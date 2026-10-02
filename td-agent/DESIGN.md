@@ -29,9 +29,20 @@ below that were the user's to make were made on 2026-10-01 and
 - **Workspaces:** several sparse-checkout git worktrees per workspace, with
   asynchronous fetch, from the first workspace increment (§7). Agents can
   commit and push (§9).
-- **Tool execution:** a jail per workspace, with cgroup memory, CPU and
-  process limits (§8), a network policy wider than none (§10), and host
-  directories such as `~/Downloads` shared in (§8).
+- **Processes:** one subprocess per conversation, under which, on a
+  host, every process that conversation causes runs (§2). The first
+  increments set no resource limits, and nothing in them may prevent
+  per-conversation memory and CPU limits from being added later and
+  inherited (§8).
+- **Tool execution:** a jail per workspace (§8), a network policy wider
+  than none (§10), and the host directories listed as `shared` in
+  configuration, `~/Downloads` read-only by default, bound in (§8, §15).
+- **Conversation features:** background processes, a todo list, search
+  and reads over a conversation's full log, compaction and
+  auto-compaction, and messages between conversations (§3, §12, §14);
+  scheduled messages are designed now and built later (§3).
+- **Development cost:** an edit confined to `td-agent/` selects td-agent's
+  own tests and lints and nothing else in the gate until packaging (§17).
 - **Auto mode:** the jail bounds what runs unreviewed; actions that cross a
   boundary go to a classifier pairing TypeSafe's Jev decision model on
   OpenRouter with a reasoning model; an action runs only when both allow,
@@ -57,13 +68,14 @@ td's source-built stage2 toolchain. Its manifest declares one dependency,
 `td-ui = { path = "../td-ui" }`, and its lock lists exactly td-agent and
 td-ui. It carries no TLS, resolves no names and opens no network
 connection itself: every request to a model provider goes through the td
-fetch service
-(APPLICATIONS.md §W.8), as td-news and td-mail do, so it needs no
-dependency sign-off and no td-crypto admission. It becomes the third
-carrier of three of the modules td-news and td-mail share byte for byte,
-`json`, the flat-TOML parser `toml` and `td_fetch`, and the recipe test
-that holds those copies identical (`recipes/src/recipes/td-mail.rs`) gains
-it. Its `grep` and `sed` tools are td-txt, the same multicall the image
+fetch service (APPLICATIONS.md §W.8), as td-news and td-mail do, so it
+needs no dependency sign-off and no td-crypto admission. It becomes the
+third carrier of three of the modules td-news and td-mail share byte for
+byte: `json`, the TOML reader `toml` and `td_fetch`. td-agent's own test
+suite holds its copies identical to td-news's; the recipe test that holds
+td-news's and td-mail's (`recipes/src/recipes/td-mail.rs`) gains td-agent
+only with the packaging increment, for the reason §17 gives. Its `grep`
+and `sed` tools are td-txt, the same multicall the image
 ships as `/bin/grep` and `/bin/sed`, run as a program rather than
 reimplemented (§12). It is zone-one source: not a foreign payload, not a
 plugin host, and not a client of any td-run server (principle 5).
@@ -80,10 +92,16 @@ own loopback.
                 |  window, keyboard, clipboard (td-ui)
                 v
   +----------------------------------+
-  | td-agent                         |--> fetchd -----> model provider
-  |  orchestrator conversation       |--> egress -----> permitted hosts
-  |  workspace conversations         |--> git worker -> git remotes
-  |  approval engine, store          |
+  | td-agent: window process         |--> git worker -> git remotes
+  |  store index, cards, schedules,  |
+  |  routing between conversations   |
+  +----------------------------------+
+                | one framed socketpair per conversation
+                v
+  +----------------------------------+
+  | td-agent conversation <id>       |--> fetchd -----> model provider
+  |  loop, model client, log writer, |--> egress -----> permitted hosts
+  |  approval engine                 |
   +----------------------------------+
                 | one framed pipe per jail instance
                 v
@@ -91,19 +109,21 @@ own loopback.
   | td-jail instance, workspace      |
   |  tool host -> sh, td-txt, git    |
   |  worktrees rw, git pointers ro,  |
-  |  system ro, loopback proxy only, |
-  |  cgroup leaf                     |
+  |  system ro, loopback proxy only  |
   +----------------------------------+
 ```
 
 There are four parties, and the design is the separation between them:
 
-1. **The agent process** owns the window, the conversation store, the model
-   client, the API key, the fetch grant, the repository store and every
-   decision of §11. It never executes anything a model wrote and never
-   reads or writes workspace file content. It runs git outside a jail
-   only on repositories no jail can write, with the fixed invocation of
-   §9, and everything else of git in maintenance instances.
+1. **The agent processes** are the window process and one conversation
+   process per running conversation, the same binary under two
+   personalities. Together they own the window, the conversation store,
+   the model client, the API key, the fetch grant, the repository store
+   and every decision of §11. They never execute anything a model wrote
+   and never read or write workspace file content. They run git outside a
+   jail only on repositories no jail can write, with the fixed invocation
+   of §9, and everything else of git in maintenance instances. How the
+   work divides between them is below.
 2. **The tool host** is the same binary under the `tool-host` personality,
    started inside a jail instance. It performs every tool effect, file
    reads and edits as well as shell commands, local commits and the
@@ -134,7 +154,68 @@ standing decision of the human's or decided under §11 when asked for.
 Publication with the human's credentials happens only through the git
 worker's push, bound to a commit the human or classifier approved.
 
-## 3. The orchestrator
+**One process per conversation.** The window process, `td-agent`, is the
+one the human starts. It owns the window, the configuration, a lock on the
+state directory that refuses a second window process, the index of
+conversations, every card, the git worker's work on shared repositories
+(the store's clones and fetches, and the publish repositories' imports
+and pushes, §9), the day's cost total, the schedule timer and the routing
+of messages between conversations (§3). For each conversation that is
+running, has a background process (§12) or is open in the window, it
+starts `td-agent conversation <id>` as its child over a framed socketpair
+and passes it the API key over that socketpair, never through argv, the
+environment or a file. The conversation process runs that conversation's
+loop. It builds and sends the model requests, reserving against the day's
+limit through the window process (§5); it is the only writer of its
+conversation's directory (§6), which it holds an exclusive lock on, so a
+restarted window process cannot start a second writer while an old
+conversation process is still exiting; it runs the rules and the
+classifier of §11; and it starts, or inside td asks the listener of §8
+to start, every jail instance the conversation uses: its own file-tool
+instance, `shell`, `grep`, `sed`, snapshot, background and maintenance
+instances, forks included. Workspace maintenance that no turn asks for
+(the periodic remote-tracking update, the counts `conversations` shows,
+the check before closing, §7) runs in the workspace's own conversation
+process; when that conversation has no process, the window process
+starts one for the purpose, without the key, and it exits when the work
+is done; if the human opens the conversation
+meanwhile, the window process hands that process the key and it goes on
+as the conversation's process. A card goes up the socketpair as a
+request and its answer comes back down. The orchestrator is a
+conversation process with no jail instances.
+
+**State shared across conversations** is the window process's: the
+human's rules, `deny everywhere` included, and each repository's
+`.td-agent/rules` as the git worker read them (§11); each workspace's
+mode, circuit-breaker counts and whether it has dropped to `ask`, which
+span a workspace's conversation and its forks; admitted remotes and
+allowlists; and every protected entry of the git chain, which it creates
+itself (§8). Conversation processes report verdicts to it and it pushes
+every change down the socketpairs as a numbered policy version; a
+conversation process applies a change before its next decision, decides
+again any approval still pending under the version it arrived in, and
+checks the version once more just before an approved action runs, so a
+deny answered in one conversation binds every other from its next action
+on.
+
+The split buys two things:
+
+- **Faults stay in one conversation.** A crash, a stuck parse or an
+  exhausted allocation ends one conversation process. The window process
+  marks the conversation failed and can restart it from its log, which
+  replays exactly (§6). A conversation process whose socketpair closes
+  exits, and every instance it started dies with it (§8).
+- **Resources have one owner.** On a host every process a conversation
+  causes descends from its conversation process, so a limit placed on
+  that process's cgroup is inherited by everything the conversation runs,
+  which is what lets §8's later limits be added without redesign.
+
+It is not a security boundary. Both personalities run unconfined as the
+human and both hold the key; the jail is the boundary, as before. A
+conversation with nothing running that is not open has no process, and
+opening it starts one from its log.
+
+## 3. The orchestrator and conversations
 
 The orchestrator is a conversation like any other in its log and model
 client, with three differences: it is always present, pinned at the top of
@@ -144,17 +225,17 @@ workspaces and conversations rather than files.
 **Its tools:**
 
 - `create_workspace {name, task, repos: [{remote, base, branch, sparse:
-  [paths]}], model?, network?}`: creates a workspace (§7) and its
+  [paths]}], model?, network?, unshared?}`: creates a workspace (§7) and its
   conversation, which starts on `task` as soon as each base commit is
   fetched while its worktrees are still being checked out. A remote must
   be admitted (§7); `network` may name `off` or `allowlist`, never `open`
   (§10).
-- `send {conversation, text}`: appends a message to a workspace
-  conversation, labelled as from the orchestrator, and wakes it if idle.
-- `list`: each workspace with its conversation state, worktree states,
-  branch, commits ahead of and behind its base, last report, and cost.
-- `read {conversation, last?}`: a bounded excerpt of a workspace
-  conversation's recent messages.
+- `conversations`, `send_message`, `history_search` and `history_read`,
+  which every conversation has (below and §12), reaching every
+  conversation without a crossing. For the orchestrator `conversations`
+  also gives each workspace's worktree states, branch, commits ahead of
+  and behind its base, and last report.
+- `todo_write`, its plan across workspaces (§12).
 - `fetch {remote?}`: an immediate store fetch (§7).
 - `close_workspace {name}`: archives the conversation and removes the
   worktrees once they are reported clean and pushed, or the human
@@ -162,13 +243,13 @@ workspaces and conversations rather than files.
 - `ask_user {question, options?}`: a structured question, answered on a
   card.
 
-**Its inputs.** The human's messages, and notifications queued from
-workspaces: a conversation's `report` (§12), a turn that finished, failed
-or is waiting for approval, a worktree that became ready or failed, and a
-base branch that advanced after a store fetch. A notification wakes the
-orchestrator for a turn of its own unless the human has paused it, so
-work proceeds while the human is away and pauses where a human card is
-open.
+**Its inputs.** The human's messages, messages from other conversations
+(below), and notifications queued from workspaces: a conversation's
+`report` (§12), a turn that finished, failed or is waiting for approval,
+a worktree that became ready or failed, and a base branch that advanced
+after a store fetch. A notification wakes the orchestrator for a turn of
+its own unless the human has paused it, so work proceeds while the human
+is away and pauses where a human card is open.
 
 **Its trust.** Everything a workspace conversation says to it, reports
 and excerpts alike, is untrusted content: a workspace's model read
@@ -189,6 +270,117 @@ The human can open any workspace conversation and talk to it directly, and
 create a workspace by hand through the same card the orchestrator's
 `create_workspace` fills in.
 
+**Between conversations.** Every conversation can see the others and
+message them, not only through the orchestrator:
+
+- `conversations`: each conversation's id, workspace, state (idle,
+  running, waiting for approval, paused, failed), background process
+  count, cost and last activity, which td-agent itself writes.
+  Model-written fields, the title, the todo item in progress (§12) and
+  background command lines, are shown only for the caller's own
+  workspace, and to the orchestrator for every workspace, so the listing
+  is not a channel between workspaces.
+- `send_message {to, text}`: queues a message for another conversation,
+  which the window process routes. A message is delivered between turns:
+  when the receiver's running turn ends, or at once if it is idle, it
+  starts a turn as a user-role message labelled with its sender. Messages
+  are asynchronous; a reply is a `send_message` back, which reaches the
+  sender the same way. `report` (§12) is a `send_message` to the
+  orchestrator with a status. A message is at most 32 KiB and a receiver
+  holds at most 16 undelivered; a send beyond either, or to an archived
+  or closed conversation, fails with a result that says which.
+- `history_search` and `history_read` (§12) take another conversation's
+  id.
+
+A message from another conversation is untrusted content, whoever sent
+it, and reaches the receiver's classifier only in its untrusted field
+(§11); it is never the human's authority. Reading another conversation's
+log brings that conversation's content, its tool output included, into
+the reader's context and so to the reader's provider and anything the
+reader may later publish. So:
+
+- a workspace conversation reads and messages every conversation of its
+  own workspace (the workspace's conversation, its forks, and theirs),
+  and messages the orchestrator, without a crossing;
+- reading the orchestrator's log is a crossing for a workspace, since
+  that log holds every workspace's reports and whatever the orchestrator
+  read from them;
+- reading or messaging another workspace's conversation is a crossing
+  (§11), whose `discloses` question covers carrying content to a
+  workspace that can publish where the source cannot. An "always" answer
+  admits that direction and that operation only: allowing A to read B
+  lets neither B read A nor A message B;
+- the orchestrator reads and messages every conversation without a
+  crossing, since relaying is its work. It can therefore carry content
+  from one workspace to another, which §11's residual risks state; the
+  per-pair crossing stops a workspace reaching another directly, not
+  through the orchestrator.
+
+**Wakes.** Two models can wake each other indefinitely, and so can a
+model and its own background processes. Every turn started by a message
+from another conversation or by a background exit notice counts against
+the receiver's wake budget, derived from the log: after twenty since the
+human last wrote to that conversation or to the orchestrator, those
+deliveries queue without starting turns and the human is notified. Two
+kinds of turn do not count, because something else bounds them: a firing
+of a schedule the human approved, bounded by its own times, and the
+orchestrator's notifications from workspaces, each caused by a
+workspace's own turn, bounded by that workspace's budget, or by a
+checkout or fetch, which no model can repeat at will. A base branch
+advancing wakes the orchestrator but is only a notice to a workspace
+conversation, waiting for its next turn. The human can pause any
+conversation; a paused conversation starts no turn until resumed,
+messages and notices to it queue, and schedule firings to it are skipped
+(below). Every turn is reserved against the cost limits as any other.
+
+Conversations in another td-agent state directory, and other agent
+harnesses' sessions on the machine, are out of reach in this design.
+Sending to them would need a socket listening outside a jail, which §1
+leaves out; seeing them could be read-only file access to their logs,
+which is not designed here (§19).
+
+**Schedules (later).** A schedule delivers a message to a conversation at
+set times, so recurring work (a nightly dependency check, a weekly triage)
+starts while the human is away. It is designed here and built after the
+increments of §18:
+
+- a schedule is a five-field cron expression (minute, hour, day of
+  month, month, day of week; numbers, `*`, lists, ranges and steps, no
+  names or macros; day of week 0 to 7, both 0 and 7 Sunday; when both
+  day fields are restricted, either matching suffices, as in cron) or a
+  single local time written `YYYY-MM-DDTHH:MM`, in the zone `TZ` names or
+  else `/etc/localtime`; a target conversation, the orchestrator by
+  default; the message text; and `catch_up`, default false;
+- the human creates one through a card or the composer. A model asks for
+  one with `schedule {cron | at, text, to?, catch_up?}`, which is a
+  human-only crossing in both modes, because a schedule spends money
+  unattended; the card shows the next three times it fires and the
+  catch-up choice. The approval is stored with the schedule, binding its
+  target, times and text, and each firing gives the classifier that
+  record as the human's standing decision to run this task at this time;
+  it does not make a model-written text the human's instruction.
+  `schedules` lists, and `cancel_schedule` cancels, only the schedules
+  targeting the caller's own conversation, the orchestrator's covering
+  all; cancelling any other is the human's;
+- a schedule whose target is archived or closed stops firing and is
+  shown as such until the human removes it;
+- schedules live in the state directory, written by the window process,
+  and fire only while it runs; there is no system timer or service.
+  Before delivering, the window process journals each occurrence by
+  schedule and its UTC instant, so a restart or a clock set back never
+  fires one twice. A firing missed while td-agent was not running is
+  dropped unless `catch_up` asks for one at startup, and never more than
+  one. A local time that does not exist is skipped and one that repeats
+  fires at its first instance;
+- a firing is delivered like a message, labelled with the schedule and
+  its author. Text a model wrote stays untrusted when it fires even
+  though the human approved the schedule: the human approved when it
+  runs and what it says, not that it is their instruction. A firing whose
+  previous turn is still running is skipped and logged rather than
+  queued, and every firing's turns are reserved against the cost limits.
+  A firing to a conversation the human has paused is skipped and logged
+  the same way.
+
 ## 4. Window and layout
 
 td-agent is a td-ui widget window (td-ui/DESIGN.md, "Widget window"). A
@@ -199,23 +391,28 @@ the state directory, which the toolkit's widget leaves to the consumer.
 recently active first, as a tree table (td-ui/DESIGN.md, "Shared tree
 table"): each workspace row shows its name, conversation state (idle,
 running, waiting for approval, failed) and branch, and opens to its
-worktrees with their state (fetching, checking out, ready, failed) and any
-forked conversations. A row waiting for approval is marked distinctly, so
-a run left in the background is visible from the list.
+worktrees with their state (fetching, checking out, ready, failed), any
+forked conversations, and its background processes (§12). A row waiting
+for approval is marked distinctly, so a run left in the background is
+visible from the list.
 
 **Right: the active conversation.** From top to bottom:
 
 - the transcript, a message list (below). It holds user, orchestrator and
   assistant messages; reasoning, collapsed to one line until opened; tool
   calls as blocks with their arguments, status and a bounded excerpt of
-  their result; and verdicts.
+  their result; verdicts; messages from other conversations and
+  schedules, labelled with their source; and a divider where compaction
+  ran (§14).
 - approval and question cards (§11), composed from the toolkit's existing
   action buttons and wrapped text block, never transcript text.
+- the todo list (§12), collapsed to its item in progress until opened.
 - the composer, an editable pane. `C-Return` sends; `Return` is a newline.
 - a status row: the model, the mode (`ask` or `auto`), the network policy,
   whether the workspace is unconfined, context used against the model's
-  length, cgroup usage against its limits, the conversation's cost, and
-  the key's remaining credit.
+  length, the resource limits (`no limits` until §8's land), the count
+  of background processes, the conversation's cost, and the key's
+  remaining credit.
 
 **The message list joins td-ui.** The transcript's widgets are general
 chat components, so they are built in td-ui, with its DESIGN.md amended in
@@ -248,8 +445,8 @@ agent drive it. That socket can answer cards, so it is created under the
 caller's runtime directory with the toolkit's ownership contract, and no
 jail instance is ever given that directory.
 
-One process serves every conversation; a second td-agent process on the
-same state directory is refused by a lock.
+The window is the window process's alone; conversation processes draw
+nothing (§2).
 
 ## 5. Model client
 
@@ -349,7 +546,7 @@ generating, or billing, when the stream closes; the interrupt says so.
 
 ## 6. Credentials and the conversation store
 
-**The API key** is held only by the agent process.
+**The API key** is held only by the agent processes (§2).
 
 - **Host-run:** `$XDG_CONFIG_HOME/td-agent/openrouter.key`, holding one
   line. It is opened without following a final symlink, and the opened
@@ -386,7 +583,8 @@ sees it. Each conversation is a directory named by a random id, holding:
   reproducible.
 - `log`: an append-only newline-delimited JSON event log, each event
   carrying a sequence number. Each event is one of:
-  - a user message, or a message from the orchestrator;
+  - a user message, or a message from another conversation or a
+    schedule, with its source (§3);
   - a request as sent: its prefix version, its parameters (model,
     reasoning, provider, `max_tokens`), and the messages after the prefix;
   - an assistant message as received, with its raw `reasoning_details`;
@@ -396,7 +594,9 @@ sees it. Each conversation is a directory named by a random id, holding:
   - a tool result as returned to the model, and the full result when the
     returned one was cut;
   - a step snapshot (§12);
-  - a notification delivered to the orchestrator;
+  - a todo list as written (§12);
+  - a background process started, exited, killed or lost (§12);
+  - a notification or notice delivered to the conversation (§3, §7, §12);
   - usage and cost;
   - a compaction (§14);
   - an interruption, an undo or a redo.
@@ -404,13 +604,27 @@ sees it. Each conversation is a directory named by a random id, holding:
 Every request ever sent is a pure function of `prefix` and `log`, so
 replaying the log reproduces the exact bytes previously sent, which is
 what keeps provider caches warm across restarts. Appends are written whole
-and fsynced at turn boundaries. A torn final line is dropped on load, and
-dropping it is reported. The log doubles as the audit trail: no jail
-instance can write it, and the classifier's and the human's verdicts are
-in it. A conversation can be forked at any message, which copies its
-prefix and log up to there into a new conversation, and exported to a
-local file; nothing is shared through any service.
+and fsynced at turn boundaries, and before any effect runs its started
+record is synced as well (Recovery, below). A torn final line is dropped
+on load, and dropping it is reported. The log doubles as the audit
+trail: no jail instance can write it, and the classifier's and the
+human's verdicts are in it. A conversation can be forked at any
+message, which copies its prefix and log up to there into a new
+conversation, and exported to a local file; nothing is shared through
+any service.
 
+**Recovery.** Every effect is logged as started, with an id, and synced
+before it runs, and logged as finished after: a model request, a tool
+call, a background process, a delivery. A conversation process that
+starts and finds an effect started but not finished never repeats it. A
+tool call becomes a result telling the model that a restart interrupted
+it and its effect is unknown, so the model checks the state; a model
+request is recorded as interrupted, its reservation counted as spent at
+its full amount, and the turn waits for the human or the next message
+rather than resending; a background process is recorded as lost.
+Messages between conversations carry delivery ids, the window process
+keeps undelivered ones in the state directory, and a receiver logs each
+id once, so a restart neither loses nor repeats a delivery.
 
 ## 7. Workspaces
 
@@ -508,15 +722,30 @@ jail-written content. The store is left alone.
 
 ## 8. The workspace jail
 
-A workspace's jail is a policy, started as td-jail instances. One
-long-lived instance serves the file tools; it runs the tool host alone,
-which starts no process, and is replaced when the ready worktrees change.
-Each `shell`, `grep`, `sed`, snapshot and maintenance call is an instance
-of its own. td-jail tears an instance down with every process in it when
-its entry exits or its launcher dies, so a timeout or an interruption,
-which kills the instance, also ends every descendant, and nothing a command
-started can go on changing the workspace after its call has returned.
-td-agent needs no process-group signalling of its own to get this.
+A workspace's jail is a policy, started as td-jail instances. Each
+conversation has one long-lived instance serving its file tools; it runs
+the tool host alone, which starts no process, and is replaced when the
+ready worktrees change. Each `shell`, `grep`, `sed`, snapshot and
+maintenance call is an instance of its own. td-jail tears an instance
+down with every process in it when its entry exits or its stage 1 dies,
+so a timeout or an interruption, which kills the instance, also ends
+every descendant, and nothing a foreground command started can go on
+changing the workspace after its call has returned; only a background
+process (§12) outlives its call, and only until it is killed. td-agent
+needs no process-group signalling of its own to get this.
+
+The instance must also die with the conversation process that launched
+it, abruptly included. Today stage 1 is bound by its death signal to
+td-jail's outer process, and nothing binds that process to its launcher,
+so a conversation process killed with `SIGKILL` could leave its instances
+running. The `workspace` kind therefore binds its outer process to its
+launcher, with a parent death signal armed and then checked against the
+expected parent, as stage 1's is, and a lifetime pipe from the
+conversation process whose closing ends the instance. The death signal
+follows the parent thread, not the process, so the pipe is the bound
+that holds whichever thread starts td-jail; the jail tests kill a
+conversation process and the window process with `SIGKILL` and find no
+instance left.
 
 Every instance has:
 
@@ -529,7 +758,8 @@ Every instance has:
   workspace tree, which the human reads. A directory configured
   read-write joins every workspace that shares it, so it is a channel
   between workspaces and is the human's explicit choice. A workspace may
-  opt out of any shared directory.
+  leave out any shared directory, through `create_workspace`'s `unshared`
+  list or the workspace card, which narrows and needs no decision.
 - **System:** the system's executable and library trees and a selective
   `/etc`, read-only, and td-agent's own tool host and td-txt, read-only.
   No cgroupfs, no `/sys`.
@@ -551,7 +781,9 @@ Every instance has:
   current filter admits `AF_UNIX`, so this is a variant of it for the
   `workspace` kind. The cost is that a program needing its own Unix
   listener fails in the jail.
-- **Limits:** a leaf of the workspace's cgroup (below).
+- **Limits:** none in the first increments; the instance is placed
+  under its conversation, on a host as a descendant of its conversation
+  process, where later limits attach (below).
 - **Isolation:** private PID, UTS, and, where the kernel provides it, IPC
   namespaces (td today does not, APPLICATIONS.md §0); no new privileges.
 - **Inheritance:** no descriptor but the instance's pipe, no runtime
@@ -680,32 +912,58 @@ td-agent then refuses, for every one of those sources, on top of §C:
   another's tree; and td-agent creates no worktree under a path a live
   grant covers.
 
-**Limits.** td-agent's cgroup subtree has three levels: a total, under it
-one node per workspace, and under each a leaf per instance; td-agent's own
-process sits in a separate leaf, so no node with children holds a process.
-Each workspace node sets `memory.high`, `memory.max`, `cpu.max` and
-`pids.max`, and `memory.swap.max` where the kernel has swap (td's does
-not), defaulting to 4 GiB with throttling from
-3.5 GiB, no swap, two CPUs and 1024 processes, configurable per workspace
-within a total that caps all workspaces together (default: three quarters
-of memory and of CPUs). Each instance leaf sets `memory.oom.group=1`, so
-an out-of-memory kill takes a whole instance, the kernel's choice of one
-within the workspace, and its tool result says so; CPU is throttled, never
-killed. The status row shows usage against the limits.
+**Limits.** The first increments set none, and say so in the status row.
+td-jail's application launch sets the package's `RLIMIT_DATA` on every
+instance even with `cgroup-root=none`; the `workspace` kind sets no data
+limit of its own, and keeps, never raises, any limit it inherits, as
+td-builder's `run-capped` keeps a tighter ambient one. The limits are
+designed so that adding them later changes no structure. On a host every
+process a conversation causes, its jail instances and everything in
+them, descends from its conversation process (§2), and td-jail's host
+launch, configured with `cgroup-root=none` as APPLICATIONS.md §X.1
+requires today, leaves each instance in its launcher's cgroup. The later
+design is then additive:
 
-None of this exists yet. td-jail today creates one level,
-`<owner>/<instance>`, refuses deeper membership, takes limits only from an
-authenticated package's resources, and sets no swap limit; and its host
-configuration requires `cgroup-root=none` (APPLICATIONS.md §X.1). The
-`workspace` kind therefore adds, on td and on a host alike, a caller-named
-nested node with caller-chosen limits under the total, and on a host a
-`cgroup-root` naming a delegated cgroup v2 hierarchy the caller may write.
-`./agent` launches td-agent into one: under a systemd user manager a
-transient delegated scope, whose delegated controllers depend on the
-systemd version and are checked, not assumed; elsewhere a subtree an
-administrator delegates. Without the memory, CPU and process controllers,
-tool execution is refused by name unless the human sets `limits = "none"`
-in configuration, which the status row then shows.
+- **A node per conversation.** On a host with a delegated cgroup v2
+  subtree, the window process moves itself into a leaf of its own,
+  never the delegated root, and creates one node per conversation; each
+  conversation process joins its node by writing to the node's
+  `cgroup.procs` before starting anything. Every instance inherits the
+  node, whose `memory.max`, `memory.high`, `cpu.max` and `pids.max` then
+  bound the whole conversation. Joining a cgroup is a file write, so
+  td-agent still needs no `unsafe`. A node per workspace above its
+  conversations, and a total above those, hold no processes and are the
+  same mechanism one level up.
+- **A leaf per instance.** cgroup v2 lets a node either hold processes
+  or enable controllers for children, not both. So splitting a
+  conversation's node into a leaf per instance, with `memory.oom.group`
+  set so an out-of-memory kill takes one instance rather than the
+  conversation, puts the conversation process in `<conversation>/self`
+  and each instance in a sibling leaf. That needs td-jail to place an
+  instance under a caller-named node; today it creates exactly
+  `<owner>/<instance>` and refuses deeper membership, so that is a
+  td-jail amendment of its own.
+- **Without a delegated cgroup**, a per-process `RLIMIT_DATA`, which
+  td-builder's `run-capped` uses for test binaries, is inherited across
+  fork and exec. It bounds each process, not their sum, so it caps a
+  runaway allocation but not a conversation's total; it has no CPU
+  counterpart that throttles (`RLIMIT_CPU` kills). Setting it needs
+  `unsafe` that td-agent does not carry, so it would be td-jail's to
+  apply to an instance's entry.
+- **Inside td**, instances are started by a root request listener, not
+  as descendants of the conversation process ("Inside td" below), so
+  that listener must place them under the conversation's node; the
+  packaging increment designs that.
+
+To keep this open, the rule is placement: everything a conversation
+causes is placed under that conversation's node, and on a host the means
+is ancestry. So on a host no increment may run a conversation's work in
+the window process or in any process not descended from that
+conversation's own; and nowhere may one conversation process serve two
+conversations, or an increment depend on td-jail moving an instance out
+of its launcher's cgroup on a host. The
+git worker's imports and pushes are children of the window process,
+which would take a limit of their own (§9).
 
 **Mechanism.** td has one confinement implementation, td-jail
 (APPLICATIONS.md §C), and td-agent does not grow a second one. The jail is
@@ -713,7 +971,7 @@ a new td-jail launch kind, `workspace`, whose policy is the list above.
 It grants no Wayland, bus, audio, fetch or tty, binds the admitted sources
 and the git chain, and runs the tool host as its entry. That kind is
 specified and landed in td-jail, with its APPLICATIONS.md and UNSAFE.md
-amendments, in the increment that first exposes a tool (§18).
+amendments, in the increment that first exposes a file or shell tool (§18).
 
 **On a development host.** td-jail's `--host` launch (APPLICATIONS.md §X.1)
 already runs for an unprivileged caller inside a user namespace it
@@ -721,7 +979,6 @@ creates; the capability its stage 1 raises is the new namespace's. The
 `workspace` kind differs from §X.1's host application launch in ways its
 §X amendment must name:
 
-- the delegated `cgroup-root` above;
 - §X.1 launches a materialized package, and its applications need the
   caller's Wayland socket and a local td-busd socket. A `workspace`
   instance runs the checkout's own tool host and td-txt, built by the same
@@ -757,8 +1014,12 @@ packaging increment designs that (§18, §19).
 
 ## 9. Git
 
-**The git worker** is the part of the agent process that runs git. It
-does so in two places, and the line between them is the design:
+**The git worker** is the part of td-agent that runs git. It does so in
+two places, and the line between them is the design. Outside a jail it
+is the window process's, which holds the shared repositories; a
+maintenance instance is started by the conversation process whose work
+needs it, or for workspace maintenance no turn asks for by the
+workspace's own conversation process (§2).
 
 - **Outside any jail**, only on repositories no jail can write: cloning
   and fetching the store, importing into and pushing from the publish
@@ -769,7 +1030,7 @@ does so in two places, and the line between them is the design:
   command that touches a workspace repository: checking out a worktree
   td-agent created (§8) and its sparse patterns, updating remote-tracking
   refs from the store (bound read-only), gc, the ahead-and-behind counts
-  `list` shows, the cleanliness check before closing, and exporting a
+  `conversations` shows, the cleanliness check before closing, and exporting a
   commit for a push. Its git reads no configuration the model can write:
   `HOME` is an empty read-only directory, `GIT_CONFIG_NOSYSTEM=1`,
   `GIT_CONFIG_GLOBAL=/dev/null`, hooks and fsmonitor are forced off on
@@ -815,9 +1076,10 @@ an approval of it is bound to immutable values:
    `index-pack --strict --max-input-size`, the pipe's frames bounded too,
    so the objects are checked and nothing but objects crosses;
    jail-written refs, reflogs and replace refs never do. The input bound
-   limits the compressed pack only, so the import runs in a cgroup leaf of
-   td-agent's own with a memory limit, which bounds what inflation and
-   delta resolution can take.
+   limits the compressed pack only: until §8's limits land, a hostile
+   pack can make the import use memory in proportion to what it inflates
+   to, and the import is the first of the git worker's children to take a
+   memory limit of its own when they do.
 3. It computes the evidence there, outside the jail, against the
    merge-base with the remote's current tip as well as the base: the
    commit subjects, the paths changed with their line counts, every added
@@ -925,16 +1187,21 @@ flag lets injected text lower its own bar.
 
 | Action | `ask` mode | `auto` mode |
 |---|---|---|
-| reads, grep, glob, plan, question, report, git_fetch | run | run |
-| orchestrator: list, read, fetch, ask_user | run | run |
-| file edits, sed, shell (local commits included) inside the jail | human | run |
+| reads, grep, glob, todo, question, report, git_fetch | run | run |
+| listing, reading, waiting on and killing own background processes | run | run |
+| history of its own conversation; `conversations` | run | run |
+| reading or messaging a conversation of its own workspace; messaging the orchestrator | run | run |
+| orchestrator: fetch, ask_user, reading or messaging any conversation | run | run |
+| file edits, sed, shell (background and local commits included) inside the jail | human | run |
+| reading or messaging another workspace's conversation; reading the orchestrator's log | human | classifier |
+| `schedule` | human | human |
 | network to a destination on the workspace allowlist | run | run |
 | network to another destination, policy `allowlist` | human | classifier |
 | git_push, unprotected branch, no force, clean scan | human | classifier |
 | git_push to a protected branch, forced, or a scan match | human | human |
 | `request_directory`, read-only | human | classifier |
 | `request_directory`, read-write | human | human |
-| orchestrator: create a workspace on an admitted remote, within defaults; send | human | run |
+| orchestrator: create a workspace on an admitted remote, within defaults | human | run |
 | orchestrator: create a workspace on any other remote, or beyond defaults | human | human |
 | orchestrator: close a workspace not reported clean and pushed | human | human |
 | network policy `open`, shared directories, limits, remotes, rules, modes | human | human |
@@ -1007,8 +1274,8 @@ state, built from separated, labelled fields:
 - the pending action;
 - an untrusted field holding everything model-authored that the verdict
   depends on: the command line, the URL, the branch name, commit subjects
-  and paths, and any message from the orchestrator, which may carry a
-  workspace model's prose.
+  and paths, and any message from another conversation or a schedule,
+  which may carry a model's prose.
 
 Neither stage sees the acting model's prose as such or any tool output;
 this follows Claude Code's published design, where Codex's reviewer does
@@ -1026,7 +1293,10 @@ shape it.
    action against the human's request), and a yes-or-no, `discloses`
    (whether the action sends workspace content to a destination that is
    neither an admitted remote nor on the workspace's allowlist; a push to
-   an admitted remote is therefore not by itself a disclosure).
+   an admitted remote is therefore not by itself a disclosure). Content
+   carried to another workspace, by a message or a read, is a disclosure
+   when the receiving workspace's remotes, allowlist or network policy
+   reach a destination the source's do not, and the state says which.
 2. **The reasoning stage** is a chat model named in configuration
    (`classifier_model`; the shipped default a bring-your-own-policy safety
    model such as `openai/gpt-oss-safeguard-20b`), given the same state and
@@ -1073,8 +1343,10 @@ hidden:
 - a push publishes whatever the branch holds, which the model wrote after
   reading untrusted input; the evidence and scan narrow that, not close it;
 - the orchestrator relays text between workspaces, so an injection read in
-  one can be written into another's task; it reaches the classifier only in
-  the untrusted field, and the human's global denies follow it;
+  one can be written into another's task, and content one workspace may
+  not send another directly can reach it through the orchestrator's
+  reads and messages, which cross nothing (§3); it reaches the classifier
+  only in the untrusted field, and the human's global denies follow it;
 - a read-only directory's contents reach the provider and the workspace
   once granted, which is why the credential locations of §8 are refused
   outright rather than left to the classifier.
@@ -1110,13 +1382,15 @@ prefix.
   unique match, the Claude Code and `str_replace` design. It has the same
   read-before-write rule. A missing match or several matches is an error
   that says which and asks for more context. No fuzzy application.
-- **`shell {command, timeout_ms?, workdir?}`**: one `sh -c` per call, in a
-  jail instance of its own, as mini-swe-agent and Claude Code run one
-  process per call. The working directory defaults to the first worktree
-  and does not persist between calls, and neither does anything the
-  command leaves running. Default timeout two minutes, maximum ten. The
-  result carries the exit status and output, cut to a head and a tail
-  with the omitted byte count named; the full output is kept in the log.
+- **`shell {command, timeout_ms?, workdir?, background?}`**: one `sh -c`
+  per call, in a jail instance of its own, as mini-swe-agent and Claude
+  Code run one process per call. The working directory defaults to the
+  first worktree and does not persist between calls, and neither does
+  anything a foreground command leaves running. Default timeout two
+  minutes, maximum ten. The result carries the exit status and output,
+  cut to a head and a tail with the omitted byte count named; the full
+  output is kept in the log. With `background: true` the call returns at
+  once with a process id instead, and the instance lives on (below).
 - **`grep {pattern, path?, include?, exclude?, extended?, ignore_case?,
   context?}`**: td-txt's `grep -rn`, run in an instance of its own, with
   the structured arguments mapped to its options (`-E`, `-i`, `-C`,
@@ -1133,8 +1407,14 @@ prefix.
   step snapshot like any edit.
 - **`glob {pattern, path?}`**: implemented in the tool host in std, capped
   and sorted.
-- **`update_plan {plan: [{step, status}]}`**: Codex's semantics. It has no
-  effect outside the conversation; the plan is drawn above the composer.
+- **`todo_write {items: [{content, status}]}`**: the todo list (below).
+- **`process_list`**, **`process_output`**, **`process_wait`** and
+  **`process_kill`**: background processes (below).
+- **`history_search`** and **`history_read`**: the conversation's full
+  log (below).
+- **`conversations`** and **`send_message`**: other conversations (§3).
+- **`schedule`**, **`schedules`** and **`cancel_schedule`**: later, with
+  schedules (§3).
 - **`question {question, options?}`**: asks the human on a card and
   returns the answer, as opencode's `question` does.
 - **`report {status, summary}`**: sends a report to the orchestrator.
@@ -1156,7 +1436,7 @@ records the tree ids and the files that changed. This is opencode's
 shadow-git design, without the shadow repository, since every worktree is
 already a repository. The human can undo a step, which restores its
 changed files from the before-tree, and redo it, through the tool host in
-a jail instance, never as a write by the agent process. A snapshot is
+a jail instance, never as a write by an agent process. A snapshot is
 jail-controlled data, good for undo within the same jail and for showing
 diffs, and never trusted outside it. It covers tracked files and
 untracked files git does not ignore: ignored files (`target/`, `.env`)
@@ -1165,9 +1445,98 @@ A directory or scratch workspace without git records pre-images of
 `write_file`, `edit_file` and `sed` targets instead, which `--sandbox`
 makes the whole of what `sed` can write.
 
+**Background processes.** A `shell` call with `background: true` keeps
+its instance running after the call returns, for a build, a watcher or a
+server. It gets an id (`p1`, `p2`, ...) numbered from the log and never
+reused within the conversation, restarts included, and the same policy,
+mounts, network and approval as a foreground call; its standard input is
+empty. The foreground timeouts do not apply: it runs until killed, or
+for `timeout_ms` when the call gives one, at most 24 hours.
+
+- `process_list`: the conversation's background processes, each with
+  its id, command, start time, state (running, exited with its status,
+  killed, or lost) and output size.
+- `process_output {id, from?, max_bytes?}`: output from a byte offset
+  counted from the process's start, bounded like `read_file`, naming the
+  next offset and the range still retained. The conversation process
+  keeps each process's output, standard error interleaved and marked, in
+  its conversation directory up to `background_output_bytes` (default 16
+  MiB), dropping the oldest beyond that; a read from before the retained
+  range starts at its beginning and says how many bytes were dropped.
+  The output is kept after the process ends and across restarts, until
+  the conversation is archived or closed; `history_search` does not
+  cover it, though the exit notice's tail, being in the log, is.
+- `process_wait {id, timeout_ms}`: returns when the process exits or the
+  timeout passes (at most ten minutes), with its state and the tail of
+  its output.
+- `process_kill {id}`: tears its instance down, with every process in it.
+
+A conversation runs at most `max_background` (default 4) at once. When
+one exits, a notice with its status and output tail is delivered between
+turns like a message (§3) and wakes the conversation if idle. Background
+processes are listed under their conversation in the window's tree, each
+with a kill action and its output viewable read-only, and the status row
+counts them. They end when killed, when their conversation is closed or
+archived, or when their conversation process exits; none survives
+td-agent, and on restart the log records each still running as lost. A
+background process keeps its conversation process running (§2). Each
+instance has its own network namespace, so a server one call starts is
+not reachable from a later call's instance; §19 records that.
+
+A background process can change a worktree between and during steps, so
+a step snapshot may include its changes, and the step's diff says that
+background processes were running. Undo and redo are refused while any
+background process of the workspace runs, since a restore could
+overwrite what one wrote or be overwritten by it.
+
+**Todo list.** `todo_write` replaces the conversation's whole list with
+items of `pending`, `in_progress`, `done` or `cancelled`, at most one in
+progress and at most 50 items of 500 bytes each, the semantics of Codex's
+`update_plan` and Claude Code's `TodoWrite`. The static text asks for one
+on work of three or more steps. Each write is a log event, so the list
+survives restarts and compaction (§14). It is drawn above the composer;
+`conversations` (§3) shows each conversation's item in progress, so the
+orchestrator and the human can follow work without reading transcripts;
+and the human can clear it. It has no effect outside the conversation and
+needs no approval. The orchestrator's list is its plan across workspaces.
+
+**The conversation's log.** The model's context is a view of the log
+(§6): compaction prunes and summarizes it (§14), and tool results are cut
+for the model. The log itself keeps everything, and two tools reach it:
+
+- `history_search {query, conversation?, kinds?, limit?}`: events whose
+  text contains every one of the query's terms, case-insensitively, newest
+  first; `kinds` narrows to user, orchestrator and conversation messages,
+  schedule firings, notifications and notices, assistant text, tool
+  calls, full tool results, approvals or compactions. In either tool, an
+  approval shows the model only its outcome and who decided it (a rule,
+  the classifier or the human), never Jev's probabilities or the
+  reasoning stage's reason, so an injected model cannot tune against the
+  classifier.
+  Each hit carries its sequence number, kind, time and a bounded excerpt
+  around the first match; at most `limit` hits (default 20, at most 100).
+- `history_read {conversation?, from, offset?, count?, max_bytes?}`: the
+  events from sequence number `from`, starting `offset` bytes into the
+  first, rendered as text, bounded by `count` (default 20, at most 100)
+  and `max_bytes` (default 32 KiB, at most 256 KiB). It ends with the
+  cursor to continue from, a sequence number and an offset, or says the
+  log is exhausted. A tool result comes back whole as the log retains it,
+  paged by that cursor, not as it was cut for the model; a page never
+  splits a UTF-8 sequence.
+
+They run in the conversation process over the stored log, reading
+another conversation's log directly (one writer, appends whole, §6). Over
+the conversation's own log they cross nothing, since everything in it
+was in the conversation already, and what they return is as trusted as
+it was then: a tool result is still untrusted content. Another
+conversation is reached as §3 says. Reasoning is searchable only where
+the provider returned it as text. The stubs and summaries compaction
+writes name the sequence numbers they replace, so a model can recover
+what a summary dropped.
+
 Planned later, each its own increment: `apply_patch`, taking Codex's patch
 grammar as one string argument for models trained on it; `web_fetch`,
-made by the agent process through the fetch service as a network
+made by the conversation process through the fetch service as a network
 crossing; a `task` tool for summarizing child conversations within a
 workspace; and an MCP stdio client.
 
@@ -1227,29 +1596,87 @@ reserved like any request; the first line of the task stands until then.
 
 ## 14. Context
 
-The context budget is the model's `context_length` from §5. Before a
-request whose estimated prompt exceeds 80% of the budget, compaction runs
-in two steps:
+The model's context is the prefix (§13) plus a view of the log; the log
+itself keeps everything (§6). The budget is the model's `context_length`
+from §5. The prompt is estimated as the last response's reported prompt
+tokens plus a bytes-over-four estimate of what has been appended since.
+
+**Auto-compaction.** Before a request whose estimated prompt plus
+`max_tokens` exceeds `compact_at` (default 80%) of the budget, the
+conversation process compacts, at a step boundary and never between a
+tool call and its result. A provider's context-length error compacts once
+and retries once. With `auto_compact = false` the turn stops at the
+threshold and asks the human instead. Compaction has two steps:
 
 1. **Tool-result pruning.** Tool results older than the most recent 40,000
    tokens are replaced with a fixed stub naming the tool, its arguments
-   and the byte count omitted, when that frees at least 20,000 tokens
-   (opencode's thresholds, configurable).
-2. **Handoff summary.** If pruning is not enough, the model writes a
-   handoff summary for a successor: progress, decisions, constraints, next
-   steps and critical data. This follows Codex's compaction prompt. The
-   new history is the prefix, the summary, and the recent user and
-   orchestrator messages up to a bound.
+   with content arguments elided as §11 elides them, the byte count
+   omitted and the sequence number `history_read` (§12) recovers it from,
+   when that frees at least 20,000 tokens (opencode's thresholds,
+   configurable).
+2. **Handoff summary.** If pruning leaves the estimate above the
+   threshold, the model writes a handoff summary for a successor:
+   progress, decisions, constraints, open questions, next steps and
+   critical data, naming the sequence numbers of what it relies on. This
+   follows Codex's compaction prompt. It uses the conversation's model,
+   or `compact_model`, and its output is bounded to a tenth of the
+   budget. Its input is the prefix, the compaction prompt and the pruned
+   view with its oldest steps dropped, by sequence number, until it fits
+   the summary model's budget less that output bound; the summary is told
+   which were dropped. It is reserved against the cost limits like any
+   request.
 
-Compaction is an event in the log; nothing before it is deleted, and the
-requests after it remain a pure function of the log. Pruning breaks the
-provider cache once, by design. The human can also compact on demand.
+**The view after a summary** is, in order: the prefix; a fixed notice that
+the conversation was compacted at a sequence number and that
+`history_search` and `history_read` reach everything before it; the
+summary; the carried state; and the recent tail. The carried state is
+copied verbatim from the log, never summarized, and every item keeps the
+source label it had (the human, the orchestrator, another conversation,
+a schedule), so nothing becomes the human's by being carried:
+
+- the task: the conversation's first message, with its source, up to a
+  bound;
+- the human's messages since the conversation began, in order, the
+  newest kept within 16 KiB, and the sequence numbers of any older ones
+  left out;
+- the current todo list (§12);
+- the workspace's worktrees with their branches and states, and the
+  background processes with theirs.
+
+The summary and the todo list are labelled as the model's own notes, not
+instructions. The recent tail is the latest steps that fit both
+`compact_keep_tokens` (default 20,000) and what the budget leaves after
+the prefix, the notice, the summary, the carried state and `max_tokens`,
+and always at least the last step; it is cut at a step boundary so that
+no tool call loses its result and no assistant message its
+`reasoning_details`. If not even the last step fits, compaction fails
+(below). After any compaction the prompt estimate restarts from the
+rebuilt view. The read-before-write digests of §12 are the conversation
+process's, not the context's, so they survive compaction; the model
+re-reads a file it needs to see again. A second compaction summarizes
+the view, earlier summary included, and carries the state again.
+
+**Manual compaction.** The human can compact at any time from the
+composer, `/compact` followed by an optional focus ("keep the failing test
+names") that is added to the summary request, or from a button. Neither
+the model nor another conversation can compact a conversation.
+
+**Failure is visible.** If the summary request fails, or the compacted
+view still exceeds the threshold, the turn stops and says why; nothing is
+silently truncated. Compaction is an event in the log, carrying the
+summary, the sequence numbers pruned and replaced, the model and the
+cost; nothing before it is deleted, and the requests after it remain a
+pure function of the log. The transcript still shows the whole log, with
+a divider where the model's view was compacted and the summary
+expandable there, so the human never loses what the model no longer
+sees. Compaction breaks the provider cache once after the prefix, by
+design.
 
 ## 15. Configuration
 
-`$XDG_CONFIG_HOME/td-agent/config` is in the flat TOML subset td-news and
-td-mail parse. Every key has a default, except `jev_threshold` until it
-is calibrated (§11):
+`$XDG_CONFIG_HOME/td-agent/config` is TOML, read by the module td-news
+and td-mail share (TOML 1.0 without dates and times). Every key has a
+default, except `jev_threshold` until it is calibrated (§11):
 
 - `base_url`
 - `model`, `orchestrator_model`, `title_model`, `classifier_fast_model`
@@ -1261,18 +1688,38 @@ is calibrated (§11):
 - `max_cost_per_turn`, `max_cost_per_conversation` and `max_cost_per_day`,
   in credits (§5); defaults 1, 10 and 25, and `none` disables any
 - `workspace_root`; default `~/td-agent`
-- `shared`: host directories bound into every workspace, each read-only
-  unless marked writable; default `["~/Downloads"]`, read-only
+- `shared`: the host directories bound into every workspace (§8), an
+  array of tables each with a `path` and an optional `write`, default
+  `false`; the default list is `~/Downloads`, read-only. A directory that
+  does not exist is skipped and reported, not created. Setting `shared`
+  replaces the default list, so `shared = []` shares nothing
 - `remotes`: the admitted git remotes (§7); default empty, so the first
   workspace on a remote asks
 - `network`: the default policy, `off` or `allowlist`; default `allowlist`
 - `network_allowlist`: the default allowlist of §10, hosts with ports
 - `protected_branches`; default `["main", "master"]`
 - `fetch_interval` and `fetch_concurrency`; defaults ten minutes and 4
-- `limits`: per-workspace memory, CPUs and processes, and the totals; or
-  `"none"` on a host without a delegated cgroup (§8)
+- `max_background` and `background_output_bytes`; defaults 4 and 16 MiB
+  (§12)
+- `auto_compact`, `compact_at`, `compact_keep_tokens` and
+  `compact_model`; defaults `true`, 80%, 20,000 and the conversation's
+  model (§14)
 
-Unknown keys are refused by name.
+There is no `limits` key until §8's limits land. Unknown keys are refused
+by name. For example:
+
+```toml
+model = "anthropic/claude-sonnet-5.5"
+mode = "auto"
+max_cost_per_day = 25
+
+[[shared]]
+path = "~/Downloads"
+
+[[shared]]
+path = "~/src/reference"
+write = false
+```
 
 ## 16. Prior art: opencode
 
@@ -1291,6 +1738,7 @@ kind. td-agent's position on its features:
 | Event-sourced session log | adopted, as a per-conversation file log (§6) |
 | Prune old tool output, then summarize | adopted, with its thresholds (§14) |
 | Small model for titles | adopted (§13) |
+| `todowrite` | adopted as `todo_write`, carried through compaction (§12) |
 | Worktree workspaces | adapted: sparse, asynchronous, per-workspace repositories, jailed (§7) |
 | allow/ask/deny patterns, last match wins | adapted: deny first, workspace rules only narrow (§11) |
 | `external_directory` prompt | replaced by mounts: what is not bound does not exist (§8) |
@@ -1313,7 +1761,13 @@ kind. td-agent's position on its features:
   path admission; the egress address predicate, every refused range and
   the machine's own addresses included; each tool's semantics against
   temporary directories, including the read-before-write digest, the edit
-  errors, and grep and sed's argument mapping with `--sandbox`.
+  errors, and grep and sed's argument mapping with `--sandbox`; the todo
+  list's bounds and single item in progress; `history_search` and
+  `history_read` over a log with a torn final line, paging a whole tool
+  result; the compaction view's carried state, its tail cut at a step
+  boundary, and its sequence-number stubs; the cron parser, next-firing
+  computation across daylight-saving changes, and catch-up at most once;
+  and the configuration's `shared` tables and refusal of unknown keys.
 - **Git units, against local repositories:** store clone and fetch with
   the fixed invocation; a workspace repository over alternates; sparse
   worktrees; the asynchronous state machine, the first request waiting on
@@ -1335,11 +1789,19 @@ kind. td-agent's position on its features:
   exchanges, Jev decisions included. td-mail's `tests/mock_fetch.rs` is the
   precedent. These cover a tool-call round trip, parallel calls, a 429
   retry, a 502 shown and not retried, 402, cost limits, interruption,
-  compaction, an orchestrator creating a workspace and receiving its
-  report, an orchestrator refused a new workspace while another has
-  dropped to `ask`, and each classifier path: both stages allow, either
-  defers or denies, a malformed reply, and a Jev outage with and without
-  `jev_required`.
+  automatic, manual and failed compaction, a context-length error
+  compacted and retried once, an orchestrator creating a workspace and
+  receiving its report, an orchestrator refused a new workspace while
+  another has dropped to `ask`, messages between conversations with their
+  labels and wake budget, a background process's exit notice waking an
+  idle conversation, a conversation process killed mid-turn and restarted
+  from its log, a restart that finds a tool call, request or delivery
+  started but not finished and repeats none of them, a policy change
+  re-deciding a pending approval, and each classifier path: both stages
+  allow, either defers or denies, a malformed reply, and a Jev outage
+  with and without `jev_required`. A conversation process is a child
+  process here as in the window, driven over its socketpair by a test
+  harness standing in for the window process.
 - **Window tests:** native compositor process tests through the driven
   seam: the layout, the workspace tree, switching conversations, selecting
   text across messages and copying it, copying a whole message and a tool
@@ -1352,62 +1814,136 @@ kind. td-agent's position on its features:
   including by renaming an ancestor; cannot create a linked worktree;
   cannot create a Unix socket, reach one published in a worktree, or make
   a datagram pair; can commit and `git switch -c`; with the proxy reaches
-  only allowlisted host and port pairs, and without it nothing; is
-  throttled at its CPU limit and loses only its own instance at its memory
-  limit; and leaves no process running after a timed-out call. Admission
-  refuses `$HOME`, the store, a credential location, and a shared
-  directory containing a worktree.
+  only allowlisted host and port pairs, and without it nothing; and
+  leaves no process running after a timed-out call, a killed
+  background process, or a conversation or window process killed with
+  `SIGKILL`. Admission refuses `$HOME`, the store, a credential
+  location, and a shared directory containing a worktree.
 - **Live checks, by hand and never in the gate:** `./agent` against
   OpenRouter, and a classifier fixture set of pending actions with expected
   verdicts. Each stage's false-allow and false-escalate counts, and Jev's
   calibration, are recorded in the commit that changes a classifier
   prompt, model or threshold.
 
+**Gate cost.** An edit confined to `td-agent/` should run td-agent's own
+tests and lints and nothing else. `builder/src/affected.rs` decides that
+in two places. `map_path` maps each changed path to preflights and
+targets; `cargo_test_cmds` then narrows the `cargo-test` preflight to the
+roster crates a diff touches and every crate that reads them. Measured on
+2026-10-02:
+
+- a path in no roster crate selects every crate and the `check` target,
+  which is what `td-agent/src/` does until `td-agent/Cargo.toml` exists,
+  so the crate increment adds its manifest and lock in the same commit as
+  its source;
+- a path in a discovered crate with no `map_path` arm of its own selects
+  that crate's preflight and also the whole `check` target, since which
+  recipe embeds a new crate is for its author to say;
+- every narrowed preflight keeps the tests and clippy of the builder,
+  recipes and engine workspace, because recipes embed crate sources and
+  the builder's tests assert exact reader sets;
+- td-mta alone escapes both: its own `map_path` arm adds only the
+  `cargo-test` preflight, and `cargo_test_cmds` drops the workspace pass
+  while its only outgoing edge is exactly `td-crypto`. A builder test
+  (`mail_gate_exemption_requires_no_distribution_recipe`) holds that no
+  recipe and no seed roster names it.
+
+td-agent is laid out to get td-mta's treatment:
+
+- no crate depends on it, so a td-agent change selects td-agent alone; a
+  change to a crate it reads selects td-agent as well, as it should;
+- no recipe, recipe test or seed roster names it until packaging. Its
+  copies of the shared modules are held identical by its own test reading
+  td-news's, not by the recipe test;
+- its outgoing edges are pinned: exactly `td-news` (that test) and
+  `td-ui` (its dependency), plus `td-compositor` from the increment that
+  declares `native-compositor-tests`, since that opt-in adds the edge.
+  The pinned set lives in `affected.rs` beside td-mta's, and a diff whose
+  edges differ from it takes the workspace pass, because the builder's
+  reader-set assertions name td-agent once it reads td-ui;
+- the crate increment adds a `td-agent/` arm to `map_path` selecting only
+  the `cargo-test` preflight; generalizes the workspace exemption and its
+  guarding test from td-mta to a list of exempt crates, each with its
+  pinned edges; and asserts that `td-agent/src/` selects no target. A diff
+  confined to td-agent then runs the format check and td-agent's own
+  tests and clippy. Packaging makes a recipe name td-agent, which the
+  guarding test refuses until the packaging increment removes td-agent
+  from the list;
+- its gate metadata is `clippy-all-targets` and `trusted-test-root`, the
+  latter because its control-socket tests bind under owner-checked
+  fixtures as td-ui's do. `native-compositor-tests`, which adds a
+  compositor build to every td-agent preflight (cached after the first),
+  is declared only by the increment whose window tests first need it,
+  and those tests stay few, in one process-test file; the rest of the
+  window's logic is tested against td-ui's widget state without a
+  compositor.
+
 ## 18. Increments
 
-Each is one green, separately landable commit on `td-agent-rolling`.
+Each is one green, separately landable commit, except the revisions of
+2, each its own. The td-agent increments stack on one rolling branch; 3
+and 6 touch only td-ui and td-net and land from branches of their own,
+in parallel with it.
 
 1. **The design**, and the AGENTS.md route to it.
-2. **This revision**: the orchestrator, workspaces, git, network, limits,
-   shared directories, the two-stage classifier and the chat components.
+2. **The revisions**, two commits: the orchestrator, workspaces, git,
+   network, shared directories, the two-stage classifier and the chat
+   components; then a process per conversation with limits deferred, the
+   conversation features of §3, §12 and §14, and the gate cost of §17.
 3. **td-ui chat components.** The message list with selection and whole-
    message copy, tested in td-ui, amending td-ui/DESIGN.md.
-4. **Window and store.** The crate; the split window with the conversation
-   tree, message list and composer; the store with local echo and no model;
+4. **Window, processes and store.** The crate with its manifest, lock and
+   gate metadata, and the generalized exemption of §17; the window process
+   and conversation processes over their socketpairs, a conversation
+   restarted from its log; the split window with the conversation tree,
+   message list and composer; the store with local echo and no model;
    driven window tests; and `./agent`. Its logic is `td-builder host-run`
    learning the name (`builder/src/host_run.rs`, and td-net's launch roster
    in `net/src/launch.rs`); the script is only the `./news` bootstrap shape,
    adding no logic in shell.
-5. **Model client over `td-fetch 1`.** Non-streaming chat with no tools; the
-   key file; the models list; usage, cost limits and credit in the status
-   row; titles; mock fetch tests. This is the first live OpenRouter use.
+5. **Model client over `td-fetch 1`.** Non-streaming chat with no tools, in
+   the conversation process; the key file; the models list; usage, cost
+   limits and credit in the status row; titles; mock fetch tests. This is
+   the first live OpenRouter use.
 6. **Fetch streaming in td-net**, with its §W.8 amendment.
 7. **The SSE reader in td-agent.**
-8. **Tool host and tool semantics.** The framed, multiplexed protocol and
-   the §12 tools, tested in-process against fixtures, td-txt included. No
-   tool is exposed to a model.
-9. **The `workspace` jail.** The td-jail launch kind with its
-   APPLICATIONS.md (§C, §P, §X) and UNSAFE.md amendments: its seccomp
-   variant, the nested cgroup with caller-chosen limits and the delegated
-   host root, shared directories, and the host-mode divergences of §8;
-   `./agent`'s launch building td-jail, td-txt and the tool host; directory
-   and scratch workspaces, with tools exposed for the first time in `ask`
-   mode.
-10. **Repository store and workspaces.** The git worker and maintenance
+8. **Conversation tools.** The todo list; `history_search` and
+   `history_read`; `conversations` and `send_message`, with their labels
+   and the wake budget. These are the first tools exposed to a model, and
+   none touches a file. Until increment 13 adds their crossings, every
+   read or message that §11 makes a crossing is refused with that reason,
+   and a conversation outside any workspace counts as a workspace of its
+   own.
+9. **Tool host and tool semantics.** The framed, multiplexed protocol and
+   the §12 file and shell tools, tested in-process against fixtures,
+   td-txt included. No such tool is exposed to a model.
+10. **The `workspace` jail.** The td-jail launch kind with its
+    APPLICATIONS.md (§C, §X) and UNSAFE.md amendments: its seccomp
+    variant, shared directories from configuration, and the host-mode
+    divergences of §8, with no cgroup work, since instances stay in their
+    launcher's cgroup (§8); `./agent`'s launch building td-jail, td-txt and
+    the tool host; directory and scratch workspaces, with file and shell
+    tools exposed for the first time, in `ask` mode.
+11. **Repository store and workspaces.** The git worker and maintenance
     instances; admitted remotes; the store and its background fetch;
     workspace repositories over alternates with the git mount chain;
     sparse worktrees prepared asynchronously; local commits and step
-    snapshots; the orchestrator with `create_workspace`, `send`, `list`,
-    `read`, `close_workspace` and notifications.
-11. **Rules and auto mode.** Rules, cards, repetition, both classifier
-    stages, the circuit breaker, and the calibrated `jev_threshold`.
-12. **Push and fetch tools.** The publish repository, export and strict
+    snapshots; the orchestrator's `create_workspace`, `close_workspace` and
+    notifications.
+12. **Background processes.** `background` on `shell`, the process tools,
+    the output store, exit notices, and the window's process list.
+13. **Rules and auto mode.** Rules, cards, repetition, both classifier
+    stages, the circuit breaker, the calibrated `jev_threshold`, and the
+    crossings for reads and messages between workspaces and of the
+    orchestrator's log.
+14. **Push and fetch tools.** The publish repository, export and strict
     import, evidence and scan, and the bound push.
-13. **Network.** The egress relay applet with its §W.8 amendment and its
+15. **Network.** The egress relay applet with its §W.8 amendment and its
     address predicate, the in-jail proxy, the policies and allowlist
     crossings.
-14. **Compaction.**
-15. **Packaging.** A recipe, an application package with
+16. **Compaction.** Automatic and manual compaction, the carried state, and
+    stubs that `history_read` resolves.
+17. **Packaging.** A recipe, an application package with
     `sockets=wayland;fetch` and the egress socket, the portal credential,
     the in-td jail path of §8 with its td-authd amendment, and a boot
     oracle. git ships on td as an explicitly reviewed non-Rust package
@@ -1415,17 +1951,39 @@ Each is one green, separately landable commit on `td-agent-rolling`.
     companion obligations of `td-profiler/DESIGN.md`, named in that
     landing.
 
-After these: `web_fetch`, `apply_patch`, child conversations within a
-workspace, skills and custom commands, the MCP client, moving a
-conversation between workspaces, and a native Anthropic Messages dialect.
+After these: resource limits (§8), schedules (§3), a loopback shared by a
+conversation's instances (§19), `web_fetch`, `apply_patch`, child
+conversations within a workspace, skills and custom commands, the MCP
+client, moving a conversation between workspaces, and a native Anthropic
+Messages dialect.
 
 ## 19. Open questions
 
 - **Host system trees.** The exact §X amendment that lets a `workspace`
   instance bind the host's system trees and `/etc` read-only.
-- **Host cgroup delegation.** How `./agent` obtains a delegated subtree on
-  hosts without a systemd user manager (elogind, Shepherd), and whether
-  td-builder's host-run should create the transient scope itself.
+- **Resource limits.** For the later limits of §8: how `./agent` obtains
+  a delegated cgroup v2 subtree, from a systemd user manager's transient
+  scope (whose delegated controllers depend on its version and must be
+  checked) or, on hosts without one (elogind, Shepherd), from an
+  administrator; whether td-builder's host-run should create the scope
+  itself; the defaults per conversation, per workspace and in total; and
+  what the status row shows where nothing is delegated.
+- **Background servers.** Each jail instance has its own network
+  namespace, so a server a background process starts is unreachable from
+  the conversation's later calls. Sharing one loopback across a
+  conversation's instances needs td-jail to start an instance in an
+  existing network namespace, and on a host each instance's user
+  namespace is its own, so the namespace's owner has to be arranged; the
+  alternative is a conversation-long instance that runs every call.
+- **Other harnesses' sessions.** Whether td-agent should see sessions
+  outside its own state directory: another td-agent's, or another agent
+  harness's, by reading their logs read-only. Messaging them would need a
+  socket outside a jail; seeing them would need a reader per format and
+  admission of their directories, which hold other models' context and
+  may hold credentials.
+- **Wake budget.** Whether twenty wakes between human messages (§3) is
+  the right bound for conversations messaging each other, and whether
+  it should count turns or cost.
 - **The jail inside td.** The root request listener td-authd would need to
   start a workspace instance for a jailed td-agent, how the workspace root
   and shared directories become portal grants, and how the git worker
