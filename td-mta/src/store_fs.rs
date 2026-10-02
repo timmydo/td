@@ -78,6 +78,8 @@ pub use temporary::{
 };
 
 #[cfg(test)]
+pub use stopped::probe_verify_account;
+#[cfg(test)]
 pub use temporary::probe::run as probe_temporary_io;
 
 /// Qualified by the host and portable allocation probes, including errors.
@@ -399,12 +401,27 @@ mod tests {
     }
     impl Fixture {
         pub(super) fn new() -> Self {
+            Self::sized(false)
+        }
+        pub(super) fn maximum_root() -> Self {
+            Self::sized(true)
+        }
+        fn sized(maximum: bool) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
+            let base = fs::canonicalize(std::env::temp_dir()).unwrap();
+            let mut name = format!(
                 "td-mta-lock-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            );
+            if maximum {
+                let length = MAX_ROOT_BYTES
+                    .checked_sub(base.as_os_str().len() + 1)
+                    .unwrap();
+                assert!((name.len()..=255).contains(&length));
+                name.push_str(&"x".repeat(length - name.len()));
+            }
+            let path = base.join(name);
             fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             let path = fs::canonicalize(path).unwrap();

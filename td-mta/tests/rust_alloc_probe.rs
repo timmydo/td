@@ -808,6 +808,17 @@ fn store_temporary_files() {
     );
 }
 
+fn store_verify_account() {
+    let mut samples = [COUNTERS.snapshot(); 16];
+    let mut slots = samples.iter_mut();
+    measured_store_fs::probe_verify_account(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "stopped account verification allocated");
+    }
+}
+
 fn journal_overlay() {
     use td_mta::{
         format::{
@@ -1017,6 +1028,7 @@ fn main() {
         .is_some_and(|arg| arg == "--store-files")
     {
         store_temporary_files();
+        store_verify_account();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1092,6 +1104,7 @@ fn main() {
     }
     store_directories();
     store_temporary_files();
+    store_verify_account();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

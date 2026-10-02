@@ -219,9 +219,12 @@ still account for those costs and concurrent owners within the ledger.
   after overlay loading, and all input descriptors close before return. Its
   VerifiedAccount summary fits 2 KiB and borrows only the stopped owner. Local
   coordinator construction/moves and nested reader temporaries still require
-  whole-worker stack qualification; no process RSS or composed allocation
-  measurement is claimed here. One fixed atomic watermark lets outer and nested
-  clock samples share regression/deadline checks without an allocated registry.
+  whole-worker stack qualification. The dedicated Rust allocator probe now
+  measures this composition on small empty/blob fixtures at short and maximum
+  roots, including refusals and persisted corruption. Fixture construction and
+  buffers are cold; no whole-service RSS or native allocation claim follows.
+  One fixed atomic watermark lets outer and nested clock samples share
+  regression/deadline checks without an allocated registry.
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
   that input to a temporary; complete worker-stack qualification remains pending.
@@ -915,6 +918,21 @@ advance performs one open, bounded frame read, bounded slot drain or completion;
 Progress changes no caller cursor. max_bytes is per source, and total scan work
 still needs driver admission. The existing allocation interval covers a history
 to active transition and successful full-capacity reclaim at both root bounds.
+
+The account-verification allocation fixture loads actual CURRENT and checks all
+selected metadata, replay, references, queue/mailbox scans and final blob files.
+Four cold-created stores combine short/maximum root length with empty final data
+and a published three-byte blob. Empty stores retain an incomplete active tail.
+Each store has two measured intervals: success plus initial/mid-pipeline
+deadlines, capture extent, overlay, history and read-work refusals, then a
+separately prepared malformed CURRENT or exact blob-checksum failure.
+All 16 snapshots must be valid; each before/after pair must match every counter,
+including allocation, reallocation, deallocation, failed requests and live/peak
+requested bytes. Scratch reuse and result disposal occur within measurement;
+fixture creation, corruption writes, buffer allocation and cleanup are outside.
+The existing positive controls and counter model run first. The --store-files
+path also runs these cases. This qualifies representative composed Rust call
+behaviour, not maximum datasets, native allocation, stack high water or RSS.
 
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,

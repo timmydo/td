@@ -256,9 +256,14 @@ impl StoppedStore {
 }
 
 #[cfg(test)]
+pub use tests::probe as probe_verify_account;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
-    use super::super::super::{active::fixture, HistorySweepLimits, TableSweepLimits};
+    use super::super::super::{
+        active::fixture, BlobInputError, BlobSweepError, HistorySweepLimits, TableSweepLimits,
+    };
     use super::super::tests::prepare;
     use super::*;
     use crate::{
@@ -583,5 +588,115 @@ mod tests {
             Err(VerifyError::Policy(PolicyError::Deadline))
         ));
         assert_eq!(clock.calls.load(Ordering::Relaxed), 1);
+    }
+    /// Only calls the observer around verification; fixture I/O and allocation are cold.
+    pub fn probe(mut snapshot: impl FnMut()) {
+        use super::super::super::tests::Fixture;
+        for maximum in [false, true] {
+            for populated in [false, true] {
+                let fixture = if maximum {
+                    Fixture::maximum_root()
+                } else {
+                    Fixture::new()
+                };
+                if maximum {
+                    assert_eq!(
+                        fixture.path.as_os_str().len(),
+                        super::super::super::MAX_ROOT_BYTES
+                    );
+                }
+                let (dir, store, _) = super::super::tests::prepare_fixture(fixture);
+                if populated {
+                    blob(&store);
+                }
+                let mut scratch = Scratch::new();
+                let clock = TestClock::new(u64::MAX, 0);
+                let expired = TestClock::new(0, 0);
+                let mid_deadline = TestClock::new(40, 0);
+                snapshot();
+                {
+                    let report = store
+                        .verify_account(&Provider, &clock, ACCOUNT, limits(), scratch.borrowed())
+                        .unwrap();
+                    scratch.overwrite();
+                    assert_eq!(report.blobs().bytes(), if populated { 3 } else { 0 });
+                    assert_eq!(report.has_incomplete_tail(), !populated);
+                }
+                assert!(matches!(
+                    store.verify_account(
+                        &Provider,
+                        &expired,
+                        ACCOUNT,
+                        limits(),
+                        scratch.borrowed()
+                    ),
+                    Err(VerifyError::Policy(PolicyError::Deadline))
+                ));
+                assert!(matches!(
+                    store.verify_account(
+                        &Provider,
+                        &mid_deadline,
+                        ACCOUNT,
+                        limits(),
+                        scratch.borrowed()
+                    ),
+                    Err(VerifyError::Policy(PolicyError::Deadline))
+                ));
+                let mut short = limits();
+                short.capture_bytes = 255;
+                assert!(matches!(
+                    store.verify_account(&Provider, &clock, ACCOUNT, short, scratch.borrowed()),
+                    Err(VerifyError::Capture(_))
+                ));
+                let mut buffers = scratch.borrowed();
+                buffers.overlay_frames = &mut [];
+                assert!(matches!(
+                    store.verify_account(&Provider, &clock, ACCOUNT, limits(), buffers),
+                    Err(VerifyError::Overlay(_))
+                ));
+                let mut short = limits();
+                short.files.history.bytes = 276;
+                assert!(matches!(
+                    store.verify_account(&Provider, &clock, ACCOUNT, short, scratch.borrowed()),
+                    Err(VerifyError::Files(_))
+                ));
+                let mut short = limits();
+                short.read.steps = 1;
+                assert!(matches!(
+                    store.verify_account(&Provider, &clock, ACCOUNT, short, scratch.borrowed()),
+                    Err(VerifyError::Data(DataError::References(_)))
+                ));
+                snapshot();
+                // Persisted corruption is prepared outside the measurement interval.
+                let name = Name::account(
+                    ACCOUNT,
+                    if populated {
+                        AccountEntry::Blob(BlobKind::Message, BlobId::from_bytes([0x44; 16]))
+                    } else {
+                        AccountEntry::Current
+                    },
+                )
+                .unwrap();
+                std::fs::write(
+                    dir.path.join(name.as_path().unwrap()),
+                    if populated { b"abd" } else { b"bad" },
+                )
+                .unwrap();
+                snapshot();
+                let result =
+                    store.verify_account(&Provider, &clock, ACCOUNT, limits(), scratch.borrowed());
+                assert!(matches!(
+                    (populated, result),
+                    (false, Err(VerifyError::Selection(_)))
+                        | (
+                            true,
+                            Err(VerifyError::Data(DataError::Blobs(BlobSweepError::Input(
+                                BlobInputError::Checksum
+                            ))))
+                        )
+                ));
+                snapshot();
+            }
+        }
     }
 }

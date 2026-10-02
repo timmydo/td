@@ -1024,6 +1024,13 @@ service activation. Each part lands independently:
     phase failures, admission, clock failures/regressions and final deadline.
     Preserve tails without repair. CLI/JSON, complete mutation policy, recovery
     accounting and activation remain separate.
+  - **M05d29 — composed verification allocation probe:** exercise the complete
+    stopped-account path inside the existing Rust allocation counter, at short
+    and maximum roots with empty/tail and populated-blob fixtures. Keep fixture
+    setup, buffer allocation and corruption writes outside eight intervals;
+    require 16 valid, unchanged paired snapshots for success and errors.
+    No instrumentation surface, allocator policy or dependency is added. Native
+    allocation, maximum datasets, worker-stack and RSS qualification remain.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

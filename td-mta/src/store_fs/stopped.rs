@@ -26,6 +26,8 @@ pub use validation::{
 
 #[path = "stopped/verify.rs"]
 mod verify;
+#[cfg(test)]
+pub use verify::probe_verify_account;
 pub use verify::{VerifiedAccount, VerifyError, VerifyLimits, VerifyScratch};
 
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.
@@ -182,7 +184,9 @@ mod tests {
     }
 
     pub(super) fn prepare() -> (Fixture, StoppedStore, active::ProbeBytes) {
-        let fixture = Fixture::new();
+        prepare_fixture(Fixture::new())
+    }
+    pub(super) fn prepare_fixture(fixture: Fixture) -> (Fixture, StoppedStore, active::ProbeBytes) {
         let root = fixture.locked();
         root.create_accounts_directory().unwrap();
         selection::prepare_probe(&root);
