@@ -656,6 +656,14 @@ service activation. Each part lands independently:
         inject before/after creation and each sync. Allocation probes include
         successful and refused directory operations. Directory creation does
         not select a checkpoint or activate serving.
+      - **M05b2c3 — immutable blob publication:** implemented consuming,
+        account-bound, non-replacing hard links, destination-parent sync,
+        temporary unlink and temporary-parent sync. Explicit failure stages
+        preserve possible effects; no implicit rollback/adoption or writable
+        result handle. Source identity/length/private policy are checked.
+        Host/musl allocation probes cover success, collisions and errors at
+        every mutation/sync boundary. Transaction/admission coupling remains
+        M05c; CURRENT replacement and recovery remain separate work.
     - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
       bounded reading through EOF and opened-file identity checks. Deployment
       uses the data-root owner as its trusted expected service identity.

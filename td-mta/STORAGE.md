@@ -159,13 +159,14 @@ never synthesize a passing sample. No external command or host probe is needed.
 Operators provision disk headroom and may monitor it with their ordinary tools.
 
 Create private files with `OpenOptions::create_new` and mode 0600, directories
-with `DirBuilder` and mode 0700. Future publication uses `hard_link` to publish
+with `DirBuilder` and mode 0700. Blob publication uses `hard_link` to publish
 immutable completed files without replacing an existing destination, then syncs
 the destination directory before removing/syncing the temporary link. Source
 and destination must share a filesystem. CURRENT uses same-directory temporary
 creation, file sync, atomic `rename` replacement and parent-directory sync.
 Checkpoint generations use exclusive directory creation and are authoritative
-only after CURRENT selection. These mutation operations remain M05 implementation work.
+only after CURRENT selection. CURRENT replacement and mutation/admission
+integration remain M05 implementation work.
 
 ### Persistent writer lock
 
@@ -266,8 +267,46 @@ count/byte bounds cannot interrupt a blocking filesystem syscall. The reader
 reports unexpected early EOF and never treats a beyond-end offset as success.
 A sync error closes the handle and leaves the output charged. The type does
 not promise durable newly created ancestors, hash/content validity, immutable
-publication, journal commit or service readiness. Parent creation, publication,
-quota integration and cleanup are later M05 work. No unlink runs in Drop.
+publication, journal commit or service readiness. Quota integration and cleanup
+are later M05 work. No unlink runs in Drop.
+
+### Immutable blob publication
+
+`SyncedTemporary::publish_blob` consumes completed private output and binds the
+message/upload destination to the account recorded at temporary-file creation.
+The caller supplies the typed blob kind and ID, admits/charges the operation,
+and verifies bytes/digest before publication. Parents must already be durable.
+Source and destination ancestors are rechecked for private owner/mode; the
+source pathname must match the retained regular mode-0600 file, have one link,
+and retain its completed length. The temporary parent must still match its
+retained handle. These are checks under the stable-namespace contract above.
+
+Refuse every existing destination, including symlinks; never replace, adopt or
+deduplicate a collision. Issue `hard_link`, sync the destination parent, remove
+the temporary link, then sync its retained parent. Cross-filesystem errors
+propagate; there is no copying fallback. Success returns a `PublishedFile` with
+a bounded caller-buffer read API and the LOCK borrow; it exposes no writable
+handle. The temporary parent is released. This primitive establishes neither
+hash validation nor quota authority, and does not produce `ports::PublishedBlob`
+or commit a transaction. No success acknowledgement follows from it alone.
+
+`PublishError` records the last established boundary:
+
+| Variant | Meaning |
+| --- | --- |
+| Rejected | No link was issued by this attempt; existing state may remain. |
+| LinkAttempted | Link call errored; destination creation may have occurred. |
+| Linked | Link succeeded; destination-parent sync failed. |
+| DestinationSynced | Destination-parent sync succeeded; temporary unlink errored and may have occurred. |
+| TemporaryUnlinked | Temporary unlink succeeded; temporary-parent sync failed. |
+
+Every error consumes the handle and retains logical charges for explicit
+cleanup/recovery. No rollback or Drop unlink runs. Failed link/unlink calls,
+including AlreadyExists/NotFound after possible internal retries, do not prove
+absence of effects. After destination sync succeeds, the destination is durable
+even if temporary cleanup fails, but this low-level call still returns an error.
+Recovery must reconcile orphan links before reuse; a caller cannot replay the
+mutation or release charges by interpreting only the underlying I/O error kind.
 
 Any create/write/flush/sync/publication error must prevent a new acceptance
 acknowledgement. Keep already acknowledged state; never delete live mail to

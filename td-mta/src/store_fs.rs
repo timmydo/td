@@ -11,7 +11,9 @@ use std::{
 mod create_directory;
 #[path = "store_fs/temporary.rs"]
 mod temporary;
-pub use temporary::{CreateError, SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES};
+pub use temporary::{
+    CreateError, PublishError, PublishedFile, SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES,
+};
 
 #[cfg(test)]
 pub use temporary::probe::run as probe_temporary_io;

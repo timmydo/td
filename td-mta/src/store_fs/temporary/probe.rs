@@ -28,6 +28,12 @@ impl Fixture {
             parent.push(part);
             create_directory(&parent);
         }
+        for entry in [
+            AccountEntry::Messages,
+            AccountEntry::Shard(crate::format::row::BlobKind::Message, 0xff),
+        ] {
+            root.create_account_directory(account, entry).unwrap();
+        }
         Self {
             path,
             root,
@@ -61,6 +67,7 @@ pub fn run(mut snapshot: impl FnMut()) {
     assert_eq!(long.path.as_os_str().len(), super::super::MAX_ROOT_BYTES);
     snapshot();
     for fixture in [&short, &long] {
+        super::publication::probe(&fixture.root, fixture.account);
         assert!(
             matches!(fixture.root.create_accounts_directory(), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)
         );

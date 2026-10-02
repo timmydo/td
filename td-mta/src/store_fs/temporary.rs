@@ -1,4 +1,7 @@
-//! Private output only; syncing a file does not publish or commit it.
+//! Private output and consuming immutable publication under the writer lock.
+#[path = "temporary/publication.rs"]
+mod publication;
+pub use publication::{PublishError, PublishedFile};
 #[cfg(test)]
 #[path = "temporary/probe.rs"]
 pub mod probe;
@@ -60,6 +63,7 @@ impl LockedRoot {
         let (file, parent) = create(&self.root.directory, &name)?;
         Ok(TemporaryFile {
             _owner: self,
+            account,
             file,
             parent,
             name,
@@ -77,6 +81,7 @@ impl LockedRoot {
 #[derive(Debug)]
 pub struct TemporaryFile<'a> {
     _owner: &'a LockedRoot,
+    account: AccountId,
     file: File,
     parent: File,
     name: Name,
@@ -129,26 +134,29 @@ impl SyncedTemporary<'_> {
     /// Reads at most the caller's slice and the completed private extent.
     /// Short reads/Interrupted propagate; zero before extent end is corruption.
     pub fn read_at(&self, offset: u64, output: &mut [u8]) -> io::Result<usize> {
-        let remaining = self
-            .len()
-            .checked_sub(offset)
-            .ok_or(io::ErrorKind::InvalidInput)?;
-        let count = usize::try_from(remaining)
-            .unwrap_or(usize::MAX)
-            .min(output.len())
-            .min(MAX_FILE_STEP_BYTES);
-        if count == 0 {
-            return Ok(0);
-        }
-        let count = self.file.file.read_at(
-            output.get_mut(..count).ok_or(io::ErrorKind::InvalidInput)?,
-            offset,
-        )?;
-        if count == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        Ok(count)
+        read_extent(&self.file.file, self.len(), offset, output)
     }
+}
+
+fn read_extent(file: &File, length: u64, offset: u64, output: &mut [u8]) -> io::Result<usize> {
+    let remaining = length
+        .checked_sub(offset)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let count = usize::try_from(remaining)
+        .unwrap_or(usize::MAX)
+        .min(output.len())
+        .min(MAX_FILE_STEP_BYTES);
+    if count == 0 {
+        return Ok(0);
+    }
+    let count = file.read_at(
+        output.get_mut(..count).ok_or(io::ErrorKind::InvalidInput)?,
+        offset,
+    )?;
+    if count == 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(count)
 }
 
 impl<'a> TemporaryFile<'a> {

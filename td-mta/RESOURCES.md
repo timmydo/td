@@ -555,7 +555,7 @@ lock-file open or descriptor cloning is permitted. Cooperative
 process locking does not alter the request pool or worker ledger.
 
 Each live TemporaryFile/SyncedTemporary retains two Files (output and its
-parent directory), one generated Name, counters and
+parent directory), one generated Name, account ID, counters and
 a borrow of the existing LockedRoot. Writes and reads use caller slices without
 buffer growth; path assembly uses the directory adapter's fixed byte ceiling.
 These operations do not acquire quota or runtime pool slots. The dedicated
@@ -572,7 +572,11 @@ directory collisions and refusal of file entries passed as directory requests;
 exclusive create/prepare, 4 KiB write/read/sync/drop, existing-name collision,
 byte-limit and read-offset refusal, missing ancestors, injected open/preparation
 and sync failures, Interrupted attempt exhaustion, retired output refusal and
-unexpected early EOF. It requires unchanged Rust allocation/deallocation
+unexpected early EOF. Blob publication adds link/sync/unlink/sync success,
+collision and errors before/after every effect boundary, plus bounded reads.
+PublishedFile retains one File, one Name, completed length and the LOCK borrow;
+publication uses fixed source/destination paths and transient directory handles.
+It requires unchanged Rust allocation/deallocation
 counters after setup and before cleanup. No new allocator hook or production
 fixture constructor is introduced. Repeat on host and static musl when compiler
 or filesystem adapter code changes. This does not measure kernel page cache,

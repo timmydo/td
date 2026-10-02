@@ -30,10 +30,12 @@ existing directory types, links and private-root permissions under an explicit
 operator-controlled stable-path contract. It performs no direct syscalls or
 free-space probes. A retained std file lock provides cooperative writer
 exclusion. Physical EOF, selected-graph validation,
-complete final-view semantics and durable publication remain unimplemented.
+complete final-view semantics and committed mail publication remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
-and parent; neither primitive grants publication or admission authority.
+and parent. Completed private blobs can be published without replacement using
+std hard-link and directory-sync operations. These low-level primitives grant
+no transaction, hash or admission authority.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
@@ -424,7 +426,7 @@ permissive creation window. Never derive a filesystem pathname from a mailbox
 name, address, attachment filename, or arbitrary client ID.
 STORAGE.md defines the std path checks, deployment identity and stable-path
 assumptions. Std writer locking and private temporary I/O are implemented;
-durable publication and runtime admission remain pending. The service
+committed mail publication and runtime admission remain pending. The service
 uses logical quotas and handles disk-full/write/sync failures; it does not
 measure or promise physical free space before admission.
 
