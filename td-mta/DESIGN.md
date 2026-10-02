@@ -91,6 +91,8 @@ row/byte budgets. A selected-table sweep now verifies and replays all 11
 checkpoint tables using one reusable record buffer and finite byte/row limits.
 A retained-history sweep checks all selected immutable segments with shared
 record/change scratch and finite byte/frame admission.
+A stopped-store owner now retains the cooperative lock behind read-only
+validation operations; consuming it restores mutation access after borrows end.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

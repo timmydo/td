@@ -15,6 +15,9 @@ pub use input::{
     CompleteFile, CompletePrefix, PrefixReader, RecoveryInput, RecoveryInputError, RepairError,
     RepairedJournal, ScannedJournal, StoreReader,
 };
+#[path = "store_fs/stopped.rs"]
+mod stopped;
+pub use stopped::StoppedStore;
 #[path = "store_fs/selection.rs"]
 mod selection;
 pub use selection::{SelectionError, SelectionScratch, SelectionStage};
@@ -419,7 +422,7 @@ mod tests {
                 _lock: lock,
             }
         }
-        fn reacquire(&self) -> File {
+        pub(super) fn reacquire(&self) -> File {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match self.lock() {

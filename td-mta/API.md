@@ -774,6 +774,13 @@ key bytes before reusing value scratch, and reports row/table progress separatel
 from completion. Completion carries row counts and the same UTC sample; full
 physical graph/aggregate validity, parent chains, blobs and pins stay external.
 
+`store_fs::StoppedStore` consumes LockedRoot and retains its cooperative lock
+behind a read-only validation interface. Metadata, overlay and sweep borrows
+keep that owner alive; consuming into_locked restores mutation access only
+after those borrows end. No raw/root accessor is exposed. This excludes writes
+through this API owner under the existing trusted-path policy, without claiming
+external filesystem exclusion, complete graph validity or runtime view pins.
+
 `store_fs::HistorySweep` verifies every retained selected history segment,
 admitting total descriptor bytes and frames before I/O. Advances open, read one
 bounded frame, or complete one selected file; only digest/EOF completion releases

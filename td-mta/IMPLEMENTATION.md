@@ -970,6 +970,13 @@ service activation. Each part lands independently:
     missing late segments and selected digest failure. Existing allocation
     probes cover slot reclamation at both roots; the multi-segment unit test
     covers reuse. Full graph/pins/activation remain.
+  - **M05d22 — stopped validation ownership:** implemented a consuming owner for
+    LockedRoot with read-only selection, overlay, table and history operations.
+    Borrowed metadata/inputs prevent thaw while live; consuming return restores
+    mutation access without lock reacquisition. Compile-fail tests enforce the
+    transfer/return lifetimes; file tests cover retained lock and validation.
+    Trusted filesystem authority remains required; serving view pins, full
+    selected-graph validation and activation remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

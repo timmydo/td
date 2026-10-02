@@ -404,6 +404,32 @@ immutable view or stopped-store exclusion and admit each next's full work plus
 bounded chunk work and deadline checks. The cooperative LOCK alone does not
 provide thread exclusion. Historical journal rows are not enumerated here.
 
+### Owning a stopped store for validation
+
+`store_fs::StoppedStore` consumes the sole LockedRoot. Existing borrowed
+writable outputs must end before that transfer. Its public interface exposes
+selected metadata loading, captured active-overlay loading and complete table
+and history sweeps; it exposes no root, raw handle or mutation operation.
+This gives offline validation read-only ownership through td-mta's API while
+retaining the same cooperative LOCK. It neither clones nor reacquires the lock.
+
+Selected metadata borrows both the owner and its caller scratch. Inputs and
+loaded overlays also borrow the owner. Only consuming `into_locked` restores
+mutation access, and Rust requires those borrows to end first. Dropping the
+owner closes the existing descriptors and releases the lock. Transitioning
+ownership performs no I/O, recovery, allocation, repair or publication.
+
+For adapters reached through this owner, the transfer supplies stopped-store
+exclusion through the API under the trusted-path policy. It does not remove
+work admission, scratch overwrite, authorization or resource obligations; an
+independently supplied overlay still needs its own immutable owner retained.
+The existing operator-controlled path/authority assumptions remain: unrelated
+filesystem access, privileged writers and noncooperating processes can still change bytes.
+A separately decoded Selection is not proof it came from this owner; every
+selected input retains its file/identity/digest checks. The selected graph and
+final rows still require validation. This is an offline ownership boundary,
+not a runtime view pin, serving adapter or store activation decision.
+
 ### Loading the selected metadata
 
 `LockedRoot::load_selection` is the first recovery input step. Its caller must

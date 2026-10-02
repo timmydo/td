@@ -172,6 +172,9 @@ still account for those costs and concurrent owners within the ledger.
   byte totals are admitted before table I/O and a finite row allowance covers
   final merge output. Per-step overlay work retains Merge's bounded cost.
   Allocation probes cover all-table replay and scratch reuse at both roots.
+  StoppedStore moves the existing LockedRoot (including its directory and lock
+  descriptors) without another allocation, descriptor or synchronization object.
+  Its operations reuse the existing metadata, overlay, record and change arenas.
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
   that input to a temporary; complete worker-stack qualification remains pending.
