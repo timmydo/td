@@ -34,6 +34,7 @@ pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
 pub(crate) mod secret;
+pub(crate) mod serial_shell;
 pub(crate) mod setup_input;
 pub(crate) mod test_iso;
 pub(crate) mod update;
@@ -415,7 +416,7 @@ const CAP: usize = 256 * 1024;
 const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 
 /// Disk ceiling on the COMBINED on-disk capture — `console.log` (ttyS0 via
-/// `-serial file:`) plus `diag.log` (qemu's own stdout/stderr). The in-memory
+/// `-serial file:`, or a serial shell's socket logfile) plus `diag.log` (qemu's own stdout/stderr). The in-memory
 /// capture is trimmed to CAP, but both files keep appending on disk, so a guest that
 /// floods ttyS0 OR a qemu that floods stderr could fill the scratch filesystem. When
 /// their sum crosses this ceiling the boot is aborted (qemu killed) and reported as
@@ -662,6 +663,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         runner.scratch_dir(),
     )?;
@@ -717,6 +719,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         runner.scratch_dir(),
     )?;
@@ -852,6 +855,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         runner.scratch_dir(),
     )?;
@@ -1422,6 +1426,7 @@ fn boot_system_once(
             capture_firefox_audio,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         scratch,
         boot_timeout(),
@@ -1458,6 +1463,7 @@ fn boot_failed_target_once(
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         scratch,
     )?;
@@ -2673,6 +2679,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         runner.scratch_dir(),
     )?;
@@ -2758,6 +2765,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         runner.scratch_dir(),
     )?;
@@ -2902,6 +2910,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         runner.scratch_dir(),
     )?;
@@ -4459,6 +4468,10 @@ struct BootPlan<'a> {
     /// What the display must come to show once the target marker is seen; a
     /// marker kill waits for it, and a boot that ends without it fails.
     screen: Option<ScreenExpect<'a>>,
+    /// Command lines to type into the serial login shell once the marker
+    /// and the greeter are seen; a marker kill waits for every report, and
+    /// a boot that ends without them fails.
+    shell: Option<&'a [serial_shell::ShellStep]>,
 }
 
 /// A capture the display must come to show: what it is, and the check of
@@ -4796,7 +4809,8 @@ fn boot_source(
     //   payload's AVX/AVX2/AVX-512 paths stay behind its own CPUID dispatch and are
     //   not reached under this model.
     // -serial file:<console>: route ttyS0 straight to a file — deterministic, no
-    //   tty/stdio games (unlike -nographic, which wants a terminal on stdin).
+    //   tty/stdio games (unlike -nographic, which wants a terminal on stdin). A
+    //   plan with a serial shell uses a socket chardev logging to that file.
     // -display none / -monitor none: fully headless. The attached virtio-vga still
     //   exercises KMS and the software compositor; only its host display is hidden.
     // -device virtio-tablet-pci: an ABSOLUTE pointer. With no QMP controller a
@@ -4824,10 +4838,14 @@ fn boot_source(
     static QMP_SEQ: AtomicU64 = AtomicU64::new(0);
     // QEMU's QMP socket serves one client at a time.
     let input = plan.physical_input || matches!(source, BootSource::LiveSetup { .. });
+    // The live wizard's greeter parks rather than log in on ttyS0.
+    if plan.shell.is_some() && matches!(source, BootSource::LiveSetup { .. }) {
+        return Err("a serial shell cannot drive the live wizard's boot".into());
+    }
     if input && plan.screen.is_some() {
         return Err("a screen expectation cannot share QMP with an input controller".into());
     }
-    let qmp_scratch = if input || plan.screen.is_some() {
+    let qmp_scratch = if input || plan.screen.is_some() || plan.shell.is_some() {
         Some(Scratch {
             dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
         })
@@ -4836,7 +4854,12 @@ fn boot_source(
     };
     let qmp_path = qmp_scratch
         .as_ref()
+        .filter(|_| input || plan.screen.is_some())
         .map(|scratch| scratch.dir.join("qmp.sock"));
+    let serial_path = qmp_scratch
+        .as_ref()
+        .filter(|_| plan.shell.is_some())
+        .map(|scratch| scratch.dir.join("tty.sock"));
     // Every non-audit oracle disables audit initialization explicitly. Merely
     // leaving the kernel's audit state off still permits unconditional seccomp
     // kill records to reach printk when CONFIG_AUDIT is compiled in.
@@ -4861,8 +4884,23 @@ fn boot_source(
     .args(["-display", "none", "-monitor", "none"])
     .args(["-no-user-config", "-vga", "none"])
     .args(["-device", "virtio-vga"])
-    .args(["-device", "virtio-tablet-pci"])
-    .args(["-serial", &serial]);
+    .args(["-device", "virtio-tablet-pci"]);
+    match &serial_path {
+        // A socket the oracle types into, QEMU waiting for it so no console
+        // byte is sent before, and logging ttyS0 to the same console file.
+        Some(socket) => {
+            cmd.arg("-chardev")
+                .arg(format!(
+                    "socket,id=ttys0,path={},server=on,wait=on,logfile={},logappend=off",
+                    socket.display().to_string().replace(',', ",,"),
+                    console_path.display().to_string().replace(',', ",,")
+                ))
+                .args(["-serial", "chardev:ttys0"]);
+        }
+        None => {
+            cmd.args(["-serial", &serial]);
+        }
+    }
     match source {
         BootSource::Direct { kernel, initramfs }
         | BootSource::DirectReordered { kernel, initramfs }
@@ -5004,6 +5042,21 @@ fn boot_source(
         .stderr(Stdio::from(diag_err))
         .spawn()
         .map_err(|e| format!("spawn {qemu}: {e}"))?;
+    let mut serial_port = match serial_path.as_deref().map(|path| {
+        serial_shell::SerialPort::connect(path, &mut || matches!(child.try_wait(), Ok(None)))
+    }) {
+        Some(Ok(port)) => Some(port),
+        Some(Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let diagnostics = read_tail(&diag_path, CAP).unwrap_or_default();
+            return Err(format!(
+                "{error}. qemu diagnostics:\n{}",
+                tail(&diagnostics, 40)
+            ));
+        }
+        None => None,
+    };
 
     let start = Instant::now();
     let marker_bytes = plan.target_marker.as_bytes();
@@ -5018,6 +5071,7 @@ fn boot_source(
         .screen
         .zip(qmp_path.clone())
         .map(|(expect, path)| ScreenWatch::new(expect, path));
+    let mut shell = plan.shell.map(serial_shell::SerialShell::new);
     let mut setup_input = match (source, qmp_path) {
         (BootSource::LiveSetup { script, .. }, Some(path)) => {
             let capture = path.with_file_name("attention.ppm");
@@ -5090,8 +5144,21 @@ fn boot_source(
                 ));
             }
         }
-        let screen_waits = screen.as_ref().is_some_and(|watch| !watch.seen);
-        if evidence.target && plan.kill_on_marker && !screen_waits {
+        if let (Some(controller), Some(port)) = (shell.as_mut(), serial_port.as_mut()) {
+            if let Err(error) = controller.poll(port, evidence.target, evidence.greeter, &buf) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let console = String::from_utf8_lossy(&buf);
+                return Err(format!(
+                    "{error}. Last serial output:\n{}",
+                    tail(&console, 80)
+                ));
+            }
+        }
+        // The marker kill waits for the display and the shell.
+        let waits = screen.as_ref().is_some_and(|watch| !watch.seen)
+            || shell.as_ref().is_some_and(|controller| !controller.done());
+        if evidence.target && plan.kill_on_marker && !waits {
             let sent = child.kill().is_ok();
             marker_killed = child
                 .wait()
@@ -5114,7 +5181,7 @@ fn boot_source(
         }
         // Abort a guest that floods without panicking: the in-memory capture is
         // trimmed to CAP, but BOTH on-disk sinks keep growing — `-serial file:`
-        // appends ttyS0 to console.log, and qemu's own stdout/stderr append to
+        // (or a serial shell's logfile) appends ttyS0 to console.log, and qemu's own stdout/stderr append to
         // diag.log. Bound their COMBINED size so neither path can fill the scratch
         // fs (a chatty-but-not-panicking guest floods ttyS0; a misconfigured qemu
         // floods stderr).
@@ -5201,7 +5268,29 @@ fn boot_source(
     if let Some(state) = awaiting {
         reason.push_str(&format!("; the wizard script still awaited {state:?}"));
     }
-    // A boot that never reached its marker fails on that, not on its display.
+    if let Some(port) = serial_port.take() {
+        port.finish();
+    }
+    // A boot that never reached its marker fails on that, not on its display
+    // or its shell.
+    if let Some(controller) = shell
+        .as_ref()
+        .filter(|controller| controller.until.is_some() || evidence.target)
+    {
+        if !controller.done() {
+            return Err(format!(
+                "{reason}; the serial shell never reported {}. Last serial output:\n{}",
+                controller.awaiting().unwrap_or("its steps"),
+                tail(&console, 80)
+            ));
+        }
+        if let Err(error) = controller.verify(&console) {
+            return Err(format!(
+                "{reason}; {error}. Last serial output:\n{}",
+                tail(&console, 80)
+            ));
+        }
+    }
     if let Some(watch) = screen
         .as_ref()
         .filter(|watch| !watch.seen && (watch.until.is_some() || evidence.target))
@@ -12618,6 +12707,7 @@ mod tests {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         };
         let kernel = Path::new("/nonexistent/bzImage");
         let live = BootSource::LiveSetup {

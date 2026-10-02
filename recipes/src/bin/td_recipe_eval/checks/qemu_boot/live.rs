@@ -37,8 +37,10 @@
 //! flip the compositor's pages, with a fresh machine identity and home the
 //! second boot keeps; each boot's compositor must name the configured zone
 //! for its clock, and its status bar, captured from the display, must end
-//! that clock in the zone's offset. The session's own use of its home is not
-//! yet observed (increment 7).
+//! that clock in the zone's offset. The account's serial login shell must
+//! say who it is, its home and zone, and read back on the second boot the
+//! file it wrote into that same home on the first. Booting the medium itself
+//! through firmware is increment 7.
 use super::build_iso::{live_medium, LiveMedium};
 use super::install::{
     cold_boots, image_volume_identity, installation_timeout, system_target_capacity, ColdBoots,
@@ -142,6 +144,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             capture_firefox_audio: false,
             tpm_socket: None,
             screen: None,
+            shell: None,
         },
         &scratch.dir,
         timeout,
@@ -185,6 +188,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 what: "the status bar's clock in the configured zone",
                 check: &zone_on_bar,
             }),
+            session: true,
         },
     )?;
     println!(
@@ -200,8 +204,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          cold-booted through firmware twice, alone and renamed behind a decoy, \
          as a healthy {USERNAME}@{HOSTNAME} with its volume {uuid} bound, a \
          fresh machine identity and /var/home/{USERNAME} created then found, \
-         and compositor page flips, its clock naming {ZONE} and its status \
-         bar ending{ZONE_ON_BAR}"
+         its login shell reading back on the second boot the file it wrote \
+         into that same home on the first, and compositor page flips, its \
+         clock naming {ZONE} and its status bar ending{ZONE_ON_BAR}"
     );
     Ok(())
 }

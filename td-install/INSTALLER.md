@@ -175,10 +175,18 @@ two minutes and before the boot is stopped, until the status bar's clock
 ends in the configured zone's offset, UTC+09:00 for Asia/Tokyo, drawn as
 the compositor draws it from the image's outline face; a boot whose
 display never shows it fails. The name and the offset come from the one
-clock the compositor loaded from `/etc/timezone`. The session's own use of
-its home across boots, and booting the medium itself through firmware, are
-still to be proven (increment 7); `./test-iso` boots the medium through
-firmware by hand.
+clock the compositor loaded from `/etc/timezone`. Each boot's serial
+console is also a socket the oracle types into, QEMU waiting for it before
+the guest starts and logging what the guest writes to the console file it
+reads: once a boot reports success and the greeter has logged the account
+in on ttyS0, its login shell must, within two minutes of that success,
+report `id -un`, the home a bare `cd` from `/` reaches through `HOME` with
+`pwd -P`, and `/etc/timezone` as `dana /var/home/dana Asia/Tokyo`; on the
+first boot it writes a per-run token into a file in that home and syncs,
+and each boot reports the file's contents and the home's inode from
+`ls -di .`, the second boot the same token and inode as the first. Booting
+the medium itself through firmware is still to be proven (increment 7);
+`./test-iso` boots the medium through firmware by hand.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
 admits any UID-1000 peer at the intake, and on a live boot those include
@@ -1175,9 +1183,9 @@ not discover `/etc/zoneinfo` automatically.
    media, boot that disk through firmware, and observe the configured
    account in the compositor with its settings and persistent home.
    Increment 6 proves the flow and the firmware boots with the account,
-   host and home reported and the zone named by the compositor's clock
-   and shown on it; this adds booting the ISO through firmware and the
-   session's own use of its persistent home.
+   host and home reported, the zone named by the compositor's clock and
+   shown on it, and the account's login shell keeping a file in the same
+   home across both boots; this adds booting the ISO through firmware.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media

@@ -1,4 +1,5 @@
 //! Native guest installation into an exclusively created, disposable QEMU disk.
+use super::serial_shell::ShellStep;
 use super::*;
 use td_engine::cpio::{Entry, Kind};
 
@@ -1920,6 +1921,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                     timeout,
                     label: "qemu-install-system",
                     screen: None,
+                    session: false,
                 },
             )?;
             require_new_installation(&installations, &first, &name)?;
@@ -1988,6 +1990,102 @@ pub(super) struct ColdBoots<'a> {
     /// What each boot's display must come to show once it reports success,
     /// before it is stopped.
     pub(super) screen: Option<ScreenExpect<'a>>,
+    /// Whether the account's own login shell must show its home kept: the
+    /// first boot writes into it, and the second reads that back from the
+    /// same directory.
+    pub(super) session: bool,
+}
+
+/// What the first boot's shell wrote into the home, and the home's inode.
+const SESSION_HOME_FILE: &str = ".td-session-home";
+const SESSION_IDENTITY: &str = "TD-SESSION-HOME-1";
+const SESSION_HOME: &str = "TD-SESSION-HOME-2";
+
+/// The account's serial login shell says who it is, where its home is and
+/// which zone it was given; on the first boot it writes `nonce` into its
+/// home, and each boot reports the file and the home's inode, which on the
+/// second must be `kept`.
+fn session_steps(
+    installed: &Installed<'_>,
+    nonce: &str,
+    kept: Option<&str>,
+) -> Result<Vec<ShellStep>, String> {
+    let zone = installed
+        .zone
+        .ok_or("a session check needs the installed zone")?;
+    let identity = format!(
+        "{} /var/home/{} {zone}",
+        installed.username, installed.username
+    );
+    let mut steps = vec![ShellStep {
+        command: format!(
+            "printf '\\n{SESSION_IDENTITY} %s %s %s\\n' \"$(id -un)\" \"$(cd / && cd && pwd -P)\" \"$(cat /etc/timezone)\""
+        ),
+        report: SESSION_IDENTITY.into(),
+        accepts: Box::new(move |payload| payload == identity),
+    }];
+    // From the home itself, which a bare `cd` reaches from / only through
+    // the session's HOME (td-sh takes an unset one as `.`); the image has
+    // no stat, and `ls -di .` prints the inode and a dot. A broken chain
+    // says so at once rather than leave the step to time out.
+    let report = format!(
+        "printf '\\n{SESSION_HOME} %s %s\\n' \"$(cat {SESSION_HOME_FILE})\" \"$(ls -di .)\" || printf '\\n{SESSION_HOME} failed\\n'"
+    );
+    let nonce = nonce.to_string();
+    match kept {
+        None => steps.push(ShellStep {
+            command: format!(
+                "cd / && cd && test ! -e {SESSION_HOME_FILE} && printf '%s\\n' {nonce} > {SESSION_HOME_FILE} && sync && {report}"
+            ),
+            report: SESSION_HOME.into(),
+            accepts: Box::new(move |payload| session_home(payload, &nonce).is_some()),
+        }),
+        Some(kept) => {
+            let kept = kept.to_string();
+            steps.push(ShellStep {
+                command: format!("cd / && cd && {report}"),
+                report: SESSION_HOME.into(),
+                accepts: Box::new(move |payload| {
+                    session_home(payload, &nonce).is_some_and(|inode| inode == kept)
+                }),
+            });
+        }
+    }
+    Ok(steps)
+}
+
+/// The home's inode, when `payload` reports `nonce` read from it and the
+/// inode `ls -di .` printed there.
+fn session_home<'p>(payload: &'p str, nonce: &str) -> Option<&'p str> {
+    let mut fields = payload.split(' ');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(read), Some(inode), Some("."), None)
+            if read == nonce
+                && !inode.is_empty()
+                && inode.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(inode)
+        }
+        _ => None,
+    }
+}
+
+/// The inode the first boot's shell reported for its home.
+fn reported_home_inode(console: &str, nonce: &str) -> Result<String, String> {
+    let prefix = format!("{SESSION_HOME} ");
+    let reports: Vec<_> = console
+        .lines()
+        .map(str::trim_end)
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .collect();
+    match reports.as_slice() {
+        [payload] => session_home(payload, nonce)
+            .map(str::to_string)
+            .ok_or_else(|| format!("the first boot's shell reported {payload:?}")),
+        _ => Err(format!(
+            "the first boot's shell reported its home {reports:?}"
+        )),
+    }
 }
 
 /// What an installed disk must boot as: its volume, deployment, account
@@ -2019,8 +2117,13 @@ pub(super) fn cold_boots(
         timeout,
         label,
         screen,
+        session,
     } = *run;
     let mut first: Option<BootResult> = None;
+    // The volume's identity is new for every run, so no earlier file could
+    // already say it.
+    let nonce = installed.uuid.replace('-', "");
+    let mut kept: Option<String> = None;
     for count in 1..=2 {
         let decoy = if count == 2 {
             let mut decoy = TargetDisk::create(scratch, &format!("{name}-decoy.img"))?;
@@ -2036,6 +2139,12 @@ pub(super) fn cold_boots(
         // Stock audio supervision needs the emulated sound device.
         boot_plan.audio = true;
         boot_plan.screen = screen;
+        let steps = if session {
+            Some(session_steps(installed, &nonce, kept.as_deref())?)
+        } else {
+            None
+        };
+        boot_plan.shell = steps.as_deref();
         println!("   [{label}] cold system boot {count}, {name} media detached");
         let result = boot_source(
             qemu,
@@ -2058,7 +2167,14 @@ pub(super) fn cold_boots(
             result.elapsed.as_secs_f64()
         );
         let device = format!("/dev/{}", partition_name(target.bus.name(count == 2), 2));
+        println!(
+            "   [{label}] {name} cold boot {count} console tail: {} bytes",
+            result.console.len()
+        );
         validate_installed_as(&result, &device, installed, count == 1)?;
+        if session && count == 1 {
+            kept = Some(reported_home_inode(&result.console, &nonce)?);
+        }
         match &first {
             Some(first) => require_same_identity(
                 first,
@@ -2448,6 +2564,7 @@ fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
         capture_firefox_audio: false,
         tpm_socket: None,
         screen: None,
+        shell: None,
     }
 }
 
@@ -2738,6 +2855,79 @@ mod tests {
         ] {
             assert!(validate_installed_as(&result, "/dev/vda2", &other, true).is_err());
         }
+    }
+
+    /// The account's shell is typed exactly these lines, and only its own
+    /// home's answers pass: who it is, the file its first boot wrote, and
+    /// the same home directory on the second.
+    #[test]
+    fn session_steps_are_answered_only_by_the_accounts_kept_home() {
+        let installed = Installed {
+            uuid: "uuid",
+            id: "deployment",
+            username: "dana",
+            hostname: "td-wizard",
+            zone: Some("Asia/Tokyo"),
+        };
+        let first = session_steps(&installed, "0123abcd", None).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].report, "TD-SESSION-HOME-1");
+        assert_eq!(
+            first[0].command,
+            "printf '\\nTD-SESSION-HOME-1 %s %s %s\\n' \"$(id -un)\" \"$(cd / && cd && pwd -P)\" \"$(cat /etc/timezone)\""
+        );
+        assert!((first[0].accepts)("dana /var/home/dana Asia/Tokyo"));
+        for wrong in [
+            "dana /home/dana Asia/Tokyo",
+            "dana /var/home/dana Asia/Seoul",
+            "tester /var/home/dana Asia/Tokyo",
+            "dana /var/home/dana",
+            "dana /var/home/dana Asia/Tokyo ",
+        ] {
+            assert!(!(first[0].accepts)(wrong), "{wrong}");
+        }
+        assert_eq!(first[1].report, "TD-SESSION-HOME-2");
+        assert_eq!(
+            first[1].command,
+            "cd / && cd && test ! -e .td-session-home && printf '%s\\n' 0123abcd > .td-session-home && sync && printf '\\nTD-SESSION-HOME-2 %s %s\\n' \"$(cat .td-session-home)\" \"$(ls -di .)\" || printf '\\nTD-SESSION-HOME-2 failed\\n'"
+        );
+        assert!((first[1].accepts)("0123abcd 256 ."));
+        for wrong in [
+            "0123abce 256 .",
+            "0123abcd 256",
+            "0123abcd x .",
+            "0123abcd  .",
+            "0123abcd 256 /var/home/dana",
+            "0123abcd 256 . .",
+            " 256 .",
+            "failed",
+        ] {
+            assert!(!(first[1].accepts)(wrong), "{wrong}");
+        }
+        // The second boot's expectation is the first's own report.
+        let console = "TD-SESSION-HOME-2 0123abcd 256 .\r\n";
+        assert_eq!(reported_home_inode(console, "0123abcd").unwrap(), "256");
+        for bad in [
+            String::new(),
+            format!("{console}{console}"),
+            "TD-SESSION-HOME-2 other 256 .\n".into(),
+        ] {
+            assert!(reported_home_inode(&bad, "0123abcd").is_err(), "{bad}");
+        }
+        let second = session_steps(&installed, "0123abcd", Some("256")).unwrap();
+        assert_eq!(second[0].command, first[0].command);
+        assert_eq!(
+            second[1].command,
+            "cd / && cd && printf '\\nTD-SESSION-HOME-2 %s %s\\n' \"$(cat .td-session-home)\" \"$(ls -di .)\" || printf '\\nTD-SESSION-HOME-2 failed\\n'"
+        );
+        assert!((second[1].accepts)("0123abcd 256 ."));
+        assert!(!(second[1].accepts)("0123abcd 257 ."));
+        assert!(!(second[1].accepts)("other 256 ."));
+        let unzoned = Installed {
+            zone: None,
+            ..installed
+        };
+        assert!(session_steps(&unzoned, "0123abcd", None).is_err());
     }
 
     #[test]
