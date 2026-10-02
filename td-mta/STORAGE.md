@@ -1025,6 +1025,24 @@ per push, or at most 8192 remaining keys for finish; callbacks retain their own
 bounded I/O and deadline accounting. Check deadlines around that entire work
 unit. This is not yet a serving ReadView or checkpoint publication mechanism.
 
+`TableInput::into_replay` connects a fresh selected table input to LoadedOverlay.
+It refuses consumed input as InvalidInput and failed input as BrokenPipe, then
+binds the supplied view's
+active identity/generation/checkpoint to the table's Selection. TableReplay
+retains that input, its fixed Merge state and a borrow of the loaded prefix.
+Advance reads one checkpoint record and performs its bounded merge/callback
+work; false establishes declared record exhaustion only. An input or callback
+failure retires the replay, and subsequent advance/finish refuses.
+
+Finish first requires the complete table digest, physical EOF and selected
+manifest binding. Only then does it drain residual overlay rows and return
+CompleteReplay with the CompleteTable, loaded-prefix borrow and live row count.
+Earlier callbacks remain provisional if any later input, completion or sink
+operation fails. This binds one supplied selected table and captured prefix;
+actual view pins/barriers, all-table and final-reference validation, and staged
+output durability/publication still belong to the coordinator. No ReadView,
+transaction or recovery activation is granted by completion.
+
 Sparse key/offset indexes and folder/date/search indexes are disposable disk files
 with bounded caches; their sizes are not RAM reservations. An absent index
 permits a bounded-work sequential scan or explicit temporary resource error.

@@ -802,8 +802,18 @@ service activation. Each part lands independently:
     an independent last-write map, check independent pre-output count/payload
     ceilings, wrong inputs/identities and sink errors;
     allocation probes include full-capacity overlay draining. File/digest
-    bindings, checkpoint publication, final reference validation and live pins
-    remain integration work.
+    bindings are connected by M05d10 below.
+  - **M05d10 — selected table replay:** implemented conversion of fresh TableInput
+    into a failure-sticky replay bound to LoadedOverlay's supplied view. Advance
+    performs one record/merge step; finish verifies table checksum/EOF/selection
+    before residual overlay callbacks. Tests also prove successful PUT output
+    both before a checkpoint row and during the final drain. Completion retains
+    the selected table and
+    borrows the loaded prefix. Tests cover unchanged/deleted/empty tables, input
+    freshness, generation mismatch, input/sink errors and late digest/extent
+    failure; allocation probes reuse existing caller arenas at both root bounds.
+    Checkpoint publication, final reference validation and live pins remain
+    integration work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

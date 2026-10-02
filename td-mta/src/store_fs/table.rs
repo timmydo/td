@@ -16,6 +16,12 @@ use crate::{
 };
 use std::io;
 
+#[path = "table/replay.rs"]
+mod replay;
+#[cfg(test)]
+pub(super) use replay::probe as probe_replay;
+pub use replay::{CompleteReplay, Error as TableReplayError, TableReplay};
+
 const MAX_TABLE_READ_CALLS: usize = 64;
 #[derive(Debug)]
 pub enum TableInputError {

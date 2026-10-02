@@ -53,6 +53,8 @@ The active-overlay loader reads a captured private prefix into caller arenas,
 binds its selected header/endpoint and retains the consumed prefix descriptor.
 A provisional streaming merge now combines sorted checkpoint records with
 overlay replacements and deletions using fixed key state and borrowed rows.
+The table-replay adapter binds a fresh table input to the loaded prefix and
+requires selected table digest/EOF completion before draining residual updates.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

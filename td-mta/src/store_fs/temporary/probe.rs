@@ -121,6 +121,14 @@ pub fn run(mut snapshot: impl FnMut()) {
             &mut history_scratch,
             &mut overlay_cells,
         );
+        super::super::table::probe_replay(
+            &fixture.root,
+            &table_probe,
+            &active_probe,
+            &mut history_scratch,
+            &mut overlay_cells,
+            &mut table_scratch,
+        );
         super::super::input::probe_recovery(
             &fixture.root,
             &recovery_probe,

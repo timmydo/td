@@ -675,6 +675,18 @@ blob record, completes them, and exercises byte-ceiling and premature-finish
 refusal at short/maximum roots. Literal fixture loading and buffers precede
 measurement; this does not add allocator instrumentation or service pools.
 
+TableReplay owns that existing TableInput and fixed inline Merge state while
+borrowing LoadedOverlay. It introduces no arena or pool: the table continues to
+use caller record scratch, and the loaded prefix keeps its admitted frame/cell
+storage. Inline state and temporary merge keys are charged to the worker stack.
+One table descriptor is open in addition to the retained active-prefix descriptor;
+CompleteReplay retains the verified table and borrows the prefix, releasing the
+record scratch for reuse. Advance admits one table record plus bounded intervening
+overlay work, and finish admits complete-table checks plus residual overlay work.
+The allocation interval measures unchanged/deleted rows, input exhaustion and
+completion, premature completion and sticky sink failure at both root bounds.
+Full worker-stack/RSS and actual pin ownership remain integration obligations.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a
