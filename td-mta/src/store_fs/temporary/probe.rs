@@ -69,8 +69,22 @@ pub fn run(mut snapshot: impl FnMut()) {
     let short = Fixture::new(base.join("short"));
     let long = Fixture::new(base.join("x".repeat(tail)));
     assert_eq!(long.path.as_os_str().len(), super::super::MAX_ROOT_BYTES);
+    for fixture in [&short, &long] {
+        for point in 0..8 {
+            let account = AccountId::from_bytes([0x60 + point; 16]);
+            fixture
+                .root
+                .create_account_directory(account, AccountEntry::Root)
+                .unwrap();
+            fixture
+                .root
+                .create_account_directory(account, AccountEntry::Metadata)
+                .unwrap();
+        }
+    }
     snapshot();
     for fixture in [&short, &long] {
+        super::current::probe(&fixture.root, fixture.account);
         super::publication::probe(&fixture.root, fixture.account);
         assert!(
             matches!(fixture.root.create_accounts_directory(), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)

@@ -12,8 +12,8 @@ mod create_directory;
 #[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{
-    CreateError, MetadataDestination, PublishError, PublishedFile, SyncedTemporary, TemporaryFile,
-    MAX_FILE_STEP_BYTES,
+    CreateError, CurrentError, CurrentUpdate, MetadataDestination, PublishError, PublishedFile,
+    SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES,
 };
 
 #[cfg(test)]

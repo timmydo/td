@@ -672,6 +672,16 @@ service activation. Each part lands independently:
         probes cover each metadata role at maximum generation/root lengths.
         Format validation, selected reachability and append authority remain
         caller/recovery responsibilities. CURRENT replacement follows.
+      - **M05b2c5 — CURRENT replacement:** implemented fixed encoded intent
+        with expected absence/previous selector, same-account/epoch advancing
+        generations, private exact-length/EOF checks, typed same-directory
+        temporary output, file/parent sync, rename and final directory sync.
+        Errors retain private/uncertain-selection effects. Fault tests pin
+        sync handles, ordering and old/new bytes at every sync/rename boundary;
+        allocation probes cover initialization/replacement, absence/stale
+        refusal and sync/rename faults at maximum roots. Durable graph
+        validation, actual barriers, reservation reconciliation and startup
+        orphan cleanup remain required before activation.
     - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
       bounded reading through EOF and opened-file identity checks. Deployment
       uses the data-root owner as its trusted expected service identity.

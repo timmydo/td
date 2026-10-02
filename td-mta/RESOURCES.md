@@ -576,6 +576,18 @@ unexpected early EOF. Blob publication adds link/sync/unlink/sync success,
 collision and errors before/after every effect boundary, plus bounded reads. Fresh metadata publication additionally
 covers table, manifest and journal destinations with maximum numeric components,
 including success and collision refusal at both root bounds.
+Expected CURRENT preparation retains two fixed 120-byte encodings, an optional
+previous marker and AccountId. Replacement writes directly from that retained
+encoding and reads through 120-byte scratch plus a one-byte EOF buffer. It uses
+fixed source/target paths and the shared temporary constructor's path scratch.
+The expected-state read briefly opens CURRENT. At rename, the call retains
+source and target parent Directories and the temporary's two Files (four Files
+in addition to LockedRoot's retained root directory and LOCK). Each Directory
+also retains its bounded path. The expected-state read bounds explicit extent
+calls to 64 plus one EOF call. The measured interval includes initialization,
+replacement, stale/absence refusal and injected errors before/after each file
+sync, temporary-parent sync, rename and final parent sync at both root bounds.
+Fixture account/directory preparation stays outside that interval.
 PublishedFile retains one File, one Name, completed length and the LOCK borrow;
 publication uses fixed source/destination paths and transient directory handles.
 It requires unchanged Rust allocation/deallocation

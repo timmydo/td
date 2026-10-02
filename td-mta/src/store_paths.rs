@@ -78,6 +78,7 @@ pub enum AccountEntry {
     Uploads,
     Metadata,
     Current,
+    CurrentTemporary(Number),
     Checkpoints,
     Checkpoint(Number),
     Manifest(Number),
@@ -140,6 +141,11 @@ impl Name {
                 return Self::encode(format_args!(
                     "accounts/{account}/metadata/journal/{number}.log"
                 ))
+            }
+            AccountEntry::CurrentTemporary(number) => {
+                return Self::encode(format_args!(
+                    "accounts/{account}/metadata/CURRENT.{number}.tmp"
+                ));
             }
             AccountEntry::TemporaryFile(number) => {
                 return Self::encode(format_args!("accounts/{account}/tmp/{number}.tmp"))

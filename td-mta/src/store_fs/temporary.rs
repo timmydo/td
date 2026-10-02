@@ -1,4 +1,7 @@
 //! Private output and consuming immutable publication under the writer lock.
+#[path = "temporary/current.rs"]
+mod current;
+pub use current::{CurrentError, CurrentUpdate};
 #[path = "temporary/publication.rs"]
 mod publication;
 pub use publication::{MetadataDestination, PublishError, PublishedFile};
@@ -55,11 +58,19 @@ impl LockedRoot {
         number: Number,
         limit: u64,
     ) -> Result<TemporaryFile<'_>, CreateError> {
+        let name = Name::account(account, AccountEntry::TemporaryFile(number))
+            .map_err(|_| CreateError::Uncreated(io::ErrorKind::InvalidInput.into()))?;
+        self.create_named(account, name, limit)
+    }
+    fn create_named(
+        &self,
+        account: AccountId,
+        name: Name,
+        limit: u64,
+    ) -> Result<TemporaryFile<'_>, CreateError> {
         if limit > i64::MAX as u64 {
             return Err(CreateError::Uncreated(io::ErrorKind::InvalidInput.into()));
         }
-        let name = Name::account(account, AccountEntry::TemporaryFile(number))
-            .map_err(|_| CreateError::Uncreated(io::ErrorKind::InvalidInput.into()))?;
         let (file, parent) = create(&self.root.directory, &name)?;
         Ok(TemporaryFile {
             _owner: self,

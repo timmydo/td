@@ -148,7 +148,11 @@ impl<'a> SyncedTemporary<'a> {
     }
 }
 
-fn validate_source(output: &TemporaryFile<'_>, path: &Path, owner: u32) -> io::Result<()> {
+pub(super) fn validate_source(
+    output: &TemporaryFile<'_>,
+    path: &Path,
+    owner: u32,
+) -> io::Result<()> {
     let named = fs::symlink_metadata(path)?;
     let held = output.file.metadata()?;
     for metadata in [&named, &held] {

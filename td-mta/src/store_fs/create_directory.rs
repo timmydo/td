@@ -134,6 +134,7 @@ mod tests {
         }
         for entry in [
             AccountEntry::Current,
+            AccountEntry::CurrentTemporary(number),
             AccountEntry::Manifest(number),
             AccountEntry::Journal(number),
             AccountEntry::TemporaryFile(number),

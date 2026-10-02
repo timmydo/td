@@ -43,6 +43,7 @@ get distinct email/blob IDs. V1 does not deduplicate message contents.
     uploads/cd/cd22....blob       arbitrary uploaded attachment/message bytes
     metadata/
       CURRENT                    selected checkpoint and manifest digest
+      CURRENT.NNNNNNNNNNNNNNNNNNNN.tmp  incomplete selector output
       checkpoints/000042/
         manifest                 table sizes/hashes, journal selection
         blobs.tbl
@@ -165,8 +166,8 @@ the destination directory before removing/syncing the temporary link. Source
 and destination must share a filesystem. CURRENT uses same-directory temporary
 creation, file sync, atomic `rename` replacement and parent-directory sync.
 Checkpoint generations use exclusive directory creation and are authoritative
-only after CURRENT selection. CURRENT replacement and mutation/admission
-integration remain M05 implementation work.
+only after CURRENT selection. Mutation/admission integration and selected-store recovery remain M05
+implementation work.
 
 ### Persistent writer lock
 
@@ -317,6 +318,58 @@ absence of effects. After destination sync succeeds, the destination is durable
 even if temporary cleanup fails, but this low-level call still returns an error.
 Recovery must reconcile orphan links before reuse; a caller cannot replay the
 mutation or release charges by interpreting only the underlying I/O error kind.
+
+### Expected CURRENT replacement
+
+`CurrentUpdate::prepare` encodes a next CURRENT and either expected absence or
+an exact previous CURRENT into fixed buffers. Replacement must retain the same
+account and epoch and strictly advance the generation; zero generation and
+encoding/hash failures refuse before filesystem effects. Epoch-changing restore
+is a separate stopped-store operation. This intent grants no graph validity,
+quota, checkpoint barrier or commit authority. The caller must validate and
+sync the entire selected graph and its ancestors before using it, and serialize
+all mutations while holding the actual writer/view barrier.
+
+`LockedRoot::replace_current` checks private metadata parents, then checks the
+expected selector before creating output. Initialization requires absence;
+replacement requires a same-owner mode-0600 regular single-link file of exactly
+120 bytes. Compare opened identity, read the complete bounded extent plus EOF,
+and require exact equality with the encoded expected selector. Reads make at
+most 64 explicit extent calls plus one EOF call; a blocking std call remains
+outside that scheduling bound. Missing, corrupt or stale selectors refuse;
+there is no fallback from replacement to initialization. This is an expected-
+state check under serialized trusted mutation, not an atomic compare-and-swap
+against external writers.
+
+Create `metadata/CURRENT.NNNNNNNNNNNNNNNNNNNN.tmp` exclusively using the typed
+positive Number and shared private-file policy. Write the 120-byte selector,
+sync the file and its metadata parent, verify source identity/private policy
+and a freshly opened source parent matching both retained parents, then `rename`
+it over CURRENT and sync that same
+metadata directory. Source and target are siblings. The old opened inode stays
+readable after replacement, but new lookups use CURRENT. Existing temporary
+names refuse without modification; failed attempts are never auto-cleaned.
+Recovery must include these same-directory temporary files in orphan accounting.
+
+Apply ADMISSION.md's existing format/job limit for temporary control files:
+one outstanding selector temporary per account, at most 120 bytes, within the
+checkpoint job's format-overhead allowance. A private failure retains that job
+slot and charge until cleanup is proven and its directory synced; choosing a
+fresh number is not permission to retry while the old attempt is unresolved.
+Startup must reconcile recognized selector temporaries before reopening the
+job slot. This bound and accounting coupling remain M05/M08 runtime work; the
+low-level replacement helper does not grant a retry or allocate quota itself.
+
+CurrentError preserves effects: Rejected precedes private creation; Create
+carries the existing Uncreated/Attempted/Created stages; Private means failure
+after temporary creation and before issuing rename; RenameAttempted means a
+failed rename may already have replaced CURRENT; Renamed means rename returned
+success but directory sync failed. Retain all logical charges. Either rename
+error stage stops writer admission until recovery determines the selected graph;
+a missing temporary pathname or an I/O error kind cannot establish selection.
+Success establishes durable selector replacement only: publish new reader views
+and reconcile the writer's reservation ledger before reopening admission.
+No MTA listener or service readiness follows from this primitive alone.
 
 Any create/write/flush/sync/publication error must prevent a new acceptance
 acknowledgement. Keep already acknowledged state; never delete live mail to

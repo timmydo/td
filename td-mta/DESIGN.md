@@ -36,7 +36,9 @@ file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can
 be published without replacement using std hard-link and directory-sync
 operations. These low-level primitives grant
-no transaction, hash or admission authority.
+no transaction, hash or admission authority. Expected CURRENT replacement uses
+a synced same-directory temporary and rename; graph validation, writer/view
+barriers and recovery still gate any accepting service.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
