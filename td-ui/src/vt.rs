@@ -83,21 +83,24 @@ pub struct Attributes {
     pub prompt: bool,
 }
 
+/// No rendition: `Attributes::default()`, as a constant.
+const DEFAULT_ATTRIBUTES: Attributes = Attributes {
+    bold: false,
+    faint: false,
+    italic: false,
+    underline: Underline::None,
+    inverse: false,
+    strike: false,
+    foreground: Color::Default,
+    background: Color::Default,
+    underline_color: Color::Default,
+    link: 0,
+    prompt: false,
+};
+
 impl Default for Attributes {
     fn default() -> Self {
-        Self {
-            bold: false,
-            faint: false,
-            italic: false,
-            underline: Underline::None,
-            inverse: false,
-            strike: false,
-            foreground: Color::Default,
-            background: Color::Default,
-            underline_color: Color::Default,
-            link: 0,
-            prompt: false,
-        }
+        DEFAULT_ATTRIBUTES
     }
 }
 
@@ -116,6 +119,12 @@ pub struct Cell {
     pub scalar: char,
     pub attributes: Attributes,
 }
+
+/// What an erase with no rendition set leaves.
+const DEFAULT_BLANK: Cell = Cell {
+    scalar: ' ',
+    attributes: DEFAULT_ATTRIBUTES,
+};
 
 impl Cell {
     fn blank(attributes: Attributes) -> Self {
@@ -175,7 +184,11 @@ struct SavedState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HistoryLine {
     start: usize,
+    /// The width the line was pushed at.
     length: usize,
+    /// The cells kept in the arena: the line up to its last cell that is
+    /// not a default blank, which every cell after it was.
+    stored: usize,
     wrapped: bool,
 }
 
@@ -184,7 +197,11 @@ struct History {
     lines: VecDeque<HistoryLine>,
     arena: Vec<Cell>,
     write: usize,
+    /// The lines' widths summed, what scrollback holds as text, which
+    /// `MAX_HISTORY_CELLS` bounds.
     cells: usize,
+    /// The cells the lines keep in the arena, which `max_cells` bounds.
+    stored: usize,
     max_cells: usize,
     max_lines: usize,
     /// Lines ever appended, which eviction does not decrease. An open
@@ -225,6 +242,7 @@ impl History {
             arena,
             write: 0,
             cells: 0,
+            stored: 0,
             max_cells,
             max_lines: if enabled { MAX_HISTORY_LINES } else { 0 },
             pushed: 0,
@@ -232,29 +250,53 @@ impl History {
         }
     }
 
-    fn prepare_line(&mut self, columns: usize) -> bool {
+    /// Evicts the oldest lines until one `columns` wide, keeping `stored`
+    /// cells, fits all three bounds: the line count, the arena, and the
+    /// text, which bounds what a search or a copy expands however few cells
+    /// the lines keep. A line wider than the arena is refused, so a history
+    /// without one keeps nothing and `stored` never outgrows it.
+    fn prepare_line(&mut self, columns: usize, stored: usize) -> bool {
         if self.max_lines == 0 || columns > self.max_cells {
             return false;
         }
         while self.lines.len() >= self.max_lines
-            || self.cells.saturating_add(columns) > self.max_cells
+            || self.stored.saturating_add(stored) > self.max_cells
+            || self.cells.saturating_add(columns) > MAX_HISTORY_CELLS
         {
             let Some(line) = self.lines.pop_front() else {
                 return false;
             };
             self.cells = self.cells.saturating_sub(line.length);
+            self.stored = self.stored.saturating_sub(line.stored);
         }
         true
     }
 
-    fn push_line(&mut self, screen_cells: &[Cell], start: usize, columns: usize, wrapped: bool) {
+    /// Pushes the `columns` cells at `start`, of which none from `extent` on
+    /// is anything but a default blank.
+    fn push_line(
+        &mut self,
+        screen_cells: &[Cell],
+        start: usize,
+        (columns, extent): (usize, usize),
+        wrapped: bool,
+    ) {
         let Some(end) = start.checked_add(columns) else {
             return;
         };
-        let Some(source_cells) = screen_cells.get(start..end) else {
+        let Some(line_cells) = screen_cells.get(start..end) else {
             return;
         };
-        if !self.prepare_line(columns) {
+        // Most lines end well short of the grid: the default blanks after
+        // the last written cell are not copied, and read back as blanks.
+        let stored = line_cells
+            .get(..extent.min(columns))
+            .and_then(|written| written.iter().rposition(|cell| *cell != DEFAULT_BLANK))
+            .map_or(0, |last| last.saturating_add(1));
+        let Some(source_cells) = line_cells.get(..stored) else {
+            return;
+        };
+        if !self.prepare_line(columns, stored) {
             return;
         }
         let line_start = self.write;
@@ -289,9 +331,11 @@ impl History {
             rest = later;
         }
         self.cells = self.cells.saturating_add(columns);
+        self.stored = self.stored.saturating_add(stored);
         self.lines.push_back(HistoryLine {
             start: line_start,
             length: columns,
+            stored,
             wrapped,
         });
         self.pushed = self.pushed.saturating_add(1);
@@ -302,6 +346,7 @@ impl History {
         self.arena.clear();
         self.write = 0;
         self.cells = 0;
+        self.stored = 0;
         // The counter goes with the lines it counted, and the numbering it
         // counted in is retired with it: zeroing `pushed` alone would let an
         // old anchor come back into range as new lines arrived, reopening a
@@ -340,7 +385,13 @@ impl History {
 
     fn line_cell(&self, line: usize, column: usize) -> Option<Cell> {
         let line = self.lines.get(line)?;
-        if column >= line.length || self.max_cells == 0 {
+        if column >= line.length {
+            return None;
+        }
+        if column >= line.stored {
+            return Some(DEFAULT_BLANK);
+        }
+        if self.max_cells == 0 {
             return None;
         }
         let index = line.start.saturating_add(column) % self.max_cells;
@@ -357,6 +408,9 @@ struct Screen {
     columns: usize,
     cells: Vec<Cell>,
     origin: usize,
+    /// Per stored row, as `cells` holds them: no cell from this column on
+    /// is anything but a default blank. A bound, not the last written cell.
+    extents: Vec<usize>,
     cursor_row: usize,
     cursor_column: usize,
     pending_wrap: bool,
@@ -379,6 +433,8 @@ impl PartialEq for Screen {
             columns,
             cells: _,
             origin: _,
+            // A bound on where text can be, not what is shown.
+            extents: _,
             cursor_row,
             cursor_column,
             pending_wrap,
@@ -445,11 +501,13 @@ impl Screen {
         history_enabled: bool,
     ) -> Result<Self, String> {
         let count = checked_cell_count(rows, columns)?;
+        let blank = Cell::blank(attributes);
         Ok(Self {
             rows,
             columns,
-            cells: vec![Cell::blank(attributes); count],
+            cells: vec![blank; count],
             origin: 0,
+            extents: vec![if blank == DEFAULT_BLANK { 0 } else { columns }; rows],
             cursor_row: 0,
             cursor_column: 0,
             pending_wrap: false,
@@ -472,6 +530,29 @@ impl Screen {
         stored.checked_mul(self.columns)
     }
 
+    /// Where `row` is kept, which `extents` is indexed by.
+    fn stored_row(&self, row: usize) -> Option<usize> {
+        if row >= self.rows {
+            return None;
+        }
+        self.origin.checked_add(row)?.checked_rem(self.rows)
+    }
+
+    fn extent(&self, row: usize) -> usize {
+        self.stored_row(row)
+            .and_then(|stored| self.extents.get(stored))
+            .copied()
+            .unwrap_or(self.columns)
+    }
+
+    fn set_extent(&mut self, row: usize, extent: usize) {
+        if let Some(stored) = self.stored_row(row) {
+            if let Some(slot) = self.extents.get_mut(stored) {
+                *slot = extent;
+            }
+        }
+    }
+
     fn row(&self, row: usize) -> Option<&[Cell]> {
         let start = self.row_start(row)?;
         self.cells.get(start..start.checked_add(self.columns)?)
@@ -492,14 +573,23 @@ impl Screen {
         };
         if end <= self.cells.len() && target.saturating_add(self.columns) <= self.cells.len() {
             self.cells.copy_within(source..end, target);
+            self.set_extent(to, self.extent(from));
         }
     }
 
+    /// A default blank fills only the cells that can hold anything else.
     fn blank_rows(&mut self, rows: std::ops::Range<usize>, attributes: Attributes) {
+        let blank = Cell::blank(attributes);
         for row in rows {
-            if let Some(cells) = self.row_mut(row) {
-                cells.fill(Cell::blank(attributes));
+            let extent = if blank == DEFAULT_BLANK {
+                self.extent(row)
+            } else {
+                self.columns
+            };
+            if let Some(cells) = self.row_mut(row).and_then(|cells| cells.get_mut(..extent)) {
+                cells.fill(blank);
             }
+            self.set_extent(row, if blank == DEFAULT_BLANK { 0 } else { extent });
         }
     }
 
@@ -528,12 +618,54 @@ impl Screen {
         }
     }
 
+    /// Every printed character comes through here, so the row's place in
+    /// the ring is found once and the extent takes the column without
+    /// comparing the cell: a printed blank only loosens the bound. Erases
+    /// write through `fill_segment`.
+    #[inline]
     fn set_cell(&mut self, row: usize, column: usize, cell: Cell) {
-        if let Some(index) = self.index(row, column) {
-            if let Some(target) = self.cells.get_mut(index) {
-                *target = cell;
-                self.damage(row);
+        if column >= self.columns {
+            return;
+        }
+        let Some(stored) = self.stored_row(row) else {
+            return;
+        };
+        let Some(index) = stored
+            .checked_mul(self.columns)
+            .and_then(|start| start.checked_add(column))
+        else {
+            return;
+        };
+        if let Some(target) = self.cells.get_mut(index) {
+            *target = cell;
+            self.damage(row);
+            if let Some(extent) = self.extents.get_mut(stored) {
+                *extent = (*extent).max(column.saturating_add(1));
             }
+        }
+    }
+
+    /// Writes `attributes`' blank over `start..end` of `row`; an erase in
+    /// no colour that reaches the extent brings it back to `start`.
+    fn fill_segment(&mut self, row: usize, start: usize, end: usize, attributes: Attributes) {
+        let end = end.min(self.columns);
+        if start >= end {
+            return;
+        }
+        let blank = Cell::blank(attributes);
+        let Some(cells) = self
+            .row_mut(row)
+            .and_then(|cells| cells.get_mut(start..end))
+        else {
+            return;
+        };
+        cells.fill(blank);
+        self.damage(row);
+        let extent = self.extent(row);
+        if blank != DEFAULT_BLANK {
+            self.set_extent(row, extent.max(end));
+        } else if start < extent && end >= extent {
+            self.set_extent(row, start);
         }
     }
 
@@ -577,15 +709,14 @@ impl Screen {
                 continue;
             };
             let wrapped = self.wrapped_rows.get(row).copied().unwrap_or(false);
+            let extent = self.extent(row);
             self.history
-                .push_line(&self.cells, cell_start, self.columns, wrapped);
+                .push_line(&self.cells, cell_start, (self.columns, extent), wrapped);
         }
     }
 
     fn clear_row(&mut self, row: usize, attributes: Attributes) {
-        for column in 0..self.columns {
-            self.set_cell(row, column, Cell::blank(attributes));
-        }
+        self.fill_segment(row, 0, self.columns, attributes);
         if row == 0 {
             self.history.unwrap_newest();
         }
@@ -596,9 +727,7 @@ impl Screen {
 
     fn clear_segment(&mut self, row: usize, start: usize, end: usize, attributes: Attributes) {
         let bounded_end = end.min(self.columns);
-        for column in start.min(bounded_end)..bounded_end {
-            self.set_cell(row, column, Cell::blank(attributes));
-        }
+        self.fill_segment(row, start, bounded_end, attributes);
         if start < bounded_end && bounded_end == self.columns {
             self.unwrap_row(row);
             if start == 0 && row == 0 {
@@ -768,6 +897,7 @@ impl Screen {
         if let Some(cells) = self.cells.get_mut(start..start.saturating_add(count)) {
             cells.fill(Cell::blank(attributes));
         }
+        self.set_extent(self.cursor_row, self.columns);
         self.unwrap_row(self.cursor_row);
         self.damage(self.cursor_row);
         self.pending_wrap = false;
@@ -793,6 +923,7 @@ impl Screen {
         if let Some(cells) = self.cells.get_mut(end.saturating_sub(count)..end) {
             cells.fill(Cell::blank(attributes));
         }
+        self.set_extent(self.cursor_row, self.columns);
         self.unwrap_row(self.cursor_row);
         self.damage(self.cursor_row);
         self.pending_wrap = false;
@@ -940,6 +1071,15 @@ impl Screen {
                 }
             }
         }
+        // `checked_cell_count` refused a zero width; `max` keeps it so.
+        self.extents = cells
+            .chunks(columns.max(1))
+            .map(|row| {
+                row.iter()
+                    .rposition(|cell| *cell != DEFAULT_BLANK)
+                    .map_or(0, |last| last.saturating_add(1))
+            })
+            .collect();
         self.rows = rows;
         self.columns = columns;
         self.cells = cells;

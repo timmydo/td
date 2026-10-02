@@ -168,8 +168,10 @@ fewer cells.
 Resource ceilings are part of the model contract:
 
 - at most 32 CSI parameters;
-- at most 1,048,576 history cells, 16,384 history lines, and 16 MiB of history
-  storage;
+- at most 1,048,576 history cells of text (the lines' widths summed),
+  16,384 history lines, and 16 MiB of history storage, in which a line
+  keeps its cells only up to the last that is not a default blank (a space
+  in no rendition), so short lines in a wide grid keep more lines;
 - at most 1 MiB of queued PTY output, 64 KiB of queued keyboard input, and
   64 KiB of queued terminal replies;
 - an OSC payload of at most 4 KiB, a title of at most 256 characters,
@@ -868,16 +870,18 @@ about mid-view, or as low as still shows its last. The text searched
 (`Terminal::search`) is the active screen with, while that is the
 primary, its history: one line per line the child wrote, its wrapped
 rows joined by their marks, so a match can span a wrap, each row read
-only as wide as the screen. The alternate screen is searched alone, at
-the live view, as foot's has no scrollback. A query with no uppercase
-letter matches either case, each scalar folded on its own as foot's
-`towlower` does. Matches are placed in a line numbering output does not
-shift (history line `n` is `pushed - lines + n`, screen row `r` is
-`pushed + r`), so a match stays put as lines scroll. After output or a
-resize, a match whose cells no longer spell the query, or whose wrap has
-gone (`Terminal::still_matches`), is dropped; a clear that renumbers
-history or a switch of screen drops it and the last place too, since
-both name a line of text that went.
+only as wide as the screen. A search reads every cell it passes, so the
+history's text ceiling (1,048,576 cells) bounds one search's work and the
+memory it joins a line into, however few cells history keeps. The
+alternate screen is searched alone, at the live view, as foot's has no
+scrollback. A query with no uppercase letter matches either case, each
+scalar folded on its own as foot's `towlower` does. Matches are placed in a
+line numbering output does not shift (history line `n` is
+`pushed - lines + n`, screen row `r` is `pushed + r`), so a match stays put
+as lines scroll. After output or a resize, a match whose cells no longer
+spell the query, or whose wrap has gone (`Terminal::still_matches`), is
+dropped; a clear that renumbers history or a switch of screen drops it and
+the last place too, since both name a line of text that went.
 
 A shell that marks where its prompt starts with OSC 133;A, with or
 without parameters (foot's shell integration), marks the next cell

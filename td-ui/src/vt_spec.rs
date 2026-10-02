@@ -1109,7 +1109,7 @@ fn clearing_history_restarts_the_count_in_a_new_numbering() {
 #[test]
 fn a_refused_push_does_not_count_as_a_line() {
     let mut history = History::new(false);
-    history.push_line(&[Cell::blank(Attributes::default()); 4], 0, 4, false);
+    history.push_line(&[Cell::blank(Attributes::default()); 4], 0, (4, 4), false);
     assert_eq!(history.lines.len(), 0);
     assert_eq!(history.pushed, 0);
 }
@@ -1291,10 +1291,12 @@ fn run_case(case: &Case, chunking: Chunking) -> Result<CaseRun, String> {
         match step {
             Step::Write(bytes) => {
                 feed_operation(&mut terminal, bytes, operation, chunking, &mut seed);
+                assert_terminal_invariants(&terminal);
                 operation += 1;
             }
             Step::Resize(rows, columns) => {
                 terminal.resize(*rows, *columns)?;
+                assert_terminal_invariants(&terminal);
                 operation += 1;
             }
             // The adapter reads the mode the terminal is in now, which is what
@@ -1741,6 +1743,33 @@ fn assert_terminal_invariants(terminal: &Terminal) {
                 .map(|line| line.length)
                 .sum::<usize>()
         );
+        assert_eq!(
+            screen.history.stored,
+            screen
+                .history
+                .lines
+                .iter()
+                .map(|line| line.stored)
+                .sum::<usize>()
+        );
+        assert!(screen
+            .history
+            .lines
+            .iter()
+            .all(|line| line.stored <= line.length));
+        assert!(screen.history.stored <= screen.history.max_cells);
+        assert_eq!(screen.extents.len(), screen.rows);
+        for row in 0..screen.rows {
+            let extent = screen.extent(row);
+            assert!(extent <= screen.columns);
+            assert!(
+                screen.row(row).unwrap()[extent..]
+                    .iter()
+                    .all(|cell| *cell == DEFAULT_BLANK),
+                "row {row} holds text past its extent {extent}"
+            );
+        }
+        assert!(screen.history.max_cells <= MAX_HISTORY_CELLS);
         assert!(screen.history.cells <= MAX_HISTORY_CELLS);
         assert!(
             screen.history.storage_bytes()
@@ -1840,7 +1869,7 @@ fn history_lines_remain_readable_across_the_ring_boundary() {
             attributes: Attributes::default(),
         },
     ];
-    history.push_line(&first, 0, first.len(), false);
+    history.push_line(&first, 0, (first.len(), first.len()), false);
     let second = [
         Cell {
             scalar: 'd',
@@ -1859,7 +1888,7 @@ fn history_lines_remain_readable_across_the_ring_boundary() {
             attributes: Attributes::default(),
         },
     ];
-    history.push_line(&second, 0, second.len(), true);
+    history.push_line(&second, 0, (second.len(), second.len()), true);
     assert_eq!(history.lines.len(), 1);
     assert_eq!(history.line_cell(0, 0).map(|cell| cell.scalar), Some('d'));
     assert_eq!(history.line_cell(0, 1).map(|cell| cell.scalar), Some('e'));
@@ -2564,4 +2593,178 @@ fn screens_showing_the_same_rows_are_equal_wherever_the_ring_turned() {
         },
     );
     assert_ne!(first, turned);
+}
+
+/// A line keeps its cells up to the last that is not a default blank and
+/// reads back as it was pushed: blanks erased in a colour are kept, and
+/// what was trimmed reads as the default blank to the line's width.
+#[test]
+fn history_lines_keep_their_text_and_read_back_whole() {
+    let blank = Cell::blank(Attributes::default());
+    let text = |scalar| Cell {
+        scalar,
+        attributes: Attributes::default(),
+    };
+    let painted = Cell::blank(Attributes {
+        background: Color::Indexed(4),
+        ..Attributes::default()
+    });
+    let rows: [Vec<Cell>; 5] = [
+        vec![text('a'), text('b'), blank, blank, blank, blank],
+        vec![blank; 6],
+        vec![text('c'), blank, text('d'), painted, blank, blank],
+        vec![painted; 6],
+        vec![text('e'); 6],
+    ];
+    let mut history = History::new(true);
+    for row in &rows {
+        history.push_line(row, 0, (row.len(), row.len()), false);
+    }
+    assert_eq!(history.lines.len(), rows.len());
+    let stored: Vec<usize> = history.lines.iter().map(|line| line.stored).collect();
+    assert_eq!(stored, [2, 0, 4, 6, 6]);
+    assert_eq!(history.stored, 18);
+    assert_eq!(history.cells, 30);
+    for (line, row) in rows.iter().enumerate() {
+        for (column, cell) in row.iter().enumerate() {
+            assert_eq!(
+                history.line_cell(line, column),
+                Some(*cell),
+                "{line}:{column}"
+            );
+        }
+        assert_eq!(history.line_cell(line, row.len()), None);
+    }
+}
+
+/// The arena bounds the cells lines keep, not their width: short lines
+/// in a wide grid keep more of them.
+#[test]
+fn short_lines_keep_more_history_in_the_same_arena() {
+    let mut history = History::new(true);
+    history.arena = Vec::with_capacity(10);
+    history.max_cells = 10;
+    let mut row = vec![Cell::blank(Attributes::default()); 10];
+    for (n, scalar) in "abcdefg".chars().enumerate() {
+        row[0].scalar = scalar;
+        history.push_line(&row, 0, (row.len(), row.len()), n % 2 == 0);
+    }
+    // Width alone would have kept one line; seven one-cell lines fit.
+    assert_eq!(history.lines.len(), 7);
+    assert_eq!(history.stored, 7);
+    for (line, scalar) in "abcdefg".chars().enumerate() {
+        assert_eq!(
+            history.line_cell(line, 0).map(|cell| cell.scalar),
+            Some(scalar)
+        );
+        assert_eq!(
+            history.line_cell(line, 9).map(|cell| cell.scalar),
+            Some(' ')
+        );
+    }
+    // A full line evicts the oldest until it fits, across the ring's end.
+    let mut full = vec![Cell::blank(Attributes::default()); 10];
+    full[9].scalar = 'z';
+    history.push_line(&full, 0, (full.len(), full.len()), true);
+    assert_eq!(history.stored, 10);
+    assert_eq!(history.lines.len(), 1);
+    assert_eq!(history.line_cell(0, 9).map(|cell| cell.scalar), Some('z'));
+    assert_eq!(history.line_cell(0, 0).map(|cell| cell.scalar), Some(' '));
+}
+
+/// Every edit keeps each row's extent a bound on its text: what moves
+/// cells within a row (ICH, DCH), fills them in a colour (erases, scrolls,
+/// line insertions under a set background), copies rows (regions, IL,
+/// DL), repeats a character (REP), or remakes the grid (resize, the
+/// alternate screen, RIS, DECSTR).
+#[test]
+fn row_extents_bound_their_text_through_every_edit() {
+    let pieces: [&[u8]; 33] = [
+        b"abc",
+        b"0123456789",
+        "\u{4e2d}\u{6587}".as_bytes(),
+        b"x\x1b[5b",
+        b"\x1bc",
+        b"\x1b[!p",
+        b"\x1b[44m",
+        b"\x1b[m",
+        b"\x1b[3@",
+        b"\x1b[2P",
+        b"\x1b[4X",
+        b"\x1b[K",
+        b"\x1b[1K",
+        b"\x1b[2K",
+        b"\x1b[J",
+        b"\x1b[2J",
+        b"\x1b[2L",
+        b"\x1b[M",
+        b"\x1b[2S",
+        b"\x1b[T",
+        b"\x1b[2;4r",
+        b"\x1b[r",
+        b"\x1b[3;5H",
+        b"\x1b[1;1H",
+        b"\x1b[5;8H",
+        b"\r\n",
+        b"\n\n\n",
+        b"\x1bM",
+        b"\x1b[?7h",
+        b"\t",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+        b"\x1b[?7l",
+    ];
+    let mut seed = 0x6c07_8965_2a3d_51f1_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..40 {
+        let mut terminal = Terminal::new(5, 8).unwrap();
+        for _ in 0..200 {
+            if next() % 40 == 0 {
+                let rows = 2 + next() as usize % 6;
+                let columns = 3 + next() as usize % 9;
+                terminal.resize(rows, columns).unwrap();
+            } else {
+                terminal.feed(pieces[next() as usize % pieces.len()]);
+            }
+            assert_terminal_invariants(&terminal);
+        }
+    }
+}
+
+/// Lines that keep no cells still count their width as text, which bounds
+/// what a search expands: a flood of wrapped spaces at the widest grid
+/// stays within `MAX_HISTORY_CELLS` of text, oldest evicted first.
+#[test]
+fn history_text_is_bounded_however_few_cells_lines_keep() {
+    let width = 4_096;
+    let mut terminal = Terminal::new(1, width).unwrap();
+    let row = vec![b' '; width];
+    for _ in 0..600 {
+        terminal.feed(&row);
+    }
+    let history = &terminal.primary.history;
+    assert_eq!(history.stored, 0);
+    assert_eq!(history.cells, MAX_HISTORY_CELLS);
+    assert_eq!(history.lines.len(), MAX_HISTORY_CELLS / width);
+    assert_eq!(terminal.history_pushed(), 599);
+    assert_eq!(terminal.history_cells(), MAX_HISTORY_CELLS);
+    assert_eq!(terminal.search("x", None, Toward::Older), None);
+}
+
+/// A line wider than the arena is refused, even one that would keep no
+/// cells: a history without room for a row of its grid keeps nothing.
+#[test]
+fn a_line_wider_than_the_arena_is_refused() {
+    let mut history = History::new(true);
+    history.arena = Vec::with_capacity(10);
+    history.max_cells = 10;
+    let row = vec![Cell::blank(Attributes::default()); 20];
+    history.push_line(&row, 0, (20, 20), false);
+    assert!(history.lines.is_empty());
+    assert_eq!((history.cells, history.stored), (0, 0));
 }
