@@ -22,7 +22,8 @@ needs them:
 - For compositor/UI, service supervision, or installation, read the matching
   `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`;
   for the shared UI toolkit td-owned graphical programs depend on, read
-  `td-ui/DESIGN.md`; for the terminal, read `td-term/DESIGN.md`.
+  `td-ui/DESIGN.md`; for the terminal, read `td-term/DESIGN.md`; for the
+  agent harness, read `td-agent/DESIGN.md`.
 - Before changing target compiler flags, ELF debug handling, profiler code, or
   profiler image integration, read `td-profiler/DESIGN.md`.
 
