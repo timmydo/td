@@ -34,28 +34,7 @@ impl LockedRoot {
         max_bytes: u64,
         scratch: &'b mut [u8; MAX_FRAME_BYTES],
     ) -> Result<HistoryInput<'r, 'c, 'm, 'b, C>, HistoryInputError> {
-        let descriptor = selection.manifest().history(index)?;
-        if descriptor.file_bytes > (JOURNAL_HEADER_BYTES + MAX_JOURNAL_FRAME_BYTES) as u64 {
-            return Err(FormatError::Limit.into());
-        }
-        if descriptor.file_bytes > max_bytes {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
-        }
-        let segment = Number::new(descriptor.segment).map_err(|_| FormatError::InvalidValue)?;
-        let file = self.open_account_file(
-            selection.current().account,
-            AccountEntry::Journal(segment),
-            descriptor.file_bytes,
-        )?;
-        if file.len() != descriptor.file_bytes {
-            return Err(io::Error::from(io::ErrorKind::InvalidData).into());
-        }
-        let expected = JournalHeader {
-            account: selection.current().account,
-            epoch: selection.store().epoch,
-            segment: descriptor.segment,
-            base: descriptor.base,
-        };
+        let (file, expected) = open_selected(self, selection, index, max_bytes)?;
         let stream = FrameInput::new(crypto, file, expected, scratch)?;
         Ok(HistoryInput {
             stream,
@@ -64,6 +43,36 @@ impl LockedRoot {
             index,
         })
     }
+}
+pub(super) fn open_selected<'r>(
+    root: &'r LockedRoot,
+    selection: Selection<'_>,
+    index: usize,
+    max_bytes: u64,
+) -> Result<(StoreReader<'r>, JournalHeader), HistoryInputError> {
+    let descriptor = selection.manifest().history(index)?;
+    if descriptor.file_bytes > (JOURNAL_HEADER_BYTES + MAX_JOURNAL_FRAME_BYTES) as u64 {
+        return Err(FormatError::Limit.into());
+    }
+    if descriptor.file_bytes > max_bytes {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+    }
+    let segment = Number::new(descriptor.segment).map_err(|_| FormatError::InvalidValue)?;
+    let file = root.open_account_file(
+        selection.current().account,
+        AccountEntry::Journal(segment),
+        descriptor.file_bytes,
+    )?;
+    if file.len() != descriptor.file_bytes {
+        return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+    }
+    let expected = JournalHeader {
+        account: selection.current().account,
+        epoch: selection.store().epoch,
+        segment: descriptor.segment,
+        base: descriptor.base,
+    };
+    Ok((file, expected))
 }
 impl<'r, C: Crypto> HistoryInput<'r, '_, '_, '_, C> {
     pub fn is_failed(&self) -> bool {
@@ -179,6 +188,7 @@ pub(super) fn probe(root: &LockedRoot, bytes: &ProbeBytes, scratch: &mut [u8; MA
     assert_eq!(complete.file().len(), 277);
     assert_eq!(complete.summary().through().number(), 1);
     assert_eq!(complete.summary().operations(), 1);
+    drop(complete);
     assert!(matches!(
         root.open_history(&td_crypto::Provider, selection, 1, 277, scratch),
         Err(HistoryInputError::Stream(_))
@@ -191,6 +201,15 @@ pub(super) fn probe(root: &LockedRoot, bytes: &ProbeBytes, scratch: &mut [u8; MA
         .unwrap();
     assert!(
         matches!(input.finish(),Err(HistoryInputError::Io(e)) if e.kind() == io::ErrorKind::InvalidInput)
+    );
+    super::history_changes::probe(
+        root,
+        selection,
+        scratch
+            .get_mut(..crate::format::table::MAX_RECORD_BYTES)
+            .unwrap()
+            .try_into()
+            .unwrap(),
     );
 }
 
@@ -359,6 +378,12 @@ mod tests {
         let file_bytes = (JOURNAL_HEADER_BYTES + MAX_JOURNAL_FRAME_BYTES + 1) as u64;
         select_history(&mut bytes, 5, file_bytes, [0; 32]);
         for admitted in [0, file_bytes] {
+            assert!(matches!(
+                root.open_history_changes(&Provider, bytes.selection(), 0, admitted, &mut []),
+                Err(HistoryInputError::Stream(StreamError::Journal(
+                    ContainerError::Format(FormatError::Limit)
+                )))
+            ));
             assert!(matches!(
                 root.open_history(
                     &Provider,

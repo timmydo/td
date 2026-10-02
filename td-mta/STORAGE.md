@@ -468,6 +468,41 @@ This is full-segment recovery/verification input. ReadView::next_change still
 needs its own streaming cursor that skips PUT bodies with bounded I/O; this
 frame-buffer adapter does not implement that API.
 
+`LockedRoot::open_history_changes` provides the same selected immutable-
+history completion checks using separate caller CHANGE cells. Both history
+openers share selected-file admission and expected header identity
+construction. The changes input validates the exact file size, admitted
+ceiling and journal header before returning. `advance_frame` borrows
+MAX_RECORD_BYTES operation scratch for that call only, discards the previous
+frame, recovers the original full slot capacity and reads one complete
+frame. `frame` exposes its checked compact changes until the next advance;
+false clears that result and marks only recorded extent exhaustion. The
+operation buffer is free for row lookups while changes are drained. Caller
+code decides whether it has consumed a prior frame before advancing. This is
+not ReadView::next_change.
+
+Each frame checks the 64-byte header and aggregate limits, and requires its
+whole declared extent to fit the recorded remainder before operation reads.
+Read each exact 12-byte operation prefix, bound its extent by remaining payload
+and operation scratch, then read/validate its remainder. Require zero remaining
+payload before reading the 40-byte footer. Header, operation reads and footer
+share 8258 explicit attempts (two per maximum operation, two fixed parts and
+64 additional attempts shared by normal 64 KiB splits and short reads); opening
+retains a separate 64-call allowance.
+The existing helper never retries errors. Each std read retains the shared
+64 KiB step cap; no whole-frame allocation or read-ahead inventory is created.
+Blocking calls remain uninterruptible by these counters; callers meter work
+between complete bounded frames.
+
+A short slot buffer is a resource refusal, not corrupt bytes. All frame/I/O/
+capacity failures retire the adapter and clear previous results. Failed input
+cannot finish or resume. Finish requires the whole journal Summary, unchanged
+physical extent/EOF and selected descriptor binding, returning CompleteHistoryChanges.
+Frames remain provisional until that selected proof plus graph/final-view and
+actual pin checks hold. This helper supplies no live serving cursor or repair
+authority. Its record input and 96 KiB change slots reuse the distinct view
+reservations in RESOURCES.md; no per-view MiB is added.
+
 Metadata, table and both journal readers share a private exact-read helper. It
 consumes the caller's existing attempt counter across framing phases, advances
 only by confirmed returned bytes, and never retries errors. Empty destinations

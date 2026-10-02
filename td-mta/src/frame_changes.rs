@@ -80,38 +80,49 @@ impl<'c, 's, C: Crypto> Collector<'c, 's, C> {
             return Err(error);
         }
         let summary = self.verifier.finish(footer)?;
-        let cells = self
-            .cells
-            .get(..self.count)
-            .ok_or(FormatError::InvalidValue)?;
-        Ok(CompleteChanges { summary, cells })
+        if self.count > self.cells.len() {
+            return Err(FormatError::InvalidValue.into());
+        }
+        Ok(CompleteChanges {
+            summary,
+            cells: self.cells,
+            count: self.count,
+        })
     }
 }
 
 /// Copied changes in stored operation order; owns no file or runtime view pin.
 pub struct CompleteChanges<'s> {
     summary: frame_stream::Summary,
-    cells: &'s [Cell],
+    cells: &'s mut [Cell],
+    count: usize,
 }
-impl CompleteChanges<'_> {
+impl<'s> CompleteChanges<'s> {
     pub const fn summary(&self) -> frame_stream::Summary {
         self.summary
     }
     pub fn len(&self) -> usize {
-        self.cells.len()
+        self.count
     }
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
+        self.count == 0
+    }
+    /// Consume the checked result and recover the original full scratch capacity.
+    pub fn into_cells(self) -> &'s mut [Cell] {
+        self.cells
     }
     pub fn records(&self) -> impl ExactSizeIterator<Item = ChangeRecord> + '_ {
         let sequence = self.summary.header().sequence;
-        self.cells.iter().map(move |cell| ChangeRecord {
-            cursor: ChangeCursor {
-                sequence,
-                operation: cell.ordinal,
-            },
-            change: cell.change,
-        })
+        self.cells
+            .iter()
+            .take(self.count)
+            .map(move |cell| ChangeRecord {
+                cursor: ChangeCursor {
+                    sequence,
+                    operation: cell.ordinal,
+                },
+                change: cell.change,
+            })
     }
 }
 
@@ -284,5 +295,34 @@ mod tests {
         assert!(
             Collector::new(&Provider, Sequence::from_u64(7), &bytes[..64], &mut cells).is_err()
         );
+    }
+    #[test]
+    fn draining_recovers_full_scratch_for_shorter_and_empty_frames() {
+        let mut cells = [Cell::EMPTY; 4];
+        let original = cells.as_ptr();
+        let change = Operation::change(ObjectType::Email, ChangeAction::Created, &[6; 16]);
+        let first = frame(&[change, change]);
+        let complete = collect(&first, &mut cells).unwrap();
+        assert_eq!(complete.len(), 2);
+        let cells = complete.into_cells();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells.as_ptr(), original);
+        let next = frame(&[Operation::change(
+            ObjectType::Thread,
+            ChangeAction::Destroyed,
+            &[7; 16],
+        )]);
+        let complete = collect(&next, cells).unwrap();
+        let records: Vec<_> = complete.records().collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].change.kind, ObjectType::Thread);
+        assert_eq!(records[0].change.id, [7; 16]);
+        let empty = frame(&[Operation::delete(Table::Threads, &[1; 16]).unwrap()]);
+        let complete = collect(&empty, complete.into_cells()).unwrap();
+        assert!(complete.is_empty());
+        assert_eq!(complete.records().next(), None);
+        let cells = complete.into_cells();
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells.as_ptr(), original);
     }
 }

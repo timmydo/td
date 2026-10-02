@@ -720,10 +720,13 @@ It validates PUT/DELETE bodies but retains none of their bytes. A slot shortage
 returns OutputFull and permanently fails collection, as do malformed operations
 or provider errors. No partial list or success boundary is exposed. Consuming
 finish checks the complete frame and returns CompleteChanges with its Summary
-and immutable populated slots. Records have the frame sequence and original
-ordinals; duplicates/actions are not coalesced or filtered. Row-only frames
-can complete with zero slots. Results do not borrow the operation input and
-retain no file or view pin. RESOURCES.md reserves distinct change slots because
+and read-only access to populated slots. Consuming into_cells returns the
+original full mutable scratch capacity for the next frame, ending that result's
+slot borrow; retained unused slots never appear in records. Records have the
+frame sequence and original ordinals; duplicates/actions are not coalesced or
+filtered. Row-only frames can complete with zero slots. Results do not borrow
+the operation input and retain no file or view pin. RESOURCES.md reserves
+distinct change slots because
 get/next may use their result buffers while a completed frame is being drained.
 This helper performs no I/O, cursor/floor/endpoint check, selected-journal
 binding, JMAP coalescing or next_change activation.

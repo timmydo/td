@@ -868,6 +868,16 @@ service activation. Each part lands independently:
     exhausted bases, journal caps, frame errors and crypto faults. The existing
     allocation interval exercises completion and abandonment. File input,
     selected history/prefix binding and ReadView cursor activation follow.
+  - **M05d14d — selected history changes:** implemented immutable selected-file
+    opening and complete-frame iteration borrowing per-call operation scratch
+    and retaining compact change slots. Check exact extent/header/aggregate limits, bound operation
+    framing and share a finite read-call budget. Consume each frame checksum
+    before retaining changes; recover full scratch capacity for the next frame.
+    Selected digest/EOF completion is separate from provisional frame access.
+    Tests cover repeated/max frames, changed bytes, short cells, read budgets,
+    I/O errors, buffer reuse and final selection. Existing allocation
+    instrumentation covers both path bounds. Live cursor/floor policy and
+    read-view pins remain future.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

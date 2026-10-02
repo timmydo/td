@@ -67,7 +67,9 @@ completion. A frame-change collector copies compact descriptors into separate
 caller slots and exposes them only after checksum completion. Incremental
 journal validation now connects those frames to a whole-journal checksum and
 bounded sequence progress; an abandoned frame retires its parent. Retained-
-history change cursors still need their I/O integration.
+history input can now read selected files with one operation buffer and compact
+change slots, requiring EOF/digest binding at completion. Live change cursors
+still need their pin and cursor-policy integration.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

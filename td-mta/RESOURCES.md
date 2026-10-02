@@ -744,6 +744,23 @@ is added. The allocation interval covers combined journal/change completion
 and an abandoned frame. Runtime I/O scheduling and complete-worker stack/RSS
 qualification remain unimplemented.
 
+HistoryChangesInput retains separate CHANGE cells, one StoreReader, the
+journal verifier, selection and compact progress/completion state. Each
+advance borrows existing MAX_RECORD_BYTES operation scratch only for that
+call; get/next can reuse it while a completed frame remains available.
+Completed frames keep the original mutable slot capacity behind read-only
+record access; consuming that result recovers all slots for the next frame.
+Its compiled Provider layout is capped at 8 KiB, charged to the worker
+stack, alongside the transient Pending and fixed 64-byte header/40-byte
+footer. No input frame arena is retained. Opening uses shared private-path
+scratch/transient parent handles. One frame admits at most 8258 explicit
+read attempts, while its total bytes and operations retain the format
+limits; callers still meter full-frame work and deadlines. The allocation
+interval reuses a cold fixture buffer's record-sized prefix for selected
+opening, local frame progress, completion and refusal at both root bounds;
+that fixture allocation grants no new deployment reservation. Whole-worker
+stack/RSS and live serving-view integration remain pending.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a
