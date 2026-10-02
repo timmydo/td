@@ -22,6 +22,12 @@ mod replay;
 pub(super) use replay::probe as probe_replay;
 pub use replay::{CompleteReplay, Error as TableReplayError, TableReplay};
 
+#[path = "table/lookup.rs"]
+mod lookup;
+#[cfg(test)]
+pub(super) use lookup::probe as probe_lookup;
+pub use lookup::{CompleteLookup, LookupError, TableLookup};
+
 const MAX_TABLE_READ_CALLS: usize = 64;
 #[derive(Debug)]
 pub enum TableInputError {
@@ -357,7 +363,7 @@ mod tests {
         hash.update(bytes).unwrap();
         hash.finish().unwrap()
     }
-    fn two_rows(root: &LockedRoot, bytes: &mut Bytes) -> Vec<u8> {
+    pub(super) fn two_rows(root: &LockedRoot, bytes: &mut Bytes) -> Vec<u8> {
         use crate::format::{container::Current, manifest, table::TableHeader, Table, TABLE_COUNT};
         let original = original();
         let mut second = original.get(TABLE_HEADER_BYTES..).unwrap().to_vec();

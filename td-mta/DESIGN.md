@@ -55,6 +55,8 @@ A provisional streaming merge now combines sorted checkpoint records with
 overlay replacements and deletions using fixed key state and borrowed rows.
 The table-replay adapter binds a fresh table input to the loaded prefix and
 requires selected table digest/EOF completion before draining residual updates.
+Point lookup now scans that complete replay and retains one matching row in
+caller scratch; it returns a row or absence only after selected-table completion.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
@@ -392,7 +394,7 @@ arena ledger with byte counts, worker stack sizes, scratch reservations, and
 TLS headroom before committing a default profile. A larger configured pool
 cannot silently retain the default memory claim.
 
-The ledger reserves 96314624 bytes under the default 96 MiB planning budget,
+The ledger reserves 96453888 bytes under the default 96 MiB planning budget,
 including planned stack, TLS, reload and process allowances. Default connection
 counts remain eight SMTP, eight HTTPS and one outbound delivery. Established
 TLS processing has a separate allowance for the single main thread, alongside

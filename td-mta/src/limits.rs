@@ -8,6 +8,8 @@ pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 /// Owned operation offsets/ordinal/type/kind, including Option layout.
 pub const OPERATION_SLOT_BYTES: usize = 32;
 pub const JOURNAL_SLOT_BYTES: usize = 32;
+/// Separate table record, retained result, key and cursor scratch.
+pub const READ_VIEW_SCRATCH_BYTES: usize = 196 * KIB;
 /// Planned provider session ceiling, not a measured worst-case bound.
 pub const TLS_SESSION_BYTES: usize = 512 * KIB;
 /// Planned provider construction/handshake ceiling; qualification remains required.
@@ -286,7 +288,11 @@ impl Limits {
                 count: self.storage_views,
                 bytes_each: sum(
                     "read view",
-                    &[self.journal_bytes, journal_descriptors, 128 * KIB],
+                    &[
+                        self.journal_bytes,
+                        journal_descriptors,
+                        READ_VIEW_SCRATCH_BYTES,
+                    ],
                 )?,
             },
             Reservation {
@@ -407,7 +413,12 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 96_314_624);
+        assert_eq!(plan.total_bytes(), 96_453_888);
+        const { assert!(crate::format::table::MAX_RECORD_BYTES <= 68 * KIB) };
+        assert_eq!(
+            READ_VIEW_SCRATCH_BYTES,
+            68 * KIB + crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 63 * KIB
+        );
         assert_eq!(plan.limits().memory_budget_bytes, 96 * MIB);
         assert!(plan.total_bytes() < plan.limits().memory_budget_bytes);
         assert_eq!(plan.log_disk_bytes(), 40 * MIB);

@@ -21,7 +21,7 @@ the checked ledger and pass the budget gate before admission is enabled.
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
 | Body/search jobs | 2 | 425984 | 851968 |
-| Storage read views | 2 | 4587520 | 9175040 |
+| Storage read views | 2 | 4657152 | 9314304 |
 | Writer and checkpoint | 1 | 6946816 | 6946816 |
 | Resident index cache | 1 | 8388608 | 8388608 |
 | Outbound slots | 1 | 572672 | 572672 |
@@ -37,10 +37,10 @@ the checked ledger and pass the budget gate before admission is enabled.
 | Certificate generations | 2 | 8388608 | 16777216 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **96314624** |
+| **Total** | | | **96453888** |
 
-The total is approximately 91.85 MiB against a 96 MiB configured budget;
-the remaining 4348672 bytes are unassigned headroom, not another cache.
+The total is approximately 91.99 MiB against a 96 MiB configured budget;
+the remaining 4209408 bytes are unassigned headroom, not another cache.
 The 64 MiB idle and 128 MiB workload RSS release ceilings remain independent
 and unverified. The TLS entries are demand headroom, not additional arenas to
 allocate and touch at startup. Idle retains its actual current generation;
@@ -70,7 +70,7 @@ still account for those costs and concurrent owners within the ledger.
   without pinning storage views between emissions.
 - Body job: headers, 64 bytes per MIME descriptor, 96 KiB decode/work scratch.
   Nested parsing and transfer decoding share that reservation.
-- Read view: 4 MiB journal prefix, 32 bytes per journal operation, 128 KiB
+- Read view: 4 MiB journal prefix, 32 bytes per journal operation, 196 KiB
   cursor/value scratch. Backup consumes an existing view.
   The replay Overlay borrows the immutable frame arena and at most 8192
   caller-owned Cell values. Limits::plan checks each compiled Cell fits the
@@ -88,7 +88,15 @@ still account for those costs and concurrent owners within the ledger.
   borrow from the per-view cursor/value arena. Tests cap the compiled Merge at
   4 KiB; this state and its temporary key buffer are charged to the owning worker
   stack. Runtime integration still must qualify the complete worker stack.
-  No new arena/pool or whole-table map is allocated. Admit one input
+  TableLookup borrows a target key and a distinct result buffer while retaining
+  the replay's record scratch. The 66608-byte maximum table record has its own
+  68 KiB partition; the 64 KiB result, 1 KiB key and existing 63 KiB cursor
+  allowances are separate at simultaneous peak. The default two views add
+  136 KiB to the plan, within the unchanged 96 MiB budget. Tests pin this
+  partition sum and the maximum record extent. The allocation probe exercises
+  present/absent/deleted lookups, completion and insufficient-result refusal
+  at both root bounds, with all buffers prepared before measurement.
+  No whole-table map is allocated. Admit one input
   record plus up to 8192 overlay keys per push, and up to 8192 keys for finish.
   The allocation executable checks unchanged/replaced/deleted rows, remaining
   output, input/sink failures, and draining the full-operation overlay after
@@ -378,7 +386,7 @@ concrete structures require a ledger amendment before admission is enabled.
 | Reservation | Partition |
 | --- | --- |
 | Body work, 96 KiB/job | Six 8 KiB nested-decode rings (NestedPartId::MAX_STEPS); 16 KiB parser/boundary/locator state; 32 KiB conversion/output |
-| Read cursor/value, 128 KiB/view | 64 KiB value; 1 KiB key; 63 KiB cursors, history streaming, sparse-index lookups and checksums |
+| Read cursor/value, 196 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 63 KiB cursors, history streaming, sparse-index lookups and checksums |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB frame-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
 | Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |

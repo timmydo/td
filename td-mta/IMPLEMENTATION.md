@@ -814,6 +814,15 @@ service activation. Each part lands independently:
     failure; allocation probes reuse existing caller arenas at both root bounds.
     Checkpoint publication, final reference validation and live pins remain
     integration work.
+  - **M05d11 — selected point lookup:** implemented a complete selected-table
+    replay that retains only the matching row in a separate caller buffer.
+    Completion exposes the final row/sequence or absence only after digest/EOF
+    and residual-overlay validation. Tests cover unchanged/replaced/inserted/
+    deleted/absent rows, variable and zero-byte values, wrong keys, short result
+    buffers, early finish and late corruption. The allocation probe exercises
+    lookup success/refusal at both root bounds. The ledger separately charges
+    maximum record and result buffers. Whole-graph reference validation and
+    runtime pin ownership remain coordinator work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

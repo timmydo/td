@@ -87,6 +87,7 @@ pub fn run(mut snapshot: impl FnMut()) {
     }
     let table_probe = super::super::table::prepare_probe(&short.root);
     drop(super::super::table::prepare_probe(&long.root));
+    let mut lookup_value = vec![0; crate::format::MAX_VALUE_BYTES];
     let mut table_scratch = [0; crate::format::table::MAX_RECORD_BYTES];
     let history_probe = super::super::history::prepare_probe(&short.root);
     drop(super::super::history::prepare_probe(&long.root));
@@ -128,6 +129,15 @@ pub fn run(mut snapshot: impl FnMut()) {
             &mut history_scratch,
             &mut overlay_cells,
             &mut table_scratch,
+        );
+        super::super::table::probe_lookup(
+            &fixture.root,
+            &table_probe,
+            &active_probe,
+            &mut history_scratch,
+            &mut overlay_cells,
+            &mut table_scratch,
+            &mut lookup_value,
         );
         super::super::input::probe_recovery(
             &fixture.root,

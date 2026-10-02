@@ -1043,6 +1043,28 @@ actual view pins/barriers, all-table and final-reference validation, and staged
 output durability/publication still belong to the coordinator. No ReadView,
 transaction or recovery activation is granted by completion.
 
+`TableInput::into_lookup` validates the requested key and table, then creates
+that same selected replay with a borrowed target key and separate caller result
+buffer. Each advance performs one replay step and copies only the matching
+row value and last-change sequence. No match or absence is exposed until
+finish validates the complete selected table and drains residual overlay rows.
+CompleteLookup retains CompleteReplay and exposes a borrowed final row or
+absence for that table/prefix. The row borrows caller result storage, so it may
+outlive the completion wrapper; into_parts can transfer the proof and row
+separately. Neither accessor creates a pin or prolongs one beyond its owner.
+It does not validate cross-row references or
+create a live view pin. Result bytes on an error remain provisional scratch.
+
+Every lookup scans the whole selected table; it cannot stop at a candidate or
+assume absence when the remaining input fails. The caller admits the table's
+byte/record work and checks deadlines between steps and around finish. An
+undersized result buffer fails with OutputFull when the matching row is copied;
+absent and zero-byte row values need no result capacity. Such failure retires
+the replay. RESOURCES.md reserves distinct maximum record and result buffers;
+there is no allocation or whole-table inventory in lookup. This provides the
+bounded scan fallback for final-reference validation; indexing and whole-graph
+recovery coordination remain separate work.
+
 Sparse key/offset indexes and folder/date/search indexes are disposable disk files
 with bounded caches; their sizes are not RAM reservations. An absent index
 permits a bounded-work sequential scan or explicit temporary resource error.
