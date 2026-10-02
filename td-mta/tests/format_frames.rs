@@ -707,3 +707,222 @@ fn incremental_frame_integrity_and_provider_failures_refuse_completion() {
     stream.push(&bytes[64..92]).unwrap();
     assert!(stream.finish(&bytes[92..]).is_ok());
 }
+
+fn incremental_journal_frame<'s, C: Crypto>(
+    verifier: &mut td_mta::format::journal_stream::changes::Verifier<'_, C>,
+    bytes: &[u8],
+    cells: &'s mut [td_mta::frame_changes::Cell],
+) -> Result<td_mta::frame_changes::CompleteChanges<'s>, JournalError> {
+    let mut pending = verifier.begin(&bytes[..64], cells)?;
+    assert_eq!(pending.header().frame_bytes, bytes.len());
+    let mut offset = 64;
+    while offset < bytes.len() - 40 {
+        let length = td_mta::format::operation::extent(&bytes[offset..offset + 12])?;
+        pending.push(&bytes[offset..offset + length])?;
+        offset += length;
+    }
+    pending.finish(&bytes[offset..])
+}
+
+#[test]
+fn incremental_journals_match_whole_frame_summaries_and_retained_changes() {
+    use td_mta::{format::journal_stream::changes, frame_changes::Cell};
+    let hdr = journal(0);
+    let first = hex(include_str!("fixtures/format-v1/frame-put-blob.hex"));
+    let second = hex(include_str!("fixtures/format-v1/frame-delete-change.hex"));
+    let mut whole = Verifier::new(&Provider, &hdr).unwrap();
+    let mut stream = changes::Verifier::new(&Provider, &hdr).unwrap();
+    assert_eq!(stream.header(), whole.header());
+    let mut cells = [Cell::EMPTY; 2];
+    for bytes in [&first, &second] {
+        let frame = whole.push(bytes).unwrap();
+        let expected: Vec<_> = frame
+            .operations()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                if let Value::Change(change) = entry.operation.value() {
+                    Some((frame.header().sequence, entry.ordinal, change))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let complete = incremental_journal_frame(&mut stream, bytes, &mut cells).unwrap();
+        assert_eq!(complete.summary().header(), frame.header());
+        assert_eq!(
+            complete.summary().digest().as_slice(),
+            &bytes[bytes.len() - 32..]
+        );
+        assert_eq!(
+            complete
+                .records()
+                .map(|record| (
+                    record.cursor.sequence,
+                    record.cursor.operation as usize,
+                    record.change
+                ))
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    let summary = stream.finish().unwrap();
+    assert_eq!(summary, whole.finish().unwrap());
+    assert_eq!(
+        summary.digest(),
+        hash(&[hdr.as_slice(), &first, &second].concat())
+    );
+    for incremental_first in [false, true] {
+        let mut mixed = Verifier::new(&Provider, &hdr).unwrap();
+        if incremental_first {
+            incremental_journal_frame(&mut mixed, &first, &mut cells).unwrap();
+            mixed.push(&second).unwrap();
+        } else {
+            mixed.push(&first).unwrap();
+            incremental_journal_frame(&mut mixed, &second, &mut cells).unwrap();
+        }
+        assert_eq!(mixed.finish(), Ok(summary));
+    }
+    for base in [0, u64::MAX] {
+        let hdr = journal(base);
+        assert_eq!(
+            changes::Verifier::new(&Provider, &hdr).unwrap().finish(),
+            Verifier::new(&Provider, &hdr).unwrap().finish()
+        );
+    }
+    assert!(std::mem::size_of::<changes::Verifier<'_, Provider>>() <= 512);
+    assert!(std::mem::size_of::<changes::Pending<'_, '_, '_, Provider>>() <= 2048);
+}
+
+#[test]
+fn incomplete_failed_and_abandoned_incremental_frames_retire_their_journal() {
+    use td_mta::{format::journal_stream::changes, frame_changes::Cell};
+    let hdr = journal(0);
+    let bytes = deletes(1, 1);
+    let mut cells = [Cell::EMPTY; 2];
+    for push in [false, true] {
+        let mut stream = changes::Verifier::new(&Provider, &hdr).unwrap();
+        {
+            let mut pending = stream.begin(&bytes[..64], &mut cells).unwrap();
+            if push {
+                pending.push(&bytes[64..92]).unwrap();
+            }
+        }
+        let expected = JournalError::Journal(Error::Format(F::Truncated));
+        assert!(matches!(stream.begin(&bytes[..64], &mut cells), Err(e) if e == expected));
+        assert_eq!(stream.push(&bytes), Err(expected));
+        assert_eq!(stream.finish(), Err(expected));
+    }
+    for mode in 0..4 {
+        let mut stream = changes::Verifier::new(&Provider, &hdr).unwrap();
+        let mut pending = stream.begin(&bytes[..64], &mut cells).unwrap();
+        let error = if mode == 0 {
+            let error = pending.push(&bytes[64..91]).unwrap_err();
+            assert_eq!(pending.push(&bytes[64..92]), Err(error));
+            assert!(matches!(pending.finish(&bytes[92..]), Err(e) if e == error));
+            error
+        } else {
+            if mode != 1 {
+                pending.push(&bytes[64..92]).unwrap();
+            }
+            let mut footer = bytes[92..].to_vec();
+            if mode == 2 {
+                *footer.last_mut().unwrap() ^= 1;
+            }
+            if mode == 3 {
+                footer.push(0);
+            }
+            pending.finish(&footer).err().unwrap()
+        };
+        assert!(matches!(stream.begin(&bytes[..64], &mut cells), Err(e) if e == error));
+        assert_eq!(stream.finish(), Err(error));
+    }
+    let bytes = hex(include_str!("fixtures/format-v1/frame-delete-change.hex"));
+    let mut stream = changes::Verifier::new(&Provider, &journal(1)).unwrap();
+    let error = incremental_journal_frame(&mut stream, &bytes, &mut [])
+        .err()
+        .unwrap();
+    assert_eq!(error, JournalError::Journal(Error::Format(F::OutputFull)));
+    assert_eq!(stream.finish(), Err(error));
+}
+
+#[test]
+fn incremental_journal_caps_sequence_and_crypto_faults_are_terminal() {
+    use td_mta::{format::journal_stream::changes, frame_changes::Cell};
+    let mut cells = [Cell::EMPTY; 1];
+    let hdr = journal(0);
+    let mut bytes_limited = changes::Verifier::new(&Provider, &hdr).unwrap();
+    for sequence in 1..=4 {
+        incremental_journal_frame(&mut bytes_limited, &maximum(sequence), &mut cells).unwrap();
+    }
+    let limit = JournalError::Journal(Error::Format(F::Limit));
+    assert!(matches!(bytes_limited.begin(&deletes(5, 1)[..64], &mut cells), Err(e) if e == limit));
+    assert_eq!(bytes_limited.finish(), Err(limit));
+    let mut operation_limited = changes::Verifier::new(&Provider, &hdr).unwrap();
+    for sequence in 1..=2 {
+        incremental_journal_frame(&mut operation_limited, &deletes(sequence, 4096), &mut cells)
+            .unwrap();
+    }
+    assert!(matches!(operation_limited.begin(&[], &mut cells), Err(e) if e == limit));
+    assert_eq!(operation_limited.finish(), Err(limit));
+    let mut byte_overshoot = Verifier::new(&Provider, &hdr).unwrap();
+    for sequence in 1..=3 {
+        incremental_journal_frame(&mut byte_overshoot, &maximum(sequence), &mut cells).unwrap();
+    }
+    incremental_journal_frame(&mut byte_overshoot, &deletes(4, 1), &mut cells).unwrap();
+    assert!(matches!(byte_overshoot.begin(&maximum(5)[..64], &mut cells), Err(e) if e == limit));
+    assert_eq!(byte_overshoot.finish(), Err(limit));
+    let mut operation_overshoot = Verifier::new(&Provider, &hdr).unwrap();
+    incremental_journal_frame(&mut operation_overshoot, &deletes(1, 4096), &mut cells).unwrap();
+    incremental_journal_frame(&mut operation_overshoot, &deletes(2, 1), &mut cells).unwrap();
+    assert!(
+        matches!(operation_overshoot.begin(&deletes(3, 4096)[..64], &mut cells), Err(e) if e == limit)
+    );
+    assert_eq!(operation_overshoot.finish(), Err(limit));
+    for previous in [1, u64::MAX] {
+        let mut stream = changes::Verifier::new(&Provider, &journal(previous)).unwrap();
+        let error = stream
+            .begin(&deletes(1, 1)[..64], &mut cells)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            if previous == 1 {
+                JournalError::Frame(DecodeError::Invalid(Error::Format(F::InvalidValue)))
+            } else {
+                JournalError::Journal(Error::Format(F::Exhausted))
+            }
+        );
+        assert_eq!(stream.finish(), Err(error));
+    }
+    let bytes = deletes(1, 1);
+    let baseline = FaultCrypto::new(usize::MAX);
+    let mut stream = changes::Verifier::new(&baseline, &hdr).unwrap();
+    incremental_journal_frame(&mut stream, &bytes, &mut cells).unwrap();
+    stream.finish().unwrap();
+    let steps = baseline.0.step.load(Ordering::Relaxed);
+    assert_eq!(steps, 20);
+    for at in 1..=steps {
+        let expected = match at {
+            4 => JournalError::Journal(Error::Checksum),
+            10 | 18 => JournalError::Frame(DecodeError::Invalid(Error::Checksum)),
+            7 | 8 | 9 | 11 | 12 | 14 | 16 | 17 => {
+                JournalError::Frame(DecodeError::Invalid(Error::Crypto(CryptoError::Crypto)))
+            }
+            _ => JournalError::Journal(Error::Crypto(CryptoError::Crypto)),
+        };
+        let crypto = FaultCrypto::new(at);
+        match Verifier::new(&crypto, &hdr) {
+            Err(error) => assert_eq!(error, expected),
+            Ok(mut stream) => match incremental_journal_frame(&mut stream, &bytes, &mut cells) {
+                Err(error) => {
+                    assert_eq!(error, expected);
+                    let used = crypto.0.step.load(Ordering::Relaxed);
+                    assert!(matches!(stream.begin(&bytes[..64], &mut cells), Err(e) if e == error));
+                    assert_eq!(stream.finish(), Err(error));
+                    assert_eq!(crypto.0.step.load(Ordering::Relaxed), used);
+                }
+                Ok(_) => assert_eq!(stream.finish(), Err(expected)),
+            },
+        }
+    }
+}

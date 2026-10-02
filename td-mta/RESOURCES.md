@@ -734,6 +734,16 @@ There is no new pool or frame arena. Future history/change cursor integration
 must prove its collection and input scratch overlap within the admitted view;
 this codec alone grants no completed cursor or new reservation.
 
+The incremental journal-change entry point uses the existing journal verifier's
+provider borrow, checked header, digest and scalar progress/error state; its compiled Provider
+layout is capped at 512 bytes. Pending owns the existing Collector and borrows
+that parent exclusively, with a compiled ceiling of 2 KiB. Both are charged
+to the worker stack. Change slots remain in their separate 96 KiB reservation,
+operation input uses the existing record region, and no journal/frame arena
+is added. The allocation interval covers combined journal/change completion
+and an abandoned frame. Runtime I/O scheduling and complete-worker stack/RSS
+qualification remain unimplemented.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a

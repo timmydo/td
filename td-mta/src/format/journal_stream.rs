@@ -2,10 +2,13 @@
 use super::{
     container::{Error as ContainerError, JournalHeader},
     frame::{CheckedHeader, DecodeError, Frame},
+    frame_header::Header,
     Error as FormatError, Sequence, JOURNAL_HEADER_BYTES, MAX_JOURNAL_FRAME_BYTES,
     MAX_JOURNAL_OPERATIONS, MIN_FRAME_BYTES,
 };
 use crate::ports::{Crypto, CryptoError, Digest};
+
+pub mod changes;
 
 /// Retains the distinction between frame errors and journal-wide validation errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,7 +119,7 @@ impl<'c, C: Crypto> Verifier<'c, C> {
         }
         result
     }
-    fn push_frame<'a>(&mut self, bytes: &'a [u8]) -> Result<Frame<'a>, Error> {
+    fn check_frame_start(&self) -> Result<(), Error> {
         self.through.successor()?;
         let remaining = MAX_JOURNAL_FRAME_BYTES
             .checked_sub(self.frame_bytes)
@@ -124,22 +127,27 @@ impl<'c, C: Crypto> Verifier<'c, C> {
         if remaining < MIN_FRAME_BYTES || self.operations == MAX_JOURNAL_OPERATIONS {
             return Err(FormatError::Limit.into());
         }
-        let checked = CheckedHeader::read(self.crypto, self.through, bytes)?;
-        let header = checked.header();
+        Ok(())
+    }
+    fn admit_header(&self, header: Header) -> Result<(usize, usize), Error> {
         let frame_bytes = self
             .frame_bytes
             .checked_add(header.frame_bytes)
             .ok_or(FormatError::Overflow)?;
-        if frame_bytes > MAX_JOURNAL_FRAME_BYTES {
-            return Err(FormatError::Limit.into());
-        }
         let operations = self
             .operations
             .checked_add(header.operations)
             .ok_or(FormatError::Overflow)?;
-        if operations > MAX_JOURNAL_OPERATIONS {
+        if frame_bytes > MAX_JOURNAL_FRAME_BYTES || operations > MAX_JOURNAL_OPERATIONS {
             return Err(FormatError::Limit.into());
         }
+        Ok((frame_bytes, operations))
+    }
+    fn push_frame<'a>(&mut self, bytes: &'a [u8]) -> Result<Frame<'a>, Error> {
+        self.check_frame_start()?;
+        let checked = CheckedHeader::read(self.crypto, self.through, bytes)?;
+        let header = checked.header();
+        let (frame_bytes, operations) = self.admit_header(header)?;
         let frame = checked.finish(self.crypto)?;
         self.digest.update(bytes)?;
         self.through = header.sequence;

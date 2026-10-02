@@ -859,6 +859,15 @@ service activation. Each part lands independently:
     failure. Separate per-view change scratch permits interleaved row lookups;
     the existing allocation probe covers bounded collection after preparation.
     Physical history input, cursor policy and real ReadView pins remain future.
+  - **M05d14c — incremental journal changes:** implemented checked journal
+    headers and exclusive pending frames over the change collector. Validate
+    sequence and aggregate budgets before operations, hash all supplied bytes
+    including footer checksums, and return the existing journal Summary only
+    after every begun frame finishes. Abandonment and all errors retire the
+    parent. Tests compare whole-frame summaries, retained changes, empty and
+    exhausted bases, journal caps, frame errors and crypto faults. The existing
+    allocation interval exercises completion and abandonment. File input,
+    selected history/prefix binding and ReadView cursor activation follow.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

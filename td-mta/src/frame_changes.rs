@@ -45,6 +45,10 @@ impl<'c, 's, C: Crypto> Collector<'c, 's, C> {
             failed: None,
         })
     }
+    /// Checked frame header only; payload and checksum completion remain pending.
+    pub const fn header(&self) -> crate::format::frame_header::Header {
+        self.verifier.header()
+    }
     /// One exact operation; row bodies are validated and then discarded.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if let Some(error) = self.failed {

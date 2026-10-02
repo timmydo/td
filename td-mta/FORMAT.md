@@ -389,6 +389,29 @@ suffix is absent. M05d owns physical EOF, exact committed-prefix consumption,
 invoking the selected-file checks, incomplete physical-tail recovery and
 selected graph publication; the byte codecs do not truncate, scan ahead or
 perform I/O.
+`journal_stream::changes::Verifier` reexports the same journal Verifier, adding
+begin/Pending to feed one operation at a time into a frame-change Collector.
+Whole-frame push and incremental begin share sequence, byte/operation admission,
+digest and completion state; callers may mix complete frames and completed
+incremental frames in one stream. Beginning a
+frame checks its header, next sequence and aggregate byte/operation ceilings.
+Begin hashes the exact frame header before returning Pending. The Pending
+frame holds an exclusive parent borrow and hashes operations and the complete
+footer, including its checksum. Frame completion returns only its compact checked changes.
+Journal counters/through-sequence advance only after both frame verification
+and the journal hash update succeed. The supplied journal can finish empty.
+
+Beginning immediately marks the parent incomplete. Any begin/push/finish error
+is terminal for that parent; discarding Pending without successful finish
+leaves a Truncated journal error, even if all operations had been supplied.
+Later push/begin/finish calls refuse and no summary can omit an abandoned frame.
+Insufficient caller change slots report Journal(Format(OutputFull)), a resource
+refusal rather than invalid frame bytes; provider failures retain their cause.
+No operation/body buffer is retained; the caller owns the separate change slots.
+Frames and their changes remain provisional until external selected-file and
+final-view checks pass. This interface does not implement file input, tail
+repair, cursor positioning, view pins or physical EOF.
+
 Retained-history I/O completion is implemented by the private adapter in
 [STORAGE.md](STORAGE.md#streaming-retained-history). Captured active-frame
 validation uses the same frame decoder with separate prefix completion and

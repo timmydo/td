@@ -1263,6 +1263,29 @@ fn store_complete_frames() {
     assert!(stream.push(bytes.get(..131).unwrap()).is_err());
     assert!(stream.push(&bytes).is_err());
     assert!(stream.finish().is_err());
+    Operation::change(
+        td_mta::format::ObjectType::Email,
+        td_mta::ports::ChangeAction::Updated,
+        &[4; 16],
+    )
+    .encode(bytes.get_mut(64..92).unwrap())
+    .unwrap();
+    seal(&crypto, Sequence::from_u64(1), 1, &mut bytes).unwrap();
+    let mut cells = [td_mta::frame_changes::Cell::EMPTY; 1];
+    let mut changes =
+        td_mta::format::journal_stream::changes::Verifier::new(&crypto, &header_bytes).unwrap();
+    let mut pending = changes.begin(bytes.get(..64).unwrap(), &mut cells).unwrap();
+    pending.push(bytes.get(64..92).unwrap()).unwrap();
+    let complete = pending.finish(bytes.get(92..).unwrap()).unwrap();
+    assert_eq!(complete.records().next().unwrap().change.id, [4; 16]);
+    assert_eq!(changes.finish().unwrap().operations(), 1);
+    let mut changes =
+        td_mta::format::journal_stream::changes::Verifier::new(&crypto, &header_bytes).unwrap();
+    {
+        let mut pending = changes.begin(bytes.get(..64).unwrap(), &mut cells).unwrap();
+        pending.push(bytes.get(64..92).unwrap()).unwrap();
+    }
+    assert!(changes.finish().is_err());
 }
 
 fn mailbox_parent_walks() {
