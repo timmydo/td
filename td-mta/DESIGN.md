@@ -105,6 +105,11 @@ An owned data-validation pass composes the reference, recipient, mailbox
 and blob sweeps through that reader, compares their counts with physical
 replay, and retains stopped ownership on completion. Recovery repair/accounting,
 mutation policy and service activation remain separate.
+A bounded account-verification entry point now loads actual CURRENT, captures
+and replays the prefix, and drives selected-file and data checks under one
+monotonic deadline. It returns owner-bound summaries with reusable scratch;
+incomplete tails are reported without repair. The inspection CLI is still
+unimplemented.
 Complete mutation-policy validation and mail publication remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory

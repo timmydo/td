@@ -829,6 +829,21 @@ CheckedData retaining the file proof/owner, while releasing reader scratch.
 Any error retires the coordinator; repair/accounting, mutation policy, runtime
 leases and service activation remain separate.
 
+`StoppedStore::verify_account` loads actual CURRENT and composes capture,
+digest-bound overlay loading, selected-file validation and data validation.
+VerifyLimits supplies all existing phase bounds plus one absolute deadline;
+VerifyScratch supplies caller-owned partitions. Limits are admitted by each
+phase before its work; malformed later-phase limits may follow earlier I/O.
+Outer pre/post checks bracket
+every stage/step/completion, and the same clock wrapper tracks monotonic samples
+from nested readers. Late outer clock errors take precedence and report Policy
+without phase context, replacing any operation error. Other failures retain
+their phase/source. Failures yield no report and may overwrite scratch. VerifiedAccount
+retains only stopped ownership and scalar completion summaries, allowing all
+scratch reuse. Incomplete tails are reported without repair. This is a blocking
+offline library API; CLI/JSON, full mutation policy, recovery accounting and
+service activation remain separate.
+
 `store_fs::HistorySweep` verifies every retained selected history segment,
 admitting total descriptor bytes and frames before I/O. Advances open, read one
 bounded frame, or complete one selected file; only digest/EOF completion releases

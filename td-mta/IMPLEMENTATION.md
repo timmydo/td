@@ -1016,6 +1016,14 @@ service activation. Each part lands independently:
     Compare reloaded prefix digests and test same-size valid replacement refusal
     and dropping the capture before using the handed-off overlay.
     Compile-fail cases pin owner retention and absence of a repair method.
+  - **M05d28 — stopped account verification:** implemented one bounded library
+    entry point from actual CURRENT selection through capture, overlay, physical
+    files and final-data checks. Apply one monotonic deadline across all stages
+    and nested readers; return owner-bound summaries after releasing all scratch
+    and input descriptors. Tests cover actual selection, empty/tail/blob cases,
+    phase failures, admission, clock failures/regressions and final deadline.
+    Preserve tails without repair. CLI/JSON, complete mutation policy, recovery
+    accounting and activation remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

@@ -521,6 +521,47 @@ longer needed. No repair method or raw ScannedJournal escapes.
 Table/history/blob/reference validation still follows before any service
 activation, and incomplete tails still require separately authorized repair.
 
+### Verifying a stopped account
+
+`StoppedStore::verify_account` now performs the complete implemented offline
+verification path for one account: read FORMAT and actual CURRENT/manifest,
+capture the active complete prefix, load its digest-bound overlay, validate
+all selected tables/history, then direct references, recipient queue states,
+mailbox parent chains and every final blob's length/hash/EOF. No caller-supplied
+selection or committed boundary can substitute for CURRENT in this entry point.
+It uses the existing stable private namespace and cooperative lock contract.
+
+VerifyLimits carries the physical journal ceiling, file/replay and read-work
+limits, data row/parent/blob limits and one absolute deadline. Each phase admits
+its own limits before its work; a malformed later-phase limit can follow earlier
+I/O. Every constructor,
+advance and consuming completion has an outer clock check before and after its
+work. The nested data reader uses the same clock wrapper and monotonic high
+watermark, so clock regression across phases also refuses. A late outer clock
+error takes precedence over an operation error and reports Policy without phase
+context, discarding that operation error. Deadline checks cannot interrupt
+blocking std I/O; full-frame capture and overlay loading remain bounded but
+indivisible work units. The offline reader still scans a selected table per
+lookup; this entry point makes no query-performance claim.
+
+VerifyScratch borrows the existing metadata, 1 MiB recovery frame, up to 4 MiB
+replay frames/8192 overlay cells, operation record, change slots and key/value
+partitions. Physical validation transfers record/change scratch to the data
+reader. Capture's descriptor is dropped after overlay handoff; all remaining
+read descriptors close before return. Other failures retain their
+phase/source. Failure never yields a partial report and may overwrite scratch.
+It performs no repair or
+publication. Incomplete active tail bytes remain unchanged and are reported.
+
+VerifiedAccount contains the selected CURRENT, derived identity, journal byte
+and tail report, and physical/data completion counts. It borrows only the stopped
+owner, so all scratch can be reused while the report keeps mutation access
+unavailable. The scalar getters are inspection summaries, not runtime leases.
+This proves the implemented structural and data checks only: complete mutation
+policy, recovery accounting/orphan handling, authorized tail repair, runtime
+leases and service activation remain separate. The planned store verify command
+and JSON interface are not implemented by this library entry point.
+
 ### Validating final references and blob data
 
 `CheckedFiles::validate_data` borrows one ValidationView and the same stopped

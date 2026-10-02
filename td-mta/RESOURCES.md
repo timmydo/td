@@ -189,7 +189,8 @@ still account for those costs and concurrent owners within the ledger.
   releases that borrow for reuse, with no new arena. Overlay loading still uses
   the existing 4 MiB replay arena: the 1 MiB scratch suffices only for prefixes
   whose frame bytes fit. Comparing the two prefix digests adds no I/O. Each
-  advance/finish still requires caller admission and deadline checks. The retained scan descriptor
+  advance/finish still requires caller admission and deadline checks. The
+  retained scan descriptor
   overlaps the reopened prefix descriptor during overlay loading; release the
   capture after handoff. No descriptor registry or serving lease is implied.
   Tests allocate their frame storage before scanning; full-worker stack and
@@ -210,6 +211,17 @@ still account for those costs and concurrent owners within the ledger.
   temporaries. Whole-worker stack qualification remains pending. Existing record
   scratch is shared across row reads and change steps; retained change slots
   remain separate. No arena, per-operation collection or thread is added.
+  The blocking verify_account composition borrows these existing partitions
+  together: selection, 1 MiB recovery frame, 4 MiB replay bytes, overlay cells,
+  record/change slots and key/value buffers. It allocates no additional arena.
+  The frame scratch is idle after capture; physical validation transfers its
+  record/change buffers into data validation. The capture descriptor is dropped
+  after overlay loading, and all input descriptors close before return. Its
+  VerifiedAccount summary fits 2 KiB and borrows only the stopped owner. Local
+  coordinator construction/moves and nested reader temporaries still require
+  whole-worker stack qualification; no process RSS or composed allocation
+  measurement is claimed here. One fixed atomic watermark lets outer and nested
+  clock samples share regression/deadline checks without an allocated registry.
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
   that input to a temporary; complete worker-stack qualification remains pending.

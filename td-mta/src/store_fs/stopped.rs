@@ -24,6 +24,10 @@ pub use validation::{
     ValidationView,
 };
 
+#[path = "stopped/verify.rs"]
+mod verify;
+pub use verify::{VerifiedAccount, VerifyError, VerifyLimits, VerifyScratch};
+
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.
 /// Stable operator-controlled paths and cooperating external writers are still required.
 pub struct StoppedStore {
