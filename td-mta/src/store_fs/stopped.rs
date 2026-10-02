@@ -30,8 +30,9 @@ mod verify;
 pub use verify::{probe_journal_publication, probe_pinned_reads, probe_verify_account};
 pub use verify::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
-    OwnedVerifyError, PinnedReadError, PinnedReadRequest, PinnedReadScratch, VerifiedAccount,
-    VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
+    OwnedVerifyError, PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead,
+    ReadPoolError, ReadScratchPool, ReadScratchSlot, VerifiedAccount, VerifiedStore, VerifyError,
+    VerifyLimits, VerifyScratch,
 };
 
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.

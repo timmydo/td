@@ -26,7 +26,8 @@ mod publication;
 pub use publication::{probe_journal_publication, probe_pinned_reads};
 pub use publication::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
-    PinnedReadError, PinnedReadRequest, PinnedReadScratch,
+    PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead, ReadPoolError,
+    ReadScratchPool, ReadScratchSlot,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

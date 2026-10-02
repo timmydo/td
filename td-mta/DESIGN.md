@@ -123,8 +123,11 @@ its writer; a deadline failure following publication can leave visible
 durable state without acknowledgment. Each pin can lend a bounded ReadView
 scope over its captured prefix, with caller scratch, full physical-file checks
 and one monotonic deadline. Later appended bytes stay invisible to old readers,
-which do not hold the writer lock. Runtime scratch-pool leases,
-checkpoint/retention transitions and protocol mutations remain unimplemented.
+which do not hold the writer lock. A fixed read scratch pool now pairs each
+lease with a captured pin and returns both on drop. Startup verifies and
+clears caller backing; captures and reads allocate no new backing. Worker
+scheduling, live checkpoint/retention transitions and protocol mutations
+remain unimplemented.
 
 Complete mutation-policy validation and mail publication remain unimplemented.
 A one-frame append primitive now validates a successor against a complete

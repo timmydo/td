@@ -1105,8 +1105,15 @@ service activation. Each part lands independently:
     temporary cleanup and pin disposal; require every Rust allocator counter
     unchanged. Fixtures, arena creation and session startup/teardown stay cold.
     Small fixtures do not qualify maximum data, native allocation or worker RSS.
+  - **M05e3f — admitted read scratch pool:** implemented exact backing checks
+    and startup touching for fixed slots. Capture pairs a moved partition with
+    a committed pin; refusal/drop returns resources without holding slot locks
+    across I/O, publication locking or callbacks. Scoped thread handoff and
+    retries reuse the same backing. Capacity, contention, poison and mismatched
+    admission refuse explicitly. Existing memory reservations cover the
+    bookkeeping; pool allocation and whole-worker qualification remain open.
   - **M05e3 — committed visibility:** runtime integration remains pending.
-    Connect scoped queries to admitted scratch-pool leases; retain
+    Connect pooled queries to worker ownership and queue admission; retain
     generation/history ownership across live checkpoint and retention changes.
     Keep the durable append/publication ordering and fault oracles before
     exposing any SMTP/JMAP acknowledgment path.

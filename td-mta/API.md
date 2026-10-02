@@ -852,8 +852,33 @@ pins can query their old prefix while the session appends beyond it; no
 writer/publication lock is held during reads or callbacks. Tables and retained
 history stay immutable throughout the session. This deliberately rechecks
 physical files per scope and scans tables per row query; it is a bounded
-fallback, not a performance qualification. Runtime scratch-pool leasing,
-blob-body reads and checkpoint/retention transitions remain separate.
+fallback, not a performance qualification. Blob-body reads and live
+checkpoint/retention transitions remain separate.
+
+ReadScratchSlot::new takes caller-owned PinnedReadScratch at startup,
+requires exact admitted replay-byte, replay-cell and change-cell extents,
+checks the fixed selection/record/layout ceilings, then clears the backing.
+Refusal precedes clearing. ReadScratchPool::new exclusively borrows an array
+of these slots; its length must equal ResourcePlan's storage_views. The pool
+allocates nothing and is borrowed by each lease, preventing reconstruction
+or backing reuse while a lease exists. Startup reads slot state through
+exclusive access without locking. A deliberately forgotten lease leaves its
+slot unavailable and prevents reconstruction of that slot array.
+
+ReadScratchPool::capture requires the session's view count to match. It tries
+at most that many slot locks, moves available scratch into a private lease,
+releases the slot lock, then captures a committed pin. Capture refusal returns
+the scratch. Full capacity, temporary lock contention, observed poison and
+invalid backing are distinct ReadPoolError cases; a journal refusal preserves
+its source. Observed poison fails that acquisition and is never cleared.
+
+PooledRead owns the pin and scratch lease and is Send + Sync, but querying
+requires an exclusive borrow. Its with_read_view reuses the existing scope
+checks; read failures retain the lease for retry. No slot lock spans I/O,
+publication locking or callbacks. Drop returns the pin and backing even after
+callback unwind; it briefly locks each owner separately. Backing remains
+provisional data between uses and has no secure-erasure guarantee. Startup
+allocation and the protocol worker/queue ownership remain caller duties.
 
 JournalSession::commit serializes one immutable frame under a separate
 writer mutex. It installs a frame-only reservation, advances bounded
@@ -872,8 +897,8 @@ for capture/publication contain no I/O or clock callbacks. Blocking
 filesystem calls and lock acquisition remain uninterruptible.
 
 The caller admits full frame work and supplies its actual recovered ledger
-and planned view count. Complete transaction/blob policy, read scratch
-leases, checkpoint/retention changes and protocol acknowledgment remain
+and planned view count. Complete transaction/blob policy, live
+checkpoint/retention changes and protocol acknowledgment remain
 external. No selected namespace change is available during this
 fixed-generation session.
 

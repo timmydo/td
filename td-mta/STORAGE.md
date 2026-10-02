@@ -613,15 +613,32 @@ but releases all temporary descriptors and borrows; the pin may be reused.
 A query failure alone does not retire the serialized writer.
 
 The exclusive pin borrow allows one reader scope per admitted captured slot;
-no reader or scratch borrow escapes the callback. No I/O or callback holds the
-publication mutex or writer mutex. Existing namespace ownership keeps selected
-tables/history immutable and prevents reclamation. Active-prefix readers stop
-at their captured offset even if a later append is complete, partial or failed.
-Only this owned session path permits queries concurrently with physical
-append; standalone append still requires stopped-store exclusion. This
-increment adds no namespace mutation, blob reader or runtime scratch-pool
-lease. Revalidating files per scope and rescanning tables per row is a bounded
+no reader or scratch borrow escapes the callback. No I/O or callback holds
+the publication mutex or writer mutex. Existing namespace ownership keeps
+selected tables/history immutable and prevents reclamation. Active-prefix
+readers stop at their captured offset even if a later append is complete,
+partial or failed. Only this owned session path permits queries concurrently
+with physical append; standalone append still requires stopped-store
+exclusion. This scope adds no namespace mutation or blob reader.
+Revalidating files per scope and rescanning tables per row is a bounded
 fallback; full-service performance and allocation qualification remain open.
+
+A ReadScratchPool exclusively borrows the admitted fixed slot array. Each
+slot receives and clears exact-size replay bytes/cells and change cells plus
+fixed selection/record backing before admission. A capture moves backing out
+of one slot before borrowing a committed identity; failure returns it. The
+resulting PooledRead retains both resources until drop and can cross a scoped
+thread boundary. It lends the existing query callback through an exclusive
+borrow, allowing retry with the same backing after query failure. The pool
+count must match both ResourcePlan and the session's configured view count.
+
+Slot acquisition uses bounded try-lock scanning. Full capacity, contention,
+observed poison and incompatible backing refuse explicitly. Drop briefly
+locks only to return backing and preserves poison; no slot lock surrounds
+read I/O, publication locking or user callbacks. Returned scratch is reused
+without a per-query allocation or erasure promise. No lease can outlive its
+pool or session. Worker scheduling, queue tickets and live namespace changes
+remain separate; this is the admitted scratch ownership boundary.
 
 A commit reserves one frame, performs bounded write/sync/confirmation and
 exact ledger reconciliation, releases the empty reservation, then replaces

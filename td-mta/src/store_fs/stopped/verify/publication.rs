@@ -14,6 +14,10 @@ use crate::{
 };
 use std::sync::{atomic::AtomicU64, Mutex, TryLockError};
 
+#[path = "publication/pool.rs"]
+mod pool;
+pub use pool::{PooledRead, ReadPoolError, ReadScratchPool, ReadScratchSlot};
+
 #[path = "publication/read.rs"]
 mod read;
 pub use read::{PinnedReadError, PinnedReadRequest, PinnedReadScratch};
@@ -777,7 +781,7 @@ mod tests {
         }
     }
 
-    fn read_request() -> PinnedReadRequest {
+    pub(super) fn read_request() -> PinnedReadRequest {
         let limits = super::super::tests::limits();
         PinnedReadRequest {
             overlay_bytes: limits.capture_bytes,
@@ -793,7 +797,9 @@ mod tests {
             },
         }
     }
-    fn inspect_reader(view: &mut dyn crate::ports::ReadView) -> Result<u64, PolicyError> {
+    pub(super) fn inspect_reader(
+        view: &mut dyn crate::ports::ReadView,
+    ) -> Result<u64, PolicyError> {
         use crate::{
             format::{key::Key, Table},
             ids::BlobId,
@@ -1273,12 +1279,12 @@ mod tests {
         });
     }
 
-    struct TestClock {
+    pub(super) struct TestClock {
         calls: AtomicU64,
         fault: u64,
     }
     impl TestClock {
-        fn new(fault: u64) -> Self {
+        pub(super) fn new(fault: u64) -> Self {
             Self {
                 calls: AtomicU64::new(0),
                 fault,
@@ -1294,7 +1300,7 @@ mod tests {
             })
         }
     }
-    trait CommitFixture {
+    pub(super) trait CommitFixture {
         fn commit_fixture(
             &self,
             crypto: &Provider,
@@ -1325,27 +1331,27 @@ mod tests {
             panic!("unrelated ticket issuance never released admission");
         }
     }
-    fn deadline() -> Deadline {
+    pub(super) fn deadline() -> Deadline {
         Deadline::after(Tick(0), 100).unwrap()
     }
-    fn start() -> JournalStart {
+    pub(super) fn start() -> JournalStart {
         JournalStart {
             max_bytes: 4096,
             deadline: deadline(),
             views: 2,
         }
     }
-    fn budget() -> FrameBudget {
+    pub(super) fn budget() -> FrameBudget {
         FrameBudget::new(160, 2).unwrap()
     }
-    fn frame(sequence: u64) -> Vec<u8> {
+    pub(super) fn frame(sequence: u64) -> Vec<u8> {
         let mut bytes = super::super::super::super::active::fixture::hex(include_str!(
             "../../../../tests/fixtures/format-v1/frame-delete-change.hex"
         ));
         format::frame::seal(&Provider, Sequence::from_u64(sequence), 2, &mut bytes).unwrap();
         bytes
     }
-    fn with_ledger(run: impl FnOnce(WriterLedger<'_>)) {
+    pub(super) fn with_ledger(run: impl FnOnce(WriterLedger<'_>)) {
         with_ledger_usage(160, 2, run);
     }
     fn with_ledger_usage(bytes: u64, operations: u64, run: impl FnOnce(WriterLedger<'_>)) {

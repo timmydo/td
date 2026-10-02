@@ -285,20 +285,21 @@ still account for those costs and concurrent owners within the ledger.
   teardown remain cold. It uses small 160-byte frames and requires all
   allocator counters unchanged, including frees. This does not qualify
   maximum datasets, concurrent worker stacks, native allocation, session
-  startup or whole-service RSS. Runtime read scratch-pool leasing remains
-  pending; query scopes are qualified separately below.
+  startup or whole-service RSS. Runtime read scratch-pool leasing is
+  described below; query scopes are qualified separately below.
 
   Pinned query preparation borrows one captured pin exclusively and reuses
   caller selection, replay frame/cell, record and change partitions. Its
   5032-byte SelectionScratch uses 5 KiB of the existing 292 KiB cursor/value
-  reservation, leaving 58 KiB for cursor/history/index/checksum state. It keeps
-  one LoadedOverlay descriptor while the existing table/history sweeps reuse
-  record/change scratch, then lends ValidationView (the existing 4 KiB state
-  bound) only within a callback. No second recovery-frame arena or heap-owned
-  reader is created. File validation and full-table row scans repeat per scope
-  and query respectively; this is a bounded fallback. Actual pool admission
-  and the complete preparation/query stack still need qualification. No
-  per-pin heap, new worker or additional arena is admitted.
+  reservation. Pool bookkeeping takes another 1 KiB, leaving 57 KiB for
+  cursor/history/index/checksum state. It keeps one LoadedOverlay descriptor
+  while the existing table/history sweeps reuse record/change scratch, then
+  lends ValidationView (the existing 4 KiB state bound) only within a
+  callback. No second recovery-frame arena or heap-owned reader is created.
+  File validation and full-table row scans repeat per scope and query
+  respectively; this is a bounded fallback. The complete preparation/query
+  stack still needs qualification. No per-pin heap, new worker or additional
+  arena is admitted.
 
   The Rust allocation probe measures complete pinned read scopes in sixteen
   intervals at short and maximum roots. Cases cover successful get/next/change
@@ -311,6 +312,19 @@ still account for those costs and concurrent owners within the ledger.
   and owner teardown remain cold. Every counter, including frees and peak,
   must remain unchanged. These small empty-final-state and short-history
   fixtures do not qualify maximum data, native allocation, worker stacks or
+  whole-service RSS.
+
+  ReadScratchSlot checks exact admitted replay-byte/cell and change-cell
+  extents before clearing all backing at startup. ReadScratchPool
+  exclusively borrows exactly storage_views slots and moves a partition into
+  one private lease per capture. Per-view bookkeeping reserves 1 KiB from
+  the existing cursor/value allowance: slot at most 256 bytes, pooled reader
+  at most 512 bytes, and pool at most 64 bytes (conservatively charged per
+  view). Runtime constructors enforce those compiled layout ceilings. No
+  arena size or total changes. Capture is a bounded try-lock scan; drop
+  briefly locks to return backing, without resetting poison. No lock spans
+  query I/O or callbacks. These ownership tests do not qualify complete
+  worker stacks, allocations across pool operations, service startup or
   whole-service RSS.
 
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
@@ -616,7 +630,7 @@ concrete structures require a ledger amendment before admission is enabled.
 | Reservation | Partition |
 | --- | --- |
 | Body work, 96 KiB/job | Six 8 KiB nested-decode rings (NestedPartId::MAX_STEPS); 16 KiB parser/boundary/locator state; 32 KiB conversion/output |
-| Read cursor/value, 292 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 58 KiB cursors, history streaming, sparse-index lookups and checksums; 96 KiB retained frame changes |
+| Read cursor/value, 292 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 57 KiB cursors, history streaming, sparse-index lookups and checksums; 96 KiB retained frame changes |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB frame-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
 | Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |
