@@ -1052,6 +1052,12 @@ service activation. Each part lands independently:
     constructor refusal, every append fault, every abandonment phase and failed
     bookkeeping. Account/generation ownership, work/deadline orchestration and
     final mutation policy remain caller responsibilities.
+  - **M05e2b — append allocation probe:** implemented sixteen observation
+    intervals over short/maximum roots and success, short-write, failure and
+    abandonment cases. Measure reservation creation, std append and exact
+    reconciliation/disposal with every allocator counter unchanged. Keep scan,
+    frame construction and fixture lifecycle cold; worker stack, maximum data
+    and whole-service RSS qualification remain separate.
   - **M05e3 — committed visibility:** planned; publish sequence and byte offset
     together only after durable append and reservation reconciliation, retaining
     selected-generation ownership for readers. Add crash/fault ordering oracles

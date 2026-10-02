@@ -16,6 +16,8 @@ use std::{
 
 #[path = "append/reserved.rs"]
 mod reserved;
+#[cfg(test)]
+pub use reserved::probe_reserved_append;
 pub use reserved::{ReconciledAppend, ReservedAppend, ReservedAppendError};
 
 const MAX_WRITE_CALLS: usize = 64;
@@ -327,7 +329,9 @@ mod tests {
     };
     use td_crypto::Provider;
     pub(super) fn setup() -> (Fixture, LockedRoot, ProbeBytes) {
-        let dir = Fixture::new();
+        setup_with(Fixture::new())
+    }
+    pub(super) fn setup_with(dir: Fixture) -> (Fixture, LockedRoot, ProbeBytes) {
         let root = dir.locked();
         root.create_accounts_directory().unwrap();
         selection::prepare_probe(&root);

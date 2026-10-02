@@ -79,6 +79,8 @@ pub use temporary::{
 };
 
 #[cfg(test)]
+pub use input::probe_reserved_append;
+#[cfg(test)]
 pub use stopped::probe_verify_account;
 #[cfg(test)]
 pub use temporary::probe::run as probe_temporary_io;

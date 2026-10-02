@@ -13,6 +13,8 @@ use std::{
 #[path = "input/recovery.rs"]
 mod recovery;
 #[cfg(test)]
+pub use recovery::probe_reserved_append;
+#[cfg(test)]
 pub(super) use recovery::{prepare_probe as prepare_recovery_probe, probe as probe_recovery};
 #[cfg(test)]
 pub(super) use recovery::{prepare_repair_probe, probe_repair};

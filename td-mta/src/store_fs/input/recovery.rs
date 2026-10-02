@@ -19,6 +19,8 @@ use std::io;
 
 #[path = "recovery/append.rs"]
 mod append;
+#[cfg(test)]
+pub use append::probe_reserved_append;
 pub use append::{
     AppendError, AppendStep, JournalAppend, ReconciledAppend, ReservedAppend, ReservedAppendError,
     SyncedAppend,

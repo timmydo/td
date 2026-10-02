@@ -140,6 +140,9 @@ impl<'r> ReservedAppend<'r, '_, '_, '_> {
 }
 
 #[cfg(test)]
+pub use tests::probe as probe_reserved_append;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::super::tests::{many, next, scan, setup, Faults};
@@ -388,6 +391,85 @@ mod tests {
                     assert!(!unchanged.has_incomplete_tail());
                 },
             );
+        }
+    }
+    pub fn probe(mut snapshot: impl FnMut()) {
+        use super::super::super::super::super::tests::Fixture;
+        use super::super::tests::setup_with;
+        for maximum in [false, true] {
+            use std::io::ErrorKind;
+            for (fault, abandon_steps, expected_error) in [
+                (None, None, None),    // ordinary production path
+                (Some(0), None, None), // successful short writes
+                (Some(1), None, Some(ErrorKind::StorageFull)),
+                (Some(4), None, Some(ErrorKind::Other)),
+                (Some(6), None, Some(ErrorKind::InvalidData)),
+                (None, Some(0), None), // abandon before writing
+                (None, Some(1), None), // abandon after writing
+                (None, Some(3), None), // abandon after confirmation
+            ] {
+                let fixture = if maximum {
+                    Fixture::maximum_root()
+                } else {
+                    Fixture::new()
+                };
+                let (_dir, root, selection) = setup_with(fixture);
+                let frame = next(3);
+                let scanned = scan(&root, &selection);
+                with_ledger(160, 2, |ledger| {
+                    let mut ops = fault.map(Faults::new);
+                    snapshot();
+                    let grant = grant(ledger, 1000, 4);
+                    let mut append = scanned
+                        .append_reserved(&Provider, &frame, ledger, grant.frame().unwrap(), Tick(2))
+                        .unwrap();
+                    if let Some(steps) = abandon_steps {
+                        for _ in 0..steps {
+                            append.advance().unwrap();
+                        }
+                        drop(append);
+                        stopped(ledger, grant);
+                    } else {
+                        let mut complete = false;
+                        for _ in 0..70 {
+                            let step = match ops.as_mut() {
+                                Some(ops) => append.advance_using(ops),
+                                None => append.advance(),
+                            };
+                            match step {
+                                Ok(AppendStep::Complete) => {
+                                    complete = true;
+                                    break;
+                                }
+                                Ok(_) => (),
+                                Err(ReservedAppendError::Append(AppendError::Indeterminate(e))) => {
+                                    assert_eq!(Some(e.kind()), expected_error);
+                                    break;
+                                }
+                                Err(e) => panic!("unexpected reserved append error: {e}"),
+                            }
+                        }
+                        assert_eq!(complete, expected_error.is_none());
+                        if complete {
+                            {
+                                let evidence = append.finish().unwrap();
+                                assert_eq!(evidence.durable().end(), 416);
+                            }
+                            assert_eq!(ledger.used(Kind::ActiveJournalBytes).unwrap(), 320);
+                            assert_eq!(ledger.used(Kind::ActiveJournalOperations).unwrap(), 4);
+                            ledger.cancel(grant).unwrap();
+                            assert_eq!(ledger.pending(Kind::BodyBytes).unwrap(), 0);
+                        } else {
+                            assert!(matches!(
+                                append.finish(),
+                                Err(ReservedAppendError::Append(AppendError::Failed))
+                            ));
+                            stopped(ledger, grant);
+                        }
+                    }
+                    snapshot();
+                });
+            }
         }
     }
 }

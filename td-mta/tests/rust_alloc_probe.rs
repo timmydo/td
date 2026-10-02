@@ -823,6 +823,17 @@ fn store_verify_account() {
     }
 }
 
+fn store_reserved_append() {
+    let mut samples = [COUNTERS.snapshot(); 32];
+    let mut slots = samples.iter_mut();
+    measured_store_fs::probe_reserved_append(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "reservation-bound journal append allocated");
+    }
+}
+
 fn journal_overlay() {
     use td_mta::{
         format::{
@@ -1033,6 +1044,7 @@ fn main() {
     {
         store_temporary_files();
         store_verify_account();
+        store_reserved_append();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1109,6 +1121,7 @@ fn main() {
     store_directories();
     store_temporary_files();
     store_verify_account();
+    store_reserved_append();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

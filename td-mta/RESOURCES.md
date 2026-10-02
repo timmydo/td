@@ -189,7 +189,19 @@ still account for those costs and concurrent owners within the ledger.
   only the durable evidence and fits 1 KiB. The guard allocates no
   ledger, arena or reservation cells. Caller-owned fixed quota/slot backing is
   reused, with full charges retained on abandonment until recovery. Production
-  stack/allocation qualification remains pending for this composed append path.
+  stack and maximum-data allocation qualification remain pending for this path.
+  The dedicated allocation process measures reservation creation and physical
+  append through terminal reconciliation/disposal in sixteen intervals: short
+  and maximum roots, each with ordinary completion, successful short writes,
+  partial write failure, sync failure, final-length refusal, and abandonment
+  before writing, after writing and after confirmation. Every allocator counter
+  must remain identical, including frees, failures and live/peak bytes. Ordinary
+  completion and abandonment use the public advance and production Real I/O;
+  short-write and failure scenarios use the injected operations. Root,
+  selection, scan, encoded frame and ledger backing are prepared before each
+  interval; fixture cleanup and ledger destruction follow it. This uses small
+  frames and injected failure boundaries, not maximum-size datasets, native
+  allocation, worker-stack or whole-service RSS qualification.
   JournalAppend and SyncedAppend each fit 1 KiB of Provider state. An append
   borrows the existing immutable transaction-frame buffer until finish/drop and
   keeps one writable descriptor after comparing it to the consumed scan's
