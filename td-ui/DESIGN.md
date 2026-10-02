@@ -2315,8 +2315,14 @@ from markup or a feed rather than finds in shown text (td-news's links
 and an article's own link), whose ends the markup gives, so a `)`, a
 quote or a trailing `.` the text rule leaves out is kept: it must be an
 `http://` or `https://` scheme, in any case, with at least one byte
-after it and hold no whitespace or control character, so it too is one
-word and no option. `open::file` is the one other target: a local file
+after it, that not a further `/`, and hold no whitespace, control
+character or backslash, so it too is one word and no option, and the
+host a browser opens is the one its text names: a browser reads `\` as
+`/` and skips slashes after the scheme, so
+`https://evil.example\x.example/` and `https:///evil.example/` would
+open `evil.example`. td-term's
+OSC 8 links pass the same test (`open::is_url`) before they are ruled,
+shown or followed. `open::file` is the one other target: a local file
 the program wrote (td-news's digest), which must be an absolute UTF-8
 path and is given as a `file://` URL with every byte but an unreserved
 one or `/` percent-encoded. The portal's `OpenURI` refuses `file`

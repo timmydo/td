@@ -676,16 +676,19 @@ A cell written in an OSC 8 link the model remembers, whose URI is an
 `http://` or `https://` URL (`open::is_url`), is that link, whatever the
 row's text around it spells: a Control-press there follows the URI,
 through td-ui's URL opener (`open::url_on`), and a link the text holds is
-not read. An OSC 8 link with any other scheme is no link, and the cell's
-row is read as text as ever, so a child cannot make a press open a file or
-a program through it. Because the URI need not be what the cells say,
-hovering such a link shows it on a status line, `link: ` and the URI, over
-the view's last row, or its first while the link has a cell on the last
-and the pointer is not on the first. A URI too long for the row loses its
-path to an ellipsis, and then its authority's head, so that the end of the
-host, its registrable name, stays shown. A Control-press on a row a status
-line covers, in the frame on the screen or the one in flight to replace
-it, follows nothing: what is under it is hidden.
+not read. An OSC 8 link with any other scheme, with a backslash, which a
+browser reads as `/`, or with a `/` after the scheme's, which it skips,
+so that the host it opens is not the one the status line shows, is no
+link, and the cell's row is read as text as ever, so a child cannot make
+a press open a file or a program through it. Because the URI need not be
+what the cells say, hovering such a link shows it on a status line,
+`link: ` and the URI, over the view's last row, or its first while the
+link has a cell on the last and the pointer is not on the first. A URI
+too long for the row loses its path to an ellipsis, and then its
+authority's head, so that the end of the host, its registrable name,
+stays shown. A Control-press on a row a status line covers, in the frame
+on the screen or the one in flight to replace it, follows nothing: what
+is under it is hidden.
 
 While the pointer is over the surface and Control alone is held, the
 link a press there would follow is ruled (`Snapshot::with_link`): a

@@ -58,15 +58,20 @@ pub fn url_on(url: &str, command: Option<&str>, display: Option<&Path>) -> Resul
 }
 
 /// Whether `url` is one `url` opens: an `http://` or `https://` scheme in
-/// any case, at least one byte after it, and no whitespace or control
-/// character.
+/// any case, at least one byte after it and that not a further `/`, and
+/// no whitespace, control character or backslash. A browser reads `\`
+/// as `/` and skips slashes after the scheme, so a URL holding either
+/// opens a host other than the one its text appears to name.
 pub fn is_url(url: &str) -> bool {
     let rest = ["https://", "http://"].into_iter().find_map(|scheme| {
         url.get(..scheme.len())
             .filter(|head| head.eq_ignore_ascii_case(scheme))
             .and_then(|_| url.get(scheme.len()..))
     });
-    !rest.is_none_or(str::is_empty) && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+    !rest.is_none_or(|rest| rest.is_empty() || rest.starts_with('/'))
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
 }
 
 /// Runs the browser, as `link` does, on a local file the program wrote
@@ -271,10 +276,61 @@ mod tests {
             "https://x\ty",
             "https://x\u{7f}",
             "https://x\u{85}",
+            // Schemes a page or a program could act on, never opened.
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "DATA:text/html,x",
+            "javascript://e.example/%0aalert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "mailto:a@e.example",
+            "vbscript:x",
+            "https:e.example",
+            "https:/e.example",
+            "http:e.example",
+            "HTTPS:e.example",
+            "https://e.example/\u{1b}]8;;x",
+            // The browser's host would be evil.example.
+            "https://evil.example\\x.accounts.google.com/",
+            "https://e.example/a\\b",
+            // An empty authority: the browser skips to evil.example.
+            "https:///evil.example/",
+            "http:////evil.example/",
         ] {
             let error = url(text, UNSTARTABLE).unwrap_err();
             assert_eq!(error, format!("not a link: {text}"));
         }
+    }
+
+    /// A URL is one word wherever the command puts it, quoted or not, and
+    /// nothing in it is read as the command's: neither its quotes, a
+    /// shell's metacharacters, nor a `{url}` of its own, which is left as
+    /// it is rather than replaced again.
+    #[test]
+    fn a_hostile_url_is_one_word_and_never_expanded() {
+        let hostile = "https://e.example/\"';$(id)`id`&|<>{url}%7Burl%7D";
+        assert!(is_url(hostile));
+        for command in [
+            "b --new-tab {url}",
+            "b --new-tab \"{url}\"",
+            "b --new-tab '{url}'",
+            "b --new-tab",
+        ] {
+            assert_eq!(
+                argv(hostile, Some(command), None).unwrap(),
+                ["b", "--new-tab", hostile],
+                "{command}"
+            );
+        }
+        assert_eq!(
+            argv(hostile, Some("b --url={url}"), None).unwrap(),
+            ["b", &format!("--url={hostile}")]
+        );
+        // Quotes inside a word are the command's own, kept as written.
+        assert_eq!(
+            argv(hostile, Some("b --url=\"{url}\""), None).unwrap(),
+            ["b", &format!("--url=\"{hostile}\"")]
+        );
     }
 
     #[test]

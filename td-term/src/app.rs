@@ -4472,6 +4472,24 @@ mod tests {
             ))
         );
         window.output(b"\x1b]8;;\x07").unwrap();
+        // Nor is a javascript: one, one whose backslash a browser reads
+        // as a slash, or one whose host the browser finds past a further
+        // slash, over text that holds no link.
+        window
+            .output(b"\x1b[12;1H\x1b]8;;javascript:alert(1)\x07click\x1b]8;;\x07")
+            .unwrap();
+        window
+            .output(b"\x1b[13;1H\x1b]8;;https://evil.example\\x.e.example/\x07click\x1b]8;;\x07")
+            .unwrap();
+        window
+            .output(b"\x1b[14;1H\x1b]8;;https:///evil.example/\x07click\x1b]8;;\x07")
+            .unwrap();
+        for row in [11, 12, 13] {
+            let cell = window.model.as_ref().unwrap().cell(row, 0).unwrap();
+            assert_ne!(cell.attributes.link, 0, "the model keeps it");
+            let at = (128, i32::try_from(row).unwrap() * 16 * 256 + 128);
+            assert_eq!(window.target_at(at), None);
+        }
         // The file URI is no link: the text under it is read instead.
         let below = (5 * 8 * 256 + 128, 16 * 256 + 128);
         assert_eq!(
