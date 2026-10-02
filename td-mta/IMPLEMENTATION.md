@@ -991,6 +991,13 @@ service activation. Each part lands independently:
     Tests cover present/deleted rows, ordered EOF, history/active continuations,
     short capacity, budgets, clock/cursor errors and late refusal. Full logical
     validation, runtime leases and service activation remain separate.
+  - **M05d25 — final queue consistency:** implemented current recipient
+    phase/retry/uncertainty/reason and required reply-code checks in the existing
+    recipient sweep. Exact groups now require correct completedAt/notification
+    state and submission-wide cancellation, retaining only scalar flags. Tests
+    exercise all states, definitive/uncertain results, historical replies,
+    retryable unknowns, group combinations and sticky sweep failures. Transition
+    history, worker fences and complete logical graph integration remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

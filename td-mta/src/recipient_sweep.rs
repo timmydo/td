@@ -1,14 +1,22 @@
-//! Exact recipient ordinal coverage in one supplied final view.
+//! Recipient coverage and queue consistency in one supplied final view.
+#[path = "recipient_sweep/state.rs"]
+mod state;
 use crate::{
     format::{self, key::Key, row::Row, Table},
     ids::SubmissionId,
     ports::{self, ReadView, ViewIdentity},
 };
+pub use state::QueueError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     View(ports::Error),
     Format(format::Error),
     ChangedView,
+    Queue {
+        submission: SubmissionId,
+        ordinal: Option<u32>,
+        error: QueueError,
+    },
     Missing {
         submission: SubmissionId,
         ordinal: u32,
@@ -57,6 +65,7 @@ struct Group {
     id: SubmissionId,
     count: u32,
     next: u32,
+    state: state::Group,
 }
 pub struct Sweep {
     identity: ViewIdentity,
@@ -177,6 +186,7 @@ impl Sweep {
                     id,
                     count: row.recipient_count,
                     next: 0,
+                    state: state::Group::new(row),
                 });
                 self.phase = Phase::Recipient;
                 self.submissions = self
@@ -188,7 +198,7 @@ impl Sweep {
                     count: row.recipient_count,
                 }
             }
-            (Phase::Recipient, Key::Recipient(id, ordinal), Row::Recipient(_)) => {
+            (Phase::Recipient, Key::Recipient(id, ordinal), Row::Recipient(row)) => {
                 if self
                     .last_recipient
                     .is_some_and(|prior| prior >= (id, ordinal))
@@ -213,6 +223,11 @@ impl Sweep {
                         ordinal: group.next,
                     });
                 }
+                group.state.recipient(row).map_err(|error| Error::Queue {
+                    submission: id,
+                    ordinal: Some(ordinal),
+                    error,
+                })?;
                 if self.rows >= self.max_rows {
                     return Err(Error::RowLimit);
                 }
@@ -221,6 +236,11 @@ impl Sweep {
                     .checked_add(1)
                     .ok_or(Error::Format(format::Error::Overflow))?;
                 if group.next == group.count {
+                    group.state.finish().map_err(|error| Error::Queue {
+                        submission: id,
+                        ordinal: None,
+                        error,
+                    })?;
                     self.group = None;
                     self.phase = Phase::Submission;
                 }
@@ -256,7 +276,7 @@ impl Sweep {
         })
     }
 }
-/// Counts/ordinals over supplied rows only; pins, physical completeness and queue policy stay external.
+/// Coverage and current queue consistency; physical completeness and transition authority stay external.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompleteCoverage {
     identity: ViewIdentity,
@@ -276,7 +296,7 @@ impl CompleteCoverage {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 pub(crate) mod tests {
     use super::*;
     use crate::{
@@ -299,7 +319,7 @@ pub(crate) mod tests {
             history_floor: Sequence::default(),
         }
     }
-    fn submission(count: u32) -> Row<'static> {
+    pub(super) fn submission(count: u32) -> Row<'static> {
         Row::Submission(SubmissionRow {
             email: EmailId::from_bytes([1; 16]),
             thread: ThreadId::from_bytes([2; 16]),
@@ -314,7 +334,7 @@ pub(crate) mod tests {
             notification_email: None,
         })
     }
-    fn recipient() -> Row<'static> {
+    pub(super) fn recipient() -> Row<'static> {
         Row::Recipient(RecipientRow {
             address: "to@example.test",
             state: RecipientState::Queued,
@@ -342,6 +362,8 @@ pub(crate) mod tests {
         wrong_table: bool,
         future: bool,
         repeat: Option<Table>,
+        submission_state: Option<SubmissionRow<'static>>,
+        recipient_state: Option<RecipientRow<'static>>,
     }
     impl<'a> View<'a> {
         fn new(submissions: &'a [(u8, u32)], recipients: &'a [(u8, u32)]) -> Self {
@@ -357,6 +379,8 @@ pub(crate) mod tests {
                 wrong_table: false,
                 future: false,
                 repeat: None,
+                submission_state: None,
+                recipient_state: None,
             }
         }
     }
@@ -402,9 +426,19 @@ pub(crate) mod tests {
             };
             for &(identifier, n) in rows {
                 let (source, row) = if table == Table::Submissions {
-                    (Key::Submission(id(identifier)), submission(n))
+                    (
+                        Key::Submission(id(identifier)),
+                        self.submission_state
+                            .map(Row::Submission)
+                            .unwrap_or_else(|| submission(n)),
+                    )
                 } else {
-                    (Key::Recipient(id(identifier), n), recipient())
+                    (
+                        Key::Recipient(id(identifier), n),
+                        self.recipient_state
+                            .map(Row::Recipient)
+                            .unwrap_or_else(recipient),
+                    )
                 };
                 let length = source.encode(key).map_err(|_| ports::Error::Capacity)?;
                 if self.repeat != Some(table) && after.is_some_and(|prior| prior >= &key[..length])
@@ -716,5 +750,104 @@ pub(crate) mod tests {
         );
         assert_eq!(view.calls, 2);
         assert!(matches!(sweep.finish(), Err(Error::Failed)));
+    }
+    #[test]
+    fn queue_failures_retire_before_group_completion() {
+        let Row::Submission(mut sub) = submission(1) else {
+            panic!("fixture");
+        };
+        let Row::Recipient(mut rec) = recipient() else {
+            panic!("fixture");
+        };
+        for mode in 0..3 {
+            let mut view = View::new(&[(1, 1)], &[(1, 0)]);
+            match mode {
+                0 => {
+                    rec.next_attempt_at = None;
+                    view.recipient_state = Some(rec);
+                }
+                1 => {
+                    sub.completed_at = Some(-1);
+                    view.submission_state = Some(sub);
+                }
+                _ => {
+                    sub.completed_at = None;
+                    sub.notification = NotificationState::Pending;
+                    view.submission_state = Some(sub);
+                }
+            }
+            let mut sweep = Sweep::new(identity(), 2);
+            assert!(matches!(
+                sweep
+                    .advance(&mut view, &mut [0; 20], &mut [0; 512])
+                    .unwrap(),
+                Step::Submission { .. }
+            ));
+            assert_eq!(
+                sweep.advance(&mut view, &mut [0; 20], &mut [0; 512]),
+                Err(Error::Queue {
+                    submission: id(1),
+                    ordinal: if mode == 0 { Some(0) } else { None },
+                    error: match mode {
+                        0 => QueueError::RecipientState,
+                        1 => QueueError::Completion,
+                        _ => QueueError::Notification,
+                    },
+                })
+            );
+            let calls = view.calls;
+            assert_eq!(
+                sweep.advance(&mut view, &mut [], &mut []),
+                Err(Error::Failed)
+            );
+            assert_eq!(view.calls, calls);
+            assert!(matches!(sweep.finish(), Err(Error::Failed)));
+        }
+    }
+    #[test]
+    fn completed_groups_and_canceled_notice_history_survive_full_sweep() {
+        for state in [
+            RecipientState::Failed,
+            RecipientState::Canceled,
+            RecipientState::OutcomeUnknown,
+        ] {
+            for notification in [NotificationState::Pending, NotificationState::Stored] {
+                let Row::Submission(mut sub) = submission(1) else {
+                    panic!("fixture");
+                };
+                sub.completed_at = Some(-1);
+                sub.notification = notification;
+                sub.notification_email = (notification == NotificationState::Stored)
+                    .then_some(EmailId::from_bytes([9; 16]));
+                let Row::Recipient(mut rec) = recipient() else {
+                    panic!("fixture");
+                };
+                rec.state = state;
+                rec.next_attempt_at = None;
+                rec.reason = if state == RecipientState::Canceled {
+                    FailureReason::Canceled
+                } else {
+                    FailureReason::Expired
+                };
+                if state == RecipientState::OutcomeUnknown {
+                    rec.attempt = Some(AttemptId::from_bytes([8; 16]));
+                    rec.attempt_count = 1;
+                    rec.last_attempt_at = Some(0);
+                    rec.phase = AttemptPhase::Final;
+                    rec.uncertain = true;
+                }
+                let mut view = View::new(&[(1, 1)], &[(1, 0)]);
+                view.submission_state = Some(sub);
+                view.recipient_state = Some(rec);
+                let mut sweep = Sweep::new(identity(), 2);
+                for _ in 0..4 {
+                    sweep
+                        .advance(&mut view, &mut [0; 20], &mut [0; 512])
+                        .unwrap();
+                }
+                assert!(sweep.is_complete());
+                assert_eq!(sweep.finish().unwrap().recipients(), 1);
+            }
+        }
     }
 }

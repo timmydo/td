@@ -846,8 +846,11 @@ configured depth policy remain external.
 through one next per advance, preserving ordered progress in both tables. It
 requires both streams exhausted before completion and refuses missing/extra/
 orphan rows, malformed sources, changed identity and total-row exhaustion.
-Completion records coverage counts only; queue state policy, selected physical
-completeness and actual pins remain separate.
+Recipient state and whole-group completion/notification/cancellation rules from
+QUEUE.md are checked before completing each group. Queue errors identify the
+submission and optionally its recipient ordinal. Completion records coverage
+counts; transition history, worker fencing, selected physical completeness and
+actual pins remain separate.
 
 `store_fs::ChangeRoute` selects the source for a NeedFrame sequence using
 selected manifest metadata and captured ViewIdentity. It validates retained

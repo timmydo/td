@@ -83,7 +83,8 @@ Direct owning references now have a bounded supplied-row checker with at most
 two lookups. A supplied-view sweep now enumerates direct checks in bounded
 steps with fixed counts; physical graph completeness and remaining aggregate
 invariants still need coordination. An ordered recipient sweep now verifies exact
-submission recipient-count/ordinal coverage separately from queue state policy.
+submission recipient-count/ordinal coverage and current queue state/group
+consistency. Attempt transitions and worker fences remain separate.
 A mailbox sweep now enumerates and roots every supplied parent chain with
 separate row/get budgets and no growing visited set. A blob sweep connects
 final rows to private-file, chunked digest and EOF verification under finite

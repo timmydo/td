@@ -145,6 +145,9 @@ still account for those costs and concurrent owners within the ledger.
   key/value result partitions. A finite combined row allowance covers both
   streams. Allocation instrumentation covers exact multiple-group and empty
   coverage with fixed input slices; no recipient collection is constructed.
+  Queue consistency adds only scalar group flags and borrowed reply-code checks,
+  preserving the 512-byte state bound and one-next-per-advance contract. No
+  separate queue scan, string copy or allocation is added.
   Mailbox Sweep retains one ParentWalk, previous mailbox ID and scalar
   progress; compiled state fits 512 bytes on the worker stack. It reuses caller
   key/value outputs and adds no arena or visited set. Separate total row/get

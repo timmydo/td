@@ -1123,10 +1123,30 @@ captured identity and submission/recipient counts. Errors retire the checker;
 failed/unfinished state cannot finish, and repeated completion still checks view
 identity without another read.
 
-This checks ordinal coverage and local row encoding only. CompleteCoverage does
-not establish physical view completeness, direct owning references, queue state
-transitions, completedAt/notification policy or actual pins. The caller composes
-those validations under the same immutable view. Each step needs admission and
+Each recipient also obeys QUEUE.md's current-state phase, retry-presence,
+uncertainty and failure-reason rules. Accepted requires positive RCPT and final
+DATA reply codes; definitive SMTP failure/retry requires the applicable stored
+negative code. Unattempted recipients cannot carry replies. Code/separator
+checks do not replace wire parsing or full JMAP reply normalization. Historical
+replies alone never authorize an attempt result or prove its fence.
+
+For each exact group, completedAt must be present exactly when no recipient
+has a future dispatch obligation. Retryable OutcomeUnknown remains pending;
+terminal OutcomeUnknown contributes a failure requiring a Pending/Stored notice.
+Unknown is terminal exactly for Expired/SmtpPermanent; other allowed reasons
+must retain a next attempt.
+A notice is required for a completed group containing Failed or OutcomeUnknown.
+A completed, wholly Canceled group may retain an earlier Pending/Stored failure
+notice; cancellation alone creates no notice. Remaining groups require None. Cancellation is
+submission-wide: a group cannot mix Canceled with other states. Only scalar
+flags are retained; completedAt is not compared with sendAt because a wall-clock
+step can put completion earlier. Queue errors carry the submission and an
+optional recipient ordinal; a group error appears at its final recipient.
+
+CompleteCoverage establishes these current-row/group rules, not physical view
+completeness, direct owning references, transition history, worker fencing,
+creation authorization or actual pins. The caller composes those validations
+under the same immutable view. Each step needs admission and
 deadline checks for the supplied view's full next operation; one logical lookup
 is not a physical I/O/time limit. Fixed progress and 20-byte cursor scratch use
 the worker stack; caller key/value result partitions are reused.

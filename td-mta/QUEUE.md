@@ -68,8 +68,10 @@ Accepted requires positive RCPT and positive final DATA replies, reason None.
 Failed requires a permanent SMTP refusal or Expired; route/authentication
 failures cannot directly produce it. RetryWait requires at least one attempt
 and a temporary/network/TLS/authentication/protocol reason, with uncertainty
-false. Unknown uses Uncertain, or the later failure/expiry reason (even while
-retry eligible). Any unsuccessful attempt with an earlier uncertainty latch
+false. Unknown uses Uncertain, or the later failure/expiry reason. It has a next
+attempt exactly when the reason is neither Expired nor SmtpPermanent; a
+permanent refusal stops retries while the uncertainty latch remains visible.
+Other failure reasons preserve a retry until expiry, including route pauses. Any unsuccessful attempt with an earlier uncertainty latch
 returns OutcomeUnknown, never RetryWait/Failed. InFlight
 starts with reason None. The uncertainty bit is latched once any attempt may
 have accepted; later definitive failures cannot clear it. Accepted may retain
@@ -77,6 +79,14 @@ that bit to expose an earlier duplicate risk. All state changes produce an
 EmailSubmission-updated CHANGE in the same frame, even when only local
 diagnostics change. Mailbox/Email/Thread changes are added only when their
 objects actually change (for example a local failure notice).
+
+Recovery's `recipient_sweep::Sweep` enforces the current-state combinations
+above after local row-codec checks, along with exact ordinal coverage and the
+completedAt/notification/whole-submission cancellation rules below. It checks
+required reply codes and separators, not full JMAP normalization. This is a
+final-view consistency check: retained replies do not establish transition
+history, worker identity or a valid fence. Those remain transaction/dispatcher
+obligations. Queue errors identify the submission and optional recipient ordinal.
 
 ## 3. Attempt and restart transitions
 
@@ -191,7 +201,11 @@ queued recipients can cancel together, but a large attempted submission with
 long reply history may require explicit refusal. Failed recipients with no
 uncertainty can become Canceled together
 with all remaining recipients: the guarantee is that no recipient received
-the message. Neither CLI nor JMAP offers partial cancellation in v1. A later
+the message. Cancellation preserves an existing Pending or Stored failure
+notice and its historical Email ID. It does not create a new notice merely
+because a recipient became Canceled; recovery therefore permits all three
+notification states on a completed, wholly Canceled submission.
+Neither CLI nor JMAP offers partial cancellation in v1. A later
 worker result with an old attempt/fence is rejected before writing state.
 
 completedAt is set once every recipient has no future dispatch obligation;
