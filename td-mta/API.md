@@ -774,6 +774,15 @@ key bytes before reusing value scratch, and reports row/table progress separatel
 from completion. Completion carries row counts and the same UTC sample; full
 physical graph/aggregate validity, parent chains, blobs and pins stay external.
 
+`store_fs::HistorySweep` verifies every retained selected history segment,
+admitting total descriptor bytes and frames before I/O. Advances open, read one
+bounded frame, or complete one selected file; only digest/EOF completion releases
+its full change-slot buffer to the next segment. Finish returns selected CURRENT,
+checkpoint and counts plus the original slots. Progress is provisional; active
+prefixes, tables, final-row invariants and actual pins remain separate. Reaching
+a selected endpoint stops frame decoding; remaining bytes fail completion.
+Insufficient change slots report ChangeCapacity, with no corruption claim.
+
 `store_fs::TableSweep` verifies and replays every selected checkpoint table
 against a supplied LoadedOverlay. Constructor admits total selected file bytes;
 merge callbacks enforce a total final-row allowance. Each advance opens, steps

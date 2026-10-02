@@ -142,6 +142,7 @@ pub fn run(mut snapshot: impl FnMut()) {
             &mut history_scratch,
             &mut overlay_cells,
         );
+        super::super::history::probe_sweep(&fixture.root, &history_probe, &mut table_scratch);
         super::super::table::probe_sweep(
             &fixture.root,
             &table_probe,

@@ -18,6 +18,14 @@ use crate::{
 };
 use std::io;
 
+#[path = "history/sweep.rs"]
+mod sweep;
+#[cfg(test)]
+pub(super) use sweep::probe as probe_sweep;
+pub use sweep::{
+    CompleteHistorySweep, HistorySweep, HistorySweepError, HistorySweepLimits, HistorySweepStep,
+};
+
 pub struct HistoryInput<'r, 'c, 'm, 'b, C: Crypto> {
     stream: FrameInput<'c, 'b, C, StoreReader<'r>>,
     crypto: &'c C,

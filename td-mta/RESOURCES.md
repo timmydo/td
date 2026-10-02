@@ -172,6 +172,13 @@ still account for those costs and concurrent owners within the ledger.
   byte totals are admitted before table I/O and a finite row allowance covers
   final merge output. Per-step overlay work retains Merge's bounded cost.
   Allocation probes cover all-table replay and scratch reuse at both roots.
+  HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
+  its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
+  that input to a temporary; complete worker-stack qualification remains pending.
+  Existing record scratch and full change slots are reused across segments.
+  Descriptor byte/frame totals are admitted before I/O; each frame retains the
+  operation reader's existing work bound. No arena or journal buffer is added.
+  Allocation probes cover selected completion and slot reclaim at both roots.
   Frame-change collection has its own 4096 slots of at most 24 bytes each,
   a separate 96 KiB reservation per view. Retained changes may coexist with
   get/next result storage; their memory never aliases those partitions. This

@@ -962,6 +962,14 @@ service activation. Each part lands independently:
     deletion overlays, exact/short admission, missing late files and changed
     final extents. Allocation probes check both root bounds. Retained history,
     cross-row/blob checks, actual view pins and activation remain separate.
+  - **M05d21 — complete retained-history validation:** implemented sequencing
+    over every selected descriptor with aggregate byte/frame admission and one
+    reusable change-slot slice. Each step opens, reads one frame or verifies a
+    selected segment; completion returns exact selection/counts and slots.
+    Tests cover empty/multiple/maximal history, admission/capacity errors,
+    missing late segments and selected digest failure. Existing allocation
+    probes cover slot reclamation at both roots; the multi-segment unit test
+    covers reuse. Full graph/pins/activation remain.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

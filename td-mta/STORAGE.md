@@ -1377,6 +1377,34 @@ replay against the supplied captured overlay; retained history, direct reference
 blobs, aggregate rules, actual pins and publication remain separate obligations.
 The caller retains immutable view or stopped-store exclusion throughout.
 
+`store_fs::HistorySweep` verifies every retained immutable history descriptor
+in the selected manifest, including frames below any client history cursor.
+Admit checked sums of descriptor bytes and sequence-range frame counts before
+opening files. Each advance opens one segment, reads one bounded complete frame,
+or finishes one selected segment through digest/extent/EOF checks. Frame and
+exhaustion steps report provisional progress, never selected completion. Reject
+any remaining bytes at completion after reaching the selected through sequence;
+never decode a further frame. The existing reader enforces contiguous frames
+from the selected base and exact final sequence/extent. A short change-slot
+slice returns ChangeCapacity when a frame cannot fit, not a corruption result.
+Smaller caller slices are allowed; reserving MAX_FRAME_OPERATIONS slots avoids
+this capacity refusal for format-valid frames.
+
+Drop each completed file before transferring the original full change-slot
+slice to the next segment; reuse caller record scratch for every frame. No
+whole journal is buffered. All failures retire the sweep; incomplete/failed
+state cannot finish. Completion requires every descriptor verified and the
+observed frame count equal to the admitted descriptor sum. Empty retained
+history needs zero byte/frame allowance and no file I/O. Consuming finish
+returns CompleteHistorySweep and the full original slot slice; evidence records
+the selected CURRENT (including manifest digest), checkpoint, segment/frame
+counts and bytes. Repeated completion performs no I/O.
+
+The caller retains real immutable ownership or stopped-store exclusion and
+admits the existing operation reader's bounded full-frame work and deadlines.
+A frame step is not one physical read. Selected tables, active-prefix recovery,
+final rows/references/blobs, runtime pins and activation remain separate.
+
 `TableInput::into_lookup` validates the requested key and table, then creates
 a selected TableReplay with a borrowed target key and separate caller result
 buffer. Each advance performs one replay step and copies only the matching

@@ -41,7 +41,10 @@ mod journal_input;
 pub use active::{ActiveInput, ActiveInputError, CompleteActive};
 #[path = "store_fs/history.rs"]
 mod history;
-pub use history::{CompleteHistory, HistoryInput, HistoryInputError};
+pub use history::{
+    CompleteHistory, CompleteHistorySweep, HistoryInput, HistoryInputError, HistorySweep,
+    HistorySweepError, HistorySweepLimits, HistorySweepStep,
+};
 #[path = "store_fs/active_changes.rs"]
 mod active_changes;
 #[path = "store_fs/change_locator.rs"]
