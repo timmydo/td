@@ -681,6 +681,20 @@ success. Reader capture uses try_lock, while publication and reader-slot
 disposal use short blocking locks without I/O or clock callbacks inside
 them. Drop never repairs files or proves an unwritten frame.
 
+The coordinator can irreversibly request a write stop through
+JournalSession::stop_writes. The atomic request is recorded before trying
+the writer mutex. Busy preserves the request and needs a retry; Ok confirms
+that prior writer activity ended and future commits are fenced. Poison
+refuses confirmation with WriterStopped and still fences new attempts.
+Commit observes the request before admission, around bounded append work,
+before publication and after the final clock check. In-flight effects may
+already exist and require recovery; neither stop nor reader disposal rolls
+them back. Reads retain their pins. Service health and queue cancellation
+remain coordinator responsibilities. Idle confirmation retains existing
+descriptors until session teardown and performs no filesystem I/O. Once a
+step starts, its existing clock/I/O error takes precedence over a concurrent
+stop request; the request still fences future writes.
+
 Each commit requires admitted frame work, the actual recovered account
 ledger, and final transaction/blob policy supplied by its future
 coordinator. This does not enable SMTP/JMAP mutations or reconcile recovery

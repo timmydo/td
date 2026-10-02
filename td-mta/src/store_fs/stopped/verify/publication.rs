@@ -12,7 +12,10 @@ use crate::{
     format::{JOURNAL_HEADER_BYTES, MAX_FRAME_BYTES},
     ports::{Clock, Crypto, Deadline, Error as PolicyError, ViewIdentity},
 };
-use std::sync::{atomic::AtomicU64, Mutex, TryLockError};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Mutex, TryLockError,
+};
 
 #[path = "publication/pool.rs"]
 mod pool;
@@ -117,6 +120,7 @@ pub struct JournalSession<'r, 'a> {
     writer: Mutex<Writer<'r, 'a>>,
     published: Mutex<Published>,
     views: u8,
+    stop_requested: AtomicBool,
 }
 /// Pins this session's generation, journal and history until drop.
 /// The identity is an inspection copy, not a standalone pin or authorization.
@@ -251,12 +255,43 @@ impl VerifiedStore {
                 invalid_reader_count: false,
             }),
             views: limits.views,
+            stop_requested: AtomicBool::new(false),
         };
         clock.sample().map_err(policy)?;
         Ok(run(&session, scratch.frame))
     }
 }
 impl<'r, 'a> JournalSession<'r, 'a> {
+    /// Request irreversible retirement, then try to confirm the writer is idle.
+    /// Busy retains the request; retry to confirm. Ok confirms an idle writer.
+    /// New commit attempts return Stopped; completed commits are not rolled back.
+    /// An in-flight append may have changed bytes or visibility; no rollback is done.
+    pub fn stop_writes(&self) -> Result<(), PolicyError> {
+        self.stop_requested.store(true, Ordering::Release);
+        let _writer = self.writer.try_lock().map_err(|e| match e {
+            TryLockError::WouldBlock => PolicyError::Busy,
+            TryLockError::Poisoned(_) => PolicyError::WriterStopped,
+        })?;
+        // Keep the retained descriptor until teardown; confirmation performs no I/O.
+        Ok(())
+    }
+    fn require_writing(&self) -> Result<(), JournalError> {
+        if self.stop_requested.load(Ordering::Acquire) {
+            Err(policy(PolicyError::WriterStopped))
+        } else {
+            Ok(())
+        }
+    }
+    fn checked_write<T>(
+        &self,
+        clock: &VerifyClock<'_>,
+        work: impl FnOnce() -> Result<T, JournalError>,
+    ) -> Result<T, JournalError> {
+        self.require_writing()?;
+        let value = checked(clock, work)?;
+        self.require_writing()?;
+        Ok(value)
+    }
     /// Reserve one admitted reader slot and capture the whole identity under one lock.
     pub fn capture(&self) -> Result<CommittedView<'_, 'r, 'a>, JournalError> {
         let mut state = self.published.try_lock().map_err(lock_error)?;
@@ -285,6 +320,7 @@ impl<'r, 'a> JournalSession<'r, 'a> {
         bytes: &[u8],
         budget: FrameBudget,
     ) -> Result<ViewIdentity, CommitError> {
+        self.require_writing().map_err(CommitError::Stopped)?;
         let clock = VerifyClock {
             source: clock,
             deadline,
@@ -298,6 +334,7 @@ impl<'r, 'a> JournalSession<'r, 'a> {
             TryLockError::WouldBlock => CommitError::Rejected(policy(PolicyError::Busy)),
             TryLockError::Poisoned(_) => CommitError::Stopped(policy(PolicyError::WriterStopped)),
         })?;
+        self.require_writing().map_err(CommitError::Stopped)?;
         if writer.boundary.is_none() {
             return Err(CommitError::Stopped(policy(PolicyError::WriterStopped)));
         }
@@ -314,24 +351,26 @@ impl<'r, 'a> JournalSession<'r, 'a> {
         let result = (|| {
             let frame = grant.frame().ok_or_else(|| policy(PolicyError::Invalid))?;
             let now = clock.sample().map_err(policy)?.monotonic;
-            let mut append = checked(&clock, || {
+            let mut append = self.checked_write(&clock, || {
                 boundary
                     .append(crypto, bytes, &mut writer.ledger, frame, now)
                     .map_err(JournalError::Append)
             })?;
             loop {
-                if checked(&clock, || append.advance().map_err(JournalError::Append))?
+                if self.checked_write(&clock, || append.advance().map_err(JournalError::Append))?
                     == AppendStep::Complete
                 {
                     break;
                 }
             }
-            let receipt = checked(&clock, || append.finish().map_err(JournalError::Append))?;
+            let receipt =
+                self.checked_write(&clock, || append.finish().map_err(JournalError::Append))?;
             writer.ledger.cancel(grant).map_err(JournalError::Ledger)?;
             let mut state = self
                 .published
                 .lock()
                 .map_err(|_| policy(PolicyError::WriterStopped))?;
+            self.require_writing()?;
             let durable = receipt.durable();
             if state.invalid_reader_count
                 || durable.current() != self.store.current
@@ -358,6 +397,7 @@ impl<'r, 'a> JournalSession<'r, 'a> {
             drop(state);
             // A late timeout may have published; it still never acknowledges success.
             clock.sample().map_err(policy)?;
+            self.require_writing()?;
             Ok((receipt, identity))
         })();
         match result {
@@ -1377,6 +1417,276 @@ mod tests {
         let mut states = [const { SlotState::EMPTY }; 8];
         let mut cells = [const { Cell::EMPTY }; 8];
         run(WriterLedger::new(&plan, 1232, used, &mut states, &mut cells).unwrap());
+    }
+    #[test]
+    fn idle_stop_is_irreversible_and_retains_readable_pins() {
+        with_ledger(|ledger| {
+            let (_dir, verified, mut startup) = owned_fixture();
+            let mut scratch = super::super::tests::Scratch::new();
+            let clock = TestClock::new(u64::MAX);
+            verified
+                .with_journal(
+                    &Provider,
+                    &clock,
+                    ledger,
+                    start(),
+                    startup.journal(),
+                    |session, _| {
+                        let mut old = session.capture().unwrap();
+                        assert_eq!(session.stop_writes(), Ok(()));
+                        assert_eq!(session.stop_writes(), Ok(()));
+                        let never = TestClock::new(0);
+                        assert!(matches!(
+                            session.commit(&Provider, &never, deadline(), &frame(3), budget()),
+                            Err(CommitError::Stopped(JournalError::Policy(
+                                PolicyError::WriterStopped
+                            )))
+                        ));
+                        assert_eq!(never.calls.load(Ordering::Relaxed), 0);
+                        assert_eq!(
+                            old.with_read_view(
+                                &Provider,
+                                &clock,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            2
+                        );
+                        let mut new = session.capture().unwrap();
+                        assert_eq!(new.identity(), old.identity());
+                        assert_eq!(
+                            new.with_read_view(
+                                &Provider,
+                                &clock,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            2
+                        );
+                        let writer = session.writer.lock().unwrap();
+                        assert!(writer.boundary.is_some());
+                        assert_eq!(writer.ledger.used(Kind::ActiveJournalBytes).unwrap(), 160);
+                        assert_eq!(writer.ledger.pending(Kind::ActiveJournalBytes).unwrap(), 0);
+                    },
+                )
+                .unwrap();
+        });
+    }
+    #[test]
+    fn stop_request_survives_contention_and_poison() {
+        for poisoned in [false, true] {
+            with_ledger(|ledger| {
+                let (_dir, verified, mut startup) = owned_fixture();
+                let clock = TestClock::new(u64::MAX);
+                verified
+                    .with_journal(
+                        &Provider,
+                        &clock,
+                        ledger,
+                        start(),
+                        startup.journal(),
+                        |session, _| {
+                            if poisoned {
+                                assert!(std::thread::scope(|scope| scope
+                                    .spawn(|| {
+                                        let _guard = session.writer.lock().unwrap();
+                                        panic!("owned poison fixture");
+                                    })
+                                    .join())
+                                .is_err());
+                                assert_eq!(session.stop_writes(), Err(PolicyError::WriterStopped));
+                            } else {
+                                let guard = session.writer.lock().unwrap();
+                                assert_eq!(
+                                    std::thread::scope(|scope| scope
+                                        .spawn(|| session.stop_writes())
+                                        .join()
+                                        .unwrap()),
+                                    Err(PolicyError::Busy)
+                                );
+                                drop(guard);
+                                // The request already fences new writes before a confirmation retry.
+                            }
+                            let never = TestClock::new(0);
+                            assert!(matches!(
+                                session.commit(&Provider, &never, deadline(), &frame(3), budget()),
+                                Err(CommitError::Stopped(JournalError::Policy(
+                                    PolicyError::WriterStopped
+                                )))
+                            ));
+                            assert_eq!(never.calls.load(Ordering::Relaxed), 0);
+                            assert_eq!(
+                                session.stop_writes(),
+                                if poisoned {
+                                    Err(PolicyError::WriterStopped)
+                                } else {
+                                    Ok(())
+                                }
+                            );
+                        },
+                    )
+                    .unwrap();
+            });
+        }
+    }
+    #[test]
+    fn step_stop_refuses_work_and_preserves_existing_operation_errors() {
+        for mode in 0..5 {
+            with_ledger(|ledger| {
+                let (_dir, verified, mut startup) = owned_fixture();
+                let good = TestClock::new(u64::MAX);
+                verified.with_journal(&Provider, &good, ledger, start(), startup.journal(), |session, _| {
+                    let source = TestClock::new(if mode == 4 { 1 } else { u64::MAX });
+                    let clock = VerifyClock { source: &source, deadline: deadline(), last: AtomicU64::new(0) };
+                    if mode == 0 {
+                        session.stop_writes().unwrap();
+                        assert!(matches!(session.checked_write(&clock, || -> Result<(), JournalError> { panic!("stopped step performed work") }), Err(JournalError::Policy(PolicyError::WriterStopped))));
+                        assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+                    } else {
+                        let _guard = session.writer.lock().unwrap();
+                        let operation_error = match mode {
+                            1 => None,
+                            2 => Some(PolicyError::Corrupt),
+                            _ => Some(PolicyError::Io { kind: std::io::ErrorKind::Other, os_code: Some(5) }),
+                        };
+                        let result = session.checked_write(&clock, || {
+                            assert_eq!(session.stop_writes(), Err(PolicyError::Busy));
+                            operation_error.map_or(Ok(()), |error| Err(policy(error)))
+                        });
+                        let expected = if mode == 4 { PolicyError::Deadline } else { operation_error.unwrap_or(PolicyError::WriterStopped) };
+                        assert!(matches!(result, Err(JournalError::Policy(error)) if error == expected));
+                        assert_eq!(source.calls.load(Ordering::Relaxed), 2);
+                    }
+                }).unwrap();
+            });
+        }
+    }
+    #[test]
+    fn stop_at_every_commit_clock_boundary_never_acknowledges_success() {
+        struct StopClock<'s, 'r, 'a> {
+            session: &'s JournalSession<'r, 'a>,
+            calls: AtomicU64,
+            stop: u64,
+        }
+        impl Clock for StopClock<'_, '_, '_> {
+            fn sample(&self) -> Result<Time, PolicyError> {
+                if self.calls.fetch_add(1, Ordering::Relaxed) == self.stop {
+                    assert_eq!(
+                        self.session.stop_writes(),
+                        if self.stop == 0 {
+                            Ok(())
+                        } else {
+                            Err(PolicyError::Busy)
+                        }
+                    );
+                }
+                Ok(Time {
+                    utc_ms: 0,
+                    monotonic: Tick(2),
+                })
+            }
+        }
+        for stop in 0..13 {
+            with_ledger(|ledger| {
+                let (dir, verified, mut startup) = owned_fixture();
+                let initial = verified.identity();
+                let path = dir.path.join(
+                    Name::account(
+                        initial.account,
+                        AccountEntry::Journal(Number::new(2).unwrap()),
+                    )
+                    .unwrap()
+                    .as_path()
+                    .unwrap(),
+                );
+                let good = TestClock::new(u64::MAX);
+                verified
+                    .with_journal(
+                        &Provider,
+                        &good,
+                        ledger,
+                        start(),
+                        startup.journal(),
+                        |session, _| {
+                            let old = session.capture().unwrap();
+                            let clock = StopClock {
+                                session,
+                                calls: AtomicU64::new(0),
+                                stop,
+                            };
+                            let bytes = frame(3);
+                            let result = (0..1000)
+                                .find_map(|_| {
+                                    clock.calls.store(0, Ordering::Relaxed);
+                                    let result = session.commit(
+                                        &Provider,
+                                        &clock,
+                                        deadline(),
+                                        &bytes,
+                                        budget(),
+                                    );
+                                    if matches!(
+                                        result,
+                                        Err(CommitError::Rejected(JournalError::Ledger(
+                                            writer::Error::Logical(
+                                                crate::admission::logical::Error::Slot(
+                                                    crate::ownership::Error::Contended
+                                                )
+                                            )
+                                        )))
+                                    ) {
+                                        std::thread::yield_now();
+                                        None
+                                    } else {
+                                        Some(result)
+                                    }
+                                })
+                                .unwrap();
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(CommitError::Stopped(JournalError::Policy(
+                                        PolicyError::WriterStopped
+                                    )))
+                                ),
+                                "stop {stop}: {result:?}"
+                            );
+                            assert!(clock.calls.load(Ordering::Relaxed) > stop);
+                            let writer = session.writer.lock().unwrap();
+                            assert_eq!(writer.boundary.is_some(), stop == 0);
+                            assert_eq!(
+                                writer.ledger.used(Kind::ActiveJournalBytes).unwrap(),
+                                if stop >= 10 { 320 } else { 160 }
+                            );
+                            assert_eq!(
+                                writer.ledger.pending(Kind::ActiveJournalBytes).unwrap(),
+                                if (1..10).contains(&stop) { 160 } else { 0 }
+                            );
+                            drop(writer);
+                            assert_eq!(session.stop_writes(), Ok(()));
+                            assert_eq!(old.identity(), initial);
+                            let new = session.capture().unwrap();
+                            assert_eq!(
+                                new.identity().committed_sequence.number(),
+                                if stop == 12 { 3 } else { 2 }
+                            );
+                            assert_eq!(
+                                std::fs::metadata(&path).unwrap().len(),
+                                if stop >= 4 { 416 } else { 256 }
+                            );
+                            assert!(matches!(
+                                session.commit(&Provider, &good, deadline(), &frame(4), budget()),
+                                Err(CommitError::Stopped(_))
+                            ));
+                        },
+                    )
+                    .unwrap();
+            });
+        }
     }
     #[test]
     fn success_publishes_pairs_reuses_reader_slots_and_retains_old_pins() {

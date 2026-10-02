@@ -927,6 +927,24 @@ and ledger. Poisoning either mutex prevents success. Mutex critical sections
 for capture/publication contain no I/O or clock callbacks. Blocking
 filesystem calls and lock acquisition remain uninterruptible.
 
+JournalSession::stop_writes records an irreversible atomic stop request,
+then tries the writer mutex. Ok confirms the writer is idle and later commit
+attempts are fenced. Busy leaves the request active: callers must retry for
+confirmation, and cannot treat it as proof that an in-flight writer has
+finished. WriterStopped means the mutex is poisoned; the request still
+fences new attempts. Repeated successful stops are idempotent. Commit checks
+the request before admission, around bounded append operations, before
+publication and after its final clock sample. A stop observed after
+reservation returns Stopped and retains recovery uncertainty. An operation
+already in progress may change bytes or publish before it observes the
+request; stop never rolls back. Existing pins and read capture remain
+available. This primitive does not mark service health, cancel other queues
+or perform recovery; the coordinator must wire those policies. Idle
+confirmation retains existing descriptors until session teardown and
+performs no filesystem I/O. Once a step starts, its existing clock/I/O error
+takes precedence over a concurrent stop request; the request still fences
+future writes.
+
 The caller admits full frame work and supplies its actual recovered ledger
 and planned view count. Complete transaction/blob policy, live
 checkpoint/retention changes and protocol acknowledgment remain

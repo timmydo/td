@@ -132,6 +132,13 @@ descriptor; one deadline and the view borrow survive that transition. Worker
 scheduling, live checkpoint/retention transitions and protocol mutations
 remain unimplemented.
 
+The scoped session also accepts an irreversible coordinator write-stop
+request. It fences new commits and reports Busy until an in-flight writer
+can be confirmed idle. Bounded commit steps observe the request; existing
+durable bytes or published state are retained for recovery. Readers keep
+their pins. Service-health reporting and queue cancellation remain runtime
+work.
+
 Complete mutation-policy validation and mail publication remain unimplemented.
 A one-frame append primitive now validates a successor against a complete
 scan, rechecks CURRENT/inode/extent, and writes bounded chunks before sync

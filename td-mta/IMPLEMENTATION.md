@@ -1133,6 +1133,12 @@ service activation. Each part lands independently:
     owner disposal; require forty valid snapshots with unchanged Rust counters.
     Startup/teardown, maximum bodies, native allocation and full-worker/RSS
     qualification remain separate.
+  - **M05e5 — explicit journal write stop:** implemented an irreversible
+    atomic request with nonblocking writer-idle confirmation. Check it
+    before admission, around append work and at publication completion.
+    Preserve in-flight uncertainty and old read pins; cover idle, contended,
+    poisoned and every commit clock boundary. Health/queue policy and
+    runtime integration remain separate.
   - **M05e3 — committed visibility:** runtime integration remains pending.
     Connect pooled queries to worker ownership and queue admission; retain
     generation/history ownership across live checkpoint and retention changes.
