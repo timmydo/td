@@ -618,6 +618,20 @@ refusal at short/maximum roots; fixture bytes/directories and scratch are
 prepared before measurement. This does not instantiate recovery workers or
 prove full-service RSS.
 
+TableInput borrows one 66608-byte record buffer and the selected manifest,
+retains one StoreReader and the fixed table verifier (1024-byte previous key,
+scalar counters/header and provider digest state). Opening uses a 112-byte
+header buffer, shared fixed path scratch and transient parent handles; it
+checks the manifest descriptor against an explicit admitted file-byte ceiling.
+Header input permits 64 explicit reads; each record shares a fresh 64-call
+allowance across prefix/remainder. No whole-table buffer or count-sized array
+is allocated. CompleteTable retains one CompleteFile and Summary. Existing
+writer/read-view scratch must supply these buffers before worker activation.
+The measured interval streams all eleven table tags, including a populated
+blob record, completes them, and exercises byte-ceiling and premature-finish
+refusal at short/maximum roots. Literal fixture loading and buffers precede
+measurement; this does not add allocator instrumentation or service pools.
+
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 

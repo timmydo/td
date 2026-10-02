@@ -382,6 +382,36 @@ container/identity/digest binding and the consumed file extents; every table,
 journal, row invariant, replay boundary and read-view pin still requires its
 own validation. It grants no serving, repair or transaction authority.
 
+### Streaming selected tables
+
+`LockedRoot::open_table` takes a supplied Selection, expected table tag, admitted
+byte ceiling and caller-owned 66608-byte record scratch. The caller provides
+quiescent recovery access or the real selected-view pin/barrier. Derive the
+account/generation/table name from that selection. Require the descriptor's
+size within the admitted ceiling and the actual private file's size equal to
+it. Read the 112-byte header into fixed scratch, start the existing table stream
+verifier and compare table/account/epoch/generation/sequence, record count and
+file size with the manifest before returning a TableInput.
+
+`next_record` consumes at most one declared record. Its exact 16-byte prefix
+bounds the remainder before reading into caller scratch. A prefix claiming
+more bytes than the recorded remaining extent is format corruption; an actual
+read failure still retains its I/O error. Prefix and remainder
+share at most 64 explicit read calls; short reads consume the allowance. The
+existing stream verifier checks each complete record's checksum, row grammar,
+sequence, strict key order and running count/extent. Return the row as a borrow
+of scratch. The caller regains control to charge/check work between records;
+blocking std operations retain the same limitation as other reads. Any row
+read/parse/verification error retires TableInput; subsequent calls refuse.
+None means only that no declared records remain, and rows are provisional.
+
+Consuming `finish` requires all declared records, stream completion, unchanged
+physical extent plus EOF, and the selected descriptor's whole-file digest.
+Success retains a read-only CompleteFile and table Summary in CompleteTable.
+No unverified rows may become visible through a serving view or transaction.
+A checked table alone proves no cross-table references, journal replay,
+selected graph completeness, durable publication or runtime pin ownership.
+
 ### Expected CURRENT replacement
 
 `CurrentUpdate::prepare` encodes a next CURRENT and either expected absence or

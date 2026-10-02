@@ -714,6 +714,16 @@ service activation. Each part lands independently:
     the allocation probe covers success and missing-account refusal at both
     root bounds. Whole table/journal validation, replay, orphan accounting and
     final-view invariants remain required before activating the store.
+  - **M05d2 — selected table input:** implemented header/extent binding before
+    row reads, incremental prefix-bounded records with sticky failure, and
+    completion through physical EOF plus whole-table manifest digest. Caller
+    scratch and per-record read-call bounds prevent whole-table buffering.
+    Tests exercise every table tag, literal input, multi-record scratch reuse,
+    valid mismatched headers, shared prefix/body attempt limits, corrupt input,
+    changed final extents and digest mismatch;
+    allocation probes cover table reads/completion and refusal at both roots.
+    Rows remain provisional. History/active journal reads, replay and complete
+    graph/final-view validation follow before store activation.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

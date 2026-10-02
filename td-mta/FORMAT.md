@@ -219,7 +219,8 @@ Returned errors leave output unchanged and a successful encode preserves its
 suffix. SHA-256 factory/update/finish failures remain distinct from encoding and
 checksum errors. These individual codecs do not establish whole-table
 validity; the stream verifier below checks the supplied record sequence, while
-manifest and selected-store binding validation remain subsequent M05 work.
+manifest and selected-store binding validation use the separate selection
+and storage adapters.
 No decoder treats immutable-table truncation as a recoverable journal tail.
 
 `table::record_extent` accepts exactly the 16-byte record prefix and returns
@@ -229,7 +230,9 @@ row grammar. The record decoder shares these bounds. One preallocated MAX_RECORD
 unchecked prefix.
 
 `table_stream::Verifier` accepts an exact validated header followed by exact
-record slices. It checks each full record, strictly increasing unsigned raw key
+record slices. Its `header` getter exposes the decoded header before records,
+physical extent or selected bindings are validated. It checks each full record,
+strictly increasing unsigned raw key
 order, and running count/payload against the declared ceilings. Its fixed state
 holds one 1024-byte prior key, counters and a digest; record memory belongs to
 the caller and may be reused after each returned borrow ends. A supplied record
@@ -242,7 +245,9 @@ record digests. Per-record results remain provisional until completion and
 selected-file bindings pass. The verifier neither reads physical EOF nor proves
 that omitted suffix bytes do not exist; the storage adapter must check EOF and
 the manifest's identity, extent and whole-file digest before publishing a table.
-It provides no cross-row reference, account authorization or durability proof.
+The implemented private table input performs these checks as specified in
+[STORAGE.md](STORAGE.md#streaming-selected-tables). It provides no cross-row
+reference, account authorization or durability proof.
 Its state does not grow with the header's count; work is one bounded record per
 push, with future I/O consumers responsible for work/deadline admission.
 

@@ -50,6 +50,10 @@ impl<'c, C: Crypto> Verifier<'c, C> {
             failed: None,
         })
     }
+    /// Validated header only; records, physical extent and selected binding remain unchecked.
+    pub const fn header(&self) -> TableHeader {
+        self.header
+    }
     pub fn push<'a>(&mut self, bytes: &'a [u8]) -> Result<Record<'a>, Error> {
         if let Some(error) = self.failed {
             return Err(error);

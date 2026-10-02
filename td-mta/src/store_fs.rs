@@ -15,6 +15,9 @@ pub use input::{CompleteFile, StoreReader};
 #[path = "store_fs/selection.rs"]
 mod selection;
 pub use selection::{SelectionError, SelectionScratch, SelectionStage};
+#[path = "store_fs/table.rs"]
+mod table;
+pub use table::{CompleteTable, TableInput, TableInputError};
 #[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{
