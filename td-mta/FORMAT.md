@@ -356,8 +356,9 @@ continuity relative to a journal, authorization or durable publication.
 
 `format::journal_stream::Verifier` hashes the exact journal header and supplied
 frames, enforces consecutive sequences and both the 4 MiB frame-byte and 8192
-operation caps, and retains only a digest, counters and identity. Before a short
-body is classified as incomplete, the verified header must fit both remaining
+operation caps, and retains only a digest, counters and identity. Its `header`
+getter exposes only the validated journal identity; frames, selected binding
+and EOF remain unchecked. Before a short body is classified as incomplete, the verified header must fit both remaining
 journal budgets. Exhausted sequences and budgets that cannot admit even one
 minimum frame refuse any further push, including a short header. Journal-wide
 errors carry journal context separately from frame errors. Every push
@@ -372,6 +373,8 @@ suffix is absent. M05d owns physical EOF, exact committed-prefix consumption,
 invoking the selected-file checks, incomplete physical-tail recovery and
 selected graph publication; the byte codecs do not truncate, scan ahead or
 perform I/O.
+Retained-history I/O completion is implemented by the private adapter in
+[STORAGE.md](STORAGE.md#streaming-retained-history).
 
 The complete-header/short-body distinction and every sync boundary are owned
 by STORAGE sections 5-6. A checksum-invalid complete final frame is corruption,

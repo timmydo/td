@@ -128,31 +128,14 @@ fn load<'a>(
 fn read_file<'r>(
     mut reader: StoreReader<'r>,
     output: &mut [u8],
-    mut read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
+    read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<usize> {
     let length = usize::try_from(reader.len()).map_err(|_| io::ErrorKind::InvalidData)?;
     let output = output
         .get_mut(..length)
         .ok_or(io::ErrorKind::InvalidInput)?;
-    let mut offset = 0;
-    let mut calls = 0;
-    while offset < length {
-        if calls == MAX_METADATA_READ_CALLS {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        calls += 1;
-        let count = read(
-            &mut reader,
-            output.get_mut(offset..).ok_or(io::ErrorKind::InvalidData)?,
-        )?;
-        if count == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        offset = offset
-            .checked_add(count)
-            .filter(|offset| *offset <= length)
-            .ok_or(io::ErrorKind::InvalidData)?;
-    }
+    let mut attempts = MAX_METADATA_READ_CALLS;
+    super::input::fill_exact_using(&mut reader, output, &mut attempts, read)?;
     drop(reader.finish()?);
     Ok(length)
 }

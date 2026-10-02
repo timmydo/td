@@ -1,5 +1,8 @@
 //! Incremental table input; rows remain provisional until completion and binding.
-use super::{CompleteFile, LockedRoot, StoreReader};
+use super::{
+    input::{fill_exact as fill, fill_exact_using as fill_using},
+    CompleteFile, LockedRoot, StoreReader,
+};
 use crate::{
     format::{
         bindings::Selection,
@@ -199,25 +202,6 @@ impl CompleteTable<'_> {
     pub fn summary(&self) -> Summary {
         self.summary
     }
-}
-fn fill(file: &mut StoreReader<'_>, output: &mut [u8], attempts: &mut usize) -> io::Result<()> {
-    fill_using(file, output, attempts, StoreReader::read)
-}
-fn fill_using<'r>(
-    file: &mut StoreReader<'r>,
-    mut output: &mut [u8],
-    attempts: &mut usize,
-    mut read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
-) -> io::Result<()> {
-    while !output.is_empty() {
-        *attempts = attempts.checked_sub(1).ok_or(io::ErrorKind::WouldBlock)?;
-        let actual = read(file, output)?;
-        if actual == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        output = output.get_mut(actual..).ok_or(io::ErrorKind::InvalidData)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

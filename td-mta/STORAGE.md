@@ -412,6 +412,46 @@ No unverified rows may become visible through a serving view or transaction.
 A checked table alone proves no cross-table references, journal replay,
 selected graph completeness, durable publication or runtime pin ownership.
 
+### Streaming retained history
+
+`LockedRoot::open_history` takes a supplied Selection, history descriptor index,
+admitted byte ceiling and caller-owned 1 MiB frame buffer. Derive only the
+selected segment's typed account/journal path. Require its declared size within
+the admitted ceiling and the 96-byte journal header plus 4 MiB frame ceiling,
+then require that exact physical private-file size. Exceeding the format ceiling
+is a format Limit; insufficient caller admission is I/O InvalidInput. Consume
+the header and compare its account, epoch, segment and base sequence before
+returning input.
+The existing journal verifier owns digest, sequence and operation-count checks.
+
+`next_frame` consumes one provisional frame. Read/check the exact 64-byte header
+checksum before using its declared length; a recorded suffix shorter than that
+header is format corruption before any read. Require the next sequence and a
+frame that fits the recorded remaining extent. Only then read the remainder
+into caller scratch and run the complete frame/journal verifier. Header and
+remainder share 64 explicit read attempts; the opening journal header has its
+own 64-call allowance. I/O errors retain their kind; invalid frame contents or
+lengths retain format errors. Every failure retires the input. The caller
+regains control to meter/check work between frames; blocking std calls cannot
+be interrupted by these bounds. None only marks the recorded extent's end.
+
+Consuming `finish` requires successful stream completion, unchanged physical
+extent and EOF, then selected history identity, through-sequence, exact byte
+size and whole-file digest binding. CompleteHistory retains a read-only
+CompleteFile and journal Summary. Retained histories are immutable: incomplete
+bytes always fail here, with no truncation or repair. Active-journal committed
+prefixes and incomplete-tail recovery need separate adapters/evidence. Frames
+remain provisional until whole-graph/final-view validation and actual pin,
+barrier and admission integration; this primitive grants no serving authority.
+This is full-segment recovery/verification input. ReadView::next_change still
+needs its own streaming cursor that skips PUT bodies with bounded I/O; this
+frame-buffer adapter does not implement that API.
+
+Metadata, table and history readers share a private exact-read helper. It
+consumes the caller's existing attempt counter across framing phases, advances
+only by confirmed returned bytes, and never retries errors. Empty destinations
+consume no attempt. Existing metadata/table completion rules remain unchanged.
+
 ### Expected CURRENT replacement
 
 `CurrentUpdate::prepare` encodes a next CURRENT and either expected absence or

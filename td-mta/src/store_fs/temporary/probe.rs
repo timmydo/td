@@ -88,11 +88,19 @@ pub fn run(mut snapshot: impl FnMut()) {
     let table_probe = super::super::table::prepare_probe(&short.root);
     drop(super::super::table::prepare_probe(&long.root));
     let mut table_scratch = [0; crate::format::table::MAX_RECORD_BYTES];
+    let history_probe = super::super::history::prepare_probe(&short.root);
+    drop(super::super::history::prepare_probe(&long.root));
+    let mut history_scratch = vec![0; crate::format::MAX_FRAME_BYTES];
     let mut selection_scratch = super::super::SelectionScratch::new();
     snapshot();
     for fixture in [&short, &long] {
         super::super::selection::probe(&fixture.root, &mut selection_scratch);
         super::super::table::probe(&fixture.root, &table_probe, &mut table_scratch);
+        super::super::history::probe(
+            &fixture.root,
+            &history_probe,
+            history_scratch.as_mut_slice().try_into().unwrap(),
+        );
         super::current::probe(&fixture.root, fixture.account);
         super::super::input::probe(&fixture.root, fixture.account);
         super::publication::probe(&fixture.root, fixture.account);

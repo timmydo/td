@@ -18,6 +18,9 @@ pub use selection::{SelectionError, SelectionScratch, SelectionStage};
 #[path = "store_fs/table.rs"]
 mod table;
 pub use table::{CompleteTable, TableInput, TableInputError};
+#[path = "store_fs/history.rs"]
+mod history;
+pub use history::{CompleteHistory, HistoryInput, HistoryInputError};
 #[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{

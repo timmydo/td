@@ -724,6 +724,17 @@ service activation. Each part lands independently:
     allocation probes cover table reads/completion and refusal at both roots.
     Rows remain provisional. History/active journal reads, replay and complete
     graph/final-view validation follow before store activation.
+  - **M05d3 — retained-history input:** implemented exact selected segment
+    extents and header identity, incremental checksummed frame reads with a
+    shared prefix/body attempt allowance, sticky failure, and completion
+    against physical EOF and selected history sequence/size/digest. Literal
+    tests cover multiple frames, valid identity mismatches, corrupt lengths,
+    headers/footers, truncation, changed extents and selected digest refusal.
+    The existing allocation interval covers frame reading and completion at
+    both root bounds. Shared exact reads replace the metadata/table copies.
+    ReadView change iteration still needs a separate cursor that skips PUT
+    bodies. Active prefixes, active-tail repair, replay and whole-graph/final-view
+    invariants remain required before activation.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

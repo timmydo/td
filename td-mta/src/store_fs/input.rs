@@ -195,6 +195,31 @@ fn check(metadata: &fs::Metadata, owner: u32, max_bytes: u64) -> io::Result<()> 
     Ok(())
 }
 
+// Exact bounded reads share the caller's attempt allowance across framing phases.
+pub(super) fn fill_exact(
+    file: &mut StoreReader<'_>,
+    output: &mut [u8],
+    attempts: &mut usize,
+) -> io::Result<()> {
+    fill_exact_using(file, output, attempts, StoreReader::read)
+}
+pub(super) fn fill_exact_using<'r>(
+    file: &mut StoreReader<'r>,
+    mut output: &mut [u8],
+    attempts: &mut usize,
+    mut read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    while !output.is_empty() {
+        *attempts = attempts.checked_sub(1).ok_or(io::ErrorKind::WouldBlock)?;
+        let actual = read(file, output)?;
+        if actual == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        output = output.get_mut(actual..).ok_or(io::ErrorKind::InvalidData)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(super) fn probe(root: &LockedRoot, account: AccountId) {

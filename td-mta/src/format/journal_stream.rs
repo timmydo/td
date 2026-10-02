@@ -102,6 +102,10 @@ impl<'c, C: Crypto> Verifier<'c, C> {
             failed: None,
         })
     }
+    /// Validated journal identity only; frames, selected bindings and EOF remain unchecked.
+    pub const fn header(&self) -> JournalHeader {
+        self.header
+    }
     pub fn push<'a>(&mut self, bytes: &'a [u8]) -> Result<Frame<'a>, Error> {
         if let Some(error) = self.failed {
             return Err(error);

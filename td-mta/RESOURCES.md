@@ -632,6 +632,24 @@ blob record, completes them, and exercises byte-ceiling and premature-finish
 refusal at short/maximum roots. Literal fixture loading and buffers precede
 measurement; this does not add allocator instrumentation or service pools.
 
+HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
+manifest, retains one StoreReader and the fixed journal verifier (header,
+sequence/count/extent counters and provider digest state). Opening uses a
+96-byte header buffer plus the existing transient handles and path scratch.
+The selected extent must fit the admitted ceiling and the fixed 4 MiB frame
+bytes plus header. Each frame shares 64 explicit read attempts across its
+64-byte header and remainder; the header is checksummed before its length is
+used. No whole-history inventory or additional per-frame buffer is allocated.
+CompleteHistory retains one CompleteFile and Summary. Recovery/verification
+must reuse an admitted existing frame arena (such as the writer's 1 MiB frame
+buffer); this grants no additional per-view MiB. ReadView::next_change still
+requires its separate cursor that skips PUT bodies with bounded I/O.
+The allocation fixture creates
+its 1 MiB buffer on the cold path before measurement and drops it afterward;
+stream, completion, missing-descriptor/byte-cap and premature-finish refusal
+run inside the interval at both root bounds. No new hook or service pool is
+introduced.
+
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 
