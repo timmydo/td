@@ -17,10 +17,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use td_agent::config::Client;
 use td_agent::frame;
-use td_agent::protocol::Up;
+use td_agent::protocol::{Down, Up};
 use td_agent::store::{Conversation, Id, Kind, Role, StateDir};
 use td_agent::supervisor::{Supervisor, Update, MAX_RESTARTS};
+
+/// The settings with no key: each turn ends at once, saying so.
+fn keyless() -> Down {
+    Down::Setup {
+        key: Err("no API key".into()),
+        client: Client::default(),
+    }
+}
 
 const PROGRAM: &str = env!("CARGO_BIN_EXE_td-agent");
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -53,7 +62,7 @@ fn until(supervisor: &mut Supervisor, heard: &mut Vec<Update>, done: impl Fn(&[U
     let deadline = Instant::now() + TIMEOUT;
     while !done(heard) {
         assert!(Instant::now() < deadline, "heard only {heard:#?}");
-        heard.extend(supervisor.poll());
+        heard.extend(supervisor.poll().into_iter().map(|(_, update)| update));
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -80,7 +89,7 @@ fn a_killed_conversation_process_is_restarted_from_its_log() {
     let scratch = Scratch::new("restart");
     let state = scratch.state();
     let id = Id::random().unwrap();
-    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf());
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
     supervisor
         .open(id.clone(), Some(Role::Orchestrator))
         .unwrap();
@@ -127,7 +136,7 @@ fn a_message_sent_just_before_moving_away_is_delivered_on_reopening() {
     let scratch = Scratch::new("away");
     let state = scratch.state();
     let (a, b) = (Id::random().unwrap(), Id::random().unwrap());
-    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf());
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
     supervisor
         .open(a.clone(), Some(Role::Orchestrator))
         .unwrap();
@@ -159,7 +168,7 @@ fn a_conversation_that_keeps_failing_is_left_failed() {
     drop(Conversation::open(&state, &id, Some(Role::Conversation), Duration::ZERO).unwrap());
     // A log corrupt inside: every start refuses it.
     std::fs::write(state.conversation(&id).join("log"), "garbage\n").unwrap();
-    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf());
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
     supervisor.open(id, None).unwrap();
     let mut heard = Vec::new();
     until(&mut supervisor, &mut heard, |h| {
@@ -275,4 +284,63 @@ fn a_relative_control_socket_and_an_unknown_key_are_refused() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("`limits`"), "{stderr}");
+}
+
+/// A message sent just before the human switches away is answered: the
+/// process is kept, in the background, through the turn it starts, and
+/// let go once the turn ends. The turn here asks the window to reserve
+/// and is refused, so nothing is ever sent to a network.
+#[test]
+fn a_message_sent_just_before_switching_away_runs_its_turn() {
+    let scratch = Scratch::new("switch");
+    let state = scratch.state();
+    let keyed = Down::Setup {
+        key: Ok(td_agent::key::Secret::new("sk-or-test".into())),
+        client: Client {
+            limits: td_agent::cost::Limits {
+                turn: None,
+                conversation: None,
+                day: None,
+            },
+            ..Client::default()
+        },
+    };
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyed);
+    let (a, b) = (Id::random().unwrap(), Id::random().unwrap());
+    supervisor
+        .open(a.clone(), Some(Role::Conversation))
+        .unwrap();
+    supervisor.send("hello".into()).unwrap();
+    // Away before the window has heard a word of the turn.
+    supervisor
+        .open(b.clone(), Some(Role::Conversation))
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut finished = None;
+    while finished.is_none() {
+        assert!(Instant::now() < deadline, "the turn did not end");
+        for (of, update) in supervisor.poll() {
+            match update {
+                Update::Up(Up::Reserve { id, .. }) if of == a => supervisor.answer(
+                    &a,
+                    &Down::Reservation {
+                        id,
+                        refusal: Some("refused by the test".into()),
+                    },
+                ),
+                Update::Up(Up::Event(event)) if of == a => {
+                    if let Kind::Finished { outcome, .. } = event.kind {
+                        finished = Some(outcome);
+                    }
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(finished.as_deref(), Some("refused by the test"));
+    assert_eq!(supervisor.open_id(), Some(&b));
+    // The turn over, the background process is let go.
+    supervisor.poll();
+    assert!(supervisor.background().is_empty());
 }

@@ -1,10 +1,12 @@
 //! What the window process and a conversation process say to each other,
 //! one JSON object per frame (`frame`), over their socketpair (DESIGN.md
-//! §2). There is no key yet: the model client that needs one is a later
-//! increment, and it will cross here, never through argv, the
-//! environment or a file.
+//! §2). The API key crosses here, in the `Setup` the window sends each
+//! conversation process first, and never through argv, the environment
+//! or a file; `Debug` never shows it.
 
+use crate::config::Client;
 use crate::json::Json;
+use crate::key::Secret;
 use crate::store::{Event, Role};
 
 /// The longest message a human sends in one go. JSON escaping can make it
@@ -16,8 +18,18 @@ pub const DELIVERY_LEN: usize = 32;
 /// From the window to a conversation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Down {
+    /// What the model client needs, first on every socketpair: the key,
+    /// or why there is none, and the configuration's settings.
+    Setup {
+        key: Result<Secret, String>,
+        client: Client,
+    },
     /// The human's message, with an id the conversation logs once.
     User { delivery: String, text: String },
+    /// The answer to a `Reserve` of the same id: granted, or why not.
+    Reservation { id: u64, refusal: Option<String> },
+    /// Ask again for the last turn, which failed in a way that may pass.
+    Retry,
 }
 
 /// From a conversation to the window.
@@ -45,6 +57,17 @@ pub enum Up {
         delivery: String,
         reason: String,
     },
+    /// Reserve `amount` pico-credits against the day's limit, which the
+    /// window holds, for request `id` of this process (DESIGN.md §5).
+    Reserve {
+        id: u64,
+        amount: u64,
+    },
+    /// Request `id` cost `amount`, in place of what it reserved.
+    Spent {
+        id: u64,
+        amount: u64,
+    },
 }
 
 fn typed(kind: &str, mut pairs: Vec<(String, Json)>) -> Vec<u8> {
@@ -68,9 +91,23 @@ pub fn delivery_ok(delivery: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+fn number(value: &Json, name: &str) -> Result<u64, String> {
+    value
+        .get(name)
+        .and_then(Json::as_u64)
+        .ok_or_else(|| format!("no {name}"))
+}
+
 impl Down {
     pub fn encode(&self) -> Vec<u8> {
         match self {
+            Self::Setup { key, client } => {
+                let key = match key {
+                    Ok(key) => ("key".to_string(), Json::Str(key.expose().into())),
+                    Err(why) => ("no_key".to_string(), Json::Str(why.clone())),
+                };
+                typed("setup", vec![key, ("client".into(), client.to_json())])
+            }
             Self::User { delivery, text } => typed(
                 "user",
                 vec![
@@ -78,12 +115,45 @@ impl Down {
                     ("text".into(), Json::Str(text.clone())),
                 ],
             ),
+            Self::Reservation { id, refusal } => typed(
+                "reservation",
+                vec![
+                    ("id".into(), Json::from(*id)),
+                    (
+                        "refusal".into(),
+                        refusal.clone().map_or(Json::Null, Json::Str),
+                    ),
+                ],
+            ),
+            Self::Retry => typed("retry", Vec::new()),
         }
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let value = crate::json::parse_slice(bytes).map_err(|e| e.to_string())?;
         match value.get("type").and_then(Json::as_str) {
+            Some("setup") => {
+                let key = match (value.get("key"), value.get("no_key")) {
+                    (Some(Json::Str(key)), None) if crate::key::plausible(key) => {
+                        Ok(Secret::new(key.clone()))
+                    }
+                    (Some(_), None) => return Err("a malformed key".into()),
+                    (None, Some(Json::Str(why))) => Err(why.clone()),
+                    _ => return Err("a setup with neither a key nor why not".into()),
+                };
+                let client =
+                    Client::from_json(value.get("client").ok_or("a setup with no client")?)?;
+                Ok(Self::Setup { key, client })
+            }
+            Some("reservation") => Ok(Self::Reservation {
+                id: number(&value, "id")?,
+                refusal: match value.get("refusal") {
+                    Some(Json::Null) => None,
+                    Some(Json::Str(why)) => Some(why.clone()),
+                    _ => return Err("a reservation with no refusal field".into()),
+                },
+            }),
+            Some("retry") => Ok(Self::Retry),
             Some("user") => {
                 let delivery = string(&value, "delivery")?;
                 if !delivery_ok(&delivery) {
@@ -134,6 +204,20 @@ impl Up {
                     ("reason".into(), Json::Str(reason.clone())),
                 ],
             ),
+            Self::Reserve { id, amount } => typed(
+                "reserve",
+                vec![
+                    ("id".into(), Json::from(*id)),
+                    ("amount".into(), Json::from(*amount)),
+                ],
+            ),
+            Self::Spent { id, amount } => typed(
+                "spent",
+                vec![
+                    ("id".into(), Json::from(*id)),
+                    ("amount".into(), Json::from(*amount)),
+                ],
+            ),
         }
     }
 
@@ -168,6 +252,14 @@ impl Up {
             Some("refused") => Self::Refused {
                 delivery: string(&value, "delivery")?,
                 reason: string(&value, "reason")?,
+            },
+            Some("reserve") => Self::Reserve {
+                id: number(&value, "id")?,
+                amount: number(&value, "amount")?,
+            },
+            Some("spent") => Self::Spent {
+                id: number(&value, "id")?,
+                amount: number(&value, "amount")?,
             },
             other => return Err(format!("unknown message {other:?}")),
         })
@@ -219,9 +311,50 @@ mod tests {
                 delivery,
                 reason: "too long".into(),
             },
+            Up::Reserve { id: 1, amount: 2 },
+            Up::Spent {
+                id: 1,
+                amount: u64::MAX,
+            },
         ] {
             assert_eq!(Up::decode(&up.encode()).unwrap(), up);
         }
+        let client = Client::default();
+        for down in [
+            Down::Setup {
+                key: Ok(Secret::new("sk-or-v1-abc".into())),
+                client: client.clone(),
+            },
+            Down::Setup {
+                key: Err("no API key".into()),
+                client,
+            },
+            Down::Reservation {
+                id: 3,
+                refusal: None,
+            },
+            Down::Reservation {
+                id: 4,
+                refusal: Some("max_cost_per_day".into()),
+            },
+            Down::Retry,
+        ] {
+            assert_eq!(Down::decode(&down.encode()).unwrap(), down);
+        }
+    }
+
+    #[test]
+    fn the_key_crosses_only_in_its_frame_and_never_in_debug() {
+        let down = Down::Setup {
+            key: Ok(Secret::new("sk-or-v1-secret".into())),
+            client: Client::default(),
+        };
+        assert!(!format!("{down:?}").contains("sk-or-v1-secret"));
+        let frame = String::from_utf8(down.encode()).unwrap();
+        assert!(frame.contains("\"key\":\"sk-or-v1-secret\""));
+        // A key that could not go in a header is refused on arrival.
+        let bad = frame.replace("sk-or-v1-secret", "sk or");
+        assert!(Down::decode(bad.as_bytes()).is_err());
     }
 
     #[test]

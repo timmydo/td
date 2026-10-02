@@ -1,0 +1,342 @@
+//! What td-agent knows of the provider's models and of the key's credit
+//! (DESIGN.md §5). `GET /models` is fetched by the window process at
+//! startup and cached in the state directory as `models`, each model cut
+//! to what td-agent uses: its context length, its largest completion, its
+//! prices and the parameters it supports. A conversation process reads the
+//! cache before each request; a cached list serves a start without the
+//! network. `GET /key` gives the key's remaining credit for the status row.
+
+use std::path::Path;
+
+use crate::cost::{self, Pricing};
+use crate::json::Json;
+
+/// The cache's file in the state directory.
+pub const CACHE: &str = "models";
+/// The longest models list taken from the provider, and the longest cache
+/// read back.
+pub const MAX_LIST: u64 = 16 * 1024 * 1024;
+const MAX_CACHE: u64 = 8 * 1024 * 1024;
+
+/// One model as td-agent uses it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Model {
+    pub id: String,
+    pub context_length: Option<u64>,
+    pub max_completion_tokens: Option<u64>,
+    /// `None` when the list gives no usable price: none at all, or a
+    /// negative one, which marks a router whose price is not fixed.
+    pub pricing: Option<Pricing>,
+    pub supported_parameters: Vec<String>,
+    /// The list's price strings as given, kept so the cache says what the
+    /// provider said.
+    prices: Vec<(String, String)>,
+}
+
+impl Model {
+    pub fn supports(&self, parameter: &str) -> bool {
+        self.supported_parameters.iter().any(|p| p == parameter)
+    }
+}
+
+/// The models list.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Models {
+    pub models: Vec<Model>,
+}
+
+/// The price fields td-agent reads, as the list names them.
+const PRICES: [&str; 6] = [
+    "prompt",
+    "completion",
+    "request",
+    "internal_reasoning",
+    "input_cache_read",
+    "input_cache_write",
+];
+
+fn number(value: Option<&Json>) -> Option<u64> {
+    value.and_then(Json::as_u64)
+}
+
+/// A price string or number's text, `None` when absent.
+fn price_text(value: &Json) -> Option<String> {
+    match value {
+        Json::Str(text) | Json::Num(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn pricing(prices: &[(String, String)]) -> Option<Pricing> {
+    let get = |name: &str| -> Option<Option<u64>> {
+        match prices.iter().find(|(key, _)| key == name) {
+            None => Some(None),
+            // A negative or unreadable price is no price: the whole list
+            // entry is then unpriced, never priced at zero.
+            Some((_, text)) => cost::parse(text, true).map(Some),
+        }
+    };
+    Some(Pricing {
+        prompt: get("prompt")??,
+        completion: get("completion")??,
+        request: get("request")?.unwrap_or(0),
+        reasoning: get("internal_reasoning")?.unwrap_or(0),
+        cache_read: get("input_cache_read")?.unwrap_or(0),
+        cache_write: get("input_cache_write")?.unwrap_or(0),
+    })
+}
+
+impl Model {
+    fn from_parts(
+        id: String,
+        context_length: Option<u64>,
+        max_completion_tokens: Option<u64>,
+        prices: Vec<(String, String)>,
+        supported_parameters: Vec<String>,
+    ) -> Self {
+        Self {
+            pricing: pricing(&prices),
+            id,
+            context_length,
+            max_completion_tokens,
+            supported_parameters,
+            prices,
+        }
+    }
+
+    fn prices_of(value: Option<&Json>) -> Vec<(String, String)> {
+        let Some(object) = value.and_then(Json::as_obj) else {
+            return Vec::new();
+        };
+        PRICES
+            .iter()
+            .filter_map(|name| {
+                let value = object.iter().find(|(key, _)| key == name)?;
+                Some((name.to_string(), price_text(&value.1)?))
+            })
+            .collect()
+    }
+
+    fn parameters_of(value: Option<&Json>) -> Vec<String> {
+        value
+            .and_then(Json::as_arr)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|p| p.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("id".into(), Json::Str(self.id.clone())),
+            (
+                "context_length".into(),
+                self.context_length.map_or(Json::Null, Json::from),
+            ),
+            (
+                "max_completion_tokens".into(),
+                self.max_completion_tokens.map_or(Json::Null, Json::from),
+            ),
+            (
+                "pricing".into(),
+                Json::Obj(
+                    self.prices
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Json::Str(v.clone())))
+                        .collect(),
+                ),
+            ),
+            (
+                "supported_parameters".into(),
+                Json::Arr(
+                    self.supported_parameters
+                        .iter()
+                        .map(|p| Json::Str(p.clone()))
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+}
+
+impl Models {
+    /// The provider's `GET /models` body: `data`, each with an `id`.
+    pub fn from_provider(body: &[u8]) -> Result<Self, String> {
+        let value = crate::json::parse_slice(body).map_err(|e| format!("the models list: {e}"))?;
+        let data = value
+            .get("data")
+            .and_then(Json::as_arr)
+            .ok_or("the models list has no `data` array")?;
+        let mut models = Vec::new();
+        for entry in data {
+            let Some(id) = entry.get("id").and_then(Json::as_str) else {
+                continue;
+            };
+            let top = entry.get("top_provider");
+            models.push(Model::from_parts(
+                id.to_string(),
+                number(entry.get("context_length"))
+                    .or_else(|| number(top.and_then(|t| t.get("context_length")))),
+                number(top.and_then(|t| t.get("max_completion_tokens"))),
+                Model::prices_of(entry.get("pricing")),
+                Model::parameters_of(entry.get("supported_parameters")),
+            ));
+        }
+        Ok(Self { models })
+    }
+
+    /// The cache's text: what `from_cache` reads back.
+    pub fn to_cache(&self) -> String {
+        Json::Arr(self.models.iter().map(Model::to_json).collect()).to_string()
+    }
+
+    pub fn from_cache(body: &[u8]) -> Result<Self, String> {
+        let value = crate::json::parse_slice(body).map_err(|e| format!("the models cache: {e}"))?;
+        let list = value.as_arr().ok_or("the models cache is not a list")?;
+        let mut models = Vec::new();
+        for entry in list {
+            let id = entry
+                .get("id")
+                .and_then(Json::as_str)
+                .ok_or("a cached model with no id")?;
+            models.push(Model::from_parts(
+                id.to_string(),
+                number(entry.get("context_length")),
+                number(entry.get("max_completion_tokens")),
+                Model::prices_of(entry.get("pricing")),
+                Model::parameters_of(entry.get("supported_parameters")),
+            ));
+        }
+        Ok(Self { models })
+    }
+
+    /// The cache in `state`, when there is one.
+    pub fn load(state: &Path) -> Result<Option<Self>, String> {
+        let path = state.join(CACHE);
+        match crate::store::read_bounded(&path, MAX_CACHE) {
+            Ok(bytes) => Self::from_cache(&bytes).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    pub fn save(&self, state: &Path) -> Result<(), String> {
+        crate::store::replace(state, CACHE, self.to_cache().as_bytes())
+    }
+
+    pub fn find(&self, id: &str) -> Option<&Model> {
+        self.models.iter().find(|m| m.id == id)
+    }
+}
+
+/// The key's credit as `GET /key` gives it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Credit {
+    /// What the key may still spend, `None` when the key has no limit of
+    /// its own.
+    pub remaining: Option<u64>,
+    /// What the key has spent.
+    pub usage: u64,
+}
+
+impl Credit {
+    pub fn from_provider(body: &[u8]) -> Result<Self, String> {
+        let value = crate::json::parse_slice(body).map_err(|e| format!("the key's record: {e}"))?;
+        let data = value.get("data").ok_or("the key's record has no `data`")?;
+        let amount = |name: &str| -> Result<Option<u64>, String> {
+            match data.get(name) {
+                None | Some(Json::Null) => Ok(None),
+                Some(Json::Num(text)) => cost::parse(text, false)
+                    .map(Some)
+                    // A negative remainder is a key past its limit.
+                    .or_else(|| text.starts_with('-').then_some(Some(0)))
+                    .ok_or_else(|| format!("the key's `{name}` is {text}")),
+                Some(_) => Err(format!("the key's `{name}` is not a number")),
+            }
+        };
+        Ok(Self {
+            remaining: amount("limit_remaining")?,
+            usage: amount("usage")?.unwrap_or(0),
+        })
+    }
+
+    /// The status row's word for it.
+    pub fn show(&self) -> String {
+        match self.remaining {
+            Some(remaining) => format!("credit {}", cost::show(remaining)),
+            None => format!("used {} (no key limit)", cost::show(self.usage)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    const LIST: &str = r#"{"data":[
+        {"id":"anthropic/claude-sonnet-5.5","name":"Claude","context_length":1000000,
+         "pricing":{"prompt":"0.000003","completion":"0.000015","request":"0","image":"0.0048",
+                    "input_cache_read":"0.0000003","input_cache_write":"0.00000375"},
+         "top_provider":{"context_length":1000000,"max_completion_tokens":64000,"is_moderated":false},
+         "supported_parameters":["max_tokens","reasoning","tools","tool_choice"]},
+        {"id":"openrouter/auto","context_length":2000000,
+         "pricing":{"prompt":"-1","completion":"-1"},
+         "top_provider":{"max_completion_tokens":null},"supported_parameters":[]},
+        {"id":"free/model","pricing":{"prompt":"0","completion":"0"},
+         "top_provider":{"context_length":8192}},
+        {"name":"no id"}
+    ]}"#;
+
+    #[test]
+    fn the_list_is_cut_to_what_td_agent_uses_and_survives_its_cache() {
+        let models = Models::from_provider(LIST.as_bytes()).unwrap();
+        assert_eq!(models.models.len(), 3);
+        let sonnet = models.find("anthropic/claude-sonnet-5.5").unwrap();
+        assert_eq!(sonnet.context_length, Some(1_000_000));
+        assert_eq!(sonnet.max_completion_tokens, Some(64_000));
+        assert!(sonnet.supports("reasoning") && !sonnet.supports("web_search"));
+        assert_eq!(
+            sonnet.pricing,
+            Some(Pricing {
+                prompt: 3_000_000,
+                completion: 15_000_000,
+                request: 0,
+                reasoning: 0,
+                cache_read: 300_000,
+                cache_write: 3_750_000,
+            })
+        );
+        // A negative price marks a router whose price is not fixed.
+        assert_eq!(models.find("openrouter/auto").unwrap().pricing, None);
+        let free = models.find("free/model").unwrap();
+        assert_eq!(free.pricing, Some(Pricing::default()));
+        assert_eq!(free.context_length, Some(8192));
+        assert!(models.find("nope").is_none());
+        let again = Models::from_cache(models.to_cache().as_bytes()).unwrap();
+        assert_eq!(again, models);
+        assert!(Models::from_provider(b"{}").is_err());
+        assert!(Models::from_cache(b"{}").is_err());
+    }
+
+    #[test]
+    fn the_credit_is_read_from_the_keys_record() {
+        let credit = Credit::from_provider(
+            br#"{"data":{"label":"sk-or-v1-abc...","limit":10,"usage":2.5,"limit_remaining":7.5,"is_free_tier":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(credit.remaining, Some(7 * cost::ONE + cost::ONE / 2));
+        assert_eq!(credit.show(), "credit $7.5000");
+        let unlimited = Credit::from_provider(
+            br#"{"data":{"limit":null,"usage":0.25,"limit_remaining":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(unlimited.show(), "used $0.2500 (no key limit)");
+        let over = Credit::from_provider(br#"{"data":{"usage":11,"limit_remaining":-1}}"#).unwrap();
+        assert_eq!(over.remaining, Some(0));
+        assert!(Credit::from_provider(br#"{"data":{"usage":"x"}}"#).is_err());
+        assert!(Credit::from_provider(b"[]").is_err());
+    }
+}

@@ -15,9 +15,11 @@ submission.
 
 ## Status
 
-Increments 3 and 4 of §18 are built: td-ui's message list, and the
+Increments 3, 4 and 5 of §18 are built: td-ui's message list; the
 crate with its gate, the window and conversation processes, the store
-and `./agent`, with local echo and no model. Where building them
+and `./agent`; and the model client over `td-fetch 1`, non-streaming
+and with no tools, with the key file, the models list, cost limits,
+credit and titles. Where building them
 settled a point the design left open, the section says so under "As
 built". No recipe names td-agent yet. The decisions below that were the
 user's to make were made on 2026-10-01 and 2026-10-02:
@@ -259,6 +261,29 @@ would hold its conversation's lock against the next.
   in the composer, and one the child refuses comes back to it with why,
   after any newer draft and never over its selection; one the composer
   cannot take is written whole to standard error.
+
+**As built (increment 5).** A turn now takes as long as its model, so a
+conversation switched away from mid-turn keeps its process: the window
+keeps every child it has started, tracking each one's turn from its
+`started` and `finished` records, and retires a background child once
+its turn ends. A child that holds a message it has not acknowledged, or
+a retry just asked for, counts as mid-turn, so a message sent just
+before a switch is answered rather than logged and abandoned. A turn
+that the closing window cuts short before its request is sent ends
+with `C-r` offered when the conversation is next opened. Opening a
+conversation whose child is still running adopts that child: the
+window reads the conversation's log from the store, dropping a final
+line still being written, and shows the child's later events, skipping
+any whose sequence number it has shown. A background child that fails
+is not restarted; its row says `failed` until it is opened. A
+conversation left mid-turn shows `running` in the list until its turn
+ends, and then closes. A message a background child refuses is noted
+in the window and written whole to standard error, since there is no
+composer of its own to return it to. The window sends every child its
+settings first, before any message: the API key, or why there is none,
+and the model client's configuration (§5, §15). The key crosses the
+socketpair in that one frame and in no argument, environment variable
+or file.
 
 ## 3. The orchestrator and conversations
 
@@ -509,6 +534,22 @@ directory. The driven control socket is opt-in, `--control-socket PATH`,
 and its actions are `new`, `previous`, `next`, `send`, `focus-next` and
 `focus-previous`.
 
+**As built (increment 5).** A row's state may also be `running`, while
+a turn is under way. A reply shows as an `assistant` message: its
+reasoning in a collapsed section, its text, and its usage as the
+message's status (prompt tokens with cached and written, completion
+tokens, and cost). A turn that ends other than `replied` adds a
+`td-agent` message saying why. One that may pass (a 502 or 503, a
+transport failure, an error inside a 200) adds that `C-r` asks again,
+and the status row says so until it does; `retry` is the driven
+action. The status row is the state, the retry hint and a notice, then
+the open conversation's model, the context its last turn request used
+against the model's length from the models list (`ctx -` before
+either is known), the conversation's cost and the day's spending across
+conversations, each against its limit where one is set, the key's
+credit, the mode, `no limits` (the resource limits of §8) and `0
+background` (the background processes of §12).
+
 ## 5. Model client
 
 **Dialect.** OpenAI Chat Completions as OpenRouter serves it at
@@ -605,6 +646,89 @@ in two increments (§18):
 
 Interrupting closes the fetch connection. Not every provider stops
 generating, or billing, when the stream closes; the interrupt says so.
+
+**As built (increment 5).** The conversation process makes each request
+with `td_fetch::post`, `stream` absent, the reply capped at 512 KiB so
+it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
+
+- **The body** is `{HEAD,"messages":[PREFIX…,MESSAGES…]}`. `HEAD` is the
+  exact text of the other members, logged with the request: `model`,
+  `max_tokens`, `reasoning: {effort}`, `provider: {require_parameters:
+  true, data_collection}`, and `cache_control` for `anthropic/*`. The
+  prefix's messages come from §6's prefix. `MESSAGES` are the user
+  messages and turn replies logged before the request, a reply as
+  `{"role":"assistant","content":…,"reasoning_details":…}` with the
+  stored bytes spliced in. With no tools there is no `tools`,
+  `tool_choice` or `parallel_tool_calls` yet, and the refusal of a model
+  lacking `tools` waits for the first tools (§18 increment 8).
+  `reasoning` is left out for a model whose cached `supported_parameters`
+  lacks it, since `require_parameters` would otherwise route it nowhere.
+- **`max_tokens`** is 16,384, or the model's `max_completion_tokens` if
+  that is less, cut to what the context has left after §14's estimate. A
+  conversation whose estimate already fills the context stops the turn
+  and says so, until compaction.
+- **`reasoning_details`** is found in the 200's bytes by a byte-span
+  walk over the JSON (`span.rs`), stored as that text, and spliced back.
+  The log holds it as a string, so the bytes sent again are the bytes
+  received.
+- **Errors.** 401, 402 and every other 4xx stop the turn with the
+  provider's message, as does a fetch failure that left nothing sent: no
+  fetch socket, a refused connection, or the service refusing or finding
+  the request malformed before sending it. A 429 is retried up to three
+  times, after its `Retry-After` seconds, or else 1, 2 and 4 s; a wait
+  past 60 s stops the turn instead. A 408, any 5xx, a transport failure,
+  a reply the service refused past the cap or its other response
+  bounds, and an error inside a 200 (a top-level `error`, a choice's
+  `error`, or `finish_reason: error`) end the turn with `C-r` offered
+  (§4), and are never retried by td-agent. A provider's raw error
+  message, where OpenRouter passes one on, is appended to its own, and
+  either is cut to 500 characters.
+- **Money** is counted in whole pico-credits (10⁻¹² of a credit) in a
+  `u64`, parsed exactly from the decimal text a response or price
+  carries. Prices round up and costs to nearest. The pricing used is
+  `prompt`, `completion`, `request`, `internal_reasoning`,
+  `input_cache_read` and `input_cache_write`. A negative price, as
+  `openrouter/auto` gives, means no pricing, and so does a missing
+  prompt or completion price. A reservation is the prompt estimate at the
+  larger of the prompt and cache-write rates, plus `max_tokens` at the
+  larger of the completion and reasoning rates, plus the request fee.
+- **What a request cost** is its `usage.cost` where the response gives
+  it; or else its tokens at the cached pricing, reasoning tokens at the
+  larger of the completion and reasoning rates, where the usage gives
+  both its prompt and completion counts; or else its whole reservation.
+  A failure that may have been billed (the `C-r` class above) counts
+  its reported cost where an error inside a 200 gave one, and else its
+  whole reservation. A failure that ran nothing counts zero. Each
+  `usage` record says which basis it used: `reported`, `computed`,
+  `reserved` or `none`. An interrupted request counts its reservation
+  only when no `usage` of it was logged before its process died.
+- **The limits.** The conversation process checks the turn's and the
+  conversation's limits against its own log before each request; the
+  day's is the window process's. The child asks the window to reserve
+  each request's amount; the window grants it only while the day's
+  total stays within `max_cost_per_day`, and the child sends its cost
+  when known, which replaces the reservation. The day is the UTC day,
+  since td-agent carries no zone data, and its total is the state
+  directory's `spend`, written before each grant is answered. A
+  reservation still held when its child dies stays spent. Reservation
+  ids start at random in each process, so no grant meant for one
+  process of a conversation is taken by the next; a reservation the
+  failed child asked for in the poll that saw it fail is not answered;
+  and a grant that comes after its request gave up waiting (30 s) is
+  released at once with a cost of zero. A model
+  missing from the cached list is refused by name. A model with no
+  pricing, or any model before the list is first cached, is refused while
+  a limit is set; with all three `none` it is sent and reserves nothing.
+- **The models list** is fetched at window start, without the key, by a
+  thread of the window's, under a 16 MiB bound. It is cached as the state
+  directory's `models`, and only `id`, `context_length` (or the top
+  provider's), `top_provider.max_completion_tokens`, the pricing above
+  and `supported_parameters` are kept. Conversation processes read that
+  cache.
+- **Credit** is `GET /key` with the key and no redirect followed, at
+  start and after a turn ends, at most every 20 s. The row shows
+  `limit_remaining` (a negative remainder as zero), or what the key has
+  used when it has no limit.
 
 ## 6. Credentials and the conversation store
 
@@ -707,6 +831,41 @@ directories are created mode 0700. The human's unacknowledged messages
 are kept in the window process's memory (§2), not the state directory:
 there is not yet a message between conversations to keep there. One
 still held when the window closes is written whole to standard error.
+
+**As built (increment 5).**
+
+- **The key file** is read once, by the window process at start, with
+  std alone and no `unsafe`. The path is walked a component at a time,
+  each opened `O_PATH | O_NOFOLLOW` beneath the descriptor of the one
+  before it (through `/proc/self/fd`), so no component can be swapped
+  between its check and its use. A symbolic link met on the way is read
+  and followed by the same walk, at most 40 of them, and every directory
+  reached is checked by its descriptor's metadata: owned by the caller
+  or root, and neither group- nor other-writable, with no exception for
+  a sticky bit. The file itself is opened `O_NOFOLLOW | O_NONBLOCK |
+  O_NOCTTY` beneath its directory, then checked as above, and must hold
+  one line of printable ASCII of at most 4,096 bytes, its newline
+  optional. Each refusal names the path and what is wrong with it. A
+  missing file is not an error at start: every turn ends saying where to
+  write the key. The key reaches no log, transcript, argument list,
+  environment or standard error; its `Debug` form is redacted.
+- **The prefix** is a JSON array of the system message, written at
+  creation from `td-agent/prompt/`. A conversation whose prefix differs
+  from the one this program writes (an empty prefix from increment 4,
+  say) gets a `prefix` event holding the new one before its next
+  request, and requests name the prefix they used.
+- **New events.** A `request` (its turn, its purpose, `turn` or `title`,
+  its prefix, its exact head, its body's length and its reservation) is
+  a started effect, synced before it is sent; an `assistant` message
+  (its text, its reasoning text, its raw `reasoning_details` and its
+  finish reason); `usage` (tokens, cost and its basis, §5); a `title`;
+  and `finished` records that carry `retry` when the human may ask a
+  failed turn again. A title request's head holds its whole body, which
+  quotes the first exchange; a turn request's body is rebuilt from the
+  log, and a test holds that the rebuilt bytes are the bytes sent.
+- **Recovery** applies to requests as to turns: one started and not
+  finished is interrupted, never resent, and its reservation counts as
+  spent in the conversation's total.
 
 ## 7. Workspaces
 
@@ -1676,6 +1835,19 @@ not written once.
 Titles come from a cheap model (`title_model`) after the first exchange,
 reserved like any request; the first line of the task stands until then.
 
+**As built (increment 5).** The prompt texts are
+`prompt/conversation.txt`, `prompt/orchestrator.txt` and
+`prompt/title.txt`. With no tools, no environment block and no project
+instructions yet, the prefix is the static text alone, which says that
+the conversation has no tools and that the window shows plain text. A
+title request is the title prompt and one user message quoting the
+first message and the start of the reply, each cut to 4 KiB, with
+`max_tokens` 256. It is sent once, after a conversation's first reply,
+and never for the orchestrator. Its reply's first line, without
+quotation marks, becomes the title. A title request that is refused
+leaves the first line standing and says why in a notice, and one that
+fails records why in its request's finish; neither fails the turn.
+
 ## 14. Context
 
 The model's context is the prefix (§13) plus a view of the log; the log
@@ -1813,6 +1985,18 @@ list of known keys. A missing file is every default, and a file longer
 than 1 MiB is refused. A relative `XDG_CONFIG_HOME` or `XDG_STATE_HOME`
 is ignored, as the XDG base directory rules say, for `$HOME/.config` or
 `$HOME/.local/state`.
+
+**As built (increment 5).** `base_url`, `model`, `orchestrator_model`,
+`title_model`, `reasoning_effort`, `data_collection` and the three cost
+limits are read and checked. The defaults are
+`https://openrouter.ai/api/v1`, `anthropic/claude-sonnet-5.5` for both
+conversation models, `anthropic/claude-haiku-4.5` for titles, and
+`medium`. `base_url` must be an `https://` URL with a host and no query,
+fragment or space, so the key is never sent in the clear; a trailing
+`/` is dropped. A model id is printable ASCII. `reasoning_effort` is one
+of `none`, `minimal`, `low`, `medium`, `high` and `xhigh`. A limit is a
+non-negative number of credits, or `none`. The key file is not a key of
+this file (§6).
 
 ## 16. Prior art: opencode
 
@@ -1991,6 +2175,39 @@ of one conversation and a second window refused, and the configuration
 refusals. The window's keys, focus, list order, status row and divider
 are tested against its widget state in `src/ui.rs` and the driven
 actions in `src/control.rs`.
+
+**As built (increment 5).** Unit tests cover request building, response
+parsing, the splice's byte identity through the log, a log replayed to
+the bytes sent, money parsing and reservation arithmetic, the day's
+ledger, each error path, and each key-file refusal against temporary
+trees. `tests/model_client.rs` drives the built program's conversation
+personality over its socketpair, as the window would, with
+`XDG_RUNTIME_DIR` pointing at `tests/support/mock_fetch.rs`. That mock
+fetch service serves the `td-fetch 1` protocol from a thread, records
+every request, and answers from `tests/fixtures/openrouter/`. The
+fixtures are written by hand in the shapes OpenRouter returns; none is
+a recording of a live exchange, and no test reaches the network. The
+cases are a turn's exact headers and body and its title; a second turn
+from a restarted process, whose body begins with every byte the first
+sent and carries the first reply's `reasoning_details` unchanged; 429
+retried three times and no more; a 502 offered for a retry and asked
+again only when told; 401 and 402; an error inside a 200; the turn's,
+the day's and an unpriced model's limits; a model without `reasoning`;
+a request in flight when its process is killed, interrupted and never
+resent; no key; and the key absent from the log, `meta`, `prefix` and
+standard error. `tests/processes.rs` adds a message sent just before
+switching away, whose turn still runs in the background. The shared
+`td_fetch.rs` joins `json.rs` and `toml.rs` in
+`tests/shared_modules.rs`.
+
+The live check is by hand. Write the key as one line to
+`$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode 0600, and run `./agent`
+from a checkout. A message to the orchestrator gets a reply, with its
+usage and cost on it. A new conversation's first reply is followed by a
+title from `title_model`. The status row shows the model, the context
+used, the cost, today's total and the key's credit. The conversation's
+`log` under `$XDG_STATE_HOME/td-agent/` holds the request, the reply
+with its `reasoning_details`, and the usage.
 
 ## 18. Increments
 

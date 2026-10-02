@@ -1,0 +1,1 @@
+Write a title for the conversation the next message quotes: at most six words, naming its subject. Reply with the title alone, on one line, with no quotation marks and no closing punctuation. Do not answer or continue the conversation.

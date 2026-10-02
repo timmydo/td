@@ -38,7 +38,7 @@ impl ErrorCode for Refusal {
 }
 
 /// The window's actions, each its default chord.
-pub const BINDINGS: [Binding; 6] = [
+pub const BINDINGS: [Binding; 7] = [
     Binding {
         name: "new",
         chord: Some("C-n"),
@@ -62,6 +62,12 @@ pub const BINDINGS: [Binding; 6] = [
         chord: Some("C-Return"),
         arguments: "",
         help: "Send the composer's text; Return is a newline.",
+    },
+    Binding {
+        name: "retry",
+        chord: Some("C-r"),
+        arguments: "",
+        help: "Ask the open conversation's failed turn again.",
     },
     Binding {
         name: "focus-next",

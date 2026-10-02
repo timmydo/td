@@ -1,10 +1,18 @@
 //! The window process (DESIGN.md §2, §4): td-ui's widget window drives
 //! the `App` with its inputs, and each turn the session hands the app
-//! what the open conversation's process said, serves the driven control
-//! socket when there is one, and carries out what the app asked.
+//! what the conversation processes said, answers their reservations from
+//! the day's ledger, serves the driven control socket when there is one,
+//! and carries out what the app asked.
+//!
+//! It also holds what crosses conversations: the API key, read once at
+//! startup and handed to each conversation process over its socketpair;
+//! the day's spending (`accounts::Ledger`); and the provider's models list
+//! and the key's credit, fetched on a thread of their own (`Fetcher`) so
+//! the window never waits on the network.
 
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use td_ui::control_socket::Socket;
 use td_ui::control_worker::Worker;
@@ -12,10 +20,15 @@ use td_ui::driven::{self, Payload};
 use td_ui::raster::{Composition, Raster, Scale, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input};
 
-use crate::config::Config;
+use crate::accounts::Ledger;
+use crate::config::{Client, Config};
 use crate::control::Remote;
-use crate::store::{self, Id, Role, StateDir};
-use crate::supervisor::{Supervisor, Update};
+use crate::key::Secret;
+use crate::models::{Credit, Models, MAX_LIST};
+use crate::protocol::{Down, Up};
+use crate::store::{self, Event, Id, Kind, Role, StateDir};
+use crate::supervisor::{Opened, Supervisor, Update};
+use crate::td_fetch;
 use crate::ui::{App, Request, Row, RowState};
 
 /// The longest a turn waits before polling the conversation again.
@@ -23,6 +36,108 @@ const POLL_MS: u64 = 50;
 /// Control requests answered per turn, so a busy client cannot starve
 /// the window's own inputs.
 const CONTROL_PER_TURN: usize = 4;
+/// The least time between two credit fetches.
+const CREDIT_EVERY: Duration = Duration::from_secs(20);
+/// The longest key record taken.
+const MAX_CREDIT: u64 = 64 * 1024;
+
+/// What the fetcher thread is asked for, and what it answers.
+enum Job {
+    Models,
+    Credit,
+}
+
+enum Fetched {
+    Models(Result<Models, String>),
+    Credit(Result<Credit, String>),
+}
+
+/// The models list and the key's credit, fetched off the window's thread.
+struct Fetcher {
+    jobs: Sender<Job>,
+    results: Receiver<Fetched>,
+    last_credit: Option<Instant>,
+    /// Whether there is a key to ask the credit of.
+    keyed: bool,
+}
+
+impl Fetcher {
+    fn start(base_url: String, key: Option<Secret>, state: PathBuf) -> Result<Self, String> {
+        let keyed = key.is_some();
+        let (jobs, work) = mpsc::channel::<Job>();
+        let (answer, results) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("td-agent-fetcher".into())
+            .spawn(move || {
+                for job in work {
+                    let fetched = match job {
+                        Job::Models => Fetched::Models(models(&base_url, &state)),
+                        Job::Credit => Fetched::Credit(credit(&base_url, key.as_ref())),
+                    };
+                    if answer.send(fetched).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| format!("the fetcher thread: {e}"))?;
+        Ok(Self {
+            jobs,
+            results,
+            last_credit: None,
+            keyed,
+        })
+    }
+
+    fn credit(&mut self, now: Instant) {
+        if !self.keyed
+            || self
+                .last_credit
+                .is_some_and(|last| now.duration_since(last) < CREDIT_EVERY)
+        {
+            return;
+        }
+        self.last_credit = Some(now);
+        let _ = self.jobs.send(Job::Credit);
+    }
+}
+
+/// `GET /models`, cached in the state directory as it comes.
+fn models(base_url: &str, state: &std::path::Path) -> Result<Models, String> {
+    let response = td_fetch::get(
+        &format!("{base_url}/models"),
+        &[("accept", "application/json")],
+        Some(MAX_LIST),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    if response.status != 200 {
+        return Err(format!("status {}", response.status));
+    }
+    let models = Models::from_provider(&response.body)?;
+    models.save(state)?;
+    Ok(models)
+}
+
+/// `GET /key`: the key's credit.
+fn credit(base_url: &str, key: Option<&Secret>) -> Result<Credit, String> {
+    let key = key.ok_or("no API key")?;
+    let authorization = format!("Bearer {}", key.expose());
+    let response = td_fetch::get(
+        &format!("{base_url}/key"),
+        &[
+            ("authorization", authorization.as_str()),
+            ("accept", "application/json"),
+        ],
+        Some(MAX_CREDIT),
+        // The service drops the key on a redirect; none is followed.
+        Some(0),
+    )
+    .map_err(|e| e.to_string())?;
+    if response.status != 200 {
+        return Err(format!("status {}", response.status));
+    }
+    Credit::from_provider(&response.body)
+}
 
 /// The window's state and what it owns outside the window.
 pub struct Session {
@@ -30,6 +145,9 @@ pub struct Session {
     supervisor: Supervisor,
     state: StateDir,
     control: Option<Worker<Payload>>,
+    ledger: Ledger,
+    fetcher: Option<Fetcher>,
+    client: Client,
 }
 
 impl Session {
@@ -37,15 +155,16 @@ impl Session {
     fn serve(&mut self) {
         for request in self.app.take_requests() {
             match request {
-                Request::Open(id) => {
-                    if let Err(reason) = self.supervisor.open(id, None) {
-                        self.app.update(Update::Failed { reason }, store::now());
-                    }
-                }
+                Request::Open(id) => self.open(id, None),
                 Request::New => self.start(),
                 Request::Send(text) => {
                     if let Err(e) = self.supervisor.send(text.clone()) {
                         self.app.restore(&text, e);
+                    }
+                }
+                Request::Retry => {
+                    if let Err(e) = self.supervisor.retry() {
+                        self.app.note(e);
                     }
                 }
                 Request::SaveShare(first, total) => {
@@ -54,6 +173,19 @@ impl Session {
                     }
                 }
             }
+        }
+    }
+
+    /// Opens conversation `id`: a process of its own replays its log; one
+    /// already running its turn is adopted, and the log is read here.
+    fn open(&mut self, id: Id, create: Option<Role>) {
+        match self.supervisor.open(id.clone(), create) {
+            Ok(Opened::Started) => {}
+            Ok(Opened::Adopted) => match read_log(&self.state, &id) {
+                Ok(events) => self.app.replay(events),
+                Err(e) => self.app.note(format!("the conversation's log: {e}")),
+            },
+            Err(reason) => self.app.update(Update::Failed { reason }, store::now()),
         }
     }
 
@@ -74,9 +206,108 @@ impl Session {
             state: RowState::Starting,
         });
         self.app.set_active(id.clone());
-        if let Err(reason) = self.supervisor.open(id, Some(Role::Conversation)) {
-            self.app.update(Update::Failed { reason }, store::now());
+        self.open(id, Some(Role::Conversation));
+    }
+
+    /// What the conversation processes said: reservations answered from
+    /// the ledger, the rest to the app.
+    fn hear(&mut self) {
+        let now = store::now();
+        for (id, update) in self.supervisor.poll() {
+            match &update {
+                Update::Up(Up::Reserve {
+                    id: request,
+                    amount,
+                }) => {
+                    let refusal = self.ledger.reserve(&id, *request, *amount, now).err();
+                    self.supervisor.answer(
+                        &id,
+                        &Down::Reservation {
+                            id: *request,
+                            refusal,
+                        },
+                    );
+                }
+                Update::Up(Up::Spent {
+                    id: request,
+                    amount,
+                }) => {
+                    if let Err(e) = self.ledger.settle(&id, *request, *amount, now) {
+                        self.app.note(e);
+                    }
+                }
+                Update::Restarting { .. } | Update::Failed { .. } => self.ledger.forget(&id),
+                Update::Up(Up::Event(Event {
+                    kind: Kind::Finished { .. },
+                    ..
+                })) => {
+                    if let Some(fetcher) = self.fetcher.as_mut() {
+                        fetcher.credit(Instant::now());
+                    }
+                }
+                _ => {}
+            }
+            if self.supervisor.open_id() == Some(&id) {
+                self.app.update(update, now);
+            } else if let Update::Refused { text, reason } = &update {
+                // No composer of its own to go back to: said, and kept
+                // whole on standard error.
+                let note = match text {
+                    Some(text) => {
+                        eprintln!(
+                            "td-agent: conversation {id} refused a message ({reason}):\n{text}"
+                        );
+                        format!(
+                            "conversation {id} refused a message: {reason}; its text is on standard error"
+                        )
+                    }
+                    None => format!("conversation {id} refused: {reason}"),
+                };
+                self.app.note(note);
+            } else {
+                self.app.background(&id, &update, now);
+            }
         }
+        let today = self.ledger.today(now);
+        self.app.set_today(today);
+        self.fetched();
+    }
+
+    /// What the fetcher brought.
+    fn fetched(&mut self) {
+        let Some(fetcher) = self.fetcher.as_ref() else {
+            return;
+        };
+        let results: Vec<Fetched> = fetcher.results.try_iter().collect();
+        for fetched in results {
+            match fetched {
+                Fetched::Models(Ok(models)) => self.show_models(&models),
+                Fetched::Models(Err(e)) => {
+                    eprintln!("td-agent: the models list: {e}");
+                    self.app.note(format!("the models list: {e}"));
+                }
+                Fetched::Credit(Ok(credit)) => self.app.set_credit(Some(credit.show())),
+                Fetched::Credit(Err(e)) => {
+                    self.app.set_credit(Some("credit unknown".into()));
+                    eprintln!("td-agent: the key's credit: {e}");
+                }
+            }
+        }
+    }
+
+    fn show_models(&mut self, models: &Models) {
+        let contexts = [&self.client.model, &self.client.orchestrator_model]
+            .iter()
+            .filter_map(|id| {
+                let length = models.find(id)?.context_length?;
+                Some((id.to_string(), length))
+            })
+            .collect();
+        self.app.set_models(
+            &self.client.model,
+            &self.client.orchestrator_model,
+            contexts,
+        );
     }
 
     /// Answers what the control socket asked, through the same paths the
@@ -106,6 +337,15 @@ impl Session {
     }
 }
 
+/// A conversation's log as the store holds it now, its final line left
+/// out if its process is still writing it.
+fn read_log(state: &StateDir, id: &Id) -> Result<Vec<Event>, String> {
+    let path = state.conversation(id).join("log");
+    let bytes = store::read_bounded(&path, store::MAX_LOG)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    store::parse_log(&bytes).map(|(events, _)| events)
+}
+
 impl Handler for Session {
     fn app_id(&self) -> &str {
         "td-agent"
@@ -126,9 +366,7 @@ impl Handler for Session {
 
     fn poll(&mut self, now: u64) -> Flow {
         self.app.tick(now);
-        for update in self.supervisor.poll() {
-            self.app.update(update, store::now());
-        }
+        self.hear();
         self.control();
         self.serve();
         Flow::Continue
@@ -183,9 +421,11 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
 
 /// Runs the window process over the state directory until the window
 /// closes: it takes the window lock, opens the orchestrator, creating it
-/// the first time, and serves `control` when given.
+/// the first time, and serves `control` when given. `key` is the API key,
+/// or why there is none, which every turn then says.
 pub fn run(
     config: Config,
+    key: Result<Secret, String>,
     state: StateDir,
     program: PathBuf,
     control: Option<PathBuf>,
@@ -217,6 +457,10 @@ pub fn run(
             config.notes.len()
         ));
     }
+    if let Err(why) = &key {
+        eprintln!("td-agent: {why}");
+        app.note(why.clone());
+    }
     let (rows, problems) = rows(&state);
     for problem in &problems {
         eprintln!("td-agent: the store: {problem}");
@@ -229,34 +473,63 @@ pub fn run(
         .find(|r| r.role == Role::Orchestrator)
         .map(|r| r.id.clone());
     app.set_rows(rows);
-    let mut supervisor = Supervisor::new(program, state.root().to_path_buf());
-    let opened = match orchestrator {
+    let client = config.client.clone();
+    app.set_models(&client.model, &client.orchestrator_model, Vec::new());
+    app.set_limits(client.limits);
+    let setup = Down::Setup {
+        key: key.clone(),
+        client: client.clone(),
+    };
+    let supervisor = Supervisor::new(program, state.root().to_path_buf(), setup);
+    let fetcher = match Fetcher::start(
+        client.base_url.clone(),
+        key.ok(),
+        state.root().to_path_buf(),
+    ) {
+        Ok(fetcher) => Some(fetcher),
+        Err(e) => {
+            app.note(e);
+            None
+        }
+    };
+    let ledger = Ledger::load(Some(state.root()), client.limits.day, store::now());
+    let mut session = Session {
+        app,
+        supervisor,
+        state,
+        control,
+        ledger,
+        fetcher,
+        client,
+    };
+    // A cached list serves until the provider's comes.
+    match Models::load(session.state.root()) {
+        Ok(Some(models)) => session.show_models(&models),
+        Ok(None) => {}
+        Err(e) => session.app.note(format!("the models cache: {e}")),
+    }
+    if let Some(fetcher) = session.fetcher.as_mut() {
+        let _ = fetcher.jobs.send(Job::Models);
+        fetcher.credit(Instant::now());
+    }
+    match orchestrator {
         Some(id) => {
-            app.set_active(id.clone());
-            supervisor.open(id, None)
+            session.app.set_active(id.clone());
+            session.open(id, None);
         }
         None => {
             let id = Id::random()?;
-            app.add_row(Row {
+            session.app.add_row(Row {
                 id: id.clone(),
                 role: Role::Orchestrator,
                 title: Role::Orchestrator.first_title().to_string(),
                 activity: store::now(),
                 state: RowState::Starting,
             });
-            app.set_active(id.clone());
-            supervisor.open(id, Some(Role::Orchestrator))
+            session.app.set_active(id.clone());
+            session.open(id, Some(Role::Orchestrator));
         }
-    };
-    if let Err(reason) = opened {
-        app.update(Update::Failed { reason }, store::now());
     }
-    let mut session = Session {
-        app,
-        supervisor,
-        state,
-        control,
-    };
     let typeface = td_ui::pinned_face::load_or_note(
         "td-agent",
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),

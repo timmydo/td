@@ -18,6 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::cost::Tokens;
 use crate::json::Json;
 
 /// `O_NOFOLLOW` on x86-64, as td-ui's control socket spells it.
@@ -25,6 +26,8 @@ const O_NOFOLLOW: i32 = 0o400000;
 
 /// The longest `meta` read back.
 const MAX_META: u64 = 64 * 1024;
+/// The longest `prefix` read back.
+pub const MAX_PREFIX: u64 = 1024 * 1024;
 /// The longest log loaded; a longer one is refused rather than read.
 pub const MAX_LOG: u64 = 256 * 1024 * 1024;
 /// What a log keeps free past an accepted message, for the records that
@@ -252,26 +255,31 @@ fn open_lock(path: &Path) -> Result<File, String> {
 
 /// At most `limit` bytes of `path`, opened without following a final
 /// link; a longer file is refused.
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW)
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .open(path)?;
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
-        return Err(format!("{} is longer than {limit} bytes", path.display()));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("longer than {limit} bytes"),
+        ));
     }
     Ok(bytes)
+}
+
+/// `read_bounded`, its failure said with the path.
+fn read_named(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    read_bounded(path, limit).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Replaces `dir/name` whole: a fresh temporary written and synced, then
 /// renamed over it and the directory synced, so a reader sees the old
 /// bytes or the new, never part of either.
-fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     let temporary = dir.join(format!(".{name}.{}", std::process::id()));
     let _ = std::fs::remove_file(&temporary);
     let write = || -> std::io::Result<()> {
@@ -337,7 +345,7 @@ impl Meta {
 }
 
 fn read_meta(dir: &Path) -> Result<Meta, String> {
-    let bytes = read_bounded(&dir.join("meta"), MAX_META)?;
+    let bytes = read_named(&dir.join("meta"), MAX_META)?;
     let value = crate::json::parse_slice(&bytes).map_err(|e| format!("meta: {e}"))?;
     Meta::from_json(&value)
 }
@@ -357,9 +365,10 @@ pub fn title(text: &str) -> String {
         .to_string()
 }
 
-/// The one effect this increment has: a turn, started when a user
+/// The effect a `Started` record opens: a turn, started when a user
 /// message is logged and finished when its reply is (DESIGN.md §6,
-/// Recovery). Until the model client, a turn's reply is "no model".
+/// Recovery). A model request is the other effect, opened by its own
+/// `Request` record, which carries what the request was.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Effect {
     Turn,
@@ -376,6 +385,65 @@ impl Effect {
     }
 }
 
+/// What a model request was for (DESIGN.md §5, §13).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Purpose {
+    /// The conversation's own exchange: the prefix and the log's messages.
+    Turn,
+    /// A title from `title_model` after the first exchange.
+    Title,
+}
+
+impl Purpose {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Title => "title",
+        }
+    }
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "turn" => Some(Self::Turn),
+            "title" => Some(Self::Title),
+            _ => None,
+        }
+    }
+}
+
+/// How a request's recorded cost was known.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Basis {
+    /// The response's `usage.cost`.
+    Reported,
+    /// The response's token counts at the cached prices.
+    Computed,
+    /// Unknown: the request may have run and been billed before failing,
+    /// so its whole reservation is counted as spent.
+    Reserved,
+    /// The request was not run (refused, rate-limited): nothing.
+    Nothing,
+}
+
+impl Basis {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Reported => "reported",
+            Self::Computed => "computed",
+            Self::Reserved => "reserved",
+            Self::Nothing => "none",
+        }
+    }
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "reported" => Some(Self::Reported),
+            "computed" => Some(Self::Computed),
+            "reserved" => Some(Self::Reserved),
+            "none" => Some(Self::Nothing),
+            _ => None,
+        }
+    }
+}
+
 /// One log event's content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -384,13 +452,55 @@ pub enum Kind {
     User { delivery: String, text: String },
     /// An effect logged and synced before it runs, for the event `of`.
     Started { effect: Effect, of: u64 },
-    /// The effect started at `started` finished.
-    Finished { started: u64, outcome: String },
+    /// The effect started at `started` finished; `retry` when the human
+    /// may ask for it again (a 502, say: shown, never retried by itself).
+    Finished {
+        started: u64,
+        outcome: String,
+        retry: bool,
+    },
     /// A restart found the effect started at `started` unfinished; it is
     /// never repeated.
     Interrupted { started: u64 },
     /// Something the store reports about itself, a torn line dropped.
     Notice { text: String },
+    /// A request prefix (DESIGN.md §6, §13) superseding the `prefix` file
+    /// and any earlier one from here on: a JSON array of the messages
+    /// every request of the conversation begins with, as exact text.
+    Prefix { text: String },
+    /// A model request, logged and synced before it is sent: the turn it
+    /// belongs to, what it is for, the prefix it begins with (0 for the
+    /// file, else the `Prefix` event's sequence number), the exact text of
+    /// its body's other members (`head`), its body's length, and the
+    /// credits reserved for it. The body is a pure function of these and
+    /// the log before it (`request::body`).
+    Request {
+        turn: u64,
+        purpose: Purpose,
+        prefix: u64,
+        head: String,
+        bytes: u64,
+        reserved: u64,
+    },
+    /// The assistant message a request received: its text, its reasoning
+    /// as text where the provider gave it, its `reasoning_details` as the
+    /// exact bytes of the response that carried them, and why it ended.
+    Assistant {
+        request: u64,
+        content: Option<String>,
+        reasoning: Option<String>,
+        details: Option<String>,
+        finish: String,
+    },
+    /// A request's token counts and what it cost, in pico-credits.
+    Usage {
+        request: u64,
+        tokens: Tokens,
+        cost: u64,
+        basis: Basis,
+    },
+    /// The title a title request gave the conversation.
+    Title { request: u64, text: String },
 }
 
 /// One line of the log.
@@ -419,10 +529,17 @@ impl Event {
                 put("effect", Json::Str(effect.word().into()));
                 put("of", Json::from(*of));
             }
-            Kind::Finished { started, outcome } => {
+            Kind::Finished {
+                started,
+                outcome,
+                retry,
+            } => {
                 put("kind", Json::Str("finished".into()));
                 put("started", Json::from(*started));
                 put("outcome", Json::Str(outcome.clone()));
+                if *retry {
+                    put("retry", Json::Bool(true));
+                }
             }
             Kind::Interrupted { started } => {
                 put("kind", Json::Str("interrupted".into()));
@@ -430,6 +547,62 @@ impl Event {
             }
             Kind::Notice { text } => {
                 put("kind", Json::Str("notice".into()));
+                put("text", Json::Str(text.clone()));
+            }
+            Kind::Prefix { text } => {
+                put("kind", Json::Str("prefix".into()));
+                put("text", Json::Str(text.clone()));
+            }
+            Kind::Request {
+                turn,
+                purpose,
+                prefix,
+                head,
+                bytes,
+                reserved,
+            } => {
+                put("kind", Json::Str("request".into()));
+                put("turn", Json::from(*turn));
+                put("purpose", Json::Str(purpose.word().into()));
+                put("prefix", Json::from(*prefix));
+                put("head", Json::Str(head.clone()));
+                put("bytes", Json::from(*bytes));
+                put("reserved", Json::from(*reserved));
+            }
+            Kind::Assistant {
+                request,
+                content,
+                reasoning,
+                details,
+                finish,
+            } => {
+                let text = |v: &Option<String>| v.clone().map_or(Json::Null, Json::Str);
+                put("kind", Json::Str("assistant".into()));
+                put("request", Json::from(*request));
+                put("content", text(content));
+                put("reasoning", text(reasoning));
+                put("reasoning_details", text(details));
+                put("finish", Json::Str(finish.clone()));
+            }
+            Kind::Usage {
+                request,
+                tokens,
+                cost,
+                basis,
+            } => {
+                put("kind", Json::Str("usage".into()));
+                put("request", Json::from(*request));
+                put("prompt_tokens", Json::from(tokens.prompt));
+                put("completion_tokens", Json::from(tokens.completion));
+                put("cached_tokens", Json::from(tokens.cached));
+                put("cache_write_tokens", Json::from(tokens.cache_write));
+                put("reasoning_tokens", Json::from(tokens.reasoning));
+                put("cost", Json::from(*cost));
+                put("basis", Json::Str(basis.word().into()));
+            }
+            Kind::Title { request, text } => {
+                put("kind", Json::Str("title".into()));
+                put("request", Json::from(*request));
                 put("text", Json::Str(text.clone()));
             }
         }
@@ -466,11 +639,66 @@ impl Event {
             Some("finished") => Kind::Finished {
                 started: number("started")?,
                 outcome: string("outcome")?,
+                retry: match value.get("retry") {
+                    None => false,
+                    Some(retry) => retry.as_bool().ok_or("retry is not a boolean")?,
+                },
             },
             Some("interrupted") => Kind::Interrupted {
                 started: number("started")?,
             },
             Some("notice") => Kind::Notice {
+                text: string("text")?,
+            },
+            Some("prefix") => Kind::Prefix {
+                text: string("text")?,
+            },
+            Some("request") => Kind::Request {
+                turn: number("turn")?,
+                purpose: value
+                    .get("purpose")
+                    .and_then(Json::as_str)
+                    .and_then(Purpose::parse)
+                    .ok_or("no purpose")?,
+                prefix: number("prefix")?,
+                head: string("head")?,
+                bytes: number("bytes")?,
+                reserved: number("reserved")?,
+            },
+            Some("assistant") => {
+                let text = |name: &str| -> Result<Option<String>, String> {
+                    match value.get(name) {
+                        None | Some(Json::Null) => Ok(None),
+                        Some(Json::Str(text)) => Ok(Some(text.clone())),
+                        Some(_) => Err(format!("{name} is not a string")),
+                    }
+                };
+                Kind::Assistant {
+                    request: number("request")?,
+                    content: text("content")?,
+                    reasoning: text("reasoning")?,
+                    details: text("reasoning_details")?,
+                    finish: string("finish")?,
+                }
+            }
+            Some("usage") => Kind::Usage {
+                request: number("request")?,
+                tokens: Tokens {
+                    prompt: number("prompt_tokens")?,
+                    completion: number("completion_tokens")?,
+                    cached: number("cached_tokens")?,
+                    cache_write: number("cache_write_tokens")?,
+                    reasoning: number("reasoning_tokens")?,
+                },
+                cost: number("cost")?,
+                basis: value
+                    .get("basis")
+                    .and_then(Json::as_str)
+                    .and_then(Basis::parse)
+                    .ok_or("no basis")?,
+            },
+            Some("title") => Kind::Title {
+                request: number("request")?,
                 text: string("text")?,
             },
             Some(other) => return Err(format!("unknown kind {other:?}")),
@@ -504,6 +732,8 @@ pub struct Conversation {
     /// The log's length, held within `MAX_LOG`.
     length: u64,
     events: Vec<Event>,
+    /// The `prefix` file's text, which a `Prefix` event supersedes.
+    prefix: String,
     /// Kept for as long as the conversation is open: the lock.
     _lock: File,
 }
@@ -535,9 +765,8 @@ impl Conversation {
                     created: now(),
                 };
                 // The request prefix (§13) is written once and never
-                // rewritten. No prompt exists before the model client,
-                // so it is empty; a later prefix is a log event.
-                create_file(&dir.join("prefix"), b"")?;
+                // rewritten; a later prefix is a log event.
+                create_file(&dir.join("prefix"), crate::prompt::prefix(role).as_bytes())?;
                 create_file(&dir.join("log"), b"")?;
                 replace(&dir, "meta", meta.to_json().to_string().as_bytes())?;
                 meta
@@ -547,6 +776,8 @@ impl Conversation {
         if &meta.id != id {
             return Err(format!("{}: its meta names another id", dir.display()));
         }
+        let prefix = String::from_utf8(read_named(&dir.join("prefix"), MAX_PREFIX)?)
+            .map_err(|_| format!("{}: not UTF-8", dir.join("prefix").display()))?;
         let path = dir.join("log");
         let mut log = OpenOptions::new()
             .read(true)
@@ -574,6 +805,7 @@ impl Conversation {
             log,
             length: bytes.len() as u64,
             events,
+            prefix,
             _lock: lock,
         };
         let mut load = Load::default();
@@ -627,6 +859,20 @@ impl Conversation {
         &self.events
     }
 
+    /// The `prefix` file's text, as written at creation.
+    pub fn prefix_file(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Whether the log has room for `bytes` more of records and the
+    /// `LOG_RESERVE` after them: a reply is taken only while it would fit.
+    pub fn has_room_for(&self, bytes: u64) -> bool {
+        self.length
+            .saturating_add(bytes)
+            .saturating_add(LOG_RESERVE)
+            <= MAX_LOG
+    }
+
     /// Whether a user message with this delivery id is already logged.
     pub fn delivered(&self, delivery: &str) -> bool {
         self.events
@@ -652,7 +898,7 @@ impl Conversation {
         let mut open = Vec::new();
         for event in &self.events {
             match &event.kind {
-                Kind::Started { .. } => open.push(event.seq),
+                Kind::Started { .. } | Kind::Request { .. } => open.push(event.seq),
                 Kind::Finished { started, .. } | Kind::Interrupted { started } => {
                     open.retain(|seq| seq != started)
                 }
@@ -876,6 +1122,7 @@ pub mod tests {
                 .append(Kind::Finished {
                     started: 2,
                     outcome: "no model".into(),
+                    retry: false,
                 })
                 .unwrap();
             conversation.sync().unwrap();
@@ -883,7 +1130,11 @@ pub mod tests {
             conversation.events().to_vec()
         };
         let dir = state.conversation(&id);
-        assert_eq!(std::fs::read(dir.join("prefix")).unwrap(), b"");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("prefix")).unwrap(),
+            crate::prompt::prefix(Role::Conversation)
+        );
+
         let log = std::fs::read_to_string(dir.join("log")).unwrap();
         assert_eq!(log.lines().count(), 3);
         assert!(log.lines().all(|line| line.starts_with("{\"seq\":")));

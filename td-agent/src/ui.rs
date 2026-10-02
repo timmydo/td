@@ -9,8 +9,12 @@
 //! so each conversation is a row of its own, a workspace of one.
 //!
 //! What the window must do outside itself (open a conversation, start a
-//! new one, send a message, save the split) it asks through `Request`s,
-//! which the session takes after every input.
+//! new one, send a message, ask a failed turn again, save the split) it
+//! asks through `Request`s, which the session takes after every input.
+//!
+//! The status row says the open conversation's model, the context its
+//! last request used against the model's length, what the conversation
+//! has cost, what today has, and the key's credit (DESIGN.md §4, §5).
 
 use td_ui::chrome::ROW;
 use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
@@ -27,8 +31,9 @@ use td_ui::window::{Clipboard, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::config::Mode;
+use crate::cost;
 use crate::protocol::{Up, MAX_TEXT};
-use crate::store::{Event, Id, Kind, Role};
+use crate::store::{Event, Id, Kind, Purpose, Role};
 use crate::supervisor::Update;
 
 /// The composer's text rows when the window has room for them.
@@ -59,6 +64,8 @@ pub enum RowState {
     Closed,
     Starting,
     Idle,
+    /// A turn is under way.
+    Running,
     Restarting,
     Failed,
 }
@@ -69,9 +76,45 @@ impl RowState {
             Self::Closed => "",
             Self::Starting => "starting",
             Self::Idle => "idle",
+            Self::Running => "running",
             Self::Restarting => "restarting",
             Self::Failed => "failed",
         }
+    }
+}
+
+/// What the status row says of the open conversation, from its log.
+#[derive(Clone, Debug, Default)]
+struct Meter {
+    /// Each request's sequence number, purpose and reservation.
+    requests: Vec<(u64, Purpose, u64)>,
+    /// Each turn reply's request and its message's index.
+    replies: Vec<(u64, usize)>,
+    /// The requests a usage record charged.
+    charged: Vec<u64>,
+    spent: u64,
+    /// The last turn request's prompt and completion tokens.
+    context: Option<u64>,
+    /// The last turn failed in a way the human may ask again.
+    retry: bool,
+}
+
+impl Meter {
+    fn request(&self, seq: u64) -> Option<(Purpose, u64)> {
+        self.requests
+            .iter()
+            .rev()
+            .find(|(s, _, _)| *s == seq)
+            .map(|(_, purpose, reserved)| (*purpose, *reserved))
+    }
+}
+
+/// A count of tokens, short.
+fn tokens(count: u64) -> String {
+    if count >= 10_000 {
+        format!("{}k", count / 1000)
+    } else {
+        count.to_string()
     }
 }
 
@@ -97,6 +140,8 @@ pub enum Request {
     New,
     /// Send the human's message to the open conversation.
     Send(String),
+    /// Ask the open conversation's failed turn again.
+    Retry,
     /// Save the split's preferred share.
     SaveShare(u32, u32),
 }
@@ -306,6 +351,20 @@ pub struct App {
     /// transcript, and each started turn's and its user message's.
     messages: Vec<(u64, usize)>,
     turns: Vec<(u64, u64)>,
+    /// The turn each conversation in the background is running.
+    background_turns: Vec<(Id, u64)>,
+    /// The last event shown, so one heard twice (read from the log when a
+    /// running conversation is opened again, then from its process) is
+    /// shown once.
+    last_seq: u64,
+    meter: Meter,
+    /// The models a conversation and the orchestrator use.
+    models: (String, String),
+    /// Each model's context length, as the models list gives it.
+    contexts: Vec<(String, u64)>,
+    credit: Option<String>,
+    today: Option<u64>,
+    limits: cost::Limits,
     requests: Vec<Request>,
     clock: u64,
     dirty: bool,
@@ -351,6 +410,18 @@ impl App {
             notice: None,
             messages: Vec::new(),
             turns: Vec::new(),
+            last_seq: 0,
+            background_turns: Vec::new(),
+            meter: Meter::default(),
+            models: (String::new(), String::new()),
+            contexts: Vec::new(),
+            credit: None,
+            today: None,
+            limits: cost::Limits {
+                turn: None,
+                conversation: None,
+                day: None,
+            },
             requests: Vec::new(),
             clock: 0,
             dirty: true,
@@ -415,11 +486,11 @@ impl App {
 
     /// The status row's line.
     pub fn status_line(&self) -> String {
-        let state = self
+        let row = self
             .active
             .as_ref()
-            .and_then(|id| self.rows.iter().find(|r| &r.id == id))
-            .map_or("no conversation", |r| r.state.word());
+            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
+        let state = row.map_or("no conversation", |r| r.state.word());
         // A notice goes next to the state, where a narrow row still
         // shows it.
         let notice = self
@@ -427,10 +498,77 @@ impl App {
             .as_deref()
             .map(|n| format!(" | {n}"))
             .unwrap_or_default();
+        let retry = if self.meter.retry {
+            " | C-r asks again"
+        } else {
+            ""
+        };
+        let model = match row.map(|r| r.role) {
+            Some(Role::Orchestrator) => self.models.1.as_str(),
+            _ => self.models.0.as_str(),
+        };
+        let length = self
+            .contexts
+            .iter()
+            .find(|(id, _)| id == model)
+            .map(|(_, length)| *length);
+        let context = match (self.meter.context, length) {
+            (Some(used), Some(length)) => format!("ctx {}/{}", tokens(used), tokens(length)),
+            (Some(used), None) => format!("ctx {}", tokens(used)),
+            (None, Some(length)) => format!("ctx 0/{}", tokens(length)),
+            (None, None) => "ctx -".to_string(),
+        };
+        // A spent amount, and the limit on it when one is set.
+        let of = |spent: u64, limit: Option<u64>| match limit {
+            Some(limit) => format!("{}/{}", cost::show(spent), cost::show(limit)),
+            None => cost::show(spent),
+        };
+        let today = self
+            .today
+            .map(|t| format!(" | today {}", of(t, self.limits.day)))
+            .unwrap_or_default();
+        let credit = self
+            .credit
+            .as_deref()
+            .map(|c| format!(" | {c}"))
+            .unwrap_or_default();
         format!(
-            "{state}{notice} | no model | mode {} | no limits | 0 background",
+            "{state}{retry}{notice} | {model} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
+            of(self.meter.spent, self.limits.conversation),
             self.mode.word()
         )
+    }
+
+    /// The models the status row names, and their context lengths.
+    pub fn set_models(
+        &mut self,
+        conversation: &str,
+        orchestrator: &str,
+        contexts: Vec<(String, u64)>,
+    ) {
+        self.models = (conversation.to_string(), orchestrator.to_string());
+        self.contexts = contexts;
+        self.touch();
+    }
+
+    /// The key's credit as the status row says it.
+    pub fn set_credit(&mut self, credit: Option<String>) {
+        self.credit = credit;
+        self.touch();
+    }
+
+    /// The spending limits the cost and today's total are shown against.
+    pub fn set_limits(&mut self, limits: cost::Limits) {
+        self.limits = limits;
+        self.touch();
+    }
+
+    /// What today has spent across conversations.
+    pub fn set_today(&mut self, today: u64) {
+        if self.today != Some(today) {
+            self.today = Some(today);
+            self.touch();
+        }
     }
 
     // --- what the session tells it ----------------------------------
@@ -457,12 +595,28 @@ impl App {
     /// Shows conversation `id`, its transcript empty until its process
     /// replays its log, and every other conversation closed.
     pub fn set_active(&mut self, id: Id) {
+        // The conversation left goes on in the background while its turn
+        // runs (its process is kept); the others keep what they showed.
+        let running = self.turns.last().map(|(turn, _)| *turn).filter(|_| {
+            self.active_row()
+                .is_some_and(|r| r.state == RowState::Running)
+        });
+        if let (Some(left), Some(turn)) = (self.active.clone(), running) {
+            if left != id {
+                self.background_turns.retain(|(of, _)| *of != left);
+                self.background_turns.push((left, turn));
+            }
+        }
+        self.background_turns.retain(|(of, _)| *of != id);
+        let background = &self.background_turns;
         for row in &mut self.rows {
-            row.state = if row.id == id {
-                RowState::Starting
-            } else {
-                RowState::Closed
-            };
+            if row.id == id {
+                row.state = RowState::Starting;
+            } else if !background.iter().any(|(of, _)| *of == row.id)
+                && row.state != RowState::Failed
+            {
+                row.state = RowState::Closed;
+            }
         }
         self.active = Some(id);
         self.clear_transcript();
@@ -473,7 +627,80 @@ impl App {
         self.transcript.remove_first(self.transcript.len());
         self.messages.clear();
         self.turns.clear();
+        self.last_seq = 0;
+        self.meter = Meter::default();
         self.touch();
+    }
+
+    /// A running conversation opened again: its log as read from the
+    /// store, its process's later events to follow.
+    pub fn replay(&mut self, events: Vec<Event>) {
+        self.clear_transcript();
+        for event in events {
+            self.event(event);
+        }
+        // The replayed turns set the state: `running` while the last is
+        // open, `idle` once it has ended (it may have ended between the
+        // window's last poll and the opening).
+        if let Some(row) = self.active_row() {
+            if row.state == RowState::Starting {
+                row.state = RowState::Idle;
+            }
+        }
+        self.refresh_list();
+    }
+
+    /// What a conversation that is not open said: only its state and
+    /// activity show, in its row.
+    pub fn background(&mut self, id: &Id, update: &Update, now: u64) {
+        let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) else {
+            return;
+        };
+        let state = match update {
+            Update::Up(Up::Event(Event {
+                seq,
+                kind:
+                    Kind::Started {
+                        effect: crate::store::Effect::Turn,
+                        ..
+                    },
+                ..
+            })) => {
+                self.background_turns.retain(|(turn_of, _)| turn_of != id);
+                self.background_turns.push((id.clone(), *seq));
+                Some(RowState::Running)
+            }
+            // The turn's end, not one of its requests': its process is
+            // let go, so the row is closed.
+            Update::Up(Up::Event(Event {
+                kind: Kind::Finished { started, .. } | Kind::Interrupted { started },
+                ..
+            })) => {
+                row.activity = now;
+                let at = self
+                    .background_turns
+                    .iter()
+                    .position(|(turn_of, turn)| turn_of == id && turn == started);
+                at.map(|at| {
+                    self.background_turns.swap_remove(at);
+                    RowState::Closed
+                })
+            }
+            Update::Up(Up::Delivered { .. }) => {
+                row.activity = now;
+                None
+            }
+            Update::Failed { .. } => Some(RowState::Failed),
+            Update::Up(Up::Title { title }) => {
+                row.title = crate::store::title(title);
+                None
+            }
+            _ => None,
+        };
+        if let Some(state) = state {
+            row.state = state;
+        }
+        self.refresh_list();
     }
 
     fn active_row(&mut self) -> Option<&mut Row> {
@@ -526,6 +753,8 @@ impl App {
             Update::Refused { text: None, reason } | Update::Up(Up::Refused { reason, .. }) => {
                 self.note(format!("refused: {reason}"))
             }
+            // The window's ledger answers these; nothing shows.
+            Update::Up(Up::Reserve { .. } | Up::Spent { .. }) => {}
             Update::Restarting { reason } => {
                 if let Some(row) = self.active_row() {
                     row.state = RowState::Restarting;
@@ -549,6 +778,10 @@ impl App {
 
     /// One log event into the transcript.
     fn event(&mut self, event: Event) {
+        if event.seq <= self.last_seq {
+            return;
+        }
+        self.last_seq = event.seq;
         // From the end: a turn's records follow its message closely, so a
         // replay finds each at once rather than scanning the whole log.
         let message_of = |messages: &[(u64, usize)], turns: &[(u64, u64)], started: u64| {
@@ -572,26 +805,147 @@ impl App {
             }
             Kind::Started { of, .. } => {
                 self.turns.push((event.seq, of));
+                self.meter.retry = false;
+                if let Some(row) = self.active_row() {
+                    row.state = RowState::Running;
+                }
+                self.refresh_list();
                 if let Some(index) = message_of(&self.messages, &self.turns, event.seq) {
                     let _ = self
                         .transcript
                         .set_status(index, Some(("running", Tone::Neutral)));
                 }
             }
-            Kind::Finished { started, outcome } => {
+            Kind::Finished {
+                started,
+                outcome,
+                retry,
+            } => {
+                if !self.turns.iter().any(|(turn, _)| *turn == started) {
+                    // A request's finish: its turn's says how it went.
+                    return self.touch();
+                }
+                self.meter.retry = retry;
+                if let Some(row) = self.active_row() {
+                    if row.state == RowState::Running {
+                        row.state = RowState::Idle;
+                    }
+                }
+                self.refresh_list();
+                let replied = outcome.starts_with("replied");
+                // "no model" is how increment 4's turns ended.
+                let status = if replied {
+                    ("replied", Tone::Good)
+                } else if outcome == "no model" {
+                    ("no model", Tone::Neutral)
+                } else {
+                    ("not answered", Tone::Bad)
+                };
                 if let Some(index) = message_of(&self.messages, &self.turns, started) {
-                    let _ = self
-                        .transcript
-                        .set_status(index, Some((&outcome, Tone::Neutral)));
+                    let _ = self.transcript.set_status(index, Some(status));
+                }
+                if outcome != "replied" && outcome != "no model" {
+                    let text = if retry {
+                        format!("{outcome}\nC-r asks again.")
+                    } else {
+                        outcome
+                    };
+                    let pushed = Message::new("td-agent")
+                        .and_then(|m| m.status("turn", Tone::Neutral))
+                        .and_then(|m| m.text(&text))
+                        .map_err(|e| e.to_string())
+                        .and_then(|m| self.push_message(m));
+                    if let Err(e) = pushed {
+                        self.note(format!("the transcript refused a notice: {e}"));
+                    }
                 }
             }
             Kind::Interrupted { started } => {
+                let charged = self.meter.charged.contains(&started);
+                if let Some((_, reserved)) = self.meter.request(started).filter(|_| !charged) {
+                    self.meter.spent = self.meter.spent.saturating_add(reserved);
+                }
+                if self.turns.iter().any(|(turn, _)| *turn == started) {
+                    if let Some(row) = self.active_row() {
+                        if row.state == RowState::Running {
+                            row.state = RowState::Idle;
+                        }
+                    }
+                    self.refresh_list();
+                }
                 if let Some(index) = message_of(&self.messages, &self.turns, started) {
                     let _ = self
                         .transcript
                         .set_status(index, Some(("interrupted", Tone::Bad)));
                 }
             }
+            Kind::Request {
+                purpose, reserved, ..
+            } => self.meter.requests.push((event.seq, purpose, reserved)),
+            Kind::Assistant {
+                request,
+                content,
+                reasoning,
+                finish,
+                ..
+            } => {
+                let mut message = Message::new("assistant");
+                if let Some(reasoning) = reasoning.filter(|r| !r.trim().is_empty()) {
+                    message = message.and_then(|m| m.section("reasoning", &reasoning, true));
+                }
+                let text = content.unwrap_or_default();
+                let text = if text.is_empty() { "(no text)" } else { &text };
+                let pushed = message
+                    .and_then(|m| m.text(text))
+                    .and_then(|m| {
+                        if finish == "stop" {
+                            Ok(m)
+                        } else {
+                            m.verdict(&finish, Tone::Neutral)
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+                    .and_then(|m| self.push_message(m));
+                match pushed {
+                    Ok(index) => self.meter.replies.push((request, index)),
+                    Err(e) => self.note(format!("the transcript refused a reply: {e}")),
+                }
+            }
+            Kind::Usage {
+                request,
+                tokens: counts,
+                cost,
+                ..
+            } => {
+                self.meter.charged.push(request);
+                self.meter.spent = self.meter.spent.saturating_add(cost);
+                if self.meter.request(request).map(|(p, _)| p) == Some(Purpose::Turn)
+                    && counts.prompt > 0
+                {
+                    self.meter.context = Some(counts.prompt.saturating_add(counts.completion));
+                }
+                let index = self
+                    .meter
+                    .replies
+                    .iter()
+                    .rev()
+                    .find(|(r, _)| *r == request)
+                    .map(|(_, index)| *index);
+                if let Some(index) = index {
+                    let status = format!(
+                        "in {} (cached {}, written {}) out {} {}",
+                        tokens(counts.prompt),
+                        tokens(counts.cached),
+                        tokens(counts.cache_write),
+                        tokens(counts.completion),
+                        cost::show(cost)
+                    );
+                    let _ = self
+                        .transcript
+                        .set_status(index, Some((&status, Tone::Neutral)));
+                }
+            }
+            Kind::Prefix { .. } | Kind::Title { .. } => {}
             Kind::Notice { text } => {
                 let pushed = Message::new("td-agent")
                     .and_then(|m| m.status("notice", Tone::Neutral))
@@ -927,6 +1281,15 @@ impl App {
             "C-PageUp" => return self.switch(-1),
             "C-PageDown" => return self.switch(1),
             "C-Return" if !repeat => return self.send(),
+            "C-r" if !repeat => {
+                if self.meter.retry {
+                    self.meter.retry = false;
+                    self.requests.push(Request::Retry);
+                    self.touch();
+                }
+                return;
+            }
+
             "F6" => {
                 let next = match self.focus {
                     Focus::List => Focus::Transcript,
@@ -1250,6 +1613,7 @@ pub mod tests {
     pub fn app() -> App {
         let surface = Surface::new(1024, 640, Scale::default()).unwrap();
         let mut app = App::new(surface, None, Mode::Auto).unwrap();
+        app.set_models("m/conv", "m/orch", vec![("m/orch".into(), 200_000)]);
         app.set_rows(vec![
             row(2, Role::Conversation, 50),
             row(1, Role::Orchestrator, 10),
@@ -1290,9 +1654,12 @@ pub mod tests {
     }
 
     #[test]
-    fn the_status_row_says_what_is_not_there_yet() {
+    fn the_status_row_says_the_model_context_cost_and_credit() {
         let mut app = app();
-        assert!(text(&app).contains("starting | no model | mode auto | no limits"));
+        assert_eq!(
+            app.status_line(),
+            "starting | m/orch | ctx 0/200k | cost $0.0000 | mode auto | no limits | 0 background"
+        );
         app.update(
             Update::Up(Up::Hello {
                 role: Role::Orchestrator,
@@ -1302,11 +1669,29 @@ pub mod tests {
             }),
             0,
         );
-        let shown = text(&app);
-        assert!(
-            shown.contains("idle | dropped a torn final log line of 7 bytes | no model"),
-            "{shown}"
+        app.set_today(cost::ONE / 4);
+        app.set_credit(Some("credit $7.5000".into()));
+        assert_eq!(
+            app.status_line(),
+            "idle | dropped a torn final log line of 7 bytes | m/orch | ctx 0/200k | cost $0.0000 \
+             | today $0.2500 | credit $7.5000 | mode auto | no limits | 0 background"
         );
+        // Each total against its limit, where one is set.
+        app.set_limits(cost::Limits::default());
+        assert!(
+            app.status_line()
+                .contains("| cost $0.0000/$10.0000 | today $0.2500/$25.0000 |"),
+            "{}",
+            app.status_line()
+        );
+        // A conversation's own model, and none known of its length.
+        key(&mut app, "C-PageDown");
+        assert!(
+            app.status_line().contains("| m/conv | ctx - |"),
+            "{}",
+            app.status_line()
+        );
+        assert!(text(&app).contains("| m/conv | ctx - |"), "{}", text(&app));
     }
 
     #[test]
@@ -1350,6 +1735,7 @@ pub mod tests {
                 kind: Kind::Finished {
                     started: 2,
                     outcome: "no model".into(),
+                    retry: false,
                 },
             })),
             0,
@@ -1574,6 +1960,307 @@ pub mod tests {
         let first = app.messages.first().copied().unwrap();
         assert_eq!(first, ((140 - kept as u64) * 3 + 1, 0));
         assert_eq!(app.messages.len(), kept);
+    }
+
+    fn at(seq: u64, kind: Kind) -> Update {
+        Update::Up(Up::Event(Event { seq, time: 0, kind }))
+    }
+
+    fn turn(app: &mut App, user: u64, text: &str) {
+        app.update(
+            at(
+                user,
+                Kind::User {
+                    delivery: String::new(),
+                    text: text.into(),
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                user + 1,
+                Kind::Started {
+                    effect: crate::store::Effect::Turn,
+                    of: user,
+                },
+            ),
+            0,
+        );
+    }
+
+    fn request(turn: u64, reserved: u64) -> Kind {
+        Kind::Request {
+            turn,
+            purpose: Purpose::Turn,
+            prefix: 0,
+            head: String::new(),
+            bytes: 0,
+            reserved,
+        }
+    }
+
+    #[test]
+    fn a_reply_shows_with_its_reasoning_usage_and_cost() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        assert_eq!(app.rows()[0].state, RowState::Running);
+        app.update(at(3, request(2, 900)), 0);
+        app.update(
+            at(
+                4,
+                Kind::Assistant {
+                    request: 3,
+                    content: Some("hi there".into()),
+                    reasoning: Some("the person greets".into()),
+                    details: Some("[]".into()),
+                    finish: "stop".into(),
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                5,
+                Kind::Usage {
+                    request: 3,
+                    tokens: cost::Tokens {
+                        prompt: 12_000,
+                        completion: 30,
+                        cached: 11_000,
+                        cache_write: 0,
+                        reasoning: 10,
+                    },
+                    cost: 12_345_600_000,
+                    basis: crate::store::Basis::Reported,
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                6,
+                Kind::Finished {
+                    started: 3,
+                    outcome: "stop".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                7,
+                Kind::Finished {
+                    started: 2,
+                    outcome: "replied".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.transcript().len(), 2, "the message and the reply");
+        let shown = text(&app);
+        assert!(shown.contains("assistant"), "{shown}");
+        assert!(shown.contains("hi there"), "{shown}");
+        assert!(shown.contains("reasoning"), "{shown}");
+        assert!(
+            shown.contains("in 12k (cached 11k, written 0) out 30 $0.0123"),
+            "{shown}"
+        );
+        assert!(shown.contains("replied"), "{shown}");
+        assert!(app.status_line().contains("ctx 12k/200k | cost $0.0123"));
+        assert_eq!(app.rows()[0].state, RowState::Idle);
+        // The same events again, as a reopened conversation's process may
+        // send what the log already gave: shown once.
+        app.update(at(7, Kind::Notice { text: "dup".into() }), 0);
+        assert_eq!(app.transcript().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_turn_says_why_and_c_r_asks_again() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, cost::ONE)), 0);
+        app.update(
+            at(
+                4,
+                Kind::Finished {
+                    started: 2,
+                    outcome: "error 502: bad gateway".into(),
+                    retry: true,
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        assert!(shown.contains("not answered"), "{shown}");
+        assert!(shown.contains("error 502: bad gateway"), "{shown}");
+        assert!(app.status_line().contains("C-r asks again"));
+        key(&mut app, "C-r");
+        assert_eq!(app.take_requests(), [Request::Retry]);
+        key(&mut app, "C-r");
+        assert!(app.take_requests().is_empty(), "asked once");
+        // An interrupted request counts its whole reservation.
+        app.update(at(5, Kind::Interrupted { started: 3 }), 0);
+        assert!(
+            app.status_line().contains("cost $1.0000"),
+            "{}",
+            app.status_line()
+        );
+        // One whose usage was logged before its process died counts that
+        // cost alone, not its reservation as well.
+        app.update(at(6, request(2, cost::ONE)), 0);
+        app.update(
+            at(
+                7,
+                Kind::Usage {
+                    request: 6,
+                    tokens: cost::Tokens::default(),
+                    cost: cost::ONE / 4,
+                    basis: crate::store::Basis::Reported,
+                },
+            ),
+            0,
+        );
+        app.update(at(8, Kind::Interrupted { started: 6 }), 0);
+        assert!(
+            app.status_line().contains("cost $1.2500"),
+            "{}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn a_conversation_left_mid_turn_shows_running_until_its_turn_ends() {
+        let mut app = app();
+        let state = |app: &App, n: u8| app.rows().iter().find(|r| r.id == id(n)).unwrap().state;
+        turn(&mut app, 1, "hello");
+        app.background(&id(3), &Update::Failed { reason: "x".into() }, 0);
+        app.set_active(id(2));
+        assert_eq!(state(&app, 1), RowState::Running, "left mid-turn");
+        assert_eq!(state(&app, 3), RowState::Failed, "kept across a switch");
+        assert_eq!(state(&app, 2), RowState::Starting);
+        // A request's finish is not the turn's.
+        let finished = |started| {
+            at(
+                9,
+                Kind::Finished {
+                    started,
+                    outcome: "stop".into(),
+                    retry: false,
+                },
+            )
+        };
+        app.background(&id(1), &finished(5), 700);
+        assert_eq!(state(&app, 1), RowState::Running);
+        app.background(&id(1), &finished(2), 800);
+        assert_eq!(state(&app, 1), RowState::Closed, "its process is let go");
+        // Adopted after its turn ended but before the window heard so:
+        // the log as read says idle.
+        app.set_active(id(1));
+        let event = |seq, kind| Event { seq, time: 0, kind };
+        app.replay(vec![
+            event(
+                1,
+                Kind::User {
+                    delivery: String::new(),
+                    text: "hello".into(),
+                },
+            ),
+            event(
+                2,
+                Kind::Started {
+                    effect: crate::store::Effect::Turn,
+                    of: 1,
+                },
+            ),
+            event(
+                3,
+                Kind::Finished {
+                    started: 2,
+                    outcome: "replied".into(),
+                    retry: false,
+                },
+            ),
+        ]);
+        assert_eq!(state(&app, 1), RowState::Idle);
+    }
+
+    #[test]
+    fn a_conversation_in_the_background_shows_its_state_in_its_row() {
+        let mut app = app();
+        let started = at(
+            9,
+            Kind::Started {
+                effect: crate::store::Effect::Turn,
+                of: 8,
+            },
+        );
+        app.background(&id(2), &started, 500);
+        let row = |app: &App| app.rows().iter().find(|r| r.id == id(2)).unwrap().clone();
+        assert_eq!(row(&app).state, RowState::Running);
+        app.background(
+            &id(2),
+            &Update::Up(Up::Title {
+                title: "named".into(),
+            }),
+            500,
+        );
+        app.background(
+            &id(2),
+            &at(
+                10,
+                Kind::Finished {
+                    started: 9,
+                    outcome: "replied".into(),
+                    retry: false,
+                },
+            ),
+            600,
+        );
+        assert_eq!(row(&app).title, "named");
+        assert_eq!(row(&app).activity, 600);
+        assert_eq!(app.transcript().len(), 0, "nothing in the open transcript");
+        // Opened again while it runs: the log as read shows it, running.
+        app.set_active(id(2));
+        app.replay(vec![
+            Event {
+                seq: 8,
+                time: 0,
+                kind: Kind::User {
+                    delivery: String::new(),
+                    text: "from the log".into(),
+                },
+            },
+            Event {
+                seq: 9,
+                time: 0,
+                kind: Kind::Started {
+                    effect: crate::store::Effect::Turn,
+                    of: 8,
+                },
+            },
+        ]);
+        assert_eq!(row(&app).state, RowState::Running);
+        assert!(text(&app).contains("from the log"));
+        // The process's copy of an event the log gave is not shown twice.
+        app.update(
+            at(
+                8,
+                Kind::User {
+                    delivery: String::new(),
+                    text: "from the log".into(),
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.transcript().len(), 1);
+        app.background(&id(3), &Update::Failed { reason: "x".into() }, 0);
+        assert_eq!(
+            app.rows().iter().find(|r| r.id == id(3)).unwrap().state,
+            RowState::Failed
+        );
     }
 
     #[test]

@@ -5,19 +5,47 @@
 //! and then serves the window's messages until the socketpair closes,
 //! when it exits.
 //!
-//! There is no model yet, so a turn is local echo: the human's message is
-//! logged and shown, and the turn finishes with the outcome "no model".
+//! A turn is one exchange with the model (DESIGN.md §5), non-streaming and
+//! with no tools: the human's message is logged, the request is reserved
+//! against the turn's, the conversation's and, through the window, the
+//! day's limits, logged as started and synced, and only then sent through
+//! the fetch service; its reply and usage are logged when it comes. A
+//! rate-limited request is asked again after a bounded wait; any other
+//! failure ends the turn and says why, with a retry action where asking
+//! again may succeed. After a conversation's first exchange its title
+//! comes from `title_model`, reserved like any request.
+//!
+//! The window's frames are read on a thread of their own into a channel,
+//! so that the window's writes never wait on a request in flight; what
+//! arrives during a turn waits its turn.
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
+use crate::accounts;
+use crate::client::{self, Completion, Failure, Params};
+use crate::config::Client;
+use crate::cost;
 use crate::frame;
+use crate::key::Secret;
+use crate::models::{Model, Models};
 use crate::protocol::{Down, Up, MAX_TEXT};
-use crate::store::{Conversation, Effect, Id, Kind, Role, StateDir, LOCK_WAIT};
+use crate::store::{
+    Basis, Conversation, Effect, Event, Id, Kind, Purpose, Role, StateDir, LOCK_WAIT,
+};
+use crate::td_fetch;
 
-/// What a turn ends with until the model client lands.
-pub const NO_MODEL: &str = "no model";
+/// What a turn ends with when there is no window settings to make a
+/// request with: the window sends them first, so only a harness that
+/// does not sees this.
+pub const NO_SETTINGS: &str = "no settings from the window";
+/// How long a request waits for the window to answer its reservation.
+const RESERVE_WAIT: Duration = Duration::from_secs(30);
 
 /// Runs the conversation over the socketpair on standard input and
 /// output until it closes. An error is why it could not go on.
@@ -31,34 +59,11 @@ pub fn run(state: &StateDir, id: &Id, create: Option<Role>) -> Result<(), String
     serve(UnixStream::from(socket), state, id, create)
 }
 
-/// How serving ended other than by the window closing between turns.
-enum End {
-    /// The window closed its end mid-exchange: as orderly as between
-    /// turns, since the log already holds the whole turn.
+/// What the reader thread hands on.
+enum Inbound {
+    Down(Down),
     Closed,
-    Failed(String),
-}
-
-impl From<String> for End {
-    fn from(e: String) -> Self {
-        Self::Failed(e)
-    }
-}
-
-/// Sends `up` to the window.
-fn send(stream: &mut UnixStream, up: &Up) -> Result<(), End> {
-    match frame::write(stream, &up.encode()) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            Err(End::Closed)
-        }
-        Err(e) => Err(End::Failed(format!("the window: {e}"))),
-    }
+    Broken(String),
 }
 
 /// The conversation over `stream`: opened, replayed, then served.
@@ -68,108 +73,701 @@ pub fn serve(
     id: &Id,
     create: Option<Role>,
 ) -> Result<(), String> {
-    match serve_until_closed(stream, state, id, create) {
-        Ok(()) | Err(End::Closed) => Ok(()),
-        Err(End::Failed(e)) => Err(e),
-    }
-}
-
-fn serve_until_closed(
-    mut stream: UnixStream,
-    state: &StateDir,
-    id: &Id,
-    create: Option<Role>,
-) -> Result<(), End> {
-    let (mut conversation, load) = Conversation::open(state, id, create, LOCK_WAIT)?;
+    let (conversation, load) = Conversation::open(state, id, create, LOCK_WAIT)?;
     if let Some(bytes) = load.torn {
         eprintln!("td-agent: conversation {id}: dropped a torn final log line of {bytes} bytes");
     }
-    send(
-        &mut stream,
-        &Up::Hello {
-            role: conversation.meta().role,
-            title: conversation.meta().title.clone(),
-            torn: load.torn,
-            interrupted: load.interrupted,
-        },
-    )?;
-    for event in conversation.events() {
-        send(&mut stream, &Up::Event(event.clone()))?;
+    let reader = stream
+        .try_clone()
+        .map_err(|e| format!("the socketpair: {e}"))?;
+    let mut session = Session {
+        conversation,
+        writer: stream,
+        inbox: listen(reader)?,
+        queue: VecDeque::new(),
+        setup: None,
+        state: state.root().to_path_buf(),
+        // Random, so no two processes of one conversation share an id,
+        // and the window's ledger never takes one's grant for another's.
+        next_reservation: u64::from_str_radix(&crate::store::random_hex(6)?, 16)
+            .map_err(|e| format!("a reservation id: {e}"))?,
+        gone: false,
+    };
+    session.send(&Up::Hello {
+        role: session.conversation.meta().role,
+        title: session.conversation.meta().title.clone(),
+        torn: load.torn,
+        interrupted: load.interrupted,
+    });
+    for event in session.conversation.events().to_vec() {
+        session.send(&Up::Event(event));
     }
-    loop {
-        let bytes = match frame::read(&mut stream) {
-            Ok(Some(bytes)) => bytes,
-            // The window closed its end: nothing more will come.
-            Ok(None) => return Ok(()),
-            Err(e) => return Err(End::Failed(format!("the window: {e}"))),
-        };
-        let Down::User { delivery, text } = Down::decode(&bytes)?;
-        if conversation.delivered(&delivery) {
+    session.serve()
+}
+
+/// Reads the window's frames into a channel until the socketpair ends.
+fn listen(mut reader: UnixStream) -> Result<Receiver<Inbound>, String> {
+    let (send, inbox) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("td-agent-window".into())
+        .spawn(move || loop {
+            let inbound = match frame::read(&mut reader) {
+                Ok(Some(bytes)) => match Down::decode(&bytes) {
+                    Ok(down) => Inbound::Down(down),
+                    Err(e) => Inbound::Broken(format!("a malformed message: {e}")),
+                },
+                // A window that closes with our frames unread resets the
+                // socketpair: closed all the same.
+                Ok(None) => Inbound::Closed,
+                Err(frame::Error::Io(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    Inbound::Closed
+                }
+                Err(e) => Inbound::Broken(e.to_string()),
+            };
+            let last = !matches!(inbound, Inbound::Down(_));
+            if send.send(inbound).is_err() || last {
+                break;
+            }
+        })
+        .map_err(|e| format!("the reader thread: {e}"))?;
+    Ok(inbox)
+}
+
+/// How a turn ended: what the window shows, whether the human may ask
+/// for it again, and whether the model replied.
+struct Outcome {
+    text: String,
+    retry: bool,
+    replied: bool,
+}
+
+impl Outcome {
+    fn stop(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            retry: false,
+            replied: false,
+        }
+    }
+}
+
+/// What a request was charged, and how that was known.
+fn charge(
+    usage: Option<client::Usage>,
+    pricing: Option<cost::Pricing>,
+    reserved: u64,
+) -> (u64, Basis) {
+    match (usage, pricing) {
+        (
+            Some(client::Usage {
+                cost: Some(cost), ..
+            }),
+            _,
+        ) => (cost, Basis::Reported),
+        (Some(usage), Some(pricing)) => (pricing.charge(&usage.tokens), Basis::Computed),
+        _ => (reserved, Basis::Reserved),
+    }
+}
+
+struct Session {
+    conversation: Conversation,
+    writer: UnixStream,
+    inbox: Receiver<Inbound>,
+    /// Messages that came while a turn waited on the window.
+    queue: VecDeque<Down>,
+    setup: Option<(Result<Secret, String>, Client)>,
+    state: PathBuf,
+    /// The last reservation id asked for.
+    next_reservation: u64,
+    /// The window has closed its end: the turn under way finishes in the
+    /// log, and then the process exits.
+    gone: bool,
+}
+
+impl Session {
+    /// Sends `up` to the window; a window gone is noted, not an error, so
+    /// a turn under way still finishes whole in the log.
+    fn send(&mut self, up: &Up) {
+        if self.gone {
+            return;
+        }
+        if let Err(e) = frame::write(&mut self.writer, &up.encode()) {
+            if !matches!(
+                e.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ) {
+                eprintln!("td-agent: the window: {e}");
+            }
+            self.gone = true;
+        }
+    }
+
+    /// Appends `kind` to the log and sends it up.
+    fn log(&mut self, kind: Kind) -> Result<Event, String> {
+        let event = self.conversation.append(kind)?.clone();
+        self.send(&Up::Event(event.clone()));
+        Ok(event)
+    }
+
+    fn sync(&mut self) -> Result<(), String> {
+        self.conversation.sync()
+    }
+
+    fn next(&mut self) -> Result<Option<Down>, String> {
+        if let Some(down) = self.queue.pop_front() {
+            return Ok(Some(down));
+        }
+        match self.inbox.recv() {
+            Ok(Inbound::Down(down)) => Ok(Some(down)),
+            Ok(Inbound::Closed) | Err(_) => Ok(None),
+            Ok(Inbound::Broken(e)) => Err(format!("the window: {e}")),
+        }
+    }
+
+    fn serve(&mut self) -> Result<(), String> {
+        while !self.gone {
+            let Some(down) = self.next()? else {
+                return Ok(());
+            };
+            match down {
+                Down::Setup { key, client } => self.setup = Some((key, client)),
+                Down::User { delivery, text } => self.user(delivery, text)?,
+                Down::Retry => self.retry()?,
+                // A reservation granted after its request gave up waiting:
+                // nothing was sent, so the window's hold is released.
+                Down::Reservation { id, refusal: None } => self.spent(id, 0),
+                Down::Reservation { .. } => {}
+            }
+            if !self.gone {
+                let _ = self.writer.flush();
+            }
+        }
+        Ok(())
+    }
+
+    fn user(&mut self, delivery: String, text: String) -> Result<(), String> {
+        if self.conversation.delivered(&delivery) {
             // A message the window sent again after a restart: logged
             // once, acknowledged each time.
-            send(&mut stream, &Up::Delivered { delivery })?;
-            continue;
+            self.send(&Up::Delivered { delivery });
+            return Ok(());
         }
         let refused = if text.len() > MAX_TEXT {
             Some(format!("a message is at most {MAX_TEXT} bytes"))
         } else if text.trim().is_empty() {
             Some("an empty message".to_string())
-        } else if !conversation.has_room(text.len()) {
+        } else if !self.conversation.has_room(text.len()) {
             Some("the conversation's log is full; start another conversation".to_string())
         } else {
             None
         };
         if let Some(reason) = refused {
-            send(&mut stream, &Up::Refused { delivery, reason })?;
-            continue;
+            self.send(&Up::Refused { delivery, reason });
+            return Ok(());
         }
         // Titled by its first message, or by the next one should the
-        // title not have been written then.
-        let untitled = conversation.meta().role == Role::Conversation
-            && conversation.meta().title == Role::Conversation.first_title();
-        // The turn runs to its end in the log before the window hears of
-        // it, so a window that goes meanwhile interrupts nothing.
-        let user = conversation
-            .append(Kind::User {
-                delivery: delivery.clone(),
-                text: text.clone(),
-            })?
-            .clone();
-        let started = conversation
+        // title not have been written then, until a title model's.
+        let untitled = self.conversation.meta().role == Role::Conversation
+            && self.conversation.meta().title == Role::Conversation.first_title();
+        let user = self.conversation.append(Kind::User {
+            delivery: delivery.clone(),
+            text: text.clone(),
+        })?;
+        let of = user.seq;
+        let user = user.clone();
+        let started = self
+            .conversation
             .append(Kind::Started {
                 effect: Effect::Turn,
-                of: user.seq,
+                of,
             })?
             .clone();
         // The started record is durable before the turn runs.
-        conversation.sync()?;
-        let finished = conversation
-            .append(Kind::Finished {
-                started: started.seq,
-                outcome: NO_MODEL.to_string(),
-            })?
-            .clone();
-        // A turn boundary.
-        conversation.sync()?;
-        let mut outbox = vec![
-            Up::Event(user),
-            Up::Event(started),
-            Up::Delivered { delivery },
-            Up::Event(finished),
-        ];
+        self.sync()?;
+        self.send(&Up::Event(user));
+        self.send(&Up::Event(started.clone()));
+        self.send(&Up::Delivered { delivery });
         if untitled {
-            conversation.retitle(&text)?;
-            outbox.push(Up::Title {
-                title: conversation.meta().title.clone(),
-            });
+            self.conversation.retitle(&text)?;
+            let title = self.conversation.meta().title.clone();
+            self.send(&Up::Title { title });
         }
-        for up in &outbox {
-            send(&mut stream, up)?;
-        }
-        stream
-            .flush()
-            .map_err(|e| End::Failed(format!("the window: {e}")))?;
+        self.turn(started.seq)
     }
+
+    /// The last turn again, when it ended in a failure that may pass.
+    fn retry(&mut self) -> Result<(), String> {
+        let events = self.conversation.events();
+        let last = events.iter().rev().find_map(|e| match e.kind {
+            Kind::Started {
+                effect: Effect::Turn,
+                of,
+            } => Some((e.seq, of)),
+            _ => None,
+        });
+        let retryable = last.filter(|(started, _)| {
+            events.iter().any(
+                |e| matches!(e.kind, Kind::Finished { started: s, retry: true, .. } if s == *started),
+            )
+        });
+        let Some((_, of)) = retryable else {
+            // Said, so the window stops counting this process busy.
+            self.send(&Up::Refused {
+                delivery: String::new(),
+                reason: "there is no failed turn to ask again".into(),
+            });
+            return Ok(());
+        };
+        let started = self.log(Kind::Started {
+            effect: Effect::Turn,
+            of,
+        })?;
+        self.sync()?;
+        self.turn(started.seq)
+    }
+
+    /// Runs turn `turn` to its end in the log.
+    fn turn(&mut self, turn: u64) -> Result<(), String> {
+        let outcome = self.exchange(turn)?;
+        if outcome.replied && self.first_reply() {
+            self.title(turn)?;
+        }
+        self.log(Kind::Finished {
+            started: turn,
+            outcome: outcome.text,
+            retry: outcome.retry,
+        })?;
+        // A turn boundary.
+        self.sync()
+    }
+
+    /// Whether the conversation has had exactly one reply, and no title
+    /// from a model yet.
+    fn first_reply(&self) -> bool {
+        if self.conversation.meta().role != Role::Conversation {
+            return false;
+        }
+        let events = self.conversation.events();
+        let mut turns = Vec::new();
+        let mut replies = 0usize;
+        for event in events {
+            match &event.kind {
+                Kind::Title { .. } => return false,
+                Kind::Request {
+                    purpose: Purpose::Turn,
+                    ..
+                } => turns.push(event.seq),
+                Kind::Assistant { request, .. } if turns.contains(request) => replies += 1,
+                _ => {}
+            }
+        }
+        replies == 1
+    }
+
+    /// The models cache and the entry for `model`, the configuration's
+    /// `key`; a refusal says why a request cannot be made with them.
+    fn model(&self, key: &str, model: &str, client: &Client) -> Result<Option<Model>, String> {
+        let models = Models::load(&self.state)?;
+        let entry = models.as_ref().and_then(|m| m.find(model)).cloned();
+        if models.is_some() && entry.is_none() {
+            return Err(format!(
+                "{model} is not in the provider's models list; set `{key}` to one that is"
+            ));
+        }
+        if client.limits.any() && entry.as_ref().and_then(|m| m.pricing).is_none() {
+            let why = if models.is_none() {
+                " (the models list has not been fetched yet)"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "no price is known for {model}{why}; a model without pricing is refused while a cost limit is set"
+            ));
+        }
+        Ok(entry)
+    }
+
+    /// Asks the window to reserve `amount` against the day: the request's
+    /// id when granted, or why not.
+    fn reserve(&mut self, amount: u64) -> Result<u64, String> {
+        self.next_reservation = self.next_reservation.wrapping_add(1);
+        let id = self.next_reservation;
+        self.send(&Up::Reserve { id, amount });
+        if self.gone {
+            return Err("the window has closed".into());
+        }
+        let deadline = Instant::now() + RESERVE_WAIT;
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match self.inbox.recv_timeout(wait) {
+                Ok(Inbound::Down(Down::Reservation {
+                    id: answered,
+                    refusal,
+                })) if answered == id => return refusal.map_or(Ok(id), Err),
+                // An earlier request's grant, come after it gave up.
+                Ok(Inbound::Down(Down::Reservation {
+                    id: late,
+                    refusal: None,
+                })) => self.spent(late, 0),
+                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Closed | Inbound::Broken(_)) | Err(RecvTimeoutError::Disconnected) => {
+                    self.gone = true;
+                    return Err("the window has closed".into());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "the window did not answer a reservation in {} s",
+                        RESERVE_WAIT.as_secs()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Tells the window what request `id` cost.
+    fn spent(&mut self, id: u64, amount: u64) {
+        self.send(&Up::Spent { id, amount });
+    }
+
+    /// Logs a request's end: its usage, then its finish.
+    fn settle(
+        &mut self,
+        request: u64,
+        usage: Option<client::Usage>,
+        cost: (u64, Basis),
+        outcome: String,
+    ) -> Result<(), String> {
+        self.log(Kind::Usage {
+            request,
+            tokens: usage.map(|u| u.tokens).unwrap_or_default(),
+            cost: cost.0,
+            basis: cost.1,
+        })?;
+        self.log(Kind::Finished {
+            started: request,
+            outcome,
+            retry: false,
+        })?;
+        Ok(())
+    }
+
+    /// The turn's exchange with the model, retrying a rate limit.
+    fn exchange(&mut self, turn: u64) -> Result<Outcome, String> {
+        let Some((key, client)) = self.setup.clone() else {
+            return Ok(Outcome::stop(NO_SETTINGS));
+        };
+        let key = match key {
+            Ok(key) => key,
+            Err(why) => return Ok(Outcome::stop(why)),
+        };
+        let role = self.conversation.meta().role;
+        let name = client.model_for(role).to_string();
+        let setting = match role {
+            Role::Orchestrator => "orchestrator_model",
+            Role::Conversation => "model",
+        };
+        let model = match self.model(setting, &name, &client) {
+            Ok(model) => model,
+            Err(why) => return Ok(Outcome::stop(why)),
+        };
+        let pricing = model.as_ref().and_then(|m| m.pricing);
+        // The prefix this program writes; a conversation begun by another
+        // (an empty one from before the model client, say) takes it as an
+        // event, at the cost of one cache miss.
+        let expected = crate::prompt::prefix(role);
+        if client::current_prefix(self.conversation.events(), self.conversation.prefix_file()).1
+            != expected
+        {
+            self.log(Kind::Prefix { text: expected })?;
+        }
+        let mut attempt = 0u32;
+        loop {
+            let events = self.conversation.events();
+            let (prefix, prefix_text) =
+                client::current_prefix(events, self.conversation.prefix_file());
+            let messages = client::messages(events);
+            let mut max_tokens = model
+                .as_ref()
+                .and_then(|m| m.max_completion_tokens)
+                .map_or(client::MAX_TOKENS, |m| m.min(client::MAX_TOKENS))
+                .max(1);
+            let effort = model
+                .as_ref()
+                .is_none_or(|m| m.supports("reasoning"))
+                .then_some(client.reasoning_effort.as_str());
+            let build = |max_tokens: u64| -> Result<(String, String), String> {
+                let head = client::head(&Params {
+                    model: &name,
+                    max_tokens,
+                    effort,
+                    client: &client,
+                });
+                let body = client::turn_body(&head, prefix_text, &messages)?;
+                Ok((head, body))
+            };
+            let (mut head, mut body) = build(max_tokens)?;
+            let estimate = client::estimate(events, body.len() as u64);
+            if let Some(context) = model.as_ref().and_then(|m| m.context_length) {
+                if estimate >= context {
+                    return Ok(Outcome::stop(format!(
+                        "the conversation is about {estimate} tokens, past {name}'s context of {context}; start another conversation (compaction comes later)"
+                    )));
+                }
+                if estimate.saturating_add(max_tokens) > context {
+                    max_tokens = context - estimate;
+                    (head, body) = build(max_tokens)?;
+                }
+            }
+            let reserved = pricing.map_or(0, |p| p.reserve(estimate, max_tokens));
+            let events = self.conversation.events();
+            if let Err(why) = cost::within(
+                "max_cost_per_turn",
+                client.limits.turn,
+                accounts::turn_spent(events, turn),
+                reserved,
+            )
+            .and_then(|()| {
+                cost::within(
+                    "max_cost_per_conversation",
+                    client.limits.conversation,
+                    accounts::spent(events),
+                    reserved,
+                )
+            }) {
+                return Ok(Outcome::stop(why));
+            }
+            let room = (body.len() as u64).saturating_add(client::MAX_REPLY.saturating_mul(2));
+            if !self.conversation.has_room_for(room) {
+                return Ok(Outcome::stop(
+                    "the conversation's log is full; start another conversation",
+                ));
+            }
+            let id = match self.reserve(reserved) {
+                Ok(id) => id,
+                // Nothing was sent; a turn the closing window cut short
+                // may be asked again when the conversation is reopened.
+                Err(why) => {
+                    return Ok(Outcome {
+                        text: why,
+                        retry: self.gone,
+                        replied: false,
+                    })
+                }
+            };
+            let request = self.log(Kind::Request {
+                turn,
+                purpose: Purpose::Turn,
+                prefix,
+                head,
+                bytes: body.len() as u64,
+                reserved,
+            })?;
+            // Logged as started and synced before it is sent: a restart
+            // that finds it unfinished never sends it again.
+            self.sync()?;
+            let failure = match client::classify(post(&client, &key, &body)) {
+                Ok(completion) => {
+                    let cost = charge(completion.usage, pricing, reserved);
+                    let text = self.reply(request.seq, &completion, cost)?;
+                    self.spent(id, cost.0);
+                    return Ok(Outcome {
+                        text,
+                        retry: false,
+                        replied: true,
+                    });
+                }
+                Err(failure) => failure,
+            };
+            let outcome = failure.outcome();
+            match failure {
+                Failure::RateLimited { message, wait } => {
+                    self.settle(request.seq, None, (0, Basis::Nothing), outcome)?;
+                    self.sync()?;
+                    self.spent(id, 0);
+                    if attempt >= client::RETRIES {
+                        return Ok(Outcome::stop(format!(
+                            "error 429: {message}; still rate-limited after {} retries",
+                            client::RETRIES
+                        )));
+                    }
+                    let Some(wait) = client::backoff(attempt, wait) else {
+                        return Ok(Outcome::stop(format!(
+                            "error 429: {message}; the provider asks for a wait longer than {} s",
+                            client::MAX_WAIT.as_secs()
+                        )));
+                    };
+                    std::thread::sleep(wait);
+                    attempt += 1;
+                }
+                Failure::Stop { .. } => {
+                    self.settle(request.seq, None, (0, Basis::Nothing), outcome.clone())?;
+                    self.spent(id, 0);
+                    return Ok(Outcome::stop(outcome));
+                }
+                Failure::Retryable { usage, .. } => {
+                    let cost = match usage {
+                        Some(client::Usage {
+                            cost: Some(cost), ..
+                        }) => (cost, Basis::Reported),
+                        _ => (reserved, Basis::Reserved),
+                    };
+                    self.settle(request.seq, usage, cost, outcome.clone())?;
+                    self.spent(id, cost.0);
+                    return Ok(Outcome {
+                        text: outcome,
+                        retry: true,
+                        replied: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Logs a completion: the assistant message, its usage and the
+    /// request's finish. The outcome is the turn's.
+    fn reply(
+        &mut self,
+        request: u64,
+        completion: &Completion,
+        cost: (u64, Basis),
+    ) -> Result<String, String> {
+        let assistant = Kind::Assistant {
+            request,
+            content: completion.content.clone(),
+            reasoning: completion.reasoning.clone(),
+            details: completion.details.clone(),
+            finish: completion.finish.clone(),
+        };
+        if let Err(e) = self.log(assistant) {
+            // A reply past what a log line holds: its cost still counts.
+            let outcome = format!("the reply could not be logged: {e}");
+            self.settle(request, completion.usage, cost, outcome.clone())?;
+            return Ok(outcome);
+        }
+        let outcome = match completion.finish.as_str() {
+            "stop" => "replied".to_string(),
+            "length" => "replied, cut short at max_tokens".to_string(),
+            "content_filter" => "stopped by the provider's content filter".to_string(),
+            "tool_calls" => "asked for a tool; this conversation has none yet".to_string(),
+            other => format!("replied ({other})"),
+        };
+        self.settle(request, completion.usage, cost, completion.finish.clone())?;
+        Ok(outcome)
+    }
+
+    /// The conversation's title from `title_model`, after its first
+    /// exchange (DESIGN.md §13). Reserved like any request; whatever goes
+    /// wrong leaves the first message's line as the title and says why.
+    fn title(&mut self, turn: u64) -> Result<(), String> {
+        let Some((Ok(key), client)) = self.setup.clone() else {
+            return Ok(());
+        };
+        let events = self.conversation.events();
+        let first = events.iter().find_map(|e| match &e.kind {
+            Kind::User { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        let reply = events.iter().rev().find_map(|e| match &e.kind {
+            Kind::Assistant { content, .. } => Some(content.clone().unwrap_or_default()),
+            _ => None,
+        });
+        let (Some(first), Some(reply)) = (first, reply) else {
+            return Ok(());
+        };
+        let model = match self.model("title_model", &client.title_model, &client) {
+            Ok(model) => model,
+            Err(why) => {
+                self.log(Kind::Notice {
+                    text: format!("no title: {why}"),
+                })?;
+                return Ok(());
+            }
+        };
+        let pricing = model.as_ref().and_then(|m| m.pricing);
+        let head = client::title_head(&client, &first, &reply);
+        let bytes = head.len() as u64 + 2;
+        let reserved = pricing.map_or(0, |p| p.reserve(bytes.div_ceil(4), client::TITLE_TOKENS));
+        let events = self.conversation.events();
+        let within = cost::within(
+            "max_cost_per_turn",
+            client.limits.turn,
+            accounts::turn_spent(events, turn),
+            reserved,
+        )
+        .and_then(|()| {
+            cost::within(
+                "max_cost_per_conversation",
+                client.limits.conversation,
+                accounts::spent(events),
+                reserved,
+            )
+        })
+        .and_then(|()| self.reserve(reserved));
+        let id = match within {
+            Ok(id) => id,
+            Err(why) => {
+                self.log(Kind::Notice {
+                    text: format!("no title: {why}"),
+                })?;
+                return Ok(());
+            }
+        };
+        let request = self.log(Kind::Request {
+            turn,
+            purpose: Purpose::Title,
+            prefix: 0,
+            head: head.clone(),
+            bytes,
+            reserved,
+        })?;
+        self.sync()?;
+        let body = format!("{{{head}}}");
+        let (usage, cost, outcome) = match client::classify(post(&client, &key, &body)) {
+            Ok(completion) => {
+                let cost = charge(completion.usage, pricing, reserved);
+                match client::title(completion.content.as_deref().unwrap_or_default()) {
+                    Some(title) => {
+                        self.log(Kind::Title {
+                            request: request.seq,
+                            text: title.clone(),
+                        })?;
+                        self.conversation.retitle(&title)?;
+                        let title = self.conversation.meta().title.clone();
+                        self.send(&Up::Title { title });
+                        (completion.usage, cost, "titled".to_string())
+                    }
+                    None => (completion.usage, cost, "no title in the reply".to_string()),
+                }
+            }
+            Err(failure) => {
+                let (usage, cost) = match &failure {
+                    Failure::Retryable { usage, .. } => match usage {
+                        Some(client::Usage {
+                            cost: Some(cost), ..
+                        }) => (*usage, (*cost, Basis::Reported)),
+                        _ => (*usage, (reserved, Basis::Reserved)),
+                    },
+                    _ => (None, (0, Basis::Nothing)),
+                };
+                (usage, cost, failure.outcome())
+            }
+        };
+        self.settle(request.seq, usage, cost, outcome)?;
+        self.spent(id, cost.0);
+        Ok(())
+    }
+}
+
+/// A model request through the fetch service.
+fn post(client: &Client, key: &Secret, body: &str) -> Result<td_fetch::Response, td_fetch::Error> {
+    let headers = client::headers(key.expose());
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+    td_fetch::post(
+        &format!("{}/chat/completions", client.base_url),
+        &headers,
+        body.as_bytes(),
+        Some(client::MAX_REPLY),
+    )
 }
 
 #[cfg(test)]
@@ -190,11 +788,30 @@ mod tests {
         frame::write(stream, &down.encode()).unwrap();
     }
 
+    /// The settings with no key: a turn ends at once, saying so.
+    fn keyless(stream: &mut UnixStream) {
+        let down = Down::Setup {
+            key: Err("no API key: write one".into()),
+            client: Client::default(),
+        };
+        frame::write(stream, &down.encode()).unwrap();
+    }
+
+    fn finished(up: &Up) -> Option<&str> {
+        match up {
+            Up::Event(Event {
+                kind: Kind::Finished { outcome, .. },
+                ..
+            }) => Some(outcome),
+            _ => None,
+        }
+    }
+
     const D1: &str = "11111111111111111111111111111111";
     const D2: &str = "22222222222222222222222222222222";
 
     #[test]
-    fn a_message_is_logged_echoed_and_its_turn_finished_with_no_model() {
+    fn a_message_is_logged_echoed_and_its_turn_finished_without_a_key() {
         let scratch = Scratch::new("serve");
         let state = scratch.state();
         let id = Id::random().unwrap();
@@ -204,6 +821,7 @@ mod tests {
             std::thread::spawn(move || serve(theirs, &state, &id, Some(Role::Conversation)))
         };
         assert!(matches!(next(&mut window), Up::Hello { torn: None, .. }));
+        keyless(&mut window);
         say(&mut window, D1, "first words\nand more");
         let Up::Event(user) = next(&mut window) else {
             panic!("no user event")
@@ -213,7 +831,7 @@ mod tests {
         );
         assert!(matches!(
             next(&mut window),
-            Up::Event(crate::store::Event {
+            Up::Event(Event {
                 kind: Kind::Started { of: 1, .. },
                 ..
             })
@@ -224,17 +842,13 @@ mod tests {
                 delivery: D1.into()
             }
         );
-        assert!(matches!(
-            next(&mut window),
-            Up::Event(crate::store::Event { kind: Kind::Finished { started: 2, ref outcome }, .. })
-                if outcome == NO_MODEL
-        ));
         assert_eq!(
             next(&mut window),
             Up::Title {
                 title: "first words".into()
             }
         );
+        assert_eq!(finished(&next(&mut window)), Some("no API key: write one"));
         // The same delivery again is acknowledged, not logged again.
         say(&mut window, D1, "first words\nand more");
         assert_eq!(
@@ -253,6 +867,28 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_without_settings_says_so() {
+        let scratch = Scratch::new("nosettings");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let (mut window, theirs) = UnixStream::pair().unwrap();
+        let served = {
+            let (state, id) = (state.clone(), id.clone());
+            std::thread::spawn(move || serve(theirs, &state, &id, Some(Role::Orchestrator)))
+        };
+        assert!(matches!(next(&mut window), Up::Hello { .. }));
+        say(&mut window, D1, "hello");
+        let outcome = loop {
+            if let Some(outcome) = finished(&next(&mut window)) {
+                break outcome.to_string();
+            }
+        };
+        assert_eq!(outcome, NO_SETTINGS);
+        drop(window);
+        served.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn a_window_gone_mid_turn_leaves_the_turn_whole_and_the_process_orderly() {
         let scratch = Scratch::new("gone");
         let state = scratch.state();
@@ -263,6 +899,7 @@ mod tests {
             std::thread::spawn(move || serve(theirs, &state, &id, Some(Role::Conversation)))
         };
         assert!(matches!(next(&mut window), Up::Hello { .. }));
+        keyless(&mut window);
         say(&mut window, D1, "said, then gone");
         drop(window);
         served.join().unwrap().unwrap();
@@ -309,6 +946,7 @@ mod tests {
         for _ in 0..3 {
             next(&mut window);
         }
+        keyless(&mut window);
         say(&mut window, D2, "found title");
         let title = loop {
             if let Up::Title { title } = next(&mut window) {
@@ -340,6 +978,7 @@ mod tests {
                     other => panic!("{other:?}"),
                 }
             }
+            keyless(&mut window);
             say(&mut window, delivery, "hi");
             for _ in 0..4 {
                 next(&mut window);

@@ -13,16 +13,20 @@ const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20      td-agent --help\n\
 \n\
 td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
-conversations, the orchestrator first, beside the open one. There is no\n\
-model yet: a message is logged and shown, and its turn ends \"no model\".\n\
+conversations, the orchestrator first, beside the open one. Each message\n\
+is a turn with the configured model through OpenRouter, by way of td's\n\
+fetch service: run it as ./agent from a td checkout, which serves that.\n\
 \n\
-Keys: C-Return sends the composer (Return is a newline); C-n starts a\n\
-conversation; C-PageUp and C-PageDown open the one above or below; F6\n\
-and S-F6 move the focus between the list, the transcript and the\n\
-composer. The control socket speaks td-ui's driven protocol.\n\
+Keys: C-Return sends the composer (Return is a newline); C-r asks a\n\
+failed turn again; C-n starts a conversation; C-PageUp and C-PageDown\n\
+open the one above or below; F6 and S-F6 move the focus between the\n\
+list, the transcript and the composer. The control socket speaks td-ui's\n\
+driven protocol.\n\
 \n\
 State: $XDG_STATE_HOME/td-agent. Configuration:\n\
-$XDG_CONFIG_HOME/td-agent/config (TOML; unknown keys are refused).\n";
+$XDG_CONFIG_HOME/td-agent/config (TOML; unknown keys are refused). The\n\
+API key: one line in $XDG_CONFIG_HOME/td-agent/openrouter.key, a file\n\
+of your own, mode 0600, in directories only you and root can write.\n";
 
 /// `td-agent conversation ID --state-dir DIR [--create ROLE]`: the
 /// window starts these; a person does not.
@@ -71,9 +75,17 @@ fn window(args: &[String]) -> Result<(), String> {
         );
     }
     let config = td_agent::config::load(config_path.as_deref())?;
+    // The key file beside the configuration; there is no other form.
+    let key = match config_path.as_deref().and_then(td_agent::key::path) {
+        Some(path) => td_agent::key::read(&path).map_err(|problem| problem.to_string()),
+        None => Err(
+            "no API key: neither XDG_CONFIG_HOME nor HOME is an absolute path to find it under"
+                .to_string(),
+        ),
+    };
     let state = StateDir::from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))?;
     let program = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
-    td_agent::window::run(config, state, program, control)
+    td_agent::window::run(config, key, state, program, control)
 }
 
 fn main() -> ExitCode {
