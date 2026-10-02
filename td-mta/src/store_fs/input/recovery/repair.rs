@@ -104,7 +104,7 @@ impl<'r> ScannedJournal<'r> {
         })
     }
 }
-fn check_current(
+pub(super) fn check_current(
     root: &LockedRoot,
     crypto: &impl Crypto,
     expected: Current,

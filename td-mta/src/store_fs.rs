@@ -12,8 +12,9 @@ mod create_directory;
 #[path = "store_fs/input.rs"]
 mod input;
 pub use input::{
-    CompleteFile, CompletePrefix, PrefixReader, RecoveryInput, RecoveryInputError, RepairError,
-    RepairedJournal, ScannedJournal, StoreReader,
+    AppendError, AppendStep, CompleteFile, CompletePrefix, JournalAppend, PrefixReader,
+    RecoveryInput, RecoveryInputError, RepairError, RepairedJournal, ScannedJournal, StoreReader,
+    SyncedAppend,
 };
 #[path = "store_fs/stopped.rs"]
 mod stopped;

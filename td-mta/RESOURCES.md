@@ -184,6 +184,18 @@ still account for those costs and concurrent owners within the ledger.
   sweep, can create additional stack temporaries; whole-worker stack
   qualification remains pending. It transfers the existing record buffer from
   table to history work and returns the existing change slots, adding no arena.
+  JournalAppend and SyncedAppend each fit 1 KiB of Provider state. An append
+  borrows the existing immutable transaction-frame buffer until finish/drop and
+  keeps one writable descriptor after comparing it to the consumed scan's
+  descriptor. Every advance writes at most 64 KiB, syncs once, or checks final
+  metadata/EOF; 64 total write calls cap pathological short-write progress. It
+  adds no arena, queue or thread. Construction rechecks CURRENT using two fixed
+  120-byte buffers, up to 64 reads plus EOF and one transient descriptor. After
+  that closes, the scanned read descriptor overlaps the new writable descriptor;
+  opening also uses the existing fixed path scratch and transient parent handles.
+  Constructor frame parsing/hash and std open
+  work still need caller admission, and whole-worker stack/allocation/resource
+  qualification remains pending for this new append path.
   JournalCapture and CapturedJournal each fit 2 KiB of provider state. Capture
   borrows the existing 1 MiB whole-frame recovery scratch; its consuming finish
   releases that borrow for reuse, with no new arena. Overlay loading still uses

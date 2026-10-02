@@ -1035,6 +1035,22 @@ service activation. Each part lands independently:
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete
   object transaction/reference rules before protocol mutations are enabled.
+  - **M05e1 — bounded frame append:** implemented a consuming complete-scan to
+    immutable-frame append path using std APIs. Recheck CURRENT and inode/length,
+    validate sequence/checksum/local operations and cumulative journal caps,
+    bound each write and the call count, then require file sync plus exact EOF
+    before returning durable endpoint evidence. Failures retire output and leave
+    uncertain effects for recovery. Tests cover partial writes, sync/confirmation
+    faults, pre-write refusal, premature finish, replay, large frames and caps.
+    Runtime reservations, final transaction policy and visibility remain external.
+  - **M05e2 — append admission integration:** planned; bind the existing writer
+    ledger's exact frame ticket to append ownership and every terminal outcome.
+    Preserve pending charges and stop admission on uncertainty or abandonment;
+    never convert a write/sync error into proof that nothing was written.
+  - **M05e3 — committed visibility:** planned; publish sequence and byte offset
+    together only after durable append and reservation reconciliation, retaining
+    selected-generation ownership for readers. Add crash/fault ordering oracles
+    before exposing any SMTP/JMAP acknowledgment path.
 
 Implement exclusive store access, generated private paths, streamed temporary
 blobs, digesting through the adapter, file/directory sync and journal commit.

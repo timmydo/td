@@ -17,7 +17,8 @@ pub(super) use recovery::{prepare_probe as prepare_recovery_probe, probe as prob
 #[cfg(test)]
 pub(super) use recovery::{prepare_repair_probe, probe_repair};
 pub use recovery::{
-    RecoveryInput, RecoveryInputError, RepairError, RepairedJournal, ScannedJournal,
+    AppendError, AppendStep, JournalAppend, RecoveryInput, RecoveryInputError, RepairError,
+    RepairedJournal, ScannedJournal, SyncedAppend,
 };
 
 #[path = "input/prefix.rs"]

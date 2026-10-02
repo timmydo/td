@@ -111,6 +111,10 @@ monotonic deadline. It returns owner-bound summaries with reusable scratch;
 incomplete tails are reported without repair. The inspection CLI is still
 unimplemented.
 Complete mutation-policy validation and mail publication remain unimplemented.
+A one-frame append primitive now validates a successor against a complete scan,
+rechecks CURRENT/inode/extent, and writes bounded chunks before sync and EOF
+confirmation. Failed or abandoned appends retain uncertain effects for recovery;
+reservation/visibility integration remains pending.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can

@@ -492,7 +492,7 @@ activation and complete logical validation remain separate.
 ### Capturing a stopped journal prefix
 
 `StoppedStore::capture_journal` wraps the existing bounded whole-frame recovery
-scanner without exposing its repair-capable ScannedJournal. Supply selected
+scanner without exposing its mutation-capable ScannedJournal. Supply selected
 metadata, a physical byte ceiling and the caller's 1 MiB frame buffer. For
 CURRENT authority, first load that metadata through the same stopped owner.
 Construction binds the selected journal header and retained-history floor;
@@ -1411,6 +1411,53 @@ folder move and submission creation are examples. Steps for a new message:
 The body precedes its reference. A metadata-only mutation starts at step 3.
 External SMTP relay attempts have their own durable phase records as specified
 in DESIGN section 11; this local commit does not make remote SMTP exactly-once.
+
+### Bounded frame append primitive
+
+`ScannedJournal::append_frame` now consumes a completed physical scan with no
+incomplete tail and borrows one immutable, complete candidate frame. An incomplete
+tail refuses with InvalidInput (repair and rescan first), not a corruption error.
+It validates
+that frame's successor sequence, local operations and checksums, then admits the
+combined 4 MiB frame-byte and 8192-operation ceilings. Before opening for append,
+it rechecks selected CURRENT using the same bounded helper as explicit tail
+repair. Opening uses std OpenOptions with read/append and the existing private
+file policy; exact length and inode identity must match the scanned descriptor.
+Constructor refusal appends no bytes and returns Rejected. A repaired tail must
+be rescanned before using this entry point.
+
+JournalAppend holds the writer-lock borrow, append descriptor, selected CURRENT,
+frame borrow and fixed counters. The caller keeps actual stopped-store exclusion
+from scan through append completion, with no live readers or writers. LOCK alone
+is not that barrier. The stable private namespace remains required: reopen checks
+do not protect against same-size external writes. The caller also owns logical
+reservation and full final-view/blob validation. This
+primitive grants none of those authorities. Each advance performs one write of
+at most 64 KiB, a file sync, or final length/EOF confirmation. At most 64 write
+calls are admitted for the complete frame; excessive short writes refuse with
+WouldBlock. Zero writes, impossible counts, Interrupted and other I/O errors
+retire the append. Retried advances on a failed state do no I/O.
+
+Every advance error reports Indeterminate; even an apparently early write error
+must not authorize retry, rollback or release of the reservation. Written byte
+counts report confirmed progress only; a failing syscall may have additional
+uncertain effects. The caller stops writer admission and preserves charges for
+recovery. Dropping an unfinished append neither syncs nor truncates any bytes.
+Premature finish returns Incomplete, and failed finish returns Failed. Both retain
+the same uncertain-effect contract: stop the writer and keep charges until
+recovery. Even Incomplete after successful sync cannot authorize acknowledgment
+or reservation release. Only constructor Rejected proves no append writes. Caller
+work/deadline checks bracket construction, every advance and finish; blocking
+std calls remain uninterruptible and frame validation is one admitted work unit.
+
+Only the sequence Write -> Sync -> Confirm -> Complete permits consuming finish
+to return SyncedAppend. Repeated Complete does no I/O. That evidence retains the
+lock/file and reports CURRENT, sequence, byte endpoint, appended bytes/operations
+and cumulative operations. It is durable append evidence only; atomic reader
+visibility, reservation reconciliation and protocol acknowledgment remain for
+the writer coordinator. File namespace is unchanged, so no directory sync is
+needed for the append itself. This foundation accepts one frame per fresh scan;
+a retained multi-commit writer and publication are not implemented here.
 
 | Failure point | Recovery and client meaning |
 | --- | --- |

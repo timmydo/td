@@ -1,4 +1,4 @@
-//! Read-only stopped-journal scan; only observed incomplete physical tails are repair candidates.
+//! Stopped-journal scanning with explicit consuming repair and append transitions.
 pub use super::super::journal_input::Error as RecoveryInputError;
 use super::super::{journal_input::MAX_READ_CALLS, LockedRoot};
 use super::{fill_exact, fill_exact_using, CompleteFile, StoreReader};
@@ -16,6 +16,10 @@ use crate::{
     store_paths::{AccountEntry, Number},
 };
 use std::io;
+
+#[path = "recovery/append.rs"]
+mod append;
+pub use append::{AppendError, AppendStep, JournalAppend, SyncedAppend};
 
 #[path = "recovery/repair.rs"]
 mod repair;

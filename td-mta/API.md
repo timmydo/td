@@ -808,6 +808,19 @@ This supplies offline validation reads, without service authorization, runtime
 pool leases, complete logical invariants or activation. The existing blocking
 std I/O duration limitation remains; a deadline check cannot interrupt a syscall.
 
+`ScannedJournal::append_frame` is a mutation-capable low-level operation outside
+the stopped read-only facade. Keep actual stopped-store exclusion (no live readers
+or writers) from scan through completion. It consumes a scan without a partial tail,
+validates a borrowed successor frame and cumulative journal ceilings, rechecks
+CURRENT and opens the same private inode at the exact scanned length. Constructor
+errors are Rejected before writes. JournalAppend advances through bounded writes,
+sync and final length/EOF confirmation. Any step error permanently retires it and
+reports Indeterminate; Failed/Incomplete finish errors and unfinished drop also
+leave uncertain bytes and charges for recovery.
+Only consuming complete finish yields SyncedAppend endpoint/count evidence.
+Caller reservations, writer serialization, graph policy, deadline/work checks,
+atomic visibility and acknowledgment remain external. No writable handle escapes.
+
 `StoppedStore::capture_journal` wraps a bounded stopped scan using caller frame
 scratch and a physical byte ceiling. Advances yield scalar frame progress or
 provisional End; finish verifies EOF and returns CapturedJournal with a derived
