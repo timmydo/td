@@ -502,3 +502,208 @@ fn diagnostics_distinguish_journal_and_frame_failures() {
         "frame validation failed: container checksum mismatch"
     );
 }
+
+fn streamed(bytes: &[u8], previous: u64) -> Result<td_mta::format::frame_stream::Summary, Error> {
+    use td_mta::format::{frame_stream, operation};
+    let mut stream = frame_stream::Verifier::new(&Provider, seq(previous), &bytes[..64])?;
+    let end = bytes.len() - 40;
+    let mut offset = 64;
+    while offset < end {
+        let prefix = bytes.get(offset..offset + 12).ok_or(F::Truncated)?;
+        let length = operation::extent(prefix)?;
+        stream.push(bytes.get(offset..offset + length).ok_or(F::Truncated)?)?;
+        offset += length;
+    }
+    stream.finish(&bytes[end..])
+}
+
+#[test]
+fn incremental_frames_match_literals_and_maximum_complete_frames() {
+    use td_mta::format::frame_stream;
+    for (bytes, previous) in [
+        (
+            hex(include_str!("fixtures/format-v1/frame-put-blob.hex")),
+            0,
+        ),
+        (
+            hex(include_str!("fixtures/format-v1/frame-delete-change.hex")),
+            1,
+        ),
+        (maximum(1), 0),
+        (deletes(1, 4096), 0),
+        (deletes(u64::MAX, 2), u64::MAX - 1),
+    ] {
+        let frame = Frame::decode(&Provider, seq(previous), &bytes).unwrap();
+        let mut verifier =
+            frame_stream::Verifier::new(&Provider, seq(previous), &bytes[..64]).unwrap();
+        assert_eq!(verifier.header(), frame.header());
+        // Reusing one operation buffer proves the verifier does not retain entries.
+        let mut scratch = vec![0; 66572];
+        for entry in frame.operations() {
+            let entry = entry.unwrap();
+            let n = entry.operation.encode(&mut scratch).unwrap();
+            assert_eq!(verifier.push(&scratch[..n]).unwrap(), entry);
+        }
+        let summary = verifier.finish(&bytes[bytes.len() - 40..]).unwrap();
+        assert_eq!(summary.header(), frame.header());
+        assert_eq!(summary.digest().as_slice(), &bytes[bytes.len() - 32..]);
+        assert_eq!(streamed(&bytes, previous), Ok(summary));
+    }
+    assert!(std::mem::size_of::<frame_stream::Verifier<'_, Provider>>() <= 512);
+    const {
+        assert!(
+            td_mta::format::OPERATION_HEADER_BYTES
+                + td_mta::format::MAX_KEY_BYTES
+                + td_mta::format::MAX_VALUE_BYTES
+                <= td_mta::format::table::MAX_RECORD_BYTES
+        );
+    }
+}
+
+#[test]
+fn incremental_frame_errors_are_terminal_and_cannot_complete_partial_data() {
+    use td_mta::format::{frame_header::Header, frame_stream::Verifier as Stream};
+    let bytes = deletes(1, 2);
+    let header = &bytes[..64];
+    let operation = &bytes[64..92];
+    let footer = &bytes[120..];
+    for n in 0..64 {
+        assert!(Stream::new(&Provider, seq(0), &header[..n]).is_err());
+    }
+    for previous in [1, u64::MAX] {
+        assert!(Stream::new(&Provider, seq(previous), header).is_err());
+    }
+    assert!(Stream::new(&Provider, seq(0), &bytes[..65]).is_err());
+    for count in 0..2 {
+        let mut stream = Stream::new(&Provider, seq(0), header).unwrap();
+        for _ in 0..count {
+            stream.push(operation).unwrap();
+        }
+        assert_eq!(stream.finish(footer), Err(Error::Format(F::Truncated)));
+    }
+    for n in 0..28 {
+        let mut stream = Stream::new(&Provider, seq(0), header).unwrap();
+        let error = stream.push(&operation[..n]).unwrap_err();
+        assert_eq!(stream.push(operation), Err(error));
+        assert_eq!(stream.finish(footer), Err(error));
+    }
+    for n in 0..40 {
+        let mut stream = Stream::new(&Provider, seq(0), header).unwrap();
+        stream.push(operation).unwrap();
+        stream.push(operation).unwrap();
+        assert_eq!(
+            stream.finish(&footer[..n]),
+            Err(Error::Format(F::Truncated))
+        );
+    }
+    let mut stream = Stream::new(&Provider, seq(0), header).unwrap();
+    stream.push(operation).unwrap();
+    stream.push(operation).unwrap();
+    assert_eq!(stream.push(operation), Err(Error::Format(F::TrailingBytes)));
+    assert_eq!(stream.finish(footer), Err(Error::Format(F::TrailingBytes)));
+    let mut stream = Stream::new(&Provider, seq(0), header).unwrap();
+    stream.push(operation).unwrap();
+    stream.push(operation).unwrap();
+    let mut extra_footer = footer.to_vec();
+    extra_footer.push(0);
+    assert_eq!(
+        stream.finish(&extra_footer),
+        Err(Error::Format(F::TrailingBytes))
+    );
+    // Exceed bytes while the declared operation count still has room.
+    let mut larger = [0; 29];
+    Operation::delete(Table::Keywords, &[b'a'; 17])
+        .unwrap()
+        .encode(&mut larger)
+        .unwrap();
+    let mut stream = Stream::new(&Provider, seq(0), header).unwrap();
+    stream.push(operation).unwrap();
+    assert_eq!(stream.push(&larger), Err(Error::Format(F::TrailingBytes)));
+    assert_eq!(stream.push(operation), Err(Error::Format(F::TrailingBytes)));
+    assert_eq!(stream.finish(footer), Err(Error::Format(F::TrailingBytes)));
+    // Independently exercise count and payload mismatches with valid headers.
+    for (count, payload, pushed, expected) in [
+        (1, 56, 2, F::TrailingBytes),
+        (2, 56, 3, F::TrailingBytes),
+        (2, 57, 2, F::Truncated),
+    ] {
+        let mut hdr = [0; 64];
+        Header {
+            frame_bytes: 104 + payload,
+            operations: count,
+            sequence: seq(1),
+        }
+        .encode(&Provider, &mut hdr)
+        .unwrap();
+        let mut stream = Stream::new(&Provider, seq(0), &hdr).unwrap();
+        for _ in 0..pushed {
+            let _ = stream.push(operation);
+        }
+        assert_eq!(stream.finish(footer), Err(Error::Format(expected)));
+    }
+    // Exact payload bytes cannot excuse a missing declared operation.
+    let mut wrong_count = vec![0; 160];
+    Operation::delete(Table::Keywords, &[b'a'; 44])
+        .unwrap()
+        .encode(&mut wrong_count[64..120])
+        .unwrap();
+    seal(&Provider, seq(1), 1, &mut wrong_count).unwrap();
+    Header {
+        frame_bytes: 160,
+        operations: 2,
+        sequence: seq(1),
+    }
+    .encode(&Provider, &mut wrong_count[..64])
+    .unwrap();
+    rehash(&mut wrong_count);
+    assert_eq!(
+        Frame::decode(&Provider, seq(0), &wrong_count),
+        Err(DecodeError::Invalid(Error::Format(F::Truncated)))
+    );
+    assert_eq!(streamed(&wrong_count, 0), Err(Error::Format(F::Truncated)));
+    // Identity CHANGE is legal in the operation codec but forbidden in a frame.
+    let mut identity = [0; 28];
+    Operation::change(ObjectType::Identity, ChangeAction::Updated, &[1; 16])
+        .encode(&mut identity)
+        .unwrap();
+    assert!(Operation::decode(&identity).is_ok());
+    let mut stream = Stream::new(&Provider, seq(0), header).unwrap();
+    assert_eq!(stream.push(&identity), Err(Error::Format(F::InvalidValue)));
+    assert_eq!(stream.push(operation), Err(Error::Format(F::InvalidValue)));
+    assert_eq!(stream.finish(footer), Err(Error::Format(F::InvalidValue)));
+}
+
+#[test]
+fn incremental_frame_integrity_and_provider_failures_refuse_completion() {
+    use td_mta::format::frame_stream::Verifier as Stream;
+    let bytes = deletes(1, 1);
+    for offset in 0..bytes.len() {
+        let mut bad = bytes.clone();
+        bad[offset] ^= 1;
+        assert!(streamed(&bad, 0).is_err(), "accepted corrupt byte {offset}");
+    }
+    let mut extra = bytes.clone();
+    extra.push(0);
+    assert!(streamed(&extra, 0).is_err());
+    // Existing fault provider visits factory, update, finish and equality calls.
+    for at in 1..=10 {
+        let crypto = FaultCrypto::new(at);
+        match Stream::new(&crypto, seq(0), &bytes[..64]) {
+            Err(_) => assert!(at <= 6),
+            Ok(mut stream) => match stream.push(&bytes[64..92]) {
+                Err(error) => {
+                    assert_eq!(at, 7);
+                    let steps = crypto.0.step.load(Ordering::Relaxed);
+                    assert_eq!(stream.push(&bytes[64..92]), Err(error));
+                    assert_eq!(stream.finish(&bytes[92..]), Err(error));
+                    assert_eq!(crypto.0.step.load(Ordering::Relaxed), steps);
+                }
+                Ok(_) => assert!(stream.finish(&bytes[92..]).is_err()),
+            },
+        }
+    }
+    let crypto = FaultCrypto::new(11);
+    let mut stream = Stream::new(&crypto, seq(0), &bytes[..64]).unwrap();
+    stream.push(&bytes[64..92]).unwrap();
+    assert!(stream.finish(&bytes[92..]).is_ok());
+}

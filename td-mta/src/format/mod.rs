@@ -6,6 +6,7 @@ pub mod bindings;
 pub mod container;
 pub mod frame;
 pub mod frame_header;
+pub mod frame_stream;
 pub mod journal_stream;
 pub mod key;
 pub mod manifest;

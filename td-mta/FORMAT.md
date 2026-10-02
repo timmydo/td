@@ -354,6 +354,22 @@ Returned errors preserve every byte. It uses no second frame-sized buffer.
 Successful sealing establishes local frame grammar and integrity, not sequence
 continuity relative to a journal, authorization or durable publication.
 
+`format::frame_stream::Verifier` validates the same local frame grammar with
+one exact operation per push. Construction checks the exact 64-byte header
+and next sequence; each push checks local rows, rejects Identity CHANGE,
+meters count/payload bytes and updates the frame digest. Returned entries
+retain stored ordinals and borrow only that call's input. They are provisional:
+no caller may publish them before consuming finish verifies exact count,
+payload extent, the exact 40-byte footer, end magic and digest. All push errors
+are sticky, including crypto failures; finish consumes the verifier. Its
+Summary contains the checked header and footer digest (excluding the digest
+itself), not a whole-journal hash. It retains no operation bytes or frame arena.
+
+This incremental codec does not classify physical incomplete tails, read files,
+bind selected journals, coalesce changes or validate final references. Even
+its Truncated error supplies no repair authority. The existing complete-frame
+reader and stopped recovery scanner retain their separate contracts.
+
 `format::journal_stream::Verifier` hashes the exact journal header and supplied
 frames, enforces consecutive sequences and both the 4 MiB frame-byte and 8192
 operation caps, and retains only a digest, counters and identity. Its `header`

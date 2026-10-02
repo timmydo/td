@@ -8,7 +8,7 @@ use super::{
 };
 use crate::ports::{Crypto, CryptoError, Digest};
 
-const END: &[u8; 8] = b"TDMTEND1";
+pub(super) const END: &[u8; 8] = b"TDMTEND1";
 
 /// Missing supplied bytes are distinct from malformed complete contents.
 /// Only the I/O adapter can establish that missing bytes are at physical EOF.
@@ -49,6 +49,13 @@ impl std::fmt::Display for DecodeError {
 }
 impl std::error::Error for DecodeError {}
 
+pub(super) fn decode_operation(bytes: &[u8]) -> Result<Operation<'_>, FormatError> {
+    let operation = Operation::decode(bytes)?;
+    if matches!(operation.value(), Value::Change(change) if change.kind == ObjectType::Identity) {
+        return Err(FormatError::InvalidValue);
+    }
+    Ok(operation)
+}
 fn take_operation<'a>(bytes: &mut &'a [u8]) -> Result<Operation<'a>, FormatError> {
     let prefix = bytes
         .get(..OPERATION_HEADER_BYTES)
@@ -57,10 +64,7 @@ fn take_operation<'a>(bytes: &mut &'a [u8]) -> Result<Operation<'a>, FormatError
     let (head, tail) = bytes
         .split_at_checked(length)
         .ok_or(FormatError::Truncated)?;
-    let operation = Operation::decode(head)?;
-    if matches!(operation.value(), Value::Change(change) if change.kind == ObjectType::Identity) {
-        return Err(FormatError::InvalidValue);
-    }
+    let operation = decode_operation(head)?;
     *bytes = tail;
     Ok(operation)
 }

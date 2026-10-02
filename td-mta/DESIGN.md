@@ -61,6 +61,9 @@ An ordered next step applies the same completion rule to the first final row,
 or the first row strictly beyond an optional encoded cursor.
 A bounded mailbox-parent walker now checks one supplied ReadView chain for
 missing targets and cycles without retaining a visited-node collection.
+Incremental frame validation now checks supplied operations and their final
+footer without retaining a complete frame; entries remain provisional until
+completion. Retained-history change cursors still need their I/O integration.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

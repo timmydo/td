@@ -1222,6 +1222,29 @@ fn store_complete_frames() {
         count += 1;
     }
     assert_eq!(count, 1);
+    for fail in [false, true] {
+        let mut incremental = td_mta::format::frame_stream::Verifier::new(
+            &crypto,
+            Sequence::default(),
+            bytes.get(..64).unwrap(),
+        )
+        .unwrap();
+        let operation = bytes.get(64..92).unwrap();
+        if fail {
+            assert!(incremental.push(operation.get(..27).unwrap()).is_err());
+            assert!(incremental.push(operation).is_err());
+            assert!(incremental.finish(bytes.get(92..).unwrap()).is_err());
+        } else {
+            assert_eq!(incremental.push(operation).unwrap().ordinal, 0);
+            assert_eq!(
+                incremental
+                    .finish(bytes.get(92..).unwrap())
+                    .unwrap()
+                    .header(),
+                frame.header()
+            );
+        }
+    }
     let header = JournalHeader {
         account: AccountId::from_bytes([0x33; 16]),
         epoch: StoreEpoch::from_bytes([0x22; 16]),

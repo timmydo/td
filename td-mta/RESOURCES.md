@@ -710,6 +710,16 @@ The allocation interval measures unchanged/deleted rows, input exhaustion and
 completion, premature completion and sticky sink failure at both root bounds.
 Full worker-stack/RSS and actual pin ownership remain integration obligations.
 
+The supplied-byte frame_stream verifier retains a provider borrow, checked
+header, digest, count/extent scalars and sticky error. Its compiled Provider layout is
+capped at 512 bytes, charged to the worker stack. Each push borrows one exact
+operation (at most 66572 bytes), which fits the existing 68 KiB record region;
+no input bytes remain borrowed by the verifier after the call. The existing
+allocation interval covers successful completion and sticky malformed input.
+There is no new pool or frame arena. Future history/change cursor integration
+must prove its collection and input scratch overlap within the admitted view;
+this codec alone grants no completed cursor or new reservation.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a

@@ -840,6 +840,15 @@ service activation. Each part lands independently:
     changed views, malformed rows and sticky errors. The allocation probe
     covers success/cycle/missing/limit cases. Actual view integration and the
     all-mailbox/whole-graph coordinator remain separate work.
+  - **M05d14a — incremental frame validation:** implemented supplied-byte
+    verification with exact header, one operation per push and exact footer.
+    Validate sequence/local grammar, preserve stored ordinals and enforce
+    count/extent/digest before completion, with sticky push errors. Differential
+    tests cover literal and maximum frames, malformed counts/bytes, Identity
+    CHANGE and provider faults. Existing allocation instrumentation covers
+    success and failure. This retains only digest/counters, enabling future
+    retained-change input without another frame arena. File I/O, journal
+    binding, change collection and ReadView integration remain separate work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete
