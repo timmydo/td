@@ -16,14 +16,14 @@ use crate::ladder::{
     FIREFOX_INPUT_CMDLINE_TOKEN, FIREFOX_NETWORK_RUNTIME_MARKER, GIT_HTTPS_RUNTIME_MARKER,
     GIT_HTTPS_TEST_URL, GIT_RUNTIME_MARKER, GREETER_MARKER, KERNEL_AUDIT_CMDLINE_TOKEN,
     NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
-    PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
-    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER,
-    SYSTEM_ETC_MUTABLE_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
-    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER,
-    SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER,
-    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, TD_APPLICATIONS_PLACED_MARKER,
-    TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER, TD_FETCH_BOOT_MARKER,
-    TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
+    PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER,
+    SETUP_INPUT_CMDLINE_TOKEN, SSHD_MARKER, SYSTEM_BOOT_SUCCESS_MARKER,
+    SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_MUTABLE_MARKER,
+    SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
+    SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
+    SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
+    TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER,
+    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
     TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER, TD_FIREFOX_CONTENT_MARKER,
     TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
     TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
@@ -1972,7 +1972,7 @@ fn build_td_svc_conf() -> String {
          # for.\n\
          [claude-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {setup_input_cmdline_token} \"*) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
          after=firefox-soak,claude-files,claude-launch\n\
          requires=td-firstboot,claude-files,claude-launch\n\
          restart=never\n\
@@ -2079,6 +2079,7 @@ fn build_td_svc_conf() -> String {
         setup_app_id = SETUP_APP_ID,
         setup_intake = SETUP_INTAKE_SOCKET,
         setup_marker = TD_SETUP_LIVE_MARKER,
+        setup_input_cmdline_token = SETUP_INPUT_CMDLINE_TOKEN,
         setup_min_height = SETUP_MIN_HEIGHT,
         setup_min_width = SETUP_MIN_WIDTH,
         setup_workspace = SETUP_WORKSPACE,
@@ -3461,6 +3462,13 @@ fn build_profile(sys: &SystemDef) -> String {
     // The greeter has been reached (login chain ran, shell live) — the primary success
     // line the qemu-boot-system oracle keys on.
     s.push_str(&format!("echo {GREETER_MARKER}\n"));
+    // The wizard oracle drives a live session for as long as its script
+    // takes, and its host ends the run: the greeter parks rather than let a
+    // live boot's settled health transaction reboot the machine under it.
+    s.push_str(&format!(
+        "case \" $(/bin/td-util cat /proc/cmdline) \" in *\" {SETUP_INPUT_CMDLINE_TOKEN} \"*) \
+         while :; do /bin/td-util sleep 300; done;; esac\n"
+    ));
     // Autotest waits for the independent root-owned health transaction.
     s.push_str(&format!(
         "if /bin/grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
@@ -7745,6 +7753,36 @@ mod tests {
                 "pub const SOCKET: &str = \"{SETUP_INTAKE_SOCKET}\";"
             ))
         );
+        // Its boot evidence answers the oracle's token on the console: the
+        // unit keeps no log of its own.
+        let evidence = include_str!("../../../td-setup/src/evidence.rs");
+        assert!(evidence.contains(&format!(
+            "pub const PROOF_CMDLINE_TOKEN: &str = \"{}\";",
+            crate::ladder::SETUP_INPUT_CMDLINE_TOKEN
+        )));
+        assert!(evidence.contains(&format!(
+            "pub const SHOWN_PREFIX: &str = \"{}\";",
+            crate::ladder::TD_SETUP_SHOWN_PREFIX
+        )));
+        assert_eq!(unit_key("setup", "log"), None);
+        // Its terminal window would map on the wizard's workspace and take
+        // the keyboard from under the drive.
+        assert!(unit_key("claude-evidence", "exec")
+            .unwrap()
+            .contains(&format!(
+                "esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {} \"*) exit 0;; esac; n=0;",
+                crate::ladder::SETUP_INPUT_CMDLINE_TOKEN
+            )));
+        // Nor does the autotest greeter reboot the live session under it.
+        let profile = build_profile(&SYSTEM);
+        let park = format!(
+            "case \" $(/bin/td-util cat /proc/cmdline) \" in *\" {} \"*) \
+             while :; do /bin/td-util sleep 300; done;; esac\n",
+            crate::ladder::SETUP_INPUT_CMDLINE_TOKEN
+        );
+        let parked = profile.find(&park).unwrap();
+        assert!(parked > profile.find(GREETER_MARKER).unwrap());
+        assert!(parked < profile.find(AUTOTEST_CMDLINE_TOKEN).unwrap());
         let pages = include_str!("../../../td-setup/src/lib.rs");
         assert!(pages.contains(&format!(
             "pub(crate) const MIN_PAGE_WIDTH: usize = {SETUP_MIN_WIDTH};"

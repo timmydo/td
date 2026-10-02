@@ -34,6 +34,7 @@ pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;
 pub(crate) mod secret;
+pub(crate) mod setup_input;
 pub(crate) mod test_iso;
 pub(crate) mod update;
 
@@ -190,6 +191,10 @@ const TD_FIREFOX_SOAK_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SOAK_MARKER;
 const TD_FIREFOX_SECCOMP_AUDIT_MARKER: &str = td_recipe::ladder::TD_FIREFOX_SECCOMP_AUDIT_MARKER;
 const TD_CLAUDE_TERMINAL_MARKER: &str = td_recipe::ladder::TD_CLAUDE_TERMINAL_MARKER;
 const TD_TERM_CLIPBOARD_FOCUS_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_FOCUS_PREFIX;
+const SETUP_INPUT_CMDLINE_TOKEN: &str = td_recipe::ladder::SETUP_INPUT_CMDLINE_TOKEN;
+const TD_SETUP_SHOWN_PREFIX: &str = td_recipe::ladder::TD_SETUP_SHOWN_PREFIX;
+/// More page states than any wizard script waits through.
+const MAX_SETUP_SHOWN: usize = 512;
 const TD_TERM_CLIPBOARD_TARGET_PREFIX: &str = td_recipe::ladder::TD_TERM_CLIPBOARD_TARGET_PREFIX;
 const TD_TERM_CLIPBOARD_SELECTION_MARKER: &str =
     td_recipe::ladder::TD_TERM_CLIPBOARD_SELECTION_MARKER;
@@ -438,10 +443,15 @@ const FINAL_DRAIN_PASSES: usize = 24;
 /// evidence; floods are rejected directly before a result is returned.
 enum EndReason {
     MarkerSeen,
+    /// The scripted wizard input ran to its end.
+    InputComplete,
     QemuExited(ExitStatus),
     TimedOut(u64),
     Flooded(u64),
-    AudioFlooded { bytes: u64, ceiling: u64 },
+    AudioFlooded {
+        bytes: u64,
+        ceiling: u64,
+    },
 }
 
 /// Outcome of a boot attempt.
@@ -509,6 +519,11 @@ struct ConsoleEvidence {
     td_firefox_seccomp_audit: bool,
     td_claude_terminal: bool,
     td_term_clipboard_focus: Option<u32>,
+    /// td-setup's page states, in the order it said them: each a sequence
+    /// number, one past the last, and the state.
+    td_setup_shown: Vec<(u32, String)>,
+    /// Why a said state is missing from `td_setup_shown`, once one is.
+    td_setup_lost: Option<String>,
     td_term_clipboard_target: Option<TerminalClipboardTarget>,
     td_term_clipboard_selection: bool,
     td_term_clipboard: bool,
@@ -4480,6 +4495,14 @@ enum BootSource<'a> {
         attachment: FirmwareAttachment,
         installation_target: Option<&'a install::TargetDisk>,
     },
+    /// A live medium booted direct, with a disposable target disk after it
+    /// and the wizard driven by `script`.
+    LiveSetup {
+        kernel: &'a Path,
+        initramfs: &'a Path,
+        target: &'a install::TargetDisk,
+        script: &'a [setup_input::SetupStep],
+    },
 }
 
 fn boot_with_timeout(
@@ -4572,6 +4595,26 @@ fn boot_source(
         }
     }
     validate_boot_plan_tokens(plan.extra_append)?;
+    let setup_input = plan
+        .extra_append
+        .split_ascii_whitespace()
+        .any(|token| token == SETUP_INPUT_CMDLINE_TOKEN);
+    if setup_input != matches!(source, BootSource::LiveSetup { .. }) {
+        return Err(format!(
+            "{SETUP_INPUT_CMDLINE_TOKEN} belongs to exactly the live setup boot"
+        ));
+    }
+    if matches!(source, BootSource::LiveSetup { .. })
+        && (plan.physical_input
+            || plan.kill_on_marker
+            || !plan.disk.as_ref().is_some_and(|disk| disk.read_only))
+    {
+        return Err(
+            "the live setup boot needs its read-only medium, no Firefox input, and its \
+             script, not its marker, to end it"
+                .into(),
+        );
+    }
     if matches!(
         source,
         BootSource::Firmware {
@@ -4651,7 +4694,7 @@ fn boot_source(
     // this.)
     let serial = format!("file:{}", console_path.display());
     static QMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let qmp_scratch = if plan.physical_input {
+    let qmp_scratch = if plan.physical_input || matches!(source, BootSource::LiveSetup { .. }) {
         Some(Scratch {
             dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
         })
@@ -4689,7 +4732,10 @@ fn boot_source(
     .args(["-serial", &serial]);
     match source {
         BootSource::Direct { kernel, initramfs }
-        | BootSource::DirectReordered { kernel, initramfs } => {
+        | BootSource::DirectReordered { kernel, initramfs }
+        | BootSource::LiveSetup {
+            kernel, initramfs, ..
+        } => {
             cmd.arg("-kernel")
                 .arg(kernel)
                 .arg("-initrd")
@@ -4813,6 +4859,12 @@ fn boot_source(
         cmd.arg("-drive").arg(install::target_drive_arg(target));
         target.attach(&mut cmd, install::protocol::TARGET_SERIAL, None)?;
     }
+    // After the medium, so the medium is the first disk and the target the
+    // second.
+    if let BootSource::LiveSetup { target, .. } = source {
+        cmd.arg("-drive").arg(install::target_drive_arg(target));
+        target.attach(&mut cmd, setup_input::TARGET_SERIAL, None)?;
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(diag))
@@ -4825,7 +4877,16 @@ fn boot_source(
     let mut console_file: Option<File> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut evidence = ConsoleEvidence::default();
-    let mut physical_input = qmp_path.map(PhysicalInputController::new);
+    let mut physical_input = qmp_path
+        .clone()
+        .filter(|_| plan.physical_input)
+        .map(PhysicalInputController::new);
+    let mut setup_input = match (source, qmp_path) {
+        (BootSource::LiveSetup { script, .. }, Some(path)) => {
+            Some(setup_input::SetupInputController::new(path, script))
+        }
+        _ => None,
+    };
     let mut end;
     let mut marker_killed = false;
     loop {
@@ -4854,6 +4915,38 @@ fn boot_source(
                     "drive staged Firefox physical input: {error}. Last serial output:\n{}",
                     tail(&console, 80)
                 ));
+            }
+        }
+        if let Some(controller) = setup_input.as_mut() {
+            match controller.progress(&evidence).and_then(|done| {
+                // Every write the guest made is QEMU's to count, whether or
+                // not it allocated a block before the machine stops.
+                match done.then(|| controller.target_writes()).transpose()? {
+                    Some(0) | None => Ok(done),
+                    Some(writes) => Err(format!(
+                        "the target disk took {writes} writes from a wizard that \
+                         never consented"
+                    )),
+                }
+            }) {
+                Ok(true) => {
+                    let sent = child.kill().is_ok();
+                    marker_killed = child
+                        .wait()
+                        .is_ok_and(|status| sent && status.signal() == Some(9));
+                    end = EndReason::InputComplete;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let console = String::from_utf8_lossy(&buf);
+                    return Err(format!(
+                        "drive the installer wizard: {error}. Last serial output:\n{}",
+                        tail(&console, 80)
+                    ));
+                }
             }
         }
         if evidence.target && plan.kill_on_marker {
@@ -4959,7 +5052,13 @@ fn boot_source(
     }
 
     let audio_flooded = matches!(&end, EndReason::AudioFlooded { .. });
-    let reason = format_end_reason(end, evidence.target);
+    let awaiting = setup_input
+        .as_ref()
+        .and_then(|controller| controller.awaiting().map(str::to_string));
+    let mut reason = format_end_reason(end, evidence.target);
+    if let Some(state) = awaiting {
+        reason.push_str(&format!("; the wizard script still awaited {state:?}"));
+    }
     if final_flooded || audio_flooded {
         return Err(format!(
             "{reason}. Last serial output:\n{}",
@@ -5686,6 +5785,7 @@ fn validate_boot_plan_tokens(extra_append: &str) -> Result<(), String> {
 fn format_end_reason(end: EndReason, target_seen: bool) -> String {
     match end {
         EndReason::MarkerSeen => "the marker was seen".to_string(),
+        EndReason::InputComplete => "the scripted wizard input completed".to_string(),
         EndReason::QemuExited(status) if target_seen => {
             format!("qemu exited on its own after the marker ({status})")
         }
@@ -6262,6 +6362,12 @@ fn latch_console_evidence_from(
         buf,
         starts_at_stream_boundary,
     );
+    latch_setup_shown(
+        &mut evidence.td_setup_shown,
+        &mut evidence.td_setup_lost,
+        buf,
+        starts_at_stream_boundary,
+    );
     latch_terminal_clipboard_target(
         &mut evidence.td_term_clipboard_target,
         buf,
@@ -6798,6 +6904,115 @@ fn latch_terminal_clipboard_focus(
             *found = Some(serial);
         }
     }
+}
+
+/// Appends each complete `TD-SETUP-SHOWN n=SEQ STATE` line whose sequence
+/// is one past the last kept; a line rescanned at a seam is kept once, and
+/// a sequence that skips one records the loss, since td-setup says each
+/// state only once and a lost one would never come again.
+fn latch_setup_shown(
+    found: &mut Vec<(u32, String)>,
+    lost: &mut Option<String>,
+    haystack: &[u8],
+    starts_at_stream_boundary: bool,
+) {
+    let prefix = TD_SETUP_SHOWN_PREFIX.as_bytes();
+    for start in 0..haystack.len() {
+        if (start != 0 || !starts_at_stream_boundary)
+            && haystack.get(start.wrapping_sub(1)) != Some(&b'\n')
+        {
+            continue;
+        }
+        let Some(body_start) = start.checked_add(prefix.len()) else {
+            return;
+        };
+        if haystack.get(start..body_start) != Some(prefix) {
+            continue;
+        }
+        let Some(rest) = haystack.get(body_start..) else {
+            continue;
+        };
+        let Some(end) = rest.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let body = rest.get(..end).unwrap_or_default();
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let Ok(text) = std::str::from_utf8(body) else {
+            continue;
+        };
+        let Some((sequence, state)) = text
+            .strip_prefix("n=")
+            .and_then(|text| text.split_once(' '))
+        else {
+            continue;
+        };
+        let Some(sequence) = sequence.parse::<u32>().ok().filter(|n| *n != 0) else {
+            continue;
+        };
+        let last = found.last().map_or(0, |(last, _)| *last);
+        if sequence <= last {
+            continue;
+        }
+        if lost.is_some() {
+            return;
+        }
+        if sequence != last.saturating_add(1) {
+            *lost = Some(format!(
+                "td-setup's evidence line {} was lost before {sequence}",
+                last.saturating_add(1)
+            ));
+        } else if !state
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+        {
+            *lost = Some(format!("td-setup's evidence line {sequence} was garbled"));
+        } else if found.len() >= MAX_SETUP_SHOWN {
+            *lost = Some(format!("td-setup said more than {MAX_SETUP_SHOWN} states"));
+        } else {
+            found.push((sequence, state.to_string()));
+        }
+    }
+}
+
+/// The sum of the write, discard and zone append counters in `drive`'s
+/// entry of a `query-blockstats` reply, from its `"device"` key to the next
+/// entry's. Every entry has `wr_operations`; the others are summed where
+/// this QEMU reports them.
+fn drive_writes(response: &str, drive: &str) -> Result<u64, String> {
+    const DEVICE: &str = "\"device\": \"";
+    const CHANGES: [&str; 3] = [
+        "\"wr_operations\": ",
+        "\"unmap_operations\": ",
+        "\"zone_append_operations\": ",
+    ];
+    let key = format!("{DEVICE}{drive}\"");
+    let mut entries = response.match_indices(&key);
+    let (start, _) = entries
+        .next()
+        .ok_or_else(|| format!("QMP block statistics name no drive {drive}"))?;
+    if entries.next().is_some() {
+        return Err(format!("QMP block statistics name drive {drive} twice"));
+    }
+    let entry = response
+        .get(start.saturating_add(key.len())..)
+        .unwrap_or_default();
+    let entry = entry.split(DEVICE).next().unwrap_or_default();
+    if !entry.contains(CHANGES[0]) {
+        return Err(format!("QMP block statistics for {drive} count no writes"));
+    }
+    let mut writes = 0u64;
+    for counter in CHANGES {
+        for rest in entry.split(counter).skip(1) {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let count = digits
+                .parse::<u64>()
+                .map_err(|_| format!("QMP block statistics for {drive} have a bad change count"))?;
+            writes = writes
+                .checked_add(count)
+                .ok_or("QMP write count overflow")?;
+        }
+    }
+    Ok(writes)
 }
 
 fn latch_terminal_clipboard_target(
@@ -7507,6 +7722,21 @@ impl Qmp {
         )
     }
 
+    /// Presses and releases one key of the wizard oracle's closed set.
+    fn press_until(&mut self, key: &str, deadline: Instant) -> Result<(), String> {
+        if !setup_input::setup_key(key) {
+            return Err(format!("QMP wizard key {key:?} is outside the closed set"));
+        }
+        self.exchange_until(
+            &format!(
+                "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[\
+                 {{\"type\":\"key\",\"data\":{{\"down\":true,\"key\":{{\"type\":\"qcode\",\"data\":\"{key}\"}}}}}},\
+                 {{\"type\":\"key\",\"data\":{{\"down\":false,\"key\":{{\"type\":\"qcode\",\"data\":\"{key}\"}}}}}}]}}}}"
+            ),
+            deadline,
+        )
+    }
+
     fn button_until(&mut self, button: &str, deadline: Instant) -> Result<(), String> {
         if !matches!(button, "left" | "right" | "wheel-down") {
             return Err("QMP input button is outside the closed set".to_string());
@@ -7534,6 +7764,20 @@ impl Qmp {
     }
 
     fn exchange_until(&mut self, command: &str, deadline: Instant) -> Result<(), String> {
+        self.query_until(command, deadline).map(|_| ())
+    }
+
+    /// Changes completed on drive `drive`, by QEMU's own count: every
+    /// write, discard and zone append counter in that drive's entry, its
+    /// protocol node's included.
+    fn drive_writes_until(&mut self, drive: &str, deadline: Instant) -> Result<u64, String> {
+        let response = self.query_until(r#"{"execute":"query-blockstats"}"#, deadline)?;
+        let response = String::from_utf8(response)
+            .map_err(|_| "QMP block statistics are not UTF-8".to_string())?;
+        drive_writes(&response, drive)
+    }
+
+    fn query_until(&mut self, command: &str, deadline: Instant) -> Result<Vec<u8>, String> {
         if command.len() > MAX_QMP_LINE_BYTES || command.contains(['\n', '\r']) {
             return Err("QMP command is over limit or multiline".to_string());
         }
@@ -7544,7 +7788,7 @@ impl Qmp {
         for _ in 0..MAX_QMP_RESPONSE_LINES {
             let response = self.read_line_until(deadline)?;
             if contains(&response, b"\"return\"") {
-                return Ok(());
+                return Ok(response);
             }
             if contains(&response, b"\"error\"") {
                 return Err(format!(
@@ -12011,5 +12255,201 @@ mod tests {
         let b = create_scratch_dir(&base, &seq).unwrap();
         assert_ne!(a, b); // distinct dirs from the shared counter
         assert!(a.is_dir() && b.is_dir());
+    }
+
+    #[test]
+    fn setup_evidence_is_kept_in_order_once_per_line() {
+        let mut evidence = ConsoleEvidence::default();
+        for invalid in [
+            format!("noise{TD_SETUP_SHOWN_PREFIX}n=1 page=welcome\n"),
+            format!("\n{TD_SETUP_SHOWN_PREFIX}n=0 page=welcome\n"),
+            format!("\n{TD_SETUP_SHOWN_PREFIX}1 page=welcome\n"),
+            format!("\n{TD_SETUP_SHOWN_PREFIX}n=1page=welcome\n"),
+            format!("\n{TD_SETUP_SHOWN_PREFIX}n=1 page=welcome"),
+        ] {
+            latch_console_evidence(&mut evidence, invalid.as_bytes(), b"target");
+            assert!(evidence.td_setup_shown.is_empty(), "{invalid:?}");
+            assert_eq!(evidence.td_setup_lost, None, "{invalid:?}");
+        }
+        let first = format!("{TD_SETUP_SHOWN_PREFIX}n=1 page=welcome\r\n");
+        latch_console_evidence(&mut evidence, first.as_bytes(), b"target");
+        // A seam rescans the same line; it is kept once.
+        latch_console_evidence(&mut evidence, first.as_bytes(), b"target");
+        latch_console_evidence(
+            &mut evidence,
+            format!(
+                "\n{TD_SETUP_SHOWN_PREFIX}n=2 page=destinations disks=1 selected=-\n\
+                 {TD_SETUP_SHOWN_PREFIX}n=2 page=forged\n\
+                 {TD_SETUP_SHOWN_PREFIX}n=3 page=waiting\n"
+            )
+            .as_bytes(),
+            b"target",
+        );
+        assert_eq!(
+            evidence.td_setup_shown,
+            [
+                (1, "page=welcome".to_string()),
+                (2, "page=destinations disks=1 selected=-".to_string()),
+                (3, "page=waiting".to_string()),
+            ]
+        );
+        assert_eq!(evidence.td_setup_lost, None);
+        // A line split by another console writer is lost, and says so.
+        let mut skipped = evidence;
+        latch_console_evidence(
+            &mut skipped,
+            format!("\n{TD_SETUP_SHOWN_PREFIX}n=5 page=welcome\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(
+            skipped.td_setup_lost.as_deref(),
+            Some("td-setup's evidence line 4 was lost before 5")
+        );
+        assert_eq!(skipped.td_setup_shown.len(), 3);
+        let mut garbled = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut garbled,
+            format!("\n{TD_SETUP_SHOWN_PREFIX}n=1 page=w\u{e9}lcome\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(
+            garbled.td_setup_lost.as_deref(),
+            Some("td-setup's evidence line 1 was garbled")
+        );
+    }
+
+    #[test]
+    fn drive_writes_count_only_the_named_drives_entry() {
+        let reply = r#"{"return": [{"device": "disk0", "stats": {"wr_operations": 9}}, {"device": "install-target", "parent": {"stats": {"wr_operations": 0}}, "stats": {"wr_operations": 0, "rd_operations": 40}, "qdev": "/machine"}]}"#;
+        assert_eq!(drive_writes(reply, "install-target"), Ok(0));
+        assert_eq!(drive_writes(reply, "disk0"), Ok(9));
+        let written = reply.replace(r#""wr_operations": 0, "rd"#, r#""wr_operations": 3, "rd"#);
+        assert_eq!(drive_writes(&written, "install-target"), Ok(3));
+        assert!(drive_writes(reply, "absent").is_err());
+        assert!(drive_writes(r#"{"return": [{"device": "x", "stats": {}}]}"#, "x").is_err());
+        // A discard or zone append changes the disk too.
+        let discarded = reply.replace(r#""rd_operations": 40"#, r#""unmap_operations": 2"#);
+        assert_eq!(drive_writes(&discarded, "install-target"), Ok(2));
+        let appended = reply.replace(r#""rd_operations": 40"#, r#""zone_append_operations": 1"#);
+        assert_eq!(drive_writes(&appended, "install-target"), Ok(1));
+        // `failed_wr_operations` is not a write that changed the disk.
+        let failed = reply.replace(r#""rd_operations": 40"#, r#""failed_wr_operations": 5"#);
+        assert_eq!(drive_writes(&failed, "install-target"), Ok(0));
+        let twice = format!("{reply}{reply}");
+        assert!(drive_writes(&twice, "install-target").is_err());
+    }
+
+    #[test]
+    fn setup_steps_match_only_states_said_after_the_last_acted_on() {
+        let script = [
+            setup_input::SetupStep {
+                shown: "page=a".into(),
+                keys: Vec::new(),
+            },
+            setup_input::SetupStep {
+                shown: "page=b".into(),
+                keys: Vec::new(),
+            },
+        ];
+        let mut controller =
+            setup_input::SetupInputController::new(PathBuf::from("/nonexistent/qmp"), &script);
+        let mut evidence = ConsoleEvidence::default();
+        evidence.td_setup_shown = vec![(1, "page=a".into())];
+        // Nothing is driven before the live session says it is ready.
+        assert_eq!(controller.progress(&evidence), Ok(false));
+        assert_eq!(controller.awaiting(), Some("page=a"));
+        evidence.target = true;
+        evidence.td_setup_shown.clear();
+        assert_eq!(controller.progress(&evidence), Ok(false));
+        // `b` said before `a` does not answer the step after `a`.
+        evidence.td_setup_shown = vec![(1, "page=b".into()), (2, "page=a".into())];
+        assert_eq!(controller.progress(&evidence), Ok(false));
+        assert_eq!(controller.awaiting(), Some("page=b"));
+        evidence.td_setup_shown.push((3, "page=b extra=1".into()));
+        assert_eq!(controller.progress(&evidence), Ok(true));
+        assert_eq!(controller.awaiting(), None);
+        // A state that does not follow within the step timeout fails.
+        let mut controller =
+            setup_input::SetupInputController::new(PathBuf::from("/nonexistent/qmp"), &script);
+        let mut waiting = ConsoleEvidence::default();
+        waiting.target = true;
+        let start = Instant::now();
+        assert_eq!(controller.progress_at(&waiting, start), Ok(false));
+        assert_eq!(
+            controller.progress_at(&waiting, start + Duration::from_secs(300)),
+            Ok(false)
+        );
+        assert!(controller
+            .progress_at(&waiting, start + Duration::from_secs(301))
+            .unwrap_err()
+            .contains("did not show \"page=a\" within 300s"));
+        // A lost line fails the drive at once.
+        let mut controller =
+            setup_input::SetupInputController::new(PathBuf::from("/nonexistent/qmp"), &script);
+        evidence.td_setup_lost = Some("lost".into());
+        assert!(controller.progress(&evidence).is_err());
+        // A step's every token must be the state's.
+        assert!(setup_input::matches("page=a x=1 y=2", "page=a y=2"));
+        assert!(!setup_input::matches("page=a x=1", "page=a x=12"));
+        assert!(!setup_input::matches("page=ab", "page=a"));
+        // Keys outside the oracle's closed set are refused.
+        assert!(setup_input::setup_key("ret") && setup_input::setup_key("slash"));
+        assert!(!setup_input::setup_key("ctrl") && !setup_input::setup_key("shift"));
+    }
+
+    #[test]
+    fn the_setup_token_belongs_to_exactly_the_live_setup_boot() {
+        let dir =
+            std::env::temp_dir().join(format!("td-setup-boot-{}-{}", std::process::id(), line!()));
+        fs::create_dir(&dir).unwrap();
+        let target = install::TargetDisk::with_capacity(&dir, "target.raw", 4096).unwrap();
+        let medium = dir.join("medium.iso");
+        fs::write(&medium, b"").unwrap();
+        let script = [];
+        let plan = |append: &'static str, read_only: bool| BootPlan {
+            disk: Some(BootDisk::new(&medium, read_only)),
+            mem: "64",
+            target_marker: "never",
+            kill_on_marker: false,
+            extra_append: append,
+            user_net: false,
+            audio: false,
+            physical_input: false,
+            capture_firefox_audio: false,
+            tpm_socket: None,
+        };
+        let kernel = Path::new("/nonexistent/bzImage");
+        let live = BootSource::LiveSetup {
+            kernel,
+            initramfs: kernel,
+            target: &target,
+            script: &script,
+        };
+        let direct = BootSource::Direct {
+            kernel,
+            initramfs: kernel,
+        };
+        let token = "td.autotest=1 td.setup-input=1";
+        assert_eq!(SETUP_INPUT_CMDLINE_TOKEN, "td.setup-input=1");
+        for (source, append, read_only) in [
+            (live, "td.autotest=1", true),
+            (direct, token, true),
+            (live, token, false),
+        ] {
+            let error = boot_source(
+                "/nonexistent/qemu",
+                source,
+                plan(append, read_only),
+                &dir,
+                Duration::from_secs(1),
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error.contains("live setup boot"),
+                "{append} {read_only}: {error}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

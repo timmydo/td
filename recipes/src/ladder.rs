@@ -1143,6 +1143,10 @@ pub const TD_MAIL_BOOT_MARKER: &str = "TD-MAIL-RUNNING";
 // token once the installer wizard's window is the focused one and
 // td-authd's setup intake is bound for it.
 pub const TD_SETUP_LIVE_MARKER: &str = "TD-SETUP-LIVE-READY";
+// Asks td-setup for its boot evidence: one line per page state shown while
+// it held the keyboard, beginning with the prefix (td-setup/src/evidence.rs).
+pub const SETUP_INPUT_CMDLINE_TOKEN: &str = "td.setup-input=1";
+pub const TD_SETUP_SHOWN_PREFIX: &str = "TD-SETUP-SHOWN ";
 pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
 // Printed by the `fetch-evidence` unit under the autotest token once
 // td-fetchd's probe, as the UI user, has asked the fetch service for a

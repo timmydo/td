@@ -19,6 +19,7 @@ use td_ui::wayland::{connect, endpoint};
 use td_ui::wire::Message;
 
 use crate::destination::DestinationPage;
+use crate::evidence::{self, field, Proof};
 use crate::outcome::{CompletionPage, Progress, ProgressPage};
 use crate::review::ReviewPage;
 use crate::service::{Answer, Service, Stage, Standing, SOCKET};
@@ -53,6 +54,8 @@ struct Window {
     size: (usize, usize),
     dirty: bool,
     front: Front,
+    /// The boot evidence, when the command line asks for it.
+    proof: Option<Proof>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -522,6 +525,59 @@ impl Wizard {
         }
     }
 
+    /// The shown page's state for the boot evidence: which page, and on
+    /// the destination, settings and review pages what the person chose.
+    fn state(&self) -> String {
+        let mut state = String::from("page=");
+        match &self.page {
+            Page::Welcome => state.push_str("welcome"),
+            Page::Waiting => state.push_str("waiting"),
+            Page::Unavailable => state.push_str("unavailable"),
+            Page::Refused(_) => state.push_str("refused"),
+            Page::Destinations => {
+                state.push_str("destinations");
+                field(&mut state, "disks", &self.disks.len().to_string());
+                let selected = self
+                    .selected
+                    .and_then(|index| self.disks.get(index))
+                    .map_or("-", Destination::name);
+                field(&mut state, "selected", selected);
+            }
+            Page::Settings => {
+                let [username, hostname, _, zone] = self.draft.values();
+                state.push_str("settings");
+                field(&mut state, "field", &self.draft.focused().to_string());
+                field(&mut state, "username", username);
+                field(&mut state, "hostname", hostname);
+                field(&mut state, "seek", self.draft.seek());
+                field(&mut state, "zone", zone);
+                // A review left is released only once the service says so.
+                let releasing = self.withdraw.is_some() || self.withdrawing.is_some();
+                field(
+                    &mut state,
+                    "withdrawal",
+                    if releasing { "pending" } else { "none" },
+                );
+            }
+            Page::Review => {
+                state.push_str("review");
+                if let Some(plan) = &self.plan {
+                    let settings = plan.settings();
+                    field(&mut state, "disk", plan.destination().name());
+                    field(&mut state, "username", settings.username());
+                    field(&mut state, "hostname", settings.hostname());
+                    field(&mut state, "zone", settings.timezone());
+                }
+            }
+            Page::Progress(Progress::Consent) => state.push_str("consent"),
+            Page::Progress(Progress::Running(_)) => state.push_str("running"),
+            Page::Progress(Progress::Failed(_)) => state.push_str("failed"),
+            Page::Progress(Progress::Unknown) => state.push_str("unknown"),
+            Page::Complete => state.push_str("complete"),
+        }
+        state
+    }
+
     /// Shown in the time zone row while it has no zone.
     fn zone_hint(&self) -> Option<&'static str> {
         match self.catalog {
@@ -660,7 +716,7 @@ fn keyboard_chord(event: KeyboardEvent) -> Result<Option<String>> {
 }
 
 impl Window {
-    fn new(stream: UnixStream, temporary: PathBuf) -> Result<Self> {
+    fn new(stream: UnixStream, temporary: PathBuf, proof: bool) -> Result<Self> {
         Ok(Self {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
@@ -668,7 +724,25 @@ impl Window {
             size: DEFAULT_SIZE,
             dirty: true,
             front: Front::new(),
+            proof: proof.then(Proof::default),
         })
+    }
+
+    /// Says the shown page's state once the window holds the keyboard.
+    /// The evidence is the oracle's, so a failed write is the oracle's to
+    /// notice, never the wizard's.
+    fn say(&mut self) {
+        let Some(proof) = self.proof.as_mut() else {
+            return;
+        };
+        // Focused, its modifiers current and its keymap loaded: a key the
+        // compositor sends now is one the wizard can read.
+        let input = self.client.input();
+        let focused =
+            self.client.focus_serial().is_some() && input.synchronized && input.map.is_some();
+        if let Some(line) = proof.due(focused) {
+            let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        }
     }
 
     /// Takes the service's answer, if one arrived.
@@ -686,7 +760,13 @@ impl Window {
 
     fn event(&mut self, message: Message) -> Result<()> {
         match self.client.handle(&message, 0)? {
-            Handled::Done | Handled::FrameDone => Ok(()),
+            Handled::Done => Ok(()),
+            Handled::FrameDone => {
+                if let Some(proof) = self.proof.as_mut() {
+                    proof.frame_done();
+                }
+                Ok(())
+            }
             Handled::Bound => self.initialize(),
             Handled::Configure { size, serial } => {
                 if let Some((width, height)) = size {
@@ -810,6 +890,8 @@ impl Window {
             typeface,
             ..
         } = self;
+        // Whether the frame shows the page, not the too-small ground.
+        let mut page = true;
         let presented = client.present(width, height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, surface, width * 4)
                 .map_err(error)?
@@ -834,6 +916,7 @@ impl Window {
                 Some(result) => result,
                 // Too small for the page: a plain chrome ground, never garbage.
                 None => {
+                    page = false;
                     raster.draw(Draw {
                         clip: surface.bounds(),
                         primitive: Primitive::Fill {
@@ -847,6 +930,13 @@ impl Window {
         })?;
         if presented {
             self.dirty = false;
+            if let Some(proof) = self.proof.as_mut() {
+                if page {
+                    proof.drawn(self.front.wizard.state());
+                } else {
+                    proof.blank();
+                }
+            }
         }
         Ok(())
     }
@@ -883,6 +973,7 @@ impl App for Window {
         if self.front.wizard.executing.is_some() {
             self.front.poll(now);
         }
+        self.say();
         Ok(())
     }
 
@@ -902,8 +993,14 @@ pub fn run_window() -> std::io::Result<()> {
             std::env::var_os("WAYLAND_DISPLAY"),
             std::env::var_os("XDG_RUNTIME_DIR"),
         )?;
+        // The evidence is the oracle's: a command line it cannot read
+        // leaves it off, never the wizard.
+        let proof = evidence::enabled(Path::new(evidence::CMDLINE)).unwrap_or_else(|why| {
+            let _ = writeln!(std::io::stderr(), "td-setup: no boot evidence: {why}");
+            false
+        });
         let stream = connect(endpoint)?;
-        let mut window = Window::new(stream, std::env::temp_dir())?;
+        let mut window = Window::new(stream, std::env::temp_dir(), proof)?;
         window.typeface = td_ui::pinned_face::load_or_note(
             "td-setup",
             std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
@@ -1105,6 +1202,65 @@ mod tests {
     fn reviewed(wizard: &Wizard) -> Box<Plan> {
         let (disk, settings) = wizard.proposal.as_ref().unwrap();
         Box::new(crate::service::tests::plan(disk, settings))
+    }
+
+    #[test]
+    fn the_evidence_states_each_page_and_what_was_chosen() {
+        let mut wizard = Wizard::new();
+        assert_eq!(wizard.state(), "page=welcome");
+        wizard.key("Return");
+        assert_eq!(wizard.state(), "page=waiting");
+        let mut wizard = listed();
+        assert_eq!(wizard.state(), "page=destinations disks=2 selected=-");
+        wizard.key("Down");
+        wizard.key("Down");
+        assert_eq!(wizard.state(), "page=destinations disks=2 selected=vdb");
+        wizard.key("Return");
+        assert_eq!(
+            wizard.state(),
+            "page=settings field=0 username= hostname= seek= zone= withdrawal=none"
+        );
+        let mut wizard = filled();
+        wizard.key("e");
+        wizard.key("u");
+        assert_eq!(
+            wizard.state(),
+            "page=settings field=3 username=al hostname=h seek=eu zone=Europe/London \
+             withdrawal=none"
+        );
+        wizard.key("Return");
+        let plan = reviewed(&wizard);
+        wizard.proposal = None;
+        wizard.sent(Asked::Review);
+        wizard.answered(Ok(Answer::Reviewed(plan)));
+        assert_eq!(
+            wizard.state(),
+            "page=review disk=vdb username=al hostname=h zone=Europe/London"
+        );
+        // Back from review is pending until the service releases it.
+        wizard.key("Escape");
+        assert_eq!(
+            wizard.state(),
+            "page=settings field=3 username=al hostname=h seek=eu zone=Europe/London \
+             withdrawal=pending"
+        );
+        assert_eq!(wizard.wanted(), Some(Asked::Withdraw));
+        wizard.withdrawing = wizard.withdraw.take();
+        wizard.sent(Asked::Withdraw);
+        assert!(wizard.state().ends_with(" withdrawal=pending"));
+        wizard.answered(Ok(Answer::Withdrawn));
+        assert!(wizard.state().ends_with(" withdrawal=none"));
+        wizard.page = Page::Review;
+        for (page, state) in [
+            (Page::Progress(Progress::Consent), "page=consent"),
+            (Page::Progress(Progress::Unknown), "page=unknown"),
+            (Page::Complete, "page=complete"),
+            (Page::Unavailable, "page=unavailable"),
+            (Page::Refused("busy"), "page=refused"),
+        ] {
+            wizard.page = page;
+            assert_eq!(wizard.state(), state);
+        }
     }
 
     #[test]

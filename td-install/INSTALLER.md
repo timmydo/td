@@ -107,12 +107,44 @@ so a wizard that exits is not relaunched behind the person, and an
 installed boot's unit exits at once. Under the autotest token a live boot
 prints `TD-SETUP-LIVE-READY` once td-setup's is the one window with its app
 id, visible, focused and at least 752x480, and td-authd's setup intake
-exists; `td-recipe-eval qemu-boot-live` boots the medium `build-iso`
-composes, from the same verified deployment and with a key made for the
-run, directly from its kernel and live selector with the token appended and
-the ISO attached read-only as a virtio disk, and requires that line. It
-does not drive the wizard: that is increment 7's oracle. No automated check
-boots that medium through firmware; `./test-iso` does so by hand.
+exists.
+
+When the command line also holds `td.setup-input=1`, td-setup says on
+standard error, which the unit leaves on the console, one
+`TD-SETUP-SHOWN n=SEQUENCE page=...` line for each page state the
+compositor showed while the window held the keyboard with its keymap
+loaded: which page, and on the destination, settings and review pages the
+disk count and selected kernel name, the focused field, the typed username,
+hostname and zone search, the zone, whether a review left is still being
+released, or the review's disk and settings. A state is said only after the
+frame drawing it is done, never once a later frame or the too-small ground
+has replaced it, and only when it differs from the last said; every value
+byte outside a closed set is written `\xHH`. The lines are a test
+diagnostic, not authenticated: any console writer could print one, and a
+compositor overlay that keeps the window's keyboard focus while taking keys
+is not visible to it. The evidence changes nothing the wizard does; a
+command line td-setup cannot read leaves it off.
+
+`td-recipe-eval qemu-boot-live` boots the medium `build-iso` composes, from
+the same verified deployment and with a key made for the run, directly from
+its kernel and live selector with both tokens appended, the ISO attached
+read-only as a virtio disk and an empty sparse disk after it. Once
+`TD-SETUP-LIVE-READY` is seen it drives the wizard through QEMU's emulated
+keyboard, pressing each key only after td-setup has said the state that key
+is for: welcome, the one listed destination, a username, hostname and time
+zone typed a key at a time, the service's review of exactly those, and back
+from the review until td-setup says the service released it. A lost or
+garbled evidence line fails the run as soon as a later line shows the gap,
+and a state that does not follow its key within five minutes fails it then.
+Under that token the session keeps the drive's keyboard: the autotest
+Claude terminal evidence, whose window would map on the wizard's workspace
+and take the keys, does not run, and the greeter parks rather than reboot
+the live boot when its health transaction settles. QEMU's own count of
+changes to the target, writes, discards and zone appends alike, must then
+be zero, and the target must have no allocated block. It does not consent
+or install: the rest of increment 7's flow, and booting that medium through
+firmware, are still to be proven; `./test-iso` boots it through firmware by
+hand.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
 admits any UID-1000 peer at the intake, and on a live boot those include
@@ -1093,7 +1125,8 @@ not discover `/etc/zoneinfo` automatically.
 6. Add the native wizard, target recipe and live startup integration. Use
    native compositor tests for navigation, rendering, input, errors and
    progress; fixtures cannot grant ordinary clients trusted consent. A live
-   boot starts the wizard ("Live startup"), proven by `qemu-boot-live`.
+   boot starts the wizard ("Live startup"), and `qemu-boot-live` drives it
+   with physical keys to the service's review.
 7. Activate the complete profile only after the end-to-end QEMU evidence:
    boot the ISO, complete the UI flow onto a disposable disk, detach the
    media, boot that disk through firmware, and observe the configured

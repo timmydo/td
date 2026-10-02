@@ -31,6 +31,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
     );
     let expected: BTreeSet<String> = [
         "destination.rs",
+        "evidence.rs",
         "lib.rs",
         "main.rs",
         "outcome.rs",
@@ -80,6 +81,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
     );
     for name in [
         "destination.rs",
+        "evidence.rs",
         "lib.rs",
         "main.rs",
         "outcome.rs",
@@ -205,6 +207,8 @@ fn client_violations(name: &str, text: &str) -> Vec<String> {
                 "let stream = connect(endpoint)?;",
                 "use td_ui::wayland::{connect, endpoint};",
                 "Service::connect(intake)",
+                // The toolkit's keyboard state, not `std::sync`.
+                "&& input.synchronized &&",
             ] {
                 code = code.replacen(allowed, "", 1);
             }
@@ -278,6 +282,32 @@ fn the_client_guard_refuses_grouped_imports_aliases_and_reexports() {
     )
     .is_empty());
     assert!(client_violations("window.rs", "use std::os::unix::net::UnixStream;").is_empty());
+}
+
+/// The boot evidence reads one file, the kernel's command line, and only
+/// `evidence` opens a file or names `/proc`; the window reaches it only
+/// through that module's own path.
+#[test]
+fn only_the_evidence_reads_the_command_line() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for entry in std::fs::read_dir(root.join("src")).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        let code = production(&text).unwrap();
+        if name == "evidence.rs" {
+            assert_eq!(code.matches("/proc/").count(), 1, "{name}");
+            assert!(code.contains("pub const CMDLINE: &str = \"/proc/cmdline\";"));
+            assert_eq!(code.matches("File::open(").count(), 1, "{name}");
+            assert!(!code.contains("std::io::stderr"), "{name} writes");
+        } else {
+            for token in ["/proc/", "File::open(", "std::fs::File", "use std::fs"] {
+                assert!(!code.contains(token), "{name} names {token}");
+            }
+        }
+    }
+    let window = std::fs::read_to_string(root.join("src/window.rs")).unwrap();
+    assert!(window.contains("evidence::enabled(Path::new(evidence::CMDLINE))"));
 }
 
 /// The inventory above walks `src`; a test file could still mount a sibling

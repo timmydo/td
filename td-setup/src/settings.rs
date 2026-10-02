@@ -49,6 +49,11 @@ impl Draft {
         self.focused
     }
 
+    /// What has been typed toward a time zone since its row was focused.
+    pub fn seek(&self) -> &str {
+        &self.seek
+    }
+
     /// The four values as the page shows them; an unchosen zone is empty.
     pub fn values(&self) -> [&str; 4] {
         let [username, hostname] = &self.texts;

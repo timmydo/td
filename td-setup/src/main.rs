@@ -20,6 +20,8 @@ const HELP: &str = concat!(
     "Page Down move between details, Enter asks the service to seek consent\n",
     "at the secure prompt, and Escape withdraws it; Escape at the consent\n",
     "view withdraws it too. Progress and its outcome follow the service.\n",
+    "When the boot's command line holds td.setup-input=1 it also says, on\n",
+    "standard error, each page state it showed while holding the keyboard.\n",
     "--preview writes the welcome page as a PPM image to stdout.\n",
     "--render-check renders all pages and exits without image output.\n",
     "This front end holds no disk-writing authority; td-install writes disks.\n",

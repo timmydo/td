@@ -95,7 +95,7 @@ impl TargetDisk {
         Self::with_capacity(scratch, name, MINIMUM_TARGET_BYTES)
     }
 
-    fn with_capacity(scratch: &Path, name: &str, bytes: u64) -> Result<Self, String> {
+    pub(super) fn with_capacity(scratch: &Path, name: &str, bytes: u64) -> Result<Self, String> {
         let path = scratch.join(name);
         let file = OpenOptions::new()
             .write(true)
@@ -2042,7 +2042,7 @@ fn require_new_installation(
     Ok(())
 }
 
-fn system_target_capacity(payload_bytes: u64) -> Result<u64, String> {
+pub(super) fn system_target_capacity(payload_bytes: u64) -> Result<u64, String> {
     let alignment = td_boot_protocol::PARTITION_ALIGN_BYTES;
     payload_bytes
         .checked_add(2 * 1024 * 1024 * 1024)

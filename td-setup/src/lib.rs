@@ -15,6 +15,7 @@
 //! authority (INSTALLER.md). Later navigation follows.
 
 pub mod destination;
+pub mod evidence;
 pub mod outcome;
 pub mod review;
 pub mod service;
