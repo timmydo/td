@@ -348,8 +348,21 @@ still account for those costs and concurrent owners within the ledger.
   fixed 64-byte BlobRow lookup buffer uses the worker stack. Sequential and
   random reads use caller output and at most 64 KiB per call, without a
   whole-body arena. The descriptor retains the pooled view's pin and backing
-  until drop. No arena size or planning total changes; allocation and complete
-  worker-stack/RSS qualification for this combined path remain separate.
+  until drop. No arena size or planning total changes; complete worker-stack
+  and whole-service RSS qualification remain separate.
+
+  The Rust allocation probe measures twenty body intervals at short and
+  maximum roots. It covers normal and empty bodies, deletion after capture,
+  missing-row/byte-cap refusal, checksum mismatch, truncation and deadlines
+  after input read, digest finish or random read. Public pool capture, row
+  lookup, body opening/hash/finish/range reads, terminal retries, post-error
+  metadata queries and pin disposal are inside measurement. Require exactly
+  forty snapshots and every Rust allocator counter unchanged. Fixtures, full
+  scratch creation/touching, owned verification, session startup and teardown
+  stay cold. A preopened fault handle truncates inside its measured interval;
+  checksum corruption is installed before measurement. These zero/three-byte
+  fixtures do not qualify maximum body sizes, native allocation, clock-source
+  or regression failures, constructor I/O faults, worker stacks or service RSS.
 
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves

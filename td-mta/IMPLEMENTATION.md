@@ -1126,6 +1126,13 @@ service activation. Each part lands independently:
     across all stages; retain the view pin until body drop. Existing cursor
     memory covers state. Authorization, worker integration, MIME locators and
     combined allocation/stack qualification remain separate.
+  - **M05e4b — pinned-body allocation probe:** implemented twenty intervals
+    across short/maximum roots, normal/empty bodies, delete-after-capture,
+    missing rows, byte caps, checksum/truncation failures and late body-step
+    deadlines. Include complete public pool/body paths, metadata reuse and
+    owner disposal; require forty valid snapshots with unchanged Rust counters.
+    Startup/teardown, maximum bodies, native allocation and full-worker/RSS
+    qualification remain separate.
   - **M05e3 — committed visibility:** runtime integration remains pending.
     Connect pooled queries to worker ownership and queue admission; retain
     generation/history ownership across live checkpoint and retention changes.

@@ -85,7 +85,8 @@ pub use temporary::{
 pub use input::probe_reserved_append;
 #[cfg(test)]
 pub use stopped::{
-    probe_journal_publication, probe_pinned_reads, probe_read_pool, probe_verify_account,
+    probe_journal_publication, probe_pinned_blobs, probe_pinned_reads, probe_read_pool,
+    probe_verify_account,
 };
 #[cfg(test)]
 pub use temporary::probe::run as probe_temporary_io;

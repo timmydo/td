@@ -28,7 +28,8 @@ pub use validation::{
 mod verify;
 #[cfg(test)]
 pub use verify::{
-    probe_journal_publication, probe_pinned_reads, probe_read_pool, probe_verify_account,
+    probe_journal_publication, probe_pinned_blobs, probe_pinned_reads, probe_read_pool,
+    probe_verify_account,
 };
 pub use verify::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,

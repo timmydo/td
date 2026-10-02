@@ -13,6 +13,8 @@ use std::sync::{Mutex, TryLockError};
 
 #[path = "pool/blob.rs"]
 mod blob;
+#[cfg(test)]
+pub use blob::probe_pinned_blobs;
 pub use blob::{PinnedBlob, PinnedBlobInput};
 
 #[derive(Debug)]

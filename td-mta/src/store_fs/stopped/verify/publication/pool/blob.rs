@@ -188,10 +188,13 @@ impl BlobReader for PinnedBlob<'_, '_> {
 }
 
 #[cfg(test)]
+pub use tests::probe as probe_pinned_blobs;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::super::super::super::super::super::tests::Fixture;
-    use super::super::super::super::tests::owned_blob_fixture;
+    use super::super::super::super::tests::owned_blob_fixture_with;
     use super::super::super::{
         tests::{
             budget, deadline, frame, read_request, start, with_ledger_usage, CommitFixture,
@@ -214,7 +217,15 @@ mod tests {
         kind: BlobKind,
         run: impl FnOnce(&Fixture, &ReadScratchPool<'_, '_>, &JournalSession<'_, '_>),
     ) {
-        let (dir, verified, mut startup) = owned_blob_fixture(bytes, kind);
+        with_blob_at(Fixture::new(), bytes, kind, run);
+    }
+    fn with_blob_at(
+        dir: Fixture,
+        bytes: &[u8],
+        kind: BlobKind,
+        run: impl FnOnce(&Fixture, &ReadScratchPool<'_, '_>, &JournalSession<'_, '_>),
+    ) {
+        let (dir, verified, mut startup) = owned_blob_fixture_with(dir, bytes, kind);
         let summary = verified.journal();
         let plan = Limits::default().plan().unwrap();
         let mut a = Backing::new(&plan);
@@ -251,6 +262,173 @@ mod tests {
             .as_path()
             .unwrap(),
         )
+    }
+    #[derive(Clone, Copy)]
+    enum ProbeCase {
+        Read,
+        Empty,
+        Append,
+        NotFound,
+        Capacity,
+        Checksum,
+        Truncate,
+        InputDeadline,
+        FinishDeadline,
+        ReadDeadline,
+    }
+    /// Fixture creation, full backing, verification and session startup stay cold.
+    pub fn probe(mut snapshot: impl FnMut()) {
+        use std::os::unix::fs::FileExt;
+        for maximum in [false, true] {
+            for case in [
+                ProbeCase::Read,
+                ProbeCase::Empty,
+                ProbeCase::Append,
+                ProbeCase::NotFound,
+                ProbeCase::Capacity,
+                ProbeCase::Checksum,
+                ProbeCase::Truncate,
+                ProbeCase::InputDeadline,
+                ProbeCase::FinishDeadline,
+                ProbeCase::ReadDeadline,
+            ] {
+                let fixture = if maximum {
+                    Fixture::maximum_root()
+                } else {
+                    Fixture::new()
+                };
+                let bytes: &[u8] = if matches!(case, ProbeCase::Empty) {
+                    b""
+                } else {
+                    b"abc"
+                };
+                let kind = if matches!(case, ProbeCase::Empty) {
+                    BlobKind::Upload
+                } else {
+                    BlobKind::Message
+                };
+                with_blob_at(fixture, bytes, kind, |dir, pool, session| {
+                    let clock = FaultClock::new(0);
+                    let good = TestClock::new(u64::MAX);
+                    let next_frame = frame(4);
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path(dir, session, kind))
+                        .unwrap();
+                    if matches!(case, ProbeCase::Checksum) {
+                        assert_eq!(file.write_at(b"abd", 0).unwrap(), 3);
+                    }
+                    snapshot();
+                    let mut old = pool.capture(session).unwrap();
+                    let id = if matches!(case, ProbeCase::NotFound) {
+                        BlobId::from_bytes([0x45; 16])
+                    } else {
+                        ID
+                    };
+                    let max = if matches!(case, ProbeCase::Capacity) {
+                        2
+                    } else {
+                        bytes.len() as u64
+                    };
+                    let opened = old.open_blob_input(&Provider, &clock, read_request(), id, max);
+                    match case {
+                        ProbeCase::NotFound => assert!(matches!(
+                            opened,
+                            Err(PinnedReadError::Policy(PolicyError::NotFound))
+                        )),
+                        ProbeCase::Capacity => assert!(matches!(
+                            opened,
+                            Err(PinnedReadError::Policy(PolicyError::Capacity))
+                        )),
+                        _ => {
+                            let mut input = opened.unwrap();
+                            if matches!(case, ProbeCase::Append) {
+                                session
+                                    .commit(&Provider, &good, deadline(), &next_frame, budget())
+                                    .unwrap();
+                            }
+                            if matches!(case, ProbeCase::Truncate) {
+                                file.set_len(1).unwrap();
+                            }
+                            if matches!(case, ProbeCase::InputDeadline) {
+                                clock.arm(1);
+                            }
+                            let mut output = [0; 3];
+                            let result = input.read(&mut output);
+                            match case {
+                                ProbeCase::InputDeadline => {
+                                    assert_eq!(result, Err(PolicyError::Deadline));
+                                    assert_eq!(input.read(&mut output), Err(PolicyError::Deadline));
+                                    assert!(matches!(input.finish(), Err(PolicyError::Deadline)));
+                                }
+                                ProbeCase::Truncate => {
+                                    assert_eq!(result.unwrap(), 1);
+                                    let error = input.read(&mut output).unwrap_err();
+                                    assert_eq!(error, PolicyError::Corrupt);
+                                    assert_eq!(input.read(&mut output), Err(error));
+                                    assert!(matches!(input.finish(), Err(e) if e == error));
+                                }
+                                _ => {
+                                    assert_eq!(result.unwrap(), bytes.len());
+                                    if matches!(case, ProbeCase::FinishDeadline) {
+                                        clock.arm(1);
+                                    }
+                                    let finished = input.finish();
+                                    match case {
+                                        ProbeCase::Checksum => {
+                                            assert!(matches!(finished, Err(PolicyError::Corrupt)))
+                                        }
+                                        ProbeCase::FinishDeadline => {
+                                            assert!(matches!(finished, Err(PolicyError::Deadline)))
+                                        }
+                                        _ => {
+                                            let mut body = finished.unwrap();
+                                            assert_eq!(body.id(), ID);
+                                            assert_eq!(body.len(), bytes.len() as u64);
+                                            assert_eq!(body.kind(), kind);
+                                            if matches!(case, ProbeCase::ReadDeadline) {
+                                                clock.arm(1);
+                                            }
+                                            let result = body.read_at(0, &mut output);
+                                            if matches!(case, ProbeCase::ReadDeadline) {
+                                                assert_eq!(result, Err(PolicyError::Deadline));
+                                                assert_eq!(
+                                                    body.read_at(0, &mut output),
+                                                    Err(PolicyError::Deadline)
+                                                );
+                                            } else {
+                                                assert_eq!(result.unwrap(), bytes.len());
+                                                assert_eq!(
+                                                    output.get(..bytes.len()).unwrap(),
+                                                    bytes
+                                                );
+                                            }
+                                            drop(body);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let present = |view: &mut dyn crate::ports::ReadView| {
+                        let mut value = [0; 64];
+                        Ok(view.get(Key::Blob(ID), &mut value)?.is_some())
+                    };
+                    assert!(old
+                        .with_read_view(&Provider, &good, read_request(), present)
+                        .unwrap());
+                    let mut new = pool.capture(session).unwrap();
+                    assert_eq!(
+                        new.with_read_view(&Provider, &good, read_request(), present)
+                            .unwrap(),
+                        !matches!(case, ProbeCase::Append)
+                    );
+                    drop(new);
+                    drop(old);
+                    snapshot();
+                });
+            }
+        }
     }
     #[test]
     fn body_keeps_old_identity_across_delete_and_releases_pool_on_drop() {

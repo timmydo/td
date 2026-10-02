@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[path = "verify/publication.rs"]
 mod publication;
 #[cfg(test)]
-pub use publication::{probe_journal_publication, probe_pinned_reads, probe_read_pool};
+pub use publication::{
+    probe_journal_publication, probe_pinned_blobs, probe_pinned_reads, probe_read_pool,
+};
 pub use publication::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
     PinnedBlob, PinnedBlobInput, PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead,
@@ -725,11 +727,12 @@ mod tests {
             .unwrap();
         (dir, verified, scratch)
     }
-    pub(super) fn owned_blob_fixture(
+    pub(super) fn owned_blob_fixture_with(
+        fixture: super::super::super::tests::Fixture,
         bytes: &[u8],
         kind: BlobKind,
     ) -> (super::super::super::tests::Fixture, VerifiedStore, Scratch) {
-        let (dir, store, _) = prepare();
+        let (dir, store, _) = super::super::tests::prepare_fixture(fixture);
         blob_bytes(&store, bytes, kind);
         let mut scratch = Scratch::new();
         let clock = TestClock::new(u64::MAX, 0);
