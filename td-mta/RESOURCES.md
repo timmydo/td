@@ -175,6 +175,12 @@ still account for those costs and concurrent owners within the ledger.
   StoppedStore moves the existing LockedRoot (including its directory and lock
   descriptors) without another allocation, descriptor or synchronization object.
   Its operations reuse the existing metadata, overlay, record and change arenas.
+  FileValidation holds both sweep states (only one performs I/O at a time),
+  completion summaries and buffer references; its Provider state fits 8 KiB.
+  Constructing both sweeps and the returned coordinator, or moving a completed
+  sweep, can create additional stack temporaries; whole-worker stack
+  qualification remains pending. It transfers the existing record buffer from
+  table to history work and returns the existing change slots, adding no arena.
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
   that input to a temporary; complete worker-stack qualification remains pending.

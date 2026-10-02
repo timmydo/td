@@ -78,7 +78,7 @@ impl<'a> PrefixReader<'a> {
             return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(CompletePrefix {
-            _owner: input.owner,
+            owner: input.owner,
             file: input.file,
             name: input.name,
             length: input.length,
@@ -89,12 +89,15 @@ impl<'a> PrefixReader<'a> {
 /// Proves consumed bytes only, not format validity, physical EOF or pin ownership.
 #[derive(Debug)]
 pub struct CompletePrefix<'a> {
-    _owner: &'a LockedRoot,
+    owner: &'a LockedRoot,
     file: File,
     name: Name,
     length: u64,
 }
 impl CompletePrefix<'_> {
+    pub(crate) fn belongs_to(&self, root: &LockedRoot) -> bool {
+        std::ptr::eq(self.owner, root)
+    }
     pub fn name(&self) -> &Name {
         &self.name
     }

@@ -17,7 +17,9 @@ pub use input::{
 };
 #[path = "store_fs/stopped.rs"]
 mod stopped;
-pub use stopped::StoppedStore;
+pub use stopped::{
+    CheckedFiles, FileValidation, StoppedStore, ValidationError, ValidationLimits, ValidationStep,
+};
 #[path = "store_fs/selection.rs"]
 mod selection;
 pub use selection::{SelectionError, SelectionScratch, SelectionStage};

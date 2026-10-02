@@ -781,6 +781,14 @@ after those borrows end. No raw/root accessor is exposed. This excludes writes
 through this API owner under the existing trusted-path policy, without claiming
 external filesystem exclusion, complete graph validity or runtime view pins.
 
+`StoppedStore::validate_files` admits both selected-table and history sweeps,
+checks the loaded prefix belongs to this owner and enforces captured history
+routing. Complete the tables first, then history using the same reclaimed
+record buffer. Finish yields CheckedFiles plus full record/change buffers only
+after both succeed. CheckedFiles retains the stopped owner and overlay; it
+proves supplied selected physical inputs, not final reference/blob invariants
+or current selection loading. Every error retires the coordinator.
+
 `store_fs::HistorySweep` verifies every retained selected history segment,
 admitting total descriptor bytes and frames before I/O. Advances open, read one
 bounded frame, or complete one selected file; only digest/EOF completion releases

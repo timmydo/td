@@ -977,6 +977,13 @@ service activation. Each part lands independently:
     transfer/return lifetimes; file tests cover retained lock and validation.
     Trusted filesystem authority remains required; serving view pins, full
     selected-graph validation and activation remain separate.
+  - **M05d23 — owned selected physical-file validation:** implemented a coordinator
+    tying the captured active prefix to the stopped owner, admitting table and
+    history budgets before I/O and reclaiming one record buffer between sweeps.
+    Finish retains owner/overlay/selection with complete physical summaries and
+    returns scratch only after both sweeps succeed. Tests cover phase ordering,
+    buffer identity, foreign owners, early admission, late faults and retirement.
+    Current selection loading, final row/blob rules and activation remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

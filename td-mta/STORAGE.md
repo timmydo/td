@@ -430,6 +430,30 @@ selected input retains its file/identity/digest checks. The selected graph and
 final rows still require validation. This is an offline ownership boundary,
 not a runtime view pin, serving adapter or store activation decision.
 
+`StoppedStore::validate_files` connects the loaded active overlay with both
+complete selected-file sweeps. Refuse an overlay whose retained prefix belongs
+to another LockedRoot, even when scalar identities match. Validate retained
+history routing against the supplied captured view and admit both table and
+history allowances before either sweep opens a file. The active prefix was
+already admitted and loaded by its separate bounded operation.
+
+Advance table replay to selected completion, reclaim its original record
+buffer, then reuse that buffer while completing all selected history. Preserve
+one underlying sweep step per advance; a separate final advance completes the
+coordinator. Any error retires the entire coordinator. No partial table/history
+success can finish. Consuming finish returns CheckedFiles and the original full
+record/change buffers. Repeated completion performs no additional I/O.
+
+CheckedFiles borrows the stopped store, supplied selection and loaded active
+overlay, retaining the read-only owner while its evidence is used. It records
+exact supplied CURRENT (including manifest digest), captured identity and both
+completed sweep summaries. These are the physical files named by that supplied
+selection; the coordinator does not reread CURRENT or claim it loaded the
+selection itself. Load the selection from this stopped owner for current-store
+validation. Cross-row/aggregate/blob invariants, tail repair, orphan accounting
+and service activation remain separate. Later validation must keep this owner
+and overlay alive; detached scalar summaries alone are not ownership evidence.
+
 ### Loading the selected metadata
 
 `LockedRoot::load_selection` is the first recovery input step. Its caller must

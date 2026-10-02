@@ -12,6 +12,12 @@ use crate::{
     ports::{Crypto, ViewIdentity},
 };
 
+#[path = "stopped/validation.rs"]
+mod validation;
+pub use validation::{
+    CheckedFiles, FileValidation, ValidationError, ValidationLimits, ValidationStep,
+};
+
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.
 /// Stable operator-controlled paths and cooperating external writers are still required.
 pub struct StoppedStore {
@@ -135,8 +141,7 @@ mod tests {
         drop(fixture.reacquire());
     }
 
-    #[test]
-    fn owner_loaded_selection_flows_through_history_overlay_and_tables() {
+    pub(super) fn prepare() -> (Fixture, StoppedStore, active::ProbeBytes) {
         let fixture = Fixture::new();
         let root = fixture.locked();
         root.create_accounts_directory().unwrap();
@@ -161,7 +166,13 @@ mod tests {
             std::fs::write(&path, active::fixture::hex(text)).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let store = StoppedStore::new(root);
+        (fixture, StoppedStore::new(root), active)
+    }
+
+    #[test]
+    fn owner_loaded_selection_flows_through_history_overlay_and_tables() {
+        let (_fixture, store, active) = prepare();
+        let account = AccountId::from_bytes([0x33; 16]);
         let mut selection_scratch = SelectionScratch::new();
         let selected = store
             .load_selection(&Provider, account, &mut selection_scratch)
