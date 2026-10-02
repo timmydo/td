@@ -222,7 +222,11 @@ recipe cannot link a second crate. td-portal, td-taskmgr, td-editor,
 td-news, td-mail, td-review, td-setup and td-term are built that way:
 each stages `td-ui`, and `td-compositor` because td-ui mounts the font
 and wire modules from it, beside its own tree. td-portal and td-setup stage
-further siblings of their own. A toolkit edit changes each consumer's
+further siblings of their own. In the other direction the compositor's
+flat recipe stages td-ui's five outline-face modules beside its own, since
+its chrome mounts them, and `tests/fonts/mod.rs` as `tests/fonts.rs` for its
+session-tests build, so an edit to that test encoder changes the
+compositor recipe too. A toolkit edit changes each consumer's
 locally derived source identity and selects each consumer's
 realized-output check.
 
@@ -2781,10 +2785,12 @@ Before this section every td-ui consumer and td-term drew text from one
 bitmap face: Unifont's 8x16 cells, pixel-doubled at scales above one. This
 section adds a second kind of face, a TrueType outline covered with
 antialiasing at the surface's own pixel size. The first such face is
-JetBrains Mono Nerd Font.
-The bitmap face stays as the fallback and as the face of the compositor's
-own chrome. The work is ordered so that a GPU backend, when td has one,
-reuses the same model as the CPU raster (see "The GPU path" below).
+JetBrains Mono Nerd Font. The bitmap face stays as the fallback and as the
+face of the compositor's attention request raster (its attention notice
+keeps the compositor's own compiled-in glyphs); the rest of the compositor's
+chrome draws the outline face (td-compositor/DESIGN.md, "Chrome text"). The
+work is ordered so that a GPU backend, when td has one, reuses the same
+model as the CPU raster (see "The GPU path" below).
 
 ### The face
 
@@ -3130,12 +3136,16 @@ raster's.
 
 The terminal reports no pixel size through `TIOCSWINSZ`: its pixel
 fields are zero (`pty::grid_size`), whatever the cell.
-The compositor's own chrome keeps the bitmap face. td-term/DESIGN.md §3's
-rule that host tests and the target consume the same face bytes holds for
-Unifont. `vt_render_spec.rs`'s PPM oracles stay on `render` and the
-bitmap face; the outline painter's oracles use fonts the tests encode
-(`tests/fonts`, mounted by path), and the image check is what realizes
-the pinned face.
+The compositor's chrome fits the outline face to the same cell, through
+`sfnt`, `coverage`, `atlas`, `face` and `face_file` mounted by path
+(td-compositor/DESIGN.md, "Chrome text"); those five modules name only
+each other, `font` (the compositor's own, which td-ui mounts) and `std`.
+td-recipe-eval mounts them as well, to draw the status bar text its
+`qemu-boot-live` screen oracle expects. td-term/DESIGN.md §3's rule that
+host tests and the target consume the same face bytes holds for Unifont.
+`vt_render_spec.rs`'s PPM oracles stay on `render` and the bitmap face;
+the outline painter's oracles use fonts the tests encode (`tests/fonts`,
+mounted by path), and the image check is what realizes the pinned face.
 
 ### The GPU path
 

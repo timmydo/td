@@ -83,6 +83,36 @@ mod local_source_roster;
 mod seed_digests;
 #[path = "td_recipe_eval/warm.rs"]
 mod warm;
+// td-ui's outline face and td-compositor's Unifont, so a screen check draws
+// the compositor's chrome text as td-compositor/src/text.rs draws it
+// (qemu_boot/update.rs, `BarText`). Each sits at the root, where its
+// `crate::` paths look: `face` asks `font` for a stand-in, and `font` reads
+// `font_data`.
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[path = "../../../td-ui/src/atlas.rs"]
+mod atlas;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[path = "../../../td-ui/src/coverage.rs"]
+mod coverage;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[path = "../../../td-ui/src/face.rs"]
+mod face;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[path = "../../../td-ui/src/face_file.rs"]
+mod face_file;
+#[allow(dead_code, reason = "shared td-compositor Unifont")]
+#[path = "../../../td-compositor/src/font.rs"]
+mod font;
+#[allow(dead_code, reason = "shared td-compositor Unifont")]
+#[path = "../../../td-compositor/src/font_data.rs"]
+mod font_data;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[path = "../../../td-ui/src/sfnt.rs"]
+mod sfnt;
+/// td-ui's test encoder: real sfnt bytes for the screen oracles' tests.
+#[cfg(test)]
+#[path = "../../../td-ui/tests/fonts/mod.rs"]
+mod test_fonts;
 // SHA-256 lives in the shared, std-only td-engine (one copy for td-recipe-eval +
 // td-builder). Re-exported at crate root so existing `crate::sha256::` paths are
 // unchanged.

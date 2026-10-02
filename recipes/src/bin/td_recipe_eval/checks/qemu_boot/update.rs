@@ -10,6 +10,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use td_recipe::{ladder, td_boot_protocol};
 
+use crate::atlas::{Slot, Style, PAGE_WIDTH};
+use crate::face::Face;
+
 type Result<T> = std::result::Result<T, String>;
 const USAGE: &str = "usage: qemu-update --kernel FILE --selector FILE --disk FILE --format raw|qcow2 --work NEW-DIR [--timeout SECONDS] [--rollback yes|no] [--accel tcg|kvm]";
 const READY_NOTICE: &str = " is ready. Press Ctrl+Alt+Escape, then I to review it.";
@@ -971,10 +974,9 @@ pub(super) fn row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool>
     Ok(true)
 }
 
-// The attention menu and the status bar use the small chrome face; consent
-// uses Unifont. Rows are space, colon, A through Z, hyphen, plus, then 0
-// through 9.
-const MENU_GLYPHS: [[u8; 7]; 40] = [
+// The attention menu uses the small chrome face; consent uses Unifont.
+// Rows are space, colon, A through Z, then hyphen.
+const MENU_GLYPHS: [[u8; 7]; 29] = [
     [0, 0, 0, 0, 0, 0, 0],
     [0, 4, 4, 0, 4, 4, 0],
     [14, 17, 17, 31, 17, 17, 17],
@@ -1004,17 +1006,6 @@ const MENU_GLYPHS: [[u8; 7]; 40] = [
     [17, 17, 10, 4, 4, 4, 4],
     [31, 1, 2, 4, 8, 16, 31],
     [0, 0, 0, 31, 0, 0, 0],
-    [0, 4, 4, 31, 4, 4, 0],
-    [14, 17, 19, 21, 25, 17, 14],
-    [4, 12, 4, 4, 4, 4, 14],
-    [14, 17, 1, 2, 4, 8, 31],
-    [30, 1, 1, 14, 1, 1, 30],
-    [2, 6, 10, 18, 31, 2, 2],
-    [31, 16, 16, 30, 1, 1, 30],
-    [14, 16, 16, 30, 17, 17, 14],
-    [31, 1, 2, 4, 8, 8, 8],
-    [14, 17, 17, 14, 17, 17, 14],
-    [14, 17, 17, 15, 1, 1, 14],
 ];
 
 /// The chrome face's rows for `character`, top first, five bits each.
@@ -1024,8 +1015,6 @@ fn chrome_glyph(character: u8) -> Result<&'static [u8; 7]> {
         b':' => 1,
         b'A'..=b'Z' => usize::from(character - b'A') + 2,
         b'-' => 28,
-        b'+' => 29,
-        b'0'..=b'9' => usize::from(character - b'0') + 30,
         _ => return Err("unsupported chrome glyph".into()),
     };
     MENU_GLYPHS
@@ -1062,64 +1051,151 @@ pub(super) fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<
     Ok(true)
 }
 
-/// The status bar's band, colours and text row (td-compositor/src/bar.rs):
-/// the chrome face doubled, 12 pixels a character, 5 pixels down a 24-pixel
-/// band, ink and background as the compositor's BGRX constants scan out.
+/// The status bar's band and colours (td-compositor/src/bar.rs) and its text
+/// (td-compositor/src/text.rs): one row of 8x16 cells 4 pixels down a 24-pixel
+/// band, each character the pinned outline face fitted to its cell and
+/// clipped to it, coverage blended from the background toward the ink, and a
+/// character the face lacks Unifont's cell in ink. The colours are the
+/// compositor's BGRX constants as they scan out.
 const BAR_HEIGHT: usize = 24;
-const BAR_TEXT_TOP: usize = 5;
+const BAR_TEXT_TOP: usize = 4;
+const BAR_CELL_WIDTH: usize = 8;
+const BAR_CELL_HEIGHT: usize = 16;
 const BAR_INK: [u8; 3] = [0xe0, 0xc8, 0xd0];
 const BAR_BACKGROUND: [u8; 3] = [0x20, 0x14, 0x18];
 
-/// Whether the status bar's line ends with `text`: drawn exactly in its
-/// cells, ending where the bar's last ink is, with nothing after it.
-pub(super) fn bar_ends_with(pixels: &[u8], text: &str) -> Result<bool> {
-    let pixel = |x: usize, y: usize| pixels.get((y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3);
-    if pixels.len() != 1280 * 800 * 3 {
-        return Err("expected a 1280x800 RGB capture".into());
-    }
-    let Some(&last) = text.as_bytes().last() else {
-        return Err("no bar text to find".into());
-    };
-    // The bar's last ink column, which the text's last glyph must end on.
-    let Some(end) = (0..1280usize)
-        .rev()
-        .find(|&x| (0..BAR_HEIGHT).any(|y| pixel(x, y) == Some(&BAR_INK[..])))
-    else {
-        return Ok(false);
-    };
-    let rows = chrome_glyph(last)?;
-    let rightmost = (0..5usize)
-        .rev()
-        .find(|&column| rows.iter().any(|bits| bits & (1 << (4 - column)) != 0))
-        .ok_or("the bar text ends in a blank glyph")?;
-    let Some(start) = end
-        .checked_sub(rightmost * 2 + 1)
-        .and_then(|origin| origin.checked_sub((text.len() - 1) * 12))
-    else {
-        return Ok(false);
-    };
-    for y in 0..BAR_HEIGHT {
-        for x in start..1280 {
-            let column = x - start;
-            let on = match (
-                text.as_bytes().get(column / 12),
-                y.checked_sub(BAR_TEXT_TOP),
-            ) {
-                (Some(character), Some(row)) if column % 12 < 10 && row < 14 => {
-                    let bits = chrome_glyph(*character)?
-                        .get(row / 2)
-                        .ok_or("missing bar glyph row")?;
-                    bits & (1 << (4 - column % 12 / 2)) != 0
+/// A suffix of the status bar's line as the compositor draws it: the band's
+/// rows across `width` columns, and the last column anything marks.
+pub(super) struct BarText {
+    width: usize,
+    pixels: Vec<[u8; 3]>,
+    last: usize,
+}
+
+impl BarText {
+    /// `text` drawn as the bar draws it, in the face whose regular style is
+    /// `regular`.
+    pub(super) fn render(regular: Vec<u8>, text: &str) -> Result<Self> {
+        let mut face = Face::fit(regular.into(), None, BAR_CELL_WIDTH, BAR_CELL_HEIGHT)
+            .map_err(|error| format!("bar face: {error}"))?;
+        let unifont = crate::font::pinned()?;
+        let width = text
+            .chars()
+            .count()
+            .checked_mul(BAR_CELL_WIDTH)
+            .ok_or("bar text is too long")?;
+        let mut pixels = vec![BAR_BACKGROUND; width * BAR_HEIGHT];
+        for (column, character) in text.chars().enumerate() {
+            let left = column * BAR_CELL_WIDTH;
+            let cell = face.cell();
+            // Each glyph is clipped to its own cell, as the compositor clips.
+            let mut put = |x: i64, y: i64, color: [u8; 3]| {
+                let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+                    return;
+                };
+                if (left..left + BAR_CELL_WIDTH).contains(&x)
+                    && (BAR_TEXT_TOP..BAR_TEXT_TOP + BAR_CELL_HEIGHT).contains(&y)
+                {
+                    if let Some(pixel) = pixels.get_mut(y * width + x) {
+                        *pixel = color;
+                    }
                 }
-                _ => false,
             };
-            let expected = if on { &BAR_INK } else { &BAR_BACKGROUND };
-            if pixel(x, y) != Some(&expected[..]) {
-                return Ok(false);
+            match face.glyph(Style::Regular, character) {
+                Slot::Blank => {}
+                Slot::Placed(entry) => {
+                    let page = face.atlas().page();
+                    let pen = i64::try_from(left + cell.pen).map_err(|_| "bar pen")?;
+                    let baseline =
+                        i64::try_from(BAR_TEXT_TOP + cell.baseline).map_err(|_| "bar baseline")?;
+                    for row in 0..entry.height {
+                        for col in 0..entry.width {
+                            let alpha = page
+                                .get((entry.y + row) * PAGE_WIDTH + entry.x + col)
+                                .copied()
+                                .unwrap_or(0);
+                            if alpha == 0 {
+                                continue;
+                            }
+                            let x = pen + i64::from(entry.left) + i64::try_from(col).unwrap_or(0);
+                            let y =
+                                baseline - i64::from(entry.top) + i64::try_from(row).unwrap_or(0);
+                            put(x, y, mix(BAR_BACKGROUND, BAR_INK, alpha));
+                        }
+                    }
+                }
+                Slot::Missing => {
+                    let index = unifont.index(character);
+                    for row in 0..unifont.height().min(BAR_CELL_HEIGHT) {
+                        for col in 0..unifont.width().min(BAR_CELL_WIDTH) {
+                            if unifont.pixel(index, col, row) {
+                                let x = i64::try_from(left + col).map_err(|_| "bar column")?;
+                                let y = i64::try_from(BAR_TEXT_TOP + row).map_err(|_| "bar row")?;
+                                put(x, y, BAR_INK);
+                            }
+                        }
+                    }
+                }
             }
         }
+        let last = (0..width)
+            .rev()
+            .find(|&x| (0..BAR_HEIGHT).any(|y| pixels.get(y * width + x) != Some(&BAR_BACKGROUND)))
+            .ok_or("the bar text marks nothing")?;
+        Ok(Self {
+            width,
+            pixels,
+            last,
+        })
     }
-    Ok(true)
+
+    /// Whether the status bar's line in a 1280x800 RGB capture ends with
+    /// this text: the bar's last mark is the text's last, and every pixel
+    /// from the text's first cell to the screen's right edge, across the
+    /// band, is exactly as drawn here, with nothing after it.
+    pub(super) fn ends(&self, pixels: &[u8]) -> Result<bool> {
+        let pixel = |x: usize, y: usize| pixels.get((y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3);
+        if pixels.len() != 1280 * 800 * 3 {
+            return Err("expected a 1280x800 RGB capture".into());
+        }
+        let Some(end) = (0..1280usize)
+            .rev()
+            .find(|&x| (0..BAR_HEIGHT).any(|y| pixel(x, y) != Some(&BAR_BACKGROUND[..])))
+        else {
+            return Ok(false);
+        };
+        let Some(start) = end.checked_sub(self.last) else {
+            return Ok(false);
+        };
+        for y in 0..BAR_HEIGHT {
+            for x in start..1280 {
+                let column = x - start;
+                let expected = if column < self.width {
+                    self.pixels
+                        .get(y * self.width + column)
+                        .ok_or("bar text pixel out of range")?
+                } else {
+                    &BAR_BACKGROUND
+                };
+                if pixel(x, y) != Some(&expected[..]) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// `from` moved toward `to` by `alpha` of 255 in each channel, rounded, as
+/// the compositor's chrome text blends.
+fn mix(from: [u8; 3], to: [u8; 3], alpha: u8) -> [u8; 3] {
+    let alpha = u16::from(alpha);
+    let mut color = [0; 3];
+    for ((out, from), to) in color.iter_mut().zip(from).zip(to) {
+        let mixed = (u16::from(from) * (255 - alpha) + u16::from(to) * alpha + 127) / 255;
+        *out = u8::try_from(mixed).unwrap_or(u8::MAX);
+    }
+    color
 }
 
 fn menu_matches(bytes: &[u8]) -> Result<bool> {
@@ -1400,7 +1476,7 @@ mod tests {
     #[test]
     fn chrome_glyphs_are_the_compositors() {
         let chrome = include_str!("../../../../../../td-compositor/src/ui.rs");
-        for character in b" :ABCDEFGHIJKLMNOPQRSTUVWXYZ-+0123456789" {
+        for character in b" :ABCDEFGHIJKLMNOPQRSTUVWXYZ-" {
             let rows = chrome_glyph(*character).unwrap();
             let line = format!(
                 "b'{}' => [{}],",
@@ -1410,80 +1486,200 @@ mod tests {
             assert!(chrome.contains(&line), "{line}");
         }
         assert!(chrome_glyph(b'a').is_err());
+        assert!(chrome_glyph(b'0').is_err());
+        assert!(chrome.contains("pub(crate) const GLYPH_ADVANCE: usize = 6;"));
+        assert!(chrome.contains("pub(crate) const GLYPH_WIDTH: usize = 5;"));
+    }
+
+    /// The bar oracle's band, cell, colours and blend are the compositor's.
+    #[test]
+    fn the_bar_text_is_the_compositors() {
         let bar = include_str!("../../../../../../td-compositor/src/bar.rs");
         for line in [
             "pub const BAR_HEIGHT: usize = 24;",
-            "const TEXT_TOP: usize = 5;",
-            "const SCALE: usize = 2;",
+            "const TEXT_TOP: usize = (BAR_HEIGHT - CELL_HEIGHT) / 2;",
             "pub(crate) const BACKGROUND: [u8; 4] = [0x18, 0x14, 0x20, 0];",
             "pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];",
             "[net, load, memory, uptime, clock].join(SEPARATOR)",
             // The band is the screen's top, and the line is drawn in it at
-            // the text row, doubled, in ink, after the cells.
+            // the text row, in ink on the background, after the cells.
             "let bar = (0, 0, width, BAR_HEIGHT);",
-            "        text_left,\n        TEXT_TOP,\n        SCALE,\n        text,\n        INK,\n",
+            "        (text_left, TEXT_TOP),\n        text,\n        (INK, BACKGROUND),\n",
         ] {
             assert!(bar.contains(line), "{line}");
         }
-        assert!(chrome.contains("pub(crate) const GLYPH_ADVANCE: usize = 6;"));
-        assert!(chrome.contains("pub(crate) const GLYPH_WIDTH: usize = 5;"));
+        let text = include_str!("../../../../../../td-compositor/src/text.rs");
+        for line in [
+            "pub(crate) const CELL_WIDTH: usize = 8;",
+            "pub(crate) const CELL_HEIGHT: usize = 16;",
+            "Face::fit(regular, None, CELL_WIDTH, CELL_HEIGHT)",
+            "let slot = face.glyph(Style::Regular, character);",
+            "let cell = crate::ui::intersect((left, y, CELL_WIDTH, CELL_HEIGHT), clip);",
+            "target.blend(page, entry, pen, ink, ground);",
+            "Some((Slot::Missing, _)) | None => target.bitmap(character, (left, y), ink),",
+            "self.put(x, y, mix(ground, ink, alpha));",
+            "(u16::from(*from) * (255 - alpha) + u16::from(*to) * alpha + 127) / 255",
+        ] {
+            assert!(text.contains(line), "{line}");
+        }
+        assert_eq!(BAR_TEXT_TOP, (BAR_HEIGHT - BAR_CELL_HEIGHT) / 2);
+        assert_eq!((BAR_CELL_WIDTH, BAR_CELL_HEIGHT), (8, 16));
+        // The image's face is the one the compositor reads.
+        let system = include_str!("../../../../../../recipes/src/recipes/system-x86-64.rs");
+        assert!(
+            system.contains("\"{in:jetbrains-mono-nerd-font}/share/fonts/jetbrains-mono-nerd\"")
+        );
+        assert_eq!(crate::face_file::DIR, "/etc/fonts/jetbrains-mono-nerd");
+        assert_eq!(
+            td_recipe::catalog::outline_face::DIR,
+            "share/fonts/jetbrains-mono-nerd"
+        );
+    }
+
+    /// A face with only a square for `0` and an empty space: what the face
+    /// has is its coverage, anything else Unifont's cell.
+    fn square_face() -> Vec<u8> {
+        use crate::test_fonts::{square, Builder, Glyph, Segment};
+        let mut builder = Builder::new(vec![
+            Glyph::Empty,
+            Glyph::Simple(vec![square(50, 0, 400)]),
+            Glyph::Empty,
+        ]);
+        let map = |scalar: char, glyph: u16| {
+            let code = u32::from(scalar) as u16;
+            Segment::Delta(code, code, glyph.wrapping_sub(code))
+        };
+        builder.format4 = vec![map(' ', 2), map('0', 1)];
+        builder.advance = Some(500);
+        builder.font()
+    }
+
+    /// Each character is drawn in its own cell, clipped to it: the face's
+    /// coverage blended toward the ink, Unifont's cell in ink otherwise.
+    #[test]
+    fn the_bar_text_draws_the_face_and_unifont_in_their_cells() {
+        let drawn = BarText::render(square_face(), " 0U").unwrap();
+        assert_eq!(drawn.width, 24);
+        let at = |x: usize, y: usize| drawn.pixels[y * 24 + x];
+        // The space marks nothing; the band outside the cell row is clear.
+        for y in 0..BAR_HEIGHT {
+            for x in 0..8 {
+                assert_eq!(at(x, y), BAR_BACKGROUND);
+            }
+            if !(BAR_TEXT_TOP..BAR_TEXT_TOP + BAR_CELL_HEIGHT).contains(&y) {
+                for x in 0..24 {
+                    assert_eq!(at(x, y), BAR_BACKGROUND, "({x}, {y})");
+                }
+            }
+        }
+        // Fitted to the cell, 1000 units a em at a 500-unit advance is 16
+        // pixels a em: the pen at 0 and the baseline at (16 / 2 + 300 *
+        // 0.016).round() = 13. The square, x 50..450 and y 0..400 units, is
+        // then x 0.8..7.2 and 6.4 pixels up from row 13: ink in columns 1 to
+        // 6 of rows 7 to 12, partly covered beside them, nothing else.
+        for row in 0..BAR_CELL_HEIGHT {
+            for column in 0..BAR_CELL_WIDTH {
+                let pixel = at(8 + column, BAR_TEXT_TOP + row);
+                let full_row = (7..=12).contains(&row);
+                let full_column = (1..=6).contains(&column);
+                if full_row && full_column {
+                    assert_eq!(pixel, BAR_INK, "({column}, {row})");
+                } else if (6..=12).contains(&row) {
+                    assert_ne!(pixel, BAR_INK, "({column}, {row})");
+                    assert_ne!(pixel, BAR_BACKGROUND, "({column}, {row})");
+                    for ((channel, from), to) in pixel.iter().zip(BAR_BACKGROUND).zip(BAR_INK) {
+                        assert!((from.min(to)..=from.max(to)).contains(channel));
+                    }
+                } else {
+                    assert_eq!(pixel, BAR_BACKGROUND, "({column}, {row})");
+                }
+            }
+        }
+        // U is not in the face, so it is Unifont's cell, exactly.
+        let unifont = crate::font::pinned().unwrap();
+        let index = unifont.index('U');
+        let mut lit = 0;
+        for row in 0..BAR_CELL_HEIGHT {
+            for column in 0..BAR_CELL_WIDTH {
+                let want = if unifont.pixel(index, column, row) {
+                    lit += 1;
+                    BAR_INK
+                } else {
+                    BAR_BACKGROUND
+                };
+                assert_eq!(at(16 + column, BAR_TEXT_TOP + row), want);
+            }
+        }
+        assert!(lit > 0);
+        let last = (16..24)
+            .rev()
+            .find(|&x| (0..BAR_HEIGHT).any(|y| at(x, y) != BAR_BACKGROUND))
+            .unwrap();
+        assert_eq!(drawn.last, last);
+        assert_eq!(mix(BAR_BACKGROUND, BAR_INK, 0), BAR_BACKGROUND);
+        assert_eq!(mix(BAR_BACKGROUND, BAR_INK, 255), BAR_INK);
+        assert_eq!(mix([0, 0, 0], [255, 255, 255], 128), [128, 128, 128]);
+        // Rounded, not truncated: 128 / 255 of one step is one.
+        assert_eq!(mix([0, 0, 0], [1, 1, 1], 128), [1, 1, 1]);
+        assert_eq!(mix([0, 0, 0], [1, 1, 1], 127), [0, 0, 0]);
+        // A face that is not a face is an error, not a blank expectation.
+        assert!(BarText::render(vec![0; 64], " 0").is_err());
+        assert!(BarText::render(square_face(), "   ").is_err());
     }
 
     /// The bar's line is matched at its end, exactly, and nowhere else.
     #[test]
     fn the_bar_line_is_matched_at_its_end() {
+        let face = square_face();
+        // Each character is clipped to its cell, so the whole line drawn at
+        // once is each character drawn where the compositor draws it.
         let bar = |text: &str, left: usize| {
             let mut pixels = [24, 32, 40].repeat(1280 * 800);
-            // The compositor's BGRX constants as RGB, written out here
-            // rather than taken from the matcher's own.
+            let line = BarText::render(face.clone(), text).unwrap();
             for y in 0..24 {
-                for x in 0..1280 {
-                    pixels[(y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3]
-                        .copy_from_slice(&[0x20, 0x14, 0x18]);
-                }
-            }
-            for (column, character) in text.bytes().enumerate() {
-                for (row, bits) in chrome_glyph(character).unwrap().iter().enumerate() {
-                    for bit in 0..5 {
-                        if bits & (1 << (4 - bit)) == 0 {
-                            continue;
-                        }
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                let x = left + column * 12 + bit * 2 + dx;
-                                let y = 5 + row * 2 + dy;
-                                pixels[(y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3]
-                                    .copy_from_slice(&[0xe0, 0xc8, 0xd0]);
-                            }
-                        }
-                    }
+                for x in 0..1280usize {
+                    let color = match x.checked_sub(left) {
+                        Some(column) if column < line.width => line.pixels[y * line.width + column],
+                        _ => [0x20, 0x14, 0x18],
+                    };
+                    pixels[(y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3].copy_from_slice(&color);
                 }
             }
             pixels
         };
+        let zone = BarText::render(face.clone(), " UTC+09:00").unwrap();
         let line = "NET ETH0 DOWN  UP 3M  2026-10-02 10:00:00 UTC+09:00";
         for left in [8, 39, 100] {
-            assert!(bar_ends_with(&bar(line, left), " UTC+09:00").unwrap());
+            assert!(zone.ends(&bar(line, left)).unwrap());
         }
         let drawn = bar(line, 8);
-        assert!(!bar_ends_with(&drawn, " UTC+08:00").unwrap());
-        assert!(!bar_ends_with(&drawn, " UTC-09:00").unwrap());
-        assert!(!bar_ends_with(&drawn, "UTC+09:0").unwrap());
-        assert!(!bar_ends_with(&bar("2026-10-02 10:00:00 UTC", 8), " UTC+09:00").unwrap());
+        for other in [" UTC+08:00", " UTC-09:00", "UTC+09:0", " UTC+90:00"] {
+            let other_text = BarText::render(face.clone(), other).unwrap();
+            assert!(!other_text.ends(&drawn).unwrap(), "{other}");
+        }
+        assert!(!zone.ends(&bar("2026-10-02 10:00:00 UTC", 8)).unwrap());
         // Text after it, or a stray pixel beside it, is not this end.
-        assert!(!bar_ends_with(&bar(&format!("{line}0"), 8), " UTC+09:00").unwrap());
+        assert!(!zone.ends(&bar(&format!("{line}0"), 8)).unwrap());
         let mut stray = drawn.clone();
-        let x = 8 + (line.len() - 10) * 12 + 11;
-        stray[(1280 + x) * 3..(1280 + x) * 3 + 3].copy_from_slice(&[0xe0, 0xc8, 0xd0]);
-        assert!(!bar_ends_with(&stray, " UTC+09:00").unwrap());
+        let x = 8 + line.len() * 8 + 1;
+        stray[(6 * 1280 + x) * 3..(6 * 1280 + x) * 3 + 3].copy_from_slice(&[0xe0, 0xc8, 0xd0]);
+        assert!(!zone.ends(&stray).unwrap());
         // Nor is a mark of another colour after it, such as a pointer.
         let mut marked = drawn.clone();
         marked[(2 * 1280 + 1270) * 3..(2 * 1280 + 1270) * 3 + 3].copy_from_slice(&[255, 0, 0]);
-        assert!(!bar_ends_with(&marked, " UTC+09:00").unwrap());
-        assert!(!bar_ends_with(&[24, 32, 40].repeat(1280 * 800), " UTC+09:00").unwrap());
-        assert!(bar_ends_with(&drawn, "").is_err());
-        assert!(bar_ends_with(&drawn, "utc").is_err());
-        assert!(bar_ends_with(&drawn, "UTC ").is_err());
+        assert!(!zone.ends(&marked).unwrap());
+        // Nor one pixel of the text itself off by a shade.
+        let mut shaded = drawn.clone();
+        let (x, y) = (BAR_TEXT_TOP..BAR_TEXT_TOP + BAR_CELL_HEIGHT)
+            .flat_map(|y| (0..8).map(move |column| (8 + (line.len() - 1) * 8 + column, y)))
+            .find(|&(x, y)| {
+                shaded[(y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3] != [0x20, 0x14, 0x18]
+            })
+            .unwrap();
+        shaded[(y * 1280 + x) * 3] ^= 1;
+        assert!(!zone.ends(&shaded).unwrap());
+        assert!(!zone.ends(&[24, 32, 40].repeat(1280 * 800)).unwrap());
+        assert!(zone.ends(&drawn[3..]).is_err());
     }
 
     /// A notice row drawn from the compositor's own chrome glyphs, hyphen

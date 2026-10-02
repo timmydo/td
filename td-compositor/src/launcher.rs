@@ -1,11 +1,14 @@
+use crate::text::{Text, CELL_HEIGHT, CELL_WIDTH};
 use crate::ui::{border, fill, intersect};
-use crate::{filter, socket, ui};
+use crate::{filter, socket};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const CARD_WIDTH: usize = 480;
 const CARD_HEIGHT: usize = 336;
+const CARD: [u8; 4] = [0x20, 0x18, 0x28, 0];
+const HIGHLIGHT: [u8; 4] = [0x58, 0x30, 0x70, 0];
 const CARD_PADDING: usize = 24;
 const MAX_LAUNCHED_CLIENTS: usize = 16;
 const MAX_APPLICATION_NAME_BYTES: usize = 32;
@@ -25,8 +28,8 @@ const ROW_STEP: usize = 42;
 const ROW_INSET: usize = 14;
 const ROW_RISE: usize = 8;
 const ROW_HEIGHT: usize = 32;
-/// A row's label is two-times glyphs, so this tall.
-const LABEL_HEIGHT: usize = ui::GLYPH_HEIGHT * 2;
+/// A row's label is one row of text cells, so this tall.
+const LABEL_HEIGHT: usize = CELL_HEIGHT;
 pub(crate) const TASK_DIRECTORY: &str = "/home/tester/src/td-vm/work";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,63 +472,55 @@ impl Launcher {
             .map(LauncherAction::Choose)
     }
 
-    pub fn paint(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
+    pub fn paint(&self, frame: &mut [u8], width: usize, height: usize, stride: usize, text: &Text) {
         if !self.visible {
             return;
         }
         let card = card(width, height);
         let (left, top, card_width, _) = card;
-        fill(frame, width, height, stride, card, [0x20, 0x18, 0x28, 0]);
+        fill(frame, width, height, stride, card, CARD);
         border(frame, width, height, stride, card, [0xc0, 0x70, 0xf0, 0]);
-        ui::draw_text_clipped(
+        text.draw(
             frame,
             width,
             height,
             stride,
-            left.saturating_add(20),
-            top.saturating_add(18),
-            2,
+            (left.saturating_add(20), top.saturating_add(18)),
             "TD LAUNCHER",
-            [0xff, 0xff, 0xff, 0],
+            ([0xff, 0xff, 0xff, 0], CARD),
             card,
         );
-        ui::draw_text_clipped(
+        text.draw(
             frame,
             width,
             height,
             stride,
-            left.saturating_add(20),
-            top.saturating_add(48),
-            2,
+            (left.saturating_add(20), top.saturating_add(48)),
             "FILTER:",
-            [0xd8, 0xb0, 0xf0, 0],
+            ([0xd8, 0xb0, 0xf0, 0], CARD),
             card,
         );
-        let query_columns = card_width.saturating_sub(136) / 12;
+        let query_columns = card_width.saturating_sub(136) / CELL_WIDTH;
         let visible_query = self.visible_query(query_columns);
-        ui::draw_text_clipped(
+        text.draw(
             frame,
             width,
             height,
             stride,
-            left.saturating_add(116),
-            top.saturating_add(48),
-            2,
+            (left.saturating_add(116), top.saturating_add(48)),
             visible_query,
-            [0xff, 0xff, 0xff, 0],
+            ([0xff, 0xff, 0xff, 0], CARD),
             card,
         );
         if self.matches.is_empty() {
-            ui::draw_text_clipped(
+            text.draw(
                 frame,
                 width,
                 height,
                 stride,
-                left.saturating_add(24),
-                top.saturating_add(92),
-                2,
+                (left.saturating_add(24), top.saturating_add(92)),
                 "NO MATCHES",
-                [0xa8, 0xa0, 0xb0, 0],
+                ([0xa8, 0xa0, 0xb0, 0], CARD),
                 card,
             );
         }
@@ -540,28 +535,19 @@ impl Launcher {
             let row_top = row_text_top(top, match_index);
             if match_index == self.selected {
                 let highlight = row_area(card, match_index);
-                fill(
-                    frame,
-                    width,
-                    height,
-                    stride,
-                    highlight,
-                    [0x58, 0x30, 0x70, 0],
-                );
+                fill(frame, width, height, stride, highlight, HIGHLIGHT);
             }
-            ui::draw_text_clipped(
+            text.draw(
                 frame,
                 width,
                 height,
                 stride,
-                left.saturating_add(24),
-                row_top,
-                2,
+                (left.saturating_add(24), row_top),
                 entry.label,
                 if match_index == self.selected {
-                    [0xff, 0xff, 0xff, 0]
+                    ([0xff, 0xff, 0xff, 0], HIGHLIGHT)
                 } else {
-                    [0xa8, 0xa0, 0xb0, 0]
+                    ([0xa8, 0xa0, 0xb0, 0], CARD)
                 },
                 card,
             );
@@ -782,6 +768,7 @@ pub(crate) fn launch_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::CELL_HEIGHT;
     use std::collections::VecDeque;
     use std::fs;
     use std::os::unix::net::UnixListener;
@@ -874,7 +861,7 @@ mod tests {
             // it are not.
             launcher.selected = row;
             let mut frame = vec![0u8; stride * height];
-            launcher.paint(&mut frame, width, height, stride);
+            launcher.paint(&mut frame, width, height, stride, &Text::default());
             let at = |x: usize, y: usize| frame.get(y * stride + x * 4..y * stride + x * 4 + 4);
             let (left, top, w, h) = row_area(card, row);
             assert_eq!(at(left, top), Some(&highlight[..]), "row {row}");
@@ -924,7 +911,7 @@ mod tests {
         assert_eq!(launcher.press_at(left + w / 2, top, width, sliver), None);
         launcher.selected = 1;
         let mut frame = vec![0u8; stride * sliver];
-        launcher.paint(&mut frame, width, sliver, stride);
+        launcher.paint(&mut frame, width, sliver, stride, &Text::default());
         let at = |x: usize, y: usize| frame.get(y * stride + x * 4..y * stride + x * 4 + 4);
         assert_ne!(at(left, top), Some(&highlight[..]), "a hidden row drawn");
         assert!((top..top + h)
@@ -1052,12 +1039,12 @@ mod tests {
         let height = 100;
         let stride = width * 4 + 8;
         let mut hidden = vec![7u8; stride * height];
-        launcher.paint(&mut hidden, width, height, stride);
+        launcher.paint(&mut hidden, width, height, stride, &Text::default());
         assert!(hidden.iter().all(|byte| *byte == 7));
 
         launcher.apply(LauncherAction::Open);
         let mut visible = hidden.clone();
-        launcher.paint(&mut visible, width, height, stride);
+        launcher.paint(&mut visible, width, height, stride, &Text::default());
         assert_ne!(visible, hidden);
         for row in visible.chunks_exact(stride) {
             assert!(row
@@ -1066,9 +1053,9 @@ mod tests {
         }
 
         let mut tiny = vec![0u8; 4];
-        launcher.paint(&mut tiny, 1, 1, 4);
+        launcher.paint(&mut tiny, 1, 1, 4, &Text::default());
         assert_eq!(tiny, [0, 0, 0, 0]);
-        launcher.paint(&mut [], 0, 0, 0);
+        launcher.paint(&mut [], 0, 0, 0, &Text::default());
     }
 
     #[test]
@@ -1079,7 +1066,7 @@ mod tests {
         let height = 150;
         let stride = width * 4 + 8;
         let mut frame = vec![7u8; stride * height];
-        launcher.paint(&mut frame, width, height, stride);
+        launcher.paint(&mut frame, width, height, stride, &Text::default());
 
         let card_width = CARD_WIDTH.min(width.saturating_sub(CARD_PADDING.saturating_mul(2)));
         let card_height = CARD_HEIGHT.min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
@@ -1103,7 +1090,7 @@ mod tests {
 
     #[test]
     fn registry_entries_are_searchable_and_fit_the_card() {
-        let glyph_height = ui::GLYPH_HEIGHT.saturating_mul(2);
+        let glyph_height = CELL_HEIGHT;
         let final_row = FIRST_ROW_TOP
             .saturating_add(ENTRY_COUNT.saturating_sub(1).saturating_mul(ROW_STEP))
             .saturating_add(glyph_height);

@@ -110,12 +110,9 @@ which counts neither cache nor reclaimable slab and reads alarmingly low on
 an idle machine. A reading that could not be taken shows its label with `?`
 rather than vanishing, so a broken source looks broken instead of looking
 like a machine with less to report; each field fails on its own, so a
-garbled `loadavg` does not take the clock down with it. The `?` is why the
-font grew a period: an unmapped byte used to draw a glyph shaped like a
-question mark, so `LOAD 0.42` rendered as `LOAD 0?42` and a healthy reading
-was indistinguishable from a failed one. The fallback is a box now, `.` and
-`?` are glyphs of their own, and both the bar's line and the help sheet's
-rows are held to a font that has every character they spell.
+garbled `loadavg` does not take the clock down with it. Both the bar's line
+and the help sheet's rows are held to Unifont having every character they
+spell, since Unifont draws whatever the outline face lacks.
 
 The strip's first cell is the LAUNCHER'S BUTTON: a square as wide as the band
 is tall, marked with three bars drawn as fills rather than a glyph, so it needs
@@ -145,11 +142,10 @@ The active one is the strip's own two colours EXCHANGED. It needs no third
 colour and no glyph beside the number, and inverse video says "you are here"
 without an operator being told which of two shades of one hue means what. Each
 cell is its number and a little air either side rather than a fixed column, so
-a workspace costs the fields beside it twenty pixels and not a reserved strip.
-The number is CENTRED in that cell rather than padded equally, because a
-glyph's advance carries a trailing column it never inks: equal padding leaves
-it a pixel left of centre, which nothing shows on the bar and the block of ink
-around an active cell does.
+a workspace costs the fields beside it sixteen pixels and not a reserved strip.
+Each face centres a glyph's advance across its text cell, and the bar's test
+holds Unifont's digits centred in theirs, so equal padding centres the number,
+which the block of ink around an active cell would show if it did not.
 
 The workspaces are painted from the LAYOUT on every frame rather than folded
 into the status line, and that is what makes the mark follow a switch at once:
@@ -1004,6 +1000,54 @@ QEMU profile deliberately fails stopped instead of retrying a potentially
 persistent error in a hot loop; the serial recovery console remains available.
 Launch and reap failures are contained inside the process adapter and leave
 the reader active so the launcher can be closed or retried.
+
+### Chrome text
+
+The chrome's text (title bands, the status bar, the launcher and the key
+sheet) is one row of Unifont's 8x16 cells, drawn by `text.rs`. At startup
+the compositor reads td-ui's pinned outline face (td-ui/DESIGN.md, "Outline
+faces and the glyph atlas") and fits it to that cell with `Face::fit`, so
+the face moves no layout, hit test or band height. A character the face
+lacks draws as its Unifont cell. Edge pixels blend from the ground the
+caller filled toward the ink, as td-ui's raster blends, never from a read of
+the frame. Characters are not case-folded: a title shows as its client
+wrote it.
+
+The compositor mounts td-ui's `sfnt`, `coverage`, `atlas`, `face` and
+`face_file` sources by path, as td-ui mounts this crate's `font` and `wire`,
+and the target recipe stages them flat like any module. They are std-only,
+carry no `unsafe` and name only each other and this crate's `font` (whose
+`stand_in` the face draws for a symbol it lacks), which the compositor's build
+holds them to; a change to them selects the compositor's checks. The
+recipe's session-tests build also compiles text.rs's tests, so it stages
+td-ui's test font encoder, `tests/fonts/mod.rs`, at `tests/fonts.rs`.
+
+td-recipe-eval mounts the same five modules, with this crate's `font` and
+`font_data`, so `qemu-boot-live` draws the status bar's expected clock as
+`text.rs` draws it, from the image's own face, and matches the installed
+session's display pixel for pixel. Its tests pin the cell, text row,
+colours, glyph path and blend against `bar.rs` and `text.rs`, and the
+evaluator's build fingerprints every mounted file.
+
+Under terminal authority only the image's immutable
+`/etc/fonts/jetbrains-mono-nerd` is read, so no file a user can write
+reaches the parser in the process that owns the trusted path. A direct
+compositor searches the host's font places as td-ui's programs do.
+`TD_UI_FACE=bitmap` keeps Unifont and reads nothing; a missing or refused
+face says so once on standard error and the chrome draws Unifont. The face
+reaches a scene only through `Runtime::set_text` at startup, so the headless
+personality, in-process scenes and this crate's pixel oracles draw Unifont.
+
+A character is covered into the atlas on its first use. A title is client
+text, so a client cycling its title through more scalars than the atlas holds
+makes later paints cover the visible cells again. That work is bounded by the
+cells visible in a frame, and the face covered is the pinned one, never a
+client's.
+
+The trusted attention display and the demo client keep their compiled-in
+glyphs: the attention notice and the demo's state lines draw the 5x7 table
+in `ui.rs`, and the attention request's raster draws Unifont. Nothing the
+compositor reads at runtime is drawn on the trusted path.
 
 ## 3. Wayland surface
 
@@ -2768,15 +2812,15 @@ by than for the one it only reads. An input
 region can be dropped with the pixels only because the client re-supplies one
 on every commit; nothing re-supplies a title.
 
-Every tile that carries decoration has a title band across its top, 20 pixels
-tall,
-holding the retained title in 2x glyphs. A tile is therefore a band and the
-client's own area beneath it, and a PLACEMENT carries both as separate
-rectangles: the layout decides where each goes, and the band's height is
-passed in beside the gap rather than known there, because how tall a band is
-belongs to whatever draws one. Two rectangles rather than one derived from the
-other because the two need not touch — a grouped container puts its children's
-bands in a run at its top and gives the content below all of them.
+Every tile that carries decoration has a title band across its top, 20
+pixels tall, holding the retained title in one row of text cells ("Chrome
+text"). A tile is therefore a band and the client's own area beneath it, and
+a PLACEMENT carries both as separate rectangles: the layout decides where
+each goes, and the band's height is passed in beside the gap rather than
+known there, because how tall a band is belongs to whatever draws one. Two
+rectangles rather than one derived from the other because the two need not
+touch — a grouped container puts its children's bands in a run at its top
+and gives the content below all of them.
 
 The client rectangle is what the blit covers, what the pointer hit test asks
 about, and what is published to clients, and the CARVE that separates it from
@@ -2956,15 +3000,15 @@ rectangle top to bottom — the slot inset on all four sides, so the padding
 around it is the same for all three — or one of them reads as a smaller button
 beside its neighbours.
 
-TWO bands carry NO buttons, both for want of ROOM, and the painter and the hit
-test decide it in one place, because a button drawn where nothing answers is a
-button that does nothing when pressed with nothing on screen to say so. A band
-too NARROW to hold them beside a name gets none: a tabbed run divides ONE
-strip between its leaves, so a column of eight gives each tab a few dozen
-pixels, and buttons there would be the whole tab with the title squeezed out —
-the room reserved for the name is a glyph at the scale titles are DRAWN at
-rather than at 1x, or the reserve is half a cell and the smear is what the
-band shows. And a band too SHORT to draw an icon in gets none either, which is
+TWO bands carry NO buttons, both for want of ROOM, and the painter and the
+hit test decide it in one place, because a button drawn where nothing
+answers is a button that does nothing when pressed with nothing on screen to
+say so. A band too NARROW to hold them beside a name gets none: a tabbed run
+divides ONE strip between its leaves, so a column of eight gives each tab a
+few dozen pixels, and buttons there would be the whole tab with the title
+squeezed out — the room reserved for the name is a whole text cell as titles
+are DRAWN, or the reserve is part of one and the smear is what the band
+shows. And a band too SHORT to draw an icon in gets none either, which is
 the same rule seen the other way: a tile clipped to a sliver keeps its band
 and loses its client, and the run's last band is clipped to whatever the
 container has left, so this is reachable rather than theoretical. The keys
@@ -4678,16 +4722,16 @@ td-term is its own program over the td-ui client toolkit, which carries the
 terminal model, renderer, keyboard encoder, terminfo compiler and PTY;
 [td-term/DESIGN.md](../td-term/DESIGN.md) records what of its contract is
 landed. The compositor keeps the pinned Unifont face, its importer and the
-PSF2 reader for its own drawing, the devpts instance the image mounts at
-sysinit, and the launcher entry and terminal-authority probe that run
-`/bin/td-term`. The selected Firefox application occupies the launcher
-application entry; the demo has no `/bin` name, service or launcher role in
-the image, although its personality remains reachable in the copied
-compositor store output for lower-level protocol tests.
-General Wayland toolkit compatibility is not claimed until the missing core
-protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
-Xwayland, and a C desktop stack remain optional consumers rather than
-foundations of td's UI.
+PSF2 reader for its chrome's fallback and its attention request, the devpts
+instance the image mounts at sysinit, and the launcher entry and
+terminal-authority probe that run `/bin/td-term`. The selected Firefox
+application occupies the launcher application entry; the demo has no `/bin`
+name, service or launcher role in the image, although its personality
+remains reachable in the copied compositor store output for lower-level
+protocol tests. General Wayland toolkit compatibility is not claimed until
+the missing core protocols have explicit tests. Hardware acceleration, niri,
+portals, PipeWire, Xwayland, and a C desktop stack remain optional consumers
+rather than foundations of td's UI.
 
 ## 9. td-term boundary and philosophy
 

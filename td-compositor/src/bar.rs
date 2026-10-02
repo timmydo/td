@@ -1,21 +1,22 @@
 use crate::clock::Clock;
+use crate::text::{Text, CELL_HEIGHT};
 use crate::ui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Tall enough for one line of 2x glyphs with a little air. The tiling area
+/// Tall enough for one line of text cells with a little air. The tiling area
 /// is the output minus this, so the number is layout, not decoration.
 pub const BAR_HEIGHT: usize = 24;
-const TEXT_TOP: usize = 5;
+/// The text cell centred down the band.
+const TEXT_TOP: usize = (BAR_HEIGHT - CELL_HEIGHT) / 2;
 const TEXT_LEFT: usize = 8;
-const SCALE: usize = 2;
 const SEPARATOR: &str = "  ";
 pub(crate) const BACKGROUND: [u8; 4] = [0x18, 0x14, 0x20, 0];
 pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];
 /// Air either side of a workspace number inside its own cell. The cell is the
-/// number and this twice, so a workspace costs the status line twenty pixels
+/// number and this twice, so a workspace costs the status line sixteen pixels
 /// rather than a fixed column — which matters, since the two share one strip
 /// and the clock is what gives way when they do not both fit.
 const DESK_PAD: usize = 4;
@@ -473,25 +474,14 @@ fn decimal(number: u8, buffer: &mut [u8; 3]) -> &str {
 /// How wide `number` draws in the strip, cell air included.
 fn desk_width(number: u8) -> usize {
     let mut buffer = [0u8; 3];
-    decimal(number, &mut buffer)
-        .len()
-        .saturating_mul(ui::GLYPH_ADVANCE)
-        .saturating_mul(SCALE)
-        .saturating_add(DESK_PAD.saturating_mul(2))
+    Text::width(decimal(number, &mut buffer)).saturating_add(DESK_PAD.saturating_mul(2))
 }
 
-/// How far into its cell a label starts, so the INK lands centred. Padding
-/// both sides by `DESK_PAD` does not: a glyph's ADVANCE carries a trailing
-/// column the glyph never fills, so the number would sit a pixel left of
-/// centre — which is invisible on the strip and not inside the active cell,
-/// where a solid block surrounds it.
+/// How far into its cell a label starts. Each face centres a glyph's advance
+/// across its text cell, so centring the text cells centres the ink, which
+/// matters inside the active cell, where a solid block surrounds it.
 fn label_inset(cell_width: usize, label: &str) -> usize {
-    let ink = label
-        .len()
-        .saturating_mul(ui::GLYPH_ADVANCE)
-        .saturating_sub(ui::GLYPH_ADVANCE.saturating_sub(ui::GLYPH_WIDTH))
-        .saturating_mul(SCALE);
-    cell_width.saturating_sub(ink) / 2
+    cell_width.saturating_sub(Text::width(label)) / 2
 }
 
 /// Paint the strip across the top. The caller owns both the workspaces and
@@ -509,6 +499,7 @@ pub fn paint(
     width: usize,
     height: usize,
     stride: usize,
+    face: &Text,
     desks: &[u8],
     active: u8,
     launcher_open: bool,
@@ -538,23 +529,21 @@ pub fn paint(
         // needs no third colour and no glyph beside the number, and inverse
         // video says "you are here" without the operator being told which of
         // two shades of one hue means what.
-        let ink = if number == active {
+        let colors = if number == active {
             ui::fill(frame, width, height, stride, cell, INK);
-            BACKGROUND
+            (BACKGROUND, INK)
         } else {
-            INK
+            (INK, BACKGROUND)
         };
         let written = decimal(number, &mut label);
-        ui::draw_text_clipped(
+        face.draw(
             frame,
             width,
             height,
             stride,
-            at.saturating_add(label_inset(cell.2, written)),
-            TEXT_TOP,
-            SCALE,
+            (at.saturating_add(label_inset(cell.2, written)), TEXT_TOP),
             written,
-            ink,
+            colors,
             cell,
         );
         left = at.saturating_add(cell.2);
@@ -565,16 +554,14 @@ pub fn paint(
     // right-aligned, say — and it costs nothing to narrow, since a narrower
     // clip can only ever remove drawing.
     let text_left = left.saturating_add(TEXT_LEFT);
-    ui::draw_text_clipped(
+    face.draw(
         frame,
         width,
         height,
         stride,
-        text_left,
-        TEXT_TOP,
-        SCALE,
+        (text_left, TEXT_TOP),
         text,
-        INK,
+        (INK, BACKGROUND),
         (text_left, 0, width.saturating_sub(text_left), BAR_HEIGHT),
     );
 }
@@ -719,6 +706,7 @@ fn unix_epoch_secs() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::CELL_WIDTH;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1132,7 +1120,7 @@ Local:
             assert_eq!(written, format!("{number}"), "{number} is written wrong");
             assert_eq!(
                 desk_width(number),
-                written.len() * ui::GLYPH_ADVANCE * SCALE + DESK_PAD * 2
+                written.len() * CELL_WIDTH + DESK_PAD * 2
             );
         }
         // One buffer serves every cell in a paint, so a SHORTER number after a
@@ -1214,6 +1202,7 @@ Local:
                 width,
                 height,
                 stride,
+                &Text::default(),
                 &[1, 2],
                 active,
                 false,
@@ -1258,7 +1247,17 @@ Local:
         let stride = width * 4;
         let ink_left = |desks: &[u8], text: &str| {
             let mut frame = vec![0u8; stride * height];
-            paint(&mut frame, width, height, stride, desks, 0, false, text);
+            paint(
+                &mut frame,
+                width,
+                height,
+                stride,
+                &Text::default(),
+                desks,
+                0,
+                false,
+                text,
+            );
             // `position`, not the iterator method whose name is also a shell
             // command: this file is `include_str!`'d into the td-compositor
             // recipe, so its text is scanned as a bootstrap step's. Scanned
@@ -1275,19 +1274,38 @@ Local:
         // Active 0 is no workspace, so every cell here is a plain number and
         // the leftmost ink after the button is the FIRST one — which is what
         // says the strip starts with the workspaces rather than with the
-        // status line.
-        assert_eq!(ink_left(&[], "LOAD 0.42"), Some(LAUNCHER_WIDTH + TEXT_LEFT));
+        // status line. Each plus its glyph's own bearing: Unifont's
+        // columns, not the cell's.
+        let font = crate::font::pinned().unwrap();
+        let bearing = |character: char| {
+            let index = font.index(character);
+            (0..CELL_WIDTH)
+                .position(|x| (0..CELL_HEIGHT).any(|y| font.pixel(index, x, y)))
+                .unwrap()
+        };
+        assert_eq!(
+            ink_left(&[], "LOAD 0.42"),
+            Some(LAUNCHER_WIDTH + TEXT_LEFT + bearing('L'))
+        );
         assert_eq!(
             ink_left(&[7], "LOAD 0.42"),
-            Some(LAUNCHER_WIDTH + label_inset(desk_width(7), "7"))
+            Some(LAUNCHER_WIDTH + label_inset(desk_width(7), "7") + bearing('7'))
         );
 
-        // The number is CENTRED in its cell, air equal either side. Padding
-        // both sides by the same number does not centre it, since a glyph's
-        // advance carries a column it never inks — and off-centre is what an
-        // inverted cell, a block of ink around the number, makes visible.
+        // The number is CENTRED in its cell, air equal either side: off-centre
+        // is what an inverted cell, a block of ink around it, makes visible.
         let mut alone = vec![0u8; stride * height];
-        paint(&mut alone, width, height, stride, &[7], 0, false, "");
+        paint(
+            &mut alone,
+            width,
+            height,
+            stride,
+            &Text::default(),
+            &[7],
+            0,
+            false,
+            "",
+        );
         let inked: Vec<usize> = (0..desk_width(7))
             .filter(|x| {
                 let x = x + LAUNCHER_WIDTH;
@@ -1320,6 +1338,7 @@ Local:
                 narrow,
                 height,
                 stride,
+                &Text::default(),
                 &[1],
                 active,
                 false,
@@ -1534,10 +1553,9 @@ Local:
         );
         let failed = line(&Clock::Utc, &Readings::default());
         // `DOWN` spells a `W` that neither of the others does, and the
-        // interface NAME is a kernel-supplied string flowing into a 43-glyph
-        // font — `dev_valid_name` forbids only `/`, `:` and whitespace, so a
-        // name is not guaranteed to be spellable and this is what would say
-        // so.
+        // interface NAME is a kernel-supplied string: `dev_valid_name`
+        // forbids only `/`, `:` and whitespace, so a name is not guaranteed
+        // to be spellable and this is what would say so.
         let down = line(
             &Clock::Utc,
             &Readings {
@@ -1550,11 +1568,10 @@ Local:
             },
         );
         for text in [full.as_str(), failed.as_str(), down.as_str()] {
-            for byte in text.bytes() {
+            for character in text.chars() {
                 assert!(
-                    ui::is_mapped(byte),
-                    "{:?} in {text:?} has no glyph",
-                    byte as char
+                    crate::text::covered(character),
+                    "{character:?} in {text:?} has no glyph"
                 );
             }
         }
@@ -1571,6 +1588,7 @@ Local:
             width,
             height,
             stride,
+            &Text::default(),
             &[1, 2],
             1,
             false,
@@ -1594,9 +1612,10 @@ Local:
             .is_some_and(|row| row.iter().any(|byte| *byte != 0)));
 
         // The text sits WHOLLY inside the band, which "only its own rows"
-        // does not say: `draw_text_clipped`'s clip rect IS the band, so a
-        // `TEXT_TOP` that cut every glyph in half would clip rather than
-        // overflow and nothing above would notice.
+        // does not say: the text's clip rect IS the band, so a `TEXT_TOP`
+        // that cut every glyph in half would clip rather than overflow and
+        // nothing above would notice. Asserted as the bar's ink rows being
+        // the rows the same line inks drawn unclipped at `TEXT_TOP`.
         //
         // Scanned from where the STATUS starts, since the active workspace's
         // cell is a block of the same ink filling the band's full height.
@@ -1609,16 +1628,28 @@ Local:
                 })
             })
             .collect();
-        assert_eq!(
-            rows.first(),
-            Some(&TEXT_TOP),
-            "the text does not start at TEXT_TOP"
+        let mut free = vec![0u8; stride * height];
+        Text::default().draw(
+            &mut free,
+            width,
+            height,
+            stride,
+            (text_left, TEXT_TOP),
+            "LOAD 0.42",
+            (INK, BACKGROUND),
+            (0, 0, width, height),
         );
-        assert_eq!(
-            rows.last(),
-            Some(&(TEXT_TOP + ui::GLYPH_HEIGHT * SCALE - 1)),
-            "the text is clipped inside its own band"
-        );
+        let unclipped: Vec<usize> = (0..height)
+            .filter(|y| {
+                (text_left..width).any(|x| {
+                    let offset = y * stride + x * 4;
+                    free.get(offset..offset + 4) == Some(&INK[..])
+                })
+            })
+            .collect();
+        assert!(!rows.is_empty());
+        assert_eq!(rows, unclipped, "the text is clipped inside its own band");
+        const { assert!(TEXT_TOP + CELL_HEIGHT <= BAR_HEIGHT) };
     }
 
     #[test]
@@ -1634,6 +1665,7 @@ Local:
             width,
             height,
             stride,
+            &Text::default(),
             &[1],
             1,
             false,
@@ -1681,7 +1713,17 @@ Local:
         let stride = width * 4;
         let button = |open: bool| {
             let mut frame = vec![0u8; stride * height];
-            paint(&mut frame, width, height, stride, &[1], 0, open, "");
+            paint(
+                &mut frame,
+                width,
+                height,
+                stride,
+                &Text::default(),
+                &[1],
+                0,
+                open,
+                "",
+            );
             let mut pixels = Vec::new();
             for y in 0..BAR_HEIGHT {
                 for x in 0..LAUNCHER_WIDTH {

@@ -163,14 +163,15 @@ deployment and flip the compositor's pages, with a machine-id and host key
 the first boot created and the second found. Once a boot reports
 success, its display is captured through QMP, at most once a second for
 two minutes and before the boot is stopped, until the status bar's clock
-ends in the configured zone's offset, UTC+09:00 for Asia/Tokyo, in the
-compositor's own glyphs; a boot whose display never shows it fails. The
-offset is what the session observably applied: it does not tell Asia/Tokyo
-from another zone at UTC+09:00, so that the volume saved the chosen name
-rests on the review page and td-install's tests. Reading the saved name
-and the session's persistent home from the installed volume, and booting
-the medium itself through firmware, are still to be proven (increment 7);
-`./test-iso` boots the medium through firmware by hand.
+ends in the configured zone's offset, UTC+09:00 for Asia/Tokyo, drawn as
+the compositor draws it from the image's outline face; a boot whose
+display never shows it fails. The offset is what the session observably
+applied: it does not tell Asia/Tokyo from another zone at UTC+09:00, so
+that the volume saved the chosen name rests on the review page and
+td-install's tests. Reading the saved name and the session's persistent
+home from the installed volume, and booting the medium itself through
+firmware, are still to be proven (increment 7); `./test-iso` boots the
+medium through firmware by hand.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
 admits any UID-1000 peer at the intake, and on a live boot those include

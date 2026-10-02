@@ -239,7 +239,7 @@ mod tests {
                 Clock::Local(Zone::parse(&fixture(&[], &[(0, false, "UTC")], footer)).unwrap());
             let text = clock.stamp(Some(0));
             assert_eq!(text, expected);
-            assert!(text.bytes().all(crate::ui::is_mapped));
+            assert!(text.chars().all(crate::text::covered));
         }
         for (epoch, expected) in [
             (0, "1970-01-01 00:00:00 UTC"),

@@ -242,6 +242,15 @@ fn evaluator_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn E
         "Cargo.lock",
         "tests/recipe-eval-tool.sh",
         "builder/src/stage0.rs",
+        // Mounted into the evaluator by path (src/bin/td-recipe-eval.rs):
+        // the screen oracles draw the compositor's chrome text with them.
+        "td-ui/src/atlas.rs",
+        "td-ui/src/coverage.rs",
+        "td-ui/src/face.rs",
+        "td-ui/src/face_file.rs",
+        "td-ui/src/sfnt.rs",
+        "td-compositor/src/font.rs",
+        "td-compositor/src/font_data.rs",
     ]
     .iter()
     .map(|rel| root.join(rel))

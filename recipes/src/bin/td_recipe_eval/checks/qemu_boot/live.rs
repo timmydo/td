@@ -62,12 +62,26 @@ const DEFAULT_ZONE: &str = "Etc/UTC";
 /// How the installed session's status bar ends its clock in `ZONE`, which
 /// keeps nine hours ahead of UTC all year.
 const ZONE_ON_BAR: &str = " UTC+09:00";
+/// The recipe whose face the image's compositor draws its chrome in.
+const FACE_RECIPE: &str = "jetbrains-mono-nerd-font";
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     // Found before the long live run, which the cold boots follow.
     let (code, vars) = efi::firmware(&qemu)?;
     let (kernel, selector, deployment) = build_system(runner)?;
+    // The bar draws in the image's outline face: the oracle draws the
+    // expected text from the same recipe's regular style, before the long
+    // run, so a face it cannot draw fails first.
+    runner.prepare_recipe_target(FACE_RECIPE)?;
+    let face_out = runner.build_plan(FACE_RECIPE)?;
+    let face_dir = runner
+        .ladder_out_from(&face_out, FACE_RECIPE)?
+        .join(td_recipe::catalog::outline_face::DIR);
+    let zone_text = update::BarText::render(
+        crate::face_file::read(&face_dir, crate::face_file::REGULAR)?,
+        ZONE_ON_BAR,
+    )?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let scratch = Scratch {
         dir: create_scratch_dir(runner.scratch_dir(), &SEQ)?,
@@ -144,7 +158,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     // The medium is detached: the disk the wizard installed boots alone
     // through firmware, as the account and host it was given.
     let uuid = image_volume_identity(&scratch.dir.join(target_name))?;
-    let zone_on_bar = |pixels: &[u8]| update::bar_ends_with(pixels, ZONE_ON_BAR);
+    let zone_on_bar = |pixels: &[u8]| zone_text.ends(pixels);
     cold_boots(
         &qemu,
         &Firmware {

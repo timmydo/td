@@ -18,6 +18,7 @@ const MODULES: &[(&str, &str)] = &[
         "app_policy",
         include_str!("../../../td-busd/src/app_policy.rs"),
     ),
+    ("atlas", include_str!("../../../td-ui/src/atlas.rs")),
     (
         "attention",
         include_str!("../../../td-compositor/src/attention.rs"),
@@ -49,7 +50,10 @@ const MODULES: &[(&str, &str)] = &[
         "control",
         include_str!("../../../td-compositor/src/control.rs"),
     ),
+    ("coverage", include_str!("../../../td-ui/src/coverage.rs")),
     ("drm", include_str!("../../../td-compositor/src/drm.rs")),
+    ("face", include_str!("../../../td-ui/src/face.rs")),
+    ("face_file", include_str!("../../../td-ui/src/face_file.rs")),
     (
         "filter",
         include_str!("../../../td-compositor/src/filter.rs"),
@@ -114,11 +118,13 @@ const MODULES: &[(&str, &str)] = &[
         "session",
         include_str!("../../../td-compositor/src/session.rs"),
     ),
+    ("sfnt", include_str!("../../../td-ui/src/sfnt.rs")),
     (
         "socket",
         include_str!("../../../td-compositor/src/socket.rs"),
     ),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
+    ("text", include_str!("../../../td-compositor/src/text.rs")),
     (
         "timezone",
         include_str!("../../../td-compositor/src/timezone.rs"),
@@ -133,6 +139,32 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/vm_wire.rs"),
     ),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
+];
+
+/// Sibling sources staged beside the modules, at the paths the
+/// `target-recipe` side of each `cfg_attr` mount names.
+const STAGED_FILES: &[(&str, &str)] = &[
+    (
+        "auth/consent.rs",
+        include_str!("../../../td-authd/src/consent.rs"),
+    ),
+    (
+        "auth/channel.rs",
+        include_str!("../../../td-authd/src/channel.rs"),
+    ),
+    ("auth/sys.rs", include_str!("../../../td-authd/src/sys.rs")),
+    (
+        "tests/channel.rs",
+        include_str!("../../../td-authd/tests/channel.rs"),
+    ),
+    (
+        "tests/sys.rs",
+        include_str!("../../../td-authd/tests/sys.rs"),
+    ),
+    (
+        "tests/fonts.rs",
+        include_str!("../../../td-ui/tests/fonts/mod.rs"),
+    ),
 ];
 
 #[cfg(test)]
@@ -185,28 +217,10 @@ pub fn recipe() -> Recipe {
             path: directory.into(),
         });
     }
-    for (name, source) in [
-        (
-            "auth/consent.rs",
-            include_str!("../../../td-authd/src/consent.rs"),
-        ),
-        (
-            "auth/channel.rs",
-            include_str!("../../../td-authd/src/channel.rs"),
-        ),
-        ("auth/sys.rs", include_str!("../../../td-authd/src/sys.rs")),
-        (
-            "tests/channel.rs",
-            include_str!("../../../td-authd/tests/channel.rs"),
-        ),
-        (
-            "tests/sys.rs",
-            include_str!("../../../td-authd/tests/sys.rs"),
-        ),
-    ] {
+    for (name, source) in STAGED_FILES {
         steps.push(Step::WriteFile {
             path: format!("{{src}}/{name}"),
-            content: source.into(),
+            content: (*source).into(),
             exec: false,
         });
     }
@@ -447,6 +461,62 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-o", "{root}/session-tests"]));
+    }
+
+    /// A `#[path]` the flat layout cannot follow fails only in the target
+    /// build, since the host resolves it in the repository. So every path
+    /// mount in a staged source is a `cfg_attr` pair: the host side, or a
+    /// `target-recipe` side naming a file this recipe writes. main.rs alone
+    /// may mount host-only, since a top-level module's default path is the
+    /// flat file MODULES writes; a nested module's default is a directory
+    /// the recipe never makes.
+    #[test]
+    fn every_staged_path_mount_names_a_staged_file() {
+        let staged: Vec<String> = MODULES
+            .iter()
+            .map(|(name, _)| format!("{name}.rs"))
+            .chain(STAGED_FILES.iter().map(|(name, _)| (*name).to_string()))
+            .collect();
+        let sources = std::iter::once(("main", MAIN_RS)).chain(MODULES.iter().copied());
+        for (name, source) in sources {
+            let squeezed: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !squeezed.contains("#[path="),
+                "{name} has a bare path mount"
+            );
+            const HOST: &str = "#[cfg_attr(not(feature=\"target-recipe\")";
+            const TARGET: &str = "#[cfg_attr(feature=\"target-recipe\"";
+            // Where the last host-side mount ended: its target side must
+            // start exactly there, on the same `mod`.
+            let mut host_end = None;
+            for (at, _) in squeezed.match_indices("#[cfg_attr(") {
+                let attribute = &squeezed[at..];
+                let attribute = &attribute[..attribute.find(")]").expect("closed cfg_attr")];
+                let Some((_, path)) = attribute.split_once("path=\"") else {
+                    continue;
+                };
+                let path = path.split('"').next().expect("quoted path");
+                let end = at + attribute.len() + 2;
+                if attribute.starts_with(HOST) {
+                    assert!(
+                        name == "main" || squeezed[end..].starts_with(TARGET),
+                        "{name} has a host-only path mount"
+                    );
+                    host_end = Some(end);
+                    continue;
+                }
+                assert!(attribute.starts_with(TARGET), "{name}: {attribute}");
+                assert_eq!(
+                    host_end,
+                    Some(at),
+                    "{name} mounts {path} without its host side"
+                );
+                assert!(
+                    staged.iter().any(|file| file == path),
+                    "{name} mounts {path}, which the recipe does not stage"
+                );
+            }
+        }
     }
 
     #[test]

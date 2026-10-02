@@ -7,6 +7,24 @@
 )]
 mod app_policy;
 
+// td-ui's outline face, mounted as td-ui mounts this crate's font and wire:
+// the chrome's text draws through it (text.rs).
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/atlas.rs")]
+mod atlas;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/coverage.rs")]
+mod coverage;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/face.rs")]
+mod face;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/face_file.rs")]
+mod face_file;
+#[allow(dead_code, reason = "shared td-ui outline face")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-ui/src/sfnt.rs")]
+mod sfnt;
+
 mod attention;
 mod authority;
 mod bar;
@@ -40,6 +58,7 @@ mod server;
 mod session;
 mod socket;
 mod sys;
+mod text;
 mod timezone;
 mod ui;
 mod vm_bridge;
@@ -450,6 +469,10 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         }
     };
     runtime.enable_attention(options.terminal_authority);
+    runtime.set_text(text::load(
+        env::var_os(face_file::SETTING).as_deref(),
+        options.terminal_authority,
+    ));
     runtime.set_launcher_application(options.launcher_application.as_deref());
     runtime.set_launcher_authority(options.terminal_authority);
     if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
@@ -1083,11 +1106,22 @@ mod confinement {
     const AUTH_CHANNEL: &str = include_str!("../../td-authd/src/channel.rs");
     const AUTH_SYS: &str = include_str!("../../td-authd/src/sys.rs");
 
+    /// Sources another crate owns, mounted by path rather than kept in src.
+    const MOUNTED: &[&str] = &[
+        "app_policy.rs",
+        "atlas.rs",
+        "coverage.rs",
+        "face.rs",
+        "face_file.rs",
+        "sfnt.rs",
+    ];
+
     const OTHER: &[(&str, &str)] = &[
         (
             "app_policy.rs",
             include_str!("../../td-busd/src/app_policy.rs"),
         ),
+        ("atlas.rs", include_str!("../../td-ui/src/atlas.rs")),
         ("attention.rs", include_str!("attention.rs")),
         ("authority.rs", AUTHORITY),
         ("bar.rs", include_str!("bar.rs")),
@@ -1098,7 +1132,10 @@ mod confinement {
         ("configure.rs", include_str!("configure.rs")),
         ("conn.rs", include_str!("conn.rs")),
         ("control.rs", include_str!("control.rs")),
+        ("coverage.rs", include_str!("../../td-ui/src/coverage.rs")),
         ("drm.rs", include_str!("drm.rs")),
+        ("face.rs", include_str!("../../td-ui/src/face.rs")),
+        ("face_file.rs", include_str!("../../td-ui/src/face_file.rs")),
         ("filter.rs", include_str!("filter.rs")),
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
@@ -1119,7 +1156,9 @@ mod confinement {
         ("secret_client.rs", include_str!("secret_client.rs")),
         ("server.rs", include_str!("server.rs")),
         ("session.rs", include_str!("session.rs")),
+        ("sfnt.rs", include_str!("../../td-ui/src/sfnt.rs")),
         ("socket.rs", include_str!("socket.rs")),
+        ("text.rs", include_str!("text.rs")),
         ("timezone.rs", include_str!("timezone.rs")),
         ("ui.rs", include_str!("ui.rs")),
         ("vm_bridge.rs", include_str!("vm_bridge.rs")),
@@ -1516,7 +1555,7 @@ unsafe impl Send for MappedRegion {}"#;
         inventoried.extend(
             OTHER
                 .iter()
-                .filter(|(name, _)| *name != "app_policy.rs")
+                .filter(|(name, _)| !MOUNTED.contains(name))
                 .map(|(name, _)| (*name).to_string()),
         );
         inventoried.sort();

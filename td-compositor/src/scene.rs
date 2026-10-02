@@ -20,8 +20,8 @@ const BORDER: usize = 4;
 /// tile keeps this band and the client gets what is left, so the number is
 /// layout rather than decoration.
 pub(crate) const TITLE_HEIGHT: usize = 20;
-const TITLE_SCALE: usize = 2;
-const TITLE_TEXT_TOP: usize = 3;
+/// The text cell centred down the band.
+const TITLE_TEXT_TOP: usize = (TITLE_HEIGHT - crate::text::CELL_HEIGHT) / 2;
 const TITLE_TEXT_LEFT: usize = 6;
 const MAX_SCENE_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_INPUT_REGION_OPERATIONS: usize = 256;
@@ -489,9 +489,9 @@ pub(crate) fn band_buttons(band: Rect) -> Option<[Rect; BUTTONS.len()]> {
     // Room for the buttons AND a name beside them. `TITLE_TEXT_LEFT` is where
     // the text starts; one CELL past it is the least that reads as a title
     // rather than as a clipped smear — a cell being a glyph at the scale the
-    // titles are actually drawn, not at 1x, or the reserve is half of what it
-    // was meant to be and the smear is what the band shows.
-    let cell = ui::GLYPH_ADVANCE.saturating_mul(TITLE_SCALE);
+    // titles are actually drawn, or the reserve is less than one and the
+    // smear is what the band shows.
+    let cell = crate::text::CELL_WIDTH;
     let least = strip.saturating_add(TITLE_TEXT_LEFT).saturating_add(cell);
     // The same height `draw_button` needs, asked HERE so the two cannot
     // disagree about whether this band has buttons at all.
@@ -865,6 +865,7 @@ pub struct Scene {
     attention_request_attempted: bool,
     attention_notice: crate::attention::Notice,
     status: String,
+    text: crate::text::Text,
 }
 
 impl Scene {
@@ -904,7 +905,13 @@ impl Scene {
             attention_request_attempted: false,
             attention_notice: crate::attention::Notice::Menu,
             status: String::new(),
+            text: crate::text::Text::default(),
         }
+    }
+
+    /// The face the chrome's text draws through; a new scene draws Unifont.
+    pub(crate) fn set_text(&mut self, text: crate::text::Text) {
+        self.text = text;
     }
 
     pub(crate) fn set_launcher_authority(&mut self, available: bool) {
@@ -3158,16 +3165,17 @@ impl Scene {
             Some(first) => (band.x, band.y, first.x.saturating_sub(band.x), band.height),
             None => rect,
         };
-        ui::draw_text_clipped(
+        self.text.draw(
             frame,
             width,
             height,
             stride,
-            band.x.saturating_add(TITLE_TEXT_LEFT),
-            band.y.saturating_add(TITLE_TEXT_TOP),
-            TITLE_SCALE,
+            (
+                band.x.saturating_add(TITLE_TEXT_LEFT),
+                band.y.saturating_add(TITLE_TEXT_TOP),
+            ),
             title,
-            TITLE_TEXT,
+            (TITLE_TEXT, fill),
             text_clip,
         );
     }
@@ -3485,6 +3493,7 @@ impl Scene {
             width,
             height,
             stride,
+            &self.text,
             &desks,
             active,
             self.launcher.visible(),
@@ -3500,8 +3509,9 @@ impl Scene {
                 draw_hint(frame, width, height, stride, hint.area);
             }
         }
-        self.launcher.paint(frame, width, height, stride);
-        self.help.paint(frame, width, height, stride);
+        self.launcher
+            .paint(frame, width, height, stride, &self.text);
+        self.help.paint(frame, width, height, stride, &self.text);
         draw_pointer(
             frame,
             width,
@@ -5370,7 +5380,7 @@ mod tests {
         // Every text pixel in the OUTPUT is one of those: the clip holds the
         // overlong title inside the band, and the untitled window's band is
         // bare rather than carrying a placeholder. One count answers both,
-        // and a band drawn with no `draw_text_clipped` clip argument fails it.
+        // and a band drawn without the text's clip fails it.
         let whole = Rect {
             x: 0,
             y: 0,
@@ -5411,7 +5421,7 @@ mod tests {
         // nothing. `a_bands_least_width_...` pins the threshold itself.
         assert!(
             rects.first().unwrap().x.saturating_sub(band.x)
-                >= TITLE_TEXT_LEFT + ui::GLYPH_ADVANCE * TITLE_SCALE,
+                >= TITLE_TEXT_LEFT + crate::text::CELL_WIDTH,
             "no room left for a name"
         );
 
@@ -5713,10 +5723,10 @@ mod tests {
 
     #[test]
     fn a_bands_least_width_leaves_a_whole_title_cell_beside_the_buttons() {
-        // The reserve is a glyph at the scale titles are DRAWN at. Reserving an
-        // unscaled one leaves half a cell, which is the clipped smear the
-        // threshold exists to prevent.
-        let cell = ui::GLYPH_ADVANCE * TITLE_SCALE;
+        // The reserve is a cell as titles are DRAWN. Reserving less leaves
+        // part of one, which is the clipped smear the threshold exists to
+        // prevent.
+        let cell = crate::text::CELL_WIDTH;
         let least = BUTTON_WIDTH * BUTTONS.len() + TITLE_TEXT_LEFT + cell;
         let band = |width| Rect {
             x: 0,

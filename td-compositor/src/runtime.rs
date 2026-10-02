@@ -909,6 +909,10 @@ impl Runtime {
         self.scene.set_launcher_application(application);
     }
 
+    pub(crate) fn set_text(&mut self, text: crate::text::Text) {
+        self.scene.set_text(text);
+    }
+
     /// The output's width in SCANOUT pixels.
     ///
     /// Scanout and not logical: both callers are `require_surface_dimensions`,

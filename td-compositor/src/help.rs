@@ -1,3 +1,4 @@
+use crate::text::Text;
 use crate::ui;
 
 const CARD_WIDTH: usize = 620;
@@ -8,7 +9,7 @@ const ROW_STEP: usize = 26;
 const BOTTOM_PADDING: usize = 22;
 const KEYS_LEFT: usize = 20;
 const ACTION_LEFT: usize = 280;
-const SCALE: usize = 2;
+const CARD: [u8; 4] = [0x18, 0x20, 0x28, 0];
 
 /// One line of the cheat sheet, PAINTED as written. `input.rs` drives each
 /// row's real chord and derives both columns back, since nothing the
@@ -145,7 +146,7 @@ impl Help {
         self.visible
     }
 
-    pub fn paint(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
+    pub fn paint(&self, frame: &mut [u8], width: usize, height: usize, stride: usize, text: &Text) {
         if !self.visible {
             return;
         }
@@ -154,46 +155,43 @@ impl Help {
         let left = width.saturating_sub(card_width) / 2;
         let top = height.saturating_sub(card_height) / 2;
         let card = (left, top, card_width, card_height);
-        ui::fill(frame, width, height, stride, card, [0x18, 0x20, 0x28, 0]);
+        ui::fill(frame, width, height, stride, card, CARD);
         ui::border(frame, width, height, stride, card, [0x70, 0xc0, 0xf0, 0]);
-        ui::draw_text_clipped(
+        text.draw(
             frame,
             width,
             height,
             stride,
-            left.saturating_add(KEYS_LEFT),
-            top.saturating_add(TITLE_TOP),
-            SCALE,
+            (
+                left.saturating_add(KEYS_LEFT),
+                top.saturating_add(TITLE_TOP),
+            ),
             "TD KEY BINDINGS",
-            [0xff, 0xff, 0xff, 0],
+            ([0xff, 0xff, 0xff, 0], CARD),
             card,
         );
         for (index, row) in ROWS.iter().enumerate() {
             let row_top = top
                 .saturating_add(FIRST_ROW_TOP)
                 .saturating_add(index.saturating_mul(ROW_STEP));
-            ui::draw_text_clipped(
+            text.draw(
                 frame,
                 width,
                 height,
                 stride,
-                left.saturating_add(KEYS_LEFT),
-                row_top,
-                SCALE,
+                (left.saturating_add(KEYS_LEFT), row_top),
                 row.keys,
-                [0xb0, 0xd8, 0xf0, 0],
+                ([0xb0, 0xd8, 0xf0, 0], CARD),
                 card,
             );
-            ui::draw_text_clipped(
+            text.draw(
                 frame,
                 width,
                 height,
                 stride,
-                left.saturating_add(ACTION_LEFT),
-                row_top,
-                SCALE,
+                (left.saturating_add(ACTION_LEFT), row_top),
                 row.action,
-                [0xff, 0xff, 0xff, 0],
+                ([0xff, 0xff, 0xff, 0], CARD),
                 card,
             );
         }
@@ -213,9 +211,7 @@ mod tests {
     use super::*;
 
     fn text_width(text: &str) -> usize {
-        text.len()
-            .saturating_mul(ui::GLYPH_ADVANCE)
-            .saturating_mul(SCALE)
+        Text::width(text)
     }
 
     #[test]
@@ -234,20 +230,18 @@ mod tests {
 
     #[test]
     fn every_character_the_sheet_spells_is_in_the_font() {
-        // `SUPER+1..9` drew as `SUPER+1??9` until the font had a period: an
-        // unmapped byte fell to a glyph shaped like a question mark, so a
-        // gap in the font was unreadable as one.
+        // `SUPER+1..9` once drew as `SUPER+1??9` for want of a period, so a
+        // gap in the font was unreadable as one. Unifont is what draws a
+        // character the outline face lacks, so it must have them all.
         for row in ROWS {
-            for byte in row.keys.bytes().chain(row.action.bytes()) {
+            for character in row.keys.chars().chain(row.action.chars()) {
                 assert!(
-                    ui::is_mapped(byte),
-                    "{:?} in {:?} has no glyph",
-                    byte as char,
+                    crate::text::covered(character),
+                    "{character:?} in {:?} has no glyph",
                     row.keys
                 );
             }
         }
-        assert!(ui::is_mapped(b'?'), "the sheet's own SUPER+? row needs one");
     }
 
     #[test]
@@ -267,7 +261,7 @@ mod tests {
         }
         let last = FIRST_ROW_TOP
             .saturating_add(ROWS.len().saturating_sub(1).saturating_mul(ROW_STEP))
-            .saturating_add(ui::GLYPH_HEIGHT.saturating_mul(SCALE));
+            .saturating_add(crate::text::CELL_HEIGHT);
         assert!(last <= card_height(), "{last} rows past {}", card_height());
         // And the card the rows are sized against fits a real screen, which
         // `card_height` alone does not say: `paint` CLIPS it to the output, so
@@ -289,11 +283,11 @@ mod tests {
         let stride = width.saturating_mul(4);
         let mut frame = vec![0u8; stride.saturating_mul(height)];
         let mut help = Help::default();
-        help.paint(&mut frame, width, height, stride);
+        help.paint(&mut frame, width, height, stride, &Text::default());
         assert!(frame.iter().all(|byte| *byte == 0));
 
         help.set(true);
-        help.paint(&mut frame, width, height, stride);
+        help.paint(&mut frame, width, height, stride, &Text::default());
         let card_width = CARD_WIDTH;
         let card_height = card_height();
         let left = width.saturating_sub(card_width) / 2;
@@ -329,7 +323,7 @@ mod tests {
         let mut frame = vec![0u8; stride.saturating_mul(height)];
         let mut help = Help::default();
         help.set(true);
-        help.paint(&mut frame, width, height, stride);
+        help.paint(&mut frame, width, height, stride, &Text::default());
         let card_width = CARD_WIDTH.min(width.saturating_sub(CARD_PADDING.saturating_mul(2)));
         let card_height = card_height().min(height.saturating_sub(CARD_PADDING.saturating_mul(2)));
         let left = width.saturating_sub(card_width) / 2;

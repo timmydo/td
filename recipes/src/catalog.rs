@@ -653,14 +653,46 @@ mod named_dirs_tests {
     /// top-level `#[cfg(test)] mod`, found by its column-0 attribute over
     /// `mod x {` and closed by brace count outside literals and comments —
     /// not merely after the file's first `#[cfg(test)]`, which qemu_boot.rs
-    /// puts on single items in the middle of production code. The test
-    /// modules' own embeds prove the spans are found.
+    /// puts on single items in the middle of production code; a file mount
+    /// directly under its own `#[cfg(test)]` onto `mod x;` is test-only as
+    /// well. The test modules' own embeds prove the spans are found.
+    ///
+    /// The one exception is a line that is exactly `#[path = "..."]`
+    /// naming a file in `build.rs`'s own-source list, read with comments
+    /// stripped, so the verdict key holds its bytes: the face and Unifont
+    /// modules the screen oracles draw the compositor's chrome text with.
+    /// Only `qemu_boot/update.rs` and `live.rs` may name them, which serve
+    /// `qemu-boot-live`, a command rather than a recipe check, so no check
+    /// scope is owed.
     #[test]
     fn the_evaluator_embeds_crate_files_only_in_its_test_modules() {
         use crate::embed_scan::{block_end, strip_comments};
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest
+            .parent()
+            .expect("repository root")
+            .canonicalize()
+            .expect("canonical root");
+        let build =
+            strip_comments(&std::fs::read_to_string(manifest.join("build.rs")).expect("build.rs"));
+        let list = build
+            .find("let mut files: Vec<PathBuf> = [")
+            .and_then(|start| {
+                let end = start + build.get(start..)?.find("\n    ]")?;
+                build.get(start..end)
+            })
+            .expect("build.rs's own-source list");
+        let fingerprinted: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        let mounts = [
+            "crate::atlas",
+            "crate::coverage",
+            "crate::face",
+            "crate::font",
+            "crate::sfnt",
+        ];
+        let bin = manifest.join("src/bin");
         let mut pending = vec![bin];
-        let (mut seen, mut in_tests) = (0usize, 0usize);
+        let (mut seen, mut in_tests, mut mounted) = (0usize, 0usize, 0usize);
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).expect("list src/bin") {
                 let path = entry.expect("entry").path();
@@ -672,6 +704,16 @@ mod named_dirs_tests {
                     continue;
                 }
                 let code = strip_comments(&std::fs::read_to_string(&path).expect("read"));
+                let oracle = ["update.rs", "live.rs"]
+                    .iter()
+                    .any(|name| path.ends_with(format!("checks/qemu_boot/{name}")));
+                for module in mounts {
+                    assert!(
+                        oracle || !code.contains(module),
+                        "{}: names {module}, mounted for the screen oracles only",
+                        path.display()
+                    );
+                }
                 let mut spans: Vec<(usize, usize)> = Vec::new();
                 let mut offset = 0usize;
                 let mut after_attr = false;
@@ -690,22 +732,49 @@ mod named_dirs_tests {
                     after_attr = text == "#[cfg(test)]";
                     offset += line.len();
                 }
+                let lines: Vec<&str> = code.split_inclusive('\n').collect();
                 let mut offset = 0usize;
-                for (n, line) in code.split_inclusive('\n').enumerate() {
+                for (n, line) in lines.iter().enumerate() {
+                    // A file mount under its own `#[cfg(test)]`, onto `mod x;`.
+                    let test_mount = line.trim_start().starts_with("#[path")
+                        && n.checked_sub(1)
+                            .and_then(|before| lines.get(before))
+                            .is_some_and(|before| before.trim_end() == "#[cfg(test)]")
+                        && lines.get(n + 1).is_some_and(|after| {
+                            let after = after.trim_end();
+                            after.starts_with("mod ") && after.ends_with(';')
+                        });
                     let embeds = line.contains("include_str!")
                         || line.contains("include_bytes!")
                         || line.contains("#[path");
-                    if embeds && line.contains("td-") {
+                    // The whole line is the mount, so nothing else rides on it.
+                    let fingerprinted = line
+                        .trim()
+                        .strip_prefix("#[path = \"")
+                        .and_then(|rest| rest.strip_suffix("\"]"))
+                        .filter(|rel| !rel.contains('"'))
+                        .and_then(|rel| path.parent()?.join(rel).canonicalize().ok())
+                        .and_then(|file| {
+                            file.strip_prefix(&root)
+                                .ok()?
+                                .to_str()
+                                .map(|rel| fingerprinted.contains(&rel))
+                        })
+                        .unwrap_or(false);
+                    let in_span = spans
+                        .iter()
+                        .any(|(open, close)| (*open..*close).contains(&offset));
+                    if embeds && line.contains("td-") && fingerprinted {
+                        mounted += 1;
+                    } else if embeds && line.contains("td-") {
                         assert!(
-                            spans
-                                .iter()
-                                .any(|(open, close)| (*open..*close).contains(&offset)),
+                            test_mount || in_span,
                             "{}:{}: embed of a crate file outside a test module: {}",
                             path.display(),
                             n + 1,
                             line.trim()
                         );
-                        in_tests += 1;
+                        in_tests += usize::from(in_span);
                     }
                     offset += line.len();
                 }
@@ -717,5 +786,6 @@ mod named_dirs_tests {
             in_tests >= 4,
             "the test modules' own embeds prove the spans: {in_tests}"
         );
+        assert_eq!(mounted, 7, "the fingerprinted face and Unifont mounts");
     }
 }
