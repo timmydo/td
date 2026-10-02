@@ -74,6 +74,7 @@ enum Act {
     Discard,
     Delete,
     Replace,
+    AcceptSwap,
 }
 
 /// What a decision about unsaved changes was asked for.
@@ -89,6 +90,9 @@ type Dialog = confirmations::Controller<Act, u64, Focus>;
 
 enum Phase {
     Opening,
+    /// Swap on these devices can put memory on storage, and the person
+    /// has not accepted it: nothing is open.
+    Swap(Vec<String>),
     Refused(String),
     /// `keys` is `None` when no vault exists yet.
     Locked {
@@ -418,6 +422,11 @@ impl App {
         self.redraw = true;
         match reply {
             Reply::Opened { keys } | Reply::Locked { keys } => self.locked(keys),
+            Reply::Swap { devices } => {
+                self.phase = Phase::Swap(devices);
+                // Unasked for, so not where the pointer might click.
+                self.ask_swap(self.pointer);
+            }
             Reply::Refused { text } => {
                 self.clear();
                 self.phase = Phase::Refused(text.clone());
@@ -703,7 +712,7 @@ impl App {
     fn host_lock(&mut self, cause: HostCause) {
         match self.phase {
             // Nothing is held, or nothing is under way.
-            Phase::Opening | Phase::Refused(_) => return,
+            Phase::Opening | Phase::Swap(_) | Phase::Refused(_) => return,
             Phase::Locked { .. } if self.busy.is_none() => return,
             // The thread already has its lock; another would answer late,
             // over whatever the locked view is then doing.
@@ -764,7 +773,7 @@ impl App {
         self.busy.is_none()
             && matches!(
                 self.phase,
-                Phase::Opening | Phase::Refused(_) | Phase::Locked { .. }
+                Phase::Opening | Phase::Swap(_) | Phase::Refused(_) | Phase::Locked { .. }
             )
     }
 
@@ -1108,7 +1117,7 @@ impl App {
                 }
             }
         }
-        let [rect, ..] = layout::dialog(surface);
+        let [rect, ..] = layout::dialog(surface, self.dialog_rows());
         if let Some((dialog, _)) = &mut self.dialog {
             let outcome = dialog.event(
                 Some(self.dialog_revision),
@@ -1213,6 +1222,16 @@ impl App {
         self.open_dialog(&model, Some(then), opener);
     }
 
+    /// The rows of the question that is or would be open: in the swap
+    /// phase only the swap question can be.
+    fn dialog_rows(&self) -> i64 {
+        if matches!(self.phase, Phase::Swap(_)) {
+            layout::SWAP_ROWS
+        } else {
+            layout::DIALOG_ROWS
+        }
+    }
+
     /// Opens the dialog where neither of its actions lies under the
     /// pointer that opened it.
     fn open_dialog(
@@ -1220,8 +1239,8 @@ impl App {
         model: &dyn Fn() -> Result<Model<Act, u64>, confirmations::Error>,
         then: Option<Then>,
         opener: Option<(i64, i64)>,
-    ) {
-        for rect in layout::dialog(self.surface) {
+    ) -> bool {
+        for rect in layout::dialog(self.surface, self.dialog_rows()) {
             let dialog =
                 model().and_then(|model| Dialog::new(model, self.surface, rect, Some(self.focus)));
             let Ok(dialog) = dialog else {
@@ -1240,7 +1259,7 @@ impl App {
                 self.dialog = Some((dialog, then));
                 self.sync_focus();
                 self.redraw = true;
-                return;
+                return true;
             }
         }
         // No place fits, or every place puts an action under the pointer.
@@ -1249,6 +1268,7 @@ impl App {
         } else {
             "The window is too small for the question"
         });
+        false
     }
 
     fn run(&mut self, then: Then) {
@@ -1441,6 +1461,48 @@ impl App {
             )
         };
         self.open_dialog(&model, None, opener);
+    }
+
+    /// Asks whether to open over swap on storage: what it risks first,
+    /// then each device as its own detail, escaped and bounded, so any
+    /// table the kernel lists can be asked about. `opener`, the pointer
+    /// when the question comes unasked, keeps Open anyway from under it.
+    fn ask_swap(&mut self, opener: Option<(i64, i64)>) {
+        let Phase::Swap(devices) = &self.phase else {
+            return;
+        };
+        let mut details = Vec::with_capacity(devices.len().min(SWAP_DEVICES) + 5);
+        details.push(SWAP_SUMMARY.to_owned());
+        details.extend(
+            devices
+                .iter()
+                .take(SWAP_DEVICES)
+                .map(|device| shown(device)),
+        );
+        if let Some(more) = devices.len().checked_sub(SWAP_DEVICES).filter(|n| *n > 0) {
+            details.push(format!("and {more} more"));
+        }
+        details.extend([SWAP_SCOPE, SWAP_RISK, SWAP_REMEDY].map(str::to_owned));
+        self.dialog_revision += 1;
+        let revision = self.dialog_revision;
+        let model = move || {
+            let details: Vec<&str> = details.iter().map(String::as_str).collect();
+            Model::new(
+                "Swap on storage",
+                "Open anyway",
+                &details,
+                Act::AcceptSwap,
+                revision,
+            )
+        };
+        if self.open_dialog(&model, None, opener) {
+            self.say("Swap on storage is active: open anyway, or cancel");
+        }
+    }
+
+    /// Declining keeps nothing open; Return asks again.
+    fn swap_declined(&mut self) {
+        self.say("Swap on storage is active, so the vault stays closed: Return asks again");
     }
 
     fn delete_now(&mut self) {
@@ -1966,6 +2028,50 @@ fn fitted(note: &str) -> String {
     }
     format!("\u{2026}{}", flat.get(start..).unwrap_or_default())
 }
+
+/// What swap on storage risks, for the question that asks to accept it.
+const SWAP_SUMMARY: &str = "While td-pass runs, the kernel may write the PIN you \
+    type, the key that opens the vault and entry text to this swap, where they can \
+    stay after td-pass exits:";
+
+/// What accepting covers.
+const SWAP_SCOPE: &str = "Open anyway accepts that for this run only; td-pass \
+    asks again next time.";
+
+/// What storage swap exposes, and to whom.
+const SWAP_RISK: &str = "Turning swap off does not erase what was written. Anyone \
+    who can read that storage can read it, or who can unlock it if it is \
+    encrypted with a lasting key, as under full-disk encryption. Swap given a \
+    fresh key at every boot loses it at the next restart, not before. \
+    Hibernation writes all of memory to swap the same way.";
+
+/// The most devices the swap question lists one by one; the kernel
+/// allows fewer.
+const SWAP_DEVICES: usize = 64;
+
+/// The most characters of a device's name the question shows.
+const SWAP_NAME: usize = 512;
+
+/// `device` as the swap question shows it: control characters escaped,
+/// as a dialog shows none, the kernel's own escapes as it wrote them, and
+/// long names cut.
+fn shown(device: &str) -> String {
+    let mut escaped = device.chars().flat_map(|c| {
+        let control = c.is_control();
+        c.escape_default()
+            .filter(move |_| control)
+            .chain((!control).then_some(c))
+    });
+    let mut shown: String = escaped.by_ref().take(SWAP_NAME).collect();
+    if escaped.next().is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// How to open without the question.
+const SWAP_REMEDY: &str = "To avoid this, turn swap off (swapoff -a) or swap only \
+    to zram without a writeback device, then start td-pass again.";
 
 /// Of two pending follow-ons, the one that must not be lost: Quit over
 /// Lock over the rest, and the earlier of two alike.

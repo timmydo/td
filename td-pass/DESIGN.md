@@ -88,6 +88,24 @@ by this build, and an unreadable or repeated identity admits nothing;
 any other system runs standalone. No refusal falls back to the other
 mode.
 
+- **Swap.** td-secret admits swap that keeps pages in memory, zram
+  without a writeback device. Other active swap opens nothing: the vault
+  thread keeps td-secret's `SwapRisk` and names its devices, and the
+  window asks whether to open anyway, in a question as tall as the
+  window's body so at 800x600 all of it shows unscrolled. It says first
+  that the kernel may write the PIN being typed, the vault's key and
+  entry text to that swap, where they can outlive td-pass; then each
+  device, escaped and bounded so any swap table can be asked about; that
+  Open anyway covers this run only; that swapoff does not erase what was
+  written, that anyone who can read the storage, or unlock it under a
+  lasting key such as full-disk encryption, can read it, that a key
+  fresh at every boot loses it only at the next restart, and that
+  hibernation writes all of memory the same way; and how to avoid it:
+  swap off or zram. Cancel is the default and keeps the vault closed;
+  Return asks again. The question that comes unasked opens away from the
+  pointer. Open anyway passes the kept risk back, for those devices and
+  this process only; nothing is stored, and the next run asks again. A
+  device that appears later refuses the next token presentation.
 - **Vault thread.** `src/backend.rs` alone holds td-secret's `pass::Host`,
   the unlocked `Vault` and the enrolled keys' credentials, and serves the
   window's commands in order. A token operation blocks it, never the
@@ -232,26 +250,28 @@ feature mounts in place of the vault thread's td-secret calls and host
 watch, and which no recipe enables: two synthetic entries under one
 primary key whose PIN is 1234, unlocking and saving asking its presence
 and then its PIN in td-secret's words, a journal of what it was asked,
-and one-shot controls that refuse a save, save the entry elsewhere first
-so the save is stale, or hold a save in flight after its PIN until the
-window cancels it. Its build gives mode admission a synthetic identity,
-so it runs on td too. Over it they observe unlocking through both
-prompts, entry selection, select all and copy offered as the window's
-selection, a paste held by the compositor and released back to the
-window, an edit undone, the save, authorized through both prompts,
-carrying exactly the text against the revision read, a refused and a
-stale save, the closing question's Save meeting the stale revision and
-Discard closing, and a lock while a save is held asking only to discard,
-cancelling the save and saving nothing. After a lock the window shows
-the locked view it started on, the compositor's one arm finds no client
-selection, and no frame file the window keeps, read through `/proc`,
-holds any frame it kept while at rest unlocked, sampled over a second
-and a half. These observe the integrated result, and the frame check is
-not the scrub's oracle: td-compositor releases each buffer before the
-next frame, so the window repaints its one buffer and the first locked
-frame overwrites it whether or not the scrub ran. The check fails only
-if a second frame file survives the lock holding an unlocked frame;
-td-ui's own tests remain the scrub's oracle.
+and one-shot controls that report swap on storage at the first open,
+refuse a save, save the entry elsewhere first so the save is stale, or
+hold a save in flight after its PIN until the window cancels it. Its
+build gives mode admission a synthetic identity, so it runs on td too.
+Over it they observe unlocking through both prompts, entry selection,
+select all and copy offered as the window's selection, a paste held by
+the compositor and released back to the window, an edit undone, the
+save, authorized through both prompts, carrying exactly the text against
+the revision read, a refused and a stale save, the closing question's
+Save meeting the stale revision and Discard closing, and a lock while a
+save is held asking only to discard, cancelling the save and saving
+nothing, and swap on storage asked about before anything opens, Cancel
+keeping the vault closed until Open anyway. After a lock the window
+shows the locked view it started on, the compositor's one arm finds no
+client selection, and no frame file the window keeps, read through
+`/proc`, holds any frame it kept while at rest unlocked, sampled over a
+second and a half. These observe the integrated result, and the frame
+check is not the scrub's oracle: td-compositor releases each buffer
+before the next frame, so the window repaints its one buffer and the
+first locked frame overwrites it whether or not the scrub ran. The check
+fails only if a second frame file survives the lock holding an unlocked
+frame; td-ui's own tests remain the scrub's oracle.
 
 Not yet: a native case that a missing frame scrub would fail, which
 needs a compositor that holds the window's buffers across frames; the

@@ -4,8 +4,9 @@
 //! entries in memory under one primary key whose PIN is 1234, keeps no
 //! file but its journal, and watches no host. The case directory named
 //! by `TD_PASS_TEST_VAULT` holds the journal, one line per thing the
-//! vault was asked or did, and the case's one-shot controls: `fail`
-//! refuses the next save, `elsewhere` saves the entry from another
+//! vault was asked or did, and the case's one-shot controls: `swap`
+//! answers the first open with swap on storage the window must accept,
+//! `fail` refuses the next save, `elsewhere` saves the entry from another
 //! device first, so the next save is stale, and `hold` keeps the next
 //! save in flight after its PIN, as a token at work would, until the
 //! window cancels it. Unlocking and saving ask the key's presence and
@@ -72,8 +73,18 @@ pub(super) fn serve(
             answers,
         };
         let reply = match command {
+            Command::Open if vault.take("swap") => {
+                vault.note("open: swap");
+                Reply::Swap {
+                    devices: vec![SWAP.to_owned()],
+                }
+            }
             Command::Open => {
                 vault.note("open");
+                Reply::Opened { keys: Some(keys()) }
+            }
+            Command::AcceptSwap => {
+                vault.note("open: swap accepted");
                 Reply::Opened { keys: Some(keys()) }
             }
             Command::Unlock { op, key: 0 } => match vault.authorize(op, "unlock", UNLOCK) {
@@ -329,6 +340,9 @@ impl Vault<'_> {
 }
 
 const FINGERPRINT: &str = "0a0b0c0d";
+
+/// The storage swap device the `swap` control reports.
+const SWAP: &str = "/dev/test-swap";
 
 fn keys() -> Vec<KeyLabel> {
     vec![KeyLabel {

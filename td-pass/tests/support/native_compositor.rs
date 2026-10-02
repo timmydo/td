@@ -22,6 +22,7 @@ const OUTPUT_HEIGHT: usize = 600;
 
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_Q: u32 = 16;
+const KEY_ESC: u32 = 1;
 
 struct Compositor {
     child: Child,
@@ -326,6 +327,7 @@ impl Pass {
     }
 
     /// Waits for td-pass to exit, which it does for `what`.
+    #[cfg(feature = "test-vault")]
     fn exit(&mut self, what: &str) -> ExitStatus {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -402,8 +404,27 @@ fn the_window_maps_takes_the_keyboard_and_closes_on_ctrl_q() {
     };
     assert!(place.width > 0 && place.x + place.width <= OUTPUT_WIDTH);
     assert!(place.height > 0 && place.y + place.height <= OUTPUT_HEIGHT);
-    compositor.chord(&[KEY_LEFTCTRL], KEY_Q);
-    let status = pass.exit("Ctrl+Q closes the window");
+    // Where swap is on storage the window first asks whether to open over
+    // it, and the question takes Ctrl+Q: Escape declines it, and is
+    // nothing to the locked view.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut again = Instant::now();
+    let status = loop {
+        if let Some(status) = pass.exited() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl+Q closes the window within {TIMEOUT:?}\n{}",
+            pass.said()
+        );
+        if Instant::now() >= again {
+            compositor.chord(&[], KEY_ESC);
+            compositor.chord(&[KEY_LEFTCTRL], KEY_Q);
+            again = Instant::now() + Duration::from_millis(500);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(status.success(), "{}", pass.said());
     wait(&pass, "the closed window leaves the layout", || {
         (!compositor.listed(&place.window)).then_some(())
@@ -588,10 +609,22 @@ mod fixture {
         /// td-pass over a fresh test vault, mapped with the keyboard and
         /// settled on its locked view, which is returned.
         fn start() -> (Self, Vec<u8>) {
+            let case = Self::launch(&[]);
+            case.wait_line("open", 1);
+            let locked = case.settle();
+            (case, locked)
+        }
+
+        /// td-pass over a fresh test vault whose one-shot `controls` are
+        /// set before it opens, mapped with the keyboard.
+        fn launch(controls: &[&str]) -> Self {
             let session = Directory::new();
             let compositor = Compositor::start(&session);
             let client = Directory::new();
             let vault = Directory::new();
+            for control in controls {
+                std::fs::write(vault.0.join(control), b"").unwrap();
+            }
             let pass = Pass::start(
                 &client,
                 &compositor.directory.join("wayland-0"),
@@ -600,17 +633,14 @@ mod fixture {
             let place = wait(&pass, "the td-pass window maps with the keyboard", || {
                 compositor.focused("td-pass")
             });
-            let case = Self {
+            Self {
                 pass,
                 compositor,
                 place,
                 vault,
                 _client: client,
                 _session: session,
-            };
-            case.wait_line("open", 1);
-            let locked = case.settle();
-            (case, locked)
+            }
         }
 
         fn tap(&mut self, key: u32) {
@@ -954,6 +984,44 @@ mod fixture {
         case.unlock();
         case.ctrl(KEY_L);
         case.after("lock", 2);
+        case.close();
+    }
+
+    /// Swap on storage: the window asks before anything opens, Cancel
+    /// first. Cancel keeps the vault closed and Return asks again; Open
+    /// anyway opens it, and the notebook then unlocks as ever.
+    #[test]
+    #[ignore = "ready supplies the disposable native compositor"]
+    fn swap_on_storage_opens_only_once_accepted() {
+        let mut case = Case::launch(&["swap"]);
+        case.after("open: swap", 1);
+        let asked = case.compositor.tile(&case.place);
+        // Cancel, Open anyway: focus starts on Cancel.
+        case.tap(KEY_ENTER);
+        case.rest();
+        assert_ne!(case.compositor.tile(&case.place), asked);
+        assert!(!case
+            .lines()
+            .iter()
+            .any(|l| l.starts_with("open: swap accepted")));
+        case.tap(KEY_ENTER);
+        case.wait_tile(&asked, "Return asks again");
+        case.tap(KEY_TAB);
+        case.tap(KEY_ENTER);
+        case.after("open: swap accepted", 1);
+        case.unlock();
+        assert_eq!(
+            case.lines(),
+            [
+                "open: swap",
+                "open: swap accepted",
+                "ask unlock None",
+                "ask unlock Some(Authorize)",
+                "unlocked"
+            ]
+        );
+        case.ctrl(KEY_L);
+        case.after("lock", 1);
         case.close();
     }
 }

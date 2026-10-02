@@ -5,7 +5,7 @@
 //! every token operation ends when its `Cancel` is cancelled.
 
 use super::events;
-use super::host::{self, Entropy, Protected};
+use super::host::{self, Entropy, Protected, Refusal};
 use super::lifecycle::{
     self, AssertRequest, Asserted, Directory, EnrollRequest, Enrolled, Error, Hardware, KeyInfo,
     Presented, Session, TokenError, Tokens,
@@ -416,6 +416,30 @@ pub fn keys_of(copy: &[u8]) -> Result<Vec<Key>, Failure> {
         .collect())
 }
 
+/// Active swap on this host that can put memory on storage: the kernel
+/// may write the process's PINs, keys and entry text there, where they can
+/// outlive it, and hibernation writes all of memory the same way. Only
+/// `Host::open` makes one, naming every such device; passing it back
+/// accepts those devices for this process. The type proves which devices
+/// td-secret named, not that a person agreed: the caller must ask.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapRisk(Vec<String>);
+
+impl SwapRisk {
+    /// The devices, as `/proc/swaps` names them.
+    pub fn devices(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// What `Host::open` found.
+pub enum Opening {
+    Opened(Host),
+    /// Swap that can put memory on storage, which the account has not
+    /// accepted; nothing was opened.
+    Swap(SwapRisk),
+}
+
 /// This desktop account's vault in standalone mode: the protected
 /// process, the vault directory and the kernel's entropy. Choosing
 /// standalone mode is the caller's: on td the notebook uses the admitted
@@ -429,18 +453,26 @@ pub struct Host {
 
 impl Host {
     /// Protects the process and admits the account's vault directory; a
-    /// host that cannot keep PINs and keys out of dumps and swap is
-    /// refused here.
-    pub fn open() -> Result<Self, Failure> {
-        let protected = host::protect().map_err(|reason| Failure(Error::Refused(reason)))?;
+    /// host that cannot keep PINs and keys out of dumps is refused here.
+    /// Swap whose pages stay in memory, zram without a writeback device,
+    /// is admitted. Any other active swap is returned as a `SwapRisk`
+    /// unless `accepted`, one the account accepted from an earlier call,
+    /// names every such device; each presentation rechecks that no other
+    /// has appeared.
+    pub fn open(accepted: Option<SwapRisk>) -> Result<Opening, Failure> {
+        let protected = match host::protect(accepted.map(|risk| risk.0).unwrap_or_default()) {
+            Ok(protected) => protected,
+            Err(Refusal::Swap(devices)) => return Ok(Opening::Swap(SwapRisk(devices))),
+            Err(Refusal::Host(reason)) => return Err(Failure(Error::Refused(reason))),
+        };
         let directory = host::account_directory().map_err(Failure)?;
         let entropy = || Entropy::open().map_err(|reason| Failure(Error::Refused(reason)));
-        Ok(Self {
+        Ok(Opening::Opened(Self {
             protected,
             directory,
             random: entropy()?,
             tokens: entropy()?,
-        })
+        }))
     }
 
     /// The enrolled keys, or `None` when no vault exists yet.
@@ -806,7 +838,9 @@ mod tests {
             Error::Token(TokenError::Unavailable),
             Error::Token(TokenError::Denied),
             Error::Token(TokenError::Several),
-            Error::Token(TokenError::Host("swap or core dumps became enabled")),
+            Error::Token(TokenError::Host(
+                "swap the account did not accept, or core dumps, became enabled",
+            )),
         ];
         for entry in [
             EntryError::Missing,

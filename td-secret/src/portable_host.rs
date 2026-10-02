@@ -19,18 +19,132 @@ const DIRECTORY: i32 = 0o200000;
 // Linux's encoding of character device 1:9, /dev/urandom.
 const URANDOM: u64 = 0x109;
 
-/// Evidence that `protect` succeeded; opening a token requires it.
-pub(super) struct Protected(());
+/// Evidence that `protect` succeeded, with the storage swap devices the
+/// account accepted; opening a token requires it.
+pub(super) struct Protected {
+    accepted: Vec<String>,
+}
+
+/// Why `protect` refused.
+pub(super) enum Refusal {
+    /// Active swap that can put memory on storage, every such device by
+    /// the name `/proc/swaps` gives, not all of them accepted.
+    Swap(Vec<String>),
+    Host(String),
+}
 
 /// Refuses unless this is an ordinary desktop account whose PINs and vault
-/// keys can stay out of dumps and swap: the process becomes non-dumpable,
-/// swap must be off and the core-dump soft limit zero, as for the manual
-/// token diagnostic. `open` rechecks memory before every presentation.
-pub(super) fn protect() -> Result<Protected, String> {
-    fido_device::desktop_account()?;
-    crate::secret_request::require_protected_memory()?;
-    crate::pin_sys::protect_process().map_err(|_| "disable process dumps")?;
-    Ok(Protected(()))
+/// keys can stay out of dumps and off storage: the process becomes
+/// non-dumpable and the core-dump soft limit must be zero, as for the
+/// manual token diagnostic. Swap is admitted when every device keeps its
+/// pages in memory, or when the account accepted each of the others in
+/// `accepted`. `open` rechecks memory before every presentation.
+pub(super) fn protect(accepted: Vec<String>) -> Result<Protected, Refusal> {
+    fido_device::desktop_account().map_err(Refusal::Host)?;
+    memory(&accepted)?;
+    crate::pin_sys::protect_process().map_err(|_| Refusal::Host("disable process dumps".into()))?;
+    Ok(Protected { accepted })
+}
+
+/// The core-dump soft limit is zero, and no swap device can put memory on
+/// storage that `accepted` does not name.
+fn memory(accepted: &[String]) -> Result<(), Refusal> {
+    let limits = fs::read_to_string("/proc/self/limits")
+        .map_err(|_| Refusal::Host("cannot read this process's limits".into()))?;
+    let swaps = match fs::read_to_string("/proc/swaps") {
+        Ok(swaps) => Some(swaps),
+        // Linux registers /proc/swaps only when CONFIG_SWAP is enabled.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err(Refusal::Host("cannot read the host's swap".into())),
+    };
+    admitted(&limits, swaps.as_deref(), accepted, &|device, attribute| {
+        fs::read_to_string(Path::new("/sys/block").join(device).join(attribute))
+    })
+}
+
+/// `memory` over the process's `limits`, the host's `swaps`, `None`
+/// without swap support, and `sysfs` as `storage_swap` reads it.
+fn admitted(
+    limits: &str,
+    swaps: Option<&str>,
+    accepted: &[String],
+    sysfs: &dyn Fn(&str, &str) -> io::Result<String>,
+) -> Result<(), Refusal> {
+    core_limit_zero(limits)?;
+    let storage = match swaps {
+        Some(swaps) => storage_swap(swaps, sysfs)?,
+        None => Vec::new(),
+    };
+    if storage.iter().all(|device| accepted.contains(device)) {
+        Ok(())
+    } else {
+        Err(Refusal::Swap(storage))
+    }
+}
+
+fn core_limit_zero(limits: &str) -> Result<(), Refusal> {
+    let core = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max core file size"));
+    if core.and_then(|line| line.split_whitespace().next()) != Some("0") {
+        return Err(Refusal::Host(
+            "credential input requires a zero core-dump soft limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The active swap devices in `/proc/swaps`'s `swaps` that can put memory
+/// on storage. A zram device keeps its compressed pages in memory unless
+/// it has a writeback device: `backing_dev` reads `none`, or is absent in
+/// a kernel built without writeback, which `sysfs` shows by the zram
+/// attribute `comp_algorithm`. Every other device, a swap file, or a zram
+/// device whose attributes cannot be read is storage. `sysfs(device,
+/// attribute)` reads one block device attribute.
+fn storage_swap(
+    swaps: &str,
+    sysfs: &dyn Fn(&str, &str) -> io::Result<String>,
+) -> Result<Vec<String>, Refusal> {
+    let mut lines = swaps.lines();
+    if lines.next().is_none() {
+        return Err(Refusal::Host("the host's swap table is unreadable".into()));
+    }
+    let mut storage = Vec::new();
+    for line in lines {
+        // The kernel escapes space, tab, newline and backslash in a name and
+        // nothing else, so only those separate columns: a name holding any
+        // other whitespace stays whole and is never another device's.
+        let mut fields = line.split([' ', '\t']).filter(|field| !field.is_empty());
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        let Some(kind) = fields.next() else {
+            return Err(Refusal::Host("the host's swap table is unreadable".into()));
+        };
+        if !in_memory(name, kind, sysfs) {
+            storage.push(name.to_owned());
+        }
+    }
+    Ok(storage)
+}
+
+fn in_memory(name: &str, kind: &str, sysfs: &dyn Fn(&str, &str) -> io::Result<String>) -> bool {
+    let Some(device) = name.strip_prefix("/dev/") else {
+        return false;
+    };
+    let Some(number) = device.strip_prefix("zram") else {
+        return false;
+    };
+    if kind != "partition" || number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match sysfs(device, "backing_dev") {
+        Ok(backing) => backing.trim_end_matches('\n') == "none",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            sysfs(device, "comp_algorithm").is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 /// The account's vault directory: `$XDG_DATA_HOME/td-pass`, or
@@ -254,12 +368,13 @@ pub(super) fn choose(found: &[Device]) -> Result<Device, TokenError> {
 /// Opens the one connected token for a single bounded operation that
 /// `cancellation` can end, after rechecking that memory is still protected.
 pub(super) fn open(
-    _protected: &Protected,
+    protected: &Protected,
     _presented: Presented<'_>,
     cancellation: &Cancellation,
 ) -> Result<Session, TokenError> {
-    crate::secret_request::require_protected_memory()
-        .map_err(|_| TokenError::Host("swap or core dumps became enabled"))?;
+    memory(&protected.accepted).map_err(|_| {
+        TokenError::Host("swap the account did not accept, or core dumps, became enabled")
+    })?;
     let found = Device::discover_desktop()
         .map_err(|_| TokenError::Host("this process is not an ordinary desktop account"))?;
     let device = choose(&found)?;
@@ -311,6 +426,144 @@ impl Entropy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+
+    /// A sysfs where zram0 has no writeback device, zram1 writes back to
+    /// sda3, zram2 is from a kernel without writeback, and zram3's
+    /// attributes cannot be read.
+    fn sysfs(device: &str, attribute: &str) -> io::Result<String> {
+        match (device, attribute) {
+            ("zram0", "backing_dev") => Ok("none\n".into()),
+            ("zram1", "backing_dev") => Ok("/dev/sda3\n".into()),
+            ("zram2", "comp_algorithm") => Ok("lzo [zstd]\n".into()),
+            ("zram3", _) => Err(io::ErrorKind::PermissionDenied.into()),
+            _ => Err(io::ErrorKind::NotFound.into()),
+        }
+    }
+
+    fn storage(swaps: &str) -> Vec<String> {
+        match storage_swap(swaps, &sysfs) {
+            Ok(storage) => storage,
+            Err(_) => vec!["refused".to_owned()],
+        }
+    }
+
+    #[test]
+    fn zram_without_writeback_is_memory_and_everything_else_storage() {
+        assert!(storage(HEADER).is_empty());
+        assert!(storage(&format!("{HEADER}\n")).is_empty());
+        let line = |name: &str, kind: &str| format!("{name} {kind} 16777212 0 100\n");
+        for kept in [
+            line("/dev/zram0", "partition"),
+            line("/dev/zram2", "partition"),
+        ] {
+            assert!(storage(&format!("{HEADER}{kept}")).is_empty(), "{kept}");
+        }
+        for (name, kind) in [
+            ("/dev/zram1", "partition"),
+            ("/dev/zram3", "partition"),
+            ("/dev/zram4", "partition"),
+            ("/dev/zram0", "file"),
+            ("/dev/zramx", "partition"),
+            ("/dev/zram", "partition"),
+            ("/dev/sda2", "partition"),
+            ("/swapfile", "file"),
+            ("/tmp/dev/zram0", "partition"),
+        ] {
+            assert_eq!(
+                storage(&format!("{HEADER}{}", line(name, kind))),
+                [name],
+                "{name} {kind}"
+            );
+        }
+        assert_eq!(
+            storage(&format!(
+                "{HEADER}{}{}{}",
+                line("/dev/zram0", "partition"),
+                line("/dev/sda2", "partition"),
+                line("/swapfile", "file")
+            )),
+            ["/dev/sda2", "/swapfile"]
+        );
+        assert_eq!(storage(""), ["refused"]);
+        assert_eq!(storage(&format!("{HEADER}/dev/sda2\n")), ["refused"]);
+    }
+
+    #[test]
+    fn a_name_keeps_whitespace_the_kernel_does_not_escape() {
+        let table =
+            format!("{HEADER}/swap\u{a0}one file 1 0 -2\n/swap\u{a0}two\u{2003}x file 1 0 -3\n");
+        assert_eq!(
+            storage(&table),
+            ["/swap\u{a0}one", "/swap\u{a0}two\u{2003}x"]
+        );
+        assert_eq!(
+            storage(&format!("{HEADER}/swap\\040one\tfile\t1\t0\t-2\n")),
+            ["/swap\\040one"]
+        );
+    }
+
+    #[test]
+    fn storage_swap_is_admitted_only_where_every_device_was_accepted() {
+        let limits = "Max core file size 0 unlimited bytes\n";
+        let table = format!(
+            "{HEADER}/dev/zram0 partition 1 0 100\n/dev/sda2 partition 1 0 -2\n/swapfile file 1 0 -3\n"
+        );
+        let accepted = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let check = |names: &[&str]| admitted(limits, Some(&table), &accepted(names), &sysfs);
+        for partial in [&[][..], &["/dev/sda2"], &["/swapfile"], &["/dev/sda2 "]] {
+            match check(partial) {
+                Err(Refusal::Swap(devices)) => assert_eq!(devices, ["/dev/sda2", "/swapfile"]),
+                _ => panic!("{partial:?} admitted"),
+            }
+        }
+        assert!(check(&["/swapfile", "/dev/sda2"]).is_ok());
+        assert!(check(&["/dev/sda2", "/swapfile", "/dev/sdb1"]).is_ok());
+        // A device that appears after the acceptance is asked about again.
+        let grown = format!("{table}/dev/sdb1 partition 1 0 -4\n");
+        match admitted(
+            limits,
+            Some(&grown),
+            &accepted(&["/dev/sda2", "/swapfile"]),
+            &sysfs,
+        ) {
+            Err(Refusal::Swap(devices)) => {
+                assert_eq!(devices, ["/dev/sda2", "/swapfile", "/dev/sdb1"])
+            }
+            _ => panic!("a new device admitted"),
+        }
+        assert!(admitted(limits, None, &[], &sysfs).is_ok());
+        assert!(matches!(
+            admitted(
+                "Max core file size unlimited unlimited bytes\n",
+                None,
+                &[],
+                &sysfs
+            ),
+            Err(Refusal::Host(_))
+        ));
+        assert!(matches!(
+            admitted(limits, Some(""), &[], &sysfs),
+            Err(Refusal::Host(_))
+        ));
+    }
+
+    #[test]
+    fn only_a_zero_core_limit_is_admitted() {
+        let limits = |soft: &str| {
+            format!(
+                "Limit Soft Limit Hard Limit Units\nMax core file size {soft} unlimited bytes\n"
+            )
+        };
+        assert!(core_limit_zero(&limits("0")).is_ok());
+        for soft in ["unlimited", "1", "00 x"] {
+            assert!(core_limit_zero(&limits(soft)).is_err(), "{soft}");
+        }
+        assert!(core_limit_zero("").is_err());
+    }
 
     #[test]
     fn location_follows_xdg_and_ignores_relative_values() {

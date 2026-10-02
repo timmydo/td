@@ -221,22 +221,15 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
     let mut enrolled: Vec<pass::Key> = Vec::new();
     // A copy read for import, and the keys it opens with.
     let mut copy: Option<(Vec<u8>, Vec<pass::Key>)> = None;
+    // The swap the window last asked about, accepted only by `AcceptSwap`.
+    let mut risk: Option<pass::SwapRisk> = None;
     while let Ok(Job { command, cancel }) = jobs.recv() {
         let reply = match command {
-            Command::Open => match pass::Host::open().and_then(|opened| {
-                let listed = opened.keys()?;
-                Ok((opened, listed))
-            }) {
-                Ok((opened, listed)) => {
-                    host = Some(opened);
-                    Reply::Opened {
-                        keys: labels(&mut keys, listed),
-                    }
-                }
-                Err(failure) => Reply::Refused {
-                    text: failure.to_string(),
-                },
-            },
+            Command::Open => open(None, &mut host, &mut keys, &mut risk),
+            Command::AcceptSwap => {
+                let accepted = risk.take();
+                open(accepted, &mut host, &mut keys, &mut risk)
+            }
             Command::Create { op } => {
                 let mut asker = Asker {
                     op,
@@ -432,6 +425,40 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
         if replies.send(reply).is_err() {
             break;
         }
+    }
+}
+
+/// Opens the host, with the swap the person accepted, and lists its keys;
+/// swap not yet accepted is kept here and named to the window.
+fn open(
+    accepted: Option<pass::SwapRisk>,
+    host: &mut Option<pass::Host>,
+    keys: &mut Vec<pass::Key>,
+    risk: &mut Option<pass::SwapRisk>,
+) -> Reply {
+    let opened = pass::Host::open(accepted).and_then(|opening| match opening {
+        pass::Opening::Opened(opened) => {
+            let listed = opened.keys()?;
+            Ok(Ok((opened, listed)))
+        }
+        pass::Opening::Swap(swap) => Ok(Err(swap)),
+    });
+    match opened {
+        Ok(Ok((opened, listed))) => {
+            *risk = None;
+            *host = Some(opened);
+            Reply::Opened {
+                keys: labels(keys, listed),
+            }
+        }
+        Ok(Err(swap)) => {
+            let devices = swap.devices().to_vec();
+            *risk = Some(swap);
+            Reply::Swap { devices }
+        }
+        Err(failure) => Reply::Refused {
+            text: failure.to_string(),
+        },
     }
 }
 

@@ -666,7 +666,7 @@ fn a_question_asked_during_a_save_is_asked_again_when_it_ends() {
     app.input(Input::Resize(surface), &mut board);
     let after = app.dialog.as_ref().unwrap().0.rect();
     assert_ne!(after, before);
-    assert_eq!(after, layout::dialog(surface)[0]);
+    assert_eq!(after, layout::dialog(surface, layout::DIALOG_ROWS)[0]);
     // The save committed what was asked: nothing is left to discard, and
     // the lock goes ahead.
     app.reply(Reply::Committed {
@@ -926,7 +926,7 @@ fn a_question_opened_by_the_pointer_keeps_its_actions_away_from_it() {
     open(&mut app, &mut board, "Down", "body");
     key(&mut app, &mut board, "Return");
     typed(&mut app, &mut board, "x");
-    let centre = layout::dialog(app.surface)[0];
+    let centre = layout::dialog(app.surface, layout::DIALOG_ROWS)[0];
     let details = ["This entry has changes that are not saved."];
     let probe = Model::new("Unsaved changes", "Save", &details, Act::Save, 0)
         .and_then(|model| model.with_alternate("Discard", Act::Discard))
@@ -2106,4 +2106,173 @@ fn a_later_warning_keeps_why_the_notebook_locked() {
         app.status,
         "Locked: choose a key and press Unlock. Sleep may come before the lock"
     );
+}
+
+#[test]
+fn swap_on_storage_is_asked_about_and_opens_only_when_accepted() {
+    let mut board = Board::default();
+    let mut app = watched();
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Open)]));
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned(), "/swapfile".to_owned()],
+    });
+    assert!(matches!(&app.phase, Phase::Swap(devices) if devices == &["/dev/sda2", "/swapfile"]));
+    assert!(app.dialog.is_some());
+    assert!(app.settled());
+    // Cancel, Open anyway: focus starts on Cancel, which keeps it closed.
+    key(&mut app, &mut board, "Return");
+    assert!(app.dialog.is_none());
+    assert!(app.take_out().is_empty());
+    assert!(matches!(app.phase, Phase::Swap(_)));
+    assert!(app.status.contains("stays closed"));
+    // Unlock is not offered while the swap stands.
+    key(&mut app, &mut board, "C-o");
+    assert!(app.take_out().is_empty());
+    key(&mut app, &mut board, "Return");
+    assert!(app.dialog.is_some());
+    key(&mut app, &mut board, "Escape");
+    assert!(app.dialog.is_none());
+    assert!(app.take_out().is_empty());
+    key(&mut app, &mut board, "Return");
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Return");
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::AcceptSwap)]
+    ));
+    assert!(matches!(app.phase, Phase::Opening));
+    app.reply(Reply::Opened {
+        keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
+    });
+    assert!(matches!(app.phase, Phase::Locked { .. }));
+}
+
+#[test]
+fn the_swap_question_names_the_devices_and_what_they_risk() {
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned()],
+    });
+    let text = format!("{:?}", app.dialog.as_ref().map(|(dialog, _)| dialog));
+    for said in [
+        "/dev/sda2",
+        "the PIN you type, the key that opens the vault and entry text",
+        "stay after td-pass exits",
+        "does not erase",
+        "full-disk encryption",
+        "Hibernation",
+        "swapoff -a",
+        "zram",
+        "this run only",
+        "Open anyway",
+    ] {
+        assert!(text.contains(said), "{said}: {text}");
+    }
+}
+
+#[test]
+fn all_the_swap_question_says_shows_in_an_800_by_600_window() {
+    let mut app = watched();
+    app.take_out();
+    assert_eq!((app.surface.width, app.surface.height), (800, 600));
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned(), "/swapfile".to_owned()],
+    });
+    let (dialog, _) = app.dialog.as_ref().unwrap();
+    let shown = i64::from(dialog.details_rect().height) / layout::row(app.surface);
+    assert!(
+        dialog.detail_rows() as i64 <= shown,
+        "{} rows in {shown}",
+        dialog.detail_rows()
+    );
+}
+
+#[test]
+fn any_swap_table_can_be_asked_about() {
+    for devices in [
+        vec!["/swap\u{7}one".to_owned()],
+        vec!["/".repeat(5000)],
+        (0..200).map(|n| format!("/swap/{n:0>300}")).collect(),
+    ] {
+        let mut app = watched();
+        app.take_out();
+        app.reply(Reply::Swap { devices });
+        assert!(app.dialog.is_some(), "{}", app.status);
+    }
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Swap {
+        devices: vec!["/swap\u{7}one".to_owned()],
+    });
+    let text = format!("{:?}", app.dialog.as_ref().map(|(dialog, _)| dialog));
+    assert!(text.contains(r"/swap\\u{7}one"), "{text}");
+    assert_eq!(shown("/swap\\040one"), "/swap\\040one");
+    assert_eq!(shown("/a\u{7}\u{a0}b"), "/a\\u{7}\u{a0}b");
+    assert_eq!(
+        shown(&"x".repeat(600)),
+        format!("{}…", "x".repeat(SWAP_NAME))
+    );
+}
+
+#[test]
+fn the_swap_question_opens_away_from_the_pointer() {
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned()],
+    });
+    let (dialog, _) = app.dialog.as_ref().unwrap();
+    let open = dialog.action_rect(confirmations::Focus::Confirm).unwrap();
+    let pointer = (open.x + 1, open.y + 1);
+    let mut board = Board::default();
+    let mut app = watched();
+    app.take_out();
+    app.pointer = Some(pointer);
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned()],
+    });
+    match app.dialog.as_ref() {
+        Some((dialog, _)) => assert!(!dialog
+            .action_rect(confirmations::Focus::Confirm)
+            .unwrap()
+            .contains(pointer.0, pointer.1)),
+        None => {
+            assert_eq!(
+                app.status,
+                "No place for the question away from the pointer; use the keys"
+            );
+            // Asked for with Return, it opens where it fits.
+            key(&mut app, &mut board, "Return");
+            assert!(app.dialog.is_some());
+        }
+    }
+    assert!(app.take_out().is_empty());
+}
+
+#[test]
+fn closing_while_swap_is_asked_about_quits_with_nothing_open() {
+    let mut board = Board::default();
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned()],
+    });
+    // The question takes the keys; closing the window answers it.
+    app.input(Input::Close, &mut board);
+    assert!(app.quitting());
+    assert!(!app
+        .take_out()
+        .iter()
+        .any(|out| matches!(out, Out::Send(Command::AcceptSwap))));
+    // Declined, Ctrl+Q quits.
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned()],
+    });
+    key(&mut app, &mut board, "Escape");
+    key(&mut app, &mut board, "C-q");
+    assert!(app.quitting());
+    assert!(app.take_out().is_empty());
 }

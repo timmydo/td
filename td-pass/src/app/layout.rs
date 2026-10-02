@@ -189,15 +189,21 @@ pub fn prompt(surface: Surface, pin: bool) -> Prompt {
     }
 }
 
+/// A question's rows: a title, a few details and its actions.
+pub const DIALOG_ROWS: i64 = 7;
+/// The swap question's rows: at 800x600 the body's height, so all it says
+/// shows without scrolling.
+pub const SWAP_ROWS: i64 = 22;
+
 /// Where the confirmation dialog may go, in the order to try it: centred,
 /// then at the top and the bottom of the body, so its actions can be kept
 /// from under the pointer that opened it.
-pub fn dialog(surface: Surface) -> [Rect; 3] {
+pub fn dialog(surface: Surface, rows: i64) -> [Rect; 3] {
     let body = body(surface, &NOTEBOOK);
     let row = row(surface);
     let cell = cell(surface);
     let width = ((surface.width as i64) - 2 * cell).clamp(0, 56 * cell);
-    let height = (7 * row).min(i64::from(body.height));
+    let height = rows.saturating_mul(row).min(i64::from(body.height));
     let x = ((surface.width as i64) - width) / 2;
     let centre = body.y + (i64::from(body.height) - height) / 2;
     let bottom = body.y + i64::from(body.height) - height;
@@ -253,7 +259,7 @@ mod tests {
                 assert_eq!(row.intersection(inside), Some(row), "{row:?}");
             }
         }
-        for rect in dialog(surface) {
+        for rect in dialog(surface, DIALOG_ROWS) {
             assert_eq!(rect.intersection(surface.bounds()), Some(rect));
         }
     }

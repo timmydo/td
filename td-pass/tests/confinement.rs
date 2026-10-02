@@ -208,7 +208,28 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     let backend = source("backend.rs");
     assert!(backend.contains("use td_secret::pass;"));
     assert_eq!(backend.matches("td_secret").count(), 1);
-    assert_eq!(backend.matches("pass::Host::open()").count(), 1);
+    assert_eq!(backend.matches("pass::Host::open(").count(), 1);
+    assert!(backend.contains("pass::Host::open(accepted)"));
+    // Swap is accepted only by the window's AcceptSwap, which passes back
+    // the risk this thread kept from the last open.
+    assert_eq!(backend.matches("risk.take()").count(), 1);
+    // and the window sends that only from Open anyway in its question.
+    let sent: Vec<usize> = [
+        "app/input.rs",
+        "app/layout.rs",
+        "app/mod.rs",
+        "app/paint.rs",
+    ]
+    .iter()
+    .map(|name| production(name).matches("Command::AcceptSwap").count())
+    .collect();
+    assert_eq!(sent, [1, 0, 0, 0]);
+    assert!(production("app/input.rs").contains(
+        "(Choice::Confirmed(Act::AcceptSwap), _) => {\n                        self.phase = Phase::Opening;\n                        self.out.push(Out::Send(Command::AcceptSwap));"
+    ));
+    assert!(
+        backend.contains("Command::AcceptSwap => {\n                let accepted = risk.take();")
+    );
     // Beside the vault, files reach folder listings and encrypted copies
     // alone: a copy is written as a new private file, never over another,
     // and read to a bound; only a partial copy it made is removed.

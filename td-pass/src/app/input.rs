@@ -77,6 +77,7 @@ impl App {
             return self.request(Then::Quit, None);
         }
         match self.phase {
+            Phase::Swap(_) if chord == "Return" => self.ask_swap(None),
             Phase::Locked { .. } => self.locked_key(chord),
             Phase::Importing { .. } => self.importing_key(chord),
             Phase::Unlocked(_) => self.notebook_key(chord, repeat, clipboard),
@@ -630,6 +631,11 @@ impl App {
                 self.sync_focus();
                 self.redraw = true;
                 match (choice, then) {
+                    (Choice::Confirmed(Act::AcceptSwap), _) => {
+                        self.phase = Phase::Opening;
+                        self.out.push(Out::Send(Command::AcceptSwap));
+                        self.say("Opening with the swap accepted for this run");
+                    }
                     (Choice::Confirmed(Act::Delete), _) => self.delete_now(),
                     (Choice::Confirmed(Act::Replace), _) => self.replace_now(),
                     (Choice::Confirmed(Act::Save), Some(then)) => self.save(Some(then)),
@@ -638,6 +644,8 @@ impl App {
                         self.run(then);
                     }
                     (Choice::Unavailable(error), _) => self.say(error.to_string()),
+                    // Anything but Open anyway declines the swap question.
+                    _ if matches!(self.phase, Phase::Swap(_)) => self.swap_declined(),
                     _ => {}
                 }
             }

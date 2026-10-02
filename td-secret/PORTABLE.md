@@ -1017,12 +1017,23 @@ notebook process composes them with its own host-authentication prompt.
 
 - **Process.** Protection requires the transport's desktop identity:
   unchanged user and group IDs and a nonzero uid. It makes the process
-  non-dumpable. Swap must be off and the core-dump soft limit zero, the
-  manual diagnostic's policy; a desktop with active swap is refused, not
-  warned. Opening a token requires the evidence protection returns and
-  rechecks swap and the core limit first, since the notebook process is
-  long-lived. Swap enabled while a vault key is already held is not
-  detected until the next presentation.
+  non-dumpable, and the core-dump soft limit must be zero, the manual
+  diagnostic's policy. Swap is admitted when every active device keeps
+  its pages in memory: a zram device without a writeback device, whose
+  `backing_dev` reads `none`, or is absent in a kernel built without
+  writeback while the zram attribute `comp_algorithm` is present. Any
+  other active swap (a partition, a swap file, a zram device that writes
+  back, or one whose attributes cannot be read) can put PINs, keys and
+  entry text on storage, where they outlive the process, and lets
+  hibernation write all of memory there. `Host::open` then opens nothing
+  and returns a `SwapRisk` naming every such device. The window explains
+  that risk and how to avoid it, and opens only if the person accepts
+  it, Cancel being the default; the acceptance covers those devices for
+  that process alone and is never stored. Opening a token requires the
+  evidence protection returns and rechecks the core limit and swap
+  first, refusing a storage device that was not accepted, since the
+  notebook process is long-lived. Swap enabled while a vault key is
+  already held is not detected until the next presentation.
 - **Location.** The vault directory is `$XDG_DATA_HOME/td-pass`, or
   `$HOME/.local/share/td-pass` when that variable is unset, empty or
   relative, as the XDG base directory specification requires. The adapter
@@ -1100,12 +1111,14 @@ both.
 
 - **Host.** `Host::open` applies the host adapter's process protection
   and admits the account's vault directory, refusing a host that cannot
-  keep PINs and keys out of dumps and swap. `keys` lists the enrolled
-  keys, or none when no vault exists. `create`, `unlock`, `import`,
-  `apply`, `add_key` and `replace_keys` are the lifecycle and notebook
-  operations above, over the production token adapter. Choosing
-  standalone mode is the caller's: on td the notebook uses the admitted
-  service, and no failed service request may lead to a `Host`.
+  keep PINs and keys out of dumps; swap that can put them on storage is
+  returned as a `SwapRisk`, opening nothing until the caller passes it
+  back accepted. `keys` lists the enrolled keys, or none when no vault
+  exists. `create`, `unlock`, `import`, `apply`, `add_key` and
+  `replace_keys` are the lifecycle and notebook operations above, over
+  the production token adapter. Choosing standalone mode is the
+  caller's: on td the notebook uses the admitted service, and no failed
+  service request may lead to a `Host`.
 - **Keys.** A `Key` is an enrolled key's role and public credential
   identity, with a `Fingerprint`: the first four bytes of the
   credential's SHA-256, so a person can tell backups apart. It holds no
@@ -1221,8 +1234,11 @@ without asking about unsaved changes.
   supported Sway setup locks through `loginctl lock-session`, for
   example from swayidle's `lock` event, and the Guix acceptance records
   that setup. Hibernation is sleep to logind and is reported the same
-  way; its image is the swap policy's question, which the host adapter
-  answers by refusing active swap.
+  way, so the notebook locks, dropping its key, before the image is
+  written. The image goes to whatever swap is active then, which may be
+  storage swap a hibernation hook turns on after td-pass checked; that
+  lock, not the swap policy, keeps the key out of it, and an unlocked
+  notebook that misses it is the gap the unwatched host warning names.
 - **Descriptors.** The watcher is td-secret's second descriptor receiver
   (`UNSAFE.md` §15). It calls the shared receive, adoption and disposal
   functions once each. An owning guard closes every descriptor a frame

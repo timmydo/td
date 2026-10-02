@@ -99,6 +99,9 @@ pub enum Change {
 pub enum Command {
     /// Protect the process, admit the vault directory and list its keys.
     Open,
+    /// Open again, the person having accepted the swap the last `Swap`
+    /// reply named, for this process.
+    AcceptSwap,
     Create {
         op: Op,
     },
@@ -171,6 +174,11 @@ pub enum Reply {
     /// The enrolled keys, `None` when the account holds no vault yet.
     Opened {
         keys: Option<Vec<KeyLabel>>,
+    },
+    /// Swap on these devices can put memory on storage; nothing is open
+    /// until the person accepts it with `AcceptSwap`.
+    Swap {
+        devices: Vec<String>,
     },
     /// This host cannot keep the notebook; nothing further is possible.
     Refused {

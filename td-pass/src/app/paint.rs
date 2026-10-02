@@ -201,7 +201,7 @@ impl Composition for Frame<'_> {
                     );
                 }
             }
-            Phase::Opening | Phase::Locking | Phase::Refused(_) => {
+            Phase::Opening | Phase::Swap(_) | Phase::Locking | Phase::Refused(_) => {
                 layout::strip(surface, &layout::LOCKED).emit(
                     [(false, false), (false, false), (false, false)],
                     damage,
