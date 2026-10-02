@@ -21,6 +21,7 @@ pub mod mime_base64;
 pub mod mime_charset;
 pub mod mime_headers;
 pub mod mime_input;
+pub mod mime_text;
 pub mod mime_unfold;
 pub mod observability;
 pub mod overlay;

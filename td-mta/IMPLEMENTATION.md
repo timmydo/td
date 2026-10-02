@@ -1238,7 +1238,14 @@ Initial independently landable increments:
   labels externally, report promotion/unknown/malformed diagnostics and charge
   scan/replay work. Cover all split points, late malformed suffixes, scalar
   boundaries, copied-state work, failure retirement and allocation counters.
-  MIME parameter binding, transfer-source rewind and body output remain open.
+  MIME parameter binding and body output remain open; M06i owns source replay.
+
+- **M06i — owned transfer-to-charset replay:** implemented one immutable source
+  borrow through optional complete prescan, checkpoint rewind and scalar
+  decoding. Share work/clock state, preserve transfer diagnostics, and retire
+  every failed operation. Cover exact ranges, short reads, direct/heuristic
+  labels, identity/base64, clock boundaries, replay I/O failure and allocation.
+  QP, nested sources, body-value filtering/truncation and JMAP remain open.
 
 Implement other header-form composition, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented

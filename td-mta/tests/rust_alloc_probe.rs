@@ -1120,6 +1120,126 @@ fn mime_checkpoints() {
     assert_eq!(COUNTERS.snapshot(), before, "transfer checkpoint allocated");
 }
 
+fn mime_text() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        body_charset::Plan,
+        mime_input::Checkpoints,
+        mime_text::{Input, Reader, Status},
+        ports::{BlobReader, Clock, Deadline, Error, Tick, Time},
+        wire::TransferEncoding,
+    };
+    struct Source {
+        reads: usize,
+        fail: usize,
+    }
+    impl BlobReader for Source {
+        fn len(&self) -> u64 {
+            9
+        }
+        fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, Error> {
+            self.reads += 1;
+            if self.reads == self.fail {
+                return Err(Error::Busy);
+            }
+            let bytes = b"xxYQ==!yy".get(offset as usize..).ok_or(Error::Invalid)?;
+            let n = bytes.len().min(output.len());
+            output
+                .get_mut(..n)
+                .unwrap()
+                .copy_from_slice(bytes.get(..n).unwrap());
+            Ok(n)
+        }
+    }
+    struct GoodClock;
+    impl Clock for GoodClock {
+        fn sample(&self) -> Result<Time, Error> {
+            Ok(Time {
+                utc_ms: 0,
+                monotonic: Tick(1),
+            })
+        }
+    }
+    fn budget(records: u64) -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10000,
+                records,
+                output_bytes: 10000,
+                ..Charge::default()
+            },
+        )
+    }
+    let before = COUNTERS.snapshot();
+    for scenario in 0..3 {
+        let mut source = Source {
+            reads: 0,
+            fail: if scenario == 1 { 4 } else { usize::MAX },
+        };
+        let mut bytes = [0; 2];
+        let mut checkpoints = Checkpoints::default();
+        let mut reader = Reader::new(
+            Input {
+                source: &mut source,
+                offset: 2,
+                length: 5,
+                encoding: TransferEncoding::Base64,
+                charset: Plan::Prescan,
+            },
+            &mut bytes,
+            &mut checkpoints,
+        )
+        .unwrap();
+        let mut work = budget(if scenario == 2 { 0 } else { 10000 });
+        let mut written = 0;
+        let mut done = false;
+        for _ in 0..100 {
+            let step = reader.poll(&GoodClock, &mut work);
+            if reader.selection().is_some() {
+                assert!(!reader.selection().unwrap().is_encoding_problem);
+                assert!(reader.is_encoding_problem());
+            }
+            match step {
+                Ok(Status::Scalar(c)) => {
+                    assert_eq!(c, 'a');
+                    written += 1;
+                }
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete) => {
+                    assert_eq!(scenario, 0);
+                    assert_eq!(written, 1);
+                    assert!(reader.is_encoding_problem());
+                    let remaining = work.remaining();
+                    assert_eq!(
+                        reader.poll(&GoodClock, &mut work).unwrap(),
+                        Status::Complete
+                    );
+                    assert_eq!(work.remaining(), remaining);
+                    done = true;
+                    break;
+                }
+                Err(error) => {
+                    assert_ne!(scenario, 0);
+                    assert_eq!(written, 0);
+                    let mut fresh = budget(10000);
+                    let remaining = fresh.remaining();
+                    assert_eq!(reader.poll(&GoodClock, &mut fresh), Err(error));
+                    assert_eq!(fresh.remaining(), remaining);
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+    }
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "transfer/charset replay allocated"
+    );
+}
+
 fn body_charset() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -1772,6 +1892,7 @@ fn main() {
         mime_base64();
         mime_input();
         mime_headers();
+        mime_text();
         body_charset();
         mime_charset();
         mime_checkpoints();
@@ -1861,6 +1982,7 @@ fn main() {
     mime_base64();
     mime_input();
     mime_headers();
+    mime_text();
     body_charset();
     mime_charset();
     mime_checkpoints();

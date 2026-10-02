@@ -751,6 +751,12 @@ It streams scalars from the existing header arena, with charged work and no
 owned strings. Header selection, source collection and JSON/JMAP output
 remain separate.
 
+The transfer-to-charset owner retains one authorized immutable body borrow
+through prescan, checkpoint rewind and final scalar decoding. Both passes
+share charged work and a monotonic clock watermark, preserving diagnostics
+and retirement. It stages one byte within fixed state; body-value projection
+and protocol output remain separate.
+
 ## 10. HTTP and JMAP
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,

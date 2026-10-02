@@ -902,7 +902,42 @@ the final pass, brackets turns with fresh clock/cancellation checks and
 preserves retirement across any saved state. Prescan owns neither a source
 nor a replay buffer. Refusal is sticky even with a fresh meter and exposes
 no selection; completed state is stable without work. MIME parameter
-integration, source rewind and body-value output remain separate.
+integration and body-value output remain separate; section 1.19 owns
+transfer-source rewind.
+
+### 1.19 Owned transfer-to-charset reader
+
+mime_text::Reader constructs its private transfer Reader from one authorized
+immutable Input extent, caller stage bytes and Checkpoints. Input's charset
+plan comes from body_charset::Plan::from_label after parameter admission.
+It retains the source borrow for its whole lifetime; the caller cannot
+rebind its source or replace internal checkpoints. For absent/ASCII labels,
+save slot zero at the start, prescan the complete decoded extent, restore
+that exact start and decode again. Explicit selections use one pass. Both
+passes charge the same live meter, including source reads, transfer work,
+charset visits/scalars and checkpoint operations. Restore never refunds work
+or resets an earlier transfer diagnostic.
+
+One poll performs one transfer/checkpoint operation or one scalar turn,
+returning Yield, Scalar or Complete. One pending transfer byte bounds staging
+without another ring. There is no caller-output buffer or successful partial
+text after an error. A private shared clock watermark covers outer and nested
+samples; fresh pre/post samples bracket every turn, and a late clock/budget
+failure overrides the result. Errors retire the owner even if retried with a
+fresh meter; no further source or clock call occurs. Completed state is stable
+without work. The selection is available after prescan (or at construction
+for explicit labels) and is hidden after failure. The combined encoding
+flag remains provisional diagnostic information on failure and is final only
+at Complete. Nested errors name an operation: Input(Policy) can originate in
+its clock or I/O adapter, so it is not proof of disk failure. A stopped meter
+is reported as Work by the outer post-check when its clock sample succeeds;
+a late clock failure still takes precedence.
+
+Identity/base64 are supported through the existing transfer source; QP still
+refuses construction. This reader emits charset scalars, preserving NUL,
+noncharacters and line endings. Body-value CRLF/JSON filtering, truncation,
+MIME parameter integration and JMAP output remain separate. Live body/part
+authorization belongs to the caller and is not granted by range validation.
 
 ## 2. Read views and change history
 

@@ -783,8 +783,18 @@ state and future decoding cursor checkpoint. It borrows caller fragments
 and retains no source, body copy or output buffer. Its isolated allocation
 interval covers label selection, single-byte fragments, valid/malformed body
 completion, copied-state replay and fresh-meter refusal with unchanged Rust
-counters. Actual transfer-source rewinding and full body worker stacks remain
-unqualified; their scans must share the live work budget.
+counters. These measurements cover the standalone scan; the composite owner
+below owns transfer replay. Full body worker stacks remain unqualified.
+
+The transfer-to-charset Reader fits 512 bytes including its inline transfer
+Reader, charset/prescan state and one pending byte. It uses one existing
+6 KiB source partition and its 2 KiB checkpoint backing, reserving slot zero
+for rewind. Its inline state fits the conversion region's existing 2 KiB
+decoder/HTML/snippet state; no new ring, body copy or process allowance is
+added. A synthetic-source allocation interval covers two-pass base64 text,
+transfer diagnostics, replay I/O failure and sticky work refusal without
+changing Rust counters. Combined filesystem allocation, nested-source use,
+whole worker stacks and service RSS remain unqualified.
 
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
