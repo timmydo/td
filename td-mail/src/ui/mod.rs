@@ -15,7 +15,7 @@ pub mod views;
 use crate::attach;
 use crate::backend::{self, BackendCommand, BackendResponse};
 use crate::compose;
-use crate::config::{AccountConfig, RetentionPolicyConfig, SpamConfig};
+use crate::config::{AccountConfig, PasswordSource, RetentionPolicyConfig, SpamConfig};
 use crate::regex::UserRegex;
 use crate::rules::CompiledRule;
 use frame::{Draft, Dropdown, Frame, Layout, Pane};
@@ -33,7 +33,7 @@ use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase, Refusal};
 use views::compose::ComposeView;
 use views::drafts::DraftsView;
-use views::mailbox_list::MailboxListView;
+use views::mailbox_list::{AccountSetup, MailboxListView};
 use views::{Body, Scene, Scroll, Slot, ViewAction, ViewStack};
 
 /// The tenth of a second the terminal's read timed out at, kept as the
@@ -91,6 +91,9 @@ struct Setup {
     draft_dir: Option<PathBuf>,
     /// None offline: no connection is ever asked for.
     connector: Option<Sender<ConnectRequest>>,
+    /// The configuration the session was started from, which setting up
+    /// the placeholder account writes; none in a test.
+    config_path: Option<PathBuf>,
 }
 
 impl Setup {
@@ -112,6 +115,24 @@ impl Setup {
             self.retention_policies.clone(),
             self.sync_interval_secs,
         )
+        .with_setup(AccountSetup {
+            placeholder: account.placeholder(),
+            portal: match &account.password {
+                PasswordSource::Portal(name) => Some(name.clone()),
+                PasswordSource::Command(_) => None,
+            },
+            server: account.well_known_url.clone(),
+            username: account.username.clone(),
+            online: !self.offline,
+            refusal: if self.offline {
+                Some("td-mail was started --offline".to_string())
+            } else {
+                match &self.config_path {
+                    Some(path) => crate::config::editable(path, &account.name).err(),
+                    None => Some("td-mail was given no configuration file".to_string()),
+                }
+            },
+        })
     }
 
     /// Opens an account: its backend starts with no connection, so the
@@ -375,6 +396,11 @@ impl Session {
             ViewAction::Quit => self.quitting = true,
             ViewAction::Compose(draft) => self.compose(&draft),
             ViewAction::SwitchAccount(name) => self.switch_account(&name),
+            ViewAction::SetUpAccount {
+                account,
+                server,
+                username,
+            } => self.set_up_account(&account, &server, &username),
             ViewAction::Scroll(scroll) => {
                 let changed = match scroll {
                     Scroll::Lines(rows) => self.pane.scroll(rows),
@@ -972,6 +998,39 @@ impl Session {
         }
         self.last_idle_sync = Instant::now();
         self.redraw();
+    }
+
+    /// Writes the server and address the setup form was given into the
+    /// configuration for the account, and opens the account again as set
+    /// up, which connects it. A refusal leaves the file and the account as
+    /// they were and says why in the status row.
+    fn set_up_account(&mut self, account: &str, server: &str, username: &str) {
+        let current = self.setup.accounts.iter().find(|a| a.name == account);
+        let result = match (&self.setup.config_path, current) {
+            (Some(path), Some(current)) => {
+                crate::config::set_up_account(path, current, server, username)
+            }
+            (None, _) => Err("no configuration file to write".to_string()),
+            (_, None) => Err(format!("no account {account} in this session")),
+        };
+        match result {
+            Ok(updated) => {
+                crate::log_info!(
+                    "[Setup] {} set up for {}",
+                    updated.name,
+                    updated.well_known_url
+                );
+                if let Some(slot) = self.setup.accounts.iter_mut().find(|a| a.name == account) {
+                    *slot = updated;
+                }
+                self.switch_account(account);
+            }
+            Err(e) => {
+                crate::log_error!("[Setup] {} not set up: {}", account, e);
+                self.note = Some(format!("Not set up: {e}"));
+                self.redraw();
+            }
+        }
     }
 
     /// The window's title is the top view's, as its scene names it now,
@@ -1642,6 +1701,7 @@ pub fn run(
     custom_headers: Vec<String>,
     spam_config: SpamConfig,
     offline: bool,
+    config_path: PathBuf,
 ) -> io::Result<()> {
     // Read before the backend thread is spawned and the window opened, so
     // an index the account list does not hold fails with nothing to close.
@@ -1672,6 +1732,7 @@ pub fn run(
         offline,
         draft_dir: None,
         connector: (!offline).then(spawn_connector),
+        config_path: Some(config_path),
     };
 
     let endpoint = td_ui::wayland::endpoint(
@@ -1761,6 +1822,7 @@ mod frame_tests {
                     .join("drafts"),
             ),
             connector: None,
+            config_path: None,
         }
     }
 
@@ -1807,6 +1869,31 @@ mod frame_tests {
             .unwrap();
         assert_eq!(session.poll(0), Flow::Continue);
         (session, cmd_rx, resp_tx)
+    }
+
+    /// A setup the configuration refuses leaves the account and the view
+    /// as they were and says why in the status row; no backend is
+    /// replaced.
+    #[test]
+    fn a_refused_setup_is_a_note_and_changes_nothing() {
+        let (mut session, cmd_rx, _resp_tx) = session(true);
+        session.set_up_account("test", "mx.td.dev", "me@td.dev");
+        assert_eq!(
+            session.note.as_deref(),
+            Some("Not set up: no configuration file to write")
+        );
+        assert_eq!(session.setup.accounts[0].well_known_url, "");
+
+        let dir = crate::testing::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = "[account.test]\nwell_known_url = \"https://mx.td.dev/.well-known/jmap\"\nusername = \"u@td.dev\"\nsecret = \"portal\"\n";
+        std::fs::write(&path, text).unwrap();
+        session.setup.config_path = Some(path.clone());
+        session.set_up_account("test", "other.td.dev", "me@td.dev");
+        let note = session.note.clone().unwrap();
+        assert!(note.contains("has changed since td-mail read it"), "{note}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(cmd_rx.try_recv().is_err(), "a backend was replaced");
     }
 
     fn key(session: &mut Session, chord: &str) {

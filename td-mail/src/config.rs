@@ -637,6 +637,333 @@ fn require_field(value: Option<String>, err: &str) -> Result<String, ConfigError
     value.ok_or_else(|| ConfigError::Parse(err.to_string()))
 }
 
+/// RFC 2606's reserved names, and RFC 6761's `example` top-level domain: a
+/// host under one names no server, so an account that points at one is a
+/// placeholder to fill in, not a connection to try.
+fn reserved_example_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    ["example", "example.com", "example.net", "example.org"]
+        .iter()
+        .any(|reserved| {
+            host == *reserved
+                || host
+                    .strip_suffix(reserved)
+                    .is_some_and(|label| label.ends_with('.'))
+        })
+}
+
+/// The authority of an http(s) URL: what lies between the scheme and the
+/// path.
+fn url_authority(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    rest.split(['/', '?', '#']).next()
+}
+
+/// The host of an http(s) URL, without userinfo or port; an IPv6 literal
+/// keeps its brackets.
+fn url_host(url: &str) -> Option<&str> {
+    let host_port = url_authority(url)?.rsplit('@').next()?;
+    let host = if host_port.starts_with('[') {
+        // An IPv6 literal: hex digits, colons and a dotted IPv4 tail.
+        host_port
+            .find(']')
+            .and_then(|end| host_port.get(..=end))
+            .filter(|host| {
+                host.get(1..host.len().saturating_sub(1))
+                    .is_some_and(|inner| {
+                        inner.contains(':')
+                            && inner
+                                .bytes()
+                                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+                    })
+            })?
+    } else {
+        host_port.split(':').next()?
+    };
+    Some(host).filter(|host| !host.is_empty() && *host != "[]")
+}
+
+/// Whether what follows an http(s) URL's host is nothing or a port from 1
+/// to 65535.
+fn url_port_valid(url: &str) -> bool {
+    let (Some(authority), Some(host)) = (url_authority(url), url_host(url)) else {
+        return false;
+    };
+    let Some((_, after)) = authority
+        .rsplit('@')
+        .next()
+        .and_then(|h| h.split_once(host))
+    else {
+        return false;
+    };
+    match after.strip_prefix(':') {
+        None => after.is_empty(),
+        Some(port) => {
+            port.len() <= 5
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port
+                    .parse::<u32>()
+                    .is_ok_and(|port| (1..=65535).contains(&port))
+        }
+    }
+}
+
+impl AccountConfig {
+    /// Whether the account's server is a reserved example name, as the
+    /// account td-firstboot provisions is until it is set up.
+    pub fn placeholder(&self) -> bool {
+        url_host(&self.well_known_url).is_some_and(reserved_example_host)
+    }
+}
+
+/// The most bytes a server or address typed into the setup form may hold.
+const SETUP_FIELD_MAX: usize = 512;
+
+/// The discovery URL for what the setup form was given: a full
+/// `https://` URL as typed, or a bare host as its RFC 8620 well-known URL.
+pub fn discovery_url(server: &str) -> Result<String, String> {
+    let server = server.trim();
+    if server.is_empty() {
+        return Err("type the server: a host, or its https:// discovery URL".into());
+    }
+    if server.len() > SETUP_FIELD_MAX || server.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("the server holds a space, a control character or too many bytes".into());
+    }
+    let url = if server.starts_with("https://") {
+        server.to_string()
+    } else if server.contains("://") {
+        return Err("the server's URL must be https://".into());
+    } else if server.contains(['/', '?', '#', '@']) {
+        return Err("a bare server is a host name only; give a full https:// URL otherwise".into());
+    } else {
+        format!("https://{server}/.well-known/jmap")
+    };
+    // The URL is written to the configuration and the log: a password in
+    // it would be kept in both.
+    if url_authority(&url).is_some_and(|authority| authority.contains('@')) {
+        return Err("the server's URL holds a user name; the address is typed next".into());
+    }
+    match url_host(&url) {
+        None => Err("the server's URL names no host".into()),
+        Some(host) if reserved_example_host(host) => {
+            Err(format!("{host} is a reserved example name, not a server"))
+        }
+        Some(_) if !url_port_valid(&url) => {
+            Err("the server's port is not a number from 1 to 65535".into())
+        }
+        Some(_) => Ok(url),
+    }
+}
+
+/// The address the setup form was given, checked as a value to write.
+pub fn setup_username(username: &str) -> Result<String, String> {
+    let username = username.trim();
+    if username.is_empty() {
+        return Err("type the account's address or user name".into());
+    }
+    if username.len() > SETUP_FIELD_MAX || username.chars().any(char::is_control) {
+        return Err("the address holds a control character or too many bytes".into());
+    }
+    Ok(username.to_string())
+}
+
+/// A TOML basic string holding `value`, which holds no control character.
+fn toml_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Whether `line` is the table header `[account.NAME]` as TOML lets it be
+/// written: spaces inside the brackets, the name quoted, a comment after.
+fn is_account_header(line: &str, name: &str) -> bool {
+    let Some((inner, after)) = line
+        .trim()
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    else {
+        return false;
+    };
+    let after = after.trim();
+    if inner.starts_with('[') || !(after.is_empty() || after.starts_with('#')) {
+        return false;
+    }
+    let Some((table, key)) = inner.split_once('.') else {
+        return false;
+    };
+    let key = key.trim();
+    table.trim() == "account"
+        && (key == name || key.strip_prefix('"').and_then(|k| k.strip_suffix('"')) == Some(name))
+}
+
+/// `contents` with `[account.NAME]`'s `well_known_url` and `username`
+/// replaced and nothing else changed. Each key must be on one line of its
+/// own in that section, once, and the section written once, or the file
+/// is not one this edits.
+fn replace_account_server(
+    contents: &str,
+    name: &str,
+    url: &str,
+    username: &str,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(contents.len() + url.len() + username.len());
+    let mut sections = 0;
+    let mut in_section = false;
+    let mut replaced = [0usize; 2];
+    for line in contents.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = is_account_header(trimmed, name);
+            sections += usize::from(in_section);
+        }
+        let key = match trimmed.split_once('=') {
+            Some((key, _)) if in_section => key.trim(),
+            _ => "",
+        };
+        let (index, value) = match key {
+            "well_known_url" => (0, url),
+            "username" => (1, username),
+            _ => {
+                out.push_str(line);
+                continue;
+            }
+        };
+        if let Some(count) = replaced.get_mut(index) {
+            *count += 1;
+        }
+        let ending = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        out.push_str(&format!("{key} = {}{ending}", toml_string(value)));
+    }
+    if sections != 1 || replaced != [1, 1] {
+        return Err(format!(
+            "the configuration does not hold [account.{name}] with one well_known_url line and one username line"
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether the configuration at `path` holds account `name` where the
+/// setup form can change it, and why not when it does not.
+pub fn editable(path: &Path, name: &str) -> Result<(), String> {
+    let contents =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    replace_account_server(&contents, name, "", "").map(|_| ())
+}
+
+/// Sets the server and address of account `name` in the configuration at
+/// `path`, the rest of the file as it was. `current` is the account as
+/// td-mail runs it: the file must still hold its server and address, so
+/// an edit made behind td-mail's back is never overwritten. The new text
+/// is parsed whole, and the account checked in it, before it replaces
+/// the old file.
+pub fn set_up_account(
+    path: &Path,
+    current: &AccountConfig,
+    server: &str,
+    username: &str,
+) -> Result<AccountConfig, String> {
+    let url = discovery_url(server)?;
+    let username = setup_username(username)?;
+    // A link is followed, so its target is what is replaced.
+    let path =
+        fs::canonicalize(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    // Held from the read to the rename: a second setup at once waits, then
+    // reads the first one's file, so neither renames the other's sibling.
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let lock = fs::File::open(dir).map_err(|e| format!("cannot open {}: {}", dir.display(), e))?;
+    lock.lock()
+        .map_err(|e| format!("cannot lock {}: {}", dir.display(), e))?;
+    let contents =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let name = current.name.as_str();
+    let on_disk = Config::parse(&contents).map_err(|e| e.to_string())?;
+    if !on_disk.accounts.iter().any(|account| {
+        account.name == name
+            && account.well_known_url == current.well_known_url
+            && account.username == current.username
+    }) {
+        return Err(format!(
+            "[account.{name}] in {} has changed since td-mail read it; it is left as it is",
+            path.display()
+        ));
+    }
+    let updated = replace_account_server(&contents, name, &url, &username)?;
+    let config = Config::parse(&updated).map_err(|e| e.to_string())?;
+    let account = config
+        .accounts
+        .into_iter()
+        .find(|account| account.name == name)
+        .filter(|account| account.well_known_url == url && account.username == username)
+        .ok_or_else(|| format!("[account.{name}] did not parse back as written"))?;
+    write_replacing(&path, updated.as_bytes())
+        .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+    Ok(account)
+}
+
+/// Replaces the file at `path` whole: a sibling is written, flushed and
+/// renamed over it with the old file's permissions, so a crash leaves the
+/// old file or the new one, never part of either. The sibling's name is
+/// fixed, so one a crash left is the one removed next time.
+fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("the configuration path names no file"))?;
+    let mut temporary = file_name.to_os_string();
+    temporary.push(".setup");
+    let temporary = dir.join(temporary);
+    let permissions = fs::metadata(path)?.permissions();
+    match fs::remove_file(&temporary) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let written = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.set_permissions(permissions)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return written;
+    }
+    // Renamed is replaced: a directory that cannot be synced leaves the
+    // new file in place, and saying otherwise would leave the window on
+    // an account the file no longer holds.
+    if let Err(e) = fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+        crate::log_warn!(
+            "[Setup] {} renamed, its directory not synced: {}",
+            path.display(),
+            e
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,5 +1376,241 @@ secret = \"portal\"
         );
         assert_eq!(account.username, "you@example.com");
         assert_eq!(account.password, PasswordSource::Portal("main".to_string()));
+        assert!(account.placeholder());
+    }
+
+    #[test]
+    fn a_reserved_example_server_is_a_placeholder_and_no_other_is() {
+        let account = |url: &str| AccountConfig {
+            name: "a".to_string(),
+            well_known_url: url.to_string(),
+            username: "u@example.com".to_string(),
+            password: PasswordSource::Portal("a".to_string()),
+        };
+        for url in [
+            "https://mail.example.com/.well-known/jmap",
+            "https://EXAMPLE.org./x",
+            "http://u@a.b.example.net:8443/",
+            "https://host.example/",
+        ] {
+            assert!(account(url).placeholder(), "{url}");
+        }
+        for url in [
+            "https://api.fastmail.com/.well-known/jmap",
+            "https://myexample.com/",
+            "https://example.com.evil.org/",
+            "https://[2001:db8::1]:8443/",
+            "",
+            "example.com",
+        ] {
+            assert!(!account(url).placeholder(), "{url}");
+        }
+        assert_eq!(url_host("https://[::1]:8443/x"), Some("[::1]"));
+        assert_eq!(url_host("https://[]/"), None);
+        assert_eq!(url_host("https://[::1/"), None);
+    }
+
+    #[test]
+    fn the_setup_form_takes_a_host_or_an_https_discovery_url() {
+        assert_eq!(
+            discovery_url(" api.fastmail.com ").unwrap(),
+            "https://api.fastmail.com/.well-known/jmap"
+        );
+        assert_eq!(
+            discovery_url("https://mx.td.dev/jmap/session").unwrap(),
+            "https://mx.td.dev/jmap/session"
+        );
+        assert_eq!(
+            discovery_url("https://[2001:db8::1]:8443/.well-known/jmap").unwrap(),
+            "https://[2001:db8::1]:8443/.well-known/jmap"
+        );
+        for refused in [
+            "",
+            "http://mx.td.dev/",
+            "ftp://x",
+            "mx.td.dev/path",
+            "a b",
+            "https://",
+            "https://[]/",
+            "https://me:hunter2@mx.td.dev/",
+            "https://mx.td.dev:abc/",
+            "https://mx.td.dev:70000/",
+            "https://mx.td.dev:0/",
+            "https://mx.td.dev:/",
+            "mx.td.dev:99999",
+            "mail.example.com",
+            "https://x.example.org/",
+        ] {
+            assert!(discovery_url(refused).is_err(), "{refused}");
+        }
+        assert_eq!(
+            discovery_url("https://mx.td.dev:8443/jmap").unwrap(),
+            "https://mx.td.dev:8443/jmap"
+        );
+        assert_eq!(
+            discovery_url("mx.td.dev:8443").unwrap(),
+            "https://mx.td.dev:8443/.well-known/jmap"
+        );
+        for (input, reason) in [
+            ("https://", "names no host"),
+            ("https://[]/", "names no host"),
+            ("https://[::1/", "names no host"),
+            ("https://[foo]/", "names no host"),
+            ("https://[mail.example.com]/", "names no host"),
+            ("https://mx.td.dev:abc/", "port"),
+        ] {
+            let err = discovery_url(input).unwrap_err();
+            assert!(err.contains(reason), "{input}: {err}");
+        }
+        assert_eq!(setup_username(" me@td.dev ").unwrap(), "me@td.dev");
+        assert!(setup_username("  ").is_err());
+        assert!(setup_username("a\nb").is_err());
+    }
+
+    fn firstboot_account() -> AccountConfig {
+        Config::parse(FIRSTBOOT_CONFIG).unwrap().accounts.remove(0)
+    }
+
+    #[test]
+    fn setting_up_an_account_replaces_two_values_and_nothing_else() {
+        let dir = crate::testing::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = format!("{FIRSTBOOT_CONFIG}\n[ui]\npage_size = 50\n");
+        std::fs::write(&path, &text).unwrap();
+        // A sibling a crash left behind is not in the way.
+        std::fs::write(dir.path().join("config.toml.setup"), "stale").unwrap();
+        let placeholder = firstboot_account();
+        let account = set_up_account(&path, &placeholder, "mx.td.dev", "me\"\\@td.dev").unwrap();
+        assert_eq!(account.well_known_url, "https://mx.td.dev/.well-known/jmap");
+        assert_eq!(account.username, "me\"\\@td.dev");
+        assert_eq!(account.password, PasswordSource::Portal("main".to_string()));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written,
+            text.replace(
+                "https://mail.example.com/.well-known/jmap",
+                "https://mx.td.dev/.well-known/jmap"
+            )
+            .replace("\"you@example.com\"", "\"me\\\"\\\\@td.dev\"")
+        );
+        assert_eq!(Config::load(&path).unwrap().ui.page_size, 50);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // What td-mail no longer runs is not what the file holds: refused,
+        // and the file is as it was.
+        let err = set_up_account(&path, &placeholder, "other.td.dev", "x@td.dev").unwrap_err();
+        assert!(err.contains("has changed since td-mail read it"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        let mut absent = account.clone();
+        absent.name = "absent".to_string();
+        let err = set_up_account(&path, &absent, "mx.td.dev", "x@td.dev").unwrap_err();
+        assert!(err.contains("has changed since td-mail read it"), "{err}");
+
+        // An account set up with a typo is set up again from the window.
+        let fixed = set_up_account(&path, &account, "mx2.td.dev", "me@td.dev").unwrap();
+        assert_eq!(fixed.well_known_url, "https://mx2.td.dev/.well-known/jmap");
+        assert_eq!(
+            Config::load(&path).unwrap().accounts[0].username,
+            "me@td.dev"
+        );
+    }
+
+    /// Setups at once are taken in turn: one is written, every other
+    /// finds the file changed, and the file is always whole.
+    #[test]
+    fn setups_at_once_are_taken_in_turn() {
+        let dir = crate::testing::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for _ in 0..20 {
+            std::fs::write(&path, FIRSTBOOT_CONFIG).unwrap();
+            let threads: Vec<_> = (0..4)
+                .map(|n| {
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        set_up_account(
+                            &path,
+                            &firstboot_account(),
+                            &format!("mx{n}.td.dev"),
+                            "me@td.dev",
+                        )
+                        .is_ok()
+                    })
+                })
+                .collect();
+            let written = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|ok| *ok)
+                .count();
+            assert_eq!(written, 1);
+            let config = Config::load(&path).unwrap();
+            assert!(config.accounts[0].well_known_url.starts_with("https://mx"));
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_linked_configuration_is_replaced_at_its_target() {
+        let dir = crate::testing::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&target, FIRSTBOOT_CONFIG).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        set_up_account(&link, &firstboot_account(), "mx.td.dev", "me@td.dev").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("https://mx.td.dev/.well-known/jmap"));
+    }
+
+    #[test]
+    fn a_file_this_cannot_edit_line_by_line_is_left_alone() {
+        let twice = "[account.main]\nwell_known_url = \"https://a.example.com/\"\nwell_known_url = \"https://b.example.com/\"\nusername = \"u\"\n";
+        assert!(replace_account_server(twice, "main", "https://x/", "y").is_err());
+        let inline = "account.main = { well_known_url = \"https://a.example.com/\", username = \"u\", secret = \"portal\" }\n";
+        assert!(replace_account_server(inline, "main", "https://x/", "y").is_err());
+        let array =
+            "[[account.main]]\nwell_known_url = \"https://a.example.com/\"\nusername = \"u\"\n";
+        assert!(replace_account_server(array, "main", "https://x/", "y").is_err());
+        let other = "[account.work]\nwell_known_url = \"https://w/\"\nusername = \"w\"\n[account.main]\nwell_known_url = \"https://a.example.com/\"\r\nusername = \"u\"\r\n";
+        assert_eq!(
+            replace_account_server(other, "main", "https://x/", "y").unwrap(),
+            "[account.work]\nwell_known_url = \"https://w/\"\nusername = \"w\"\n[account.main]\nwell_known_url = \"https://x/\"\r\nusername = \"y\"\r\n"
+        );
+        // The header as TOML lets it be written.
+        for header in [
+            "[ account . main ]",
+            "[account.\"main\"]",
+            "[account.main]  # the one account",
+        ] {
+            let text = format!(
+                "{header}\nwell_known_url = \"https://a.example.com/\"\nusername = \"u\"\n"
+            );
+            let replaced = replace_account_server(&text, "main", "https://x/", "y").unwrap();
+            assert!(
+                replaced.contains("well_known_url = \"https://x/\""),
+                "{header}"
+            );
+        }
+        assert!(!is_account_header("[account.main] trailing", "main"));
+
+        // What the form can change is what the window offers it for: a
+        // legacy [jmap] account is not.
+        let dir = crate::testing::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, FIRSTBOOT_CONFIG).unwrap();
+        assert!(editable(&path, "main").is_ok());
+        assert!(editable(&path, "default").is_err());
+        std::fs::write(
+            &path,
+            "[jmap]\nwell_known_url = \"https://mail.example.com/\"\nusername = \"u\"\nsecret = \"portal\"\n",
+        )
+        .unwrap();
+        assert!(editable(&path, "default").is_err());
+        assert!(editable(&dir.path().join("absent"), "main").is_err());
+        assert!(!is_account_header("[account.mainx]", "main"));
     }
 }

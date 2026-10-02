@@ -84,6 +84,10 @@ pub fn run_password_command(cmd: &str) -> Result<String, String> {
 /// and nowhere else.
 pub const PORTAL_HELPER: &str = "/app/bin/td-secret";
 
+/// What every failure to get a credential from the portal begins with, so
+/// the window can tell it from a server's and say how to store one.
+pub const PORTAL_FAILURE: &str = "credential portal: ";
+
 /// Ask the credential portal for the secret stored as mail/NAME. The helper
 /// receives the secret over D-Bus and an fd and prints it. Trailing newlines
 /// go as they do for a command's output, so a secret stored from a file an
@@ -100,22 +104,22 @@ fn read_portal_credential_from(helper: &str, name: &str) -> Result<String, Strin
         .args(["get", name])
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("credential portal: {} did not run: {}", helper, e))?;
+        .map_err(|e| format!("{PORTAL_FAILURE}{} did not run: {}", helper, e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         return Err(if stderr.is_empty() {
             format!(
-                "credential portal: {} get {} failed with {}",
+                "{PORTAL_FAILURE}{} get {} failed with {}",
                 helper, name, output.status
             )
         } else {
-            format!("credential portal: {} get {}: {}", helper, name, stderr)
+            format!("{PORTAL_FAILURE}{} get {}: {}", helper, name, stderr)
         });
     }
     let mut password = String::from_utf8(output.stdout).map_err(|_| {
         format!(
-            "credential portal: {} get {}: the credential is not valid UTF-8",
+            "{PORTAL_FAILURE}{} get {}: the credential is not valid UTF-8",
             helper, name
         )
     })?;
@@ -174,6 +178,38 @@ mod portal_tests {
         let err = read_portal_credential_from(&absent, "main").unwrap_err();
         assert!(err.contains("did not run"), "{err}");
         assert!(err.contains(&absent), "{err}");
+
+        // A placeholder's credential is asked for, and its server is not:
+        // the helper's failure is the answer while the credential is
+        // withheld, and the placeholder's once it is handed over.
+        let (withheld, handed) = (
+            crate::testing::tempdir().unwrap(),
+            crate::testing::tempdir().unwrap(),
+        );
+        let mut placeholder = crate::config::AccountConfig {
+            name: "main".to_string(),
+            well_known_url: "https://mail.example.com/.well-known/jmap".to_string(),
+            username: "you@example.com".to_string(),
+            password: crate::config::PasswordSource::Command(helper(
+                withheld.path(),
+                "echo 'no such credential' >&2; exit 3",
+            )),
+        };
+        let err = crate::connect_account(&placeholder).err().unwrap();
+        assert!(err.contains("no such credential"), "{err}");
+        placeholder.password =
+            crate::config::PasswordSource::Command(helper(handed.path(), "echo secret"));
+        let err = crate::connect_account(&placeholder).err().unwrap();
+        assert!(
+            err.contains("is the provisioned placeholder; its server"),
+            "{err}"
+        );
+
+        // Every failure carries the prefix the window recognises.
+        for helper in [&refused, &silent, &bytes, &absent] {
+            let err = read_portal_credential_from(helper, "main").unwrap_err();
+            assert!(err.starts_with(super::PORTAL_FAILURE), "{err}");
+        }
     }
 }
 
@@ -186,6 +222,15 @@ pub fn read_password(source: &PasswordSource) -> Result<String, String> {
 
 pub fn connect_account(account: &AccountConfig) -> Result<JmapClient, String> {
     let password = read_password(&account.password)?;
+    // The credential is asked for first, as for any account, so the
+    // portal's answer is the same whether or not the account is set up;
+    // a placeholder's server is never asked anything.
+    if account.placeholder() {
+        return Err(format!(
+            "[account.{}] is the provisioned placeholder; its server {} is not contacted",
+            account.name, account.well_known_url
+        ));
+    }
     let (_session, client) =
         JmapClient::discover(&account.well_known_url, &account.username, &password).map_err(
             |e| match e {
@@ -663,6 +708,7 @@ fn main() {
         custom_headers,
         config.spam,
         offline,
+        config_path,
     );
 
     if let Err(e) = outcome {

@@ -9398,6 +9398,25 @@ receipt logging remains available after an enrolled session is unlocked. The tok
 proof of a client's read. The shipped helper's ordering and live transfer
 tests establish the read-before-acknowledgement behavior.
 
+The provisioned configuration lives in the application account's private
+home, which the human session cannot write, so td-mail sets the
+placeholder up itself. For an account whose server is an RFC 2606
+example name, td-mail still asks the portal for the credential, so the
+unenrolled boot's refusal above is unchanged, but never contacts the
+server. Its window says so, and `s` opens a two-field form (server host
+or `https://` discovery URL, then address); the same form is offered
+when a connection fails for a reason other than the portal, so a typing
+mistake is corrected the same way. td-mail replaces exactly those two
+lines of that `[account.NAME]` section, and only while the file still
+holds the server and address td-mail is running with; it parses the
+new text whole before writing it to a sibling and renaming it into
+place. A legacy `[jmap]` section, a duplicated key, an inline table and
+an offline session are refused, and the window says why. The password
+is never typed into td-mail. When the portal refuses the credential,
+the window shows the enrollment, unlock and `td-secret set` steps above
+with the portal's reason, and `a` connects again; it names no root
+path.
+
 Firstboot writes the placeholder into the store before creating portal-mode
 configuration. It imports an existing credential at the formerly provisioned
 mail password path, durably switches that configuration, and removes the

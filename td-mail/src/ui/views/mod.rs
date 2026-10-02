@@ -145,6 +145,13 @@ pub enum ViewAction {
     /// Retain the draft and edit it in the pane.
     Compose(crate::compose::ComposeDraft),
     SwitchAccount(String),
+    /// Write the server and address the setup form was given into the
+    /// configuration for the placeholder account, and open it again.
+    SetUpAccount {
+        account: String,
+        server: String,
+        username: String,
+    },
     Scroll(Scroll),
     /// A request of the pane's kind, served as the pane's own are: the
     /// session answers the clipboard's, and hands the view the rest
