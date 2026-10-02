@@ -878,6 +878,14 @@ service activation. Each part lands independently:
     I/O errors, buffer reuse and final selection. Existing allocation
     instrumentation covers both path bounds. Live cursor/floor policy and
     read-view pins remain future.
+  - **M05d14e — captured active changes:** implemented selected-prefix changes
+    over the same operation input as immutable history. Validate active identity
+    and byte admission, retain one checked frame of compact changes and finish
+    only at the captured sequence/offset. Prefix completion permits append growth
+    and refuses shrinkage or partial frames. Tests cover complete/incomplete
+    later appends, empty prefixes, short slots, I/O faults, mismatched views and
+    endpoint mismatch. Existing allocation instrumentation covers both root
+    bounds. Live cursor, history-floor and pin integration remain future.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

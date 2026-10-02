@@ -38,6 +38,11 @@ pub use active::{ActiveInput, ActiveInputError, CompleteActive};
 #[path = "store_fs/history.rs"]
 mod history;
 pub use history::{CompleteHistory, HistoryInput, HistoryInputError};
+#[path = "store_fs/active_changes.rs"]
+mod active_changes;
+#[path = "store_fs/change_input.rs"]
+mod change_input;
+pub use active_changes::{ActiveChangesInput, CompleteActiveChanges};
 #[path = "store_fs/history_changes.rs"]
 mod history_changes;
 pub use history_changes::{CompleteHistoryChanges, HistoryChangesInput};

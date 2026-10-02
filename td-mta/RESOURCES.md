@@ -761,6 +761,15 @@ opening, local frame progress, completion and refusal at both root bounds;
 that fixture allocation grants no new deployment reservation. Whole-worker
 stack/RSS and live serving-view integration remain pending.
 
+ActiveChangesInput uses the same private operation reader as HistoryChangesInput,
+with PrefixReader fixing its captured extent and prefix-only completion. Its
+compiled Provider layout also fits 8 KiB on the worker stack. Record scratch,
+CHANGE slots, transient Pending and read allowances are unchanged; append growth
+creates no new inventory. Existing root-bound allocation intervals cover empty
+and populated prefixes, checksum completion and admission/premature-finish
+refusals using the cold fixture record-buffer prefix. This is component evidence,
+not complete-worker memory qualification or live-view activation.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a

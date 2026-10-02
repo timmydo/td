@@ -29,23 +29,7 @@ impl LockedRoot {
         max_bytes: u64,
         scratch: &'b mut [u8; MAX_FRAME_BYTES],
     ) -> Result<ActiveInput<'r, 'c, 'm, 'b, C>, ActiveInputError> {
-        validate_view(selection, view)?;
-        if view.committed_offset > max_bytes {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
-        }
-        let selected = selection.manifest().header();
-        let file = self.open_journal_prefix(
-            selected.account,
-            Number::new(selected.active_segment).map_err(|_| FormatError::InvalidValue)?,
-            view.committed_offset,
-            (JOURNAL_HEADER_BYTES + MAX_JOURNAL_FRAME_BYTES) as u64,
-        )?;
-        let expected = JournalHeader {
-            account: selected.account,
-            epoch: selected.epoch,
-            segment: selected.active_segment,
-            base: selected.through,
-        };
+        let (file, expected) = open_selected(self, selection, view, max_bytes)?;
         let stream = FrameInput::new(crypto, file, expected, scratch)?;
         Ok(ActiveInput {
             stream,
@@ -54,6 +38,31 @@ impl LockedRoot {
             bytes: view.committed_offset,
         })
     }
+}
+pub(super) fn open_selected<'r>(
+    root: &'r LockedRoot,
+    selection: Selection<'_>,
+    view: ViewIdentity,
+    max_bytes: u64,
+) -> Result<(PrefixReader<'r>, JournalHeader), ActiveInputError> {
+    validate_view(selection, view)?;
+    if view.committed_offset > max_bytes {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+    }
+    let selected = selection.manifest().header();
+    let file = root.open_journal_prefix(
+        selected.account,
+        Number::new(selected.active_segment).map_err(|_| FormatError::InvalidValue)?,
+        view.committed_offset,
+        (JOURNAL_HEADER_BYTES + MAX_JOURNAL_FRAME_BYTES) as u64,
+    )?;
+    let expected = JournalHeader {
+        account: selected.account,
+        epoch: selected.epoch,
+        segment: selected.active_segment,
+        base: selected.through,
+    };
+    Ok((file, expected))
 }
 pub(super) fn validate_view(
     selection: Selection<'_>,
@@ -262,6 +271,15 @@ pub(super) fn probe(root: &LockedRoot, bytes: &ProbeBytes, scratch: &mut [u8; MA
         root.open_active_prefix(&td_crypto::Provider, selection, wrong, maximum, scratch),
         Err(ActiveInputError::Stream(_))
     ));
+    super::active_changes::probe(
+        root,
+        bytes,
+        scratch
+            .get_mut(..crate::format::table::MAX_RECORD_BYTES)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
 }
 
 #[cfg(test)]

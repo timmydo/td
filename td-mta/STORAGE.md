@@ -583,6 +583,26 @@ acquires runtime pins, implements ReadView::next_change or activates service.
 Full-prefix recovery/verification reuses an already admitted frame arena; it
 adds no per-view MiB reservation.
 
+`LockedRoot::open_active_changes` applies the same selected active-field,
+range and admitted-byte checks through a shared active-file opener, with
+compact CHANGE cells and per-call
+MAX_RECORD_BYTES operation scratch. The operation buffer is available to row
+lookups while checked changes are retained. It shares the private operation reader with
+HistoryChangesInput: identical header/operation/extent checks, slot reuse,
+8258-call frame budget and terminal failure rules. `frame` exposes checked
+provisional changes; `advance_frame` discards them before reading the next frame.
+Only the captured byte range is read, even when a complete or incomplete suffix
+exists at open or is appended later. A captured partial frame always fails.
+
+Consuming completion returns CompleteActiveChanges only after the captured
+prefix is consumed, remains physically present and matches the supplied
+sequence/offset. It retains a CompletePrefix, never converts to whole-file EOF
+proof and never hashes later appended bytes. A supplied endpoint with the wrong
+sequence fails completion even if each frame validates. This is provisional
+verification input: no frame becomes serving data before selected completion,
+final-view validation and actual pin/barrier checks. Retained history-floor and
+live next_change policy remain separate; no extra frame arena is reserved.
+
 ### Scanning a stopped active journal
 
 `LockedRoot::scan_active_journal` is read-only recovery input. The caller holds

@@ -68,8 +68,10 @@ caller slots and exposes them only after checksum completion. Incremental
 journal validation now connects those frames to a whole-journal checksum and
 bounded sequence progress; an abandoned frame retires its parent. Retained-
 history input can now read selected files with one operation buffer and compact
-change slots, requiring EOF/digest binding at completion. Live change cursors
-still need their pin and cursor-policy integration.
+change slots, requiring EOF/digest binding at completion. Active change input
+shares that operation reader while stopping at a captured prefix, allowing
+append growth and binding completion to its sequence/offset. Live change
+cursors still need their pin and cursor-policy integration.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

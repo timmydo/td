@@ -1,31 +1,16 @@
 //! Selected immutable history using operation scratch and retained change slots.
-use super::{input::fill_exact_using, CompleteFile, HistoryInputError, LockedRoot, StoreReader};
+use super::{change_input::ChangesInput, CompleteFile, HistoryInputError, LockedRoot, StoreReader};
 use crate::{
-    format::{
-        bindings::Selection,
-        frame::DecodeError,
-        journal_stream::{changes::Verifier, Error as StreamError, Summary},
-        operation,
-        table::MAX_RECORD_BYTES,
-        Error as FormatError, FRAME_FOOTER_BYTES, FRAME_HEADER_BYTES, JOURNAL_HEADER_BYTES,
-        MAX_FRAME_OPERATIONS, OPERATION_HEADER_BYTES,
-    },
+    format::{bindings::Selection, journal_stream::Summary, table::MAX_RECORD_BYTES},
     frame_changes::{Cell, CompleteChanges},
     ports::Crypto,
 };
-use std::io;
-
-const MAX_FRAME_READS: usize = 2 * MAX_FRAME_OPERATIONS + 66;
 
 pub struct HistoryChangesInput<'r, 'c, 'm, 'b, C: Crypto> {
-    file: StoreReader<'r>,
-    verifier: Verifier<'c, C>,
+    stream: ChangesInput<'c, 'b, C, StoreReader<'r>>,
     crypto: &'c C,
     selection: Selection<'m>,
     index: usize,
-    available: Option<&'b mut [Cell]>,
-    complete: Option<CompleteChanges<'b>>,
-    failed: bool,
 }
 impl LockedRoot {
     /// Caller admits bytes/work and retains actual recovery/view barriers and pins.
@@ -37,126 +22,33 @@ impl LockedRoot {
         max_bytes: u64,
         cells: &'b mut [Cell],
     ) -> Result<HistoryChangesInput<'r, 'c, 'm, 'b, C>, HistoryInputError> {
-        let (mut file, expected) =
-            super::history::open_selected(self, selection, index, max_bytes)?;
-        let mut bytes = [0; JOURNAL_HEADER_BYTES];
-        let mut attempts = super::journal_input::MAX_READ_CALLS;
-        fill_exact_using(&mut file, &mut bytes, &mut attempts, StoreReader::read)?;
-        let verifier = Verifier::new(crypto, &bytes)?;
-        if verifier.header() != expected {
-            return Err(FormatError::InvalidValue.into());
-        }
+        let (file, expected) = super::history::open_selected(self, selection, index, max_bytes)?;
+        let stream = ChangesInput::new(crypto, file, expected, cells)?;
         Ok(HistoryChangesInput {
-            file,
-            verifier,
+            stream,
             crypto,
             selection,
             index,
-            available: Some(cells),
-            complete: None,
-            failed: false,
         })
     }
 }
-fn invalid_frame(error: FormatError) -> HistoryInputError {
-    StreamError::Frame(DecodeError::Invalid(error.into())).into()
-}
 impl<'r, C: Crypto> HistoryChangesInput<'r, '_, '_, '_, C> {
     pub fn is_failed(&self) -> bool {
-        self.failed
+        self.stream.is_failed()
     }
     /// Locally checked changes only; whole-file selection and final-view proof remain pending.
     pub fn frame(&self) -> Option<&CompleteChanges<'_>> {
-        if self.failed {
-            None
-        } else {
-            self.complete.as_ref()
-        }
+        self.stream.frame()
     }
     /// Discards the previous frame, then reads one bounded frame. False is not EOF proof.
     pub fn advance_frame(
         &mut self,
         scratch: &mut [u8; MAX_RECORD_BYTES],
     ) -> Result<bool, HistoryInputError> {
-        self.advance_using(scratch, StoreReader::read)
-    }
-    fn advance_using(
-        &mut self,
-        scratch: &mut [u8; MAX_RECORD_BYTES],
-        mut read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
-    ) -> Result<bool, HistoryInputError> {
-        if self.failed {
-            return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
-        }
-        self.failed = true;
-        if let Some(previous) = self.complete.take() {
-            self.available = Some(previous.into_cells());
-        }
-        let remaining = self
-            .file
-            .len()
-            .checked_sub(self.file.position())
-            .ok_or_else(|| invalid_frame(FormatError::InvalidValue))?;
-        if remaining == 0 {
-            self.failed = false;
-            return Ok(false);
-        }
-        if remaining < FRAME_HEADER_BYTES as u64 {
-            return Err(invalid_frame(FormatError::InvalidValue));
-        }
-        let mut attempts = MAX_FRAME_READS;
-        let mut header = [0; FRAME_HEADER_BYTES];
-        fill_exact_using(&mut self.file, &mut header, &mut attempts, &mut read)?;
-        let cells = self
-            .available
-            .take()
-            .ok_or_else(|| invalid_frame(FormatError::InvalidValue))?;
-        let mut pending = self.verifier.begin(&header, cells)?;
-        let header = pending.header();
-        if header.frame_bytes as u64 > remaining {
-            return Err(invalid_frame(FormatError::InvalidValue));
-        }
-        let mut payload = header.payload_bytes().map_err(invalid_frame)?;
-        for _ in 0..header.operations {
-            if payload < OPERATION_HEADER_BYTES {
-                return Err(invalid_frame(FormatError::InvalidValue));
-            }
-            let prefix = scratch
-                .get_mut(..OPERATION_HEADER_BYTES)
-                .ok_or_else(|| invalid_frame(FormatError::Limit))?;
-            fill_exact_using(&mut self.file, prefix, &mut attempts, &mut read)?;
-            let length = operation::extent(prefix).map_err(invalid_frame)?;
-            payload = payload
-                .checked_sub(length)
-                .ok_or_else(|| invalid_frame(FormatError::InvalidValue))?;
-            let bytes = scratch
-                .get_mut(..length)
-                .ok_or_else(|| invalid_frame(FormatError::Limit))?;
-            fill_exact_using(
-                &mut self.file,
-                bytes
-                    .get_mut(OPERATION_HEADER_BYTES..)
-                    .ok_or_else(|| invalid_frame(FormatError::Limit))?,
-                &mut attempts,
-                &mut read,
-            )?;
-            pending.push(bytes)?;
-        }
-        if payload != 0 {
-            return Err(invalid_frame(FormatError::InvalidValue));
-        }
-        let mut footer = [0; FRAME_FOOTER_BYTES];
-        fill_exact_using(&mut self.file, &mut footer, &mut attempts, &mut read)?;
-        self.complete = Some(pending.finish(&footer)?);
-        self.failed = false;
-        Ok(true)
+        self.stream.advance_frame(scratch)
     }
     pub fn finish(self) -> Result<CompleteHistoryChanges<'r>, HistoryInputError> {
-        if self.failed {
-            return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
-        }
-        let summary = self.verifier.finish()?;
-        let file = self.file.finish()?;
+        let (file, summary) = self.stream.finish()?;
         self.selection
             .check_history_journal(self.crypto, self.index, summary)?;
         Ok(CompleteHistoryChanges { file, summary })
@@ -213,8 +105,13 @@ pub(super) fn probe(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
+    use super::super::change_input::MAX_FRAME_READS;
     use super::super::tests::Fixture;
     use super::*;
+    use crate::format::{
+        frame::DecodeError, journal_stream::Error as StreamError, Error as FormatError,
+        FRAME_HEADER_BYTES, JOURNAL_HEADER_BYTES, MAX_FRAME_OPERATIONS, OPERATION_HEADER_BYTES,
+    };
     use crate::{
         format::{
             container::{Current, Error as ContainerError, JournalHeader},
@@ -226,7 +123,7 @@ mod tests {
         ports::ChangeAction,
         store_paths::{AccountEntry, Name, Number},
     };
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, io, os::unix::fs::PermissionsExt};
     use td_crypto::{Digest, Provider};
     const ACCOUNT: AccountId = AccountId::from_bytes([0x33; 16]);
     struct Selected {
@@ -419,9 +316,11 @@ mod tests {
                 write(&root, &bytes);
             }
             let error = if mode == 3 {
-                input.advance_using(scratch.as_mut_slice().try_into().unwrap(), |_, _| {
-                    Err(io::ErrorKind::Interrupted.into())
-                })
+                input
+                    .stream
+                    .advance_using(scratch.as_mut_slice().try_into().unwrap(), |_, _| {
+                        Err(io::ErrorKind::Interrupted.into())
+                    })
             } else {
                 input.advance_frame(scratch.as_mut_slice().try_into().unwrap())
             };
@@ -545,7 +444,7 @@ mod tests {
                 .unwrap();
             let mut reads = 0;
             assert!(matches!(
-                input.advance_using(
+                input.stream.advance_using(
                     scratch.as_mut_slice().try_into().unwrap(),
                     |file, output| {
                         reads += 1;
@@ -560,7 +459,7 @@ mod tests {
             ));
             assert_eq!(reads, mode + 1);
             assert_eq!(
-                input.file.position(),
+                input.stream.position(),
                 (JOURNAL_HEADER_BYTES + FRAME_HEADER_BYTES + mode * OPERATION_HEADER_BYTES) as u64
             );
             assert!(input.is_failed());
@@ -585,7 +484,7 @@ mod tests {
             .unwrap();
         let mut calls = 0;
         assert!(
-            matches!(input.advance_using(scratch.as_mut_slice().try_into().unwrap(), |file, output| { calls+=1; file.read(output.get_mut(..1).unwrap()) }),
+            matches!(input.stream.advance_using(scratch.as_mut_slice().try_into().unwrap(), |file, output| { calls+=1; file.read(output.get_mut(..1).unwrap()) }),
             Err(HistoryInputError::Io(e)) if e.kind()==io::ErrorKind::WouldBlock)
         );
         assert_eq!(calls, MAX_FRAME_READS);
