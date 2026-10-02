@@ -145,6 +145,15 @@ still account for those costs and concurrent owners within the ledger.
   key/value result partitions. A finite combined row allowance covers both
   streams. Allocation instrumentation covers exact multiple-group and empty
   coverage with fixed input slices; no recipient collection is constructed.
+  Mailbox Sweep retains one ParentWalk, previous mailbox ID and scalar
+  progress; compiled state fits 512 bytes on the worker stack. It reuses caller
+  key/value outputs and adds no arena or visited set. Separate total row/get
+  allowances cover enumeration and repeated chain traversal. Each walk also
+  re-reads its starting row: total gets sum chain lengths including start and
+  root, so N root mailboxes need N gets. Shared chains may require quadratic
+  gets; the admission budget must account for that cost
+  and each lookup's full physical work. Allocation probes cover rooted shared
+  chains and an empty forest using fixed slices and result scratch.
   Frame-change collection has its own 4096 slots of at most 24 bytes each,
   a separate 96 KiB reservation per view. Retained changes may coexist with
   get/next result storage; their memory never aliases those partitions. This

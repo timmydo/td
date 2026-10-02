@@ -899,6 +899,30 @@ the caller also checks deadlines between advances. An advance after completion
 performs no get, but still refuses a changed view. Failed or unfinished walks
 cannot produce completion.
 
+`mailbox_sweep::Sweep` enumerates every supplied final mailbox and runs
+ParentWalk from each ID before advancing enumeration. Each advance performs
+one next or one get, never a whole chain. Validate local source encoding,
+sequence and strictly increasing mailbox IDs before admitting another row.
+Check full captured identity before/after enumeration and through each get;
+movement always reports the same top-level ChangedView. A finite row allowance
+limits completed mailboxes and a separate total-get allowance spans all walks.
+Give each new walk only the remaining allowance; exhausted work refuses rather
+than declaring a cycle or a valid forest. Empty views need neither allowance.
+
+Retain only one walker, previous mailbox ID, identity and scalar counts. No
+visited forest or chain cache is built. Each walk re-reads its starting row,
+even though enumeration already validated it. Total gets are the sum of every
+chain length including its start and root: N root mailboxes need N gets.
+Shared ancestors are read again, and a long chain can require quadratic total
+gets across its starting mailboxes.
+The caller admits those logical lookup counts and each lookup's full physical
+work and deadline. Completed chains report their own lookup count; only EOF
+after all chains rooted yields CompleteForest with identity, mailbox and total
+get counts. Every error retires the sweep; incomplete/failed state cannot finish.
+Repeated completion checks identity without I/O. This covers enumerated chains
+only: physical enumeration completeness, actual pins, configured depth policy
+and other graph invariants remain separate requirements.
+
 `row_references::ReferenceCheck` validates direct owning references of one
 supplied final row. Validate the source key/value and sequence ceiling first,
 then retain only the borrowed source key and at most two copied typed targets.

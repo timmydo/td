@@ -941,6 +941,13 @@ service activation. Each part lands independently:
     rows, duplicate keys, lookup/identity faults, malformed sources and terminal
     states. Allocation probes cover fixed populated/empty fixtures. Queue state
     policy, physical view completeness and actual pins remain separate.
+  - **M05d18 — all-mailbox parent validation:** implemented ordered enumeration
+    plus one incremental ParentWalk at a time. Each step performs one next or
+    get, with separate finite row/total-get allowances and view checks. Tests
+    cover rooted/shared chains, empty views, late cycles/missing parents,
+    exhausted work, corrupt/moved lookups and duplicate/descending enumeration.
+    Allocation probes cover populated/empty fixtures. Physical completeness,
+    configured depth policy and runtime pins remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

@@ -13,6 +13,7 @@ pub mod generations;
 pub mod ids;
 pub mod limits;
 pub mod mailbox_parents;
+pub mod mailbox_sweep;
 pub mod merge;
 pub mod observability;
 pub mod overlay;

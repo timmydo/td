@@ -774,6 +774,14 @@ key bytes before reusing value scratch, and reports row/table progress separatel
 from completion. Completion carries row counts and the same UTC sample; full
 physical graph/aggregate validity, parent chains, blobs and pins stay external.
 
+`mailbox_sweep::Sweep` enumerates mailboxes and checks each complete parent
+chain, at most one next or get per advance. Separate row and total-get budgets
+bound admitted work without a growing visited set. Completion requires mailbox
+EOF and every chain rooted under the same view identity. Cycles, missing or
+malformed rows, ordering/view changes and exhausted admission retire the sweep.
+CompleteForest carries identity/counts; physical completeness, pins and the
+configured depth policy remain external.
+
 `recipient_sweep::Sweep` checks exact recipient ordinals for every submission
 through one next per advance, preserving ordered progress in both tables. It
 requires both streams exhausted before completion and refuses missing/extra/
