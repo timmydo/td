@@ -1704,6 +1704,204 @@ fn mime_input() {
     assert_eq!(before, after, "MIME source input allocated");
 }
 
+fn mime_qp_input() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        body_charset::Plan,
+        mime_base64::Status,
+        mime_input::{Checkpoints, Error, Reader},
+        mime_text::{Input, Reader as TextReader, Status as Text},
+        ports::{BlobReader, Clock, Deadline, Error as PolicyError, Tick, Time},
+        wire::TransferEncoding,
+    };
+    struct Source {
+        calls: usize,
+        fail: bool,
+    }
+    impl BlobReader for Source {
+        fn len(&self) -> u64 {
+            9
+        }
+        fn read_at(&mut self, at: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
+            self.calls += 1;
+            if self.fail && self.calls == 3 {
+                return Err(PolicyError::Busy);
+            }
+            assert!((2..7).contains(&at));
+            assert!(output.len() as u64 <= 7 - at);
+            let input = b"xxa \tb=yy".get(at as usize..).unwrap();
+            let count = output.len().min(input.len());
+            output
+                .get_mut(..count)
+                .unwrap()
+                .copy_from_slice(input.get(..count).unwrap());
+            Ok(count)
+        }
+    }
+    struct GoodClock;
+    impl Clock for GoodClock {
+        fn sample(&self) -> Result<Time, PolicyError> {
+            Ok(Time {
+                utc_ms: 0,
+                monotonic: Tick(1),
+            })
+        }
+    }
+    fn budget() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10000,
+                records: 10000,
+                output_bytes: 10000,
+                ..Charge::default()
+            },
+        )
+    }
+    let before = COUNTERS.snapshot();
+    for fail in [false, true] {
+        let mut source = Source { calls: 0, fail };
+        let mut bytes = [0; 2];
+        let mut slots = Checkpoints::default();
+        let mut reader = Reader::with_checkpoints(
+            &mut source,
+            2,
+            5,
+            TransferEncoding::QuotedPrintable,
+            &mut bytes,
+            &mut slots,
+        )
+        .unwrap();
+        let mut work = budget();
+        reader.save_checkpoint(0, &GoodClock, &mut work).unwrap();
+        for replay in 0..2 {
+            if replay != 0 {
+                reader.restore_checkpoint(0, &GoodClock, &mut work).unwrap();
+            }
+            let mut written = 0;
+            let mut done = false;
+            for _ in 0..100 {
+                let mut byte = [0; 1];
+                match reader.poll(&GoodClock, &mut work, &mut byte) {
+                    Ok(step) => {
+                        if step.written != 0 {
+                            assert_eq!(byte.first(), b"a \tb".get(written));
+                            written += 1;
+                        }
+                        if step.status == Status::Complete {
+                            done = true;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        assert!(fail);
+                        assert_eq!(error, Error::Policy(PolicyError::Busy));
+                        let mut fresh = budget();
+                        let remaining = fresh.remaining();
+                        assert_eq!(reader.poll(&GoodClock, &mut fresh, &mut byte), Err(error));
+                        assert_eq!(fresh.remaining(), remaining);
+                        break;
+                    }
+                }
+            }
+            if fail {
+                assert_eq!(reader.failure(), Some(Error::Policy(PolicyError::Busy)));
+                break;
+            }
+            assert!(done);
+            assert_eq!(written, 4);
+            assert!(reader.is_encoding_problem());
+        }
+        assert_eq!(source.calls, if fail { 3 } else { 8 });
+    }
+    let mut source = Source {
+        calls: 0,
+        fail: false,
+    };
+    let mut bytes = [0; 2];
+    let mut slots = Checkpoints::default();
+    let mut text = TextReader::new(
+        Input {
+            source: &mut source,
+            offset: 2,
+            length: 5,
+            encoding: TransferEncoding::QuotedPrintable,
+            charset: Plan::Prescan,
+        },
+        &mut bytes,
+        &mut slots,
+    )
+    .unwrap();
+    let mut work = budget();
+    let mut written = 0;
+    let mut done = false;
+    for _ in 0..200 {
+        match text.poll(&GoodClock, &mut work).unwrap() {
+            Text::Scalar(c) => {
+                assert_eq!(u32::from(c), u32::from(*b"a \tb".get(written).unwrap()));
+                written += 1;
+            }
+            Text::Yield => {}
+            Text::Complete => {
+                done = true;
+                break;
+            }
+        }
+    }
+    assert!(done);
+    assert_eq!(written, 4);
+    assert!(text.is_encoding_problem());
+    assert!(!text.selection().unwrap().is_encoding_problem);
+    assert_eq!(source.calls, 8);
+    struct Resident {
+        reads: usize,
+    }
+    impl BlobReader for Resident {
+        fn len(&self) -> u64 {
+            305
+        }
+        fn read_at(&mut self, at: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
+            assert!(at >= 2 && at + output.len() as u64 <= 303);
+            self.reads += 1;
+            for (i, byte) in output.iter_mut().enumerate() {
+                *byte = if at + i as u64 == 302 { b'x' } else { b' ' };
+            }
+            Ok(output.len())
+        }
+    }
+    let mut resident = Resident { reads: 0 };
+    let mut buffer = [0; 512];
+    let mut reader = Reader::new(
+        &mut resident,
+        2,
+        301,
+        TransferEncoding::QuotedPrintable,
+        &mut buffer,
+    )
+    .unwrap();
+    let mut work = budget();
+    let mut at = 0;
+    let mut done = false;
+    for _ in 0..1000 {
+        let mut output = [0; 1];
+        let step = reader.poll(&GoodClock, &mut work, &mut output).unwrap();
+        if step.written != 0 {
+            assert_eq!(output, [if at == 300 { b'x' } else { b' ' }]);
+            at += 1;
+        }
+        if step.status == Status::Complete {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert_eq!(at, 301);
+    assert_eq!(resident.reads, 1);
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "owned QP source/text allocated");
+}
+
 fn mime_qp() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -2123,6 +2321,7 @@ fn main() {
         store_pinned_blobs();
         mime_base64();
         mime_qp();
+        mime_qp_input();
         mime_input();
         mime_headers();
         body_value();
@@ -2215,6 +2414,7 @@ fn main() {
     store_pinned_blobs();
     mime_base64();
     mime_qp();
+    mime_qp_input();
     mime_input();
     mime_headers();
     body_value();

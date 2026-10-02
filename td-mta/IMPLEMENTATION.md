@@ -1181,17 +1181,16 @@ Initial independently landable increments:
   fixture split, small output, all tail pad-bit values, charged
   backpressure, checkpoint replay and deadlines. An isolated allocation
   interval covers basic successful/malformed/refused paths. Nested source
-  ownership, quoted-printable, headers, charsets, Unicode and protocol
-  integration remain open.
+  ownership, Unicode and protocol integration remain open.
 
 - **M06b — bounded transfer input:** implemented a live body-reader borrow
   and checked encoded extent with caller source backing. Refill or decode
-  one bounded turn under shared monotonic/deadline/work checks; support
-  identity/base64 and refuse QP explicitly. Preserve terminal
+  one bounded turn under shared monotonic/deadline/work checks; initial
+  identity/base64 support is extended to QP by M06l. Preserve terminal
   errors/completion and diagnose source-contract failures. Cover exact
   ranges, short reads, backpressure, clock faults, work refusal and a real
   pinned-body path; qualify core allocations with a synthetic source. Nested
-  source checkpoints, QP and protocol integration remain open.
+  source chains and protocol integration remain open.
 
 - **M06c — raw header scanner:** implemented fixed state and source extents,
   256-transition turns, field work charging and exact body/header boundaries.
@@ -1206,8 +1205,7 @@ Initial independently landable increments:
   maximal invalid subparts across fragments, charge lookahead/replay/scalars,
   retain EOF, and retire work failures. Cover all byte values, exhaustive
   two-byte UTF-8 inputs, boundary/malformed fixtures, checkpoint work and
-  allocation counters. Unknown-label handling, prescan, encoded words, NFC and
-  protocol projection remain open.
+  allocation counters. Encoded words, NFC and protocol projection remain open.
 
 - **M06e — transfer source checkpoints:** implemented eight private slots in
   caller-owned stage backing, cleared for each exclusive reader binding.
@@ -1216,7 +1214,7 @@ Initial independently landable increments:
   Charge checkpoint records and fresh pre/post clock checks, retain live
   deadline/work state, and prevent cross-source or failed-owner revival.
   Cover unread input, partial decoding, completion, rebinding, bad slots,
-  clock/work failure and allocation counters. Nested chains and QP remain open.
+  clock/work failure and allocation counters. Nested chains remain open.
 
 - **M06f — bounded header unfolding:** implemented byte-preserving removal of
   CRLF/bare-LF folds before SP/HTAB, retaining bare CR and nonfold bytes.
@@ -1238,14 +1236,14 @@ Initial independently landable increments:
   labels externally, report promotion/unknown/malformed diagnostics and charge
   scan/replay work. Cover all split points, late malformed suffixes, scalar
   boundaries, copied-state work, failure retirement and allocation counters.
-  MIME parameter binding and body output remain open; M06i owns source replay.
+  MIME parameter binding and protocol output remain open; M06i owns source replay.
 
 - **M06i — owned transfer-to-charset replay:** implemented one immutable source
   borrow through optional complete prescan, checkpoint rewind and scalar
   decoding. Share work/clock state, preserve transfer diagnostics, and retire
   every failed operation. Cover exact ranges, short reads, direct/heuristic
   labels, identity/base64, clock boundaries, replay I/O failure and allocation.
-  QP, nested sources, body-value filtering/truncation and JMAP remain open.
+  Nested sources, body-value response ownership and JMAP remain open.
 
 - **M06j — plain body-value filtering:** implemented CRLF conversion, I-JSON
   noncharacter replacement and exact UTF-8 scalar-prefix byte caps. Continue
@@ -1259,8 +1257,14 @@ Initial independently landable increments:
   source-position replay for interior runs. Fixed copied state and charged
   256-transition turns avoid growing buffers. Cover malformed fixtures,
   fragment/output boundaries, long runs, replay/refusal and allocation.
-  Source ownership, nested checkpoints and transfer-reader integration remain
-  open; the reader still refuses QP.
+  M06l supplies raw-source ownership; nested checkpoints remain open.
+
+- **M06l — owned QP input and text replay:** bind QP rewind positions to the
+  retained immutable raw extent; reuse resident runs or discard stale source
+  buffers and yield before charged refills. Save/restore the complete decoder state in existing private
+  slots. Compose with charset prescan under the same source, clock and meter.
+  Cover exact ranges, small buffers, every-turn checkpoints, rewind I/O and
+  clock failures and allocation. Nested decoded-source chains remain open.
 
 Implement other header-form composition, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented

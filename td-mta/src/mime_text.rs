@@ -337,6 +337,30 @@ mod tests {
     fn exact_extent_is_scanned_and_replayed_before_scalars() {
         for (bytes, encoding, label, expected, problem, charset) in [
             (
+                b"xxcaf=C3=A9yy".as_slice(),
+                TransferEncoding::QuotedPrintable,
+                None,
+                "café",
+                true,
+                Charset::Utf8,
+            ),
+            (
+                b"xxcaf=C3=A9yy",
+                TransferEncoding::QuotedPrintable,
+                Some(b"utf-8".as_slice()),
+                "café",
+                false,
+                Charset::Utf8,
+            ),
+            (
+                b"xxa \tb=yy",
+                TransferEncoding::QuotedPrintable,
+                None,
+                "a \tb",
+                true,
+                Charset::Ascii,
+            ),
+            (
                 b"xxcaf\xc3\xa9yy".as_slice(),
                 TransferEncoding::Identity,
                 None,

@@ -722,10 +722,11 @@ or protocol projection yet.
 A bounded transfer-input owner now connects identity/base64 decoding to a
 borrowed immutable body reader and a checked encoded extent. It reuses one
 source partition and brackets refill/decode turns with clock and work
-checks. It retains the source pin and refuses unsupported QP. Optional exclusive
-stage checkpoint storage supports charged save/restore of the same source,
-without copying ring bytes or resetting the clock/work state. Part
-authorization, nested source ownership and MIME structure remain separate.
+checks. It retains the source pin and supports QP rewind and replay.
+Optional exclusive stage checkpoint storage supports charged save/restore of
+the same source, without copying ring bytes or resetting the clock/work
+state. Part authorization, nested source ownership and MIME structure remain
+separate.
 
 The raw header scanner emits bounded name/value source extents, preserves
 folded bytes, and identifies the body boundary under the file parsing policy.
@@ -760,8 +761,10 @@ and protocol output remain separate.
 A fixed quoted-printable cursor now implements the stable transfer policy
 with explicit source-position rewind requests. It scans and replays long
 whitespace runs using fixed state, with charged lookahead and bounded turns.
-Transfer-reader/source ownership and nested checkpoint integration remain
-separate; existing transfer readers still refuse QP.
+The transfer reader binds those requests to its immutable raw extent, reuses
+resident input or refills from the exact run start. Caller checkpoints
+retain QP scan/replay state, and charset prescan uses the same owned source.
+Nested decoded-source checkpoint integration remains separate.
 
 The plain body-value filter converts CRLF, replaces noncharacters for I-JSON
 and applies a UTF-8 scalar-boundary byte cap with fixed pending state. It keeps

@@ -736,8 +736,10 @@ the same bounded turn; only earlier positions require external reposition.
 No line/body buffer or resource allowance grows. Its isolated
 allocation interval covers soft breaks, interior/trailing whitespace,
 malformed escapes, repositioning, short output, copied-state replay and
-sticky refusal. Integrating that state with transfer/nested source owners
-and their checkpoint backing remains separate.
+sticky refusal. The raw transfer reader now retains that state in a fixed
+decoder enum and
+its saved slots; no extra backing is added. Nested decoded-source ownership
+and simultaneous checkpoint scheduling remain separate.
 
 The first transfer-input owner borrows a BlobReader and at most the existing
 6 KiB stage byte partition. Its inline compiled state fits 256 bytes; it
@@ -755,6 +757,17 @@ The live Reader still fits 256 bytes. Binding clears old slots; save/restore
 copy no ring and allocate nothing. A synthetic-source allocation interval
 covers binding, save, replay, completion and sticky refusal. Nested source
 chains and their simultaneous checkpoint use remain unqualified.
+
+QP integration retains one additional raw extent origin, a fixed decoder
+enum and the existing backing. Reader still fits 256 bytes, each saved state
+fits 256 bytes and eight slots fit 2 KiB; the text owner still fits 512
+bytes. The QP input interval covers resident reuse/refill, checkpoint
+replay, source failure and two-pass charset decoding with unchanged Rust
+counters. Functional tests restore at every turn and inject every clock
+boundary plus a rewind read failure. Long prose, bare CR and whitespace
+cases bound physical reads and total charged bytes with full 6 KiB backing.
+These are synthetic-source measurements, not combined filesystem,
+nested-source or complete-worker qualification.
 
 The raw header scanner uses at most 128 bytes of inline state within parser
 state and returns one 32-byte field descriptor at a time. It holds no source

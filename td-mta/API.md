@@ -707,14 +707,13 @@ body buffer, source reader or heap owner is stored in the decoder.
 
 ### 1.13 Bounded transfer input
 
-mime_input::Reader borrows a live BlobReader, caller buffer of 1..=6144 bytes
-and checked offset/length. The caller must establish account/root/part
+mime_input::Reader borrows a live BlobReader, caller buffer of 1..=6144
+bytes and checked offset/length. The caller must establish account/root/part
 authorization and reproduce the exact MIME descriptor; a bounds check alone
-grants none of those. Identity and base64 are implemented; QuotedPrintable
-refuses explicitly. Unknown transfer tokens use identity bytes with a
-diagnostic supplied by the MIME parser. The source borrow retains the
-underlying body owner's pin. No raw file accessor or complete body
-allocation is added.
+grants none of those. Identity, base64 and quoted-printable are implemented.
+Unknown transfer tokens use identity bytes with a diagnostic supplied by the
+MIME parser. The source borrow retains the underlying body owner's pin. No
+raw file accessor or complete body allocation is added.
 
 Each poll performs either one source read of at most 6 KiB or one decoder
 turn of at most 256 transitions; identity copies at most 256 bytes. Refill
@@ -725,12 +724,24 @@ successful read and its traversal consume two source-byte charges. NeedInput
 is internal; public progress is Yield, NeedOutput or Complete with exact
 written bytes. Identity returns Yield after a bounded copy while more bytes
 remain, including when that copy fills the output; NeedOutput means its
-nonempty input received an empty output slice. Base64 can also return
-NeedOutput after filling a nonempty slice with pending decoded bytes. In
-both cases the caller consumes written bytes before polling again with
-available output. A short successful read is allowed; zero progress before the
-declared extent end or a count beyond the requested slice is Corrupt. Never
-probe outside that extent.
+nonempty input received an empty output slice. Base64 and QP can also return
+NeedOutput after filling a nonempty slice with pending decoded bytes,
+including a QP hard-CRLF or malformed-escape pair. In all cases the caller
+consumes written bytes before polling again with available output. A short
+successful read is allowed; zero progress before the declared extent end or
+a count beyond the requested slice is Corrupt. Never probe outside that
+extent.
+
+QP Reposition maps the decoder's relative position to the checked absolute
+extent cursor. If that cursor is still in the resident buffer, move only its
+used cursor and return Yield; the next turn reuses those bytes. Otherwise
+discard buffered source bytes, replace the physical cursor and yield before
+the next refill. Replayed reads charge their full requested capacities;
+resident visits are charged again in both paths. No manual checkpoint slot
+is used by a raw-source QP rewind; saved caller checkpoints include the QP
+mode/positions. The source borrow, monotonic watermark and live meter never
+change. This implements one raw-source stage, not nested decoded-source
+checkpointing.
 
 One monotonic watermark and Meter deadline bracket every active turn. A
 post-work clock/budget refusal overrides its earlier result; any failure is
@@ -740,18 +751,18 @@ after the final bracket succeeds and later polls return zero-progress
 Complete without work until an earlier checkpoint is restored. position is
 the current decoded cursor and rewinds on restore; replayed output still
 consumes work. Encoding diagnostics describe that cursor's decoding history
-and become final at completion. Invalid extents/backing/checkpoints,
-unavailable decoder, adapter errors and work refusal remain distinct fixed
-errors.
-with_checkpoints exclusively borrows the stage's caller-owned Checkpoints
-storage and clears its eight private slots on every new binding. Save/restore
-use slot numbers; save replaces that slot's earlier point. The caller owns
-slot assignment across outstanding lookahead operations; nested slot scheduling
-is separate. No saved state can be supplied from another source.
-Each slot retains the exact consumed encoded cursor, decoded position, small
-base64 state (including pending output/diagnostic) and completion flag. Save
-subtracts unread buffered bytes from the fetched cursor. Restore discards the
-ring contents and refills from that cursor, never from the body origin.
+and become final at completion. Invalid extents/backing/checkpoints, adapter
+errors and work refusal remain distinct fixed errors. with_checkpoints
+exclusively borrows the stage's caller-owned Checkpoints storage and clears
+its eight private slots on every new binding. Save/restore use slot numbers;
+save replaces that slot's earlier point. The caller owns slot assignment
+across outstanding lookahead operations; nested slot scheduling is separate.
+No saved state can be supplied from another source. Each slot retains the
+exact consumed encoded cursor, decoded position, fixed transfer state
+(including pending output/diagnostic and QP replay positions) and completion
+flag. Save subtracts unread buffered bytes from the fetched cursor. Restore
+discards the ring contents and refills from that cursor, never from the body
+origin.
 
 Checkpoint operations charge one record and bracket the bounded copy with
 the same fresh monotonic/deadline checks. A post-copy clock failure overrides
@@ -761,7 +772,7 @@ clock watermark, live job meter and every charge; it cannot revive a failed
 reader or extend its lifetime. Even a completed checkpoint requires a live
 restore operation before cached Complete can be polled. Source positions and
 slots remain private to the borrowed reader; drop/rebind cannot carry a saved
-point to a different body. Nested source chains, QP and protocol output remain
+point to a different body. Nested source chains and protocol output remain
 separate.
 
 ### 1.14 Raw header scanner
@@ -933,8 +944,8 @@ its clock or I/O adapter, so it is not proof of disk failure. A stopped meter
 is reported as Work by the outer post-check when its clock sample succeeds;
 a late clock failure still takes precedence.
 
-Identity/base64 are supported through the existing transfer source; QP still
-refuses construction. This reader emits charset scalars, preserving NUL,
+Identity/base64/QP are supported through the existing transfer source. This
+reader emits charset scalars, preserving NUL,
 noncharacters and line endings. Body-value CRLF/JSON filtering, truncation,
 MIME parameter integration and JMAP output remain separate. Live body/part
 authorization belongs to the caller and is not granted by range validation.
@@ -1013,9 +1024,9 @@ record charge. EOF and active entry check the deadline. The caller brackets
 turns with fresh clock/cancellation checks. Errors retire the cursor even
 with a fresh meter and invalidate the whole provisional decoded body.
 Copied state retains neither source identity nor meter: its owner must keep
-both bindings and failure retirement, without refunds. Reader integration,
-nested source checkpoints and protocol output remain separate; the existing
-mime_input::Reader still explicitly refuses QP.
+both bindings and failure retirement, without refunds. Nested source
+checkpoints and protocol output remain separate. The existing
+mime_input::Reader binds this cursor to one immutable raw extent.
 
 ## 2. Read views and change history
 

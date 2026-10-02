@@ -1,7 +1,8 @@
 //! One bounded transfer-decoding source over a caller-authorized immutable extent.
 use crate::{
     admission::work::{Charge, Meter, Stop},
-    mime_base64::{self, Decoder, Status},
+    mime_base64::{self, Status},
+    mime_qp,
     ports::{BlobReader, Clock, Error as PolicyError, Tick},
     wire::TransferEncoding,
 };
@@ -11,7 +12,6 @@ pub const INPUT_BYTES: usize = 6 * 1024;
 pub enum Error {
     InvalidRange,
     InvalidBacking,
-    UnsupportedEncoding,
     InvalidCheckpoint,
     Policy(PolicyError),
     Work(Stop),
@@ -21,7 +21,6 @@ impl std::fmt::Display for Error {
         f.write_str(match self {
             Self::InvalidRange => "invalid encoded body extent",
             Self::InvalidBacking => "invalid transfer input backing",
-            Self::UnsupportedEncoding => "transfer decoder is not implemented",
             Self::InvalidCheckpoint => "invalid transfer source checkpoint",
             Self::Policy(_) => "transfer input adapter failed",
             Self::Work(_) => "transfer input work budget exhausted",
@@ -34,6 +33,21 @@ pub struct Progress {
     pub written: usize,
     /// NeedInput is internal and is never returned by this source owner.
     pub status: Status,
+}
+#[derive(Clone, Copy)]
+enum Decoder {
+    Identity,
+    Base64(mime_base64::Decoder),
+    QuotedPrintable(mime_qp::Decoder),
+}
+impl Decoder {
+    const fn is_encoding_problem(&self) -> bool {
+        match self {
+            Self::Identity => false,
+            Self::Base64(decoder) => decoder.is_encoding_problem(),
+            Self::QuotedPrintable(decoder) => decoder.is_encoding_problem(),
+        }
+    }
 }
 pub const CHECKPOINTS: usize = 8;
 #[derive(Clone, Copy)]
@@ -61,12 +75,12 @@ pub struct Reader<'r, 'b> {
     source: &'r mut dyn BlobReader,
     buffer: &'b mut [u8],
     checkpoints: Option<&'b mut Checkpoints>,
+    origin: u64,
     end: u64,
     fetched: u64,
     decoded: u64,
     used: usize,
     available: usize,
-    encoding: TransferEncoding,
     decoder: Decoder,
     last: Tick,
     failure: Option<Error>,
@@ -87,20 +101,23 @@ impl<'r, 'b> Reader<'r, 'b> {
         if buffer.is_empty() || buffer.len() > INPUT_BYTES {
             return Err(Error::InvalidBacking);
         }
-        if encoding == TransferEncoding::QuotedPrintable {
-            return Err(Error::UnsupportedEncoding);
-        }
         Ok(Self {
             source,
             buffer,
             checkpoints: None,
+            origin: offset,
             end,
             fetched: offset,
             decoded: 0,
             used: 0,
             available: 0,
-            encoding,
-            decoder: Decoder::default(),
+            decoder: match encoding {
+                TransferEncoding::Identity => Decoder::Identity,
+                TransferEncoding::Base64 => Decoder::Base64(mime_base64::Decoder::default()),
+                TransferEncoding::QuotedPrintable => {
+                    Decoder::QuotedPrintable(mime_qp::Decoder::new(length))
+                }
+            },
             last: Tick(0),
             failure: None,
             complete: false,
@@ -296,45 +313,89 @@ impl<'r, 'b> Reader<'r, 'b> {
             .get(self.used..self.available)
             .ok_or(Error::InvalidBacking)?;
         let last = self.fetched == self.end;
-        let step = if self.encoding == TransferEncoding::Base64 {
-            self.decoder
+        let mut rewind = None;
+        let step = match &mut self.decoder {
+            Decoder::Base64(decoder) => decoder
                 .poll(input, output, last, now, meter)
-                .map_err(Error::Work)?
-        } else {
-            let count = input
-                .len()
-                .min(output.len())
-                .min(mime_base64::STEP_TRANSITIONS);
-            meter
-                .charge(
-                    now,
-                    Charge {
-                        io_bytes: count as u64,
-                        output_bytes: count as u64,
-                        ..Charge::default()
+                .map_err(Error::Work)?,
+            Decoder::QuotedPrintable(decoder) => {
+                let step = decoder
+                    .poll(input, output, now, meter)
+                    .map_err(Error::Work)?;
+                let status = match step.status {
+                    mime_qp::Status::NeedInput => Status::NeedInput,
+                    mime_qp::Status::NeedOutput => Status::NeedOutput,
+                    mime_qp::Status::Yield => Status::Yield,
+                    mime_qp::Status::Complete => Status::Complete,
+                    mime_qp::Status::Reposition => {
+                        rewind = Some(decoder.position());
+                        Status::Yield
+                    }
+                };
+                mime_base64::Progress {
+                    consumed: step.consumed,
+                    written: step.written,
+                    status,
+                }
+            }
+            Decoder::Identity => {
+                let count = input
+                    .len()
+                    .min(output.len())
+                    .min(mime_base64::STEP_TRANSITIONS);
+                meter
+                    .charge(
+                        now,
+                        Charge {
+                            io_bytes: count as u64,
+                            output_bytes: count as u64,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(Error::Work)?;
+                output
+                    .get_mut(..count)
+                    .ok_or(Error::InvalidBacking)?
+                    .copy_from_slice(input.get(..count).ok_or(Error::InvalidBacking)?);
+                mime_base64::Progress {
+                    consumed: count,
+                    written: count,
+                    status: if count == input.len() && last {
+                        Status::Complete
+                    } else if !input.is_empty() && output.is_empty() {
+                        Status::NeedOutput
+                    } else {
+                        Status::Yield
                     },
-                )
-                .map_err(Error::Work)?;
-            output
-                .get_mut(..count)
-                .ok_or(Error::InvalidBacking)?
-                .copy_from_slice(input.get(..count).ok_or(Error::InvalidBacking)?);
-            mime_base64::Progress {
-                consumed: count,
-                written: count,
-                status: if count == input.len() && last {
-                    Status::Complete
-                } else if !input.is_empty() && output.is_empty() {
-                    Status::NeedOutput
-                } else {
-                    Status::Yield
-                },
+                }
             }
         };
-        self.used = self
-            .used
-            .checked_add(step.consumed)
-            .ok_or(Error::InvalidRange)?;
+        if let Some(position) = rewind {
+            let cursor = self
+                .origin
+                .checked_add(position)
+                .ok_or(Error::InvalidRange)?;
+            if cursor > self.end {
+                return Err(Error::InvalidRange);
+            }
+            let buffer_start = self
+                .fetched
+                .checked_sub(self.available as u64)
+                .ok_or(Error::InvalidRange)?;
+            if cursor >= buffer_start && cursor <= self.fetched {
+                self.used =
+                    usize::try_from(cursor - buffer_start).map_err(|_| Error::InvalidRange)?;
+            } else {
+                self.fetched = cursor;
+                self.used = 0;
+                self.available = 0;
+            }
+        } else {
+            self.used = self
+                .used
+                .checked_add(step.consumed)
+                .ok_or(Error::InvalidRange)?;
+        }
         self.decoded = self
             .decoded
             .checked_add(step.written as u64)
@@ -431,6 +492,18 @@ mod tests {
     fn bounded_extents_short_reads_and_decoding_preserve_exact_octets() {
         for (encoded, encoding, expected, problem) in [
             (
+                b"a=20\r\nb \t\r\nc=0A=QZ=".as_slice(),
+                TransferEncoding::QuotedPrintable,
+                b"a \r\nb\r\nc\n=QZ".as_slice(),
+                true,
+            ),
+            (
+                b"a \tx= \t\r\ny=09".as_slice(),
+                TransferEncoding::QuotedPrintable,
+                b"a \txy\t".as_slice(),
+                false,
+            ),
+            (
                 b"TWFu".as_slice(),
                 TransferEncoding::Base64,
                 b"Man".as_slice(),
@@ -499,7 +572,13 @@ mod tests {
                     reader.poll(&clock, &mut meter, &mut [0; 1]).unwrap().status,
                     Status::Complete
                 );
-                assert_eq!(source.calls, encoded.len().div_ceil(capacity.min(max)));
+                let minimum = encoded.len().div_ceil(capacity.min(max));
+                if encoding == TransferEncoding::QuotedPrintable {
+                    assert!(source.calls >= minimum);
+                    assert!(source.calls <= encoded.len() * 2);
+                } else {
+                    assert_eq!(source.calls, minimum);
+                }
             }
         }
     }
@@ -544,16 +623,6 @@ mod tests {
                 &mut [0; INPUT_BYTES + 1]
             ),
             Err(Error::InvalidBacking)
-        ));
-        assert!(matches!(
-            Reader::new(
-                &mut source,
-                0,
-                4,
-                TransferEncoding::QuotedPrintable,
-                &mut [0; 4]
-            ),
-            Err(Error::UnsupportedEncoding)
         ));
         let mut backing = [0; 4];
         let clock = TestClock::good();
@@ -778,6 +847,11 @@ mod tests {
         assert!(std::mem::size_of::<Saved>() <= 256);
         for (bytes, encoding, expected) in [
             (
+                b"=4x \tZ=\r\n!".as_slice(),
+                TransferEncoding::QuotedPrintable,
+                b"=4x \tZ!".as_slice(),
+            ),
+            (
                 b"abcdef".as_slice(),
                 TransferEncoding::Identity,
                 b"abcdef".as_slice(),
@@ -846,7 +920,7 @@ mod tests {
                     assert_eq!(reader.position(), expected.len() as u64);
                     assert_eq!(
                         reader.is_encoding_problem(),
-                        encoding == TransferEncoding::Base64
+                        encoding != TransferEncoding::Identity
                     );
                     if slot != 7 {
                         assert!(meter.remaining().io_bytes < before.io_bytes);
@@ -855,6 +929,230 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn qp_resident_replay_bounds_physical_reads_and_total_byte_charges() {
+        struct Counted<'a> {
+            bytes: &'a [u8],
+            reads: usize,
+            requested: usize,
+        }
+        impl BlobReader for Counted<'_> {
+            fn len(&self) -> u64 {
+                self.bytes.len() as u64
+            }
+            fn read_at(&mut self, at: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
+                let at = at as usize;
+                assert!(at >= 3 && at + output.len() <= self.bytes.len() - 3);
+                self.reads += 1;
+                self.requested += output.len();
+                output.copy_from_slice(&self.bytes[at..at + output.len()]);
+                Ok(output.len())
+            }
+        }
+        let mut long = vec![b' '; INPUT_BYTES * 3 + 1];
+        long.push(b'x');
+        for (encoded, problem) in [
+            (b"a b".repeat(3000), false),
+            (vec![b'\r'; 9000], true),
+            (b" \r".repeat(4500), true),
+            (long, false),
+        ] {
+            let mut raw = b"xxx".to_vec();
+            raw.extend_from_slice(&encoded);
+            raw.extend_from_slice(b"yyy");
+            let mut source = Counted {
+                bytes: &raw,
+                reads: 0,
+                requested: 0,
+            };
+            let mut backing = [0; INPUT_BYTES];
+            let mut reader = Reader::new(
+                &mut source,
+                3,
+                encoded.len() as u64,
+                TransferEncoding::QuotedPrintable,
+                &mut backing,
+            )
+            .unwrap();
+            let capacity = encoded.len() as u64 * 6 + 32;
+            let mut work = budget(capacity, encoded.len() as u64);
+            let clock = TestClock::good();
+            let mut result = Vec::new();
+            let mut complete = false;
+            for _ in 0..encoded.len() * 2 {
+                let mut bytes = [0; 256];
+                let step = reader.poll(&clock, &mut work, &mut bytes).unwrap();
+                result.extend_from_slice(&bytes[..step.written]);
+                if step.status == Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            assert_eq!(result, encoded);
+            assert_eq!(reader.is_encoding_problem(), problem);
+            assert!(source.reads <= encoded.len().div_ceil(INPUT_BYTES) * 2 + 1);
+            assert!(source.requested <= encoded.len() * 2 + INPUT_BYTES);
+        }
+    }
+
+    #[test]
+    fn qp_every_turn_checkpoint_keeps_scan_rewind_and_pending_output() {
+        let raw = b"xx=4x \tZ= \t\r\n!\t\rx \t\r\n=20yy";
+        let expected = b"=4x \tZ!\t\rx\r\n ";
+        for capacity in [1, 2, 6, INPUT_BYTES] {
+            let mut reached_end = false;
+            for turn in 0..200 {
+                let mut source = Source {
+                    bytes: raw,
+                    max: usize::MAX,
+                    calls: 0,
+                    mode: 0,
+                };
+                let mut bytes = [0; INPUT_BYTES];
+                let mut slots = Checkpoints::default();
+                let mut reader = Reader::with_checkpoints(
+                    &mut source,
+                    2,
+                    (raw.len() - 4) as u64,
+                    TransferEncoding::QuotedPrintable,
+                    &mut bytes[..capacity],
+                    &mut slots,
+                )
+                .unwrap();
+                let clock = TestClock::good();
+                let mut meter = checkpoint_budget();
+                let mut prefix = Vec::new();
+                for _ in 0..turn {
+                    let mut byte = [0; 1];
+                    let step = reader.poll(&clock, &mut meter, &mut byte).unwrap();
+                    prefix.extend_from_slice(&byte[..step.written]);
+                    if step.status == Status::Complete {
+                        reached_end = true;
+                        break;
+                    }
+                }
+                reader.save_checkpoint(0, &clock, &mut meter).unwrap();
+                let suffix = drain(&mut reader, &mut meter);
+                assert_eq!([prefix.as_slice(), suffix.as_slice()].concat(), expected);
+                reader.restore_checkpoint(0, &clock, &mut meter).unwrap();
+                assert_eq!(reader.position(), prefix.len() as u64);
+                assert_eq!(drain(&mut reader, &mut meter), expected[prefix.len()..]);
+                assert!(reader.is_encoding_problem());
+                if reached_end {
+                    break;
+                }
+            }
+            assert!(reached_end);
+        }
+    }
+
+    #[test]
+    fn qp_rewind_io_and_each_clock_boundary_retire_the_same_owner() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        struct CheckedSource {
+            calls: Arc<AtomicUsize>,
+            previous: u64,
+            fail_rewind: bool,
+        }
+        impl BlobReader for CheckedSource {
+            fn len(&self) -> u64 {
+                8
+            }
+            fn read_at(&mut self, at: u64, out: &mut [u8]) -> Result<usize, PolicyError> {
+                assert!((2..6).contains(&at));
+                assert!(out.len() as u64 <= 6 - at);
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.fail_rewind && at < self.previous {
+                    return Err(PolicyError::Busy);
+                }
+                self.previous = at;
+                let bytes = b"xxa \tbyy";
+                let count = out.len().min(2);
+                out[..count].copy_from_slice(&bytes[at as usize..at as usize + count]);
+                Ok(count)
+            }
+        }
+        let mut samples = 0;
+        for pass in 0..3 {
+            let faults = if pass == 2 { samples } else { 1 };
+            for fault in 0..faults {
+                for mode in 0..if pass == 2 { 3 } else { 1 } {
+                    if pass == 2 && mode == 1 && fault == 0 {
+                        continue;
+                    }
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let mut source = CheckedSource {
+                        calls: calls.clone(),
+                        previous: 0,
+                        fail_rewind: pass == 1,
+                    };
+                    let mut backing = [0; 2];
+                    let mut slots = Checkpoints::default();
+                    let mut reader = Reader::with_checkpoints(
+                        &mut source,
+                        2,
+                        4,
+                        TransferEncoding::QuotedPrintable,
+                        &mut backing,
+                        &mut slots,
+                    )
+                    .unwrap();
+                    let clock = TestClock {
+                        calls: AtomicU64::new(0),
+                        fault: if pass == 2 { fault } else { u64::MAX },
+                        mode,
+                    };
+                    let mut meter = checkpoint_budget();
+                    let mut output = Vec::new();
+                    let mut failed = None;
+                    let mut complete = false;
+                    for _ in 0..200 {
+                        let mut byte = [0; 1];
+                        match reader.poll(&clock, &mut meter, &mut byte) {
+                            Ok(step) => {
+                                output.extend_from_slice(&byte[..step.written]);
+                                if step.status == Status::Complete {
+                                    complete = true;
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                failed = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if pass == 0 {
+                        assert!(complete);
+                        assert_eq!(output, b"a \tb");
+                        assert_eq!(calls.load(Ordering::Relaxed), 4);
+                        samples = clock.calls.load(Ordering::Relaxed);
+                    } else {
+                        assert!(!complete);
+                        let expected = if pass == 1 || mode == 2 {
+                            Error::Policy(PolicyError::Busy)
+                        } else if mode == 0 {
+                            Error::Work(Stop::Deadline)
+                        } else {
+                            Error::Policy(PolicyError::Invalid)
+                        };
+                        assert_eq!(failed, Some(expected));
+                        let io = calls.load(Ordering::Relaxed);
+                        let ticks = clock.calls.load(Ordering::Relaxed);
+                        let mut fresh = checkpoint_budget();
+                        let before = fresh.remaining();
+                        assert_eq!(reader.poll(&clock, &mut fresh, &mut [0; 1]), Err(expected));
+                        assert_eq!(reader.save_checkpoint(0, &clock, &mut fresh), Err(expected));
+                        assert_eq!(calls.load(Ordering::Relaxed), io);
+                        assert_eq!(clock.calls.load(Ordering::Relaxed), ticks);
+                        assert_eq!(fresh.remaining(), before);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn checkpoint_backing_is_exclusive_to_each_binding_and_bad_slots_retire() {
         let mut slots = Checkpoints::default();
