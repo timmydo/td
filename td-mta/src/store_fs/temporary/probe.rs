@@ -139,6 +139,15 @@ pub fn run(mut snapshot: impl FnMut()) {
             &mut table_scratch,
             &mut lookup_value,
         );
+        super::super::table::probe_next(
+            &fixture.root,
+            &table_probe,
+            &active_probe,
+            &mut history_scratch,
+            &mut overlay_cells,
+            &mut table_scratch,
+            &mut lookup_value,
+        );
         super::super::input::probe_recovery(
             &fixture.root,
             &recovery_probe,

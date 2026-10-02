@@ -57,6 +57,8 @@ The table-replay adapter binds a fresh table input to the loaded prefix and
 requires selected table digest/EOF completion before draining residual updates.
 Point lookup now scans that complete replay and retains one matching row in
 caller scratch; it returns a row or absence only after selected-table completion.
+An ordered next step applies the same completion rule to the first final row,
+or the first row strictly beyond an optional encoded cursor.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

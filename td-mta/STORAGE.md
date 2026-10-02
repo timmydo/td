@@ -1065,6 +1065,24 @@ there is no allocation or whole-table inventory in lookup. This provides the
 bounded scan fallback for final-reference validation; indexing and whole-graph
 recovery coordination remain separate work.
 
+`TableInput::into_next` provides the ordered scan fallback. None requests the
+first final row; a supplied cursor must decode as a locally valid key for the
+selected table. Compare canonical encoded bytes and retain only the first row
+strictly greater than the cursor, with its last-change sequence. Replacements
+and tombstones are handled by the same replay. Continue reading and validating
+after capturing that candidate; exhaustion is successful only after complete
+selected-table and residual-overlay validation. Invalid cursors and insufficient
+key/value output refuse explicitly; callback errors retire the replay.
+
+CompleteNext exposes the resulting Record or exhaustion and retains the replay
+proof. Key and value borrow distinct caller output slices and may outlive the
+wrapper; into_parts transfers the proof and row separately without granting a
+pin. Both outputs remain provisional on error. One next operation scans the
+entire table, with the same per-step/finish admission and deadline contract as
+lookup. The next call must open fresh input with the same actual pinned view;
+this adapter does not retain a file position or instantiate that view. Indexed
+iteration and complete recovery/reference coordination remain separate work.
+
 Sparse key/offset indexes and folder/date/search indexes are disposable disk files
 with bounded caches; their sizes are not RAM reservations. An absent index
 permits a bounded-work sequential scan or explicit temporary resource error.

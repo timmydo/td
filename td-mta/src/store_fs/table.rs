@@ -28,6 +28,12 @@ mod lookup;
 pub(super) use lookup::probe as probe_lookup;
 pub use lookup::{CompleteLookup, LookupError, TableLookup};
 
+#[path = "table/next.rs"]
+mod next;
+#[cfg(test)]
+pub(super) use next::probe as probe_next;
+pub use next::{CompleteNext, NextError, TableNext};
+
 const MAX_TABLE_READ_CALLS: usize = 64;
 #[derive(Debug)]
 pub enum TableInputError {

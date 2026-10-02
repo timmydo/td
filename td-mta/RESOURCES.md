@@ -96,7 +96,14 @@ still account for those costs and concurrent owners within the ledger.
   partition sum and the maximum record extent. The allocation probe exercises
   present/absent/deleted lookups, completion and insufficient-result refusal
   at both root bounds, with all buffers prepared before measurement.
-  No whole-table map is allocated. Admit one input
+  TableNext uses those same record/value partitions and the 1 KiB output-key
+  partition. Its borrowed input cursor is at most 1 KiB within the existing
+  cursor allowance; comparison uses another fixed 1 KiB worker-stack buffer
+  until a candidate is captured. Tests cap compiled TableNext at 8 KiB; this
+  inline state plus its temporary buffer stays charged to the worker stack,
+  whose full runtime qualification remains pending. The allocation probe covers
+  initial/equal/later cursors, deletions, exhaustion and short-key refusal at
+  both root bounds. No additional pool or whole-table map is allocated. Admit one input
   record plus up to 8192 overlay keys per push, and up to 8192 keys for finish.
   The allocation executable checks unchanged/replaced/deleted rows, remaining
   output, input/sink failures, and draining the full-operation overlay after

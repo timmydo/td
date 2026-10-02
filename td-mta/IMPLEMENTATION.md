@@ -823,6 +823,14 @@ service activation. Each part lands independently:
     lookup success/refusal at both root bounds. The ledger separately charges
     maximum record and result buffers. Whole-graph reference validation and
     runtime pin ownership remain coordinator work.
+  - **M05d12 — selected ordered scan:** implemented a complete selected replay
+    retaining only the first final row strictly after an encoded cursor, or
+    the first row when no cursor is supplied. Completion returns key/value/
+    sequence or proven exhaustion. Tests cover canonical encoded ordering,
+    replacements/deletions/residual rows, exclusive cursors, malformed cursors,
+    short output, incomplete consumption and late corruption; allocation probes
+    cover both root bounds. Existing scratch partitions fund both outputs.
+    Indexed iteration, whole-graph recovery and live pins remain separate work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete
