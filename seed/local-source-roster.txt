@@ -16,6 +16,7 @@ td-mail-source td-mail td-ui,td-compositor
 td-net-source net engine,td-boot
 td-news-source td-news td-ui,td-compositor
 td-open-source td-open td-busd
+td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine
 td-photo-source td-photo td-ui,td-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui
 td-review-source td-review td-ui,td-compositor

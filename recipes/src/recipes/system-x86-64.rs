@@ -4357,6 +4357,17 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-photo}/bin/td-photo".into(),
         link: "{root}/real-root/bin/td-photo".into(),
     });
+    // td-pass, the encrypted notebook (td-pass/DESIGN.md): the same static
+    // executable a foreign host runs. On td it refuses until td mode is
+    // built, so the image carries the artifact and its debug companion.
+    steps.push(Step::CopyTree {
+        from: "{in:td-pass}".into(),
+        dest: "{root}/real-root{in:td-pass}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-pass}/bin/td-pass".into(),
+        link: "{root}/real-root/bin/td-pass".into(),
+    });
     // td-editor, the text editor, a static system-tree program run from the
     // terminal (td-editor/DESIGN.md).
     steps.push(Step::CopyTree {
@@ -5504,6 +5515,7 @@ pub fn recipe() -> Recipe {
             "td-term-terminfo",
             "td-photo",
             "td-editor",
+            "td-pass",
             "td-jail",
             "td-seatd",
             "td-vm-guest",
@@ -7308,6 +7320,7 @@ mod tests {
             ("td-review", "td-review"),
             ("td-photo", "td-photo"),
             ("td-editor", "td-editor"),
+            ("td-pass", "td-pass"),
         ] {
             assert!(steps.iter().any(|step| matches!(step,
                 Step::Symlink { link, target }
@@ -14174,10 +14187,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     }
 
     #[test]
-    fn td_photo_and_td_editor_are_packed_and_not_merely_symlinked() {
+    fn td_photo_td_editor_and_td_pass_are_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for name in ["td-photo", "td-editor"] {
+        for name in ["td-photo", "td-editor", "td-pass"] {
             assert!(
                 steps.iter().any(|step| matches!(
                     step,

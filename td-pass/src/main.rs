@@ -13,7 +13,14 @@ mod plain;
 mod protocol;
 mod window;
 
+use std::io::Write;
 use std::process::ExitCode;
+
+/// What `--help` prints: the window takes no arguments.
+const HELP: &str = "usage: td-pass\n\
+    A two-pane encrypted notebook over td-secret's portable vault, \
+    opened with a FIDO2 key and its PIN. It runs standalone on a foreign \
+    Wayland desktop; on td it refuses until td mode is built.";
 
 fn main() -> ExitCode {
     // An argument that is not text is no worker's and no window's.
@@ -26,6 +33,12 @@ fn main() -> ExitCode {
     };
     if let Some(result) = td_secret::pass::worker(&args) {
         return exit(result);
+    }
+    if args == ["--help"] {
+        return exit(
+            writeln!(std::io::stdout(), "{HELP}")
+                .map_err(|error| format!("cannot write the usage: {error}")),
+        );
     }
     if !args.is_empty() {
         return exit(Err("usage: td-pass".to_owned()));

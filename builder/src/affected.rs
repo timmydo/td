@@ -1526,6 +1526,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The notebook the same way: td-pass-test runs the static binary's
+    // entry.
+    if p.starts_with("td-pass/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
     // The terminal the same way: td-term-test runs the static binary's
     // selftest and requires the terminfo entry td-term-terminfo writes.
     if p.starts_with("td-term/") && !p.contains("..") {
@@ -2817,6 +2826,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-term/src/app.rs", "recipe-checks");
     assert_preflight!("td-term/src/ready.rs", "cargo-test");
     assert_target!("td-term/Cargo.lock", "recipe-checks");
+    // The notebook as well: td-pass-test runs its static entry.
+    assert_target!("td-pass/src/window.rs", "check");
+    assert_target!("td-pass/src/app/mod.rs", "recipe-checks");
+    assert_preflight!("td-pass/src/backend.rs", "cargo-test");
+    assert_target!("td-pass/Cargo.lock", "recipe-checks");
     assert_target!("td-compositor/Cargo.lock", "recipe-checks");
     assert_no_target!("td-compositor/DESIGN.md", "check");
     assert_preflight!("start", "shell-syntax");

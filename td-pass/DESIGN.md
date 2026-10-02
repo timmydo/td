@@ -82,10 +82,11 @@ and cryptographic details stay out of the notebook flow.
 ## Implemented window
 
 `src/main.rs` dispatches td-secret's token worker before anything else,
-then admits a mode from os-release: an `ID` or `ID_LIKE` naming td is
-refused, since td mode's service is not reached by this build, and an
-unreadable or repeated identity admits nothing; any other system runs
-standalone. No refusal falls back to the other mode.
+then answers `--help`, then admits a mode from os-release: an `ID` or
+`ID_LIKE` naming td is refused, since td mode's service is not reached
+by this build, and an unreadable or repeated identity admits nothing;
+any other system runs standalone. No refusal falls back to the other
+mode.
 
 - **Vault thread.** `src/backend.rs` alone holds td-secret's `pass::Host`,
   the unlocked `Vault` and the enrolled keys' credentials, and serves the
@@ -222,8 +223,9 @@ read only through `src/files.rs` in those ways, and the vault-document
 policy.
 
 Not yet: the native compositor cases, the host lock and sleep evidence
-on the supported host, td mode, and the recipe and image integration of
-increment 5.
+on the supported host, td mode, the foreign-host acceptance of the same
+executable, and increment 5's independent recovery, migration and
+hardware evidence.
 
 ## Delivery and proof
 
@@ -271,3 +273,25 @@ decisions and lock during an in-flight operation. Inspect retained buffers
 and clipboard lifecycle after lock; a backend key deletion alone is not a
 successful lock test. The first production target is complete only with
 td-secret's physical primary/backup and fresh-machine recovery evidence.
+
+### Implemented artifact
+
+`recipes/src/recipes/td-pass.rs` builds td-pass as a target Cargo recipe
+with the source-built stage2 toolchain, from the checkout's own trees:
+td-pass, and the sibling trees its closure mounts by path (td-secret,
+td-ui, td-compositor, td-authd, td-busd, td-firstboot and engine). Its
+lock names only td-pass, td-secret and td-ui, so the closure is std. The
+binary is static PIE with no interpreter, needed library or run path,
+built with the target's frame pointers and line tables, and its output
+carries the build-ID-matched debug companion. The system image copies
+the whole output and links `/bin/td-pass` to it, so the image's
+deployment index covers it and the same executable can be carried to a
+foreign host. On td itself the window refuses until td mode is built;
+the token worker's entry, dispatched before mode admission, still runs
+there with only the caller's own device access, as on any host.
+`td-pass-test` requires the binary, asserts its static shape and runs
+`td-pass --help`, the one argument the window answers besides the token
+worker's. A recipe test walks every literal `#[path]`, `include!`,
+`include_str!` and `include_bytes!` the compiled crates name, and those
+the named files name in turn, and pins the staged trees to exactly the
+trees reached; a name built with `concat!` is not walked.
