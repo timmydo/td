@@ -1453,11 +1453,23 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-review and td-vm are independent host tools. Neither enters a
-    // bootstrap graph or recipe closure, so unlike the crates
-    // above there is no target artifact for recipe-checks to link.
+    // td-review, the integrator's window, is a static target recipe packed
+    // into the image with a realized-output check (td-review-test), as
+    // td-taskmgr is. Its App-level tests drive a real git repo and run only
+    // on the cargo-test preflight (`--include-ignored`); recipe-checks holds
+    // the static link.
+    if p.starts_with("td-review/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
+    // td-vm is an independent host tool. It enters no bootstrap graph or
+    // recipe closure, so unlike the crates above there is no target artifact
+    // for recipe-checks to link.
     //
-    // `cargo-test` is the one gate that reaches td-review at all —
+    // `cargo-test` is the one gate that reaches td-vm at all —
     // clippy --all-targets, its tests, and
     // its dependency-free lock, now through the derived roster rather than a
     // name in its body — and the preflight above covers all three and then
@@ -1470,7 +1482,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // an hour of mes/tcc/gcc that cannot read a host-side crate. Bounded means
     // bounded by what the diff can break; a selection nothing in it inspects is
     // latency, and latency is what gets a pre-push check skipped.
-    if pattern_matches("td-review/*|td-vm/*", p) {
+    if pattern_matches("td-vm/*", p) {
         sel.add_preflight("cargo-test");
         return;
     }
@@ -2891,24 +2903,23 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-boot/src/main.rs",
         "bootstrap-x86_64-self-gcc-store-native"
     );
-    // Nothing builds td-review as a target artifact, so no -test recipe links
-    // it — and it selects no check target at all, so these assert what RUNS
-    // rather than only what is recorded: `cargo-test` is the whole selection,
-    // and it is the only gate whose body names the crate.
-    assert_preflight!("td-review/src/main.rs", "cargo-test");
-    assert_preflight!("td-review/src/land.rs", "cargo-test");
-    assert_preflight!("td-review/tests/land.rs", "cargo-test");
-    assert_preflight!("td-review/Cargo.toml", "cargo-test");
-    assert_preflight!("td-review/Cargo.lock", "cargo-test");
-    assert_no_target!("td-review/src/main.rs", "recipe-checks");
-    assert_no_target!("td-review/Cargo.toml", "recipe-checks");
-    // The bootstrap ladder cannot read a host-side crate: selecting it here
-    // bought nothing and cost the hour that makes a pre-push check get skipped.
-    assert_no_target!("td-review/src/main.rs", "check");
-    assert_no_target!("td-review/src/land.rs", "check");
-    assert_no_target!("td-review/tests/land.rs", "check");
-    assert_no_target!("td-review/Cargo.toml", "check");
-    assert_no_target!("td-review/Cargo.lock", "check");
+    // td-review is a static target recipe packed into the image: its source
+    // takes the host suite (the only tier for its git-driving tests) and the
+    // static-link proof through recipe-checks.
+    for path in [
+        "td-review/src/main.rs",
+        "td-review/src/land.rs",
+        "td-review/tests/land.rs",
+        "td-review/Cargo.toml",
+        "td-review/Cargo.lock",
+    ] {
+        assert_preflight!(path, "cargo-test");
+        assert_target!(path, "recipe-checks");
+        assert_target!(path, "check");
+    }
+    // The bootstrap ladder cannot read a host-side crate: selecting it for
+    // td-vm bought nothing and cost the hour that makes a pre-push check get
+    // skipped.
     for path in [
         "td-vm/src/bin/td-vm.rs",
         "td-vm/src/bin/td-vm-git.rs",
@@ -5643,7 +5654,7 @@ mod tests {
     /// the tree rather than trusted. The `#[path]` and `include_str!` readers
     /// the tree carries — td-portal and td-editor both build modules out of
     /// td-compositor — are the positive controls, so the scan cannot go
-    /// vacuous; td-review, the one crate no recipe embeds, is read by nobody,
+    /// vacuous; td-review is read by no other crate,
     /// so its change runs its own suite and the workspace's and no other; no
     /// crate reads itself, and nothing off the roster appears. Textual, and
     /// so bounded: a path assembled by `concat!` from pieces that never spell
@@ -10209,11 +10220,11 @@ mod tests {
         );
 
         // td-review → the cargo-test preflight over the workspace suite and
-        // td-review's OWN manifest, and NOTHING else: the only selection with
-        // no `td-builder check` line at all. Pinned as exact output because
-        // the absences are the point — a stray target would restore an hour
-        // of bootstrap builds, and a stray manifest another crate's suite,
-        // for a crate none of it reads.
+        // td-review's OWN manifest, and recipe-checks scoped to its recipe
+        // and realized-output check. Pinned as exact output because the
+        // absences are the point — a stray manifest would run another
+        // crate's suite, and an unscoped recipe-checks every recipe's, for a
+        // crate none of them reads.
         assert_eq!(
             path_output(&root, "td-review/src/land.rs"),
             expect(&[
@@ -10224,6 +10235,8 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  td-builder check check recipe-checks",
+                "  recipe-checks scope: td-review (TD_CHECK_SCOPE on the command above)",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",

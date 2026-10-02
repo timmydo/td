@@ -192,7 +192,7 @@ cross to the worker stamped with the newest frame painted whole a dwell
 before the window read them, and the program's typeahead drop discards
 those stamped before the frame that raised a confirmation (td-review's
 `window.rs`). The toolkit
-is unchanged; td-review is a host tool, not yet a recipe consumer.
+is unchanged. td-review is a recipe consumer packed into the image.
 
 ## Purpose and trust position
 
@@ -210,9 +210,9 @@ consumer's lock then lists exactly its own package plus td-ui. A program
 that depends on td-ui is built by a cargo recipe that stages sibling source
 trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
 recipe cannot link a second crate. td-portal, td-taskmgr, td-editor,
-td-news, td-mail, td-setup and td-term are built that way: each stages
-`td-ui`, and `td-compositor` because td-ui mounts the font and wire
-modules from it, beside its own tree. td-portal and td-setup stage
+td-news, td-mail, td-review, td-setup and td-term are built that way:
+each stages `td-ui`, and `td-compositor` because td-ui mounts the font
+and wire modules from it, beside its own tree. td-portal and td-setup stage
 further siblings of their own. A toolkit edit changes each consumer's
 locally derived source identity and selects each consumer's
 realized-output check.

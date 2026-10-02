@@ -57,12 +57,12 @@
 //! (`allow-*-in-tests`), which scopes it to tests rather than to a file. td-svc's
 //! unsafe surface is one `kill(2)`, which safe std has
 //! no route to at all; DESIGN.md records that and why every OTHER capability it
-//! needs is reachable through safe std. td-review is the one
-//! HOST-side crate here (in neither bootstrap graph, but pure std and offline), and
-//! only its `--bins` tests run — declared as `gate-test-args`, separately from the
+//! needs is reachable through safe std. For td-review and td-vm only the
+//! `--bins` tests run — declared as `gate-test-args`, separately from the
 //! `test-args` the host preflight uses, because the two legs deliberately run
-//! different suites: its integration tests need a `git`, which the
-//! sandbox toolchain has none of, so they run in the host `cargo-test` preflight.
+//! different suites: their integration tests need the host (td-review's need
+//! a `git`, which the sandbox toolchain has none of), so they run in the host
+//! `cargo-test` preflight.
 //! The network tools
 //! (fetch/feed/subst) carry the vendored
 //! FSDG crates and can't compile offline, so they are NOT linted here; their

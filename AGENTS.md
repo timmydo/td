@@ -322,7 +322,7 @@ message.
   crate's confinement tests must pin the source-level contract the compiler
   cannot express.
 - `builder`, `recipes`, and `engine` are one zero-external-dependency workspace.
-  Target crates and the host tools `td-review` and `td-vm` have standalone
+  Target crates and the host tool `td-vm` have standalone
   locks that list their own package and, at most, other `td-*` roster crates
   they depend on by path (except the named crypto admission below): no registry
   or git crate, and no path outside the roster, so engine sources reach a target crate only as shared source. A

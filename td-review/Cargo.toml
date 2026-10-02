@@ -41,7 +41,3 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"
-
-[profile.release]
-opt-level = 2
-strip = true

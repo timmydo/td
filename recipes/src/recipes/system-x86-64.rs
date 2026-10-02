@@ -4322,6 +4322,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-taskmgr}/bin/td-taskmgr".into(),
         link: "{root}/real-root/bin/td-taskmgr".into(),
     });
+    // td-review, the integrator's review and landing window: a static
+    // system-tree program over the image's own `/bin/git`.
+    steps.push(Step::CopyTree {
+        from: "{in:td-review}".into(),
+        dest: "{root}/real-root{in:td-review}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-review}/bin/td-review".into(),
+        link: "{root}/real-root/bin/td-review".into(),
+    });
     // td-term, the terminal (td-term/DESIGN.md): a static system-tree program
     // the session starts and the launcher opens, and its compiled terminfo
     // entry, a data package `/etc/terminfo` names.
@@ -5489,6 +5499,7 @@ pub fn recipe() -> Recipe {
             "td-svc",
             "td-profiler",
             "td-taskmgr",
+            "td-review",
             "td-term",
             "td-term-terminfo",
             "td-photo",
@@ -7294,6 +7305,7 @@ mod tests {
             ("td-authd", "td-authd"),
             ("td-term", "td-term"),
             ("td-taskmgr", "td-taskmgr"),
+            ("td-review", "td-review"),
             ("td-photo", "td-photo"),
             ("td-editor", "td-editor"),
         ] {
@@ -14093,6 +14105,36 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             native_inputs.iter().any(|input| input == "td-taskmgr"),
             "td-taskmgr must be a declared native input"
         );
+    }
+
+    #[test]
+    fn td_review_is_packed_beside_the_images_git() {
+        let steps = real_root_steps(&SYSTEM).unwrap();
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-review}"
+                        && dest == "{root}/real-root{in:td-review}"
+            )),
+            "td-review must be CopyTree'd into the immutable root"
+        );
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { target, link }
+                    if target == "{in:td-review}/bin/td-review"
+                        && link == "{root}/real-root/bin/td-review"
+            )),
+            "/bin/td-review must name the staged static package"
+        );
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        for input in ["td-review", "git-x86-64"] {
+            assert!(
+                native_inputs.iter().any(|i| i == input),
+                "{input} must be a declared native input: td-review runs git"
+            );
+        }
     }
 
     #[test]

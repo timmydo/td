@@ -444,6 +444,7 @@ mod tests {
                 "td-news",
                 "td-photo",
                 "td-portal",
+                "td-review",
                 "td-secret",
                 "td-setup",
                 "td-taskmgr",

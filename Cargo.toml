@@ -13,16 +13,13 @@
 # would have edited at once (APPLICATIONS.md §V.0).
 #
 # Each standalone crate states its own reason for being outside the workspace in
-# its own manifest, which is where a reader adding one will be. Two that are not
+# its own manifest, which is where a reader adding one will be. One that is not
 # obvious from a crate name:
 #   net/       — the network tools (td-net); the ONLY crates allowed external
 #                deps (ureq/rustls/sha2/ring), so their vendored closure must
 #                not mix into the engine's dependency-free lock. It is
 #                deliberately NOT `td-`-prefixed: that prefix is what
 #                builder/src/affected.rs discovers as a dependency-free crate.
-#   td-review/ — a HOST-side integrator utility (branch review + squash landing
-#                TUI). In neither bootstrap graph: it is not a control-plane
-#                build program and never enters a closure.
 
 [workspace]
 resolver = "2"
