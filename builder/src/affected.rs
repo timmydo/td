@@ -5774,6 +5774,7 @@ mod tests {
                 "td-authd",
                 "td-compositor",
                 "td-crypto",
+                "td-dua",
                 "td-editor",
                 "td-firstboot",
                 "td-install",
@@ -8175,6 +8176,7 @@ mod tests {
                 "td-authd",
                 "td-compositor",
                 "td-crypto",
+                "td-dua",
                 "td-editor",
                 "td-firstboot",
                 "td-install",
@@ -8198,12 +8200,13 @@ mod tests {
             ]
         );
         // td-photo's and td-mail's native cases make their commands three,
-        // as td-setup's are; td-news, td-pass and td-term, toolkit consumers
-        // with no native case, add two each. The test-only P-256 oracle connects
-        // td-secret to td-crypto and then td-mta, adding two commands each;
-        // the installation fixture, reading td-install's codecs, adds two.
+        // as td-setup's are; td-dua, td-news, td-pass and td-term, toolkit
+        // consumers with no native case, add two each. The test-only P-256
+        // oracle connects td-secret to td-crypto and then td-mta, adding two
+        // commands each; the installation fixture, reading td-install's
+        // codecs, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 55, "{comp:?}");
+        assert_eq!(comp.len(), 57, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -8214,6 +8217,7 @@ mod tests {
                 "td-busd",
                 "td-compositor",
                 "td-crypto",
+                "td-dua",
                 "td-editor",
                 "td-firstboot",
                 "td-install",
@@ -8246,6 +8250,7 @@ mod tests {
                 "td-boot",
                 "td-compositor",
                 "td-crypto",
+                "td-dua",
                 "td-editor",
                 "td-firstboot",
                 "td-install",

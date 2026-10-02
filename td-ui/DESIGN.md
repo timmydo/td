@@ -16,8 +16,8 @@ painter, the single-line text entry `TextEntry`, the button strip
 terminal's reusable half: the VT parser and model, its renderer, the
 keyboard chord encoder, the terminfo compiler and the PTY with its
 threads. td-editor is its first consumer; the installer front end
-`td-setup` (its welcome page landed), td-portal's file chooser, td-photo
-and the terminal `td-term` follow.
+`td-setup` (its welcome page landed), td-portal's file chooser, td-photo,
+the terminal `td-term` and the disk usage analyzer `td-dua` follow.
 This document is the component contract and the starting point for
 successive agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern
 changes and submission.
