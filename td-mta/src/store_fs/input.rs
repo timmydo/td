@@ -10,6 +10,12 @@ use std::{
     os::unix::fs::{FileExt, MetadataExt},
 };
 
+#[path = "input/recovery.rs"]
+mod recovery;
+#[cfg(test)]
+pub(super) use recovery::{prepare_probe as prepare_recovery_probe, probe as probe_recovery};
+pub use recovery::{RecoveryInput, RecoveryInputError, ScannedJournal};
+
 #[path = "input/prefix.rs"]
 mod prefix;
 #[cfg(test)]

@@ -380,7 +380,10 @@ selected sequence/offset binding, specified in
 [STORAGE.md](STORAGE.md#validating-captured-active-frames).
 
 The complete-header/short-body distinction and every sync boundary are owned
-by STORAGE sections 5-6. A checksum-invalid complete final frame is corruption,
+by STORAGE sections 5-6. The read-only stopped scanner implements physical
+classification as specified in
+[STORAGE.md](STORAGE.md#scanning-a-stopped-active-journal); explicit repair is
+still separate. A checksum-invalid complete final frame is corruption,
 not a recoverable incomplete tail. No forward magic search is permitted.
 
 ## 5. Manifest

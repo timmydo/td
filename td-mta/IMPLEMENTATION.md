@@ -754,9 +754,18 @@ service activation. Each part lands independently:
     truncation and final sequence mismatch. Both adapters reuse one admitted
     frame arena in the allocation fixture. Real pins/history retention,
     ReadView's separate change cursor, tail repair and final-view checks remain.
-  - **M05d5 — stopped active-tail recovery:** classify actual incomplete EOF
-    separately from complete corrupt frames, retain the last valid boundary,
-    and truncate/sync only during exclusive recovery. Finish graph/replay and
+  - **M05d5a — stopped active scan:** implemented read-only whole-file scanning
+    with selected header identity, bounded provisional frames and physical EOF
+    completion. ScannedJournal retains the last valid boundary and incomplete
+    tail extent without repair. Short journal headers, complete corrupt frames,
+    gaps and impossible declared budgets refuse. Tests cover every short final
+    header/body/footer length, complete corruption, short-tail gaps, exhausted
+    sequence/byte/operation budgets, the physical format cap, read-budget
+    failure and changed extents. Allocation probes reuse the existing arena at
+    both roots. Live journal readers retain strict short-frame refusal.
+  - **M05d5b — explicit tail repair:** recheck scanner-retained identity/extent,
+    truncate only its observed incomplete tail, then sync under exclusive
+    recovery. Preserve uncertainty on syscall errors. Finish graph/replay and
     reference validation before opening pins or mutation admission.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;

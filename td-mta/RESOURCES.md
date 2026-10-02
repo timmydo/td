@@ -672,6 +672,16 @@ and populated active prefixes with an incomplete suffix, final binding and
 invalid-view/admission refusal. Literal active files and metadata are prepared
 before the snapshots. No extra per-view buffer or runtime pin pool is added.
 
+RecoveryInput retains one whole-file StoreReader, fixed journal verifier and
+valid sequence/operation counters, borrowing the same admitted 1 MiB frame
+arena. It performs at most 64 explicit reads per frame/tail, and no suffix
+allocation or directory inventory. ScannedJournal retains the CompleteFile,
+verified Summary and valid byte boundary. The allocation interval reuses the
+active fixture with its incomplete suffix and the existing frame arena, checks
+physical EOF completion, whole-file byte refusal, premature completion and
+sticky read failure at both root bounds. Fixture metadata preparation is cold;
+no repair, worker slot or extra frame reservation is introduced.
+
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 

@@ -528,6 +528,46 @@ acquires runtime pins, implements ReadView::next_change or activates service.
 Full-prefix recovery/verification reuses an already admitted frame arena; it
 adds no per-view MiB reservation.
 
+### Scanning a stopped active journal
+
+`LockedRoot::scan_active_journal` is read-only recovery input. The caller holds
+actual stopped-store exclusion with no live readers or writers; LOCK alone
+does not serialize threads. Open only the selected active journal as a whole
+private file under the admitted byte ceiling and format cap. Require a complete
+checksummed 96-byte journal header matching selected account, epoch, segment
+and checkpoint base. A short journal header is corruption, never an empty
+recoverable journal. Caller ceilings below the header are InvalidInput.
+
+RecoveryInput borrows the existing 1 MiB frame arena. One next_frame call
+returns a provisional checked frame, or None at the recorded end or after
+consuming an incomplete recorded tail. Before any further frame/tail read,
+require a sequence successor, an available operation and capacity for a minimum
+frame. Exhaustion refuses even a physically short header. For a remainder
+shorter than 64 bytes,
+consume those bytes without feeding them to the journal verifier. Otherwise
+validate the entire fixed frame header and exact next sequence first. Require
+its declared complete size and operation count to fit the remaining segment
+budgets, even if its body is incomplete. Consume at most its recorded physical
+remainder; only a complete frame is passed to the full verifier. A complete
+invalid header/footer, sequence gap or impossible frame is corruption.
+
+Each frame or tail shares 64 explicit reads across header/remainder. Read
+failures, exhausted attempt bounds and format failures retire the scanner.
+A short physical read relative to the opening extent is an I/O failure, not
+repair evidence. The stopped file may not change during scanning. Recovery's
+incomplete-tail classification stays separate from live FrameInput, whose
+history and active-prefix reads continue to reject short recorded frames.
+
+Consuming `finish` requires the whole recorded extent consumed, unchanged
+length and observed physical EOF. ScannedJournal retains the CompleteFile,
+summary of only complete frames, and exact valid byte boundary. Its incomplete
+flag means physical bytes remain beyond that boundary; those bytes have been
+read but have not been mutated or included in the verified prefix digest.
+No scanning operation truncates, syncs repaired content, publishes committed
+state, validates final row references or grants serving authority. Explicit
+repair must use this observed file identity and boundary under exclusive
+recovery before complete graph/replay validation and activation.
+
 ### Expected CURRENT replacement
 
 `CurrentUpdate::prepare` encodes a next CURRENT and either expected absence or
