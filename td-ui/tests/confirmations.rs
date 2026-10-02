@@ -781,3 +781,29 @@ fn an_alternate_label_is_bounded_and_needs_its_own_row() {
         Error::NoRoom
     );
 }
+
+#[test]
+fn the_default_chords_name_the_keys() {
+    for (chord, key) in [
+        ("Tab", Key::Tab),
+        ("S-Tab", Key::BackTab),
+        ("Up", Key::Up),
+        ("Down", Key::Down),
+        ("PageUp", Key::PageUp),
+        ("PageDown", Key::PageDown),
+        ("Home", Key::Home),
+        ("End", Key::End),
+        ("Return", Key::Activate),
+        ("Space", Key::Activate),
+        (" ", Key::Activate),
+        ("Escape", Key::Escape),
+    ] {
+        assert_eq!(Key::from_chord(chord), Some(key), "{chord}");
+    }
+    // Left and Right are not focus moves: the actions stand in rows.
+    for chord in [
+        "Left", "Right", "C-Up", "S-Up", "C-Tab", "S-Escape", "C-q", "y", "x", "",
+    ] {
+        assert_eq!(Key::from_chord(chord), None, "{chord}");
+    }
+}

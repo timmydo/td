@@ -1,4 +1,6 @@
 //! Revision-bound confirmation with a scrollable immutable request.
+//! The consumer routes its chords in; `Key::from_chord` is the default
+//! set.
 
 use crate::chrome::{Item, List, Panel, Row, ROW};
 use crate::raster::{Draw, Primitive, Rect, Surface, BORDER};
@@ -168,6 +170,28 @@ pub enum Key {
     End,
     Activate,
     Escape,
+}
+impl Key {
+    /// The default bindings: Tab and Shift+Tab between the details and
+    /// the actions, Up and Down, Page Up and Down, Home and End within
+    /// the details, Return or Space to choose the focused action, and
+    /// Escape to cancel. A chord it names nothing for is the consumer's
+    /// to pass as `Event::Other`, which the open dialog consumes.
+    pub fn from_chord(chord: &str) -> Option<Self> {
+        match chord {
+            "Tab" => Some(Self::Tab),
+            "S-Tab" => Some(Self::BackTab),
+            "Up" => Some(Self::Up),
+            "Down" => Some(Self::Down),
+            "PageUp" => Some(Self::PageUp),
+            "PageDown" => Some(Self::PageDown),
+            "Home" => Some(Self::Home),
+            "End" => Some(Self::End),
+            "Return" | "Space" | " " => Some(Self::Activate),
+            "Escape" => Some(Self::Escape),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {

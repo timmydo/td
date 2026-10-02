@@ -5,24 +5,6 @@
 
 use super::*;
 
-/// A chord the dialog understands.
-fn dialog_key(chord: &str) -> Option<confirmations::Key> {
-    use confirmations::Key;
-    Some(match chord {
-        "Tab" => Key::Tab,
-        "S-Tab" => Key::BackTab,
-        "Up" => Key::Up,
-        "Down" => Key::Down,
-        "PageUp" => Key::PageUp,
-        "PageDown" => Key::PageDown,
-        "Home" => Key::Home,
-        "End" => Key::End,
-        "Return" | "Space" | " " => Key::Activate,
-        "Escape" => Key::Escape,
-        _ => return None,
-    })
-}
-
 impl App {
     /// One input; whether the window should close is `quitting`.
     pub fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
@@ -81,7 +63,7 @@ impl App {
             return self.chooser_key(chord, repeat);
         }
         if let Some((dialog, _)) = &mut self.dialog {
-            let event = match dialog_key(chord) {
+            let event = match confirmations::Key::from_chord(chord) {
                 Some(key) => confirmations::Event::Key {
                     key,
                     repeated: repeat,

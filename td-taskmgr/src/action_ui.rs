@@ -581,21 +581,9 @@ impl Controller {
             self.retry_results();
             return true;
         }
-        let ck = match key {
-            "Tab" => Some(confirm::Key::Tab),
-            "S-Tab" => Some(confirm::Key::BackTab),
-            "Up" => Some(confirm::Key::Up),
-            "Down" => Some(confirm::Key::Down),
-            "Home" => Some(confirm::Key::Home),
-            "End" => Some(confirm::Key::End),
-            "PageUp" => Some(confirm::Key::PageUp),
-            "PageDown" => Some(confirm::Key::PageDown),
-            "Return" | "Space" | " " => Some(confirm::Key::Activate),
-            "Escape" => Some(confirm::Key::Escape),
-            _ => None,
-        };
         if self.confirmation(
-            ck.map(|key| confirm::Event::Key { key, repeated })
+            confirm::Key::from_chord(key)
+                .map(|key| confirm::Event::Key { key, repeated })
                 .unwrap_or(confirm::Event::Other),
         ) {
             return true;

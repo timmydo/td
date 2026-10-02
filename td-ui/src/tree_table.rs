@@ -1,4 +1,6 @@
 //! Pure tree-table interaction over stable, validated visible row IDs.
+//! The consumer owns its key bindings and focus traversal;
+//! `Key::from_chord` is the default set.
 use crate::raster::{Rect, Scrollbar, Surface};
 pub use crate::tree_table_geometry::{
     CellRect, Error as GeometryError, Geometry, Hit as GeometryHit, GUTTER, INDENT, ROW,
@@ -43,6 +45,28 @@ pub enum Key {
     Activate,
     ScrollLeft,
     ScrollRight,
+}
+impl Key {
+    /// The default bindings: arrows, Page Up and Down, Home and End for
+    /// the first and last rows, Shift with Left or Right to scroll
+    /// sideways, and Return or Space to activate. Header focus and
+    /// every other chord stay with the consumer.
+    pub fn from_chord(chord: &str) -> Option<Self> {
+        match chord {
+            "Up" => Some(Self::Up),
+            "Down" => Some(Self::Down),
+            "Left" => Some(Self::Left),
+            "Right" => Some(Self::Right),
+            "PageUp" => Some(Self::PageUp),
+            "PageDown" => Some(Self::PageDown),
+            "Home" => Some(Self::First),
+            "End" => Some(Self::Last),
+            "S-Left" => Some(Self::ScrollLeft),
+            "S-Right" => Some(Self::ScrollRight),
+            "Return" | "Space" | " " => Some(Self::Activate),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {

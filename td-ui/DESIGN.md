@@ -2034,16 +2034,19 @@ Focus starts on Cancel. Tab/BackTab cycle only through the detail list,
 Cancel, the alternate if any, and Confirm; without an alternate,
 `Focus::Alternate` is never focused and has no row. Up/Down,
 PageUp/PageDown and Home/End navigate details; Activate acts only on the
-focused action. Escape cancels. Primary pointer press arms an action and
-release on that same action chooses it; moving away or any intervening
-keyboard input, including repeats, cancels the arm. Pointer actions
-preserve the keyboard focus choice; abandoning a pointer gesture cannot
-move the default keyboard action to Confirm. Blank detail rows do not
-select content. Outside input is consumed without closing or reaching
-underlying controls. Other unhandled input is consumed. Key repeat
-never activates. Focus loss cancels; resize cancels a pending gesture
-and returns focus to Cancel. A missing or changed revision closes stale
-without confirmation.
+focused action. Escape cancels. `Key::from_chord` is the default set:
+Tab and Shift+Tab, Up and Down, Page Up/Down, Home and End, Return or
+Space for Activate and Escape; Left and Right, like any chord it names
+nothing for, reach the dialog as `Event::Other`. Primary pointer press
+arms an action and release on that same action chooses it; moving away
+or any intervening keyboard input, including repeats, cancels the arm.
+Pointer actions preserve the keyboard focus choice; abandoning a pointer
+gesture cannot move the default keyboard action to Confirm. Blank detail
+rows do not select content. Outside input is consumed without closing or
+reaching underlying controls. Other unhandled input is consumed. Key
+repeat never activates. Focus loss cancels; resize cancels a pending
+gesture and returns focus to Cancel. A missing or changed revision
+closes stale without confirmation.
 
 Confirmation, cancellation, stale data and an unavailable resized layout
 each produce one `Closed` outcome. Later events are ignored and a closed
@@ -2058,19 +2061,20 @@ The adapter must not position Confirm, nor an alternate such as Discard,
 beneath the pointer that opened the dialog: a second click in a
 double-click is otherwise a fresh gesture.
 
-`tests/confirmations.rs` pins default cancellation, focus confinement,
-press/release pairing, duplicate/repeated input, outside input, stale data,
-focus loss, resize refusal and focus restoration. It covers capture
-independence, lossless Unicode wrapping and scrolling, the full one-MiB
-request bound, malformed input and unusable geometry. A three-way dialog's
-rows stand in order inside it, each choosing its own action by press and
-release and the alternate by Tab and Activate, each painting its own
-label with only the focused row highlighted at scales one through four;
-its label is bounded and validated, counted in storage, and refused with
-`NoRoom` when too wide or when the height holds only two actions, and a
-resize to such a height closes it `Unavailable`. Draw-stream and
-pixel checks at scales one through four keep the controls within the
-dialog, preserve pixels outside it and respect partial damage.
+`tests/confirmations.rs` pins the default chords, default cancellation,
+focus confinement, press/release pairing, duplicate/repeated input,
+outside input, stale data, focus loss, resize refusal and focus
+restoration. It covers capture independence, lossless Unicode wrapping
+and scrolling, the full one-MiB request bound, malformed input and
+unusable geometry. A three-way dialog's rows stand in order inside it,
+each choosing its own action by press and release and the alternate by
+Tab and Activate, each painting its own label with only the focused row
+highlighted at scales one through four; its label is bounded and
+validated, counted in storage, and refused with `NoRoom` when too wide
+or when the height holds only two actions, and a resize to such a height
+closes it `Unavailable`. Draw-stream and pixel checks at scales one
+through four keep the controls within the dialog, preserve pixels
+outside it and respect partial damage.
 
 ## Shared directory finder
 
@@ -2432,22 +2436,25 @@ The consumer provides an optional ascending/descending sort indicator.
 
 The adapter routes focus to rows or a validated heading. Up/Down,
 PageUp/PageDown and First/Last select and reveal rows. Up/Down without a
-selection start at the first visible row; unchanged navigation is consumed
-without repeating a selection intent. Left collapses an
+selection start at the first visible row; unchanged navigation is
+consumed without repeating a selection intent. Left collapses an
 expanded branch, otherwise selects its parent; Right expands a collapsed
 branch, otherwise selects its first visible child. Activate emits a row
 activation or heading sort intent. Header Left/Right and First/Last move
-and reveal the focused heading. ScrollLeft/ScrollRight move the horizontal
-viewport. Navigation honors repeats; repeated Activate is consumed.
-The consumer owns physical key bindings and focus traversal.
+and reveal the focused heading. ScrollLeft/ScrollRight move the
+horizontal viewport. Navigation honors repeats; repeated Activate is
+consumed. The consumer owns physical key bindings and focus traversal;
+`Key::from_chord` is the default set: arrows, Page Up/Down, Home and End
+for First and Last, Shift+Left/Right to scroll sideways, and Return or
+Space to activate.
 
-Tests cover bounded hierarchy and text validation, stable ID/anchor
-replacement, stale and interrupted gestures, disclosure and navigation,
-scrollbar capture, horizontal header/cell/hit alignment, visible-only
-formatting, fallback and scale 1-4 clipping/partial-repaint pixel oracles,
-and the disclosure box's exact plus and minus, its colour on a focused
-selection, its clipping to partial damage and its absence on a leaf, at
-scales 1-4.
+Tests cover the default chords, bounded hierarchy and text validation,
+stable ID/anchor replacement, stale and interrupted gestures, disclosure
+and navigation, scrollbar capture, horizontal header/cell/hit alignment,
+visible-only formatting, fallback and scale 1-4 clipping/partial-repaint
+pixel oracles, and the disclosure box's exact plus and minus, its colour
+on a focused selection, its clipping to partial damage and its absence
+on a leaf, at scales 1-4.
 
 ## Task-manager widgets
 

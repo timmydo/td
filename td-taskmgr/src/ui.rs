@@ -1424,21 +1424,7 @@ impl State {
                 return Outcome::Changed;
             }
             Focus::Tree => {
-                let key = match key {
-                    "Up" => Some(tree::Key::Up),
-                    "Down" => Some(tree::Key::Down),
-                    "Left" => Some(tree::Key::Left),
-                    "Right" => Some(tree::Key::Right),
-                    "Home" => Some(tree::Key::First),
-                    "End" => Some(tree::Key::Last),
-                    "PageUp" => Some(tree::Key::PageUp),
-                    "PageDown" => Some(tree::Key::PageDown),
-                    "S-Left" => Some(tree::Key::ScrollLeft),
-                    "S-Right" => Some(tree::Key::ScrollRight),
-                    "Return" => Some(tree::Key::Activate),
-                    _ => None,
-                };
-                if let Some(key) = key {
+                if let Some(key) = tree::Key::from_chord(key) {
                     if let Some(view) = &mut self.view {
                         let outcome = view.table.event(tree::Event::Key { key, repeated });
                         self.tree_outcome(outcome);

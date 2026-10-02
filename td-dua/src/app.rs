@@ -94,41 +94,6 @@ fn dialog_rect(surface: Surface) -> Option<Rect> {
     })
 }
 
-fn dialog_key(chord: &str) -> Option<confirmations::Key> {
-    use confirmations::Key;
-    Some(match chord {
-        "Tab" | "Right" => Key::Tab,
-        "S-Tab" | "Left" => Key::BackTab,
-        "Up" => Key::Up,
-        "Down" => Key::Down,
-        "PageUp" => Key::PageUp,
-        "PageDown" => Key::PageDown,
-        "Home" => Key::Home,
-        "End" => Key::End,
-        "Return" | "Space" | " " => Key::Activate,
-        "Escape" => Key::Escape,
-        _ => return None,
-    })
-}
-
-fn table_key(chord: &str) -> Option<tree_table::Key> {
-    use tree_table::Key;
-    Some(match chord {
-        "Up" => Key::Up,
-        "Down" => Key::Down,
-        "Left" => Key::Left,
-        "Right" => Key::Right,
-        "Home" => Key::First,
-        "End" => Key::Last,
-        "PageUp" => Key::PageUp,
-        "PageDown" => Key::PageDown,
-        "S-Left" => Key::ScrollLeft,
-        "S-Right" => Key::ScrollRight,
-        "Return" | "Space" | " " => Key::Activate,
-        _ => return None,
-    })
-}
-
 impl App {
     /// A window over `root`, an absolute directory, asking for its scan.
     pub fn new(root: PathBuf, surface: Surface) -> Self {
@@ -463,7 +428,7 @@ impl App {
 
     fn key(&mut self, chord: &str, repeat: bool) {
         if self.dialog.is_some() {
-            let event = match dialog_key(chord) {
+            let event = match confirmations::Key::from_chord(chord) {
                 Some(key) => confirmations::Event::Key {
                     key,
                     repeated: repeat,
@@ -488,7 +453,7 @@ impl App {
                 _ => {}
             }
         }
-        let Some(key) = table_key(chord) else {
+        let Some(key) = tree_table::Key::from_chord(chord) else {
             return;
         };
         if let Some(table) = &mut self.table {

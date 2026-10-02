@@ -197,14 +197,15 @@ action interprets the visual indentation or a substring match as its target.
 
 ## Process detail view
 
-Double-clicking a process row or pressing Enter opens a detail view for its
-exact process key. Details (Enter) provides the same toolbar action. Its
-CPU and RSS plots use retained history for that process, with one row of
-cards and Page Up/Down access when both do not fit side by side. The lower
-pane roots a parent/child tree at that process; unrelated branches and
-ancestors no longer consume its indentation. A Parent button and Alt+Up
-open its observed parent using the same key-bound view. An unavailable
-parent is informational, not an invented PID target.
+Double-clicking a process row or pressing Enter or Space (td-ui's
+default tree chords) opens a detail view for its exact process key.
+Details (Enter) provides the same toolbar action. Its CPU and RSS plots
+use retained history for that process, with one row of cards and Page
+Up/Down access when both do not fit side by side. The lower pane roots a
+parent/child tree at that process; unrelated branches and ancestors no
+longer consume its indentation. A Parent button and Alt+Up open its
+observed parent using the same key-bound view. An unavailable parent is
+informational, not an invented PID target.
 
 The detail identity stays fixed while selecting related rows for ordinary
 process actions. Double-click/Enter on a related process opens its details.

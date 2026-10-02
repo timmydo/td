@@ -798,3 +798,27 @@ fn disclosure_is_a_drawn_box_with_a_plus_or_minus_at_every_scale() {
         assert!(fills.iter().all(|(_, _, color)| *color == INK));
     }
 }
+
+#[test]
+fn the_default_chords_name_the_keys() {
+    for (chord, key) in [
+        ("Up", Key::Up),
+        ("Down", Key::Down),
+        ("Left", Key::Left),
+        ("Right", Key::Right),
+        ("PageUp", Key::PageUp),
+        ("PageDown", Key::PageDown),
+        ("Home", Key::First),
+        ("End", Key::Last),
+        ("S-Left", Key::ScrollLeft),
+        ("S-Right", Key::ScrollRight),
+        ("Return", Key::Activate),
+        ("Space", Key::Activate),
+        (" ", Key::Activate),
+    ] {
+        assert_eq!(Key::from_chord(chord), Some(key), "{chord}");
+    }
+    for chord in ["Tab", "S-Tab", "Escape", "C-Up", "S-Up", "a", "d", "D", ""] {
+        assert_eq!(Key::from_chord(chord), None, "{chord}");
+    }
+}
