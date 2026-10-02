@@ -85,9 +85,9 @@ JetBrains Mono Nerd Font that td-ui and td-term draw with in
 `~/.local/share/fonts/jetbrains-mono-nerd` (under `$XDG_DATA_HOME` when
 that is set), so td programs run on this host draw with it rather than
 Unifont (`td-builder install-fonts`). `./install-apps` builds td-editor,
-td-mail, td-news, td-photo, td-taskmgr and td-term in release mode with
-those tools and installs them for you, every program built before any is
-installed (`td-builder install-apps`). Each runs by name from
+td-mail, td-news, td-photo, td-review, td-taskmgr and td-term in release
+mode with those tools and installs them for you, every program built
+before any is installed (`td-builder install-apps`). Each runs by name from
 `~/.local/bin`; td-news and td-mail there are links to an installed td-net
 that serves their fetch service for each run, as `./news` and `./mail` do,
 with the programs themselves in `~/.local/lib/td`.

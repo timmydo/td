@@ -2,7 +2,7 @@
 //! release mode with the host's cargo and installed for this host's user.
 //! The repository-root `./install-apps` entry script execs this.
 //!
-//! td-editor, td-photo, td-taskmgr and td-term are installed in
+//! td-editor, td-photo, td-review, td-taskmgr and td-term are installed in
 //! `~/.local/bin`. td-news and td-mail fetch only through td's fetch
 //! service, which a host session does not run, so they are installed with
 //! td-net in `~/.local/lib/td`, and their names in `~/.local/bin` are links
@@ -31,6 +31,7 @@ const APPS: &[&str] = &[
     "td-mail",
     "td-news",
     "td-photo",
+    "td-review",
     "td-taskmgr",
     "td-term",
 ];
