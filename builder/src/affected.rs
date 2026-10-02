@@ -4481,7 +4481,7 @@ fn is_name_char(c: char) -> bool {
 
 /// The directories `crate_readers` walks whole; a target declared by `path`
 /// under one of them is already read.
-const SCANNED_SOURCE_DIRS: [&str; 4] = ["src/", "tests/", "examples/", "benches/"];
+const SCANNED_SOURCE_DIRS: &[&str] = &["src/", "tests/", "examples/", "benches/"];
 
 /// The files a manifest declares by a `path = "..."` line of its own, outside
 /// `#` comments, as spelled: `[[bin]]`, `[lib]`, `[[test]]` and the rest all
@@ -4665,7 +4665,7 @@ fn crate_readers(root: &Path, roster: &[GateCrate]) -> Result<Vec<(String, Vec<S
 ///
 /// Checked against the tree rather than trusted, in
 /// `host_only_sources_are_not_reachable_from_the_engine`.
-const HOST_ONLY_ENGINE_SOURCES: [&str; 1] = ["builder/src/ready.rs"];
+const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 
 /// The subset of the derived command list a diff over `changed` can actually
 /// invalidate.

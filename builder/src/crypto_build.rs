@@ -26,7 +26,7 @@ pub(crate) fn validate_sources(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) const CONTROLS: [(&str, &str); 5] = [
+pub(crate) const CONTROLS: &[(&str, &str)] = &[
     ("AWS_LC_SYS_USE_SYSTEM", "0"),
     ("AWS_LC_SYS_CMAKE_BUILDER", "0"),
     ("AWS_LC_SYS_PREBUILT_NASM", "0"),
@@ -281,7 +281,7 @@ mod tests {
     use super::*;
     #[test]
     fn native_controls_refuse_fallbacks_and_target_overrides() {
-        assert!(check_controls(CONTROLS.into_iter().map(|(k, v)| (k.into(), v.into()))).is_ok());
+        assert!(check_controls(CONTROLS.iter().map(|&(k, v)| (k.into(), v.into()))).is_ok());
         for (key, value) in [
             ("AWS_LC_SYS_USE_SYSTEM", "1"),
             ("AWS_LC_SYS_CMAKE_BUILDER", "1"),

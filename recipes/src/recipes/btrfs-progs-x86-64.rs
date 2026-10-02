@@ -15,7 +15,7 @@ use crate::types::{Recipe, Step};
 // touches rsp or rbp, so it keeps every caller's frame chain and needs no
 // ASSEMBLY_EXCEPTIONS entry.
 /// Busybox applets configure and the Makefile call by name.
-const TOOLS: [&str; 45] = [
+const TOOLS: &[&str] = &[
     "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname", "echo",
     "egrep", "env", "expr", "false", "fgrep", "find", "grep", "head", "install", "ln", "ls",
     "mkdir", "mktemp", "mv", "od", "printf", "pwd", "readlink", "rm", "rmdir", "sed", "sleep",

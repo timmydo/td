@@ -959,7 +959,7 @@ fn warm_td_crate_closure_resolving(
 /// arch once with the current source-built `feed/`. Best-effort and idempotent;
 /// the intern is the fail-closed enforcement (issue #546).
 fn warm_kernel_headers_seed(root: &Path) {
-    const ARCHES: [&str; 2] = ["i386", "x86_64"];
+    const ARCHES: &[&str] = &["i386", "x86_64"];
     // Bound the cargo fallback like warm_td_crate_closure; the warm itself is
     // already `timeout`-wrapped.
     let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
@@ -979,7 +979,7 @@ fn warm_kernel_headers_seed(root: &Path) {
         },
     };
 
-    let missing = warm_kh_arches(root, &primary, &ARCHES);
+    let missing = warm_kh_arches(root, &primary, ARCHES);
     if missing.is_empty() {
         return;
     }

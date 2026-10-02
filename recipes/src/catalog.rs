@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn every_assembly_exception_names_a_declared_target_recipe() {
-        for (stem, _) in td_engine::target_profile::ASSEMBLY_EXCEPTIONS {
+        for &(stem, _) in td_engine::target_profile::ASSEMBLY_EXCEPTIONS {
             let recipe = lookup(stem)
                 .unwrap_or_else(|| panic!("assembly exception names missing recipe {stem}"));
             if matches!(stem, "gcc-x86-64-stage1" | "gcc-x86-64-native") {

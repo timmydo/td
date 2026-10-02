@@ -496,7 +496,7 @@ pub(crate) fn build_inner() -> Result<()> {
     Ok(())
 }
 
-const NATIVE_WRAPPERS: [&str; 6] = [
+const NATIVE_WRAPPERS: &[&str] = &[
     "malloc",
     "calloc",
     "realloc",
@@ -2707,7 +2707,7 @@ mod tests {
             .get("CARGO_ENCODED_RUSTFLAGS")
             .unwrap()
             .contains("force-frame-pointers=yes"));
-        for (key, value) in crate::crypto_build::CONTROLS {
+        for &(key, value) in crate::crypto_build::CONTROLS {
             assert_eq!(env.get(key).unwrap(), value);
         }
         assert_eq!(env.get("CARGO_PROFILE_RELEASE_STRIP").unwrap(), "none");

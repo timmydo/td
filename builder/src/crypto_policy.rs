@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
-pub(crate) const DEPENDENCIES: [&str; 3] = [
+pub(crate) const DEPENDENCIES: &[&str] = &[
     "aws-lc-rs = { version = \"=1.18.1\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
     "rustls = { version = \"=0.23.45\", default-features = false, features = [\"std\", \"tls12\", \"aws_lc_rs\"] }",
     "webpki-roots = \"=1.0.8\"",

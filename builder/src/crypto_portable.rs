@@ -20,7 +20,7 @@ struct Archive {
     sha256: &'static str,
 }
 
-const RUST: [Archive; 4] = [
+const RUST: &[Archive] = &[
     Archive {
         name: "rustc-1.96.0-x86_64-unknown-linux-gnu",
         component: "rustc",
@@ -54,7 +54,7 @@ struct NativeInput {
     inside: &'static str,
 }
 
-const NATIVE: [NativeInput; 5] = [
+const NATIVE: &[NativeInput] = &[
     NativeInput {
         graph: "gcc-x86-64-self",
         recipe: "gcc-x86-64-self",
@@ -463,7 +463,7 @@ fn copy_archive(source: &Path, destination: &Path, pin: &Archive) -> Result<()> 
 
 fn rust_receipt() -> String {
     let mut text = format!("portable-inputs 1\nhost {HOST}\ntarget {TARGET}\n");
-    for pin in &RUST {
+    for pin in RUST {
         text.push_str(&format!(
             "archive {DIST}/{}.tar.xz {} {}\n",
             pin.name, pin.bytes, pin.sha256
@@ -555,7 +555,7 @@ fn prepare_rust(root: &Path, archives: &Path) -> Result<PathBuf> {
     let parent = root.join(".td-build-cache");
     let scratch = Scratch::new(&parent)?;
     let kit = scratch.0.join("kit");
-    for pin in &RUST {
+    for pin in RUST {
         let filename = format!("{}.tar.xz", pin.name);
         let private = scratch.0.join(&filename);
         copy_archive(&archives.join(filename), &private, pin)?;

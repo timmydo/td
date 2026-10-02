@@ -27,7 +27,7 @@ options:
 /// The reviewers a record may name. Closed on purpose: a misspelt reviewer is a
 /// review nobody ran, and an open roster cannot tell those two apart.
 pub const SUBAGENT: &str = "subagent";
-pub const CLI_REVIEWERS: [&str; 3] = ["agy", "claude", "codex"];
+pub const CLI_REVIEWERS: &[&str] = &["agy", "claude", "codex"];
 /// The cross-model reviewer BOTH acting-agent rosters name. Whichever model is
 /// acting, the other two reviews are Agy plus the model that is not the actor —
 /// so "any two of three" would accept a Codex agent reviewed by Codex and
@@ -178,11 +178,11 @@ fn known_reviewer(name: &str) -> bool {
 /// does not recognise is one it cannot compare. Splitting on the first `-` was
 /// not enough: `claude-opus-4.8` and `opus-4.8` are the same model, and that is
 /// the spelling an agent naturally writes for its own subagent.
-const MODELS: [&str; 6] = ["opus", "sonnet", "haiku", "fable", "gpt", "gemini"];
+const MODELS: &[&str] = &["opus", "sonnet", "haiku", "fable", "gpt", "gemini"];
 
 fn family(model: &str) -> Option<&'static str> {
     let lower = model.to_ascii_lowercase();
-    MODELS.into_iter().find(|m| {
+    MODELS.iter().copied().find(|m| {
         lower
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|token| token == *m)

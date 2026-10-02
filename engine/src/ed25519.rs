@@ -893,7 +893,7 @@ mod tests {
     /// Each was signed with a seed of one repeated byte over the message
     /// `(0..len).map(|i| i % 251)`; the seed is recorded so any ed25519
     /// implementation can regenerate the pair.
-    const RING_VECTORS: [(u8, usize, &str, &str); 4] = [
+    const RING_VECTORS: &[(u8, usize, &str, &str)] = &[
         (
             0x01,
             0,
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn known_good_signatures_verify() {
-        for (seed, len, public_hex, signature_hex) in RING_VECTORS {
+        for &(seed, len, public_hex, signature_hex) in RING_VECTORS {
             let public: [u8; 32] = from_hex(public_hex);
             let signature: [u8; 64] = from_hex(signature_hex);
             assert!(
@@ -944,7 +944,7 @@ mod tests {
     fn a_known_good_signature_stops_verifying_when_anything_moves() {
         // The same four vectors as the negative case: a verifier that accepts
         // everything passes the test above and fails this one.
-        for (seed, len, public_hex, signature_hex) in RING_VECTORS {
+        for &(seed, len, public_hex, signature_hex) in RING_VECTORS {
             let public: [u8; 32] = from_hex(public_hex);
             let signature: [u8; 64] = from_hex(signature_hex);
 

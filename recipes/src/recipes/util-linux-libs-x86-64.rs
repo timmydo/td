@@ -10,7 +10,7 @@ use crate::types::{Recipe, Step};
 // into mkfs.btrfs, which ships, and one frame-pointer-less caller truncates
 // every stack above it.
 /// Busybox applets configure, libtool and the Makefiles call by name.
-const TOOLS: [&str; 45] = [
+const TOOLS: &[&str] = &[
     "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname", "echo",
     "egrep", "env", "expr", "false", "fgrep", "find", "grep", "head", "install", "ln", "ls",
     "mkdir", "mktemp", "mv", "od", "printf", "pwd", "readlink", "rm", "rmdir", "sed", "sleep",

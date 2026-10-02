@@ -2120,7 +2120,7 @@ impl StoreGcReport {
 
 /// `1234567` → `1.2 MB`: decimal units, one decimal, for an operator's report.
 fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    const UNITS: &[&str] = &["B", "kB", "MB", "GB", "TB"];
     let mut v = n as f64;
     let mut i = 0;
     // 999.95 rounds to `1000.0` at one decimal; step up before that, not at 1000.
@@ -5999,13 +5999,13 @@ fn validate_application_step_contract(
 }
 
 // Every phase runner makes an explicit choice about application metadata.
-const APPLICATION_PHASE_RUNNERS: [&str; 4] = [
+const APPLICATION_PHASE_RUNNERS: &[&str] = &[
     "autotools-build",
     "rust-build",
     "cmake-build",
     "mesboot-build",
 ];
-const NON_APPLICATION_PHASE_RUNNERS: [&str; 2] = ["stage0-build", "rust-stage0-build"];
+const NON_APPLICATION_PHASE_RUNNERS: &[&str] = &["stage0-build", "rust-stage0-build"];
 
 fn push_drv_field(spec: &mut String, directive: &str, value: &str) -> Result<(), String> {
     if directive
@@ -7460,13 +7460,13 @@ fn inputs_from_recipe_json(alist: &json::Json) -> Result<Vec<String>, String> {
 /// them. Named so the TOOL channels below cannot drift from the full set: a
 /// fourth channel added to one list and not the other is either a path the plan
 /// never resolves or a path §B.8's table never rules on.
-const CHANNELS: [&str; 3] = ["inputs", "nativeInputs", "payloadInputs"];
+const CHANNELS: &[&str] = &["inputs", "nativeInputs", "payloadInputs"];
 
 /// The two channels §B.8's table calls "the tool, compilation and execution
 /// channel — refused" for a marked path. `payloadInputs` is deliberately absent:
 /// that is the DATA channel, and an image consuming an application through it is
 /// the arrangement the marker exists to permit.
-const TOOL_CHANNELS: [&str; 2] = ["inputs", "nativeInputs"];
+const TOOL_CHANNELS: &[&str] = &["inputs", "nativeInputs"];
 
 /// ABSENT is empty; PRESENT AND MALFORMED is an ERROR. A channel that is not an
 /// array, or that holds a non-string, must not read as "no names": the tool
@@ -14344,7 +14344,7 @@ daemon build START (2/2 active)
     /// added to `TOOL_CHANNELS` alone is a path the plan never resolves.
     #[test]
     fn the_tool_channels_are_a_subset_of_every_channel() {
-        for c in TOOL_CHANNELS {
+        for &c in TOOL_CHANNELS {
             assert!(CHANNELS.contains(&c), "{c} is not a declaration channel");
         }
         assert_eq!(

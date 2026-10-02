@@ -41,7 +41,7 @@ const DEFAULT_MIB: u64 = 1024;
 /// default is the TIGHTER direction, so a crate added later is capped, not
 /// exempted, and the list stays auditable at a glance.
 const CONTROL_PLANE_MIB: u64 = 2048;
-const CONTROL_PLANE: [&str; 3] = ["td-builder", "td-recipe", "td-engine"];
+const CONTROL_PLANE: &[&str] = &["td-builder", "td-recipe", "td-engine"];
 
 /// Raise or lower the ceiling for a deliberate one-off. It may not REMOVE one:
 /// a safety that can be switched off is one that eventually is.

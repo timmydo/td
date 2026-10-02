@@ -1077,7 +1077,7 @@ fn validate_bus_name(name: &str) -> Result<(), String> {
 }
 
 /// The broker's reserved name and namespace roots (td-busd `policy`).
-const RESERVED_BUS_ROOTS: [&str; 3] = [
+const RESERVED_BUS_ROOTS: &[&str] = &[
     "org.freedesktop.DBus",
     "org.freedesktop.portal",
     "org.freedesktop.impl.portal",

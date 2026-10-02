@@ -470,7 +470,7 @@ fn subst(template: &Path, dest: &Path, map: &[(String, String)]) -> Result<(), S
 /// otherwise build silently against the stale transcription. So a source-pin
 /// bump that changes any of these refuses here, before anything compiles;
 /// re-audit the port against the new script, then update its pin.
-const PORTED_SCRIPT_PINS: [(&str, &str); 8] = [
+const PORTED_SCRIPT_PINS: &[(&str, &str)] = &[
     (
         "configure.sh",
         "3f79a202ed711a1247eacded9ec31fc22d4e3b33bf6bb0e4ac2a318c8a89e6ae",
@@ -506,7 +506,7 @@ const PORTED_SCRIPT_PINS: [(&str, &str); 8] = [
 ];
 
 fn verify_ported_scripts(top: &Path) -> Result<(), String> {
-    for (rel, want) in PORTED_SCRIPT_PINS {
+    for &(rel, want) in PORTED_SCRIPT_PINS {
         let p = top.join(rel);
         let got =
             crate::sha256::sha256_file(&p).map_err(|e| format!("read {}: {e}", p.display()))?;

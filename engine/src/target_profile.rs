@@ -19,7 +19,7 @@ pub const DIRECT_RUSTC_ARGS: [&str; 6] = [
 /// Debug sections removed from every target companion after its line program
 /// and ordinary symbols have been copied out of the runtime. Keep the producer
 /// and recipe-side consumer guard on this one roster.
-pub const ALWAYS_PRUNED_DEBUG_SECTIONS: [&str; 22] = [
+pub const ALWAYS_PRUNED_DEBUG_SECTIONS: &[&str] = &[
     ".debug_info",
     ".debug_abbrev",
     ".debug_aranges",
@@ -63,7 +63,7 @@ pub fn direct_rustc_args(build_root: &str, source_root: &str) -> [String; 6] {
 /// preserve an x86-64 frame chain. Compiler-generated functions around them
 /// still use the global policy; samples entering one of these ranges are an
 /// explicit coverage boundary rather than silently trusted unwinds.
-pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 7] = [
+pub const ASSEMBLY_EXCEPTIONS: &[(&str, &str)] = &[
     (
         "codex",
         "aws-lc-sys 0.39.0, ring 0.17.14, and zstd-sys 2.0.16+zstd.1.5.7 x86_64 assembly",
@@ -93,7 +93,7 @@ pub const ASSEMBLY_EXCEPTIONS: [(&str, &str); 7] = [
 /// and libgcc boundaries apply to every output passed to the target splitter;
 /// this roster adds Rust/LLVM and is pinned against both Cargo and direct-rustc
 /// recipes by the catalog tests.
-pub const RUST_PROFILED_RECIPES: [&str; 41] = [
+pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "codex",
     "fd",
     "ripgrep",
@@ -178,7 +178,7 @@ pub struct LineAttributionException {
     pub reason: &'static str,
 }
 
-pub const LINE_ATTRIBUTION_EXCEPTIONS: [(&str, LineAttributionException); 2] = [
+pub const LINE_ATTRIBUTION_EXCEPTIONS: &[(&str, LineAttributionException)] = &[
     (
         "codex",
         LineAttributionException {

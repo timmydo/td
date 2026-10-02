@@ -357,6 +357,12 @@ message.
 - Use `std`, not `no_std`. Allocate buffers and collections outside hot loops
   where practical. Keep comments terse and explain a non-obvious why; design
   rationale and review history belong in the commit message or normative doc.
+- Declare a constant list as a slice, `const NAMES: &[&str] = &[...]`: two
+  branches that each add an entry and bump a `[&str; N]` can merge without
+  conflict into a mis-sized array that does not compile. Keep `[T; N]` only
+  where the length is itself the invariant or entries are read by position.
+  The builder/recipes/engine workspace follows this; convert a `td-*` crate's
+  list when touching it.
 
 Keep this root file focused on rules every task needs. Put component detail in
 the routed normative document and tool-specific procedure in `DEVELOPMENT.md`.

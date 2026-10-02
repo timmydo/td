@@ -1751,7 +1751,7 @@ mod tests {
         );
     }
 
-    const POST_BOOTSTRAP_BOUNDARY_OUTPUTS: [&str; 6] = [
+    const POST_BOOTSTRAP_BOUNDARY_OUTPUTS: &[&str] = &[
         "rust-toolchain",
         "gcc-x86-64-self",
         "binutils-x86-64-self",
@@ -1764,7 +1764,7 @@ mod tests {
     // These independent target artifacts and checks deliberately run before
     // self-hosting but are not ancestors of rust-toolchain. New recipes default
     // to the far side of the boundary and must not grow this list silently.
-    const BOOTSTRAP_SIDE_CONSUMERS: [&str; 15] = [
+    const BOOTSTRAP_SIDE_CONSUMERS: &[&str] = &[
         "busybox-test",
         "elfutils-x86-64",
         "elfutils-x86-64-test",
@@ -1781,9 +1781,9 @@ mod tests {
         "make-test",
         "sed-mesboot",
     ];
-    const SELF_HOSTED_PHASE_MARKERS: [&str; 3] =
-        ["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
-    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 8] = [
+    const SELF_HOSTED_PHASE_MARKERS: &[&str] =
+        &["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
+    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: &[(&str, &str)] = &[
         // Identity/codegen audits deliberately look back across the boundary.
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
@@ -1801,8 +1801,8 @@ mod tests {
         // provenance gate, not a catalog recipe this exception table can name.
         ("make-x86-64-self", "make-x86-64"),
     ];
-    const RECIPE_SHEBANG_INTERPRETERS: [&str; 2] = [super::SH, super::POST_BOOTSTRAP_SH];
-    const GUEST_LITERAL_SHEBANGS: [(&str, &str); 16] = [
+    const RECIPE_SHEBANG_INTERPRETERS: &[&str] = &[super::SH, super::POST_BOOTSTRAP_SH];
+    const GUEST_LITERAL_SHEBANGS: &[(&str, &str)] = &[
         ("linux-x86-64", "{root}/initramfs/init"),
         ("kexec-spike-x86-64", "{root}/inner-init"),
         ("kexec-spike-x86-64", "{root}/outer-init"),
@@ -2147,7 +2147,7 @@ mod tests {
     /// `.rs` handed to anything but rustc. That test is a TRIPWIRE and not a
     /// gate — it cannot exempt anything, only complain — which is why it is
     /// safe for it to be approximate where a gate would not be.
-    const RUST_NOT_A_COMMAND_SURFACE: [(&str, &str); 1] = [("td-txt", "{src}/sed.rs")];
+    const RUST_NOT_A_COMMAND_SURFACE: &[(&str, &str)] = &[("td-txt", "{src}/sed.rs")];
 
     /// Whether this step writes a rostered `.rs` body of `stem`.
     ///
@@ -2168,7 +2168,7 @@ mod tests {
     /// The retired tools, named once: the farm branch and the text branch each
     /// scan for them, and a third added to one alone would be invisible on the
     /// other with every test still green.
-    const HOST_TOOLS: [&str; 2] = ["find", "xargs"];
+    const HOST_TOOLS: &[&str] = &["find", "xargs"];
 
     /// A ToolFarm judged link by link, which the flattened text list cannot do.
     ///
@@ -2312,7 +2312,7 @@ mod tests {
         let mut bootstrap_recipes = HashSet::new();
         collect_recipe_closure(recipes, "rust-toolchain", &mut bootstrap_recipes);
         let mut bootstrap_interior = bootstrap_recipes.clone();
-        for boundary_output in POST_BOOTSTRAP_BOUNDARY_OUTPUTS {
+        for &boundary_output in POST_BOOTSTRAP_BOUNDARY_OUTPUTS {
             assert!(
                 bootstrap_interior.remove(boundary_output),
                 "post-bootstrap boundary output is absent from rust-toolchain closure: \
@@ -2360,7 +2360,7 @@ mod tests {
     fn bootstrap_side_consumers_remain_pre_self_hosting() {
         let recipes = catalog::all();
         let (bootstrap_recipes, bootstrap_interior) = bootstrap_partition(&recipes);
-        for allowed_stem in BOOTSTRAP_SIDE_CONSUMERS {
+        for &allowed_stem in BOOTSTRAP_SIDE_CONSUMERS {
             let recipe = recipes
                 .iter()
                 .find(|(stem, _)| *stem == allowed_stem)
@@ -2439,7 +2439,7 @@ mod tests {
         ));
         let mut synthetic_closure = HashSet::new();
         collect_recipe_closure(&recipes, "synthetic-post-bootstrap", &mut synthetic_closure);
-        for marker in SELF_HOSTED_PHASE_MARKERS {
+        for &marker in SELF_HOSTED_PHASE_MARKERS {
             assert!(
                 !synthetic_closure.contains(marker),
                 "the negative control must prove the marker-free boundary"
@@ -3032,7 +3032,7 @@ mod tests {
     /// that is not the reviewed one.
     #[test]
     fn every_rostered_entry_names_a_body_the_recipe_writes() {
-        for (stem, body) in RUST_NOT_A_COMMAND_SURFACE {
+        for &(stem, body) in RUST_NOT_A_COMMAND_SURFACE {
             let recipe = catalog::all()
                 .into_iter()
                 .find(|(name, _)| *name == stem)

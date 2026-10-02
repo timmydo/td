@@ -611,7 +611,7 @@ struct FailureEvidence {
     markers: std::collections::BTreeSet<&'static str>,
 }
 
-const FAILURE_MARKERS: [&str; 5] = [
+const FAILURE_MARKERS: &[&str] = &[
     ladder::SYSTEM_ROOT_RO_MARKER,
     ladder::SYSTEM_ETC_RO_MARKER,
     ladder::SYSTEM_STATE_WRITABLE_MARKER,
@@ -647,7 +647,7 @@ impl FailureEvidence {
                 "failed candidate unexpectedly reached health or fallback: {line}"
             ));
         }
-        for marker in FAILURE_MARKERS {
+        for &marker in FAILURE_MARKERS {
             if line == marker {
                 self.markers.insert(marker);
             }
@@ -1165,7 +1165,7 @@ mod tests {
     use super::*;
 
     fn failure_lines(id: &str) -> Vec<String> {
-        let mut lines = FAILURE_MARKERS.map(str::to_string).to_vec();
+        let mut lines: Vec<String> = FAILURE_MARKERS.iter().map(|m| m.to_string()).collect();
         lines.push(format!(
             "{} {id}",
             td_boot_protocol::SELECTED_CURRENT_MARKER

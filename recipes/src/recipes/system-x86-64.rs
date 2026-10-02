@@ -1270,7 +1270,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 48] = [
+const TD_SVC_UNITS: &[&str] = &[
     "hostname",
     "td-firstboot",
     "release-source",
@@ -2777,7 +2777,7 @@ fn build_td_txt_probes() -> String {
 /// `/proc/sys/user/max_*_namespaces` exists whatever the namespace symbols say —
 /// `kernel/ucount.c` registers all seven entries under CONFIG_SYSCTL alone. Those are
 /// read for their VALUE in [`SANDBOX_KERNEL_UCOUNTS`] instead.
-const SANDBOX_KERNEL_NODES: [(&str, &str, &str); 6] = [
+const SANDBOX_KERNEL_NODES: &[(&str, &str, &str)] = &[
     (
         "/proc/cgroups",
         "CONFIG_CGROUPS",
@@ -2815,7 +2815,7 @@ const SANDBOX_KERNEL_NODES: [(&str, &str, &str); 6] = [
 /// these two lines are how a running kernel reports a feature that has no node of its
 /// own — and the second is the only runtime evidence for a symbol that cannot be pinned
 /// (it is `def_bool y` on `SECCOMP && NET`, computed rather than answered).
-const SANDBOX_KERNEL_STATUS_FIELDS: [(&str, &str, &str); 2] = [
+const SANDBOX_KERNEL_STATUS_FIELDS: &[(&str, &str, &str)] = &[
     (
         "Seccomp:",
         "CONFIG_SECCOMP",
@@ -2846,7 +2846,7 @@ const SANDBOX_KERNEL_STATUS_FIELDS: [(&str, &str, &str); 2] = [
 /// `cgroup_disable=pids` on the command line leaves the row in place and clears that
 /// column — the one failure no config guard can see, which is the whole reason a
 /// runtime leg is worth having here at all.
-const SANDBOX_KERNEL_CONTROLLERS: [(&str, &str, &str); 1] = [(
+const SANDBOX_KERNEL_CONTROLLERS: &[(&str, &str, &str)] = &[(
     "pids",
     "CONFIG_CGROUP_PIDS",
     "pids.max never exists, so nothing bounds a fork bomb inside a jail",
@@ -2854,7 +2854,7 @@ const SANDBOX_KERNEL_CONTROLLERS: [(&str, &str, &str); 1] = [(
 
 /// The controllers the mounted unified hierarchy must actually expose. Unlike
 /// `/proc/cgroups`, this is authoritative for the v2 memory controller.
-const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: [(&str, &str, &str); 3] = [
+const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: &[(&str, &str, &str)] = &[
     (
         "cpu",
         "CONFIG_CGROUP_SCHED",
@@ -2874,7 +2874,7 @@ const SANDBOX_KERNEL_CGROUP2_CONTROLLERS: [(&str, &str, &str); 3] = [
 
 /// Controller files whose presence witnesses scheduler features narrower than
 /// the controller itself.
-const SANDBOX_KERNEL_CGROUP2_NODES: [(&str, &str, &str, &str); 1] = [(
+const SANDBOX_KERNEL_CGROUP2_NODES: &[(&str, &str, &str, &str)] = &[(
     crate::ladder::TD_APPLICATION_CGROUP_SESSION,
     "cpu.weight",
     "CONFIG_FAIR_GROUP_SCHED",
@@ -2882,7 +2882,7 @@ const SANDBOX_KERNEL_CGROUP2_NODES: [(&str, &str, &str, &str); 1] = [(
 )];
 
 /// Rows compiled into controller files only with the named scheduler feature.
-const SANDBOX_KERNEL_CGROUP2_ROWS: [(&str, &str, &str, &str, &str); 1] = [(
+const SANDBOX_KERNEL_CGROUP2_ROWS: &[(&str, &str, &str, &str, &str)] = &[(
     crate::ladder::TD_APPLICATION_CGROUP_SESSION,
     "cpu.stat",
     "nr_periods",
@@ -2903,7 +2903,7 @@ const SANDBOX_KERNEL_CGROUP2_ROWS: [(&str, &str, &str, &str, &str); 1] = [(
 /// table under CONFIG_SYSCTL, so the FILE is there on a kernel with no namespaces at
 /// all. That is also why the unreadable arm's diagnostic names a missing `/proc/sys`
 /// rather than a missing namespace — the cause it used to name could not produce it.
-const SANDBOX_KERNEL_UCOUNTS: [(&str, &str); 4] = [
+const SANDBOX_KERNEL_UCOUNTS: &[(&str, &str)] = &[
     ("max_user_namespaces", "CLONE_NEWUSER"),
     ("max_pid_namespaces", "CLONE_NEWPID"),
     ("max_uts_namespaces", "CLONE_NEWUTS"),
@@ -10941,7 +10941,7 @@ mod tests {
         // not "inert" — it is a line PID 1 reports as unsupported on every boot, and (for
         // `shutdown`) a teardown silently never run. shape_check dry-runs this table through
         // the real parser; this catches the same thing without a target build.
-        const SUPPORTED_ACTIONS: [&str; 4] = ["sysinit", "wait", "once", "respawn"];
+        const SUPPORTED_ACTIONS: &[&str] = &["sysinit", "wait", "once", "respawn"];
         for line in inittab
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
@@ -12816,7 +12816,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// fails below. What this roster cannot catch is a pin added to the kernel recipe
     /// and to nothing else — the recipe's own `.config` guard is what covers that, and
     /// it fails the producer build rather than this test.
-    const SANDBOX_SYMBOLS: [&str; 13] = [
+    const SANDBOX_SYMBOLS: &[&str] = &[
         "CONFIG_USER_NS",
         "CONFIG_PID_NS",
         "CONFIG_UTS_NS",
@@ -12837,7 +12837,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     /// An exception list rather than a silent gap: a symbol that is merely missing from
     /// the probes looks identical to one nobody got round to, and this is the difference
     /// between the two.
-    const SANDBOX_SYMBOLS_WITHOUT_A_RUNTIME_WITNESS: [(&str, &str); 0] = [];
+    const SANDBOX_SYMBOLS_WITHOUT_A_RUNTIME_WITNESS: &[(&str, &str)] = &[];
 
     /// Each pinned symbol is observed at RUNTIME by a probe that names it, and each
     /// probed symbol is one the kernel recipe actually pins. A pin with no probe ships a
@@ -12854,7 +12854,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     #[test]
     fn every_sandbox_symbol_is_both_pinned_and_probed() {
         let probes = build_sandbox_kernel_probes();
-        for symbol in SANDBOX_SYMBOLS {
+        for &symbol in SANDBOX_SYMBOLS {
             let excused = SANDBOX_SYMBOLS_WITHOUT_A_RUNTIME_WITNESS
                 .iter()
                 .any(|(excused, _)| *excused == symbol);
@@ -13772,7 +13772,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // that does not end a boot.
         // All three applets, not just reboot: poweroff and halt end a boot identically, so a
         // script switched to either would escape a reboot-only scan while the count still held.
-        const POWER: [&str; 3] = ["reboot", "poweroff", "halt"];
+        const POWER: &[&str] = &["reboot", "poweroff", "halt"];
         let mut initiators = 0;
         for (name, body, _) in etc_files(&SYSTEM).unwrap() {
             let mut body = body;
