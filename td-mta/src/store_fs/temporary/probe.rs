@@ -101,6 +101,7 @@ pub fn run(mut snapshot: impl FnMut()) {
             &history_probe,
             history_scratch.as_mut_slice().try_into().unwrap(),
         );
+        super::super::input::probe_prefix(&fixture.root);
         super::current::probe(&fixture.root, fixture.account);
         super::super::input::probe(&fixture.root, fixture.account);
         super::publication::probe(&fixture.root, fixture.account);

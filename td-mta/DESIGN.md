@@ -37,8 +37,10 @@ input checks headers against that manifest, yields one provisional record at
 a time, and requires physical EOF and the complete table digest to finish.
 Retained-history input likewise yields one checked, provisional frame at a time
 and finishes only against the selected segment's extent, sequence and digest.
-Active journal prefixes, tail repair and complete selected-graph validation, final-view semantics and committed mail
-publication remain unimplemented.
+Captured-prefix I/O now opens private journal files, allows append growth and
+returns distinct prefix completion without claiming physical EOF. Active
+prefix frame/selection validation, tail repair, complete selected-graph and
+final-view validation, and committed mail publication remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can

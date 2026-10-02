@@ -10,6 +10,12 @@ use std::{
     os::unix::fs::{FileExt, MetadataExt},
 };
 
+#[path = "input/prefix.rs"]
+mod prefix;
+#[cfg(test)]
+pub(super) use prefix::probe as probe_prefix;
+pub use prefix::{CompletePrefix, PrefixReader};
+
 impl LockedRoot {
     /// Startup FORMAT input. Whole-container validation still belongs to the codec.
     pub fn open_format(&self) -> io::Result<StoreReader<'_>> {
@@ -170,18 +176,42 @@ impl CompleteFile<'_> {
         super::temporary::read_extent(&self.file, self.length, offset, output)
     }
 }
+#[derive(Clone, Copy)]
+enum Extent {
+    Whole,
+    Prefix(u64),
+}
 fn open(root: &Directory, name: &Name, max_bytes: u64) -> io::Result<(File, u64)> {
+    open_extent_using(root, name, max_bytes, Extent::Whole, |path| {
+        File::open(path)
+    })
+}
+fn open_extent_using(
+    root: &Directory,
+    name: &Name,
+    max_bytes: u64,
+    extent: Extent,
+    open_file: impl FnOnce(&std::path::Path) -> io::Result<File>,
+) -> io::Result<(File, u64)> {
     let mut buffer = [0; MAX_PATH_BYTES];
     let source = root.destination(name, &mut buffer)?;
     let before = fs::symlink_metadata(source.path)?;
     check(&before, source.owner, max_bytes)?;
-    let file = File::open(source.path)?;
-    let after = file.metadata()?;
-    check(&after, source.owner, max_bytes)?;
-    if !super::same_file(&before, &after) || before.len() != after.len() {
+    if matches!(extent, Extent::Prefix(end) if before.len() < end) {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    Ok((file, after.len()))
+    let file = open_file(source.path)?;
+    let after = file.metadata()?;
+    check(&after, source.owner, max_bytes)?;
+    let length = match extent {
+        Extent::Whole if before.len() == after.len() => after.len(),
+        Extent::Prefix(end) if after.len() >= before.len() => end,
+        _ => return Err(io::ErrorKind::InvalidData.into()),
+    };
+    if !super::same_file(&before, &after) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok((file, length))
 }
 fn check(metadata: &fs::Metadata, owner: u32, max_bytes: u64) -> io::Result<()> {
     if !metadata.is_file()

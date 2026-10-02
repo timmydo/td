@@ -650,6 +650,18 @@ stream, completion, missing-descriptor/byte-cap and premature-finish refusal
 run inside the interval at both root bounds. No new hook or service pool is
 introduced.
 
+PrefixReader retains one StoreReader with its extent fixed to the captured
+prefix; CompletePrefix retains one File, Name, prefix length and LOCK borrow.
+Opening uses the existing fixed path scratch and transient parent handles.
+Sequential and completed random reads borrow caller slices and keep the
+64 KiB step ceiling. No suffix buffer or per-prefix allocation is introduced.
+The existing measured interval opens/consumes/completes a journal prefix,
+checks bounded random reads and exercises invalid limits, short physical
+extent, premature completion and sticky read failure at short/maximum roots.
+Fixture files precede measurement; output uses a fixed stack array. This
+qualifies primitive Rust allocations, not live read-view pinning or complete
+service memory.
+
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 

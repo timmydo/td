@@ -695,7 +695,8 @@ service activation. Each part lands independently:
         files, stale size, partial/failed reads, roles, modes, links and limits;
         the allocation interval covers success and refusal/error paths.
         Parser/digest/selection binding remains M05d. Operator-config/secrets
-        loading and concurrent active-journal prefix reads remain separate.
+        loading remains separate; M05d4a below implements concurrent journal
+        prefix I/O without claiming frame validation or a real read-view pin.
     - **M05b2e — recovery evidence:** local temporary-folder process tests
       exercise the common std API on the host. XFS deployment crash/power-loss
       qualification is release evidence; no xfsprogs prerequisite for ordinary
@@ -735,6 +736,19 @@ service activation. Each part lands independently:
     ReadView change iteration still needs a separate cursor that skips PUT
     bodies. Active prefixes, active-tail repair, replay and whole-graph/final-view
     invariants remain required before activation.
+  - **M05d4a — captured prefix I/O:** implemented journal-only PrefixReader
+    and distinct CompletePrefix. Private-file checks permit same-inode
+    monotonic growth within the opening ceiling; reads expose only the
+    supplied captured bytes. Completion accepts later appends but refuses a
+    missing prefix, without claiming physical EOF. Tests cover open-time
+    growth/shrink/replacement, suffix exclusion, limits, truncation and sticky
+    errors; the existing allocation interval covers both root bounds. Real
+    pin ownership, active header/frame/selection validation and repair remain
+    separate. Whole-file readers retain their exact extent/EOF contract.
+  - **M05d4b — active-prefix validation:** bind captured sequence/offset and
+    selected active identity, stream checked frames through an admitted arena,
+    then check the complete active summary. Share framing with retained history
+    while preserving distinct whole-file and prefix completion evidence.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

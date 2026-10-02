@@ -352,8 +352,9 @@ verifiers and check their summaries against selection metadata. It proves no
 current pathname binding, read-view pin, parser validity or authorization.
 
 Use this completion path for quiescent recovery or pinned immutable files.
-Reading a concurrently growing active journal through a committed prefix needs
-a separate prefix-bound adapter; full physical EOF is not that prefix. Secret
+Reading a concurrently growing active journal uses the
+[captured prefix adapter](#captured-journal-prefix-io); full physical EOF is
+not that prefix. Secret
 and operator-config files also retain their separate SCHEMA.md policy and loader
 work. No public config-check/service readiness is granted by this store reader.
 
@@ -451,6 +452,36 @@ Metadata, table and history readers share a private exact-read helper. It
 consumes the caller's existing attempt counter across framing phases, advances
 only by confirmed returned bytes, and never retries errors. Empty destinations
 consume no attempt. Existing metadata/table completion rules remain unchanged.
+
+### Captured journal prefix I/O
+
+`LockedRoot::open_journal_prefix` opens only a typed account/journal name with
+an explicit captured prefix and physical byte ceiling. The caller authorizes
+the account, admits read work and holds the actual committed-prefix pin or
+quiescent recovery barrier. A supplied number is not a pin. Require prefix
+bytes <= physical ceiling <= signed 64-bit file offset maximum before I/O.
+Apply the same private owner, mode, regular-file, single-link, parent and inode
+checks as whole-file input. The prefix must already exist before opening.
+Permit only monotonic observed growth of that same inode between metadata
+checks, within the physical ceiling. Whole-file input retains its exact-length
+check. These observations do not detect a shrink followed by regrowth; real
+writer/pin serialization must keep committed bytes immutable.
+
+PrefixReader reuses bounded sequential input internally, with its length set
+to the captured end. Each read makes at most one explicit 64 KiB call and can
+never return a later suffix. Read failures retire it. Consuming `finish`
+requires the full prefix consumed and the current file length at least that
+prefix. It does not read for EOF or require an unchanged whole-file size.
+Later growth beyond the opening physical ceiling is outside this reader's
+scope; the journal writer separately enforces the segment limit.
+
+Success returns CompletePrefix, a distinct read-only handle with random reads
+bounded to the captured extent. It cannot be converted into CompleteFile or
+its physical EOF evidence. Neither type alone establishes journal grammar,
+selection/sequence binding, a runtime pin, recovery validity or serving
+permission. Active-prefix frame validation and active-tail repair remain
+separate steps. Empty byte prefixes are expressible at this raw I/O layer;
+valid journal prefixes must contain the format header.
 
 ### Expected CURRENT replacement
 
