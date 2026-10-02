@@ -74,8 +74,9 @@ append growth and binding completion to its sequence/offset. A supplied-frame
 cursor now checks captured identity, retained floors and endpoint
 boundaries while draining supplied checked frames. A selected-route helper
 checks retained coverage and chooses a history descriptor or the captured active
-segment. Byte location within segments and actual view-pin integration remain
-separate.
+segment. A bounded locator now reads at most one frame per step within that
+source, hides earlier changes and returns reusable slots only after selected
+completion. Segment transitions and actual view-pin integration remain separate.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

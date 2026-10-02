@@ -902,6 +902,14 @@ service activation. Each part lands independently:
     coverage and invalid views. Existing allocation instrumentation covers both
     source types and below-floor/changed-view refusal. Physical frame location
     and real pins remain future.
+  - **M05d14h — bounded selected frame location:** implemented opening a routed
+    source and locating the target with at most one frame per advance. Hide
+    earlier frames, bind supplied view identity and refuse excess sequences.
+    Continue within that segment, then require its selected completion before
+    returning full reusable slots. Tests cover exact read positions, locating
+    before the floor, both source types, append growth, premature finish, view/
+    checksum/I/O failures and endpoint refusal. Existing allocation probes cover
+    slot transfer and empty-prefix reclaim. Segment transitions/live pins remain.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

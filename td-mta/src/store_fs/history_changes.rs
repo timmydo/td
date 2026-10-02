@@ -32,7 +32,11 @@ impl LockedRoot {
         })
     }
 }
-impl<'r, C: Crypto> HistoryChangesInput<'r, '_, '_, '_, C> {
+impl<'r, 'b, C: Crypto> HistoryChangesInput<'r, '_, '_, 'b, C> {
+    #[cfg(test)]
+    pub(super) fn position(&self) -> u64 {
+        self.stream.position()
+    }
     pub fn is_failed(&self) -> bool {
         self.stream.is_failed()
     }
@@ -48,10 +52,17 @@ impl<'r, C: Crypto> HistoryChangesInput<'r, '_, '_, '_, C> {
         self.stream.advance_frame(scratch)
     }
     pub fn finish(self) -> Result<CompleteHistoryChanges<'r>, HistoryInputError> {
-        let (file, summary) = self.stream.finish()?;
+        let (complete, _) = self.finish_reuse()?;
+        Ok(complete)
+    }
+    /// Checked completion plus the original full scratch capacity for another segment.
+    pub fn finish_reuse(
+        self,
+    ) -> Result<(CompleteHistoryChanges<'r>, &'b mut [Cell]), HistoryInputError> {
+        let (file, summary, cells) = self.stream.finish_reuse()?;
         self.selection
             .check_history_journal(self.crypto, self.index, summary)?;
-        Ok(CompleteHistoryChanges { file, summary })
+        Ok((CompleteHistoryChanges { file, summary }, cells))
     }
 }
 

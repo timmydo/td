@@ -40,6 +40,9 @@ mod history;
 pub use history::{CompleteHistory, HistoryInput, HistoryInputError};
 #[path = "store_fs/active_changes.rs"]
 mod active_changes;
+#[path = "store_fs/change_locator.rs"]
+mod change_locator;
+pub use change_locator::{ChangeCompletion, ChangeFrameStep, ChangeInput, ChangeInputError};
 #[path = "store_fs/change_route.rs"]
 mod change_route;
 pub use change_route::{ChangeRoute, ChangeSource};

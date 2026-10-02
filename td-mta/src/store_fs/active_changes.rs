@@ -34,7 +34,11 @@ impl LockedRoot {
         })
     }
 }
-impl<'r, C: Crypto> ActiveChangesInput<'r, '_, '_, '_, C> {
+impl<'r, 'b, C: Crypto> ActiveChangesInput<'r, '_, '_, 'b, C> {
+    #[cfg(test)]
+    pub(super) fn position(&self) -> u64 {
+        self.stream.position()
+    }
     pub fn is_failed(&self) -> bool {
         self.stream.is_failed()
     }
@@ -50,10 +54,17 @@ impl<'r, C: Crypto> ActiveChangesInput<'r, '_, '_, '_, C> {
         self.stream.advance_frame(scratch)
     }
     pub fn finish(self) -> Result<CompleteActiveChanges<'r>, ActiveInputError> {
-        let (file, summary) = self.stream.finish()?;
+        let (complete, _) = self.finish_reuse()?;
+        Ok(complete)
+    }
+    /// Checked completion plus the original full scratch capacity for another segment.
+    pub fn finish_reuse(
+        self,
+    ) -> Result<(CompleteActiveChanges<'r>, &'b mut [Cell]), ActiveInputError> {
+        let (file, summary, cells) = self.stream.finish_reuse()?;
         self.selection
             .check_active_prefix(self.through, self.bytes, summary)?;
-        Ok(CompleteActiveChanges { file, summary })
+        Ok((CompleteActiveChanges { file, summary }, cells))
     }
 }
 #[derive(Debug)]

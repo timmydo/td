@@ -144,12 +144,18 @@ impl<'c, 'b, C: Crypto, R: Input> ChangesInput<'c, 'b, C, R> {
         self.failed = false;
         Ok(true)
     }
-    pub fn finish(self) -> Result<(R::Complete, Summary), InputError> {
+    pub fn finish_reuse(self) -> Result<(R::Complete, Summary, &'b mut [Cell]), InputError> {
         if self.failed {
             return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
         }
         let summary = self.verifier.finish()?;
         let file = self.file.finish()?;
-        Ok((file, summary))
+        let cells = match self.complete {
+            Some(complete) => complete.into_cells(),
+            None => self
+                .available
+                .ok_or_else(|| invalid_frame(FormatError::InvalidValue))?,
+        };
+        Ok((file, summary, cells))
     }
 }

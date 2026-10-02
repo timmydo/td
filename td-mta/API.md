@@ -765,6 +765,15 @@ This immutable lookup performs no I/O and does not retire on a caller error.
 The driver still validates/opens files, locates the frame under a work budget
 and holds real pins; a source choice is not serving authorization.
 
+`LockedRoot::open_changes_at` returns ChangeInput for one requested sequence.
+Each advance reads at most one complete bounded frame and returns Locating,
+Frame or End. Locating hides earlier changes and does not change the caller's change cursor.
+Frame permits draining the checked result before the next advance. Exact view
+identity is required on each advance. End alone proves no selected completion;
+finish verifies the source and returns typed completion plus reusable full
+CHANGE slots. The driver handles segment transitions, work/deadlines and real
+pins. These remain provisional filesystem building blocks, not ReadView service.
+
 BlobReader is an already authorized, opened, immutable file with a live owner
 pin held until it closes. Store::open_blob requires Access and borrows the
 view, retaining that ownership until the reader drops. It checks live message/

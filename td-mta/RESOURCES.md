@@ -787,6 +787,17 @@ below-floor/changed-view refusal. Physical frame location and complete-view
 memory remain
 separate work; this helper changes no arena or concurrency allowance.
 
+ChangeInput holds one history/active reader plus captured identity, target and
+fixed progress fields. The compiled Provider wrapper fits the existing 8 KiB
+reader stack ceiling. Each advance retains the common 8258-read, one-frame bound
+and borrows the same per-call record scratch. Finish reclaims original full
+CHANGE capacity after selected completion, even after End or an empty prefix;
+it does not clear or allocate a replacement arena. The returned completion
+retains its descriptor until dropped, so the driver must budget retained handles
+or drop it before moving segments. Existing root-bound allocation intervals
+cover history-to-active scratch reuse, empty-prefix reclaim and target refusal.
+Actual streaming view ownership and complete-worker measurements remain pending.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a

@@ -622,6 +622,37 @@ It grants no file-open authority or proof of physical availability, journal
 integrity, final-view validity or real pins. Locating bytes within the selected
 segment retains its own work budget; this helper supplies only a source choice.
 
+`LockedRoot::open_changes_at` combines the selected route with the matching
+history or active change reader for one target sequence and one source segment.
+Validate route/view/target before opening; preserve that reader's caller-byte
+admission and whole-file or captured-prefix checks. One `advance` borrows record
+scratch, checks the exact captured identity, discards the prior frame and reads
+at most one bounded complete frame. Until it reaches the target, it returns
+Locating with the checked sequence and hides the frame's changes. Locating is
+internal work progress; it cannot advance a user cursor or authorize a page.
+Reading earlier frames, including those before the retained floor, is needed
+for the selected segment's integrity and exposes no earlier changes.
+
+At the target and subsequent frames in that segment, return Frame and expose
+only checked provisional changes. The caller drains them before advancing.
+Refuse a sequence beyond the selected segment/captured endpoint before exposing
+it. End requires the target reached and the selected final sequence seen, but
+is not a completion proof. All advance errors retire ChangeInput and hide its
+frame; subsequent advance/finish returns Failed. Underlying I/O/format errors
+remain Input errors; policy/view errors keep their Policy classification.
+
+Consuming finish still requires selected history digest/physical EOF or exact
+captured active-prefix completion. It returns a typed History/Active completion
+and the original full mutable CHANGE-slot capacity. The underlying history and
+active readers also expose finish_reuse, with their existing finish APIs
+retaining the prior result type. Scratch is returned only after all completion
+checks succeed, whether the final frame is still present or End cleared it.
+An empty active input can likewise reclaim its untouched cells. No new arena or
+per-frame allocation is introduced. This locates within one selected segment;
+segment transitions, live pin ownership, full final-view validation and serving
+remain driver work. Every location step needs its own admitted full-frame work
+unit/deadline check; blocking std calls retain their existing limitation.
+
 ### Scanning a stopped active journal
 
 `LockedRoot::scan_active_journal` is read-only recovery input. The caller holds

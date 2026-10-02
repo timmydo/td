@@ -116,6 +116,15 @@ pub fn run(mut snapshot: impl FnMut()) {
             &active_probe,
             history_scratch.as_mut_slice().try_into().unwrap(),
         );
+        super::super::change_locator::probe(
+            &fixture.root,
+            &active_probe,
+            history_scratch
+                .get_mut(..crate::format::table::MAX_RECORD_BYTES)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         super::super::active_overlay::probe(
             &fixture.root,
             &active_probe,
