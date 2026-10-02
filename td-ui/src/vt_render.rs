@@ -699,12 +699,28 @@ pub fn render_with(
         return Err("font cells have no area".into());
     }
 
-    fill(pixels, palette.background());
-
     // Only the cells that can reach the surface are visited; `div_ceil`
     // keeps a partially visible last row or column.
     let rows = snapshot.rows().min(height.div_ceil(cell_height));
     let columns = snapshot.columns().min(width.div_ceil(cell_width));
+
+    // Every cell writes each of its pixels, so only what the grid leaves
+    // uncovered is cleared.
+    let grid = (
+        columns.checked_mul(cell_width).map(|w| w.min(width)),
+        rows.checked_mul(cell_height).map(|h| h.min(height)),
+    );
+    match grid {
+        (Some(grid_width), Some(grid_height)) => {
+            fill_margin(
+                pixels,
+                width,
+                (grid_width, grid_height),
+                palette.background(),
+            );
+        }
+        _ => fill(pixels, palette.background()),
+    }
     for row in 0..rows {
         let Some(origin_y) = row.checked_mul(cell_height) else {
             break;
@@ -757,11 +773,51 @@ pub fn render_with(
 }
 
 fn fill(pixels: &mut [u8], color: [u8; 3]) {
-    let [red, green, blue] = color;
-    let packed = [blue, green, red, 0];
-    for pixel in pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
-        *pixel = packed;
+    pixels
+        .as_chunks_mut::<BYTES_PER_PIXEL>()
+        .0
+        .fill(packed(color));
+}
+
+/// Clears what lies right of and below the grid's `width` by `height`
+/// corner of a surface `stride` pixels wide.
+fn fill_margin(pixels: &mut [u8], stride: usize, (width, height): (usize, usize), color: [u8; 3]) {
+    let color = packed(color);
+    let surface = pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0;
+    let Some(covered) = stride.checked_mul(height) else {
+        surface.fill(color);
+        return;
+    };
+    let (grid, below) = surface.split_at_mut(covered.min(surface.len()));
+    below.fill(color);
+    if width < stride {
+        for row in grid.chunks_mut(stride) {
+            if let Some(right) = row.get_mut(width..) {
+                right.fill(color);
+            }
+        }
     }
+}
+
+/// XRGB8888 is little-endian in memory: blue, green, red, unused.
+fn packed([red, green, blue]: [u8; 3]) -> [u8; BYTES_PER_PIXEL] {
+    [blue, green, red, 0]
+}
+
+/// The `length` pixels of row `y` from column `x`, or none unless all of
+/// them are inside the surface.
+fn span(
+    pixels: &mut [u8],
+    (width, height): (usize, usize),
+    (x, y): (usize, usize),
+    length: usize,
+) -> Option<&mut [[u8; BYTES_PER_PIXEL]]> {
+    if y >= height || x.checked_add(length)? > width {
+        return None;
+    }
+    let start = offset_of(width, x, y)?;
+    let end = start.checked_add(length.checked_mul(BYTES_PER_PIXEL)?)?;
+    Some(pixels.get_mut(start..end)?.as_chunks_mut().0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -778,29 +834,60 @@ fn paint_cell(
     let attributes = &cell.attributes;
     let ink = Ink::new(attributes, palette);
     let (cell_width, cell_height) = cell_size(font, outline.as_deref());
+    // The cell's columns left of the surface's right edge; each row is
+    // written whole through them, a rule laid over it afterwards.
+    let visible = width.saturating_sub(origin_x).min(cell_width);
+    if visible == 0 {
+        return;
+    }
+    let ruled = attributes.strike || attributes.underline != Underline::None;
+    let (foreground, background) = (packed(ink.foreground), packed(ink.background));
+    let underline = packed(ink.underline);
+    let rule_over = |pixels: &mut [[u8; BYTES_PER_PIXEL]], row: usize| {
+        if !ruled {
+            return;
+        }
+        for (column, pixel) in pixels.iter_mut().enumerate() {
+            let x = origin_x.saturating_add(column);
+            match rule(attributes, (cell_width, cell_height), x, column, row) {
+                Some(Rule::Strike) => *pixel = foreground,
+                Some(Rule::Underline) => *pixel = underline,
+                None => {}
+            }
+        }
+    };
     if let Some(face) = outline {
         let slot = face.glyph(face.style(attributes.bold, attributes.italic), cell.scalar);
         if slot != Slot::Missing {
-            let (x, y) = (origin_x, origin_y);
-            let coverage = |column: usize, row: usize| match slot {
-                Slot::Placed(entry) => covered(face, entry, column, row),
-                _ => 0,
+            let glyph = match slot {
+                Slot::Placed(entry) => Some(Coverage::new(face, entry)),
+                _ => None,
             };
             for row in 0..cell_height {
-                let Some(y) = y.checked_add(row).filter(|&y| y < height) else {
+                let Some(y) = origin_y.checked_add(row) else {
                     return;
                 };
-                for column in 0..cell_width {
-                    let Some(x) = x.checked_add(column).filter(|&x| x < width) else {
-                        break;
-                    };
-                    let color = match rule(attributes, (cell_width, cell_height), x, column, row) {
-                        Some(Rule::Strike) => ink.foreground,
-                        Some(Rule::Underline) => ink.underline,
-                        None => mix(ink.background, ink.foreground, coverage(column, row)),
-                    };
-                    put_pixel(pixels, width, height, x, y, color);
+                let Some(pixels) = span(pixels, (width, height), (origin_x, y), visible) else {
+                    return;
+                };
+                match glyph.as_ref().and_then(|glyph| glyph.row(face, row)) {
+                    Some((offset, coverage)) => {
+                        for (column, pixel) in pixels.iter_mut().enumerate() {
+                            let alpha = offset
+                                .entry_column(column)
+                                .and_then(|at| coverage.get(at))
+                                .copied()
+                                .unwrap_or(0);
+                            *pixel = match alpha {
+                                0 => background,
+                                u8::MAX => foreground,
+                                _ => packed(mix(ink.background, ink.foreground, alpha)),
+                            };
+                        }
+                    }
+                    None => pixels.fill(background),
                 }
+                rule_over(pixels, row);
             }
             return;
         }
@@ -828,35 +915,92 @@ fn paint_cell(
         let Some(y) = origin_y.checked_add(row) else {
             return;
         };
-        if y >= height {
+        let Some(pixels) = span(pixels, (width, height), (origin_x, y), visible) else {
             return;
-        }
-        let glyph_row = within(row, inset_y, font.height());
-        let lean = match glyph_row {
-            Some(glyph_row) if attributes.italic => shear(glyph_row, font.height()),
-            _ => 0,
         };
-        for column in 0..cell_width {
-            let Some(x) = origin_x.checked_add(column) else {
-                break;
-            };
-            if x >= width {
-                break;
-            }
-            let inked = match (within(column, inset_x, font.width()), glyph_row) {
-                (Some(glyph_column), Some(glyph_row)) => {
-                    lit(font, glyph, glyph_column, glyph_row, attributes.bold, lean)
+        let bits = within(row, inset_y, font.height())
+            .and_then(|glyph_row| Some((glyph_row, font.row(glyph, glyph_row)?)))
+            .filter(|(_, bits)| bits.iter().any(|&byte| byte != 0));
+        match bits {
+            Some((glyph_row, bits)) => {
+                let lean = if attributes.italic {
+                    shear(glyph_row, font.height())
+                } else {
+                    0
+                };
+                for (column, pixel) in pixels.iter_mut().enumerate() {
+                    let inked = within(column, inset_x, font.width()).is_some_and(|column| {
+                        lit(bits, font.width(), column, attributes.bold, lean)
+                    });
+                    *pixel = if inked { foreground } else { background };
                 }
-                _ => false,
-            };
-            let color = match rule(attributes, (cell_width, cell_height), x, column, row) {
-                Some(Rule::Strike) => ink.foreground,
-                Some(Rule::Underline) => ink.underline,
-                None if inked => ink.foreground,
-                None => ink.background,
-            };
-            put_pixel(pixels, width, height, x, y, color);
+            }
+            None => pixels.fill(background),
         }
+        rule_over(pixels, row);
+    }
+}
+
+/// A placed glyph's coverage, read a cell row at a time from the atlas
+/// page, placed from the face's pen and baseline and clipped to the cell,
+/// so a lean or an overhang never reaches the next.
+struct Coverage {
+    entry: Entry,
+    offset: Offset,
+    /// The entry row under the cell's row 0, negative while the entry
+    /// starts below it.
+    top: i64,
+}
+
+/// Where the entry's first column lands against the cell's first.
+#[derive(Clone, Copy)]
+enum Offset {
+    /// This many columns left of the cell, as an overhang starts.
+    Before(usize),
+    /// This many columns into the cell.
+    Inside(usize),
+}
+
+impl Offset {
+    /// The entry column under the cell's `column`, none left of the entry.
+    fn entry_column(self, column: usize) -> Option<usize> {
+        match self {
+            Offset::Before(before) => column.checked_add(before),
+            Offset::Inside(inside) => column.checked_sub(inside),
+        }
+    }
+}
+
+impl Coverage {
+    fn new(face: &Face, entry: Entry) -> Self {
+        let cell = face.cell();
+        let signed = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        let start = signed(cell.pen).saturating_add(i64::from(entry.left));
+        let offset = match usize::try_from(start) {
+            Ok(inside) => Offset::Inside(inside),
+            Err(_) => Offset::Before(usize::try_from(start.unsigned_abs()).unwrap_or(usize::MAX)),
+        };
+        let top = i64::from(entry.top).saturating_sub(signed(cell.baseline));
+        Self { entry, offset, top }
+    }
+
+    /// The entry's coverage row under the cell's `row` with its offset,
+    /// none above or below the entry: the whole row, or as much of it as
+    /// the page holds.
+    fn row<'a>(&self, face: &'a Face, row: usize) -> Option<(Offset, &'a [u8])> {
+        let row = i64::try_from(row).ok()?;
+        let y = usize::try_from(row.saturating_add(self.top)).ok()?;
+        if y >= self.entry.height {
+            return None;
+        }
+        let start = self
+            .entry
+            .y
+            .checked_add(y)?
+            .checked_mul(PAGE_WIDTH)?
+            .checked_add(self.entry.x)?;
+        let rest = face.atlas().page().get(start..).unwrap_or(&[]);
+        Some((self.offset, rest.get(..self.entry.width).unwrap_or(rest)))
     }
 }
 
@@ -942,34 +1086,6 @@ fn rule(
     under.then_some(Rule::Underline)
 }
 
-/// The coverage `entry` puts at (`column`, `row`) of the cell: the glyph's
-/// pixels from the atlas page, placed from the face's pen and baseline and
-/// clipped to the cell, so a lean or an overhang never reaches the next.
-fn covered(face: &Face, entry: Entry, column: usize, row: usize) -> u8 {
-    let cell = face.cell();
-    let signed = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
-    let x = signed(column)
-        .saturating_sub(signed(cell.pen))
-        .saturating_sub(i64::from(entry.left));
-    let y = signed(row)
-        .saturating_sub(signed(cell.baseline))
-        .saturating_add(i64::from(entry.top));
-    let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
-        return 0;
-    };
-    if x >= entry.width || y >= entry.height {
-        return 0;
-    }
-    entry
-        .y
-        .checked_add(y)
-        .and_then(|page_row| page_row.checked_mul(PAGE_WIDTH))
-        .and_then(|start| start.checked_add(entry.x))
-        .and_then(|start| start.checked_add(x))
-        .and_then(|at| face.atlas().page().get(at).copied())
-        .unwrap_or(0)
-}
-
 /// `from` moved toward `to` by `alpha` of 255, per channel, rounded.
 fn mix(from: [u8; 3], to: [u8; 3], alpha: u8) -> [u8; 3] {
     let alpha = u16::from(alpha);
@@ -981,28 +1097,23 @@ fn mix(from: [u8; 3], to: [u8; 3], alpha: u8) -> [u8; 3] {
     mixed
 }
 
-/// Whether the cell's pixel at (`glyph_column`, `glyph_row`) is set, after
-/// the shear moves which source column it reads and bold adds the column
-/// to its left. Both effects are clipped by construction: a source column
-/// left of the glyph does not exist, and a set bit pushed past the cell's
-/// right edge is never asked for.
-fn lit(
-    font: &Font,
-    glyph: usize,
-    glyph_column: usize,
-    glyph_row: usize,
-    bold: bool,
-    lean: usize,
-) -> bool {
+/// Whether the pixel at `glyph_column` of a glyph row's `bits`, `width`
+/// columns wide, is set, after the shear moves which source column it
+/// reads and bold adds the column to its left. Both effects are clipped by
+/// construction: a source column left of the glyph does not exist, and a
+/// set bit pushed past the cell's right edge is never asked for.
+fn lit(bits: &[u8], width: usize, glyph_column: usize, bold: bool, lean: usize) -> bool {
+    // Most-significant bit first, as PSF2 stores a row (`Font::pixel`).
+    let set = |column: usize| {
+        column < width
+            && bits
+                .get(column / 8)
+                .is_some_and(|byte| byte >> (7 - column % 8) & 1 == 1)
+    };
     let Some(source) = glyph_column.checked_sub(lean) else {
         return false;
     };
-    if font.pixel(glyph, source, glyph_row) {
-        return true;
-    }
-    bold && source
-        .checked_sub(1)
-        .is_some_and(|left| font.pixel(glyph, left, glyph_row))
+    set(source) || (bold && source.checked_sub(1).is_some_and(set))
 }
 
 #[allow(clippy::too_many_arguments)]

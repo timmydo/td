@@ -2317,3 +2317,439 @@ fn a_cells_rules_and_cursor_take_the_faces_cell() {
         .iter()
         .all(|&(x, y)| (10..20).contains(&x) && (x == 10 || x == 19 || y == 0 || y == 21)));
 }
+
+// ------------------------------------------------- the painter's reference
+
+// The painter as it was before it wrote a cell a row at a time: every
+// pixel through `put_pixel`, its coverage looked up on its own, the whole
+// surface cleared first. Kept as the oracle the faster painter must match
+// byte for byte (`the_painter_matches_its_per_pixel_reference`).
+
+fn reference_render_with(
+    snapshot: &Snapshot,
+    palette: &Palette,
+    font: &Font,
+    mut outline: Option<&mut Face>,
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    let expected = width
+        .checked_mul(height)
+        .and_then(|count| count.checked_mul(BYTES_PER_PIXEL))
+        .ok_or_else(|| format!("surface {width}x{height} overflows a byte count"))?;
+    if pixels.len() != expected {
+        return Err(format!(
+            "surface {width}x{height} needs {expected} bytes, not {}",
+            pixels.len()
+        ));
+    }
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
+    if cell_width == 0 || cell_height == 0 {
+        return Err("font cells have no area".into());
+    }
+
+    reference_fill(pixels, palette.background());
+
+    // Only the cells that can reach the surface are visited; `div_ceil`
+    // keeps a partially visible last row or column.
+    let rows = snapshot.rows().min(height.div_ceil(cell_height));
+    let columns = snapshot.columns().min(width.div_ceil(cell_width));
+    for row in 0..rows {
+        let Some(origin_y) = row.checked_mul(cell_height) else {
+            break;
+        };
+        for column in 0..columns {
+            let Some(origin_x) = column.checked_mul(cell_width) else {
+                break;
+            };
+            let cell = snapshot.cell(row, column);
+            reference_paint_cell(
+                pixels,
+                width,
+                height,
+                font,
+                outline.as_deref_mut(),
+                palette,
+                &cell,
+                (origin_x, origin_y),
+            );
+            if snapshot.linked(row, column) {
+                let ground = Ink::new(&cell.attributes, palette).background;
+                paint_link_rule(
+                    pixels,
+                    (width, height),
+                    ground,
+                    (origin_x, origin_y),
+                    (cell_width, cell_height),
+                );
+            }
+        }
+    }
+
+    if let Some((row, column)) = snapshot.cursor() {
+        reference_paint_cursor(
+            pixels,
+            width,
+            height,
+            font,
+            outline,
+            palette,
+            snapshot,
+            (row, column),
+        );
+    }
+
+    if snapshot.bell() {
+        invert_ring(pixels, width, height);
+    }
+    Ok(())
+}
+
+fn reference_fill(pixels: &mut [u8], color: [u8; 3]) {
+    let [red, green, blue] = color;
+    let packed = [blue, green, red, 0];
+    for pixel in pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
+        *pixel = packed;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reference_paint_cell(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    font: &Font,
+    outline: Option<&mut Face>,
+    palette: &Palette,
+    cell: &Cell,
+    (origin_x, origin_y): (usize, usize),
+) {
+    let attributes = &cell.attributes;
+    let ink = Ink::new(attributes, palette);
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
+    if let Some(face) = outline {
+        let slot = face.glyph(face.style(attributes.bold, attributes.italic), cell.scalar);
+        if slot != Slot::Missing {
+            let (x, y) = (origin_x, origin_y);
+            let coverage = |column: usize, row: usize| match slot {
+                Slot::Placed(entry) => reference_covered(face, entry, column, row),
+                _ => 0,
+            };
+            for row in 0..cell_height {
+                let Some(y) = y.checked_add(row).filter(|&y| y < height) else {
+                    return;
+                };
+                for column in 0..cell_width {
+                    let Some(x) = x.checked_add(column).filter(|&x| x < width) else {
+                        break;
+                    };
+                    let color = match rule(attributes, (cell_width, cell_height), x, column, row) {
+                        Some(Rule::Strike) => ink.foreground,
+                        Some(Rule::Underline) => ink.underline,
+                        None => mix(ink.background, ink.foreground, coverage(column, row)),
+                    };
+                    put_pixel(pixels, width, height, x, y, color);
+                }
+            }
+            return;
+        }
+    }
+    let glyph = font.index(cell.scalar);
+    // Centred: a larger cell frames the glyph and a smaller one clips it
+    // about its middle, an odd difference trimming the right column or the
+    // bottom row once more, and the bitmap face's own cell holds it
+    // exactly.
+    let inset = |cell: usize, glyph: usize| {
+        let signed = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        (signed(cell).saturating_sub(signed(glyph))) / 2
+    };
+    let (inset_x, inset_y) = (
+        inset(cell_width, font.width()),
+        inset(cell_height, font.height()),
+    );
+    let within = |at: usize, inset: i64, glyph: usize| {
+        i64::try_from(at)
+            .ok()
+            .and_then(|at| usize::try_from(at.saturating_sub(inset)).ok())
+            .filter(|&at| at < glyph)
+    };
+    for row in 0..cell_height {
+        let Some(y) = origin_y.checked_add(row) else {
+            return;
+        };
+        if y >= height {
+            return;
+        }
+        let glyph_row = within(row, inset_y, font.height());
+        let lean = match glyph_row {
+            Some(glyph_row) if attributes.italic => shear(glyph_row, font.height()),
+            _ => 0,
+        };
+        for column in 0..cell_width {
+            let Some(x) = origin_x.checked_add(column) else {
+                break;
+            };
+            if x >= width {
+                break;
+            }
+            let inked = match (within(column, inset_x, font.width()), glyph_row) {
+                (Some(glyph_column), Some(glyph_row)) => {
+                    reference_lit(font, glyph, glyph_column, glyph_row, attributes.bold, lean)
+                }
+                _ => false,
+            };
+            let color = match rule(attributes, (cell_width, cell_height), x, column, row) {
+                Some(Rule::Strike) => ink.foreground,
+                Some(Rule::Underline) => ink.underline,
+                None if inked => ink.foreground,
+                None => ink.background,
+            };
+            put_pixel(pixels, width, height, x, y, color);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reference_paint_cursor(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    font: &Font,
+    outline: Option<&mut Face>,
+    palette: &Palette,
+    snapshot: &Snapshot,
+    (row, column): (usize, usize),
+) {
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
+    let (Some(origin_x), Some(origin_y)) =
+        (column.checked_mul(cell_width), row.checked_mul(cell_height))
+    else {
+        return;
+    };
+    let cell = snapshot.cell(row, column);
+    if snapshot.focused() {
+        // A focused cursor is the cell drawn with its ink exchanged, which
+        // is inverse's presentation — so a cursor over an already-inverse
+        // cell reads as the surrounding text, as on a real terminal.
+        let mut attributes = cell.attributes;
+        attributes.inverse = !attributes.inverse;
+        let flipped = Cell {
+            scalar: cell.scalar,
+            attributes,
+        };
+        reference_paint_cell(
+            pixels,
+            width,
+            height,
+            font,
+            outline,
+            palette,
+            &flipped,
+            (origin_x, origin_y),
+        );
+        return;
+    }
+    // Unfocused it is a hollow box: present, but not claiming the keyboard.
+    let ink = Ink::new(&cell.attributes, palette);
+    for glyph_row in 0..cell_height {
+        for glyph_column in 0..cell_width {
+            let edge = glyph_row == 0
+                || glyph_column == 0
+                || glyph_row.saturating_add(1) == cell_height
+                || glyph_column.saturating_add(1) == cell_width;
+            if !edge {
+                continue;
+            }
+            let (Some(x), Some(y)) = (
+                origin_x.checked_add(glyph_column),
+                origin_y.checked_add(glyph_row),
+            ) else {
+                continue;
+            };
+            put_pixel(pixels, width, height, x, y, ink.foreground);
+        }
+    }
+}
+
+/// The coverage `entry` puts at (`column`, `row`) of the cell: the glyph's
+/// pixels from the atlas page, placed from the face's pen and baseline and
+/// clipped to the cell, so a lean or an overhang never reaches the next.
+fn reference_covered(face: &Face, entry: Entry, column: usize, row: usize) -> u8 {
+    let cell = face.cell();
+    let signed = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+    let x = signed(column)
+        .saturating_sub(signed(cell.pen))
+        .saturating_sub(i64::from(entry.left));
+    let y = signed(row)
+        .saturating_sub(signed(cell.baseline))
+        .saturating_add(i64::from(entry.top));
+    let (Ok(x), Ok(y)) = (usize::try_from(x), usize::try_from(y)) else {
+        return 0;
+    };
+    if x >= entry.width || y >= entry.height {
+        return 0;
+    }
+    entry
+        .y
+        .checked_add(y)
+        .and_then(|page_row| page_row.checked_mul(PAGE_WIDTH))
+        .and_then(|start| start.checked_add(entry.x))
+        .and_then(|start| start.checked_add(x))
+        .and_then(|at| face.atlas().page().get(at).copied())
+        .unwrap_or(0)
+}
+
+/// What the differential corpus writes: text the outline faces have ('0',
+/// ' '), text only the bitmap face has, wide and block scalars, and every
+/// rendition the painter decides on per cell or per pixel.
+const PIECES: [&[u8]; 28] = [
+    b"0",
+    b"0",
+    b" ",
+    b"A",
+    b"g",
+    "\u{e9}".as_bytes(),
+    "\u{2588}".as_bytes(),
+    "\u{2502}".as_bytes(),
+    b"\r\n",
+    b"\x1b[0m",
+    b"\x1b[1m",
+    b"\x1b[2m",
+    b"\x1b[3m",
+    b"\x1b[7m",
+    b"\x1b[9m",
+    b"\x1b[4m",
+    b"\x1b[4:2m",
+    b"\x1b[4:3m",
+    b"\x1b[4:4m",
+    b"\x1b[4:5m",
+    b"\x1b[24m",
+    b"\x1b[31m",
+    b"\x1b[38;5;200m",
+    b"\x1b[48;2;10;200;30m",
+    b"\x1b[58;5;46m",
+    b"\x1b[39;49m",
+    b"\x1b[5;3H",
+    b"\x1b[K",
+];
+
+/// The faces the corpus draws through: the bitmap face alone; the
+/// rendition face fitted to the bitmap cell; a face whose square sits off
+/// the pixel grid, so its edges are partial coverage; one whose square
+/// overhangs the cell on every side; one overhanging only the cell's
+/// left, its partial right edge inside it, so where an overhang starts
+/// reading the entry shows; and one on a cell of its own larger than the
+/// bitmap one, so a scalar it lacks is the bitmap glyph centred.
+fn corpus_faces() -> Vec<Option<Face>> {
+    let (width, height) = (face().width(), face().height());
+    vec![
+        None,
+        Some(outline_face()),
+        Some(Face::fit(outline_style(30, -70, 470, 830), None, width, height).unwrap()),
+        Some(Face::fit(outline_style(-125, -300, 625, 1100), None, width, height).unwrap()),
+        Some(Face::fit(outline_style(-90, -50, 330, 640), None, width, height).unwrap()),
+        Some(Face::sized(outline_style(40, -90, 430, 700), None, 23.0).unwrap()),
+    ]
+}
+
+#[test]
+fn the_painter_matches_its_per_pixel_reference() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for outline in corpus_faces() {
+        let (cell_width, cell_height) = cell_size(face(), outline.as_ref());
+        for case in 0..40 {
+            let (rows, columns) = (1 + next() as usize % 6, 1 + next() as usize % 9);
+            let mut input = Vec::new();
+            for _ in 0..next() % 120 {
+                input.extend_from_slice(PIECES[next() as usize % PIECES.len()]);
+            }
+            let terminal = terminal(rows, columns, &input);
+            // The grid exactly, cut short in either axis mid-cell, and
+            // with a margin right of and below it.
+            let (grid_width, grid_height) = (columns * cell_width, rows * cell_height);
+            let (width, height) = match case % 4 {
+                0 => (grid_width, grid_height),
+                1 => (
+                    grid_width.saturating_sub(1 + next() as usize % cell_width),
+                    grid_height,
+                ),
+                2 => (grid_width, 1 + next() as usize % grid_height),
+                _ => (
+                    grid_width + next() as usize % 13,
+                    grid_height + next() as usize % 11,
+                ),
+            };
+            let width = width.max(1);
+            let selection = (case % 3 == 0).then(|| Selection {
+                anchor: (0, next() as usize % columns),
+                extent: (next() as usize % rows, next() as usize % columns),
+            });
+            let link = (case % 5 == 0).then(|| {
+                Hover::Span(LinkSpan {
+                    row: next() as usize % rows,
+                    start: 0,
+                    end: 1 + next() as usize % columns,
+                })
+            });
+            let snapshot = Snapshot::new(&terminal, case % 2 == 0, case % 7 == 0)
+                .with_selection(selection)
+                .with_link(link);
+            let mut expected = vec![0x5a; width * height * BYTES_PER_PIXEL];
+            let mut actual = vec![0xa5; width * height * BYTES_PER_PIXEL];
+            // Each painter starts from the face as it was, so each covers
+            // the frame's glyphs into its atlas itself.
+            reference_render_with(
+                &snapshot,
+                palette(),
+                face(),
+                outline.clone().as_mut(),
+                &mut expected,
+                width,
+                height,
+            )
+            .unwrap();
+            render_with(
+                &snapshot,
+                palette(),
+                face(),
+                outline.clone().as_mut(),
+                &mut actual,
+                width,
+                height,
+            )
+            .unwrap();
+            assert!(
+                expected == actual,
+                "case {case}: {columns}x{rows} grid, {width}x{height} surface, cell \
+                 {cell_width}x{cell_height}, input {:?}",
+                String::from_utf8_lossy(&input)
+            );
+        }
+    }
+}
+
+fn reference_lit(
+    font: &Font,
+    glyph: usize,
+    glyph_column: usize,
+    glyph_row: usize,
+    bold: bool,
+    lean: usize,
+) -> bool {
+    let Some(source) = glyph_column.checked_sub(lean) else {
+        return false;
+    };
+    if font.pixel(glyph, source, glyph_row) {
+        return true;
+    }
+    bold && source
+        .checked_sub(1)
+        .is_some_and(|left| font.pixel(glyph, left, glyph_row))
+}
