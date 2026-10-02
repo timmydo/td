@@ -757,6 +757,12 @@ share charged work and a monotonic clock watermark, preserving diagnostics
 and retirement. It stages one byte within fixed state; body-value projection
 and protocol output remain separate.
 
+The plain body-value filter converts CRLF, replaces noncharacters for I-JSON
+and applies a UTF-8 scalar-boundary byte cap with fixed pending state. It keeps
+validating the remaining scalars after truncation so trailing diagnostics are
+retained. HTML truncation, response serialization and JMAP integration remain
+separate.
+
 ## 10. HTTP and JMAP
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,

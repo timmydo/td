@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod body_charset;
+pub mod body_value;
 pub mod bounded;
 pub mod change_cursor;
 pub mod clock;

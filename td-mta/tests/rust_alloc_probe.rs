@@ -1120,6 +1120,109 @@ fn mime_checkpoints() {
     assert_eq!(COUNTERS.snapshot(), before, "transfer checkpoint allocated");
 }
 
+fn body_value() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        body_value::{Error, Plain, Status},
+        ports::{Deadline, Tick},
+    };
+    fn budget(records: u64) -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                records,
+                output_bytes: 1000,
+                ..Charge::default()
+            },
+        )
+    }
+    let before = COUNTERS.snapshot();
+    for cap in [0, 3] {
+        let input = ['a', '\r', '\n', 'é', '\u{ffff}'];
+        let full = ['a', '\n', 'é', '\u{fffd}'];
+        let short = ['a', '\n'];
+        let expected = if cap == 0 {
+            full.as_slice()
+        } else {
+            short.as_slice()
+        };
+        let mut value = Plain::new(cap);
+        let mut work = budget(1000);
+        let mut pos = 0;
+        let mut written = 0;
+        let mut done = false;
+        for _ in 0..30 {
+            let step = value
+                .poll(
+                    input.get(pos).copied(),
+                    pos == input.len(),
+                    Tick(1),
+                    &mut work,
+                )
+                .unwrap();
+            if step.consumed {
+                pos += 1;
+            }
+            match step.status {
+                Status::Scalar(c) => {
+                    assert_eq!(Some(&c), expected.get(written));
+                    written += 1;
+                }
+                Status::Yield | Status::NeedInput => {}
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(pos, input.len());
+        assert_eq!(written, expected.len());
+        assert!(value.is_encoding_problem());
+        assert_eq!(value.is_truncated(), cap != 0);
+        let remaining = work.remaining();
+        assert_eq!(
+            value
+                .poll(Some('x'), true, Tick(100), &mut work)
+                .unwrap()
+                .status,
+            Status::Complete
+        );
+        assert_eq!(work.remaining(), remaining);
+    }
+    let mut value = Plain::new(0);
+    let mut work = budget(100);
+    value.poll(Some('\r'), false, Tick(1), &mut work).unwrap();
+    let saved = value;
+    for _ in 0..2 {
+        assert_eq!(
+            value
+                .poll(Some('a'), true, Tick(1), &mut work)
+                .unwrap()
+                .status,
+            Status::Scalar('\r')
+        );
+        value = saved;
+    }
+    let mut value = Plain::new(0);
+    assert_eq!(
+        value.poll(Some('a'), true, Tick(1), &mut budget(0)),
+        Err(Error::Work(Stop::Records))
+    );
+    let mut fresh = budget(100);
+    let remaining = fresh.remaining();
+    assert_eq!(
+        value.poll(None, true, Tick(1), &mut fresh),
+        Err(Error::Work(Stop::Records))
+    );
+    assert_eq!(fresh.remaining(), remaining);
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "plain body value filtering allocated"
+    );
+}
+
 fn mime_text() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -1892,6 +1995,7 @@ fn main() {
         mime_base64();
         mime_input();
         mime_headers();
+        body_value();
         mime_text();
         body_charset();
         mime_charset();
@@ -1982,6 +2086,7 @@ fn main() {
     mime_base64();
     mime_input();
     mime_headers();
+    body_value();
     mime_text();
     body_charset();
     mime_charset();

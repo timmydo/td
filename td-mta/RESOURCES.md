@@ -796,6 +796,14 @@ transfer diagnostics, replay I/O failure and sticky work refusal without
 changing Rust counters. Combined filesystem allocation, nested-source use,
 whole worker stacks and service RSS remain unqualified.
 
+The plain body-value filter fits 64 bytes alongside the text reader in the
+same 2 KiB decoder/HTML/snippet state. It retains a possible CR, byte counts
+and flags, never a text buffer. Its allocation interval covers conversion,
+noncharacter replacement beyond a cap, truncation/completion, pending-state
+replay and fresh-meter refusal. A functional composed test validates a
+malformed charset tail after the output cap. Response-spool allocation,
+HTML handling and complete worker stacks remain unqualified.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

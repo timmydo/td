@@ -939,6 +939,45 @@ noncharacters and line endings. Body-value CRLF/JSON filtering, truncation,
 MIME parameter integration and JMAP output remain separate. Live body/part
 authorization belongs to the caller and is not granted by range validation.
 
+### 1.20 Plain body-value filtering and byte caps
+
+body_value::Plain consumes already-decoded scalars for non-HTML body values.
+Convert CRLF to LF and replace Unicode noncharacters with U+FFFD, retaining
+bare CR, LF, NUL, other controls, valid unassigned scalars and decomposed text.
+This is the body policy, not Raw/Text header filtering. Never apply NFC or
+HTML interpretation here. MIME/charset decoding remains in section 1.19;
+JSON escaping and HTML truncation remain separate.
+
+poll takes an optional scalar and a last flag, returning whether it consumed
+the scalar with Scalar, Yield, NeedInput or Complete. Retain an unconsumed
+scalar/last pair: flushing a preceding bare CR may consume neither. A consumed
+last scalar or empty last input records EOF; drain a final CR before Complete.
+A temporarily absent scalar with last=false does not finish a pending CR.
+At most one input scalar is inspected and one output scalar emitted per turn.
+
+The supplied cap counts projected UTF-8 octets, with zero disabling only this
+argument's cap. Emit the longest scalar prefix within the cap; once the next
+scalar will not fit, suppress it and all subsequent output. A value ending
+exactly at the cap is not truncated. Continue consuming to actual source EOF
+so noncharacters and upstream malformed tails still contribute diagnostics.
+Combine the projection flag with transfer/charset flags. Metadata is final
+only at Complete. A later source, work or count-overflow failure must discard
+provisional output; truncation never grants partial successful validation.
+
+Charge one record per scalar inspection, including a revisited lookahead after
+bare CR, and each emitted UTF-8 octet. This standalone filter cannot assume
+an upstream decoder charged scalar work. Composition with the charset reader
+therefore charges two records per ordinary scalar, or three with prescan,
+before other traversal work. The default two-million-record allowance can
+limit body interpretation below the message byte limit; a small output cap
+does not bypass complete-tail validation. Raw downloads remain available.
+JSON serialization charges its own wire output. Caller-owned source/scalar
+checkpoints retain the live meter and
+retirement state; copied filter state never refunds work or revives failure.
+The caller brackets deterministic turns with fresh clock/cancellation checks.
+Refusals latch even with a fresh meter; Complete remains stable without work.
+This primitive owns neither the source nor a response writer.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

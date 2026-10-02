@@ -1247,6 +1247,13 @@ Initial independently landable increments:
   labels, identity/base64, clock boundaries, replay I/O failure and allocation.
   QP, nested sources, body-value filtering/truncation and JMAP remain open.
 
+- **M06j — plain body-value filtering:** implemented CRLF conversion, I-JSON
+  noncharacter replacement and exact UTF-8 scalar-prefix byte caps. Continue
+  validation after truncation, preserve NUL/other text, and retire failures.
+  Cover pending CR/EOF, boundary caps, post-cap diagnostics, work/replay,
+  a composed transfer-text fixture and allocation counters. HTML truncation,
+  response ownership and JMAP output remain open.
+
 Implement other header-form composition, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME
