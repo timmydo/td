@@ -7,6 +7,8 @@
 //! state machine is testable without a compositor.
 
 use std::io;
+use std::ops::Range;
+use std::sync::Arc;
 
 pub const RED: u8 = 31;
 pub const GREEN: u8 = 32;
@@ -278,6 +280,59 @@ fn wrap_one(line: &Line, cols: usize, row: &mut dyn FnMut(Line) -> bool) {
     }
 }
 
+/// A text shown whole in td-ui's document pane rather than laid out in rows:
+/// the window scrolls it, selects in it and copies from it, and only the
+/// rows around it are the frame's.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Document {
+    /// Which text this is. A new one is loaded afresh at its top; the same
+    /// one keeps its place and selection across frames.
+    pub id: u64,
+    pub text: String,
+    /// Byte ranges of `text`, in order, and the style each line is drawn in;
+    /// a plain line has none.
+    pub styles: Vec<(Range<usize>, Style)>,
+}
+
+impl Document {
+    /// `lines` as one text, a line each, every hostile scalar but the tab
+    /// replaced as `sanitize` replaces it. Tabs stay for the pane to lay out
+    /// and for a copy to carry.
+    pub fn new(id: u64, lines: &[Line]) -> Document {
+        let mut text = String::new();
+        let mut styles = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                text.push('\n');
+            }
+            let start = text.len();
+            text.extend(line.text.chars().map(|c| {
+                // td-ui's decoder drops a leading byte-order mark, which
+                // would shift every range after it.
+                if (c != '\t' && is_hostile(c)) || c == '\u{feff}' {
+                    REPLACEMENT
+                } else {
+                    c
+                }
+            }));
+            if line.style != Style::PLAIN && text.len() > start {
+                styles.push((start..text.len(), line.style));
+            }
+        }
+        Document { id, text, styles }
+    }
+}
+
+/// Where a frame shows a [`Document`]: `rows` frame rows from `row`, and
+/// whether the reading keys are the pane's (no prompt is up to take them).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pane {
+    pub row: usize,
+    pub rows: usize,
+    pub document: Arc<Document>,
+    pub keys: bool,
+}
+
 /// Where a frame's scrolling region is and how far it has scrolled, for the
 /// window's scrollbar: `visible` rows from frame row `row`, over `total`
 /// lines of content with `first` at the top.
@@ -297,6 +352,7 @@ pub struct Frame {
     pub cols: usize,
     lines: Vec<Line>,
     scroll: Option<Scroll>,
+    pane: Option<Pane>,
     /// The branch each list row shows, by frame row, so a press is read
     /// against the frame it was made on rather than whatever the list has
     /// become since.
@@ -310,6 +366,7 @@ impl Frame {
             cols: cols.max(1),
             lines: Vec::with_capacity(rows),
             scroll: None,
+            pane: None,
             picks: Vec::new(),
         }
     }
@@ -340,6 +397,25 @@ impl Frame {
             total,
             first,
         });
+    }
+
+    /// The next `rows` rows, as many as there is room for, show `document`
+    /// in the pane; `keys` hands it the reading keys.
+    pub fn pane(&mut self, rows: usize, document: Arc<Document>, keys: bool) {
+        let rows = rows.min(self.room());
+        self.pane = Some(Pane {
+            row: self.lines.len(),
+            rows,
+            document,
+            keys,
+        });
+        for _ in 0..rows {
+            self.push_blank();
+        }
+    }
+
+    pub fn shows(&self) -> Option<&Pane> {
+        self.pane.as_ref()
     }
 
     /// The row pushed next shows the branch `refname`.
@@ -378,15 +454,25 @@ impl Frame {
         self.scroll
     }
 
-    /// The rows' text, one line each, for a test to read.
+    /// The rows' text, one line each, for a test to read; a pane's rows read
+    /// as its document's first lines.
     #[cfg(test)]
     pub fn text(&self) -> String {
+        let mut shown = self.pane.as_ref().map(|pane| {
+            (
+                pane.row..pane.row + pane.rows,
+                pane.document.text.lines().map(str::to_string),
+            )
+        });
         let mut out = String::new();
         for (i, line) in self.lines.iter().enumerate() {
             if i > 0 {
                 out.push('\n');
             }
-            out.push_str(&line.text);
+            match shown.as_mut().filter(|(rows, _)| rows.contains(&i)) {
+                Some((_, lines)) => out.push_str(&lines.next().unwrap_or_default()),
+                None => out.push_str(&line.text),
+            }
         }
         out
     }

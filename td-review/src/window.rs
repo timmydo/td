@@ -24,9 +24,16 @@
 //! short of anybody's reaction to a new prompt. And a frame counts as shown
 //! only once it was painted whole: on a surface too small for its rows, the
 //! prompt bar is clipped away, and nothing could have seen it.
+//!
+//! The review's preview is not rows. A frame hands it whole to the window,
+//! which shows it in td-ui's document pane, td-news's and td-mail's reader:
+//! the pane scrolls it, selects in it by drag, word and line, and the window
+//! copies the selection to the clipboard on `C-c`. Those inputs stay on the
+//! window thread; they decide nothing, so no stamp guards them.
 
 use std::collections::VecDeque;
 use std::io;
+use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -34,16 +41,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use td_ui::chrome::SELECTED_ROW;
+use td_ui::editor::{self, Controller, Outcome};
+use td_ui::editor_clipboard::{self, Snapshot};
+use td_ui::editor_error::Error as PaneError;
+use td_ui::editor_model::TabId;
 use td_ui::pointer::DoubleClick;
 use td_ui::raster::{
     self, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scrollbar, Surface, Weight,
     CHROME, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
 };
+#[cfg(test)]
+use td_ui::window::NoClipboard;
 use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::app::{self, App};
-use crate::view::{self, Frame, Key, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
+use crate::view::{self, Document, Frame, Key, Pane, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
 
 /// A row's height at scale one: a cell with a pixel of leading above and
 /// below, so the bars' fills do not touch the glyphs of the rows beside them.
@@ -90,6 +103,43 @@ fn fits(frame: &Frame, surface: Surface) -> bool {
     let s = surface.scale.value();
     frame.lines().len() * LINE * s <= surface.height
         && (frame.cols * CELL_WIDTH + MARGIN + GUTTER) * s <= surface.width
+}
+
+/// Where `pane` lies on `surface`: its rows across the whole width, cut short
+/// at the surface's foot; none when no row of it is on the surface.
+fn pane_rect(pane: &Pane, surface: Surface) -> Option<Rect> {
+    let s = surface.scale.value();
+    let y = pane.row.saturating_mul(LINE * s);
+    let height = pane
+        .rows
+        .saturating_mul(LINE * s)
+        .min(surface.height.saturating_sub(y));
+    if height == 0 || surface.width == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: 0,
+        y: i64::try_from(y).ok()?,
+        width: u32::try_from(surface.width).ok()?,
+        height: u32::try_from(height).ok()?,
+    })
+}
+
+/// How far a reading key scrolls a pane of `page` rows: a row, a page, half
+/// one, or to an end; none for any other key.
+fn scroll_of(key: Key, page: usize) -> Option<isize> {
+    let page = isize::try_from(page.max(1)).unwrap_or(isize::MAX);
+    Some(match key {
+        Key::Char('j') | Key::Down | Key::Enter => 1,
+        Key::Char('k') | Key::Up => -1,
+        Key::Char(' ') | Key::PageDown | Key::Ctrl('f') => page,
+        Key::Char('b') | Key::PageUp | Key::Ctrl('b') => -page,
+        Key::Ctrl('d') => page / 2,
+        Key::Ctrl('u') => -(page / 2),
+        Key::Char('g') | Key::Home => -isize::MAX,
+        Key::Char('G') | Key::End => isize::MAX,
+        _ => return None,
+    })
 }
 
 /// The ink a palette slot is drawn in on the toolkit's paper. The slots name
@@ -145,6 +195,8 @@ pub struct Painting<'a> {
     pub frame: Option<&'a Frame>,
     /// Painted over the frame's last row, as a bar of its own.
     pub notice: Option<&'a str>,
+    /// The document pane, painted over the rows the frame keeps for it.
+    pub pane: Option<&'a dyn Composition>,
 }
 
 impl Painting<'_> {
@@ -206,6 +258,9 @@ impl Composition for Painting<'_> {
                 break;
             }
             self.row(i, &line.text, line.style, damage, sink);
+        }
+        if let Some(pane) = self.pane {
+            pane.emit(damage, sink);
         }
         if let Some(scroll) = frame
             .scroll()
@@ -418,6 +473,14 @@ struct Shown {
     picks: Vec<(usize, String)>,
 }
 
+/// The document the pane holds: which one, its tab, and the inks its styled
+/// lines are drawn in.
+struct Held {
+    id: u64,
+    tab: Option<TabId>,
+    inks: Vec<(Range<usize>, u32)>,
+}
+
 /// The window thread's side: the widget window's handler.
 struct Session {
     title: String,
@@ -439,6 +502,18 @@ struct Session {
     scale: usize,
     epoch: Instant,
     clicks: DoubleClick<usize>,
+    /// td-ui's document pane, for the review's preview.
+    pane: Controller,
+    held: Option<Held>,
+    /// A press in the pane is held: its drag and release are the pane's.
+    dragging: bool,
+    /// The surface painted last, which the pane is placed on.
+    surface: Option<Surface>,
+    /// The window's clock at its last turn, the pane's ticks.
+    clock: u64,
+    /// What a copy came to, over the status row until the next input or
+    /// the next frame, so it never covers a prompt bar a frame raised.
+    note: Option<String>,
 }
 
 impl Session {
@@ -447,8 +522,8 @@ impl Session {
         events: Sender<Event>,
         messages: Receiver<Message>,
         grid: Arc<Grid>,
-    ) -> Self {
-        Session {
+    ) -> Result<Self, String> {
+        Ok(Session {
             title,
             events,
             messages,
@@ -464,7 +539,205 @@ impl Session {
             scale: 1,
             epoch: Instant::now(),
             clicks: DoubleClick::default(),
+            pane: Controller::pane().map_err(|e| format!("document pane: {e}"))?,
+            held: None,
+            dragging: false,
+            surface: None,
+            clock: 0,
+            note: None,
+        })
+    }
+
+    /// The pane the frame on screen shows, if it shows one.
+    fn region(&self) -> Option<&Pane> {
+        self.shown.as_ref().and_then(|(_, frame)| frame.shows())
+    }
+
+    /// The pane's tab and revision while the frame on screen shows the
+    /// document it holds.
+    fn showing(&self) -> Option<(TabId, u64)> {
+        let held = self.held.as_ref()?;
+        if self.region()?.document.id != held.id {
+            return None;
         }
+        let tab = held.tab?;
+        let revision = self.pane.editor().document(tab).ok()?.revision();
+        Some((tab, revision))
+    }
+
+    /// Hands the pane `event`; a change while it is on screen repaints. A
+    /// refusal is nothing: the pane is as it was.
+    fn pane_event(&mut self, event: editor::Event<'_>) -> Outcome {
+        let outcome = self.pane.dispatch(event).unwrap_or(Outcome::Ignored);
+        if outcome == Outcome::Changed && self.region().is_some() {
+            self.dirty = true;
+        }
+        outcome
+    }
+
+    /// Places the pane where the frame on screen shows it on `surface`, and
+    /// has it hold that frame's document, loaded afresh at its top when it
+    /// is a new one.
+    fn sync_pane(&mut self, surface: Surface) {
+        let Some(region) = self.region().cloned() else {
+            if std::mem::take(&mut self.dragging) {
+                self.pane_event(editor::Event::CancelPointer);
+            }
+            return;
+        };
+        if let Some(rect) = pane_rect(&region, surface) {
+            self.pane_event(editor::Event::Frame { rect, surface });
+        }
+        if self
+            .held
+            .as_ref()
+            .is_none_or(|held| held.id != region.document.id)
+        {
+            self.load(&region.document);
+        }
+    }
+
+    fn load(&mut self, document: &Document) {
+        if let Some(tab) = self.held.take().and_then(|held| held.tab) {
+            if let Ok(revision) = self.pane.editor().document(tab).map(|doc| doc.revision()) {
+                self.pane_event(editor::Event::Close { tab, revision });
+            }
+        }
+        self.dragging = false;
+        let mut inks: Vec<(Range<usize>, u32)> = document
+            .styles
+            .iter()
+            .map(|(range, style)| (range.clone(), paint_of(*style).1.ink))
+            .collect();
+        let mut loaded = self.pane_event(editor::Event::Load(document.text.as_bytes()));
+        if !matches!(loaded, Outcome::Created(_)) {
+            inks.clear();
+            let refused = format!(
+                "This preview cannot be shown here: its {} bytes are past what the pane holds.",
+                document.text.len()
+            );
+            loaded = self.pane_event(editor::Event::Load(refused.as_bytes()));
+        }
+        let tab = match loaded {
+            Outcome::Created(tab) => {
+                self.pane_event(editor::Event::ReadOnly { tab, enabled: true });
+                Some(tab)
+            }
+            _ => None,
+        };
+        self.held = Some(Held {
+            id: document.id,
+            tab,
+            inks,
+        });
+        self.dirty = true;
+    }
+
+    /// A chord the pane takes while the frame on screen hands it the reading
+    /// keys: a scroll, a copy, select-all, or one the panes never bound,
+    /// such as Shift and an arrow, which extends its selection. Whether it
+    /// took it.
+    fn pane_key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) -> bool {
+        if !self.region().is_some_and(|region| region.keys) {
+            return false;
+        }
+        let Some((tab, revision)) = self.showing() else {
+            return false;
+        };
+        if chord == "C-c" || chord == "C-S-c" {
+            if !repeat {
+                self.copy(tab, revision, clipboard);
+            }
+            return true;
+        }
+        let key = view::key(chord);
+        if let Some(key) = key {
+            let page = self.pane.geometry().grid().1;
+            if let Some(rows) = scroll_of(key, page) {
+                if !repeat || view::repeats(key) {
+                    self.scroll_pane(tab, revision, rows);
+                }
+                return true;
+            }
+            if key != Key::Ctrl('a') {
+                return false;
+            }
+        }
+        let outcome = self.pane_event(editor::Event::Key {
+            tab,
+            revision,
+            chord,
+        });
+        if let Outcome::Request { name: "copy", .. } = outcome {
+            self.copy(tab, revision, clipboard);
+        }
+        true
+    }
+
+    fn scroll_pane(&mut self, tab: TabId, revision: u64, rows: isize) {
+        self.pane_event(editor::Event::Scroll {
+            tab,
+            revision,
+            rows,
+            columns: 0,
+        });
+    }
+
+    /// Offers the pane's selection to the clipboard, at the press being
+    /// delivered; what came of it is the status row's note.
+    fn copy(&mut self, tab: TabId, revision: u64, clipboard: &mut dyn Clipboard) {
+        let note = match Snapshot::capture_selection(self.pane.editor(), tab, revision) {
+            Ok(Some(snapshot)) => match clipboard.copy(snapshot.text()) {
+                Ok(()) => " copied to the clipboard".to_string(),
+                Err(refusal) => format!(" copy refused: {refusal}"),
+            },
+            Ok(None) => " nothing selected to copy".to_string(),
+            Err(PaneError::Limit) => format!(
+                " copy refused: the selection is past the clipboard's {} KiB",
+                editor_clipboard::MAX_BYTES / 1024
+            ),
+            Err(error) => format!(" copy refused: {error}"),
+        };
+        self.note = Some(note);
+        self.dirty = true;
+    }
+
+    /// A left-button phase for the pane: a press in it, and the drag and
+    /// release that follow it wherever they go. Whether it was the pane's.
+    fn pane_pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool) -> bool {
+        if !self.dragging {
+            let inside = phase == PointerPhase::Press
+                && self
+                    .surface
+                    .zip(self.region())
+                    .and_then(|(surface, region)| pane_rect(region, surface))
+                    .is_some_and(|rect| rect.contains(x, y));
+            if !inside {
+                return false;
+            }
+        }
+        let Some((tab, revision)) = self.showing() else {
+            self.dragging = false;
+            return false;
+        };
+        self.dragging = phase != PointerPhase::Release;
+        self.clicks.cancel();
+        // The pane counts a double or triple click by its ticks.
+        self.pane_event(editor::Event::Tick(self.clock));
+        self.pane_event(editor::Event::Pointer {
+            tab,
+            revision,
+            phase: match phase {
+                PointerPhase::Press => editor::PointerPhase::Press,
+                PointerPhase::Move => editor::PointerPhase::Move,
+                PointerPhase::Release => editor::PointerPhase::Release,
+            },
+            x,
+            cell_x: x,
+            y,
+            extend,
+        });
+        true
     }
 
     /// Hands the worker `event`; a worker that has gone closes the window.
@@ -556,23 +829,65 @@ impl Session {
         })
     }
 
+    #[cfg(test)]
     fn input_at(&mut self, input: Input<'_>, now: Instant) -> Flow {
-        match input {
-            Input::Key { chord, repeat } => match view::key(chord) {
-                Some(key) if !repeat || view::repeats(key) => {
-                    let seen = self.stamp(now);
-                    self.send(Event::Key { key, seen })
+        self.input_with(input, now, &mut NoClipboard)
+    }
+
+    fn input_with(
+        &mut self,
+        input: Input<'_>,
+        now: Instant,
+        clipboard: &mut dyn Clipboard,
+    ) -> Flow {
+        // A held key's repeats leave the note its first press made.
+        let pressed = matches!(
+            input,
+            Input::Key { repeat: false, .. }
+                | Input::Pointer {
+                    phase: PointerPhase::Press,
+                    ..
                 }
-                _ => Flow::Continue,
-            },
+        );
+        if pressed && self.note.take().is_some() {
+            self.dirty = true;
+        }
+        match input {
+            Input::Key { chord, repeat } => {
+                if self.pane_key(chord, repeat, clipboard) {
+                    return Flow::Continue;
+                }
+                match view::key(chord) {
+                    Some(key) if !repeat || view::repeats(key) => {
+                        let seen = self.stamp(now);
+                        self.send(Event::Key { key, seen })
+                    }
+                    _ => Flow::Continue,
+                }
+            }
             Input::Pointer {
-                phase: PointerPhase::Press,
+                phase,
                 x,
                 y,
+                extend,
                 ..
-            } => self.press(x, y, now),
+            } => {
+                if self.pane_pointer(phase, x, y, extend) || phase != PointerPhase::Press {
+                    return Flow::Continue;
+                }
+                self.press(x, y, now)
+            }
             Input::Wheel { rows, .. } if rows != 0 => {
                 self.clicks.cancel();
+                if let Some((tab, revision)) = self
+                    .region()
+                    .is_some_and(|region| region.keys)
+                    .then(|| self.showing())
+                    .flatten()
+                {
+                    self.scroll_pane(tab, revision, rows);
+                    return Flow::Continue;
+                }
                 let seen = self.stamp(now);
                 self.send(Event::Wheel { rows, seen })
             }
@@ -583,8 +898,16 @@ impl Session {
                 self.clicks.cancel();
                 self.send(Event::Redraw)
             }
-            Input::Focus(_) | Input::CancelPointer => {
+            Input::Focus(focused) => {
                 self.clicks.cancel();
+                self.pane_event(editor::Event::Focus(focused));
+                Flow::Continue
+            }
+            Input::CancelPointer => {
+                self.clicks.cancel();
+                if std::mem::take(&mut self.dragging) {
+                    self.pane_event(editor::Event::CancelPointer);
+                }
                 Flow::Continue
             }
             // The worker closes the window by ending, once whatever it is
@@ -597,9 +920,7 @@ impl Session {
                 }
                 self.send(Event::Close)
             }
-            Input::Pointer { .. } | Input::Wheel { .. } | Input::Hover(_) | Input::Paste(_) => {
-                Flow::Continue
-            }
+            Input::Wheel { .. } | Input::Hover(_) | Input::Paste(_) => Flow::Continue,
         }
     }
 }
@@ -613,11 +934,13 @@ impl Handler for Session {
         &self.title
     }
 
-    fn input(&mut self, input: Input<'_>, _clipboard: &mut dyn Clipboard) -> Flow {
-        self.input_at(input, Instant::now())
+    fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> Flow {
+        self.input_with(input, Instant::now(), clipboard)
     }
 
-    fn poll(&mut self, _now: u64) -> Flow {
+    fn poll(&mut self, now: u64) -> Flow {
+        self.clock = now;
+        self.pane_event(editor::Event::Tick(now));
         loop {
             match self.messages.try_recv() {
                 Ok(Message::Frame {
@@ -661,18 +984,42 @@ impl Handler for Session {
     fn paint(&mut self, raster: &mut Raster<'_, '_>, surface: Surface) -> Result<(), String> {
         if let Some(pending) = self.pending.take() {
             self.shown = Some(pending);
+            // A copy was answered on the frame before: painted over this
+            // one's last row, it could hide the confirmation it raises.
+            self.note = None;
         }
-        let frame = self.shown.as_ref().map(|(_, frame)| frame);
-        raster
-            .paint(
-                &Painting {
-                    surface,
-                    frame,
-                    notice: self.closing.then_some(CLOSING),
-                },
-                surface.bounds(),
-            )
-            .map_err(|e| e.to_string())?;
+        self.surface = Some(surface);
+        self.sync_pane(surface);
+        {
+            let frame = self.shown.as_ref().map(|(_, frame)| frame);
+            // The pane is painted only where it was placed on this surface.
+            // A scene the pane cannot make leaves its rows blank rather than
+            // closing the window, perhaps mid-landing.
+            let scene = match (self.showing(), self.held.as_ref()) {
+                (Some(_), Some(held)) if self.pane.geometry().surface() == surface => self
+                    .pane
+                    .scene(&[])
+                    .ok()
+                    .map(|scene| scene.inks(&held.inks)),
+                _ => None,
+            };
+            let notice = if self.closing {
+                Some(CLOSING)
+            } else {
+                self.note.as_deref()
+            };
+            raster
+                .paint(
+                    &Painting {
+                        surface,
+                        frame,
+                        notice,
+                        pane: scene.as_ref().map(|scene| scene as &dyn Composition),
+                    },
+                    surface.bounds(),
+                )
+                .map_err(|e| e.to_string())?;
+        }
         self.dirty = false;
         if let Some((generation, frame)) = self.shown.take() {
             if fits(&frame, surface) {
@@ -706,7 +1053,8 @@ pub fn run(app: App, title: String) -> io::Result<()> {
     let worker = thread::Builder::new()
         .name("td-review".into())
         .spawn(move || serve(app, link))?;
-    let mut session = Session::new(title, event_tx, message_rx, shared);
+    let mut session =
+        Session::new(title, event_tx, message_rx, shared).map_err(io::Error::other)?;
     let typeface = td_ui::pinned_face::load_or_note(
         "td-review",
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
@@ -802,6 +1150,7 @@ mod tests {
             surface: surface(400, 200, 1),
             frame: Some(&frame),
             notice: None,
+            pane: None,
         };
         assert_eq!(
             glyphs(&painting),
@@ -844,6 +1193,7 @@ mod tests {
             surface: surface(600, 100, 1),
             frame: Some(&frame),
             notice: Some(CLOSING),
+            pane: None,
         };
         let last: String = glyphs(&painting)
             .into_iter()
@@ -863,6 +1213,7 @@ mod tests {
             surface: surface(600, 40, 1),
             frame: Some(&tall),
             notice: Some(CLOSING),
+            pane: None,
         };
         assert!(fills(&painting)
             .iter()
@@ -881,6 +1232,7 @@ mod tests {
             surface: surface(100, 54, 1),
             frame: Some(&frame),
             notice: None,
+            pane: None,
         };
         let shown = glyphs(&painting);
         assert!(shown.iter().all(|&(x, ..)| x + 8 <= 100 - 12), "{shown:?}");
@@ -905,6 +1257,7 @@ mod tests {
                 surface: surface(100, 54, 1),
                 frame: Some(&short),
                 notice: None,
+                pane: None,
             };
             assert!(!fills(&painting).iter().any(|&(_, color)| color == CHROME));
         }
@@ -999,7 +1352,8 @@ mod tests {
             event_tx,
             message_rx,
             Arc::new(Grid::new((24, 80))),
-        );
+        )
+        .unwrap();
         (session, event_rx, message_tx)
     }
 
@@ -1234,5 +1588,311 @@ mod tests {
         frame_with("cancelled");
         event_tx.send(Event::Close).unwrap();
         assert!(worker.join().unwrap().is_ok(), "the landing never ran");
+    }
+
+    /// A clipboard that keeps what it was offered.
+    #[derive(Default)]
+    struct Kept(Option<Arc<str>>);
+
+    impl Clipboard for Kept {
+        fn available(&self) -> bool {
+            true
+        }
+        fn has_text(&self) -> bool {
+            false
+        }
+        fn pasting(&self) -> bool {
+            false
+        }
+        fn copy(&mut self, text: Arc<str>) -> Result<(), td_ui::window::Refusal> {
+            self.0 = Some(text);
+            Ok(())
+        }
+        fn paste(&mut self) -> Result<(), td_ui::window::Refusal> {
+            Err(td_ui::window::Refusal::NoSelection)
+        }
+    }
+
+    /// A review frame: a title, `document` in the pane below it, a footer.
+    fn reviewing(document: &Arc<Document>, keys: bool) -> Frame {
+        let mut frame = Frame::new(20, 80);
+        frame.push(&Line::new(" review", Style::bar(CYAN)));
+        frame.pane(18, Arc::clone(document), keys);
+        frame.push(&Line::new(" keys", Style::dim().with_invert()));
+        frame
+    }
+
+    /// `frame` on screen on an 800 by 600 surface, the pane placed for it.
+    fn showing(session: &mut Session, generation: u64, frame: Frame) {
+        let surface = surface(800, 600, 1);
+        session.shown = Some((generation, frame));
+        session.surface = Some(surface);
+        session.sync_pane(surface);
+    }
+
+    fn drag(session: &mut Session, from: (i64, i64), to: (i64, i64)) {
+        for (phase, (x, y)) in [
+            (PointerPhase::Press, from),
+            (PointerPhase::Move, to),
+            (PointerPhase::Release, to),
+        ] {
+            session.input_at(
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                    follow: false,
+                },
+                Instant::now(),
+            );
+        }
+    }
+
+    /// The pane's first document row's cell `column`, in surface pixels.
+    fn cell(session: &Session, column: i64) -> (i64, i64) {
+        let doc = session.pane.geometry().document();
+        (doc.x + column * CELL_WIDTH as i64, doc.y + 8)
+    }
+
+    fn selected(session: &Session) -> std::ops::Range<usize> {
+        let (tab, _) = session.showing().unwrap();
+        session
+            .pane
+            .editor()
+            .document(tab)
+            .unwrap()
+            .selection()
+            .range()
+    }
+
+    /// A drag in the review's pane selects, and `C-c` offers the selection to
+    /// the clipboard at that key press, saying so on the status row; the
+    /// worker sees neither. Under a prompt `C-c` is the prompt's again.
+    #[test]
+    fn a_drag_in_the_pane_selects_and_c_c_copies_it() {
+        let (mut session, events, _messages) = session();
+        let document = Arc::new(Document::new(1, &[Line::plain("hello world")]));
+        showing(&mut session, 1, reviewing(&document, true));
+        let (from, to) = (cell(&session, 0), cell(&session, 5));
+        drag(&mut session, from, to);
+        assert_eq!(selected(&session), 0..5);
+        let mut kept = Kept::default();
+        session.input_with(press("C-c", false), Instant::now(), &mut kept);
+        assert_eq!(kept.0.as_deref(), Some("hello"));
+        assert_eq!(session.note.as_deref(), Some(" copied to the clipboard"));
+        let mut held = Kept::default();
+        session.input_with(press("C-c", true), Instant::now(), &mut held);
+        assert!(held.0.is_none(), "a repeat copies nothing");
+        assert!(session.note.is_some(), "and leaves the note");
+        session.input_with(press("C-S-c", false), Instant::now(), &mut kept);
+        assert!(events.try_recv().is_err(), "the worker saw nothing");
+
+        showing(&mut session, 2, reviewing(&document, false));
+        let mut untouched = Kept::default();
+        session.input_with(press("C-c", false), Instant::now(), &mut untouched);
+        assert!(untouched.0.is_none());
+        assert_eq!(
+            events.try_iter().next(),
+            Some(Event::Key {
+                key: Key::Ctrl('c'),
+                seen: 0
+            })
+        );
+        assert!(session.note.is_none(), "a key clears the note");
+        session.input_at(press("j", false), Instant::now());
+        assert!(
+            matches!(
+                events.try_recv(),
+                Ok(Event::Key {
+                    key: Key::Char('j'),
+                    ..
+                })
+            ),
+            "under a prompt j is the worker's"
+        );
+    }
+
+    /// A preview past what the pane holds is a line saying so, uninked.
+    #[test]
+    fn a_preview_past_the_pane_says_so() {
+        let (mut session, _events, _messages) = session();
+        let huge = Line::new("+".repeat(16 * 1024 * 1024 + 1), Style::fg(GREEN));
+        let document = Arc::new(Document::new(1, &[huge]));
+        showing(&mut session, 1, reviewing(&document, true));
+        let (tab, _) = session.showing().unwrap();
+        let shown = session
+            .pane
+            .editor()
+            .document(tab)
+            .unwrap()
+            .text()
+            .to_string();
+        assert!(
+            shown.starts_with("This preview cannot be shown here"),
+            "{shown}"
+        );
+        assert!(session.held.as_ref().unwrap().inks.is_empty());
+    }
+
+    /// With nothing selected a copy offers nothing and says so.
+    #[test]
+    fn a_copy_with_nothing_selected_says_so() {
+        let (mut session, _events, _messages) = session();
+        let document = Arc::new(Document::new(1, &[Line::plain("hello")]));
+        showing(&mut session, 1, reviewing(&document, true));
+        let mut kept = Kept::default();
+        session.input_with(press("C-c", false), Instant::now(), &mut kept);
+        assert!(kept.0.is_none());
+        assert_eq!(session.note.as_deref(), Some(" nothing selected to copy"));
+    }
+
+    /// The reading keys and the wheel scroll the pane on the window thread
+    /// while the frame hands it them; a key that decides something, and every
+    /// key on a frame without a pane, is the worker's.
+    #[test]
+    fn the_reading_keys_scroll_the_pane() {
+        let (mut session, events, _messages) = session();
+        let lines: Vec<Line> = (0..200).map(|i| Line::plain(format!("{i}"))).collect();
+        let document = Arc::new(Document::new(1, &lines));
+        showing(&mut session, 1, reviewing(&document, true));
+        let tab = session.showing().unwrap().0;
+        let row = |session: &Session| session.pane.tab_view(tab).unwrap().viewport.origin().row;
+        session.input_at(press("j", false), Instant::now());
+        assert_eq!(row(&session), 1);
+        session.input_at(press("G", false), Instant::now());
+        let end = row(&session);
+        assert!(end > 100, "{end}");
+        session.input_at(press("g", false), Instant::now());
+        assert_eq!(row(&session), 0);
+        session.input_at(
+            Input::Wheel {
+                rows: 3,
+                columns: 0,
+            },
+            Instant::now(),
+        );
+        assert_eq!(row(&session), 3);
+        assert!(events.try_recv().is_err(), "the worker saw no scroll");
+        session.input_at(press("s", false), Instant::now());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                key: Key::Char('s'),
+                ..
+            })
+        ));
+
+        showing(&mut session, 2, listing(&["origin/a"]));
+        session.input_at(press("j", false), Instant::now());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                key: Key::Char('j'),
+                ..
+            })
+        ));
+    }
+
+    /// The same document across frames keeps the pane's place and selection;
+    /// a new one is loaded afresh, the old one closed.
+    #[test]
+    fn a_new_document_is_loaded_afresh_and_the_same_one_kept() {
+        let (mut session, _events, _messages) = session();
+        let first = Arc::new(Document::new(1, &[Line::plain("hello world")]));
+        showing(&mut session, 1, reviewing(&first, true));
+        let (from, to) = (cell(&session, 0), cell(&session, 5));
+        drag(&mut session, from, to);
+        showing(&mut session, 2, reviewing(&first, false));
+        assert_eq!(selected(&session), 0..5);
+        let second = Arc::new(Document::new(2, &[Line::plain("hello world")]));
+        showing(&mut session, 3, reviewing(&second, true));
+        assert!(selected(&session).is_empty());
+        assert_eq!(session.pane.editor().tabs().count(), 1);
+    }
+
+    /// The pane paints the document over the frame's rows, each styled line
+    /// in its ink.
+    #[test]
+    fn the_pane_paints_diff_lines_in_their_ink() {
+        let (mut session, _events, _messages) = session();
+        let lines = [Line::plain("x"), Line::new("+y", Style::fg(GREEN))];
+        let document = Arc::new(Document::new(1, &lines));
+        showing(&mut session, 1, reviewing(&document, true));
+        let held = session.held.as_ref().unwrap();
+        let scene = session.pane.scene(&[]).unwrap().inks(&held.inks);
+        let (_, frame) = session.shown.as_ref().unwrap();
+        let painting = Painting {
+            surface: surface(800, 600, 1),
+            frame: Some(frame),
+            notice: None,
+            pane: Some(&scene),
+        };
+        let inks: Vec<(char, u32)> = glyphs(&painting)
+            .into_iter()
+            .map(|(_, _, scalar, ink)| (scalar, ink))
+            .collect();
+        assert!(inks.contains(&('x', INK)), "{inks:?}");
+        assert!(inks.contains(&('y', ink(GREEN))), "{inks:?}");
+    }
+
+    /// Through the window's own turn: a frame the worker sent is taken by a
+    /// poll and painted, the pane placed and painted with it, and the frame
+    /// stays on screen for the drag that follows and the paints after it.
+    #[test]
+    fn a_painted_review_frame_takes_a_drag_into_its_pane() {
+        let (mut session, _events, messages) = session();
+        let document = Arc::new(Document::new(1, &[Line::plain("hello world")]));
+        messages
+            .send(Message::Frame {
+                generation: 1,
+                frame: reviewing(&document, true),
+                taken: 0,
+            })
+            .unwrap();
+        assert_eq!(session.poll(0), Flow::Continue);
+        let surface = surface(800, 600, 1);
+        let font = td_ui::font::pinned().unwrap();
+        let mut pixels = vec![0; 800 * 600 * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, 800 * 4).unwrap();
+        session.paint(&mut raster, surface).unwrap();
+        let (from, to) = (cell(&session, 0), cell(&session, 5));
+        drag(&mut session, from, to);
+        assert_eq!(selected(&session), 0..5);
+        session.paint(&mut raster, surface).unwrap();
+        assert_eq!(selected(&session), 0..5);
+        assert!(session.showing().is_some());
+    }
+
+    /// A copy's note is the frame's it was made on. `s` sent, then `C-c`
+    /// before the squash prompt's frame is painted: the note goes when that
+    /// frame does, so the prompt bar it raised is what is on screen when the
+    /// frame counts as shown.
+    #[test]
+    fn a_new_frame_clears_a_copy_note_before_it_can_cover_a_prompt() {
+        let (mut session, events, messages) = session();
+        let document = Arc::new(Document::new(1, &[Line::plain("hello")]));
+        let surface = surface(800, 600, 1);
+        let font = td_ui::font::pinned().unwrap();
+        let mut pixels = vec![0; 800 * 600 * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, 800 * 4).unwrap();
+        let frame = |generation, keys| Message::Frame {
+            generation,
+            frame: reviewing(&document, keys),
+            taken: 0,
+        };
+        messages.send(frame(1, true)).unwrap();
+        session.poll(0);
+        session.paint(&mut raster, surface).unwrap();
+        session.input_at(press("s", false), Instant::now());
+        assert!(events.try_recv().is_ok(), "s is the worker's");
+        // The prompt's frame arrives, and C-c is read before it is painted.
+        messages.send(frame(2, false)).unwrap();
+        session.poll(0);
+        session.input_at(press("C-c", false), Instant::now());
+        assert!(session.note.is_some());
+        session.paint(&mut raster, surface).unwrap();
+        assert!(session.note.is_none());
+        assert!(!session.region().unwrap().keys);
     }
 }

@@ -193,6 +193,10 @@ before the window read them, and the program's typeahead drop discards
 those stamped before the frame that raised a confirmation (td-review's
 `window.rs`). The toolkit
 is unchanged. td-review is a recipe consumer packed into the image.
+Its review pane then moved into the editor core's read-only document
+pane (increment 31), so a diff is selected and copied as an article is
+in td-news; the pane's inks keep its colours, and the reading keys,
+selection and copy stay on the window thread, outside the stamps.
 
 ## Purpose and trust position
 
@@ -2473,9 +2477,9 @@ copy of a widget is an acceptable completion of this work.
 
 ## Editor core
 
-The document pane td-mail and td-news embed, and the td-pass notebook
-window is to embed, is td-editor's own editing core, moved here whole so
-no consumer depends on the editor crate: the text bounds and lossless
+The document pane td-mail, td-news and td-review embed, and the td-pass
+notebook window is to embed, is td-editor's own editing core, moved here
+whole so no consumer depends on the editor crate: the text bounds and lossless
 codec, the model and its transactions, the fill planner, the key
 profiles, the layout, the clipboard capture, the dialog permits, the
 controller and the scene, as `editor_text`, `editor_model`,
@@ -3179,3 +3183,8 @@ regressions. Those increments extend the original sequence below.
     panes as styled rows through `text_run` and reads the window's
     chords, its state machine on a worker thread with frame-stamped
     inputs, its terminal layer and pager deleted. Landed.
+31. td-review's review in the document pane: the preview a frame hands
+    the window whole, shown read-only in `editor::Controller::pane`
+    with `Scene::inks` colouring its diff lines, scrolled by the reading
+    keys and the wheel, selected by drag, word and line, and copied on
+    `C-c` through the window's clipboard. Landed.

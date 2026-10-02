@@ -1014,7 +1014,8 @@ backgrounds, the selection's ground, underlines and the caret are drawn
 as without it, and a glyph selected while the view is focused keeps the
 selection's paper ink, so a selection reads the same over inked text. A
 glyph whose bytes lie across a range's edge, or in none, is drawn in
-`INK`. The editor's own window passes none.
+`INK`. The editor's own window passes none; td-review colours a diff's
+lines with them.
 
 `Geometry` admits nonzero axes through 8192 and at most 32 MiB of tight
 four-byte pixels; those ceilings are td-ui's `raster::Surface`, which
@@ -2906,9 +2907,11 @@ module is imported. These fixtures do not replace the live Weston test.
 td-news shows an article in a read-only document pane, td-mail shows
 a message in one and composes a draft in an editable one, in their
 own windows beside the toolkit's lists, instead of calling out to
-an editor process. The pane is td-ui's editor core (`td_ui::editor`
-and its `editor_*` siblings, `td-ui/DESIGN.md`, "Editor core"), the
-document model, controller, keys, layout, scene and clipboard capture
+an editor process; td-review shows a branch's preview in a read-only
+one, its diff lines inked, so a reviewer selects and copies it. The
+pane is td-ui's editor core (`td_ui::editor` and its `editor_*`
+siblings, `td-ui/DESIGN.md`, "Editor core"), the document model,
+controller, keys, layout, scene and clipboard capture
 this editor's own window drives, so each host depends on `td-ui` alone
 and its recipe stages no editor tree; the landings are APPLICATIONS.md
 §W.8, "Reworked again", and "Composing in place". The host owns the

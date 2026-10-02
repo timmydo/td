@@ -2,11 +2,12 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 
 use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
 use crate::land::{self, Mode, Outcome, Preview};
 use crate::record;
-use crate::view::{self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
+use crate::view::{self, Document, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
 use crate::worktrees;
 
 pub enum Flow {
@@ -88,7 +89,8 @@ struct Reviewing {
     oid: String,
     /// The base tip the pane was rendered against, re-checked for the same reason.
     base_oid: String,
-    lines: Vec<Line>,
+    /// The preview, whole, for the window's document pane.
+    document: Arc<Document>,
     empty: bool,
 }
 
@@ -111,7 +113,8 @@ pub struct App {
     editing_filter: bool,
     screen: Screen,
     reviewing: Option<Reviewing>,
-    scroll: usize,
+    /// Documents made so far, so each review the pane is handed is new.
+    documents: u64,
     log: Vec<Line>,
     log_title: String,
     log_scroll: usize,
@@ -149,7 +152,7 @@ impl App {
             editing_filter: false,
             screen: Screen::List,
             reviewing: None,
-            scroll: 0,
+            documents: 0,
             log: Vec::new(),
             log_title: String::new(),
             log_scroll: 0,
@@ -486,29 +489,18 @@ impl App {
             return;
         };
         let name = r.refname.as_str();
-        // Wrapped to the window, so a long diff line is read whole: the pane
-        // is the only view of the diff there is.
-        let total = view::wrapped_len(&r.lines, f.cols);
-        let height = f.rows.saturating_sub(2);
-        let scroll = self.scroll.min(total.saturating_sub(height));
-        let pos = if total <= height {
-            "all".to_string()
-        } else {
-            // Bottom of the viewport, not its top: the top caps at total-height,
-            // which reads as 80% when the last line is already on screen.
-            format!(
-                "{}%",
-                (scroll.saturating_add(height).min(total) * 100) / total.max(1)
-            )
-        };
-        self.title(f, &format!(" review  {name}  vs {}   [{pos}]", self.base));
-        f.scrollbar(height, total, scroll);
-        for line in &view::wrap_window(&r.lines, f.cols, scroll, height) {
-            f.push(line);
-        }
+        self.title(f, &format!(" review  {name}  vs {}", self.base));
+        // The window's document pane is the whole preview, wrapped to the
+        // window: it scrolls it, selects in it and copies from it, and takes
+        // the reading keys unless a prompt is up to take them.
+        f.pane(
+            f.rows.saturating_sub(2),
+            Arc::clone(&r.document),
+            self.prompt.is_none(),
+        );
         self.footer(
             f,
-            " j/k scroll · space/b page · g/G top/end · s squash · r rebase now · q back",
+            " j/k scroll · g/G ends · C-c copy · s squash · r rebase now · q back",
         );
     }
 
@@ -868,12 +860,10 @@ impl App {
     }
 
     fn handle_review(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
-        let rows = term.size().0;
         match key {
             Key::Char('q') | Key::Esc | Key::Char('h') | Key::Left => {
                 self.show_list();
             }
-            Key::Ctrl('c') => return Ok(Flow::Quit),
             Key::Char('?') => self.screen = Screen::Help,
             // No pager: the window is no terminal to hand one, and the pane
             // is the whole diff. `p` stays unbound here rather than taking
@@ -885,23 +875,25 @@ impl App {
             // is the tree this pane diffed, and it undoes itself on anything
             // else — and it publishes nothing, so `p` remains the step that
             // leaves this machine.
-            Key::Char('r') => {
-                if !self.refused_as_empty() {
-                    self.run_land(Mode::Rebase, term)?;
-                    // The pane those keys were aimed at is now the log, where
-                    // `q` goes to the list and `p` there publishes without
-                    // asking. `s` gets this from its confirmation; `r` has to
-                    // take it here, or removing the prompt would have made
-                    // `r q p` a way to publish nothing was ever confirmed.
-                    self.stale_typeahead = true;
-                }
-            }
-            _ => {
-                let total = self.review_rows(term.size().1);
-                self.scroll = scroll_by(self.scroll, key, total, rows);
-            }
+            Key::Char('r') => self.rebase_now(term)?,
+            // The window's pane scrolls, selects and copies (`C-c`) itself.
+            _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// `r` on the review: land it rebased, unless there is nothing to land.
+    fn rebase_now(&mut self, term: &mut dyn Ui) -> io::Result<()> {
+        if !self.refused_as_empty() {
+            self.run_land(Mode::Rebase, term)?;
+            // The pane those keys were aimed at is now the log, where
+            // `q` goes to the list and `p` there publishes without
+            // asking. `s` gets this from its confirmation; `r` has to
+            // take it here, or removing the prompt would have made
+            // `r q p` a way to publish nothing was ever confirmed.
+            self.stale_typeahead = true;
+        }
+        Ok(())
     }
 
     /// True when the pane has nothing to land — which neither mode can do
@@ -1000,20 +992,12 @@ impl App {
                 };
                 self.top = scroll_top(self.sel, self.top, height);
             }
-            (None, Screen::Review) => {
-                self.scroll = by(self.scroll, self.review_rows(cols));
-            }
+            // The window's pane scrolls under the wheel itself.
+            (None, Screen::Review) => {}
             (None, Screen::Help) => {
                 self.help_scroll = by(self.help_scroll, help_lines().len());
             }
         }
-    }
-
-    /// Rows the review pane's lines take, wrapped to `cols`.
-    fn review_rows(&self, cols: usize) -> usize {
-        self.reviewing
-            .as_ref()
-            .map_or(0, |r| view::wrapped_len(&r.lines, cols))
     }
 
     /// Rows the log takes, wrapped to the window.
@@ -1137,14 +1121,14 @@ impl App {
         };
         let empty = preview.is_empty();
         let lines = preview_lines(branch, &preview, &self.base, self.now);
+        self.documents = self.documents.saturating_add(1);
         self.reviewing = Some(Reviewing {
             refname,
             oid: preview.branch_oid.clone(),
             base_oid: preview.base_oid.clone(),
-            lines,
+            document: Arc::new(Document::new(self.documents, &lines)),
             empty,
         });
-        self.scroll = 0;
         self.screen = Screen::Review;
         Ok(())
     }
@@ -1859,6 +1843,8 @@ fn help_lines() -> Vec<Line> {
         &[
             ("j / k, space / b", "scroll"),
             ("g / G", "top / end"),
+            ("drag", "select; double, triple click a word, a line"),
+            ("C-c", "copy the selection"),
             ("s", "land it squashed: one commit on the base — asks first"),
             ("r", "land it rebased: its own commits, replayed"),
             ("", "lands on the keystroke — no confirmation"),
@@ -2261,7 +2247,7 @@ pub(crate) fn reviewing_fixture() -> App {
         refname: "origin/b00".to_string(),
         oid: "1".repeat(40),
         base_oid: "2".repeat(40),
-        lines: vec![Line::plain("diff")],
+        document: Arc::new(Document::new(1, &[Line::plain("diff")])),
         empty: false,
     });
     app.screen = Screen::Review;
@@ -4837,9 +4823,10 @@ mod tests {
         assert!(app.stale_typeahead());
     }
 
-    /// The wheel moves the list's selection and scrolls a pane, within their
+    /// The wheel moves the list's selection and scrolls the log, within their
     /// ends — wrapped rows counted — and over the squash confirmation it does
-    /// nothing: any key but `y` there is a no, and a wheel is not a key.
+    /// nothing: any key but `y` there is a no, and a wheel is not a key. The
+    /// review's pane is the window's to scroll.
     #[test]
     fn the_wheel_scrolls_and_answers_nothing() {
         let mut app = listed_app(40);
@@ -4861,37 +4848,61 @@ mod tests {
         assert_eq!(app.log_scroll, 31 + 2 - 22, "a long line is three rows");
 
         app.screen = Screen::Review;
-        app.reviewing = Some(Reviewing {
-            refname: "origin/b00".to_string(),
-            oid: "1".repeat(40),
-            base_oid: "2".repeat(40),
-            lines: (0..50).map(|i| Line::plain(format!("{i}"))).collect(),
-            empty: false,
-        });
         app.prompt = Some(Prompt::Squash);
         app.wheel(4, 24, 80);
-        assert_eq!(app.scroll, 0);
         assert!(matches!(app.prompt, Some(Prompt::Squash)));
-        app.prompt = None;
-        app.wheel(4, 24, 80);
-        assert_eq!(app.scroll, 4);
     }
 
-    /// The review pane wraps a line too long for the window, so the end of a
-    /// long diff line is on screen, and scrolls over the wrapped rows.
+    /// The review hands the window's pane the preview whole, a long line
+    /// unclipped and each diff line with its style, between the title and the
+    /// footer, and the reading keys only while no prompt is up to take them.
+    /// The same review keeps its document, so the pane keeps its place and
+    /// selection across frames.
     #[test]
-    fn the_review_pane_shows_a_long_line_whole() {
+    fn the_review_hands_the_pane_the_whole_preview() {
         let mut app = reviewing_fixture();
         let long = format!("+{}END", "x".repeat(150));
+        let lines = [
+            Line::plain("head"),
+            Line::new(long.clone(), diff_style("+")),
+        ];
         if let Some(r) = app.reviewing.as_mut() {
-            r.lines = vec![Line::plain("head"), Line::new(long, diff_style("+"))];
+            r.document = Arc::new(Document::new(7, &lines));
         }
-        let text = app.render(10, 60).text();
-        assert!(text.contains("END"), "{text}");
-        assert!(text.contains("\u{21aa}"), "{text}");
-        let mut ui = FakeUi::new();
-        app.handle(Key::Char('G'), &mut ui).unwrap();
-        assert_eq!(app.scroll, 0, "four rows fit eight: nothing to scroll");
+        let frame = app.render(10, 60);
+        let pane = frame.shows().expect("the review shows a pane");
+        assert_eq!((pane.row, pane.rows), (1, 8), "between title and footer");
+        assert!(pane.keys);
+        assert_eq!(pane.document.text, format!("head\n{long}"));
+        assert_eq!(
+            pane.document.styles,
+            vec![(5..5 + long.len(), Style::fg(GREEN))]
+        );
+        assert!(Arc::ptr_eq(
+            &pane.document,
+            &app.render(10, 60).shows().unwrap().document
+        ));
+        app.prompt = Some(Prompt::Squash);
+        assert!(!app.render(10, 60).shows().unwrap().keys);
+    }
+
+    /// A document is the lines joined, hostile scalars replaced as a row
+    /// replaces them but tabs kept for the pane to lay out and a copy to
+    /// carry, and only styled, non-empty lines carry a range.
+    #[test]
+    fn a_document_keeps_tabs_and_scrubs_the_rest() {
+        let doc = Document::new(
+            1,
+            &[
+                Line::new("+a\tb\u{1b}[31m", diff_style("+")),
+                Line::new("", Style::fg(RED)),
+                Line::plain("\u{202e}x"),
+            ],
+        );
+        assert_eq!(doc.text, "+a\tb\u{b7}[31m\n\n\u{b7}x");
+        let marked = Document::new(2, &[Line::new("\u{feff}+x", Style::fg(GREEN))]);
+        assert_eq!(marked.text, "\u{b7}+x");
+        assert_eq!(doc.styles, vec![(0..10, Style::fg(GREEN))]);
     }
 
     /// What the list reports for one branch: what a landing would find there.
