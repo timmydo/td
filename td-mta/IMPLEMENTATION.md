@@ -487,37 +487,16 @@ Split at these concrete boundaries before dependent milestones start:
 - **M04c2:** charged work meters in `admission/work.rs` and checked
   network/attempt deadline budgets in `admission/timers.rs`; consumers own
   actual state transitions, idle resets and scheduling enforcement.
-- **M04c3a:** checked physical-space arithmetic in `admission/space.rs`,
-  including concurrent-probe correction and checkpoint completion capacity.
 - **M04c3b1:** fixed logical quota groups and linear effect tickets in
   `admission/quota.rs` and `admission/logical.rs`; no physical I/O permission.
 - **M04c3b2:** coordinator-owned selected/journal scalar ledger and derived
   checkpoint capacity in `admission/writer.rs`, including reserved candidate
   frames, dedicated append tickets and simulated writer-barrier transitions.
-  Rollover preserves outstanding leases and stays closed for physical admission.
+  Rollover preserves outstanding leases and stays closed for reconciliation.
   M08 supplies trusted selected/committed state and exact metadata accounting.
-- **M04c3b3a:** bounded filesystem registry and probe observations consumed
-  once in `admission/filesystems.rs`; adapter identity and actual probes remain M05.
-  This matches probe data without installing any physical reservation.
-- **M04c3b3b:** implemented writer preparation with same-cell physical
-  reservations,
-  fresh probe assessment, checked extensions and atomic effect/cancel updates.
-  Every filesystem delta is prevalidated before any logical installation.
-  Existing leases remain bounded by 64 combined 128-byte records.
-  `admission/coordinator.rs` starts closed until baseline checkpoint capacity
-  passes fresh probes; ordinary extensions and one-shot journal appends use
-  the same atomic logical/physical accounting. No platform I/O is implemented.
-- **M04c3b3c1:** implemented a checked registry-wide probe epoch and atomic
-  invalidation in
-  `admission/filesystems.rs`. Earlier tickets and already matched samples
-  refuse at the same Tick; no capacity or identity changes. The registry
-  fence alone does not implement checkpoint publication or reopening.
-- **M04c3b3c2:** implemented protected-to-building capacity transfer, overlapping
-  checkpoint quota, closed writer transitions and post-fence probe reopening in
-  `admission/coordinator/checkpoint.rs`. One fixed attempt record is independent
-  of client lease saturation. Partial/unselected output keeps its charges. M05
-  supplies descriptor-backed probes and cleanup proof; M08 owns persistence,
-  exact metadata state and view/writer pin authority.
+- **M04c3 runtime integration:** pending logical building/retention quota,
+  cleanup accounting and post-checkpoint reconciliation under M08. Use the
+  existing bounded logical ledger. No physical-space registry or probe gate.
 - **M04d1:** implemented typed bounded event and explicit inspection encoders
   in `observability.rs`, including stable JSON Lines fields, redaction by
   default event shape, bounded UTF-8 truncation and ASCII JSON escaping.
@@ -541,9 +520,8 @@ effective configuration, alias/identity resolution and secret-file references.
 Define typed JSON log/status encoders with maximum sizes and redaction. Add
 config check and redacted effective-config library operations; later CLI wiring
 uses these exact functions.
-Implement ADMISSION.md's checked u64 disk/work configuration and filesystem
-reservation coordinator. This does not implement a platform space probe;
-M05 supplies that reviewed boundary and its fault-injected fake.
+Implement ADMISSION.md's checked u64 disk/work configuration and logical
+reservations. M05/M08 supply I/O error handling and durable effect accounting.
 
 **Acceptance:** oversized/malformed/duplicate/unknown config fails with location
 and stable codes; no secret is echoed. Resource overflow, exhausted slots and
@@ -553,9 +531,9 @@ store mutations, live reload or filesystem log rotation in this task.
 
 ## M05 — Immutable blobs and journal commit/replay
 
-ADMISSION.md's physical completion reserves and free-space probe are required
-before write admission. Any unsafe platform probe follows the separate
-UNSAFE.md amendment/confinement workflow; no new surface is preauthorized.
+ADMISSION.md's logical quotas and failure/recovery contract apply before
+write admission. Use std filesystem APIs and STORAGE.md's stable-path
+deployment assumptions. Physical free-space admission is not part of v1.
 
 **Depends on:** M02/M04/M07. **Own:** storage I/O adapter, blob files, journal codec,
 store locking and initial replay; no search index or protocol endpoints.
@@ -636,45 +614,38 @@ service activation. Each part lands independently:
     blob IDs, positive canonical generation/segment numbers and known table
     names. Validate directory-entry blob names against namespace and shard.
     No filesystem access or authority follows from these names.
-  - **M05b2 — private filesystem boundary:** trusted-root and descriptor-relative
-    operations, process-scoped exclusive lock, ownership/mode/type validation
-    and non-replacing publication with file/directory sync. Own fault injection
-    and process-death tests; names alone do not complete this adapter.
-    - **M05b2a — directory lookup:** implemented Linux x86-64 openat2 with
-      directory-only, beneath/no-symlink and close-on-exec flags. Retain an
-      owned descriptor independently of pathname changes. Kernel rejection,
-      ownership/exec cleanup and allocation observations cover the primitive.
-      Linux 5.6+ is required; no older-kernel fallback is planned.
-    - **M05b2b — root admission and lock:** private-root path checks are
-      implemented; filesystem admission and persistent LOCK remain pending.
-      A caller-provided directory descriptor alone is not a trusted root.
-      - **M05b2b1 — private-root path:** implemented an actual-effective-UID
-        check and descriptor walk from `/`, refusing untrusted owners, writable
-        ancestors (including sticky directories), symlinks and nonprivate data
-        roots. Keep this distinct from filesystem admission and LOCK.
-      - **M05b2b2 — filesystem and LOCK:** local XFS (primary deployment),
-        ext4 and Btrfs qualification, persistent private lock inode, exclusive
-        lifetime and process-death tests remain required.
-        - **M05b2b2a — descriptor space observations:** implemented fstatfs with
-          fixed storage and checked byte/inode conversion. Recognize XFS,
-          Btrfs and the ambiguous ext-family magic without claiming filesystem
-          admission. Test allocation-free host and musl observations.
-        - **M05b2b2b — qualification/identity:** establish supported filesystem
-          features and project/user/group quota policy, deduplicate shared
-          backing capacity, and bind fresh observations to coordinator tickets.
-          Qualify allocation granularity separately from statfs counting units:
-          cover ext4 bigalloc and XFS realtime/extent-size hints. Qualify XFS
-          first; do not infer ext4 from the shared ext-family magic.
-        - **M05b2b2c — persistent LOCK:** validate/open the private regular
-          inode without opening a device/FIFO for I/O, retain its exclusive
-          lock for the writer lifetime, never unlink it, and prove independent
-          opens contend and process death releases the lock.
-    - **M05b2c — durable operations:** pending confined file creation/read/
-      write, non-replacing publication, sync and deterministic fault model.
-      Process-death tests and later VM power-loss evidence remain required.
+  - **M05b2 — std filesystem boundary:** generated paths, startup permission
+    checks, cooperative writer lock and durable publication under STORAGE.md.
+    - **M05b2a — lookup/root checks:** implemented bounded std path lookup,
+      pre-existing symlink/type refusal, retained File metadata and mode/owner
+      checks. Supervisor identity and stable roots/mounts are deployment
+      preconditions. Tests distinguish retained-file identity from later
+      pathname lookup and cover maximum-path allocation on host/musl.
+    - **M05b2b — persistent LOCK:** implement with std `File::try_lock`.
+      Open/create one private regular mode-0600 inode, validate metadata,
+      retain the lock for the writer lifetime and never unlink/replace it.
+      Test independent-process contention, process death, wrong type/mode,
+      missing permissions and cleanup without service activation.
+    - **M05b2c — durable file operations:** implement exclusive temporary
+      creation, bounded reads/writes, immutable publication via `hard_link`,
+      same-directory CURRENT replacement via `rename`, and explicit file and
+      directory sync. Keep fixed path buffers and extend allocation/error tests.
+      Checkpoint directories use exclusive creation and gain authority only
+      through CURRENT. Same-filesystem publication is required; propagate
+      cross-device errors. Inject failure before/after every operation and
+      distinguish proven no effect, partial private output and uncertain commit.
+    - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
+      bounded reading through EOF and opened-file identity checks. Deployment
+      uses the data-root owner as its trusted expected service identity.
+      Configuration replacement during reload may refuse/retry; no hostile
+      namespace writer or effective-UID verification claim.
+    - **M05b2e — recovery evidence:** local temporary-folder process tests
+      exercise the common std API on the host. XFS deployment crash/power-loss
+      qualification is release evidence; no xfsprogs prerequisite for ordinary
+      tests and no runtime filesystem whitelist/profile probe.
 - **M05c — immutable blobs:** admitted streamed temporary bodies, inline SHA-256,
   exact size accounting and durable non-replacing publication. Couple effect
-  tickets and completion reserves; inject failures at each filesystem step.
+  tickets and logical completion budgets; inject failures at each filesystem step.
 - **M05d — selected-store recovery:** validate CURRENT's complete selected graph,
   replay contiguous frames, fence corruption and repair only incomplete EOF
   tails under the lock. Do not scan for a newer unselected generation or magic.

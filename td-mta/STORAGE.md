@@ -101,101 +101,88 @@ thread assignment or submission result. Copying just `.eml` files salvages
 content but does not restore the account. Configuration, devices and ACME state
 have their own lifetimes; an account checkpoint does not claim to snapshot them.
 
-Require Linux 5.6 or newer with openat2 available; refusal or unavailability
-fails closed without a path-walking fallback. Use trusted private roots on
-local XFS, ext4 or Btrfs, qualified for rename/file/directory sync behavior.
-XFS is the primary deployment target. Support is a qualification requirement,
-not a claim that the current foundations have passed power-loss tests. NFS
-and external live writers are unsupported. Filenames, permissions and safe
-path construction obey DESIGN section 6. New-format files
-are refused rather than interpreted as an older schema.
+Use local storage with working atomic same-filesystem rename and file/directory
+sync. XFS is the deployment target; ext4 and Btrfs are also test targets. The
+adapter uses the same std filesystem operations on each. NFS and external live
+writers are unsupported. There is no filesystem-type, quota-profile or kernel
+syscall admission probe. Actual durability still requires the crash/error tests
+below; a successful ordinary unit test is not power-loss evidence.
 
-### Descriptor boundary
+### Std filesystem boundary
 
-`store_fs::Directory` pins a caller-opened directory File and checks its type.
-Its `open` takes only a generated Name, resolves relative to the retained
-handle using openat2, and accepts only directories. Every path component must
-remain beneath that handle and no symbolic or magic link may be resolved.
-New handles are close-on-exec and owned immediately; std closes them on drop.
-Metadata reads use the retained handle. Renaming/replacing its old pathname
-does not retarget a handle. Lookup uses fixed stack storage and does not retry
-kernel errors, including EAGAIN, ENOSYS or policy denial.
+Use `std::fs` and its safe Unix extensions. No owned syscall assembly, raw
+handle adoption, C bindings or filesystem-specific ioctl is required.
+`Directory::from_path` checks each component with `symlink_metadata`, rejects
+non-directories (including symlinks), opens a File, and compares the final
+metadata identity before/after open. Metadata reads use that retained File.
+`Directory::open` builds a fixed absolute path from a generated Name and uses
+the same checks. New lookups use the stored pathname, not the retained handle.
 
-This is a lookup primitive, not an admitted store root. The caller supplies
-the initial File; its path may have followed links before reaching this API.
-No ownership, mode, ancestor, filesystem or writer-lock claim follows from
-construction or successful relative lookup. Mount crossings remain possible.
+Deployment keeps every root, ancestor and mount stable for the process
+lifetime. Root, the dedicated service identity and mount authority are trusted;
+no external process may rename, replace or mutate service namespaces while it
+runs. These checks detect existing mistakes; they do not atomically confine
+lookup or prevent a concurrent symlink/rename attack. A retained File survives
+rename, but future pathname lookup can reach a replacement. Stop the service
+before moving storage, changing mounts or repairing directories.
 
-`PrivateRoot::open` separately validates the absolute configuration path and
-walks it from an opened `/` descriptor, retaining each parent through the
-next openat2 call. Each actual ancestor must belong to root or the service
-UID, with no group/other write bits; sticky shared directories are refused.
-The current O_RDONLY directory walk requires ancestors to be readable as well
-as searchable by the service. Search-only ancestors fail with an I/O error;
-supporting them would require a separately reviewed O_PATH profile.
-The final data directory must belong to the service UID and have exact 0700
-permissions with no special bits. The UID comes from geteuid, never an
-operator-provided owner number; UID zero is refused. Startup must retain its
-unprivileged deployment credentials. Deployment must map both UID 0 and the
-service UID in the current user namespace and keep `kernel.overflowuid`
-different from both. Otherwise unmapped file owners can appear to match a
-trusted owner. The dedicated service identity must not be the overflow UID
-(default 65534). These are deployment preconditions: this path check does not
-validate UID mappings or the overflow sysctl, inspect capabilities, or
-authorize later identity switching. Root and the service UID, and the
-mount namespace they control, are trusted. No untrusted concurrent writer is
-supported. Only the final handle is retained after this startup walk; later
-trusted-owner renames do not retarget it.
+`PrivateRoot::open` additionally requires a non-root-owned mode-0700 data root,
+no special bits, and ancestors owned by root or that directory's owner without
+group/other write permission (including sticky directories). The supervisor
+must run the service as that dedicated owner without elevated capabilities.
+This adapter delegates process identity to deployment rather than reading
+procfs credentials. A successful path check is not proof of process identity. Deployments using user namespaces must keep
+root/service identities mapped and distinct from the overflow UID. Permissions
+and ownership are deployment checks, not authorization derived from mail input.
+The persistent writer lock and store recovery remain required before serving.
 
-The separate type certifies only these directory owner/mode/lookup checks.
-Its child Directory accessor retains ordinary confinement guarantees and does
-not grant checked ownership to descendants. Filesystem qualification, the
-persistent exclusive LOCK and store-format validation must still complete
-before activation. No files or directories are created here. File I/O,
-durable mutation and fault injection remain pending. The current raw ABI
-supports x86-64 only; additional architectures need their own reviewed
-mapping. UNSAFE section 22 owns the exact syscall, flags, descriptor ownership
-and confinement tests.
+Directory-adapter paths are limited to 383 UTF-8 bytes; a private root is
+at most 254 bytes, leaving a separator and the 128-byte generated-name budget.
+Configuration syntax retains its general 4095-byte bound; the storage adapter
+rejects roots exceeding its tighter bound before I/O. Structural config parsing
+alone does not perform storage admission. The future complete `config check`
+must apply that same root check before reporting the configuration usable.
+Other file adapters (including logs/runtime/operator inputs) must establish
+their own bounded path and allocation contracts before activation. Names and path assembly
+use fixed buffers. Host and static-musl allocation probes must demonstrate
+zero Rust allocations for successful and failing lookups at the full bound;
+requalify after toolchain changes rather than relying on an undocumented std
+conversion threshold. Directory iteration has separate, pending measurements.
 
-### Filesystem observations
+### Disk exhaustion and durable operations
 
-`Directory::filesystem_space` probes the retained directory with
-fstatfs, using fixed stack storage. It recognizes XFS, Btrfs and the
-ext-family magic; the latter cannot distinguish ext4 from ext2/ext3 and
-is not ext4 admission. Require ST_VALID before interpreting the read-
-only mount bit. Return the statfs counting unit, f_bavail scaled into
-bytes, explicit inode availability and that read-only bit. These are
-unqualified fields, not an admission Sample or a validated allocation
-granularity. Reject unknown families, nonpositive units, negative counts
-used by the conversion and byte-count overflow. Btrfs inode headroom is
-Unsupported; XFS/ext-family inode counts remain observations, not a
-promise that allocating that many files will succeed. Use available
-blocks, never privileged free blocks. Each observation can become stale.
+ADMISSION.md defines logical byte/file quotas and bounded pending reservations.
+They do not represent reserved filesystem blocks or promise write completion.
+Std supplies no free-space/inode query: report those observations as unavailable,
+never synthesize a passing sample. No external command or host probe is needed.
+Operators provision disk headroom and may monitor it with their ordinary tools.
 
-This probe does not establish a backing-capacity key, match a coordinator
-probe ticket, admit a filesystem or grant permission to write. Btrfs
-subvolumes share capacity despite differing device/statfs identifiers.
-XFS and ext4 project quotas can change the directory's reported values;
-user/group quota headroom is not supplied by these filesystem statistics.
-Qualification must establish the quota policy, deduplicate shared capacity,
-and select a conservative allocation granularity before constructing an
-admission Sample. Ext4 bigalloc clusters and XFS realtime/extent-size hints
-can exceed the counting unit. Unsupported quota or allocation profiles must
-refuse qualification. Read-only observations cannot authorize write admission.
+Create private files with `OpenOptions::create_new` and mode 0600, directories
+with `DirBuilder` and mode 0700. Future publication uses `hard_link` to publish
+immutable completed files without replacing an existing destination, then syncs
+the destination directory before removing/syncing the temporary link. Source
+and destination must share a filesystem. CURRENT uses same-directory temporary
+creation, file sync, atomic `rename` replacement and parent-directory sync.
+Checkpoint generations use exclusive directory creation and are authoritative
+only after CURRENT selection. `File::try_lock` on the persistent LOCK inode
+provides cooperative writer exclusion; never unlink or replace that inode.
+These mutation/lock operations remain M05 implementation work.
 
-The kernel and zero-allocation fixtures require successful observations
-on the retained executable directory, which must use XFS, Btrfs or an
-ext-family filesystem; neither fixture writes there. Rename/lookup scratch
-may use tmpfs. Unsupported executable storage fails instead of certifying
-success. Procfs verifies the unsupported-family error path, including its
-zero-allocation behavior.
+Any create/write/flush/sync/publication error must prevent a new acceptance
+acknowledgement. Keep already acknowledged state; never delete live mail to
+make room. Partial private output stays charged until cleanup. Uncertain journal
+or CURRENT publication stops writer admission until recovery establishes the
+committed boundary. Disk exhaustion can require operator cleanup before even a
+checkpoint or deletion transaction can proceed. A response-spool failure after
+commit closes the response; it cannot undo or report failure of known commits.
 
-Filesystem qualification also requires persistent-lock/process-death
-tests, short/failing I/O, file and parent-directory sync, non-replacing
-publication, and disposable-filesystem/VM crash recovery. Record
-filesystem and kernel versions, formatting features, mount and quota
-settings. Ordinary kernel probe tests on the development filesystem do
-not qualify XFS durability.
+Test the std adapter with short/failing I/O, full-disk/quota/read-only errors,
+failed file and parent-directory sync, non-replacing publication, competing
+writer processes and process death. Deterministic injection and temporary
+folders are normal development tests. Disposable filesystem/VM power-loss tests
+are release durability evidence; record the filesystem/kernel/mount settings
+used. XFS tools are not a runtime or ordinary test prerequisite, and installing
+any new external test tool still requires approval.
 
 ## 3. Metadata records
 

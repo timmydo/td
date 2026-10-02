@@ -1,13 +1,11 @@
 //! Scalar writer admission. M05/M08 supply filesystem and publication authority;
 //! this state machine alone never authorizes I/O or a checkpoint selection.
-use super::space::RoundedGrowth;
 use super::{
     logical::{
-        self, Cell, Charges, EffectResult, EffectTicket, LeaseId, Leases, PartId, Physical,
-        MAX_GROUP_CELLS,
+        self, Cell, Charges, EffectResult, EffectTicket, LeaseId, Leases, PartId, MAX_GROUP_CELLS,
     },
     quota::{Charge, Kind, Usage},
-    space, Plan,
+    Plan,
 };
 use crate::{
     format,
@@ -157,7 +155,7 @@ pub enum AppendResult {
 pub enum Phase {
     Open,
     Barrier,
-    AwaitingSpace,
+    AwaitingRecovery,
     Stopped,
 }
 
@@ -200,56 +198,6 @@ impl<'a> WriterLedger<'a> {
         ledger.checkpoint_need()?;
         Ok(ledger)
     }
-    pub(super) fn build_need(&self) -> Result<CheckpointNeed, Error> {
-        self.open()?;
-        if self.appending.is_some() {
-            return Err(Error::Busy);
-        }
-        self.leases.project_rollover()?;
-        self.need_from(&Usage::default())
-    }
-    pub(super) fn start_build(&mut self) -> Result<(), Error> {
-        let need = self.build_need()?;
-        self.leases.reserve_checkpoint(need.generation_bytes())?;
-        self.phase = Phase::Barrier;
-        Ok(())
-    }
-    pub(super) fn complete_build_io(&mut self, bytes: u64) -> Result<(), Error> {
-        if !matches!(self.phase, Phase::Barrier | Phase::Stopped) {
-            return Err(Error::Closed);
-        }
-        self.leases.complete_checkpoint(bytes)?;
-        Ok(())
-    }
-    pub(super) fn abandon_build(&mut self, unused: u64, untouched: bool) -> Result<(), Error> {
-        if self.phase != Phase::Barrier {
-            return Err(Error::Closed);
-        }
-        self.leases.release_checkpoint(unused, false)?;
-        self.phase = if untouched {
-            Phase::Open
-        } else {
-            Phase::AwaitingSpace
-        };
-        Ok(())
-    }
-    pub(super) fn select_build(
-        &mut self,
-        selected: u64,
-        bound: u64,
-        unused: u64,
-    ) -> Result<(), Error> {
-        let was_barrier = self.phase == Phase::Barrier;
-        self.phase = Phase::Stopped;
-        if !was_barrier {
-            return Err(Error::Invalid);
-        }
-        self.validate_selection(selected, bound)?;
-        self.leases.release_checkpoint(unused, true)?;
-        self.selected_tables = selected;
-        self.phase = Phase::AwaitingSpace;
-        Ok(())
-    }
     fn validate_selection(&self, selected: u64, bound: u64) -> Result<(), Error> {
         if selected
             < super::widen(
@@ -262,55 +210,6 @@ impl<'a> WriterLedger<'a> {
             return Err(Error::Invalid);
         }
         Ok(())
-    }
-    pub(super) fn stop(&mut self) {
-        self.phase = Phase::Stopped;
-    }
-    pub(super) fn reopen(&mut self) -> Result<(), Error> {
-        if self.phase != Phase::AwaitingSpace {
-            return Err(Error::Closed);
-        }
-        self.phase = Phase::Open;
-        Ok(())
-    }
-    pub(super) fn plan(&self) -> &'a Plan {
-        self.plan
-    }
-    pub(super) fn pristine(&self) -> bool {
-        self.phase == Phase::Open && self.appending.is_none() && self.leases.is_empty()
-    }
-    pub(super) fn physical(&self, part: PartId) -> Result<Physical, Error> {
-        Ok(self.leases.physical(part)?)
-    }
-    pub(super) fn frame_part(frame: FrameId) -> PartId {
-        frame.0
-    }
-    pub(super) fn physical_group(
-        &self,
-        lease: LeaseId,
-    ) -> Result<[Option<Physical>; MAX_GROUP_CELLS], Error> {
-        Ok(self.leases.physical_group(lease)?)
-    }
-    pub(super) fn extend_bound(
-        &mut self,
-        part: PartId,
-        amounts: [u64; 4],
-        extra: RoundedGrowth,
-        now: Tick,
-    ) -> Result<(), Error> {
-        self.open()?;
-        ordinary(&self.leases.remaining(part)?)?;
-        Ok(self.leases.extend_bound(part, amounts, extra, now)?)
-    }
-    pub(super) fn complete_bound(
-        &mut self,
-        ticket: &mut EffectTicket,
-        result: EffectResult,
-        physical: RoundedGrowth,
-    ) -> Result<(), Error> {
-        Ok(self
-            .leases
-            .complete_bound(ticket, result, physical, false)?)
     }
     pub fn phase(&self) -> Phase {
         self.phase
@@ -343,15 +242,15 @@ impl<'a> WriterLedger<'a> {
             "checkpoint operations",
         )?;
         Ok(CheckpointNeed {
-            generation_bytes: space::checkpoint_bytes(self.selected_tables, bytes, operations)?,
+            generation_bytes: checkpoint_bytes(self.selected_tables, bytes, operations)?,
             fresh_journal_bytes: super::widen(format::JOURNAL_HEADER_BYTES, "fresh journal")?,
         })
     }
     pub fn checkpoint_need(&self) -> Result<CheckpointNeed, Error> {
         self.need_from(self.leases.quotas().pending())
     }
-    /// Holds the exclusive ledger borrow while the composed coordinator checks
-    /// fresh physical observations. Dropping preparation changes no state.
+    /// Holds the exclusive ledger borrow while checking logical quotas.
+    /// Dropping preparation changes no state.
     pub fn prepare<'b>(
         &'b mut self,
         requests: &[Charges],
@@ -407,6 +306,12 @@ impl<'a> WriterLedger<'a> {
     pub fn cancel_lease(&mut self, lease: LeaseId) -> Result<(), Error> {
         Ok(self.leases.cancel(lease)?)
     }
+    /// Extend an ordinary part only while writer admission is open.
+    pub fn extend(&mut self, part: PartId, amounts: [u64; 4], now: Tick) -> Result<(), Error> {
+        self.open()?;
+        ordinary(&self.leases.remaining(part)?)?;
+        Ok(self.leases.extend(part, amounts, now)?)
+    }
     /// Admitted non-journal work may finish while a checkpoint barrier is held.
     pub fn begin_effect(
         &mut self,
@@ -452,22 +357,6 @@ impl<'a> WriterLedger<'a> {
         ticket: &mut AppendTicket,
         result: AppendResult,
     ) -> Result<(), Error> {
-        self.complete_append_inner(ticket, result, None)
-    }
-    pub(super) fn complete_append_bound(
-        &mut self,
-        ticket: &mut AppendTicket,
-        result: AppendResult,
-        physical: Option<RoundedGrowth>,
-    ) -> Result<(), Error> {
-        self.complete_append_inner(ticket, result, physical)
-    }
-    fn complete_append_inner(
-        &mut self,
-        ticket: &mut AppendTicket,
-        result: AppendResult,
-        physical: Option<RoundedGrowth>,
-    ) -> Result<(), Error> {
         self.open()?;
         if self.appending != Some(ticket.frame) {
             return Err(Error::Invalid);
@@ -483,14 +372,7 @@ impl<'a> WriterLedger<'a> {
                 return Ok(());
             }
         };
-        if let Some(physical) = physical {
-            self.leases.complete_bound(
-                &mut ticket.effect,
-                effect,
-                physical,
-                result == AppendResult::Synced,
-            )?;
-        } else if result == AppendResult::Synced {
+        if result == AppendResult::Synced {
             self.leases.complete_frame(&mut ticket.effect, effect)?;
         } else {
             self.leases.complete_effect(&mut ticket.effect, effect)?;
@@ -546,18 +428,10 @@ impl Prepared<'_, '_> {
     pub fn checkpoint_need(&self) -> CheckpointNeed {
         self.need
     }
-    /// The caller must first pass the composed physical-space gate. This helper
-    /// installs logical state only; CAS refusal leaves all counters unchanged.
+    /// Install the logical reservation; I/O errors remain fallible.
     pub fn install(self, now: Tick) -> Result<Grant, Error> {
-        self.install_inner(None, now)
-    }
-    pub(super) fn install_bound(self, physical: &[Physical], now: Tick) -> Result<Grant, Error> {
-        self.install_inner(Some(physical), now)
-    }
-    fn install_inner(self, physical: Option<&[Physical]>, now: Tick) -> Result<Grant, Error> {
         let issued = self.ledger.leases.reserve_group(
             self.charges.get(..self.count).ok_or(Error::Invalid)?,
-            physical,
             self.has_frame,
             self.deadline,
             now,
@@ -629,8 +503,8 @@ impl Checkpoint<'_, '_> {
         self.ledger.phase = Phase::Open;
     }
     /// M08 supplies the selected table length only after durable selection.
-    /// The returned ledger stays closed: b3 must protect the next checkpoint
-    /// from a fresh physical probe before it can reopen admission.
+    /// The returned ledger stays closed until M08 reconciles publication and
+    /// cleanup. This scalar model has no runtime recovery/reopen authority.
     pub fn selected(self, selected_tables: u64) -> Result<(), Error> {
         // The adapter reports an already durable selection. Any inconsistency
         // now needs recovery, not another attempt against the old journal.
@@ -639,13 +513,39 @@ impl Checkpoint<'_, '_> {
             .validate_selection(selected_tables, self.selected_bound)?;
         self.ledger.leases.rollover()?;
         self.ledger.selected_tables = selected_tables;
-        self.ledger.phase = Phase::AwaitingSpace;
+        self.ledger.phase = Phase::AwaitingRecovery;
         Ok(())
     }
     /// Uncertain selection cannot safely resume either active journal.
     pub fn uncertain(self) {
         self.ledger.phase = Phase::Stopped;
     }
+}
+
+fn checkpoint_bytes(
+    selected_tables: u64,
+    journal_bytes: u64,
+    journal_operations: u64,
+) -> Result<u64, super::Error> {
+    use super::{add, mul, widen, MIB};
+    let correction = crate::format::RECORD_OVERHEAD_BYTES
+        .checked_sub(crate::format::OPERATION_HEADER_BYTES)
+        .ok_or(super::Error::Inconsistent(
+            "record overhead below operation header",
+        ))?;
+    add(
+        add(selected_tables, journal_bytes, "checkpoint reserve")?,
+        add(
+            mul(
+                widen(correction, "record overhead correction")?,
+                journal_operations,
+                "checkpoint reserve",
+            )?,
+            MIB,
+            "checkpoint reserve",
+        )?,
+        "checkpoint reserve",
+    )
 }
 
 #[cfg(test)]
@@ -702,6 +602,50 @@ mod tests {
         }
         Err(Error::Busy)
     }
+    #[test]
+    fn ordinary_extension_respects_quota_deadline_frame_and_writer_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let p = plan()?;
+        let mut states = [const { SlotState::EMPTY }; 8];
+        let mut cells = [const { Cell::EMPTY }; 8];
+        let mut ledger = WriterLedger::new(&p, 1232, recovered(0, 0)?, &mut states, &mut cells)?;
+        let job = grant(
+            &mut ledger,
+            &[charge(Kind::BodyBytes, 100)],
+            Some(FrameBudget::new(1000, 4)?),
+        )?;
+        let part = ledger.part(job, 0)?;
+        let frame = job.frame().ok_or(Error::Invalid)?;
+        ledger.extend(part, [50, 0, 0, 0], Tick(2))?;
+        assert_eq!(ledger.pending(Kind::BodyBytes)?, 150);
+        assert!(ledger
+            .extend(part, [p.disk().body_bytes, 0, 0, 0], Tick(2))
+            .is_err());
+        assert_eq!(ledger.pending(Kind::BodyBytes)?, 150);
+        assert_eq!(
+            ledger.extend(part, [1, 0, 0, 0], Tick(101)),
+            Err(Error::Logical(logical::Error::Expired))
+        );
+        assert_eq!(
+            ledger.extend(frame.0, [1, 0, 0, 0], Tick(2)),
+            Err(Error::Invalid)
+        );
+        ledger.begin_checkpoint()?.selected(1232)?;
+        assert_eq!(
+            ledger.extend(part, [1, 0, 0, 0], Tick(3)),
+            Err(Error::Closed)
+        );
+        assert_eq!(ledger.pending(Kind::BodyBytes)?, 150);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_length_bound_checks_overflow() {
+        assert!(checkpoint_bytes(u64::MAX, 1, 0).is_err());
+        assert!(checkpoint_bytes(0, 0, u64::MAX).is_err());
+        assert_eq!(checkpoint_bytes(0, 0, 1), Ok(super::super::MIB + 36));
+    }
+
     #[test]
     fn candidate_bound_includes_used_pending_and_new_frames_without_mutating(
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -828,7 +772,7 @@ mod tests {
         let mut raw = barrier.begin_effect(part, [100, 0, 0, 0], Tick(2))?;
         barrier.complete_effect(&mut raw, EffectResult::Proven([40, 0, 0, 0]))?;
         barrier.selected(1500)?;
-        assert_eq!(ledger.phase(), Phase::AwaitingSpace);
+        assert_eq!(ledger.phase(), Phase::AwaitingRecovery);
         let mut remainder = ledger.begin_effect(part, [60, 0, 0, 0], Tick(3))?;
         ledger.complete_effect(&mut remainder, EffectResult::Uncertain)?;
         assert_eq!(ledger.used(Kind::ClosedJournalBytes)?, 6096);
@@ -1086,7 +1030,7 @@ mod tests {
             let result = barrier.selected(selected);
             if selected == bound {
                 result?;
-                assert_eq!(ledger.phase(), Phase::AwaitingSpace);
+                assert_eq!(ledger.phase(), Phase::AwaitingRecovery);
                 assert_eq!(
                     ledger.used(Kind::ClosedJournalBytes)?,
                     p.closed_journal_bytes()

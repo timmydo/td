@@ -1,9 +1,7 @@
-//! Fixed logical leases. Physical admission and writer barriers are separate
-//! coordinator gates; owning one of these tokens never authorizes I/O alone.
+//! Fixed logical leases. Writer barriers and durable publication remain separate;
+//! owning one of these tokens never proves that a write will succeed.
 use super::{
-    filesystems::FilesystemId,
     quota::{Charge, Kind, Quotas, Usage},
-    space::RoundedGrowth,
     Error as PlanError, Plan,
 };
 use crate::{
@@ -73,11 +71,6 @@ pub struct LeaseId(SlotId);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartId(SlotId);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Physical {
-    pub filesystem: FilesystemId,
-    pub remaining: RoundedGrowth,
-}
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Issued {
     pub lease: LeaseId,
@@ -92,7 +85,6 @@ struct Record {
     deadline: Deadline,
     kinds: [Option<Kind>; CHARGES_PER_CELL],
     amounts: [u64; CHARGES_PER_CELL],
-    physical: Option<Physical>,
 }
 impl Record {
     fn charges(self) -> Charges {
@@ -176,35 +168,6 @@ impl<'a> Leases<'a> {
         self.slots.available()
     }
 
-    pub(super) fn reserve_checkpoint(&mut self, bytes: u64) -> Result<(), Error> {
-        self.healthy()?;
-        if self.pending(Kind::CheckpointBytes)? != 0 {
-            return Err(Error::Busy);
-        }
-        let mut extra = Usage::default();
-        extra.add(Kind::CheckpointBytes, bytes)?;
-        self.quotas = self.quotas.with_reservation(extra).map_err(Error::Quota)?;
-        Ok(())
-    }
-    pub(super) fn complete_checkpoint(&mut self, bytes: u64) -> Result<(), Error> {
-        self.healthy()?;
-        let mut used = Usage::default();
-        used.add(Kind::CheckpointBytes, bytes)?;
-        self.quotas.complete(used)?;
-        Ok(())
-    }
-    pub(super) fn release_checkpoint(&mut self, unused: u64, rollover: bool) -> Result<(), Error> {
-        self.healthy()?;
-        let mut next = self.quotas.clone();
-        let mut release = Usage::default();
-        release.add(Kind::CheckpointBytes, unused)?;
-        next.release_unused(release)?;
-        if rollover {
-            next = next.with_rollover().map_err(Error::Quota)?;
-        }
-        self.quotas = next;
-        Ok(())
-    }
     pub(super) fn quotas(&self) -> &Quotas {
         &self.quotas
     }
@@ -234,8 +197,7 @@ impl<'a> Leases<'a> {
     }
 
     /// Atomic across up to eight records. Duplicate kinds add across the group.
-    /// This reserves logical budgets only; the full coordinator couples it to
-    /// fresh physical probes and its derived checkpoint reserve before effects.
+    /// This reserves logical budgets only; runtime handles write/sync failure.
     pub fn reserve(
         &mut self,
         requests: &[Charges],
@@ -251,25 +213,21 @@ impl<'a> Leases<'a> {
         now: Tick,
         acquire: impl FnMut(&mut SlotPool<'a>, usize) -> Result<SlotId, SlotError>,
     ) -> Result<LeaseId, Error> {
-        self.reserve_inner(requests, None, false, deadline, now, acquire)
+        self.reserve_inner(requests, false, deadline, now, acquire)
             .map(|issued| issued.lease)
     }
     pub(super) fn reserve_group(
         &mut self,
         requests: &[Charges],
-        physical: Option<&[Physical]>,
         has_frame: bool,
         deadline: Deadline,
         now: Tick,
     ) -> Result<Issued, Error> {
-        self.reserve_inner(requests, physical, has_frame, deadline, now, |pool, _| {
-            pool.acquire()
-        })
+        self.reserve_inner(requests, has_frame, deadline, now, |pool, _| pool.acquire())
     }
     fn reserve_inner(
         &mut self,
         requests: &[Charges],
-        physical: Option<&[Physical]>,
         has_frame: bool,
         deadline: Deadline,
         now: Tick,
@@ -284,9 +242,6 @@ impl<'a> Leases<'a> {
         }
         if requests.len() > self.slots.available() {
             return Err(Error::Full);
-        }
-        if physical.is_some_and(|p| p.len() != requests.len()) {
-            return Err(Error::Invalid);
         }
         let next = self.project(requests)?;
         let mut issued = [None; MAX_GROUP_CELLS];
@@ -331,11 +286,6 @@ impl<'a> Leases<'a> {
         };
         for (ordinal, (issued, charges)) in issued.iter().flatten().zip(requests).enumerate() {
             let (id, index) = *issued;
-            let binding = physical.and_then(|p| p.get(ordinal)).copied();
-            if physical.is_some() && binding.is_none() {
-                self.poisoned = true;
-                return Err(Error::Poisoned);
-            }
             if !self.cells.get(index).is_some_and(|c| c.record.is_none())
                 || records.iter().flatten().any(|(other, _)| *other == index)
             {
@@ -360,7 +310,6 @@ impl<'a> Leases<'a> {
                     deadline,
                     kinds: charges.map(|c| (c.amount != 0).then_some(c.kind)),
                     amounts: charges.map(|c| c.amount),
-                    physical: binding,
                 },
             ));
         }
@@ -415,61 +364,15 @@ impl<'a> Leases<'a> {
             .map(|r| PartId(r.id))
             .ok_or(Error::Stale)
     }
-    pub(super) fn is_empty(&self) -> bool {
-        self.cells.iter().all(|c| c.record.is_none())
-    }
-    pub(super) fn physical(&self, part: PartId) -> Result<Physical, Error> {
-        self.record(part)?.1.physical.ok_or(Error::Invalid)
-    }
-    pub(super) fn physical_group(
-        &self,
-        lease: LeaseId,
-    ) -> Result<[Option<Physical>; MAX_GROUP_CELLS], Error> {
-        let root = self.root(lease)?;
-        let mut out = [None; MAX_GROUP_CELLS];
-        for record in self
-            .cells
-            .iter()
-            .filter_map(|c| c.record)
-            .filter(|r| r.root == root)
-        {
-            if record.busy {
-                return Err(Error::Busy);
-            }
-            let binding = record.physical.ok_or(Error::Invalid)?;
-            *out.get_mut(usize::from(record.ordinal))
-                .ok_or(Error::Invalid)? = Some(binding);
-        }
-        Ok(out)
-    }
     pub fn remaining(&self, part: PartId) -> Result<Charges, Error> {
         Ok(self.record(part)?.1.charges())
     }
 
-    /// Increase a live part's remaining logical budget. The full coordinator
-    /// must pair this with fresh physical admission before enabling more I/O.
+    /// Increase a live part's remaining logical budget before more I/O.
     pub fn extend(
         &mut self,
         part: PartId,
         amounts: [u64; CHARGES_PER_CELL],
-        now: Tick,
-    ) -> Result<(), Error> {
-        self.extend_inner(part, amounts, None, now)
-    }
-    pub(super) fn extend_bound(
-        &mut self,
-        part: PartId,
-        amounts: [u64; 4],
-        physical: RoundedGrowth,
-        now: Tick,
-    ) -> Result<(), Error> {
-        self.extend_inner(part, amounts, Some(physical), now)
-    }
-    fn extend_inner(
-        &mut self,
-        part: PartId,
-        amounts: [u64; 4],
-        physical: Option<RoundedGrowth>,
         now: Tick,
     ) -> Result<(), Error> {
         let (index, mut record) = self.record(part)?;
@@ -490,21 +393,14 @@ impl<'a> Leases<'a> {
             *remaining = super::add(*remaining, *amount, "lease extension")?;
         }
         let next = self.quotas.with_reservation(extra).map_err(Error::Quota)?;
-        match (&mut record.physical, physical) {
-            (Some(binding), Some(extra)) => {
-                binding.remaining = binding.remaining.checked_add(extra)?
-            }
-            (None, None) => (),
-            _ => return Err(Error::Invalid),
-        }
         let cell = self.cells.get_mut(index).ok_or(Error::Stale)?;
         cell.record = Some(record);
         self.quotas = next;
         Ok(())
     }
 
-    /// Must be called before effects. The composed coordinator applies physical
-    /// and writer gates first. A busy part cannot be reused or canceled.
+    /// Must be called before effects and after writer admission.
+    /// A busy part cannot be reused or canceled.
     pub fn begin_effect(
         &mut self,
         part: PartId,
@@ -540,7 +436,7 @@ impl<'a> Leases<'a> {
         ticket: &mut EffectTicket,
         result: EffectResult,
     ) -> Result<(), Error> {
-        self.complete_effect_inner(ticket, result, None, false)
+        self.complete_effect_inner(ticket, result, false)
     }
     pub(super) fn check_effect(&self, ticket: &EffectTicket) -> Result<(), Error> {
         let part = ticket.part.ok_or(Error::InactiveTicket)?;
@@ -554,22 +450,12 @@ impl<'a> Leases<'a> {
         ticket: &mut EffectTicket,
         result: EffectResult,
     ) -> Result<(), Error> {
-        self.complete_effect_inner(ticket, result, None, true)
-    }
-    pub(super) fn complete_bound(
-        &mut self,
-        ticket: &mut EffectTicket,
-        result: EffectResult,
-        physical: RoundedGrowth,
-        release_remainder: bool,
-    ) -> Result<(), Error> {
-        self.complete_effect_inner(ticket, result, Some(physical), release_remainder)
+        self.complete_effect_inner(ticket, result, true)
     }
     fn complete_effect_inner(
         &mut self,
         ticket: &mut EffectTicket,
         result: EffectResult,
-        physical: Option<RoundedGrowth>,
         release_remainder: bool,
     ) -> Result<(), Error> {
         let part = ticket.part.ok_or(Error::InactiveTicket)?;
@@ -607,16 +493,6 @@ impl<'a> Leases<'a> {
             }
             next.release_unused(unused)?;
             record.amounts.fill(0);
-        }
-        match (&mut record.physical, physical) {
-            (Some(binding), Some(actual)) => {
-                binding.remaining = binding.remaining.checked_sub(actual)?;
-                if release_remainder {
-                    binding.remaining = binding.remaining.zeroed();
-                }
-            }
-            (None, None) => (),
-            _ => return Err(Error::Invalid),
         }
         record.busy = false;
         let cell = self.cells.get_mut(index).ok_or(Error::Stale)?;

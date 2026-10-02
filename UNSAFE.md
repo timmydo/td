@@ -15,10 +15,10 @@ can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
 `recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-TWO
-numbered target-side exceptions, TWENTY of them live, each a standalone
+numbered target-side exceptions, NINETEEN of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary (the crate itself
-`#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
+`#![deny(unsafe_code)]`s); the seventeenth, eighteenth and twenty-second are retired and
 their crates forbid `unsafe` outright.
 The first nine confine that boundary to their syscall-instruction layer except
 for `td-compositor`, whose received descriptors enter exact File ownership through a second
@@ -51,15 +51,15 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty live surfaces in twenty-two numbered entries. The
+roster counts nineteen live surfaces in twenty-two numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
 value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
-The twenty-second, `td-mta`, opens confined directories, reads its effective
-UID and probes filesystem space through three scoped instruction functions.
-One also adopts its returned descriptor; its test allocators remain separate.
+The twenty-second, `td-mta`, is retired: its production library and binary
+forbid the keyword and use safe std filesystem APIs. Test allocators remain
+separate.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -123,7 +123,7 @@ own entry.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | `openat2(2)`, directory-only beneath a borrowed parent with no symlink resolution; one newly returned descriptor adoption; `geteuid(2)` for root admission; `fstatfs(2)` on a retained directory |
+| 22 | `td-mta` | retired: production library and binary forbid `unsafe`; filesystem access uses safe std APIs |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -3005,84 +3005,11 @@ detached it; the read-back reports that case rather than hiding it. Any
 further syscall, request, configured field or flag, caller, or allowance
 amends this section and `td-install/DESIGN.md`.
 
-## 22. `td-mta` — confined directories, identity and space observations
+## 22. `td-mta` — retired
 
-`store_fs_sys.rs` has three function-scoped allowances, each containing one
-Linux x86-64 syscall instruction. The directory opener additionally owns
-one `File::from_raw_fd` adoption. The syscalls are openat2 (437),
-geteuid (107) and fstatfs (138). The complete 24-byte repr(C) open_how has
-three initialized u64 fields: flags are O_RDONLY (0) | O_DIRECTORY (0o200000)
-| O_CLOEXEC (0o2000000), mode is zero, and resolve is RESOLVE_BENEATH (8) |
-RESOLVE_NO_SYMLINKS (4). The latter also refuses magic links. The request
-size is exactly 24. No caller chooses a flag, mode, syscall or raw fd.
-The safe wrapper borrows a live File and terminated CStr through return.
-Its assembly uses rax/rdi/rsi/rdx/r10, clobbers rcx/r11 and declares neither
-nomem nor readonly. Negative returns use a shared total converter: only
--4095..=-1 becomes a raw OS error; other values are InvalidData, with checked
-negation and conversion.
-Each successful nonnegative int descriptor, including zero, is immediately
-adopted exactly once before any fallible operation. Std owns every close.
-No pointer dereference, mapping, foreign function or raw close is added.
-
-`store_fs::Directory::open` calls the directory wrapper with a retained
-directory and a canonical `store_paths::Name`. The additional caller is
-`store_fs::PrivateRoot::walk`, with each component from a lexically validated
-absolute configuration path, copied into one fixed 4096-byte C-string buffer.
-It starts at a std-opened `/` descriptor and checks each parent before
-opening its child. Both production callers retain the exact parent through
-the syscall. `from_file` accepts a caller-opened directory and checks only
-type: it does not certify the anchor's ancestry, ownership, permissions,
-filesystem, or lock. Generated
-names and lookup confinement do not establish those properties either.
-Directory handles survive path renames; mount crossings remain allowed.
-
-The second instruction reads geteuid with no arguments and no user-memory
-access, using rax and clobbering rcx/r11, with nostack/nomem. It never changes
-credentials. Negative policy-injected errors propagate; nonnegative output
-must fit u32. Only PrivateRoot::open calls it in production. A zero service
-UID is refused. The caller must retain the deployment credentials; this
-surface neither enumerates nor modifies process capabilities.
-
-The third instruction calls fstatfs on a borrowed live directory File.
-It uses rax/rdi/rsi with rcx/r11 clobbers and nostack, with neither
-nomem nor readonly. The kernel may write only the initialized 120-byte,
-8-byte-aligned repr(C) x86-64 statfs record, retained exclusively
-through return. Pin its field offsets and size: seven i64 words, two i32
-fsid words, three i64 words and four spare i64 words. Return data only
-for syscall result zero; negative errors use the total converter and
-unexpected positive results refuse. The wrapper allocates no Rust memory
-and adds no pointer dereference, new descriptor or retry loop. Only
-Directory::filesystem_space calls this wrapper in production. Its safe
-conversion and observation limits are specified in STORAGE.md's
-Filesystem observations section; kernel statistics alone grant no write
-authority.
-
-STORAGE.md's Descriptor boundary section owns PrivateRoot's owner/mode and
-readable-ancestor policy. The raw directory flags remain unchanged. This
-surface creates no file, qualifies no filesystem, holds no LOCK and enables
-no service operation.
-
-Linux 5.6+ is the deployment minimum. Unsupported or denied openat2 fails
-without a fallback or retry loop. The initial ABI is x86-64 only; future
-architectures must supply their own reviewed register and flag mapping.
-Confinement inventories all mail source and pins this entire raw file,
-its allowance/adoption/instruction counts, the pinned library root with
-compiler-forbidden safe modules, and the caller set.
-Kernel tests refuse absolute and escaping raw names, final/intermediate
-symlinks, wrong types and missing entries, and check retained-inode identity,
-close-on-exec and drop cleanup. PrivateRoot fixtures check actual effective
-UID against a file the process created, final-root ownership, exact private
-mode, ancestor owner refusal before child lookup, the root-owner exemption,
-and shared-write/sticky refusals. A scalar fixture covers every error-converter
-boundary including isize::MIN. The allocation probe invokes public root
-admission outside its measured region and observes successful and failing
-directory lookup and space probes without Rust allocations. Scalar tests
-cover family classification, inode support, signed bounds and multiplication
-overflow; kernel tests pin procfs fields/unsupported-family refusal and
-continued observation after directory rename. These do not qualify XFS
-write durability. Any new operation, flag profile, caller, architecture or
-allowance amends this section and
-STORAGE.md; the two test-only allocation exceptions below are unchanged.
+The production library and binary forbid `unsafe_code` throughout. Filesystem
+operations use safe std APIs under STORAGE.md's stable-path deployment contract.
+Only the separate test executables retain the T1/T2 exceptions below.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 
@@ -3121,8 +3048,7 @@ The human-approved test instrumentation exception is confined to
 `tests/rust_alloc_probe.rs` integration executable. Cargo marks this target
 `harness = false`: one main runs each observation sequentially without libtest
 workers. The root is `cfg(test)` and denies unsafe code. The production
-library denies the keyword with only section 22 allowed; the binary forbids
-it. No runtime feature enables a probe.
+library and binary both forbid the keyword. No runtime feature enables a probe.
 
 One impl-scoped allowance covers `unsafe impl GlobalAlloc` and exactly four
 methods (`alloc`, `alloc_zeroed`, `dealloc`, `realloc`). Each has exactly one
@@ -3169,8 +3095,8 @@ The approved allocation instrumentation exception also admits a separate
 `tests/native_alloc_probe.rs` executable. Its native modules compile only
 with `cfg(td_native_alloc_probe)`, applied by the isolated builder to this
 final test target for Linux x86-64 musl. Ordinary host tests run an explicit
-unqualified stub. The production library permits only section 22; the binary
-retains `forbid(unsafe_code)` and the test root denies it. No Cargo feature
+unqualified stub. The production library and binary
+retain `forbid(unsafe_code)` and the test root denies it. No Cargo feature
 or common compiler flag enables wrapping.
 
 `tests/support/native_allocator_bridge.rs` declares the six real libc entry

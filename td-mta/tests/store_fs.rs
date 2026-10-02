@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::{
-    fs::{self, File},
+    fs::{self},
     io,
     os::unix::{fs::symlink, fs::MetadataExt},
     path::{Path, PathBuf},
@@ -28,7 +28,7 @@ impl Fixture {
         Self(path)
     }
     fn anchor(&self) -> Directory {
-        Directory::from_file(File::open(&self.0).unwrap()).unwrap()
+        Directory::from_path(self.0.to_str().unwrap()).unwrap()
     }
 }
 impl Drop for Fixture {
@@ -48,19 +48,19 @@ fn descriptors_for(path: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn generated_nested_paths_and_pinned_parent_survive_path_replacement() {
+fn retained_metadata_and_path_lookup_have_distinct_lifetimes() {
     let fixture = Fixture::new();
     let original = fixture.0.join("root");
     let moved = fixture.0.join("moved");
     let name = Name::account(AccountId::from_bytes([7; 16]), AccountEntry::Metadata).unwrap();
     fs::create_dir_all(original.join(name.as_path().unwrap())).unwrap();
-    let root = Directory::from_file(File::open(&original).unwrap()).unwrap();
+    let root = Directory::from_path(original.to_str().unwrap()).unwrap();
     let before = root.open(&name).unwrap();
     let expected = identity(before.metadata().unwrap());
     fs::rename(&original, &moved).unwrap();
     fs::create_dir_all(original.join(name.as_path().unwrap())).unwrap();
     let after = root.open(&name).unwrap();
-    assert_eq!(identity(after.metadata().unwrap()), expected);
+    assert_ne!(identity(after.metadata().unwrap()), expected);
     assert_ne!(
         identity(fs::metadata(original.join(name.as_path().unwrap())).unwrap()),
         expected
@@ -69,7 +69,7 @@ fn generated_nested_paths_and_pinned_parent_survive_path_replacement() {
 }
 
 #[test]
-fn reject_final_and_intermediate_links_even_when_they_stay_beneath_anchor() {
+fn reject_existing_final_and_intermediate_links() {
     let fixture = Fixture::new();
     let root = fixture.anchor();
     let account = AccountId::from_bytes([8; 16]);
@@ -78,11 +78,17 @@ fn reject_final_and_intermediate_links_even_when_they_stay_beneath_anchor() {
     fs::create_dir_all(fixture.0.join(format!("real/{account}/metadata"))).unwrap();
     symlink("real", fixture.0.join("accounts")).unwrap();
     for name in [&accounts, &nested] {
-        assert_eq!(root.open(name).unwrap_err().raw_os_error(), Some(40));
+        assert_eq!(
+            root.open(name).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
     }
     fs::remove_file(fixture.0.join("accounts")).unwrap();
     symlink("/", fixture.0.join("accounts")).unwrap();
-    assert_eq!(root.open(&accounts).unwrap_err().raw_os_error(), Some(40));
+    assert_eq!(
+        root.open(&accounts).unwrap_err().kind(),
+        io::ErrorKind::NotADirectory
+    );
 }
 
 #[test]
@@ -101,7 +107,7 @@ fn refuse_regular_files_missing_entries_and_nondirectory_anchors() {
         io::ErrorKind::NotADirectory
     );
     assert_eq!(
-        Directory::from_file(File::open(&path).unwrap())
+        Directory::from_path(path.to_str().unwrap())
             .unwrap_err()
             .kind(),
         io::ErrorKind::NotADirectory
@@ -148,4 +154,86 @@ fn descriptor_ownership_closes_on_drop_and_does_not_cross_exec() {
     assert_eq!(descriptors_for(&path).len(), 1);
     drop(child);
     assert!(descriptors_for(&path).is_empty());
+}
+
+#[test]
+fn private_root_checks_modes_ancestry_and_lexical_bounds() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use td_mta::store_fs::{PrivateRoot, RootError, MAX_PATH_BYTES, MAX_ROOT_BYTES};
+    let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir_all(parent).unwrap();
+    let base = parent.join(format!("private-root-{}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+    let fixture = Fixture(base);
+    let child = fixture.0.join("data");
+    fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
+    let path = child.to_str().unwrap();
+    let owner = fs::metadata(&child).unwrap().uid();
+    if owner == 0 {
+        assert!(matches!(PrivateRoot::open(path), Err(RootError::Owner)));
+    } else {
+        let trusted = child.ancestors().skip(1).all(|path| {
+            fs::symlink_metadata(path).is_ok_and(|m| {
+                m.is_dir() && (m.uid() == 0 || m.uid() == owner) && m.mode() & 0o022 == 0
+            })
+        });
+        if trusted {
+            let root = PrivateRoot::open(path).unwrap();
+            assert_eq!(root.directory().metadata().unwrap().uid(), owner);
+        } else {
+            eprintln!("positive private-root case unavailable: untrusted fixture ancestry");
+            assert!(PrivateRoot::open(path).is_err());
+        }
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(matches!(
+            PrivateRoot::open(path),
+            Err(RootError::WritableAncestor)
+        ));
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let link = fixture.0.join("link");
+    symlink(&child, &link).unwrap();
+    assert!(matches!(PrivateRoot::open(link.to_str().unwrap()),
+        Err(RootError::Io(error)) if error.kind() == io::ErrorKind::NotADirectory));
+    let through_link = link.join("nested");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(child.join("nested"))
+        .unwrap();
+    if owner != 0 {
+        assert!(matches!(PrivateRoot::open(through_link.to_str().unwrap()),
+            Err(RootError::Io(error)) if error.kind() == io::ErrorKind::NotADirectory));
+    }
+    for mode in [0o750, 0o755, 0o1700, 0o2700, 0o4700] {
+        fs::set_permissions(&child, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(matches!(
+            PrivateRoot::open(path),
+            Err(RootError::PrivateMode)
+        ));
+    }
+    for path in [
+        "",
+        "relative",
+        "/tmp/../root",
+        "/tmp/./root",
+        "//tmp",
+        "/tmp/",
+        "/bad\0name",
+    ] {
+        assert!(matches!(PrivateRoot::open(path), Err(RootError::Path)));
+        assert_eq!(
+            Directory::from_path(path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    assert!(matches!(
+        PrivateRoot::open(&format!("/{}", "x".repeat(MAX_ROOT_BYTES))),
+        Err(RootError::Path)
+    ));
+    assert_eq!(
+        Directory::from_path(&format!("/{}", "x".repeat(MAX_PATH_BYTES)))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
 }

@@ -224,7 +224,7 @@ still account for those costs and concurrent owners within the ledger.
 Message size, upload/queue quotas, queue length and log file limits are disk or
 admission bounds. Growing them does not reserve whole bodies or a whole queue in
 RAM. The default log disk reservation is five 8 MiB files (active plus four
-retained). ADMISSION.md freezes free-space/metadata/inode quotas, completion
+retained). ADMISSION.md freezes logical byte/file quotas, logical completion
 reserves and maintenance work/deadlines, enforced by M05/M08 before mail can
 be accepted.
 
@@ -426,10 +426,9 @@ materialize one lookup key at a time within existing parser/read scratch.
 The 128 KiB queue/state reservation has eight 64-entry input queues and one
 512-entry completion queue, all with 32-byte entries (32 KiB total), a
 128-entry due-recipient window with 128-byte entries (16 KiB), 64 reservation
-records with 128-byte entries (8 KiB), sixteen filesystem records including
-slot generations at no more than 128 bytes each (2 KiB), one dedicated
+records with 128-byte entries (8 KiB), one future dedicated
 checkpoint-attempt record plus sequence counter (at most 512 bytes), and a
-remaining 71,168 bytes for timers, other pools' slot generations, bounded
+remaining 73,216 bytes for timers, other pools' slot generations, bounded
 generation pins, queue heads and counters. A
 reservation record stores references/charges; it does not embed a frame.
 The window can be refilled from the disk due-time index, never from a full
@@ -523,7 +522,7 @@ M04c1's `admission.rs` validates the separate u64 disk/work plan and capacity
 relationships in ADMISSION.md. It consumes an already validated ResourcePlan
 without changing this RAM ledger. Logical upload/queue quotas may be smaller
 than message_bytes; admission must enforce the intersection of logical quota,
-raw-body quota and actual free capacity for each operation. These settings do
+raw-body quota and successful I/O for each operation. These settings do
 not guarantee that any particular upload/submission can currently fit.
 
 M04c2's admission work/timer helpers charge fixed scalar counters and compute
@@ -532,38 +531,23 @@ sampling, fixed scheduling steps, protocol transitions, nested-budget charging
 and completion of admitted durable work. These helpers do not establish
 whole-process memory usage or execution-time enforcement.
 
-M04c3a's space evaluator uses scalar counters and injected probe samples. It
-protects pending and checkpoint capacity in its arithmetic, including writes
-completed during a probe. M04c3b1 supplies fixed logical reservation records,
-atomic grouped quota checks and linear effect tickets. M04c3b3b adds a physical
-filesystem binding and remaining rounded growth to the same cell. The combined
-cell plus slot fits 128 bytes, enforced by a layout test; no second reservation
-table is allocated. No replacement cells
-are allocated on saturation. M04c3b2's scalar writer ledger wraps this same
-table; each framed job uses one of its cells for journal bytes/operations.
-Prepared requests and quota projections use fixed stack arrays, with no heap
-growth. Its checkpoint barrier preserves pending frame ownership and does
-not reopen on selection. M04c3b3b couples quota and filesystem changes using
-a fixed sixteen-entry stack projection and at most eight staged lease records.
-It consumes/rechecks probes at admission and publishes prevalidated filesystem
-changes only after logical installation succeeds. M04c3b3c2 transfers protected
-capacity to one dedicated checkpoint attempt, so a full client lease table
-cannot starve its reservation. Building quota stays in the same Quotas ledger.
-Attempt and I/O tokens live in owned job scratch; dropping one pins admission
-or its effect until reconciliation. Transfers and completions use fixed stack
-projections. M05/M08 own actual
-written/orphan cleanup, writer/view locking and publication authority.
+Logical reservation records and grouped quota checks use fixed caller-owned
+cells and linear effect tickets. Each cell plus slot fits within 128 bytes;
+there is no physical-filesystem binding or probe table. The scalar writer
+ledger uses the same cells for journal bytes/operations, with fixed stack
+projections and no heap growth. Its barrier preserves pending frame ownership
+and stays closed after selection until runtime reconciliation exists. M08 owns
+building/retention accounting in a dedicated attempt outside client slots,
+actual cleanup, writer/view locking and publication authority.
 
-M04c3b3a's filesystem table borrows its backing cells and SlotStates from
-that 2 KiB partition; saturation refuses without allocation. Probe tickets
-and observations live in caller-owned job scratch, not the 32-byte queue
-entry itself. Queue entries carry references to owned job payloads. Matching
-an observation grants no capacity. The composed coordinator tests drive
-physical counter transitions using injected samples and completion proofs.
-They establish accounting bounds, not runtime filesystem behavior or RSS.
-M04c3b3c1 stores one probe epoch on the registry and copies it into the fixed
-stack projection. The filesystem record/slot size is unchanged, and no per-probe
-table is allocated. Invalidation retains capacity and lease ownership.
+The std directory adapter owns a File and a 383-byte path buffer per retained
+directory. Complete operational paths are bounded at 383 bytes and data roots
+at 254 bytes. One child lookup uses a fixed 383-byte scratch buffer; no PathBuf
+or heap string is created by the adapter. The default allocation probe covers
+short and maximum-length successful/missing std paths after its positive
+controls. This qualifies the pinned host/musl implementation, not every std
+version. Recheck with compiler changes. Directory iteration and future mutable
+file operations need their own allocation evidence before hot-path use.
 
 M04a1's `bounded.rs` supplies borrowed byte arenas, explicit-compaction wire
 buffers and atomic text formatting. They neither allocate backing storage nor

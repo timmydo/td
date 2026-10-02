@@ -248,7 +248,9 @@ failed or unsupported probe. Age is the observation age in milliseconds, not a
 persisted monotonic tick. Disk records are emitted in caller order; duplicate,
 out-of-range or more than 16 indices refuse before touching visible output.
 Observed headroom is diagnostic only: a stale health snapshot cannot authorize
-physical growth. M05/M19 own sampling, index mapping and freshness reporting.
+growth. The std-only runtime has no free-space/inode sampler: publish null
+headroom/age and unknown inodes. These optional diagnostic fields do not
+authorize writes; M19 owns the namespace index mapping.
 
 Recommended actions are derived from supplied facts in fixed order:
 `check_config`, `inspect_storage`, `inspect_listeners`, `inspect_admission`,

@@ -242,8 +242,8 @@ the budget alone does not change connection counts or the RSS release targets.
 ### `[disk]`
 
 `body_bytes`, `body_files`, `live_metadata_bytes`, `checkpoint_bytes`,
-`response_bytes`, `response_total_bytes`, `cache_bytes`, `cold_bytes`,
-`free_bytes`, `free_inodes`.
+`response_bytes`, `response_total_bytes`, `cache_bytes`, `cold_bytes`.
+These are logical quotas; physical free-space settings are not supported.
 
 ### `[work]`
 

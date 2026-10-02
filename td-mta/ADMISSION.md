@@ -7,30 +7,18 @@ M04c1 implements checked disk/work configuration in
 already validated ResourcePlan, DiskLimits, WorkLimits and explicit
 ViewMode. It validates capacity relationships without allocating pools or
 inspecting the filesystem. M04c2 supplies pure charged meters and timer
-budgets in `src/admission/work.rs` and `src/admission/timers.rs`. M04c3a
-supplies pure physical-space arithmetic in `src/admission/space.rs`. M04c3b1
-supplies fixed logical leases and linear effect tickets in
-`src/admission/logical.rs`, using `src/admission/quota.rs`. M04c3b2 supplies
-the scalar writer/checkpoint ledger in `src/admission/writer.rs`. M04c3b3
-owns the composed physical reservation coordinator. Its first increment,
-M04c3b3a, supplies bounded filesystem registration and linear probe matching
-in `src/admission/filesystems.rs`. M04c3b3b composes atomic admission and effect
-accounting in `src/admission/coordinator.rs`. M04c3b3c1 adds causal probe
-fences in the registry; M04c3b3c2 adds conditional checkpoint transfer and
-reopening in `src/admission/coordinator/checkpoint.rs`.
-M05b2b2a supplies bounded descriptor-based space observations as specified
-in STORAGE.md. Filesystem qualification, shared-capacity identity and binding
-these observations to the coordinator remain pending. M05/M08 supply
-persistence and maintenance; M13 owns request retention. No running admission
-coordinator is claimed.
+budgets in `src/admission/work.rs` and `src/admission/timers.rs`. Fixed logical
+leases and linear effect tickets live in `src/admission/logical.rs`, using `src/admission/quota.rs`.
+The scalar writer/checkpoint ledger is in `src/admission/writer.rs`.
+Runtime locking, actual I/O, cleanup proofs and recovery remain M05/M08.
 
 ## 1. Disk accounting
 
 Disk lengths, offsets, counts and arithmetic use checked u64 values. Convert
 only an individual bounded I/O chunk to usize. A four-GiB quota is not a
 four-GiB allocation or an assumption that every target has 64-bit usize.
-One coordinator serializes accounting and reservations for the store, grouped
-by backing filesystem where logs or private scratch reside elsewhere.
+One coordinator serializes logical accounting and reservations for the store,
+including logs and private scratch even when they reside on separate mounts.
 
 The default personal profile has these ceilings. MiB and GiB are binary units.
 These are caps on use, not files preallocated to every cap at startup.
@@ -91,14 +79,14 @@ deletion reclaim the logical quota; neither may bypass QUEUE.md's minimum
 retention or uncertainty acknowledgements. Status reports pending and retained
 counts separately so this refusal is diagnosable.
 
-Count new shard directories and temporary metadata/control files in the
-filesystem inode reservation, even though they are not body files. All 256
+Bound new shard directories and temporary metadata/control files by their
+format/job limits, even though they are not body files. All 256
 shards may be prepared during startup; if created later their publication and
 directory sync remain part of the admitted operation. A checkpoint's projected
 live size is computed from the final row changes before commit, with checked
 old/new record lengths. Tombstones do not let a live table exceed its quota.
 Size-nonincreasing deletion remains possible at a full logical quota, subject
-to journal, response and physical completion capacity.
+to journal/response quotas and successful filesystem operations.
 
 The service reconstructs charges under LOCK before opening listeners, including
 private/orphan files, every selected/unselected/retired/building generation,
@@ -132,11 +120,11 @@ the whole group; every applicable category must fit used plus pending plus
 new charges before any group is installed. Constructor use comes from trusted
 store reconciliation and cannot exceed configured caps. These counters are
 not disk authority. The helper does not grant filesystem or writer permission;
-M04c3b2/M04c3b3 must couple its reservation to the checkpoint and space gates.
+M08 must couple its reservation to the writer and checkpoint state.
 
 Group and part tokens validate the complete process-local slot generation.
 A bounded extension increases a part's reservation without allocating another
-cell; the composed coordinator also requires fresh physical admission.
+cell; writer state and all logical caps still apply.
 Initially zero amounts disable their positions for the lease lifetime; an
 extension cannot activate them. An enabled position consumed to zero keeps
 its kind and can be extended. Packed kinds and amounts avoid pair padding. A
@@ -152,11 +140,11 @@ prove zero growth. Cancel releases only unused reservations; used raw/orphan
 charges remain. The logical helper has no public operation to release used
 charges. M05/M08's object ledger and proven cleanup/commit transitions own
 that later integration; a freed lease token cannot authenticate object cleanup.
-M04c3b2/M04c3b3 wrap this same logical ledger, without duplicate quota-used
-counters. Typed journal commit/rollover and object cleanup transitions must
+The writer and future runtime coordinator wrap this same logical ledger,
+without duplicate quota-used counters. Typed journal commit/rollover and object cleanup transitions must
 account for all recycled buckets, including scratch and logs. Proven effect
 amounts are trusted adapter inputs, not capabilities against arbitrary code.
-The composed coordinator must restrict who can supply that proof.
+Runtime integration must restrict who can supply that proof.
 
 The coordinator's job registry retains every lease and effect ticket until
 completion. Both handles carry must-use diagnostics. Bounded expiry enumeration
@@ -183,13 +171,13 @@ segment header. Zero committed frame bytes and zero operations must agree.
 
 Preparation checks all logical caps and derives the checkpoint bound from
 selected tables plus committed, pending and candidate frame bytes/operations.
-A prepared request holds an exclusive ledger borrow through the future physical
-assessment; dropping it changes nothing. Installation rechecks its deadline
+A prepared request holds an exclusive ledger borrow through installation;
+dropping it changes nothing. Installation rechecks its deadline
 and atomically acquires the logical cells. A framed job appends one dedicated
 frame cell to at most seven ordinary cells. Generic requests/effects reject
 active/closed journal, checkpoint and live-metadata quota kinds even at zero
-amount; these require writer or maintenance transitions. The composed
-coordinator supplies physically checked extensions for ordinary parts. A frame
+amount; these require writer or maintenance transitions. Ordinary parts may
+be extended only within their logical caps. A frame
 reserves its full ceiling at initial admission and cannot be extended.
 
 Only one dedicated append ticket may be in flight. Its actual byte/operation
@@ -198,7 +186,7 @@ fit the minimum encoded size for that many operations. M08 still validates
 the serialized frame. Proven durable completion moves exactly those amounts
 from pending to used and atomically releases the unused frame remainder.
 A frame reservation permits only one successful transaction; separated appends
-cannot reuse its rounded physical budget. Proven no-write completion leaves
+cannot reuse its logical frame budget. Proven no-write completion leaves
 the reservation unchanged and permits retry. An uncertain
 append keeps its ticket busy and pending and stops writer admission: the active
 EOF may have a torn tail, so checkpoint rollover is unsafe before recovery.
@@ -223,317 +211,59 @@ selected table length must fit the committed-only output bound and
 live-metadata cap; uncommitted reservations cannot explain selected output.
 Invalid selection leaves counters unchanged and stops the writer, because
 the adapter reported an already durable on-disk change. Success enters
-AwaitingSpace; the standalone scalar barrier has no public reopen operation.
-Runtime integration uses the composed coordinator's building reservations and
-post-fence physical admission. The standalone scalar barrier itself does not
-reserve building/retention quota or transfer physical capacity. Both paths
-share selection-bound validation and the quota rollover projection. M08's
-exact live-metadata updates, selected identities, publication proof and cleanup
-authority are also still required.
+AwaitingRecovery. The scalar model has no public reopen operation; M08 must
+reconcile selected identities, output/orphan charges, journal rollover and
+view pins before opening runtime admission. Building/retention quota accounting
+belongs to that same future runtime integration.
 
-## 2. Free space and completion reserves
+## 2. Logical reservations and I/O failure
 
-Keep 128 MiB of filesystem free space above all outstanding reservations, and
-4096 free inodes where the filesystem reports a meaningful inode count.
-M04 permits raising these floors, never lowering them below these defaults.
-A worker samples available bytes/inodes before granting disk admission; a
-cached health sample alone cannot authorize a new body or maintenance run.
-Missing or failed byte probes refuse write startup/admission. Unsupported
-inode reporting is explicit in health: enforce the file-count cap and ordinary
-write-error behavior, without claiming an inode guarantee.
-These floors apply independently to every backing filesystem used by the
-service, including separate scratch/log mounts. A smaller dedicated mount is
-an unsupported configuration and fails startup validation. Request/sort scratch
-on tmpfs also counts against host/cgroup memory and is unsupported by the
-default low-memory deployment profile; use disk-backed private scratch.
+Admission enforces configured logical byte/file quotas, fixed request slots,
+writer state and work deadlines. It does not query physical free bytes, inodes,
+filesystem type, allocation granularity or quota profiles. There are no
+`free_bytes` or `free_inodes` settings, probe tickets or backing-capacity keys.
+Unknown disk statistics remain unavailable in health; startup never fabricates
+capacity from quota ceilings. Quotas bound service growth, not other writers,
+filesystem metadata, compression, snapshots or the host's available blocks.
 
-The physical reservation includes rounded remaining data growth, new files and
-all namespaces sharing that filesystem. Round each growing file using the
-probe's allocation unit, with checked arithmetic; metadata allocation overhead
-is covered by the free-space floor rather than a false exact prediction.
-Already written bytes are not outstanding bytes; moving a charge between those
-states must be atomic in the coordinator. Filesystem compression, snapshots,
-quotas and other host processes can still cause ENOSPC or sync errors. The
-reservation does not prove that a future write will succeed.
+Operators provision headroom for coexisting selected/retired/building metadata,
+message bodies, response/sort scratch, logs and cold state. Disk-backed scratch
+is the low-memory deployment default; tmpfs use adds host/cgroup memory outside
+the service's RSS. No spare-block guarantee is made, even for admitted work.
+External filesystem quotas and ordinary monitoring may be used by deployment;
+none is a runtime dependency or an admission oracle.
 
-Sampling must also account for writes concurrent with the probe. Per filesystem,
-keep checked monotonic counters of completed charged byte growth/new inodes.
-Capture them before starting the probe. Under the coordinator at grant time,
-subtract every subsequent counter increment from the reported available space,
-as well as remaining/pending-I/O reservations, completion reserve and floor.
-An in-progress write remains reserved until completion atomically moves its
-charge to those counters. A newer probe can reconcile older completed growth;
-never credit deletion before a probe observes the freed space. This may count
-some concurrent growth twice, conservatively, but cannot count it as free twice.
-Use space available to an unprivileged user, not privileged reserved blocks.
-Before granting, also check that completed plus pending, checkpoint and new
-reserved growth fits the monotonic counter domain, including inode counts
-when the physical inode probe is unsupported. Exhaustion refuses before I/O;
-never wrap a counter after an admitted write has already happened.
+Before mutation reserve the maximum logical body, frame, response and category
+charges. Count a blob once in raw bytes even when upload/queue logical categories
+overlap. Keep written/orphan charges until proven cleanup. Checkpoint output
+bounds use selected table lengths plus committed/pending/candidate journal bytes,
+plus 36 bytes per journal operation and a 1 MiB format overhead allowance.
+This checked length bound is not rounded disk allocation. The new journal's
+96-byte header is separate. M08 must reserve building output within checkpoint
+quota, preserve outstanding frame leases across rollover and account old/new
+files until cleanup. Client-slot exhaustion must not prevent bounded maintenance.
 
-The implemented space evaluator consumes one filesystem's successful probe,
-its captured completed counters, current counters, protected checkpoint
-capacity for the resulting state (including the new request) and a new
-request rounded per file. The request retains its rounding unit; a probe
-reporting a different unit refuses evaluation. It returns remaining bytes
-and explicit available/unsupported inode headroom. It mutates no state and
-grants no lease. The coordinator must match the open filesystem identity and
-fresh probe, reject probe failure, and atomically install all passing
-reservations and the resulting checkpoint reserve before another evaluation.
-All namespaces on that filesystem share counters. The file-growth helper
-assumes the old allocation was already charged; shrinking or deleting a file
-gives no immediate physical credit. Round each file separately. A partial or
-failed write retains its pending charge until the coordinator accounts for
-its completed growth; unused reservation release cannot release written/orphan
-bytes. Ordinary byte/inode shortage, including a floor larger than available
-space, remains distinct from exhausted monotonic counters.
+A reservation promises only logical room. Every create, write, flush, file sync,
+publication and directory sync can fail. Return temporary protocol failure
+before acceptance, retain partial-output charges, and stop new mutations when
+journal/selection durability is uncertain. Do not treat an error as proof that
+no bytes were written. Recovery must establish the committed prefix and selected
+generation before the writer reopens. Pure private-body failures may be cleaned
+up without declaring journal corruption; record the actual failure domain.
+Already committed operations remain committed even if later response output fails.
+Never emit SMTP success or JMAP creation success before required durable steps.
 
-A free-space probe must use the actual open store/filesystem identity, not a
-shell utility or a client-supplied path. Safe std currently supplies no portable
-free-space/inode probe. M05b2b2a implements the narrow fstatfs observation
-surface recorded in UNSAFE.md section 22 and STORAGE.md. It allocates no Rust
-memory but does not establish backing identity, qualify filesystem policies,
-or bind a result to a coordinator ticket. Its counting unit is not yet an
-allocation granularity, and its returned fields are not an admission Sample.
-Those conversions and quota/feature policies remain M05b2b2b requirements.
-Injected samples still drive the coordinator's boundary and reservation tests;
-an arbitrary successful space snapshot is not an admission credential.
+Disk full can prevent maintenance or deletion transactions as well as receipt.
+Expose refusing-mutations health and require operator capacity repair when
+needed. Do not delete acknowledged mail or pinned history, silently release
+orphan charges, or loop on failing writes to manufacture progress. Bounded
+retry/backoff applies to recoverable private-output failures; uncertain commits
+require recovery. A checkpoint must honor generation pins and logical quotas
+before starting, and cannot publish partial output after a failure.
 
-Before admitting each mutation, preserve enough additional physical capacity
-to checkpoint its resulting state: the selected table lengths plus committed
-journal bytes plus outstanding reserved frame bytes, plus 36 bytes for each
-committed/reserved journal operation, and bounded new table/manifest/CURRENT
-overhead within the additional 1 MiB generation allowance. A table record's
-48-byte overhead exceeds a PUT operation header by 36 bytes; even DELETE/CHANGE
-are conservatively counted in this correction. Directory inode reservations
-and the filesystem metadata floor are separate. This is a conservative streaming
-merge upper bound; replaced rows and tombstones can only reduce the output.
-Keep this reserve distinct from admitted body/WAL/response completion charges.
-It is reusable checkpoint capacity, not a new full reservation per client.
-The checkpoint helper returns an unrounded total. When individual output
-lengths are not yet known, bound the sum of per-file rounded lengths by
-`round_up(total, unit) + (file_count - 1) * unit`, with checked arithmetic.
-Count every prospective file, including all eleven tables, manifest and
-CURRENT temporary; reserve new directory/file inodes separately. This padding
-is required even when an allocation unit exceeds the 1 MiB format allowance.
-The RoundedGrowth total-bound constructor implements this conservative bound.
-In addition to the thirteen generation files and fourteen file/directory
-inodes, protect a fresh active journal: round its 96-byte header separately
-and reserve one more inode. Closing the old journal changes its logical quota
-category, without physical growth from the rename itself. Transfer outstanding
-leases to the new journal during the checkpoint barrier; they keep their
-charges and identities and acquire no sequence early. Transferable WAL leases
-reserve `round_up(frame_bytes, unit)` independently of the old active EOF;
-its available trailing block cannot be assumed to exist at the new journal's
-EOF. The bound `round_up(x + n) - round_up(x) <= round_up(n)` preserves capacity
-across that rebase. M04c3b3 enforces these physical reservations and transfers.
-
-Maintenance, cache rebuilds, logging and new requests cannot borrow the space
-needed to finish admitted commits or the last permitted checkpoint. If retiring
-the current generation would exceed two pinned retired generations, defer that
-checkpoint/admission; an unpinned current generation adds no retired pin.
-Never remove a pin to force progress. Checkpoint/scratch quota
-pressure is retryable storage unavailability. It is not permission to delete
-acknowledged mail, failed submissions or advertised/pinned history.
-
-An online backup writes to an explicitly chosen external destination, with
-independent free-space checks and a bounded output reservation. Its output is
-outside store quotas; source generation/body pins still count normally. Do not
-create a backup hardlink farm or silently use the active store as its target.
-
-### Filesystem registration and probe matching
-
-M04c3b3a keeps at most sixteen caller-backed filesystem entries. All configured
-namespaces sharing available-space capacity must receive the same BackingKey
-from the trusted adapter and use the same registered FilesystemId. Duplicate
-keys reuse a slot; an inconsistent allocation unit refuses. The key is an
-adapter-assigned value, not a pathname or a promise that a kernel device number
-alone identifies shared capacity. M05 must establish it from pinned descriptors
-and account for mount aliases. No actual identity discovery happens here.
-Registration uses checked process-wide slot generations, so a retired,
-reconstructed or foreign registry's identifier cannot authorize a new entry.
-
-The registry captures monotonic completed growth before a worker begins the
-probe, retaining its start Tick as well as its deadline. A non-Clone ProbeTicket
-becomes a non-Clone Observation only after a
-successful adapter result with a nonzero allocation unit. Failed probes produce
-no observation. Multiple probes can overlap and finish out of order; no
-latest-only serial rejects an otherwise valid earlier sample. The consumer
-removes an observation from its caller-owned Option on every attempt, including
-refusal. It matches the live filesystem identifier, deadline and pinned unit,
-and refuses regressed completed byte or inode counters. Deadline equality is
-expired, and a current Tick before the captured start is invalid. Unsupported
-inode reporting remains explicit in the sample. The composed coordinator
-must clamp the probe window to `WorkLimits::admission_seconds` and the
-enclosing deadline; an arbitrary request deadline is not a probe freshness
-bound.
-
-A CheckedSample retains identity, epoch, start/deadline, captured counters
-and sample. It is matched data, never a lease or I/O permission. The
-composed atomic grant must consume it by value and recheck its identity,
-epoch, deadline, allocation unit and counter ordering under the same
-exclusive coordinator state that installs the reservation. Checkpoint
-reopening requires a probe begun after selection, with an ordering fence
-owned by the barrier; equal millisecond Tick values alone cannot establish
-that order. M04c3b3c1 supplies this registry fence through
-`invalidate_probes`: it advances one checked registry-wide probe epoch
-atomically. All tickets retain the epoch captured before sampling. Both
-observation consumption and final physical assessment reject a different
-epoch, including observations already matched before the fence. A staged
-assessment uses its projected epoch, so an uncommitted fence cannot admit an
-old sample through that projection. Probes begun within one epoch may still
-complete out of order. Epoch exhaustion refuses without changing the
-registry; there is no wraparound or partial invalidation. The fence changes
-no identity, capacity counter or lease reference.
-
-M04c3b3c2 must invoke this fence after accounting for durable selection,
-while admission remains closed, and require successful post-fence probes
-before reopening. A failed fence cannot permit reopening. The standalone
-registry operation establishes ordering only; it does not publish a
-checkpoint, grant capacity, or establish the caller's selection/worker
-authority. M05 must take the actual space sample after issuing the ticket,
-not attach cached probe data to a ticket issued after the fence. Precompute
-every filesystem counter/reference update before installing lease cells;
-publish those updates infallibly only after successful logical installation.
-Failed multi-filesystem grants discard all their samples. The registry
-itself exposes no public capacity-counter mutation; the composed coordinator
-owns its accounting transitions.
-
-Filesystem retirement refuses pending growth, protected checkpoint capacity
-or any live lease reference, including a lease with zero physical growth.
-Outstanding probes own no capacity; retiring/re-registering makes their old
-identifiers stale. Completed counters may reset only with that new identity
-and a fresh probe. M05's owner detaches every configured path alias before
-retiring their shared entry; registration does not count path attachments.
-Dropping the registry leaves occupied cells and prevents accidental table reuse.
-An orderly reset reconciles effects through the live coordinator before drop.
-An abandoned coordinator requires full store reconciliation under LOCK before
-fresh bookkeeping is constructed; inspecting or blindly clearing old cells is
-not reconciliation. The guard is not an integrity boundary against the trusted
-backing-memory owner.
-Unexpected post-acquisition bookkeeping failures poison the registry.
-
-### Combined reservation implementation
-
-M04c3b3b's Coordinator owns the writer ledger and filesystem registry with no
-mutable escape to either. Its metadata filesystem identities are fixed at
-construction; the entire registered filesystem set is fixed in this increment,
-including log/scratch mounts. Registration/retirement remain standalone
-registry operations until configuration integration supplies an owned route.
-It accepts only a pristine logical lease table; recovered usage
-and selected lengths still come from one trusted startup snapshot. It starts
-closed, then initializes only after fresh samples cover the separately rounded
-generation output and fresh journal header. Metadata locations sharing one
-filesystem aggregate their demand before applying that filesystem's floor.
-
-Each ordinary request supplies four logical charges and one rounded physical
-budget bound to a registered filesystem. One group has at most eight parts,
-including its optional last, dedicated journal part. The physical binding is
-stored in the same lease cell. The adapter owns the proof that these budgets
-cover the proposed objects and categories. This API does not infer file
-identity, make syscalls or prove serialized journal contents.
-
-Admission consumes all supplied CheckedSamples, including on refusal. It
-rechecks identity, allocation unit, start/deadline, maximum probe age and
-completed counter ordering while holding both ledgers exclusively. Every
-requested filesystem and both metadata locations require exactly one sample;
-duplicate, unnecessary or missing samples refuse. Slot-generation contention
-also discards all samples without publishing charges; the scheduler retries
-with new probes on a later turn. The assessment uses old
-pending growth, the resulting checkpoint reserve and new growth once each.
-A fixed filesystem projection validates byte/inode additions and lease
-references before logical installation. Logical installation precomputes all
-records and returned tokens before publication. The final filesystem publish
-has no fallible operation. No successful logical grant can escape without its
-physical reservation, and ordinary failures publish neither ledger.
-
-Ordinary extensions use fresh samples and the same staging rule without
-allocating a new cell or reference. Frame reservations cover one complete
-transaction and use a rounded frame-length ceiling independent of active EOF.
-A proven synchronized append charges actual rounded growth and releases all
-unused logical/physical frame capacity together. Proven no-write permits retry;
-uncertain append keeps its pending capacity and busy ticket and stops the
-writer.
-The dedicated frame cannot be extended or reused after a successful append.
-
-Ordinary I/O uses linear tickets bounding both logical and physical effects.
-Proven completion charges only reported bounded effects; uncertain completion
-charges the whole plan. Invalid proof leaves both ledgers and the live ticket
-unchanged. Existing I/O can finish after expiry or a writer stop. Cancellation
-refuses busy groups and releases unused growth plus one filesystem reference
-per cell. Used/orphan charges and monotonic completed growth remain. Fully
-spent or zero-growth cells retain their filesystem reference until cancellation.
-Cancellation and short journal completion may leave checkpoint protection
-conservatively high; the next fresh admission recomputes it. No deletion credit
-or used-quota cleanup is inferred from freeing a lease.
-
-### Checkpoint attempt implementation
-
-M04c3b3c2 keeps one dedicated checkpoint attempt outside the 64 client lease
-cells. Its record and checked attempt sequence fit 512 bytes in the existing
-control arena. A full client table cannot prevent checkpoint reservation.
-An opaque, non-Clone token pairs the fixed generation-filesystem identity with
-the checked attempt sequence; stale or foreign tokens change nothing. The
-registry is owned privately, so another coordinator cannot share that identity.
-An abandoned token keeps admission closed; the service must retain tokens or
-restart/reconcile under LOCK. It cannot infer zero effects from their loss.
-
-Before `begin_build`, M08 holds the actual writer/view barrier and proves pin
-eligibility. The coordinator refuses an in-flight append and checks closed
-journal caps. It derives building output from selected tables and committed
-frames/operations only, bounded by the protected reserve which also includes
-pending frames. It transfers this generation bound plus the fresh journal
-header from protected capacity to pending growth. Shared filesystem amounts
-are aggregated in the same projection. No additional probe, floor or duplicate
-physical charge is needed because total reserved capacity does not increase.
-The same transition reserves CheckpointBytes alongside all already used,
-selected, retired and orphan output. Quota refusal leaves both physical state
-and writer phase unchanged. Existing journal lease identities and reservations
-are retained; new grants, extensions and appends remain closed. Existing raw
-I/O and lease cancellation remain available directly through the coordinator.
-
-The attempt's deadline is the enclosing deadline intersected with the configured
-checkpoint wall-clock limit. One linear build I/O ticket at a time bounds new
-generation bytes and rounded generation/header growth. Completion stages both
-filesystems and the shared quota ledger before publication. A proven result
-charges its exact bounded amounts; uncertainty charges the plan and marks the
-attempt unsuitable for selection. Invalid proof keeps the effect pinned.
-Already admitted I/O can report completion after its deadline or a writer stop.
-The worker owns proof that reported I/O has finished; these counters do not
-validate file contents or authorize publication.
-
-Before any selection, a quiescent zero-effect abort restores the transferred
-capacity and releases its unused quota, reopening the unchanged writer.
-After any written or uncertain effect, abort retains completed growth and used
-checkpoint/orphan bytes, releases only unused reservations, invalidates probes
-and enters AwaitingSpace on the old selected generation. Cleanup credit still
-requires M05/M08's object and unlink proofs. An abandoned fresh journal header
-is outside logical generation and selected/closed journal byte quotas: its
-rounded bytes and inode remain charged as completed physical growth, and
-fresh probes include the orphan. M05/M08 must reconcile these private files
-before retry loops can claim bounded orphan retention. Losing an I/O ticket
-leaves the attempt busy; expiry cannot supply a worker-quiescence proof.
-
-`select_build` reports an already durable, validated selection from M08. The
-accounting guard requires no in-flight/uncertain build I/O, charged generation
-bytes covering the selected tables, all generation file/directory inodes,
-rounded growth covering charged output, and a fully charged fresh journal
-header. These are accounting consistency checks, not a serialization proof.
-Selection releases unused building reservations, retains used output including
-old selected/retired generations, rolls committed frames and the old header
-into closed-journal quota, resets only committed active usage, and advances
-the probe epoch in the same exclusive transition. Outstanding journal parts
-keep their identities and rounded physical reservations. A matching but invalid
-selection report or an uncertain selection stops the writer and retains the
-attempt for reconciliation; a foreign token cannot stop another coordinator.
-
-Successful selection enters AwaitingSpace. `reopen_after_checkpoint` consumes
-fresh samples for both metadata locations, derives protection from the new
-selected baseline and unchanged outstanding frames, and assesses floors and
-completed growth before opening admission. A pre-selection probe refuses even
-at the same Tick, whether it was still running or already matched. Failure
-leaves admission closed with counters unchanged. Exact live-metadata updates,
-actual CURRENT publication, view pins and authoritative cleanup remain M08.
+An online backup uses a chosen external destination, bounded output work and
+ordinary I/O failure handling. It is outside store quotas; source pins remain
+accounted. Do not create a backup hardlink farm or target the active store.
 
 ## 3. Work budgets and deadlines
 
@@ -887,14 +617,6 @@ and Tick overflow. They
 do not exercise sockets, scheduler priority, cancellation or allocation/RSS.
 Those remain tests at the consumers below.
 
-M04c3a fake-sample tests pin per-file rounding, exact byte/inode floors,
-pending/last-checkpoint preservation, completion transitions concurrent with
-a probe, fresh-probe reconciliation, unsupported inodes, counter regression,
-pre-effect counter headroom (including pending/checkpoint growth), allocation
-unit matching, multi-file rounding slack and the journal-operation correction. These are
-arithmetic tests, not evidence of fresh probe matching, reservation ownership,
-atomic live grants, orphan recovery or an actual filesystem adapter.
-
 M04c3b1 tests pin independently configured quota mappings, duplicate grouped
 charges, all-or-nothing cap/late-ticket refusal, fixed capacity and record
 layout, stale/foreign tokens, extensions, effect pinning, uncertain/orphan
@@ -902,8 +624,8 @@ charges surviving cancellation, deadline/completion separation and rejection
 of startup use above a cap. Expiry enumeration covers short output buffers and
 busy non-root members; overflow and disabled extensions preserve the book.
 These tests exercise logical state transitions;
-physical coupling, writer barriers, actual cleanup and live probes remain
-M04c3b3/M05/M08 gates.
+runtime writer barriers, actual cleanup and durable effects remain
+M05/M08 gates.
 
 M04c3b2 tests derive checkpoint bounds from used/pending/candidate counters,
 exercise serialized proven/uncertain appends, reject generic writer-quota
@@ -914,47 +636,14 @@ cases pin append-ticket replay, one successful transaction per frame lease,
 barrier expiry handling, stopped completion handling, dropped/uncertain
 barriers, committed-only selection bounds and exact closed-quota fits.
 
-M04c3b3a tests cover registry/constructor bounds, occupied state, reconstruction,
-poisoned refusal, alias deduplication, stale/foreign identity, single observation
-consumption, overlapping probes, start/deadline metadata and both counter
-regressions. Counter changes are injected fixture state to exercise retirement
-and probe matching. These tests perform no filesystem syscall, real identity
-derivation, live growth accounting or atomic physical/logical grant.
-
-M04c3b3b tests exercise coupled grants on shared and distinct filesystems,
-late shortage with no publication, completed growth during a probe, consumed
-expired/over-age and unnecessary samples, partial/uncertain effects,
-invalid and foreign tickets,
-quota failure after physical extension staging, one-shot frame completion,
-writer-stop accounting and all 64 cells including physical bindings. These use
-injected probes and effect proofs; real filesystem effects remain M05/M08.
-
-M04c3b3c1 tests reject both unfinished probes and already matched samples
-across a fence at an identical Tick. Fresh probes at that same Tick remain
-usable and can finish out of order. A staged fence refuses old samples before
-publication, and epoch exhaustion preserves the registry. Successful and
-refused fences preserve identities, capacity and live
-references, within the existing sixteen-entry memory bound. Checkpoint
-publication and reopening are not exercised by these registry tests.
-
-M04c3b3c2 tests cover checkpoint admission with all client cells occupied,
-overlapping quota refusal, unchanged total physical protection on shared and
-separate filesystems, raw completion/cancellation while closed, committed and
-reserved journal rollover, same-Tick stale probes, failed/retried reopening,
-partial and uncertain aborts retaining orphan charges, invalid/foreign effects,
-lost tokens, deadline/sequence exhaustion and inconsistent durable reports.
-The dedicated state has a 512-byte layout assertion. These remain injected
-accounting tests; they perform no actual file write, sync, selection or unlink.
-
 M04/M05/M08/M13 add tests at their real execution boundaries, not document-only
 assertions: concurrent quota reservations cannot overbook; failed publications
-keep orphan charges; byte/inode probes fail closed as specified; admitted
-commit space survives a cache/GC attempt; pinned generations block checkpoint
+keep orphan charges; logical reservations survive competing cache/GC work; pinned generations block checkpoint
 admission; every maintenance limit resumes service without unsafe reclamation.
 Inject failures before/after selection, sync and response-file writes.
 Include minimum-row metadata at configured caps, at least one full successful
 GC traversal across bounded proof/unlink windows, startup private-body/unselected-checkpoint cleanup,
-concurrent-probe counter transitions, and history pins across journal rollover.
+disk-full refusal/recovery and history pins across journal rollover.
 
 M09/M11/M17 own DNS, receiving and smart-host timer/slow-peer tests; M13 owns
 HTTP execution-versus-transmission timers and per-byte transfer bounds. M20

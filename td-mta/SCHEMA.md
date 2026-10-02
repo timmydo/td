@@ -403,15 +403,16 @@ does not perform that check. Combined key/chain PEM files are unsupported;
 keep the key in its separate private file. Successful permission checks
 alone cannot authorize exposing a secret as a signature.
 
-M05 must validate the opened regular file and its pinned ancestor chain.
-Each owner must be root or the deployment's actual service UID; reject
+M05 must validate the opened regular file and its stable ancestor path.
+Each owner must be root or the dedicated data-root owner; reject
 symlink components and group/other-writable files or ancestors, including
 sticky writable ancestors. Reject execute and special bits on input files.
 Relay passwords and private keys additionally require no group/other
 permissions (`0400` or `0600` with owner read access). Other roles can be
 readable by group/others, but retain every ownership and write-protection
-check. `requires_private_mode=false` does not waive those checks. The UID
-comes from the trusted process/deployment context, never an input reference.
+check. `requires_private_mode=false` does not waive those checks. The expected UID
+comes from the checked private data root, never an input reference. Deployment
+must run as that dedicated identity; std does not verify the process UID.
 Open/read checks run with the same unprivileged service credentials for
 `config check` and service startup; a privileged check is not a substitute.
 Root ownership is allowed only when that service can actually read the file.
@@ -421,15 +422,14 @@ rules exclude other UIDs, not compromise of the trusted service UID itself.
 Use physical paths: symlink aliases under `/etc` gain no special exception.
 
 These are adapter requirements, not properties established by the inventory.
-Checking pathname metadata before opening is insufficient; validate the
-actual descriptors used for reading. Refuse non-regular objects before a
-read-capable open can block on a FIFO or trigger device behavior; checking
-only after a potentially blocking open is insufficient. M05 must specify
-and review the concrete descriptor-opening mechanism and its syscall
-surface before implementation; this inventory introduces neither.
-Operators replace input files atomically and do not mutate their contents
-in place during validation. Untrusted concurrent writers to operator inputs
-are unsupported under this contract's ownership/write-protection rules.
+Under STORAGE.md's trusted stable-path contract, check each component with
+`symlink_metadata`, reject non-regular final files before read-capable open,
+then validate opened metadata and compare identity. These checks are not atomic
+against a hostile namespace writer. Operators may replace regular input files
+atomically during reload; identity mismatch refuses that candidate and keeps
+the active generation. They must not introduce symlinks/devices/FIFOs, rename
+ancestors or mutate input contents in place during validation. No direct syscall
+or C binding is required or preauthorized by this inventory.
 Metadata length
 is only a hint; bounded reading and actual EOF establish the raw byte limit.
 All material still obeys the aggregate text/provider budgets above.

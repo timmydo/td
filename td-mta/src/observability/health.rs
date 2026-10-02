@@ -7,7 +7,7 @@ use super::{
 use crate::bounded::{self, TextBuffer};
 use std::fmt;
 
-pub const MAX_DISKS: usize = crate::admission::filesystems::MAX_FILESYSTEMS;
+pub const MAX_DISKS: usize = 16;
 pub const MAX_STATUS_BYTES: usize = 4096;
 pub const MAX_UNAVAILABLE_BYTES: usize = 2048;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

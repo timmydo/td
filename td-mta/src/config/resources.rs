@@ -641,9 +641,7 @@ mod tests {
                 "response_bytes",
                 "response_total_bytes",
                 "cache_bytes",
-                "cold_bytes",
-                "free_bytes",
-                "free_inodes"
+                "cold_bytes"
             ]
         );
         assert_eq!(

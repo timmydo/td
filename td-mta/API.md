@@ -752,20 +752,20 @@ reused slot is rejected even if it has the same Rust type.
 Include every PUT, DELETE and retained CHANGE in frame bytes/operation count.
 Capacity is global across reservations and survives checkpoint transfer under
 STORAGE.md's barrier. No unaccounted frame/operation overrun may reach disk.
-DiskBudget separately reserves physical new-blob bytes/files, metadata
+DiskBudget separately reserves logical raw-blob bytes/files, metadata
 bytes/files and logical upload/queue quota increases (including a new pin on
-an existing body). Logical quotas may overlap physical bytes and are not
-added to them a second time. When size is unknown reserve the admitted maximum.
-ADMISSION.md fixes quota ceilings and checkpoint/free-space headroom; no blob creation
+an existing body). Upload/queue categories may overlap raw-blob charges and are not
+added to raw use a second time. When size is unknown reserve the admitted maximum.
+ADMISSION.md fixes logical quota ceilings and checkpoint output bounds; no blob creation
 may bypass this reservation. Exceeding a logical quota returns Quota; temporary
 pool/storage pressure returns Capacity/Busy. Dropping or expiring releases
 unused capacity once; already-written orphan bytes remain charged until cleanup.
 DiskBudget covers store operations. Request retention, sort/cache runs, logs
-and cold-state files have separate typed leases from the same filesystem
-admission coordinator; they cannot bypass its aggregate completion reserves.
+and cold-state files have separate typed logical leases. No lease reserves
+physical blocks or guarantees I/O success. All write/sync failures propagate.
 
 Store::begin_blob borrows an active reservation exclusively and charges its
-physical quota before creating the private file. BlobWriter writes whole
+raw-body quota before creating the private file. BlobWriter writes whole
 chunks or fails; after error the entire writer is poisoned and must be
 dropped, never retried with the same chunk. publish
 consumes it and returns only after file and publication-directory sync.

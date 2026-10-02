@@ -1,4 +1,4 @@
-//! Checked disk/work configuration. No filesystem admission or probe yet.
+//! Checked logical disk/work configuration. No physical-space probe.
 use crate::limits::ResourcePlan;
 
 pub const MIB: u64 = 1 << 20;
@@ -53,11 +53,8 @@ macro_rules! settings {
     };
 }
 
-pub mod coordinator;
-pub mod filesystems;
 pub mod logical;
 pub mod quota;
-pub mod space;
 pub mod timers;
 pub mod work;
 pub mod writer;
@@ -71,8 +68,6 @@ settings! { DiskLimits {
     response_total_bytes: 256 * MIB, 1, 4 * GIB;
     cache_bytes: 128 * MIB, 1024, GIB;
     cold_bytes: 16 * MIB, 1, 64 * MIB;
-    free_bytes: 128 * MIB, 128 * MIB, u64::MAX;
-    free_inodes: 4096, 4096, u64::MAX;
 } }
 
 settings! { WorkLimits {
@@ -105,7 +100,7 @@ pub enum ViewMode {
 }
 
 /// Immutable validated disk/work settings and independent logical quota caps.
-/// A future coordinator must still check observed use and physical free space.
+/// Runtime admission reconciles actual logical use; I/O can still fail.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Plan {
     disk: DiskLimits,
@@ -522,14 +517,6 @@ mod tests {
             },
             DiskLimits {
                 body_bytes: 1024 * GIB + 1,
-                ..DiskLimits::default()
-            },
-            DiskLimits {
-                free_bytes: 128 * MIB - 1,
-                ..DiskLimits::default()
-            },
-            DiskLimits {
-                free_inodes: 4095,
                 ..DiskLimits::default()
             },
             DiskLimits {

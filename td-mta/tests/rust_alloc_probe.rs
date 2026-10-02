@@ -692,43 +692,40 @@ fn entropy_workers() {
 }
 
 fn store_directories() {
-    use std::os::unix::fs::MetadataExt;
     use td_mta::{
-        store_fs::{Directory, PrivateRoot, RootError},
+        store_fs::{Directory, MAX_PATH_BYTES},
         store_paths::{Name, RootEntry},
     };
     let path = std::env::temp_dir().join(format!("td-mta-dir-alloc-{}", std::process::id()));
     std::fs::create_dir(&path).unwrap();
     std::fs::create_dir(path.join("accounts")).unwrap();
-    let root = Directory::from_file(std::fs::File::open(&path).unwrap()).unwrap();
-    let expected_uid = root.metadata().unwrap().uid();
-    // Exercise the effective-UID boundary in the portable runtime too. This
-    // does not certify the fixture's entire host ancestry as an admitted root.
-    match PrivateRoot::open("/") {
-        Ok(admitted) => assert_eq!(admitted.service_uid(), expected_uid),
-        Err(RootError::ServiceIdentity) => assert_eq!(expected_uid, 0),
-        Err(RootError::Owner | RootError::PrivateMode) => assert_ne!(expected_uid, 0),
-        Err(error) => panic!("root admission probe: {error}"),
-    }
-    // Portable runtime scratch is tmpfs; the executable is disk-backed.
-    // Observe its retained parent without creating or writing anything there.
-    let executable = std::env::current_exe().unwrap();
-    let space_directory =
-        Directory::from_file(std::fs::File::open(executable.parent().unwrap()).unwrap()).unwrap();
-    let unsupported = Directory::from_file(std::fs::File::open("/proc").unwrap()).unwrap();
+    let root = Directory::from_path(path.to_str().unwrap()).unwrap();
+    // Exercise std's conversion at the service's full path bound, not just
+    // common short deployment paths. Construct fixture paths before measuring.
+    let prefix = path.join("x".repeat(160));
+    std::fs::create_dir(&prefix).unwrap();
+    let tail_length = MAX_PATH_BYTES
+        .checked_sub(prefix.as_os_str().len())
+        .and_then(|remaining| remaining.checked_sub(1))
+        .filter(|length| (1..=255).contains(length))
+        .expect("allocation fixture TMPDIR must leave a valid maximum-path component");
+    let long = prefix.join("y".repeat(tail_length));
+    std::fs::create_dir(&long).unwrap();
     let present = Name::root(RootEntry::Accounts).unwrap();
     let missing = Name::root(RootEntry::Lock).unwrap();
+    let absent = long.with_file_name("z".repeat(long.file_name().unwrap().len()));
     let before = COUNTERS.snapshot();
     for _ in 0..64 {
         let directory = root.open(black_box(&present)).unwrap();
         assert!(directory.metadata().unwrap().is_dir());
-        let observation = space_directory.filesystem_space().unwrap();
-        assert!(observation.counting_unit > 0);
-        assert_eq!(
-            unsupported.filesystem_space().unwrap_err().kind(),
-            std::io::ErrorKind::Unsupported
-        );
         drop(directory);
+        drop(Directory::from_path(black_box(long.to_str().unwrap())).unwrap());
+        assert_eq!(
+            Directory::from_path(black_box(absent.to_str().unwrap()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
         assert_eq!(
             root.open(black_box(&missing)).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
@@ -737,7 +734,7 @@ fn store_directories() {
     assert_eq!(
         COUNTERS.snapshot(),
         before,
-        "directory lookup or space observation allocated"
+        "std directory lookup allocated"
     );
     drop(root);
     std::fs::remove_dir_all(path).unwrap();

@@ -25,13 +25,11 @@ validates complete frames and supplied journal streams with bounded counters,
 sequence continuity and sticky failure; it seals caller-built payloads in place.
 M05a3c binds history summaries to selected descriptors and active summaries to
 the caller's pinned committed prefix.
-M05b1 generates canonical storage paths. M05b2a opens directories relative
-to retained descriptors; M05b2b1 separately checks private data-root ancestry,
-ownership and permissions. M05b2b2a adds bounded descriptor-based filesystem
-space observations, including XFS as the primary deployment target.
-Filesystem qualification, shared-capacity identity, the writer lock,
-physical EOF, selected-graph validation, complete final-view semantics and
-persistent file I/O remain unimplemented.
+M05b1 generates canonical storage paths. The std filesystem adapter checks
+existing directory types, links and private-root permissions under an explicit
+operator-controlled stable-path contract. It performs no direct syscalls or
+free-space probes. The writer lock, physical EOF, selected-graph validation,
+complete final-view semantics and durable file mutations remain unimplemented.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented
@@ -42,16 +40,11 @@ state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
 M04's `bounded` and `ownership` modules provide caller-owned buffer/queue/slot
 primitives. Its `admission` module validates disk/work settings and derived
 capacity requirements and supplies charged work meters, timer budgets and
-physical-space arithmetic for injected probe samples. Fixed logical leases
-add grouped quota checks and effect tickets. The scalar writer ledger derives
-checkpoint needs from that same quota ledger and models a closed writer
-barrier. A bounded filesystem registry matches linear probe observations.
-The composed coordinator atomically couples logical and physical reservations,
-effects and cancellation. Checked epochs invalidate pre-fence probes even
-when their timestamps match later probes. A dedicated checkpoint attempt
-transfers protected capacity, charges overlapping output, preserves outstanding
-journal leases and, after any effect, keeps admission closed until post-fence
-probes pass.
+fixed logical leases with grouped quota checks and effect tickets. The scalar
+writer ledger derives checkpoint output bounds from those quotas and models a
+closed writer barrier. Physical free-space accounting is absent; bounded logical
+reservations cannot guarantee successful future I/O. M05/M08 still own actual
+publication, orphan accounting and checkpoint reconciliation.
 They do not instantiate service pools, perform live disk I/O or
 implement protocol handlers.
 
@@ -72,7 +65,7 @@ The service receives Internet SMTP for local recipients, stores and serves
 mail through JMAP, and submits outgoing messages through a configured smart
 host. It also supports receiving from an upstream gateway MX. It ships as
 one executable with all executable dependencies statically linked against
-musl for x86-64 Linux 5.6 or newer, with openat2 available. Files for
+musl for x86-64 Linux 5.6 or newer. Files for
 configuration, secrets, trust, and mail remain external. Data formats and interfaces must permit a future aarch64 build.
 
 Included in v1:
@@ -194,10 +187,8 @@ Replacing only the direct digest/signing operations does not replace TLS's
 cryptography. Retaining Rustls means td-crypto still has an external TLS
 implementation even after AWS-LC is removed.
 
-The production library denies `unsafe_code`, with only the confined directory
-lookup, effective-UID/space queries and descriptor adoption in UNSAFE.md
-section 22 allowed. The binary retains `forbid(unsafe_code)`. The separate
-test executable
+The production library and binary both retain `forbid(unsafe_code)`.
+The separate test executable
 `tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
 exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc
 implementation forwards all four operations to System without changing
@@ -427,10 +418,10 @@ the service does not support a data root with an untrusted concurrent writer.
 Create secret/mail files as 0600 and private directories as 0700, without a
 permissive creation window. Never derive a filesystem pathname from a mailbox
 name, address, attachment filename, or arbitrary client ID.
-The implemented descriptor directory lookup and private-root owner/mode walk
-are specified in STORAGE.md. Filesystem qualification and the writer lock
-remain pending. The narrow Linux syscalls and immediate descriptor adoption
-are recorded in UNSAFE.md section 22.
+STORAGE.md defines the std path checks, deployment identity and stable-path
+assumptions. The writer lock and durable mutations remain pending. The service
+uses logical quotas and handles disk-full/write/sync failures; it does not
+measure or promise physical free space before admission.
 
 Planned commands, with stable JSON output and exit codes:
 
@@ -748,7 +739,7 @@ a rate-limited stderr fallback. Logs are diagnostic evidence, not the journal
 or an acceptance condition. The supervisor must not rotate the same files.
 
 Expose counters for accepted/refused mail, TLS/plain sessions, active slots,
-limit refusals, queue age/depth, unknown outcomes, disk headroom, dropped logs,
+limit refusals, queue age/depth, unknown outcomes, logical disk usage/quotas, dropped logs,
 index lag, authentication failures and certificate expiry/renewal. `status`
 distinguishes serving, degraded, recovering and refusing mutations. Readiness
 requires valid local configuration, usable storage, configured listeners,
