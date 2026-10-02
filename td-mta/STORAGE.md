@@ -648,10 +648,34 @@ active readers also expose finish_reuse, with their existing finish APIs
 retaining the prior result type. Scratch is returned only after all completion
 checks succeed, whether the final frame is still present or End cleared it.
 An empty active input can likewise reclaim its untouched cells. No new arena or
-per-frame allocation is introduced. This locates within one selected segment;
-segment transitions, live pin ownership, full final-view validation and serving
-remain driver work. Every location step needs its own admitted full-frame work
+per-frame allocation is introduced. This locates within one selected segment.
+ChangeScan below coordinates transitions; live pin ownership, full final-view
+validation and serving remain driver work. Every location step needs its own admitted full-frame work
 unit/deadline check; blocking std calls retain their existing limitation.
+
+`LockedRoot::change_scan` joins the cursor and locator for one object kind,
+captured view and starting cursor. Construction validates metadata only. Each
+advance first checks exact view identity and caller continuation, then performs
+one bounded phase: open a selected source, read one frame, drain its retained
+changes, or verify/close a consumed source. Progress reports internal work and
+leaves the caller cursor unchanged. Record/Advanced preserve the cursor helper's
+stored ordinals, filtering and explicit whole-frame boundaries. The current
+frame is drained before the next read; locating cannot change the user cursor.
+
+A source must pass selected completion before its cells transfer to another
+source. Drop its completion descriptor before opening the next file. All errors
+retire the entire scan, including opening, cursor, reading and final digest/EOF
+errors. Complete is returned only after reaching the captured endpoint boundary
+and verifying/closing every opened source. Consuming finish then returns the
+original full scratch capacity. An initially exhausted range opens no file;
+completion covers only sources actually consumed. The scan does not validate
+unvisited history, an unused empty active prefix, the whole graph or live pins.
+
+Records and boundaries remain provisional. Publication requires the surrounding
+driver's selected-file/graph validation under actual immutable pins; this scan
+cannot establish those requirements or authorize early JMAP pages. The caller
+admits each work phase and its deadline; max_bytes caps each opened source,
+not total scan work. No record scratch survives advance.
 
 ### Scanning a stopped active journal
 

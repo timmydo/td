@@ -910,6 +910,14 @@ service activation. Each part lands independently:
     before the floor, both source types, append growth, premature finish, view/
     checksum/I/O failures and endpoint refusal. Existing allocation probes cover
     slot transfer and empty-prefix reclaim. Segment transitions/live pins remain.
+  - **M05d14i — sequential selected change scan:** implemented cursor/locator
+    coordination with separate bounded opening, locating, draining and completion
+    phases. Verify/close each source before transferring slots; retain caller
+    continuation during internal work and retire the entire scan on errors.
+    Tests cover source transitions, partial cursors, filtering, late corruption,
+    exact continuation, I/O refusal and exhausted ranges without I/O. Existing
+    allocation probes cover source transfer/reclaim. Runtime ReadView integration
+    and early-page validity/pins remain future.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

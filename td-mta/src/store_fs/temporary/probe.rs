@@ -125,6 +125,15 @@ pub fn run(mut snapshot: impl FnMut()) {
                 .try_into()
                 .unwrap(),
         );
+        super::super::change_scan::probe(
+            &fixture.root,
+            &active_probe,
+            history_scratch
+                .get_mut(..crate::format::table::MAX_RECORD_BYTES)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
         super::super::active_overlay::probe(
             &fixture.root,
             &active_probe,

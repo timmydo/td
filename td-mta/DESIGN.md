@@ -76,7 +76,9 @@ boundaries while draining supplied checked frames. A selected-route helper
 checks retained coverage and chooses a history descriptor or the captured active
 segment. A bounded locator now reads at most one frame per step within that
 source, hides earlier changes and returns reusable slots only after selected
-completion. Segment transitions and actual view-pin integration remain separate.
+completion. A sequential scan now coordinates cursor draining and checked
+source transitions with the same arena. Actual view-pin integration remains
+separate.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

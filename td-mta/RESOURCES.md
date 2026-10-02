@@ -798,6 +798,14 @@ or drop it before moving segments. Existing root-bound allocation intervals
 cover history-to-active scratch reuse, empty-prefix reclaim and target refusal.
 Actual streaming view ownership and complete-worker measurements remain pending.
 
+ChangeScan adds fixed cursor/source-transition state to one locator, borrowing
+one slot arena throughout. Its compiled Provider layout remains within 8 KiB.
+It drops a checked source completion before opening the next descriptor. Each
+advance performs one open, bounded frame read, bounded slot drain or completion;
+Progress changes no caller cursor. max_bytes is per source, and total scan work
+still needs driver admission. The existing allocation interval covers a history
+to active transition and successful full-capacity reclaim at both root bounds.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a

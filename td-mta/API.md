@@ -771,8 +771,16 @@ Frame or End. Locating hides earlier changes and does not change the caller's ch
 Frame permits draining the checked result before the next advance. Exact view
 identity is required on each advance. End alone proves no selected completion;
 finish verifies the source and returns typed completion plus reusable full
-CHANGE slots. The driver handles segment transitions, work/deadlines and real
-pins. These remain provisional filesystem building blocks, not ReadView service.
+CHANGE slots. ChangeScan below coordinates segment transitions; the driver
+admits work/deadlines and holds real pins. These remain provisional filesystem
+building blocks, not ReadView service.
+
+`store_fs::ChangeScan` connects that locator to the cursor for a fixed kind and
+starting position. Each advance returns internal Progress or a cursor Change
+step. It verifies and closes each consumed source before reusing slots for the
+next source, and retires on any failure. Complete/finish cover consumed sources
+only; an already exhausted range requires no file I/O. Returned changes retain
+the same provisional status and external validity/pin requirements.
 
 BlobReader is an already authorized, opened, immutable file with a live owner
 pin held until it closes. Store::open_blob requires Access and borrows the

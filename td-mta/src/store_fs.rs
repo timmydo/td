@@ -46,6 +46,9 @@ pub use change_locator::{ChangeCompletion, ChangeFrameStep, ChangeInput, ChangeI
 #[path = "store_fs/change_route.rs"]
 mod change_route;
 pub use change_route::{ChangeRoute, ChangeSource};
+#[path = "store_fs/change_scan.rs"]
+mod change_scan;
+pub use change_scan::{ChangeScan, ChangeScanRequest, ChangeScanStep};
 #[path = "store_fs/change_input.rs"]
 mod change_input;
 pub use active_changes::{ActiveChangesInput, CompleteActiveChanges};
