@@ -818,6 +818,45 @@ copies, not read leases. Its only ownership exit, into_stopped, consumes the
 proof before restoring offline access. No writable handle or activation
 authority is exposed.
 
+`VerifiedStore::with_journal` consumes the store and its recovered account
+ledger for a scoped JournalSession. Startup rechecks actual CURRENT, the
+complete active journal digest/extent and ledger counters under its
+deadline. It lends the session only after all checks; any error drops both
+owners. The callback receives the recovery frame scratch for reuse.
+Returning drops the session and store lock; neither the session nor a
+borrowed CommittedView may escape the callback.
+
+JournalSession::capture reserves one configured view slot (one through
+eight) and copies the entire ViewIdentity under a short publication mutex.
+Its borrowed CommittedView retains the session and selected namespace; only
+append beyond an already published prefix can change journal bytes. Drop
+returns the slot. Capacity or mutex contention refuses without waiting;
+poisoning retires new captures. These pins expose only identity and perform
+no filesystem reads. They do not relax low-level append exclusion against
+live query I/O. Serving ReadView remains separate.
+
+JournalSession::commit serializes one immutable frame under a separate
+writer mutex. It installs a frame-only reservation, advances bounded
+append/sync/confirm, reconciles actual charges and releases the empty
+reservation, then publishes the sequence and byte offset together. Clock
+checks bracket construction, each step and finish; a final check follows
+publication. Initial time/admission or writer-lock contention returns
+Rejected without starting append. A poisoned writer mutex or an already
+stopped writer returns Stopped even before reservation. Once reservation
+succeeds, any failure returns Stopped and prevents all future writes in this
+session. Full or partial bytes may exist; a final deadline failure can
+follow publication. Existing views retain their old identity. No failure
+rolls back bytes or visibility. Recovery requires a new lock, verification
+and ledger. Poisoning either mutex prevents success. Mutex critical sections
+for capture/publication contain no I/O or clock callbacks. Blocking
+filesystem calls and lock acquisition remain uninterruptible.
+
+The caller admits full frame work and supplies its actual recovered ledger
+and planned view count. Complete transaction/blob policy, read scratch
+leases, checkpoint/retention changes and protocol acknowledgment remain
+external. No selected namespace change is available during this
+fixed-generation session.
+
 `ScannedJournal::append_frame` is a mutation-capable low-level operation outside
 the stopped read-only facade. Keep actual stopped-store exclusion (no live readers
 or writers) from scan through completion. It consumes a scan without a partial tail,

@@ -19,8 +19,9 @@ pub use input::{
 #[path = "store_fs/stopped.rs"]
 mod stopped;
 pub use stopped::{
-    CaptureError, CaptureStep, CapturedJournal, CheckedData, CheckedFiles, DataError, DataLimits,
-    DataStep, DataValidation, FileValidation, JournalCapture, OwnedVerifyError, ReadLimits,
+    CaptureError, CaptureStep, CapturedJournal, CheckedData, CheckedFiles, CommitError,
+    CommittedView, DataError, DataLimits, DataStep, DataValidation, FileValidation, JournalCapture,
+    JournalError, JournalSession, JournalStart, JournalStartScratch, OwnedVerifyError, ReadLimits,
     StoppedStore, ValidationError, ValidationLimits, ValidationReadRequest, ValidationStep,
     ValidationView, VerifiedAccount, VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
 };

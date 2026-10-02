@@ -268,6 +268,16 @@ still account for those costs and concurrent owners within the ledger.
   This replaces the stopped owner at completion and adds no pool or arena.
   Its whole-worker stack and allocation qualification remain pending.
 
+  JournalSession fits 8 KiB, including the existing writer ledger, one
+  retained journal boundary and two mutex states. It borrows the consumed
+  VerifiedStore for its whole scope. Caller ledger cells/slots remain
+  preallocated; startup reuses selection and recovery-frame scratch,
+  returning the frame to the scoped callback. Reader pins use a bounded
+  counter (configured one through eight) and a borrowed owner plus copied
+  identity, without a new pool or arena. Actual read scratch leasing,
+  whole-worker stack and allocation qualification remain pending. No
+  filesystem I/O occurs under the publication mutex.
+
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
   that input to a temporary; complete worker-stack qualification remains pending.

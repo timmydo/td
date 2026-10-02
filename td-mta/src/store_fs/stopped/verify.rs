@@ -20,6 +20,12 @@ use crate::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "verify/publication.rs"]
+mod publication;
+pub use publication::{
+    CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifyLimits {
     pub capture_bytes: u64,
@@ -370,7 +376,7 @@ mod tests {
     };
     use td_crypto::Provider;
     const ACCOUNT: AccountId = AccountId::from_bytes([0x33; 16]);
-    struct Scratch {
+    pub(super) struct Scratch {
         metadata: SelectionScratch,
         frame: Box<[u8; MAX_FRAME_BYTES]>,
         frames: [u8; 4096],
@@ -409,6 +415,12 @@ mod tests {
                 changes: &mut self.changes,
                 key: &mut self.key,
                 value: &mut self.value,
+            }
+        }
+        pub(super) fn journal(&mut self) -> JournalStartScratch<'_> {
+            JournalStartScratch {
+                selection: &mut self.metadata,
+                frame: &mut self.frame,
             }
         }
         fn overwrite(&mut self) {
@@ -678,6 +690,16 @@ mod tests {
             Err(VerifyError::Policy(PolicyError::Deadline))
         ));
         assert_eq!(clock.calls.load(Ordering::Relaxed), 1);
+    }
+    pub(super) fn owned_fixture() -> (super::super::super::tests::Fixture, VerifiedStore, Scratch) {
+        let (dir, store, _) = prepare();
+        fixture::write(&store.root, &fixture::journal());
+        let mut scratch = Scratch::new();
+        let clock = TestClock::new(u64::MAX, 0);
+        let verified = store
+            .verify_owned_account(&Provider, &clock, ACCOUNT, limits(), scratch.borrowed())
+            .unwrap();
+        (dir, verified, scratch)
     }
     #[test]
     fn owned_verification_keeps_exclusion_releases_scratch_and_consumes_its_proof() {

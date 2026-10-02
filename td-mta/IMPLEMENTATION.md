@@ -1074,10 +1074,18 @@ service activation. Each part lands independently:
     return discards this proof before restoring offline operations. This
     prepares the owner for publication; reader leases, serialized live
     append and atomic visibility remain separate.
-  - **M05e3 — committed visibility:** planned; publish sequence and byte offset
-    together only after durable append and reservation reconciliation, retaining
-    selected-generation ownership for readers. Add crash/fault ordering oracles
-    before exposing any SMTP/JMAP acknowledgment path.
+  - **M05e3b — scoped journal publication:** implemented an owning scope with
+    startup digest/extent/ledger rechecks, one serialized writer and a
+    separate publication mutex. Bounded borrowed identity pins retain the
+    fixed selected namespace. Publish only after sync and reconciliation;
+    failures after reservation permanently retire writes, including a late
+    deadline after publication. Serving query I/O, scratch leases and live
+    checkpoint/retention transitions remain separate.
+  - **M05e3 — committed visibility:** serving integration remains pending.
+    Connect identity pins to read scratch and immutable prefix queries; retain
+    generation/history ownership across live checkpoint and retention changes.
+    Keep the durable append/publication ordering and fault oracles before
+    exposing any SMTP/JMAP acknowledgment path.
 
 Implement exclusive store access, generated private paths, streamed temporary
 blobs, digesting through the adapter, file/directory sync and journal commit.

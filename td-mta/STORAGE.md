@@ -579,6 +579,52 @@ store and verifies again. No failed attempt changes mail data or repairs files.
 This is the ownership transition for one configured account, without runtime
 reader leases, writer admission, recovery accounting or service activation.
 
+### Scoped committed visibility
+
+VerifiedStore can be consumed by with_journal together with the recovered
+writer ledger. Before entering its callback, re-read the selected metadata
+and complete active journal, compare CURRENT and the verified journal
+digest/extent, and check ledger byte/operation counters and open phase.
+Startup is deadline checked and uses caller selection/recovery-frame
+scratch. No incomplete tail is admitted. The callback receives the frame
+partition for reuse after scanning ends.
+
+The session retains the verified store and its lock throughout the callback.
+Its private writer state holds the ledger and either the initial scan or the
+last reconciled append owner. Only one writer can enter; reservation and I/O
+run under a writer mutex. A separate short mutex protects the published
+ViewIdentity and bounded reader count. Capture copies the entire identity
+and lends a CommittedView that borrows the session; it cannot escape the
+consuming scope. The whole selected namespace remains retained: there is no
+checkpoint, retention or writable-root operation in this session. These pins
+currently expose identity, not query I/O.
+
+A commit reserves one frame, performs bounded write/sync/confirmation and
+exact ledger reconciliation, releases the empty reservation, then replaces
+the published sequence/offset together. Old views retain their captured
+prefix. Work uses the existing immutable frame and reservation backing; no
+new arena is created.
+
+Pre-reservation time/admission or writer-lock contention does not retire a
+healthy session. A poisoned writer mutex or an already stopped writer
+returns Stopped before reservation. After reservation installation, the
+prior boundary is consumed and absent until successful completion. Any error
+or unwind after that point leaves no path to another append. Earlier
+publications remain valid; an incomplete or complete new frame is left for
+recovery. Deadline checks bracket each construction/advance/finish and
+follow publication. A failure of that last check may expose the newly
+durable identity without acknowledging success; it still retires the writer.
+No error rolls back a published identity. Poisoning either mutex refuses
+success. Reader capture uses try_lock, while publication and reader-slot
+disposal use short blocking locks without I/O or clock callbacks inside
+them. Drop never repairs files or proves an unwritten frame.
+
+Each commit requires admitted frame work, the actual recovered account
+ledger, and final transaction/blob policy supplied by its future
+coordinator. This does not enable SMTP/JMAP mutations, implement serving
+ReadView, or reconcile recovery orphans/quotas. Those remaining obligations
+still gate service activation.
+
 ### Validating final references and blob data
 
 `CheckedFiles::validate_data` borrows one ValidationView and the same stopped

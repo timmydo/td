@@ -29,6 +29,7 @@ mod verify;
 #[cfg(test)]
 pub use verify::probe_verify_account;
 pub use verify::{
+    CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
     OwnedVerifyError, VerifiedAccount, VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
 };
 
