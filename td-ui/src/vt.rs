@@ -15,6 +15,15 @@ const MAX_HISTORY_LINES: usize = 16_384;
 const HISTORY_ALLOCATOR_MARGIN: usize = 1024 * 1024;
 const MAX_CSI_PARAMS: usize = 32;
 const MAX_REPLY_BYTES: usize = 64 * 1024;
+/// An OSC's payload past this is dropped whole.
+const MAX_OSC: usize = 4096;
+/// The OSC 8 links the model remembers; a cell whose link has been
+/// forgotten is no link.
+const MAX_LINKS: usize = 1024;
+/// The longest OSC 8 URI kept.
+const MAX_URI: usize = 2048;
+/// The longest OSC 8 `id=` that joins links; a longer one is no id.
+const MAX_LINK_ID: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Color {
@@ -61,6 +70,9 @@ pub struct Attributes {
     pub background: Color,
     /// `SGR 58`'s; `Default` draws the underline in the foreground.
     pub underline_color: Color,
+    /// The OSC 8 link the cell was written in (`Terminal::link`), 0 for
+    /// none. SGR does not touch it; an erase does.
+    pub link: u32,
 }
 
 impl Default for Attributes {
@@ -75,6 +87,7 @@ impl Default for Attributes {
             foreground: Color::Default,
             background: Color::Default,
             underline_color: Color::Default,
+            link: 0,
         }
     }
 }
@@ -1234,6 +1247,23 @@ pub struct Terminal {
     /// buffer alone makes a batch look like a single sequence.
     reply_ends: Vec<usize>,
     bell_pending: bool,
+    /// The OSC being received, and whether it outgrew `MAX_OSC`.
+    osc: Vec<u8>,
+    osc_overflow: bool,
+    /// The OSC 8 links cells name, oldest first, ids rising, at most
+    /// `MAX_LINKS`; an id is never given twice, so a forgotten link's
+    /// cells can never name a later one.
+    links: VecDeque<Link>,
+    next_link: u32,
+}
+
+/// An OSC 8 link: its id, the `id=` parameter that lets separately
+/// written runs of cells be one link, and its URI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Link {
+    id: u32,
+    key: Vec<u8>,
+    uri: String,
 }
 
 impl Terminal {
@@ -1261,7 +1291,17 @@ impl Terminal {
             replies: Vec::new(),
             reply_ends: Vec::new(),
             bell_pending: false,
+            osc: Vec::new(),
+            osc_overflow: false,
+            links: VecDeque::new(),
+            next_link: 1,
         })
+    }
+
+    /// The URI of the OSC 8 link `id` names, while the model remembers it.
+    pub fn link(&self, id: u32) -> Option<&str> {
+        let at = self.links.binary_search_by_key(&id, |link| link.id).ok()?;
+        self.links.get(at).map(|link| link.uri.as_str())
     }
 
     fn screen(&self) -> &Screen {
@@ -1315,7 +1355,11 @@ impl Terminal {
         let Some(saved) = saved else {
             return;
         };
-        self.attributes = saved.attributes;
+        // An OSC 8 link lasts until an OSC 8 ends it, not with the cursor.
+        self.attributes = Attributes {
+            link: self.attributes.link,
+            ..saved.attributes
+        };
         self.origin_mode = saved.origin_mode;
         self.auto_wrap = saved.auto_wrap;
         self.g0 = saved.g0;
@@ -1859,19 +1903,105 @@ impl Terminal {
     }
 
     fn start_string(&mut self, kind: StringKind) {
+        self.osc.clear();
+        self.osc_overflow = false;
         self.parser = ParserState::String(kind);
     }
 
+    /// A string's byte. An OSC's payload is kept, to `MAX_OSC`, and acted
+    /// on when BEL or ESC (the start of ST) ends it; CAN and SUB cancel it.
     fn string_byte(&mut self, kind: StringKind, byte: u8) {
-        if matches!(byte, 0x07 | 0x18 | 0x1a) {
+        if matches!(byte, 0x18 | 0x1a) {
             self.parser = ParserState::Ground;
             return;
         }
-        if byte == 0x1b {
-            self.parser = ParserState::Escape;
+        if matches!(byte, 0x07 | 0x1b) {
+            if kind == StringKind::Osc && !self.osc_overflow {
+                self.dispatch_osc();
+            }
+            self.parser = if byte == 0x1b {
+                ParserState::Escape
+            } else {
+                ParserState::Ground
+            };
             return;
         }
+        if kind == StringKind::Osc {
+            if self.osc.len() < MAX_OSC {
+                self.osc.push(byte);
+            } else {
+                self.osc_overflow = true;
+            }
+        }
         self.parser = ParserState::String(kind);
+    }
+
+    /// An OSC this profile acts on: 8, a hyperlink. Any other is ignored.
+    fn dispatch_osc(&mut self) {
+        let mut payload = std::mem::take(&mut self.osc);
+        if let Some(rest) = payload.strip_prefix(b"8;") {
+            self.osc_link(rest);
+        }
+        payload.clear();
+        self.osc = payload;
+    }
+
+    /// `OSC 8 ; params ; URI`: the cells written after it are the link's,
+    /// until one with an empty URI ends it. A URI of more than `MAX_URI`
+    /// bytes, or any byte that is not printable ASCII, ends it too, as no
+    /// link. Two links with the same nonempty `id=` parameter, of at most
+    /// `MAX_LINK_ID` bytes, and URI are one link, however far apart their
+    /// cells were written.
+    fn osc_link(&mut self, rest: &[u8]) {
+        let Some(split) = rest.iter().position(|&byte| byte == b';') else {
+            return;
+        };
+        let (params, uri) = (rest.get(..split), rest.get(split.saturating_add(1)..));
+        let (Some(params), Some(uri)) = (params, uri) else {
+            return;
+        };
+        let printable = |bytes: &[u8]| bytes.iter().all(|byte| (0x21..=0x7e).contains(byte));
+        if uri.is_empty() || uri.len() > MAX_URI || !printable(uri) {
+            self.attributes.link = 0;
+            return;
+        }
+        let Ok(uri) = std::str::from_utf8(uri) else {
+            self.attributes.link = 0;
+            return;
+        };
+        let key = params
+            .split(|&byte| byte == b':')
+            .find_map(|param| param.strip_prefix(b"id="))
+            .filter(|key| key.len() <= MAX_LINK_ID)
+            .unwrap_or_default();
+        let known = (!key.is_empty())
+            .then(|| {
+                self.links
+                    .iter()
+                    .find(|link| link.key == key && link.uri == uri)
+                    .map(|link| link.id)
+            })
+            .flatten();
+        if let Some(id) = known {
+            self.attributes.link = id;
+            return;
+        }
+        let id = self.next_link;
+        let Some(next) = id.checked_add(1) else {
+            // Every id given: no more links, rather than a reused one.
+            self.attributes.link = 0;
+            return;
+        };
+        self.next_link = next;
+        self.links.push_back(Link {
+            id,
+            key: key.to_vec(),
+            uri: uri.to_owned(),
+        });
+        while self.links.len() > MAX_LINKS {
+            self.links.pop_front();
+        }
+        self.attributes.link = id;
     }
 
     fn csi_byte(&mut self, mut csi: Csi, byte: u8) {
@@ -2142,7 +2272,12 @@ impl Terminal {
                 continue;
             }
             match code {
-                0 => self.attributes = Attributes::default(),
+                0 => {
+                    self.attributes = Attributes {
+                        link: self.attributes.link,
+                        ..Attributes::default()
+                    }
+                }
                 1 => self.attributes.bold = true,
                 2 => self.attributes.faint = true,
                 3 => self.attributes.italic = true,
@@ -2373,6 +2508,7 @@ impl Terminal {
 
     fn reset_model(&mut self) {
         self.attributes = Attributes::default();
+        self.links.clear();
         self.primary.reset(self.attributes);
         self.alternate.reset(self.attributes);
         self.alternate_active = false;

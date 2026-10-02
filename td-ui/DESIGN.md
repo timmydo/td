@@ -453,8 +453,10 @@ of its own files may name each module.
   literal naming the outline face and where its notices ship.
 - `open`: `link`, which starts the browser on one whole link,
   `link_on`, the same on a display the caller names, `url`, the same on
-  a URL a program lists from markup, and `file`, the same on a local
-  file the program wrote; under "Following links" below.
+  a URL a program lists from markup, `url_on`, that on a display the
+  caller names (td-term's OSC 8 links), `is_url`, whether `url` takes a
+  URL, and `file`, the same on a local file the program wrote; under
+  "Following links" below.
 - `wayland`: `Endpoint` and `endpoint` (from the `WAYLAND_SOCKET`,
   `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` values a consumer passes),
   `connect`, `Connection` (`new`, `send` with at most one borrowed file,
@@ -603,7 +605,8 @@ of its own files may name each module.
   `take_bell` for the coalesced bell, the history reads and `scrollback`,
   `wrapped`, `primary_wrapped` and `history_wrapped`, which rows an
   autowrap ended, `search`, the nearest match of a query older or newer
-  than a `Place` as a `Found`, `still_matches`, whether a found match's
+  than a `Place` as a `Found`, `link`, the URI of an OSC 8 link a cell
+  names (`Attributes::link`), `still_matches`, whether a found match's
   cells and wraps still spell its query, and `mouse`, the pointer
   reporting the child asked for), `Toward`, `Place`, `Found`,
   `MAX_QUERY`, `MouseMode` with `MouseTracking`, `Cell`, `Attributes`
@@ -612,8 +615,9 @@ of its own files may name each module.
   `vt_spec.rs`, runs the native corpus under `spec/vt`.
 - `vt_render`: `Palette` (`pinned`, foot's with its own default ink),
   `Snapshot` (`new` with focus and bell, `with_cursor`, `scrolled_back`,
-  `with_selection`, `with_link`, a `LinkSpan` of a row ruled in black or
-  white against each cell's ground (`linked`),
+  `with_selection`, `with_link`, a `Hover` ruled in black or white
+  against each cell's ground (`linked`): a `LinkSpan` of a row, or an
+  OSC 8 link's id wherever its cells are,
   `with_status`, a line over the row at an `Edge`, its
   reads, `wrapped`, whether a row of the view goes on at the next, and
   `span` and `select`, a pointer gesture's unit at a cell and its

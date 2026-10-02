@@ -402,6 +402,7 @@ fn the_rendition_matrix_covers_exactly_the_models_attribute_flags() {
         foreground: _,
         background: _,
         underline_color: _,
+        link: _,
     } = attributes();
     let flags = [
         ("bold", bold),
@@ -605,7 +606,7 @@ fn a_hovered_link_is_ruled_to_stand_out_from_its_ground() {
         start: 1,
         end: 3,
     };
-    let snapshot = Snapshot::new(&terminal, false, false).with_link(Some(link));
+    let snapshot = Snapshot::new(&terminal, false, false).with_link(Some(Hover::Span(link)));
     let linked: Vec<bool> = (0..4).map(|column| snapshot.linked(0, column)).collect();
     assert_eq!(linked, [false, true, true, false]);
     assert!(!snapshot.linked(1, 1));
@@ -624,9 +625,36 @@ fn a_hovered_link_is_ruled_to_stand_out_from_its_ground() {
     assert_eq!(rule(2), vec![[0, 0, 0]; cell_width], "on the light ground");
     assert_eq!(rule(0), vec![palette().entry(0); cell_width], "not linked");
     let covered = Snapshot::new(&terminal, false, false)
-        .with_link(Some(link))
+        .with_link(Some(Hover::Span(link)))
         .with_status(Some("search"), Edge::Top);
     assert!(!covered.linked(0, 1));
+}
+
+/// An OSC 8 link is ruled by its id, on every row its cells are on, and
+/// no other cell is, an unlinked one included.
+#[test]
+fn an_osc8_link_is_ruled_by_its_id() {
+    let terminal = terminal(
+        3,
+        8,
+        b"\x1b]8;;https://e.example/a\x07abc\r\nde\x1b]8;;\x07f\r\n\x1b]8;;https://e.example/b\x07g",
+    );
+    let id = terminal.cell(0, 0).unwrap().attributes.link;
+    assert_ne!(id, 0);
+    let snapshot = Snapshot::new(&terminal, false, false).with_link(Some(Hover::Link(id)));
+    let linked: Vec<Vec<bool>> = (0..3)
+        .map(|row| (0..4).map(|column| snapshot.linked(row, column)).collect())
+        .collect();
+    assert_eq!(
+        linked,
+        [
+            [true, true, true, false],
+            [true, true, false, false],
+            [false, false, false, false]
+        ]
+    );
+    let none = Snapshot::new(&terminal, false, false).with_link(Some(Hover::Link(0)));
+    assert!(!none.linked(0, 3), "id 0 is no link");
 }
 
 /// The wave's rise and period and the dots' length are units of the

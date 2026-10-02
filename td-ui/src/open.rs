@@ -45,15 +45,28 @@ pub fn link_on(
 /// whitespace or control character, so it is one word and no option however
 /// it ends.
 pub fn url(url: &str, command: Option<&str>) -> Result<String, String> {
+    url_on(url, command, None)
+}
+
+/// As `url`, the browser told the display it is to open on, as
+/// `link_on` tells it: td-term's OSC 8 links, whose URI the child named.
+pub fn url_on(url: &str, command: Option<&str>, display: Option<&Path>) -> Result<String, String> {
+    if !is_url(url) {
+        return Err(format!("not a link: {url}"));
+    }
+    start(url, command, display)
+}
+
+/// Whether `url` is one `url` opens: an `http://` or `https://` scheme in
+/// any case, at least one byte after it, and no whitespace or control
+/// character.
+pub fn is_url(url: &str) -> bool {
     let rest = ["https://", "http://"].into_iter().find_map(|scheme| {
         url.get(..scheme.len())
             .filter(|head| head.eq_ignore_ascii_case(scheme))
             .and_then(|_| url.get(scheme.len()..))
     });
-    if rest.is_none_or(str::is_empty) || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!("not a link: {url}"));
-    }
-    start(url, command, None)
+    !rest.is_none_or(str::is_empty) && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Runs the browser, as `link` does, on a local file the program wrote

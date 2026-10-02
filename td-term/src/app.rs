@@ -314,7 +314,44 @@ fn from_waited(waited: pty::Waited) -> Event {
 struct Drawn {
     size: Size,
     activated: bool,
-    link: Option<render::LinkSpan>,
+    link: Option<render::Hover>,
+}
+
+/// `link: ` and an OSC 8 link's URI, cut to `columns` so that where the
+/// link goes stays shown: the path first, then the authority's head,
+/// since a host's registrable name is its tail. The URI is printable
+/// ASCII, so a byte is a column.
+fn link_line(uri: &str, columns: usize) -> String {
+    let line = format!("link: {uri}");
+    if line.len() <= columns {
+        return line;
+    }
+    let (scheme, rest) = uri.split_once("://").unwrap_or(("", uri));
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..end).unwrap_or(rest);
+    let path = rest.get(end..).unwrap_or_default();
+    let head = format!("link: {scheme}://");
+    let marker = match path.get(..1) {
+        Some(first) if path.len() > 2 => format!("{first}\u{2026}"),
+        _ => path.to_owned(),
+    };
+    let room = columns.saturating_sub(head.len() + marker.chars().count());
+    if authority.len() <= room {
+        return format!("{head}{authority}{marker}");
+    }
+    let tail = authority
+        .get(authority.len().saturating_sub(room.saturating_sub(1))..)
+        .unwrap_or_default();
+    format!("{head}\u{2026}{tail}{marker}")
+}
+
+/// What a Control-press follows: a link found in the row's text, opened
+/// by td-ui's text rule, or the URI an OSC 8 link names, opened only as
+/// an http or https URL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Target {
+    Text(String),
+    Uri(String),
 }
 
 /// The frame in flight: complete once the compositor released its buffer
@@ -327,6 +364,11 @@ struct Frame {
     /// one that had (only the hovered link or the focus changed), so
     /// the screen showed that model before it and after.
     shows_model: bool,
+    /// The row this frame's status line covers, and the one the frame
+    /// before it covered, on the screen until this one is presented: a
+    /// press there follows nothing, since what is under it is hidden.
+    covered: Option<usize>,
+    before: Option<usize>,
 }
 
 /// The child, from the loop's side. The terminal ends when its output has
@@ -404,7 +446,7 @@ struct Drag {
     extent: Option<(i32, i32)>,
     /// The link under a Control-press, read from the screen as it stood at
     /// the press, which the frame closing the press follows.
-    link: Option<String>,
+    link: Option<Target>,
     /// A followed press is still held: its drag and release select nothing.
     following: bool,
     /// What the press selects by, from how many came at its cell.
@@ -1267,14 +1309,21 @@ impl Window {
     /// it: a model changed since the last committed frame (`stale`, which a
     /// resize's reflow sets), or a committed frame for a changed model whose
     /// callback has not said it reached the screen (`shows_model`), is not
-    /// what was on screen, and the press is then a plain one.
-    fn shown_link(&self, fixed: (i32, i32)) -> Option<String> {
-        let shown = !self.stale && self.frame.as_ref().is_some_and(|frame| frame.shows_model);
-        shown.then(|| self.link_at(fixed)).flatten()
+    /// what was on screen, and the press is then a plain one. Nor is a
+    /// row a status line covers, in that frame or the one it replaces.
+    fn shown_link(&self, fixed: (i32, i32)) -> Option<Target> {
+        let frame = self.frame.as_ref().filter(|frame| frame.shows_model);
+        let frame = frame.filter(|_| !self.stale)?;
+        let row = self.cell_at(fixed).map(|(row, _)| row);
+        let hidden = |covered: Option<usize>| covered.is_some() && covered == row;
+        if hidden(frame.covered) || (!frame.presented && hidden(frame.before)) {
+            return None;
+        }
+        self.target_at(fixed)
     }
 
-    fn link_at(&self, fixed: (i32, i32)) -> Option<String> {
-        self.link_span(fixed).map(|(_, link)| link)
+    fn target_at(&self, fixed: (i32, i32)) -> Option<Target> {
+        self.link_span(fixed).map(|(_, target)| target)
     }
 
     /// The link Control-hover rules: the one a Control-press at the
@@ -1282,7 +1331,7 @@ impl Window {
     /// Control alone is held (Caps and Num Lock aside). None while the
     /// child takes the press as a report, or a search the press would
     /// end is open.
-    fn hovered_link(&self) -> Option<render::LinkSpan> {
+    fn hovered_link(&self) -> Option<render::Hover> {
         let held = self.client.input().held();
         if !self.drag.inside || !held.control || held.alt || held.shift {
             return None;
@@ -1293,12 +1342,15 @@ impl Window {
         self.link_span(self.drag.position).map(|(span, _)| span)
     }
 
-    /// The link under a pointer position in the viewport's row, as td-ui's
-    /// rule finds it, and the cells it covers; none past the drawn grid,
-    /// whose edge cells a selection's clamp would reach. A cell holds one
-    /// scalar, so the row's text is its cells in order; a link the terminal
-    /// wrapped onto the next row is found only up to the row's end.
-    fn link_span(&self, fixed: (i32, i32)) -> Option<(render::LinkSpan, String)> {
+    /// The link under a pointer position, and what a hover rules for it:
+    /// the OSC 8 link the cell was written in, if the model still knows it
+    /// and its URI is http or https, else the link in the viewport's row
+    /// as td-ui's rule finds it, and the cells it covers; none past the
+    /// drawn grid, whose edge cells a selection's clamp would reach. A cell
+    /// holds one scalar, so the row's text is its cells in order; a link
+    /// the terminal wrapped onto the next row is found only up to the
+    /// row's end.
+    fn link_span(&self, fixed: (i32, i32)) -> Option<(render::Hover, Target)> {
         let (rows, columns) = self.cells?;
         let inside = |value: i32, cells: u16, cell: usize| {
             usize::try_from(value.div_euclid(256))
@@ -1311,6 +1363,10 @@ impl Window {
         let terminal = self.model.as_ref()?;
         let viewport = self.viewport.offset(terminal.scrollback());
         let snapshot = render::Snapshot::new(terminal, false, false).scrolled_back(viewport);
+        let id = snapshot.cell(row, column).attributes.link;
+        if let Some(uri) = terminal.link(id).filter(|uri| td_ui::open::is_url(uri)) {
+            return Some((render::Hover::Link(id), Target::Uri(uri.to_owned())));
+        }
         let mut text = String::new();
         // Where each cell's scalar starts in the text.
         let mut starts = Vec::new();
@@ -1326,14 +1382,43 @@ impl Window {
             .position(|&at| at >= range.end)
             .unwrap_or(starts.len());
         let link = text.get(range)?.to_owned();
-        Some((render::LinkSpan { row, start, end }, link))
+        let span = render::LinkSpan { row, start, end };
+        Some((render::Hover::Span(span), Target::Text(link)))
+    }
+
+    /// The status line a hovered OSC 8 link shows: its URI, which its cells
+    /// need not spell, on the last row, or the first while the link has a
+    /// cell on the last.
+    fn link_status(&self, hover: Option<render::Hover>) -> Option<(String, render::Edge)> {
+        let Some(render::Hover::Link(id)) = hover else {
+            return None;
+        };
+        let terminal = self.model.as_ref()?;
+        let uri = terminal.link(id)?;
+        let viewport = self.viewport.offset(terminal.scrollback());
+        let snapshot = render::Snapshot::new(terminal, false, false).scrolled_back(viewport);
+        let last = snapshot.rows().checked_sub(1)?;
+        let on_last =
+            (0..snapshot.columns()).any(|column| snapshot.cell(last, column).attributes.link == id);
+        let pointer = self.cell_at(self.drag.position).map(|(row, _)| row);
+        let edge = if on_last && pointer != Some(0) {
+            render::Edge::Top
+        } else {
+            render::Edge::Bottom
+        };
+        Some((link_line(uri, snapshot.columns()), edge))
     }
 
     /// Opens a followed link on the display the terminal is on; one that
     /// cannot be opened is a line on stderr and the bell.
-    fn follow(&mut self, link: &str) {
+    fn follow(&mut self, target: &Target) {
         let display = Path::new(&self.wayland_display);
-        if let Err(error) = td_ui::open::link_on(link, self.browser.as_deref(), Some(display)) {
+        let browser = self.browser.as_deref();
+        let opened = match target {
+            Target::Text(link) => td_ui::open::link_on(link, browser, Some(display)),
+            Target::Uri(uri) => td_ui::open::url_on(uri, browser, Some(display)),
+        };
+        if let Err(error) = opened {
             let _ = writeln!(std::io::stderr().lock(), "td-term: open link: {error}");
             self.ring();
         }
@@ -2268,7 +2353,9 @@ impl App for Window {
                 .as_ref()
                 .ok_or("the terminal has no model to draw")?;
             let viewport = self.viewport.offset(terminal.scrollback());
-            let status = self.search_status();
+            let status = self
+                .search_status()
+                .or_else(|| self.link_status(wanted.link));
             let snapshot = render::Snapshot::new(terminal, wanted.activated, ringing)
                 .scrolled_back(viewport)
                 .with_selection(self.shown_selection())
@@ -2279,6 +2366,10 @@ impl App for Window {
                         .as_ref()
                         .map_or(render::Edge::Bottom, |(_, edge)| *edge),
                 );
+            let covered = status.as_ref().map(|(_, edge)| match edge {
+                render::Edge::Top => 0,
+                render::Edge::Bottom => snapshot.rows().saturating_sub(1),
+            });
             let (palette, font, outline) = (&self.palette, &self.font, &mut self.outline);
             let (width, height) = (wanted.size.width, wanted.size.height);
             let presented = self.client.present(width, height, &mut |pixels| {
@@ -2294,10 +2385,13 @@ impl App for Window {
                 self.needs_commit = false;
                 let shows_model =
                     same_model && self.frame.as_ref().is_some_and(|frame| frame.shows_model);
+                let before = self.frame.as_ref().and_then(|frame| frame.covered);
                 self.frame = self.client.presented().map(|buffer| Frame {
                     buffer,
                     presented: false,
                     shows_model,
+                    covered,
+                    before,
                 });
                 return Ok(());
             }
@@ -4035,11 +4129,11 @@ mod tests {
         text.push_str(" https://e.example/yz");
         window.output(text.as_bytes()).unwrap();
         shown(&mut window);
-        let link = Some(render::LinkSpan {
+        let link = Some(render::Hover::Span(render::LinkSpan {
             row: 0,
             start: 4,
             end: 23,
-        });
+        }));
         let hovered = |window: &Window| window.wanted().and_then(|drawn| drawn.link);
         assert_eq!(hovered(&window), None, "not over the surface");
         window
@@ -4082,11 +4176,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             hovered(&window),
-            Some(render::LinkSpan {
+            Some(render::Hover::Span(render::LinkSpan {
                 row: 1,
                 start: 61,
                 end: 80,
-            })
+            }))
         );
         point(&mut window, 22);
         assert_eq!(hovered(&window), link);
@@ -4126,11 +4220,11 @@ mod tests {
         window.draw().unwrap();
         assert_eq!(
             window.drawn.and_then(|drawn| drawn.link),
-            Some(render::LinkSpan {
+            Some(render::Hover::Span(render::LinkSpan {
                 row: 0,
                 start: 4,
                 end: 16,
-            })
+            }))
         );
         modifiers(&mut window, 0);
     }
@@ -4192,8 +4286,212 @@ mod tests {
         assert!(!bell(&mut window));
     }
 
+    fn link_text(window: &Window, at: (i32, i32)) -> Option<String> {
+        window.target_at(at).map(|target| match target {
+            Target::Text(text) | Target::Uri(text) => text,
+        })
+    }
+
+    /// An OSC 8 link with an http URI is the link wherever its cells are:
+    /// ruled by its id, its URI on the status line though its cells spell
+    /// something else, followed as that URI, and preferred to a link its
+    /// cells' text holds. One whose URI is not http or https is no link,
+    /// and the row's text is read as ever.
+    #[test]
+    fn an_osc8_link_is_ruled_shown_and_followed_as_its_uri() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.browser = Some("/nonexistent/td-term-browser".into());
+        window
+            .output(b"\x1b]8;;https://e.example/hidden\x07see https://e.example/shown\x1b]8;;\x07 x\r\n")
+            .unwrap();
+        window
+            .output(b"\x1b]8;;file:///etc/passwd\x07https://e.example/text\x1b]8;;\x07")
+            .unwrap();
+        shown(&mut window);
+        let id = window
+            .model
+            .as_ref()
+            .unwrap()
+            .cell(0, 0)
+            .unwrap()
+            .attributes
+            .link;
+        window
+            .event(message(POINTER, 0, &[1, SURFACE, 10 * 8 * 256 + 128, 128]))
+            .unwrap();
+        modifiers(&mut window, CONTROL);
+        let wanted = window.wanted().unwrap();
+        assert_eq!(wanted.link, Some(render::Hover::Link(id)));
+        assert_eq!(
+            window.link_status(wanted.link),
+            Some((
+                "link: https://e.example/hidden".to_string(),
+                render::Edge::Bottom
+            ))
+        );
+        assert_eq!(
+            window.target_at((10 * 8 * 256 + 128, 128)),
+            Some(Target::Uri("https://e.example/hidden".into()))
+        );
+        shown(&mut window);
+        let (width, height) = window.cell;
+        let at = ((height - 2) * 640 + 2 * width) * 4;
+        assert_eq!(
+            window.client.pixels().get(at..at + 3),
+            Some([255, 255, 255].as_slice()),
+            "ruled from the link's first cell"
+        );
+        // The frame shows the status line, inverted, over the last row.
+        let corner = ((19 * height) * 640 + 639) * 4;
+        assert_eq!(
+            window.client.pixels().get(corner..corner + 3),
+            Some([0xcc, 0xdc, 0xdc].as_slice())
+        );
+        click(&mut window, true);
+        assert!(bell(&mut window), "followed, and no browser rang");
+        click(&mut window, false);
+        // A link with a cell on the last row moves the status to the first.
+        window
+            .output(b"\x1b[20;70H\x1b]8;;https://e.example/low\x07low\x1b]8;;\x07")
+            .unwrap();
+        let low = window
+            .model
+            .as_ref()
+            .unwrap()
+            .cell(19, 69)
+            .unwrap()
+            .attributes
+            .link;
+        window
+            .event(message(
+                POINTER,
+                2,
+                &[0, 69 * 8 * 256 + 128, 19 * 16 * 256 + 128],
+            ))
+            .unwrap();
+        assert_eq!(
+            window
+                .link_status(Some(render::Hover::Link(low)))
+                .map(|(_, edge)| edge),
+            Some(render::Edge::Top)
+        );
+        // A link on both edges keeps the status off the row pointed at.
+        window
+            .output(b"\x1b[1;70H\x1b]8;id=e;https://e.example/e\x07e\x1b[20;75He\x1b]8;;\x07")
+            .unwrap();
+        let both = window
+            .model
+            .as_ref()
+            .unwrap()
+            .cell(0, 69)
+            .unwrap()
+            .attributes
+            .link;
+        let edge = |window: &Window| {
+            window
+                .link_status(Some(render::Hover::Link(both)))
+                .map(|(_, edge)| edge)
+        };
+        assert_eq!(edge(&window), Some(render::Edge::Top));
+        window
+            .event(message(POINTER, 2, &[0, 69 * 8 * 256 + 128, 128]))
+            .unwrap();
+        assert_eq!(edge(&window), Some(render::Edge::Bottom));
+        // A URI longer than the row is cut to keep its authority.
+        let long = format!(
+            "\x1b[10;1H\x1b]8;;https://e.example/{}\x07L",
+            "p".repeat(80)
+        );
+        window.output(long.as_bytes()).unwrap();
+        let id = window
+            .model
+            .as_ref()
+            .unwrap()
+            .cell(9, 0)
+            .unwrap()
+            .attributes
+            .link;
+        assert_eq!(
+            window.link_status(Some(render::Hover::Link(id))),
+            Some((
+                "link: https://e.example/\u{2026}".to_string(),
+                render::Edge::Bottom
+            ))
+        );
+        window.output(b"\x1b]8;;\x07").unwrap();
+        // The file URI is no link: the text under it is read instead.
+        let below = (5 * 8 * 256 + 128, 16 * 256 + 128);
+        assert_eq!(
+            window.target_at(below),
+            Some(Target::Text("https://e.example/text".into()))
+        );
+        modifiers(&mut window, 0);
+    }
+
     fn bell(window: &mut Window) -> bool {
         window.model.as_mut().unwrap().take_bell()
+    }
+
+    /// A URI too long for the status line loses its path first, then the
+    /// head of its authority, whose tail names where it goes.
+    #[test]
+    fn the_link_line_keeps_the_end_of_the_authority() {
+        assert_eq!(
+            link_line("https://e.example/a", 80),
+            "link: https://e.example/a"
+        );
+        let path = format!("https://e.example/{}", "p".repeat(80));
+        assert_eq!(link_line(&path, 40), "link: https://e.example/\u{2026}");
+        let host = format!("https://{}.evil.example/x", "a".repeat(50));
+        let line = link_line(&host, 40);
+        assert_eq!(
+            line,
+            format!("link: https://\u{2026}{}.evil.example/x", "a".repeat(10))
+        );
+        assert_eq!(line.chars().count(), 40);
+        let bare = format!("https://{}.evil.example", "a".repeat(50));
+        assert_eq!(
+            link_line(&bare, 40),
+            format!("link: https://\u{2026}{}.evil.example", "a".repeat(12))
+        );
+    }
+
+    /// A press on the row a status line covers follows nothing, in the
+    /// frame on the screen and in one in flight to replace it: the link
+    /// there is hidden under another's URI.
+    #[test]
+    fn a_press_under_the_status_line_follows_nothing_it_hides() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window
+            .output(b"\x1b]8;;https://e.example/a\x07aaa\x1b]8;;\x07")
+            .unwrap();
+        window
+            .output(b"\x1b[20;1H\x1b]8;;https://e.example/b\x07bbb\x1b]8;;\x07")
+            .unwrap();
+        shown(&mut window);
+        window
+            .event(message(POINTER, 0, &[1, SURFACE, 8 * 256 + 128, 128]))
+            .unwrap();
+        modifiers(&mut window, CONTROL);
+        shown(&mut window);
+        let low = (8 * 256 + 128, 19 * 16 * 256 + 128);
+        let b = Some(Target::Uri("https://e.example/b".into()));
+        assert_eq!(window.target_at(low), b);
+        assert_eq!(window.shown_link(low), None, "under a's status line");
+        window
+            .event(message(
+                POINTER,
+                2,
+                &[0, 8 * 256 + 128, 19 * 16 * 256 + 128],
+            ))
+            .unwrap();
+        window.draw().unwrap();
+        assert_eq!(window.shown_link(low), None, "until b's frame is shown");
+        complete(&mut window);
+        assert_eq!(window.shown_link(low), b);
+        modifiers(&mut window, 0);
     }
 
     /// A Control-press over a link opens it through td-ui's opener (here a
@@ -4264,7 +4562,10 @@ mod tests {
         window
             .event(message(POINTER, 3, &[2, 0, LEFT_BUTTON, 1]))
             .unwrap();
-        assert_eq!(window.drag.link.as_deref(), Some("https://e.example/x"));
+        assert_eq!(
+            window.drag.link,
+            Some(Target::Text("https://e.example/x".into()))
+        );
         window
             .model
             .as_mut()
@@ -4272,7 +4573,7 @@ mod tests {
             .feed(b"\rsee https://z.example/y now");
         window.stale = true;
         assert_eq!(
-            window.link_at((10 * 8 * 256 + 128, 128)).as_deref(),
+            link_text(&window, (10 * 8 * 256 + 128, 128)).as_deref(),
             Some("https://z.example/y")
         );
         click(&mut window, false);
@@ -4325,16 +4626,19 @@ mod tests {
         window.cells = Some((1, 20));
         let at = |column: i32| (column * 8 * 256 + 128, 128);
         assert_eq!(
-            window.link_at(at(19)).as_deref(),
+            link_text(&window, at(19)).as_deref(),
             Some("https://e.example/ab")
         );
-        assert_eq!(window.link_at(at(20)), None);
+        assert_eq!(link_text(&window, at(20)), None);
         // A model wider than the drawn grid is read only as far as it is drawn.
         window.cells = Some((1, 15));
-        assert_eq!(window.link_at(at(14)).as_deref(), Some("https://e.examp"));
+        assert_eq!(
+            link_text(&window, at(14)).as_deref(),
+            Some("https://e.examp")
+        );
         window.cells = Some((1, 20));
-        assert_eq!(window.link_at((at(5).0, 16 * 256 + 128)), None);
-        assert_eq!(window.link_at((-256, 128)), None);
+        assert_eq!(link_text(&window, (at(5).0, 16 * 256 + 128)), None);
+        assert_eq!(link_text(&window, (-256, 128)), None);
     }
 
     /// A left press or release at `serial` at a column of the first row,

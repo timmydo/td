@@ -75,6 +75,7 @@ const BLANK: Cell = Cell {
         foreground: Color::Default,
         background: Color::Default,
         underline_color: Color::Default,
+        link: 0,
     },
 };
 
@@ -149,8 +150,16 @@ pub struct Cursor {
     pub visible: bool,
 }
 
-/// A link's cells on one row of the view, `start..end`, which td-term
-/// rules while Control alone is held over it.
+/// What td-term rules under a Control-hover: a link found in a row's
+/// text, by its cells, or an OSC 8 link, by the id its cells were written
+/// in, wherever they are on the view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Hover {
+    Span(LinkSpan),
+    Link(u32),
+}
+
+/// A link's cells on one row of the view, `start..end`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkSpan {
     pub row: usize,
@@ -234,7 +243,7 @@ pub struct Snapshot<'a> {
     bell: bool,
     selection: Option<Selection>,
     status: Option<(Vec<char>, Edge)>,
-    link: Option<LinkSpan>,
+    link: Option<Hover>,
 }
 
 impl<'a> Snapshot<'a> {
@@ -282,7 +291,7 @@ impl<'a> Snapshot<'a> {
     }
 
     /// Rules `link`'s cells (`linked`).
-    pub fn with_link(mut self, link: Option<LinkSpan>) -> Self {
+    pub fn with_link(mut self, link: Option<Hover>) -> Self {
         self.link = link;
         self
     }
@@ -328,7 +337,14 @@ impl<'a> Snapshot<'a> {
     /// Whether the cell is one of the hovered link's, ruled over whatever
     /// it holds; none on the status line's row, which covers them.
     pub fn linked(&self, row: usize, column: usize) -> bool {
-        !self.status_row(row) && self.link.is_some_and(|link| link.contains(row, column))
+        if self.status_row(row) {
+            return false;
+        }
+        match self.link {
+            Some(Hover::Span(span)) => span.contains(row, column),
+            Some(Hover::Link(id)) => id != 0 && self.cell(row, column).attributes.link == id,
+            None => false,
+        }
     }
 
     /// Infallible so the cell loop has no error path: anything the model

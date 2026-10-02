@@ -2273,3 +2273,99 @@ fn literal_runs(body: &[u8]) -> Vec<Vec<u8>> {
     }
     runs
 }
+
+/// OSC 8: the cells written after a link are its, until an empty URI,
+/// an invalid one or an erase ends it, whichever terminator closed the
+/// OSC; SGR leaves it be; a shared `id=` joins two runs into one link;
+/// CAN cancels; a payload past the bound is dropped whole; the oldest
+/// link is forgotten past the table's bound, and a reset forgets all.
+#[test]
+fn osc8_links_name_the_cells_written_in_them() {
+    let link = |terminal: &Terminal, row: usize, column: usize| {
+        terminal.cell(row, column).map(|cell| cell.attributes.link)
+    };
+    let mut terminal = Terminal::new(4, 16).unwrap();
+    terminal.feed(b"\x1b]8;;https://e.example/a\x07A\x1b[1;31mB\x1b[0mC\x1b]8;;\x07D");
+    let a = link(&terminal, 0, 0).unwrap();
+    assert_ne!(a, 0);
+    assert_eq!(terminal.link(a), Some("https://e.example/a"));
+    assert_eq!(link(&terminal, 0, 1), Some(a), "SGR leaves it");
+    assert_eq!(link(&terminal, 0, 2), Some(a), "SGR 0 too");
+    assert_eq!(link(&terminal, 0, 3), Some(0), "an empty URI ends it");
+    terminal.feed(b"\x1b]8;;https://e.example/b\x1b\\E\x1b]8;;\x1b\\F");
+    let b = link(&terminal, 0, 4).unwrap();
+    assert!(b > a, "ST ends an OSC as BEL does");
+    assert_eq!(link(&terminal, 0, 5), Some(0));
+    // A shared id joins runs; without one each run is its own link.
+    terminal.feed(b"\x1b]8;id=x;https://e.example/c\x07G\x1b]8;;\x07H");
+    terminal.feed(b"\x1b]8;id=x;https://e.example/c\x07I\x1b]8;;\x07");
+    terminal.feed(b"\x1b]8;;https://e.example/c\x07J\x1b]8;;\x07");
+    let g = link(&terminal, 0, 6).unwrap();
+    assert_eq!(link(&terminal, 0, 8), Some(g));
+    assert_ne!(link(&terminal, 0, 9), Some(g));
+    // An invalid URI ends the open link rather than naming one.
+    terminal.feed(b"\r\n\x1b]8;;https://e.example/d\x07K\x1b]8;;https://e.example/ x\x07L");
+    assert_ne!(link(&terminal, 1, 0), Some(0));
+    assert_eq!(link(&terminal, 1, 1), Some(0), "a space");
+    let long = format!("\x1b]8;;https://e.example/{}\x07M", "y".repeat(MAX_URI));
+    terminal.feed(long.as_bytes());
+    assert_eq!(link(&terminal, 1, 2), Some(0), "past MAX_URI");
+    // CAN cancels the OSC; one past MAX_OSC is dropped whole.
+    terminal.feed(b"\x1b]8;;https://e.example/e\x18N");
+    assert_eq!(link(&terminal, 1, 3), Some(0));
+    terminal.feed(b"\x1b]8;;https://e.example/f\x07O");
+    let o = link(&terminal, 1, 4).unwrap();
+    let over = format!("\x1b]8;;https://e.example/{}\x07P", "z".repeat(MAX_OSC));
+    terminal.feed(over.as_bytes());
+    assert_eq!(
+        link(&terminal, 1, 5),
+        Some(o),
+        "the overlong OSC changed nothing"
+    );
+    // An erase drops the link with the cell.
+    terminal.feed(b"\x1b]8;;\x07\r\x1b[2K");
+    assert_eq!(link(&terminal, 1, 4), Some(0));
+    // ESC ends an OSC though no ST follows, and the escape still runs.
+    terminal.feed(b"\x1b]8;;https://e.example/h\x1b[1mS");
+    let s = link(&terminal, 1, 0).unwrap();
+    assert_ne!(s, 0);
+    assert!(terminal.cell(1, 0).unwrap().attributes.bold);
+    // A C0 byte or UTF-8 in the URI ends the link; a DCS leaves it.
+    terminal.feed(b"\x1b]8;;https://e.example/h\x07T\x1b]8;;https://e.\x01x/\x07U");
+    assert_eq!(link(&terminal, 1, 2), Some(0), "a C0 byte");
+    terminal.feed(b"\x1b]8;;https://e.example/h\x07V\x1b]8;;https://\xc3\xa9.example/\x07W");
+    assert_eq!(link(&terminal, 1, 4), Some(0), "UTF-8");
+    terminal.feed(b"\x1b]8;;https://e.example/h\x07X\x1bP8;;\x1b\\Y\x1b]8;;\x07\x1b[0m");
+    assert_eq!(link(&terminal, 1, 6), link(&terminal, 1, 5), "a DCS");
+    // DECRC restores the cursor, not the link: one opened since stays
+    // open, and one ended since stays ended.
+    terminal.feed(b"\x1b7\x1b]8;;https://e.example/i\x07\x1b8Z");
+    let z = link(&terminal, 1, 7).unwrap();
+    assert_eq!(terminal.link(z), Some("https://e.example/i"));
+    terminal.feed(b"\x1b7\x1b]8;;\x07\x1b8\x1b[2;10H!");
+    assert_eq!(link(&terminal, 1, 9), Some(0));
+    // An id past MAX_LINK_ID joins nothing.
+    let key = "k".repeat(MAX_LINK_ID + 1);
+    for _ in 0..2 {
+        terminal.feed(format!("\x1b]8;id={key};https://e.example/j\x07!\x1b]8;;\x07").as_bytes());
+    }
+    assert_ne!(link(&terminal, 1, 10), link(&terminal, 1, 11));
+    assert_eq!(terminal.osc.len(), 0, "the payload's buffer is kept empty");
+    // The table keeps the newest MAX_LINKS.
+    for n in 0..MAX_LINKS {
+        terminal.feed(format!("\x1b]8;;https://e.example/{n}\x07Q").as_bytes());
+    }
+    assert_eq!(terminal.link(a), None, "forgotten");
+    assert_eq!(terminal.links.len(), MAX_LINKS);
+    let newest = terminal.next_link - 1;
+    assert_eq!(
+        terminal.link(newest),
+        Some(format!("https://e.example/{}", MAX_LINKS - 1).as_str())
+    );
+    terminal.feed(b"\x1bc");
+    assert_eq!(terminal.link(newest), None, "a reset forgets");
+    // Ids are never reused: past the last, no more links.
+    terminal.next_link = u32::MAX;
+    terminal.feed(b"\x1b]8;;https://e.example/g\x07R");
+    assert_eq!(link(&terminal, 0, 0), Some(0));
+}

@@ -90,10 +90,12 @@ for td's shell and userland. It implements:
   position reports, and the replies required by the claimed profile;
 - DEC cursor preservation for mode 1048 and alternate-screen mode 1049;
 - bracketed-paste mode 2004, initially disabled and cleared by terminal
-  reset; and
+  reset;
 - pointer reporting: tracking modes 9, 1000, 1002 and 1003 and SGR's
   encoding, mode 1006, each initially off and cleared by terminal reset,
-  reported as §3 says.
+  reported as §3 says; and
+- OSC 8 hyperlinks, which name the cells written in them, followed as
+  §3 says.
 
 UTF-8 scalars are initially single-cell glyphs. Wide cells, combining
 sequences, grapheme clustering, bidi, shaping, and emoji presentation require
@@ -129,12 +131,27 @@ search, the core data-device clipboard and the primary selection are
 specified in §3. A protocol is not parsed merely because another
 terminal implements it.
 
-Unsupported CSI operations are ignored as complete sequences. OSC, DCS, SOS,
+Unsupported CSI operations are ignored as complete sequences. DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
-execute commands or open paths. BEL or ST terminates an ignored string; CAN
-and SUB cancel one. ESC either begins ST or recovers through the normal escape
-state. Unsupported input must not leak printable fragments or desynchronize
-subsequent supported input.
+execute commands or open paths. An OSC's payload is kept, to 4 KiB, and an
+OSC 8 is acted on when BEL or ESC, the start of ST, ends it; one that
+outgrows the bound is dropped whole, and every other OSC is ignored. CAN and
+SUB cancel a string. ESC either begins ST or recovers through the normal
+escape state. Unsupported input must not leak printable fragments or
+desynchronize subsequent supported input.
+
+`OSC 8 ; params ; URI` makes the cells written after it the link's, until
+an OSC 8 with an empty URI ends it, as does one whose URI is longer than
+2 KiB or holds anything but printable ASCII; an erase drops a cell's link
+with it, and neither SGR nor DECSC and DECRC touch it: a link is not
+saved with the cursor. Two links with the same URI and the same nonempty
+`id=` parameter are one link, however far apart their cells were written;
+an `id=` longer than 256 bytes is no id. The model remembers the newest
+1024 links in a table whose ids are never given twice, so a cell whose
+link was forgotten, or reset away, is no link rather than another one;
+once every 32-bit id is given there are no more. The id makes each cell
+4 bytes larger, so history's and the grid's byte budgets hold that many
+fewer cells.
 
 Resource ceilings are part of the model contract:
 
@@ -142,7 +159,9 @@ Resource ceilings are part of the model contract:
 - at most 1,048,576 history cells, 16,384 history lines, and 16 MiB of history
   storage;
 - at most 1 MiB of queued PTY output, 64 KiB of queued keyboard input, and
-  64 KiB of queued terminal replies; and
+  64 KiB of queued terminal replies;
+- an OSC payload of at most 4 KiB, and at most 1024 OSC 8 links, each
+  with a URI of at most 2 KiB and an `id=` of at most 256 bytes; and
 - a grid of at most `vt::MAX_DIMENSION` (16,384) rows or columns and 1,048,576
   cells in 16 MiB, on a surface within td-ui's raster ceilings (8192 pixels an
   axis, 32 MiB a frame), each checked before anything is allocated for it.
@@ -651,6 +670,21 @@ can read. A link that cannot be opened is a `td-term: open link:` line on
 stderr and rings the visual bell (§3). A cell holds one scalar, so the row's
 text is its cells in order; a link the terminal wrapped onto the next row is
 found only up to the row's end.
+
+A cell written in an OSC 8 link the model remembers, whose URI is an
+`http://` or `https://` URL (`open::is_url`), is that link, whatever the
+row's text around it spells: a Control-press there follows the URI,
+through td-ui's URL opener (`open::url_on`), and a link the text holds is
+not read. An OSC 8 link with any other scheme is no link, and the cell's
+row is read as text as ever, so a child cannot make a press open a file or
+a program through it. Because the URI need not be what the cells say,
+hovering such a link shows it on a status line, `link: ` and the URI, over
+the view's last row, or its first while the link has a cell on the last
+and the pointer is not on the first. A URI too long for the row loses its
+path to an ellipsis, and then its authority's head, so that the end of the
+host, its registrable name, stays shown. A Control-press on a row a status
+line covers, in the frame on the screen or the one in flight to replace
+it, follows nothing: what is under it is hidden.
 
 While the pointer is over the surface and Control alone is held, the
 link a press there would follow is ruled (`Snapshot::with_link`): a
@@ -1487,7 +1521,11 @@ terminal, and td-term's prove the program:
   triple, dragging by them, a row being its whole wrapped line; rules
   exactly the link under the pointer while Control alone is held over
   the surface, and none under reporting, in a search or once focus or
-  the pointer has gone, drawing a frame for it with the model unchanged
+  the pointer has gone, an http OSC 8 link by its id with its URI on a
+  status line, cut to keep the authority's end, off the row pointed at
+  and over which a press follows nothing, followed as that URI, and no
+  other OSC 8 link, drawing a
+  frame for it with the model unchanged
   in which a Control-press still follows the link, and after a resize
   ruling it where the reflow put it; copies a wrapped line without the
   wrap's newline; makes a release's selection
