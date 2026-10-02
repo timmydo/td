@@ -82,30 +82,58 @@ impl<'r> ScannedJournal<'r> {
         frame: FrameId,
         now: Tick,
     ) -> Result<ReservedAppend<'r, 'b, 'l, 'a>, ReservedAppendError> {
-        let append = self.append_frame(crypto, bytes)?;
-        let invalid = || ReservedAppendError::Ledger(writer::Error::Invalid);
-        let actual = FrameBudget::new(
-            u64::try_from(bytes.len()).map_err(|_| invalid())?,
-            u64::try_from(append.operations).map_err(|_| invalid())?,
-        )?;
-        let prior_bytes = append
-            .file
-            .len()
-            .checked_sub(JOURNAL_HEADER_BYTES as u64)
-            .ok_or_else(invalid)?;
-        let prior_operations = append
-            .total_operations
-            .checked_sub(append.operations)
-            .ok_or_else(invalid)?;
-        if ledger.used(Kind::ActiveJournalBytes)? != prior_bytes
-            || ledger.used(Kind::ActiveJournalOperations)?
-                != u64::try_from(prior_operations).map_err(|_| invalid())?
-        {
-            return Err(invalid());
-        }
-        let guard = ledger.guard_append(frame, actual, now)?;
-        Ok(ReservedAppend { append, guard })
+        bind(self.append_frame(crypto, bytes)?, ledger, frame, now)
     }
+}
+impl<'r> ReconciledAppend<'r> {
+    /// Consume the retained durable boundary to append its successor without a
+    /// full journal rescan. Keep the same stopped-store/account exclusion and
+    /// ledger. Constructor refusal writes nothing; this consumed owner is then
+    /// closed, so rescan before a later attempt. Publication remains external.
+    pub fn append_reserved<'b, 'l, 'a>(
+        self,
+        crypto: &impl Crypto,
+        bytes: &'b [u8],
+        ledger: &'l mut WriterLedger<'a>,
+        frame: FrameId,
+        now: Tick,
+    ) -> Result<ReservedAppend<'r, 'b, 'l, 'a>, ReservedAppendError> {
+        bind(
+            self.durable.append_frame(crypto, bytes)?,
+            ledger,
+            frame,
+            now,
+        )
+    }
+}
+fn bind<'r, 'b, 'l, 'a>(
+    append: JournalAppend<'r, 'b>,
+    ledger: &'l mut WriterLedger<'a>,
+    frame: FrameId,
+    now: Tick,
+) -> Result<ReservedAppend<'r, 'b, 'l, 'a>, ReservedAppendError> {
+    let invalid = || ReservedAppendError::Ledger(writer::Error::Invalid);
+    let actual = FrameBudget::new(
+        u64::try_from(append.bytes.len()).map_err(|_| invalid())?,
+        u64::try_from(append.operations).map_err(|_| invalid())?,
+    )?;
+    let prior_bytes = append
+        .file
+        .len()
+        .checked_sub(JOURNAL_HEADER_BYTES as u64)
+        .ok_or_else(invalid)?;
+    let prior_operations = append
+        .total_operations
+        .checked_sub(append.operations)
+        .ok_or_else(invalid)?;
+    if ledger.used(Kind::ActiveJournalBytes)? != prior_bytes
+        || ledger.used(Kind::ActiveJournalOperations)?
+            != u64::try_from(prior_operations).map_err(|_| invalid())?
+    {
+        return Err(invalid());
+    }
+    let guard = ledger.guard_append(frame, actual, now)?;
+    Ok(ReservedAppend { append, guard })
 }
 impl<'r> ReservedAppend<'r, '_, '_, '_> {
     pub fn written_bytes(&self) -> usize {
@@ -203,6 +231,184 @@ mod tests {
             }
         }
         panic!("reservation contention did not converge");
+    }
+    fn complete<'r>(mut append: ReservedAppend<'r, '_, '_, '_>) -> ReconciledAppend<'r> {
+        for _ in 0..70 {
+            if append.advance().unwrap() == AppendStep::Complete {
+                return append.finish().unwrap();
+            }
+        }
+        panic!("bounded append did not complete");
+    }
+    #[test]
+    fn reconciled_boundaries_chain_without_rescanning_and_charge_each_successor() {
+        with_ledger(160, 2, |ledger| {
+            let (_dir, root, selection) = setup();
+            let bytes = next(3);
+            let first = grant(ledger, 1000, 4);
+            let mut receipt = complete(
+                scan(&root, &selection)
+                    .append_reserved(&Provider, &bytes, ledger, first.frame().unwrap(), Tick(2))
+                    .unwrap(),
+            );
+            ledger.cancel(first).unwrap();
+            for sequence in 4..=6 {
+                let bytes = next(sequence);
+                let reserved = grant(ledger, 1000, 4);
+                receipt = complete(
+                    receipt
+                        .append_reserved(
+                            &Provider,
+                            &bytes,
+                            ledger,
+                            reserved.frame().unwrap(),
+                            Tick(2),
+                        )
+                        .unwrap(),
+                );
+                assert_eq!(receipt.durable().through().number(), sequence);
+                assert_eq!(receipt.durable().end(), 96 + 160 * (sequence - 1));
+                assert_eq!(
+                    receipt.durable().total_operations(),
+                    2 * (sequence as usize - 1)
+                );
+                assert_eq!(
+                    ledger.used(Kind::ActiveJournalBytes).unwrap(),
+                    160 * (sequence - 1)
+                );
+                assert_eq!(
+                    ledger.used(Kind::ActiveJournalOperations).unwrap(),
+                    2 * (sequence - 1)
+                );
+                assert_eq!(ledger.pending(Kind::ActiveJournalBytes).unwrap(), 0);
+                ledger.cancel(reserved).unwrap();
+            }
+            let replayed = scan(&root, &selection);
+            assert_eq!(replayed.summary().through(), receipt.durable().through());
+            assert_eq!(replayed.file().len(), receipt.durable().end());
+            assert!(!replayed.has_incomplete_tail());
+        });
+    }
+    #[test]
+    fn chained_constructor_refuses_bad_frames_changed_current_extent_and_inode_before_writes() {
+        use crate::store_paths::{AccountEntry, Name, Number};
+        for mode in 0..5 {
+            with_ledger(160, 2, |ledger| {
+                let (dir, root, selection) = setup();
+                let bytes = next(3);
+                let first = grant(ledger, 1000, 4);
+                let receipt = complete(
+                    scan(&root, &selection)
+                        .append_reserved(&Provider, &bytes, ledger, first.frame().unwrap(), Tick(2))
+                        .unwrap(),
+                );
+                ledger.cancel(first).unwrap();
+                let account = receipt.durable().current().account;
+                let name =
+                    Name::account(account, AccountEntry::Journal(Number::new(2).unwrap())).unwrap();
+                let path = dir.path.join(name.as_path().unwrap());
+                let mut bytes = next(if mode == 0 { 5 } else { 4 });
+                match mode {
+                    1 => *bytes.last_mut().unwrap() ^= 1,
+                    2 => {
+                        let name = Name::account(account, AccountEntry::Current).unwrap();
+                        std::fs::write(
+                            dir.path.join(name.as_path().unwrap()),
+                            [0; crate::format::CURRENT_BYTES],
+                        )
+                        .unwrap();
+                    }
+                    3 => {
+                        use std::io::Write;
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&path)
+                            .unwrap()
+                            .write_all(b"late")
+                            .unwrap();
+                    }
+                    4 => {
+                        let prior = std::fs::read(&path).unwrap();
+                        std::fs::remove_file(&path).unwrap();
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&path)
+                            .unwrap()
+                            .write_all(&prior)
+                            .unwrap();
+                    }
+                    _ => (),
+                }
+                let prior = std::fs::read(&path).unwrap();
+                let reserved = grant(ledger, 1000, 4);
+                assert!(matches!(
+                    receipt.append_reserved(
+                        &Provider,
+                        &bytes,
+                        ledger,
+                        reserved.frame().unwrap(),
+                        Tick(2)
+                    ),
+                    Err(ReservedAppendError::Append(AppendError::Rejected(_)))
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), prior);
+                assert_eq!(ledger.phase(), Phase::Open);
+                assert_eq!(ledger.used(Kind::ActiveJournalBytes).unwrap(), 320);
+                ledger.cancel(reserved).unwrap();
+            });
+        }
+    }
+    #[test]
+    fn chained_write_failure_keeps_prior_durable_prefix_and_full_pending_charge() {
+        with_ledger(160, 2, |ledger| {
+            let (_dir, root, selection) = setup();
+            let bytes = next(3);
+            let first = grant(ledger, 1000, 4);
+            let receipt = complete(
+                scan(&root, &selection)
+                    .append_reserved(&Provider, &bytes, ledger, first.frame().unwrap(), Tick(2))
+                    .unwrap(),
+            );
+            ledger.cancel(first).unwrap();
+            let bytes = next(4);
+            let reserved = grant(ledger, 1000, 4);
+            let mut append = receipt
+                .append_reserved(
+                    &Provider,
+                    &bytes,
+                    ledger,
+                    reserved.frame().unwrap(),
+                    Tick(2),
+                )
+                .unwrap();
+            let mut ops = Faults::new(1);
+            assert_eq!(
+                append.advance_using(&mut ops).unwrap(),
+                AppendStep::Written { bytes: 7 }
+            );
+            assert!(
+                matches!(append.advance_using(&mut ops), Err(ReservedAppendError::Append(AppendError::Indeterminate(ref e))) if e.kind() == std::io::ErrorKind::StorageFull)
+            );
+            assert!(append.finish().is_err());
+            assert_eq!(ledger.phase(), Phase::Stopped);
+            assert_eq!(ledger.used(Kind::ActiveJournalBytes).unwrap(), 320);
+            assert_eq!(ledger.used(Kind::ActiveJournalOperations).unwrap(), 4);
+            assert_eq!(ledger.pending(Kind::ActiveJournalBytes).unwrap(), 1000);
+            assert_eq!(ledger.pending(Kind::ActiveJournalOperations).unwrap(), 4);
+            assert!(matches!(
+                ledger.cancel(reserved),
+                Err(writer::Error::Logical(LogicalError::Busy))
+            ));
+            let replayed = scan(&root, &selection);
+            assert_eq!(replayed.summary().through().number(), 3);
+            assert_eq!(replayed.valid_bytes(), 416);
+            assert_eq!(replayed.file().len(), 423);
+            assert!(replayed.has_incomplete_tail());
+        });
     }
     #[test]
     fn durable_finish_charges_actual_frame_and_preserves_other_reservations() {

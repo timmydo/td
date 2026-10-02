@@ -116,7 +116,9 @@ rechecks CURRENT/inode/extent, and writes bounded chunks before sync and EOF
 confirmation. Failed or abandoned appends retain uncertain effects for recovery;
 the reservation-bound adapter stops admission on uncertainty or abandonment and
 reconciles exact frame charges only after durable completion. Atomic visibility
-integration remains pending.
+integration remains pending. A reconciled boundary can start its successor
+without a full journal rescan, while retaining the CURRENT/inode/extent checks
+and stopped-store exclusion.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can

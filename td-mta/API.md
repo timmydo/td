@@ -832,6 +832,13 @@ durable evidence is accessible by shared reference only. Constructor refusal
 starts no new effect; bookkeeping refusal after durable I/O is uncertain and
 stops admission. Runtime publication and client acknowledgment remain external.
 
+`ReconciledAppend::append_reserved` consumes a reconciled boundary for the next
+successor without a full rescan. Shared construction retains cumulative sequence,
+byte and operation checks and rechecks CURRENT/inode/extent before writes. Keep
+the same stopped-store/account exclusion and ledger. Refusal consumes the old
+owner but writes nothing; rescan before a later attempt. Successful finish gives
+the next reconciled owner. This grants no live view or publication authority.
+
 `StoppedStore::capture_journal` wraps a bounded stopped scan using caller frame
 scratch and a physical byte ceiling. Advances yield scalar frame progress or
 provisional End; finish verifies EOF and returns CapturedJournal with a derived

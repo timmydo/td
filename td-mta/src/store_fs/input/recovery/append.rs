@@ -102,71 +102,88 @@ impl<'r> ScannedJournal<'r> {
                 io::Error::from(io::ErrorKind::InvalidInput).into(),
             ));
         }
-        let total_bytes = self
-            .summary
-            .frame_bytes()
-            .checked_add(bytes.len())
-            .filter(|n| *n <= MAX_JOURNAL_FRAME_BYTES)
-            .ok_or(AppendError::Rejected(FormatError::Limit.into()))?;
-        let frame = Frame::decode(crypto, self.summary.through(), bytes)
-            .map_err(|e| AppendError::Rejected(StreamError::from(e).into()))?;
-        let header = frame.header();
-        let total_operations = self
-            .summary
-            .operations()
-            .checked_add(header.operations)
-            .filter(|n| *n <= MAX_JOURNAL_OPERATIONS)
-            .ok_or(AppendError::Rejected(FormatError::Limit.into()))?;
-        let end = u64::try_from(total_bytes)
-            .ok()
-            .and_then(|n| n.checked_add(crate::format::JOURNAL_HEADER_BYTES as u64))
-            .ok_or(AppendError::Rejected(FormatError::Overflow.into()))?;
-        let owner = self.file.owner;
-        check_current(owner, crypto, self.current).map_err(AppendError::Rejected)?;
-        let (file, length) = open_extent_using(
-            &owner.root.directory,
-            &self.file.name,
-            self.prefix,
-            Extent::Whole,
-            |path| OpenOptions::new().read(true).append(true).open(path),
-        )
-        .map_err(|e| AppendError::Rejected(e.into()))?;
-        let original = self
-            .file
-            .file
-            .metadata()
-            .map_err(|e| AppendError::Rejected(e.into()))?;
-        let opened = file
-            .metadata()
-            .map_err(|e| AppendError::Rejected(e.into()))?;
-        if length != self.prefix
-            || original.len() != self.prefix
-            || opened.len() != self.prefix
-            || !super::super::super::same_file(&original, &opened)
-        {
-            return Err(AppendError::Rejected(
-                io::Error::from(io::ErrorKind::InvalidData).into(),
-            ));
-        }
-        Ok(JournalAppend {
-            file: CompleteFile {
-                owner,
-                file,
-                name: self.file.name,
-                length: self.prefix,
-            },
-            current: self.current,
+        prepare_append(
+            self.file,
+            self.current,
+            self.summary.through(),
+            self.summary.operations(),
+            crypto,
             bytes,
-            through: header.sequence,
-            end,
-            total_operations,
-            operations: header.operations,
-            written: 0,
-            calls: 0,
-            phase: Phase::Writing,
-            failed: false,
-        })
+        )
     }
+}
+fn prepare_append<'r, 'b>(
+    prior_file: CompleteFile<'r>,
+    current: Current,
+    through: Sequence,
+    prior_operations: usize,
+    crypto: &impl Crypto,
+    bytes: &'b [u8],
+) -> Result<JournalAppend<'r, 'b>, AppendError> {
+    let prefix = prior_file.len();
+    let prior_bytes = prefix
+        .checked_sub(crate::format::JOURNAL_HEADER_BYTES as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(AppendError::Rejected(FormatError::Overflow.into()))?;
+    let total_bytes = prior_bytes
+        .checked_add(bytes.len())
+        .filter(|n| *n <= MAX_JOURNAL_FRAME_BYTES)
+        .ok_or(AppendError::Rejected(FormatError::Limit.into()))?;
+    let frame = Frame::decode(crypto, through, bytes)
+        .map_err(|e| AppendError::Rejected(StreamError::from(e).into()))?;
+    let header = frame.header();
+    let total_operations = prior_operations
+        .checked_add(header.operations)
+        .filter(|n| *n <= MAX_JOURNAL_OPERATIONS)
+        .ok_or(AppendError::Rejected(FormatError::Limit.into()))?;
+    let end = u64::try_from(total_bytes)
+        .ok()
+        .and_then(|n| n.checked_add(crate::format::JOURNAL_HEADER_BYTES as u64))
+        .ok_or(AppendError::Rejected(FormatError::Overflow.into()))?;
+    let owner = prior_file.owner;
+    check_current(owner, crypto, current).map_err(AppendError::Rejected)?;
+    let (file, length) = open_extent_using(
+        &owner.root.directory,
+        &prior_file.name,
+        prefix,
+        Extent::Whole,
+        |path| OpenOptions::new().read(true).append(true).open(path),
+    )
+    .map_err(|e| AppendError::Rejected(e.into()))?;
+    let original = prior_file
+        .file
+        .metadata()
+        .map_err(|e| AppendError::Rejected(e.into()))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| AppendError::Rejected(e.into()))?;
+    if length != prefix
+        || original.len() != prefix
+        || opened.len() != prefix
+        || !super::super::super::same_file(&original, &opened)
+    {
+        return Err(AppendError::Rejected(
+            io::Error::from(io::ErrorKind::InvalidData).into(),
+        ));
+    }
+    Ok(JournalAppend {
+        file: CompleteFile {
+            owner,
+            file,
+            name: prior_file.name,
+            length: prefix,
+        },
+        current,
+        bytes,
+        through: header.sequence,
+        end,
+        total_operations,
+        operations: header.operations,
+        written: 0,
+        calls: 0,
+        phase: Phase::Writing,
+        failed: false,
+    })
 }
 impl<'r> JournalAppend<'r, '_> {
     pub const fn is_failed(&self) -> bool {
@@ -269,6 +286,22 @@ pub struct SyncedAppend<'r> {
     frame_bytes: usize,
     total_operations: usize,
     operations: usize,
+}
+impl<'r> SyncedAppend<'r> {
+    fn append_frame<'b>(
+        self,
+        crypto: &impl Crypto,
+        bytes: &'b [u8],
+    ) -> Result<JournalAppend<'r, 'b>, AppendError> {
+        prepare_append(
+            self.file,
+            self.current,
+            self.through,
+            self.total_operations,
+            crypto,
+            bytes,
+        )
+    }
 }
 impl SyncedAppend<'_> {
     pub const fn current(&self) -> Current {

@@ -203,17 +203,23 @@ still account for those costs and concurrent owners within the ledger.
   frames and injected failure boundaries, not maximum-size datasets, native
   allocation, worker-stack or whole-service RSS qualification.
   JournalAppend and SyncedAppend each fit 1 KiB of Provider state. An append
-  borrows the existing immutable transaction-frame buffer until finish/drop and
-  keeps one writable descriptor after comparing it to the consumed scan's
-  descriptor. Every advance writes at most 64 KiB, syncs once, or checks final
-  metadata/EOF; 64 total write calls cap pathological short-write progress. It
-  adds no arena, queue or thread. Construction rechecks CURRENT using two fixed
-  120-byte buffers, up to 64 reads plus EOF and one transient descriptor. After
-  that closes, the scanned read descriptor overlaps the new writable descriptor;
-  opening also uses the existing fixed path scratch and transient parent handles.
-  Constructor frame parsing/hash and std open
-  work still need caller admission, and whole-worker stack/allocation/resource
-  qualification remains pending for this new append path.
+  borrows the existing immutable transaction-frame buffer until finish/drop
+  and keeps one writable descriptor after comparing it to the consumed prior
+  boundary's descriptor. Every advance writes at most 64 KiB, syncs once, or
+  checks final metadata/EOF; 64 total write calls cap pathological short-write
+  progress. It adds no arena, queue or thread. Construction rechecks CURRENT
+  using two fixed 120-byte buffers, up to 64 reads plus EOF and one transient
+  descriptor. After that closes, the prior boundary descriptor overlaps the
+  new writable descriptor: a read-only scan for the first append, or the
+  retained previous append thereafter. Opening also uses existing fixed path
+  scratch and transient parent handles. Each successor consumes the prior
+  evidence and returns its next owner. The caller may refill the same frame
+  buffer after finish and reuse its ledger; no additional frame arena or full
+  journal reread is needed between successes. Constructor frame parsing/hash
+  and std open work still need caller admission, and whole-worker
+  stack/allocation/resource qualification remains pending for this new append
+  path.
+
   JournalCapture and CapturedJournal each fit 2 KiB of provider state. Capture
   borrows the existing 1 MiB whole-frame recovery scratch; its consuming finish
   releases that borrow for reuse, with no new arena. Overlay loading still uses

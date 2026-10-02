@@ -1058,6 +1058,14 @@ service activation. Each part lands independently:
     reconciliation/disposal with every allocator counter unchanged. Keep scan,
     frame construction and fixture lifecycle cold; worker stack, maximum data
     and whole-service RSS qualification remain separate.
+  - **M05e2c — reusable reconciled boundary:** implemented consuming successor
+    append from ReconciledAppend, sharing the original construction and binding
+    checks. Keep prior sequence/count/extent evidence and compare CURRENT and
+    reopened inode/extent before each append without replaying the whole journal.
+    Constructor refusal consumes the owner and needs a later rescan; uncertainty
+    retains stopped admission and busy charges. Tests cover repeated successors,
+    replay/accounting, changed selection/extent/inode and partial second writes.
+    Live views and publication remain separate.
   - **M05e3 — committed visibility:** planned; publish sequence and byte offset
     together only after durable append and reservation reconciliation, retaining
     selected-generation ownership for readers. Add crash/fault ordering oracles

@@ -1456,36 +1456,56 @@ lock/file and reports CURRENT, sequence, byte endpoint, appended bytes/operation
 and cumulative operations. It is durable append evidence only; atomic reader
 visibility, reservation reconciliation and protocol acknowledgment remain for
 the writer coordinator. File namespace is unchanged, so no directory sync is
-needed for the append itself. This foundation accepts one frame per fresh scan;
-a retained multi-commit writer and publication are not implemented here.
+needed for the append itself. A physical scan starts the append chain; after
+ledger reconciliation, its retained boundary can start the next append without
+rescanning prior frame contents. A live writer/publication coordinator is still
+not implemented here.
 
 ### Reservation-bound append
 
-`ScannedJournal::append_reserved` constructs the same append before starting any
-writes, then binds its exact frame size and operation count to the supplied
-WriterLedger frame reservation. Its selected-journal byte/operation totals must
-match the complete scan. The caller supplies the ledger recovered for this
-account and keeps stopped-store exclusion (no live readers or writers) from scan
-through completion. Matching scalar counts do not establish account or generation
-identity. Constructor refusal starts no
-new effect and leaves preexisting reservations unchanged.
+`ScannedJournal::append_reserved` constructs the same append before starting
+any writes, then binds its exact frame size and operation count to the
+supplied WriterLedger frame reservation. Its selected-journal byte/operation
+totals must match the retained prior boundary. The caller supplies the ledger
+recovered for this account and keeps stopped-store exclusion (no live readers
+or writers) from scan through completion. Matching scalar counts do not
+establish account or generation identity. Constructor refusal starts no new
+effect and leaves preexisting reservations unchanged.
 
-ReservedAppend exclusively borrows that ledger until finish or drop. Its private
-guard owns the exact busy append ticket. Each advance delegates to the bounded
-physical append; any error stops ledger admission. Abandonment at any point,
-including after sync or confirmation, also stops admission and retains the full
-conservative reservation as busy. No drop path proves that nothing was written,
-cancels a ticket, retries I/O or truncates a partial frame. Recovery must account
-for any complete or partial bytes before those charges can be released.
+ReservedAppend exclusively borrows that ledger until finish or drop. Its
+private guard owns the exact busy append ticket. Each advance delegates to the
+bounded physical append; any error stops ledger admission. Abandonment at any
+point, including after sync or confirmation, also stops admission and retains
+the full conservative reservation as busy. No drop path proves that nothing
+was written, cancels a ticket, retries I/O or truncates a partial frame.
+Recovery must account for any complete or partial bytes before those charges
+can be released.
 
-Only successful physical finish followed by exact ledger reconciliation returns
-ReconciledAppend, a distinct owner with read-only access to durable endpoint
-evidence. Reconciliation charges actual appended bytes and operations once,
-releases unused frame allowance and preserves unrelated reservation parts. A
-bookkeeping failure stops admission and returns no success evidence even though
-the append may already be durable. Runtime work/deadline bracketing, blob and
-transaction policy, atomic reader visibility and client acknowledgment remain
-with the writer coordinator; this adapter does not implement them.
+Only successful physical finish followed by exact ledger reconciliation
+returns ReconciledAppend, a distinct owner with read-only access to durable
+endpoint evidence. Reconciliation charges actual appended bytes and operations
+once, releases unused frame allowance and preserves unrelated reservation
+parts. A bookkeeping failure stops admission and returns no success evidence
+even though the append may already be durable. Runtime work/deadline
+bracketing, blob and transaction policy, atomic reader visibility and client
+acknowledgment remain with the writer coordinator; this adapter does not
+implement them.
+
+`ReconciledAppend::append_reserved` consumes its retained durable boundary and
+starts a successor with the same append and reservation checks. It reuses the
+validated sequence and cumulative operation count, derives cumulative frame
+bytes from the retained exact endpoint, and rechecks CURRENT plus reopened
+inode/extent before any write. The old descriptor stays alive through that
+comparison and is then closed. This skips full journal reread/replay; it does
+not skip filesystem identity checks or permit overlapping writers/readers.
+Keep stopped-store exclusion and the same account ledger throughout the chain.
+
+Constructor refusal consumes/closes the old evidence owner without appending
+bytes or changing existing reservations. A later attempt therefore needs a
+fresh scan. A step failure stops the ledger and keeps busy charges as before;
+there is no automatic rollback, retry or reconstruction from an uncertain
+frame. Only a successful finish supplies the next reconciled owner. Reader
+publication and protocol acknowledgment still need the writer coordinator.
 
 | Failure point | Recovery and client meaning |
 | --- | --- |
