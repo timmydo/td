@@ -1497,6 +1497,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-agent the same way until its packaging increment: no recipe, recipe
+    // test or seed roster names it, and nothing reads it, so its own tests
+    // and lints are all a confined edit can break (td-agent/DESIGN.md §17).
+    // `WORKSPACE_EXEMPT` pins the crates it reads.
+    if p.starts_with("td-agent/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // The editor is a static target recipe with a realized-output check
     // (td-editor-test), so a source edit changes a target artifact: the host
     // preflight still holds its gate 325 lock/test/clippy obligations, and
@@ -4681,13 +4690,31 @@ fn crate_readers(root: &Path, roster: &[GateCrate]) -> Result<Vec<(String, Vec<S
 /// `host_only_sources_are_not_reachable_from_the_engine`.
 const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 
+/// The roster crates a confined diff may test without the builder, recipes
+/// and engine workspace pass, each with the exact set of roster crates it
+/// reads (its outgoing edges in `crate_readers`), sorted. No recipe and no
+/// seed roster names any of them, which
+/// `workspace_exemption_requires_no_distribution_recipe` holds, and a crate
+/// leaves the list in the landing that makes a recipe name it; a crate that
+/// gains a reader is no longer alone after reader closure, so it takes the
+/// whole list without the list changing. td-mta reads
+/// td-crypto, its one dependency. td-agent reads td-news, whose shared
+/// modules its test holds identical, and td-ui, its one dependency
+/// (td-agent/DESIGN.md §17); declaring `native-compositor-tests` adds
+/// td-compositor, which joins this list in the same landing.
+const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
+    ("td-agent", &["td-news", "td-ui"]),
+    ("td-mta", &["td-crypto"]),
+];
+
 /// The subset of the derived command list a diff over `changed` can actually
 /// invalidate.
 ///
-/// The workspace commands run unless only td-mta remains after reader closure
-/// with its reviewed outgoing edge to td-crypto. Mail source changes that alter
-/// that graph must still reach the workspace's exact graph assertions.
-/// Otherwise `recipes` embeds target crate sources and can be redded,
+/// The workspace commands run unless reader closure leaves exactly one crate
+/// of `WORKSPACE_EXEMPT` and its outgoing edges are exactly the ones pinned
+/// there. A source change that alters that graph must still reach the
+/// workspace's exact graph assertions, which name the crate once it reads
+/// another. Otherwise `recipes` embeds target crate sources and can be redded,
 /// and the builder's own tests name the one crate no recipe embeds. A path
 /// names the roster crate whose directory holds it; that crate's commands
 /// run, and so do those of every crate that READS it — closed transitively,
@@ -4702,15 +4729,18 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     };
     let readers = crate_readers(root, &roster)?;
     close_over_readers(&mut selected, &readers);
-    let mail_only = selected.len() == 1 && selected.first().is_some_and(|c| c == "td-mta");
-    if mail_only {
-        let dependencies = readers.iter().filter_map(|(name, consumers)| {
-            consumers
-                .iter()
-                .any(|c| c == "td-mta")
-                .then_some(name.as_str())
-        });
-        if !dependencies.eq(["td-crypto"]) {
+    let exempt = match selected.as_slice() {
+        [only] => WORKSPACE_EXEMPT.iter().find(|(name, _)| name == only),
+        _ => None,
+    };
+    if let Some((name, pinned)) = exempt {
+        let mut edges: Vec<&str> = readers
+            .iter()
+            .filter(|(_, consumers)| consumers.iter().any(|c| c == name))
+            .map(|(read, _)| read.as_str())
+            .collect();
+        edges.sort_unstable();
+        if edges != *pinned {
             return Ok(all);
         }
     }
@@ -4718,7 +4748,7 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
         .iter()
         .filter(|cmd| match cmd_manifest_crate(cmd) {
             Some(c) => selected.iter().any(|s| s == c),
-            None => !mail_only || is_format_check(cmd),
+            None => exempt.is_none() || is_format_check(cmd),
         })
         .cloned()
         .collect();
@@ -5804,6 +5834,7 @@ mod tests {
         assert_eq!(
             check_scope(&root, &paths(&["td-compositor/src/main.rs"]), &check),
             Some(paths(&[
+                "td-agent",
                 "td-authd",
                 "td-compositor",
                 "td-crypto",
@@ -8208,6 +8239,7 @@ mod tests {
         assert_eq!(
             names(&comp),
             [
+                "td-agent",
                 "td-authd",
                 "td-compositor",
                 "td-crypto",
@@ -8237,19 +8269,20 @@ mod tests {
             ]
         );
         // td-photo's, td-mail's and td-pass's native cases make their
-        // commands three, as td-setup's are; td-dua, td-news, td-review and
-        // td-term, toolkit consumers with no native case, add two each. The
-        // test-only P-256 oracle connects td-secret to td-crypto and then
-        // td-mta, adding two commands each, and td-open, which mounts
+        // commands three, as td-setup's are; td-agent, td-dua, td-news,
+        // td-review and td-term, toolkit consumers with no native case, add
+        // two each. The test-only P-256 oracle connects td-secret to td-crypto
+        // and then td-mta, adding two commands each, and td-open, which mounts
         // td-secret's descriptor module, adds two; the installation
         // fixture, reading td-install's codecs, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 62, "{comp:?}");
+        assert_eq!(comp.len(), 64, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
             names(&one("td-busd/src/wire.rs")),
             [
+                "td-agent",
                 "td-audio",
                 "td-authd",
                 "td-busd",
@@ -8286,6 +8319,7 @@ mod tests {
         assert_eq!(
             names(&one("td-boot/src/protocol.rs")),
             [
+                "td-agent",
                 "td-authd",
                 "td-boot",
                 "td-compositor",
@@ -8668,24 +8702,156 @@ mod tests {
     }
 
     #[test]
-    fn mail_gate_exemption_requires_no_distribution_recipe() {
+    fn workspace_exemption_requires_no_distribution_recipe() {
         let root = repo_root();
         let mut recipes = Vec::new();
         collect_rs_recursive(&root.join("recipes/src"), &mut recipes);
         assert!(!recipes.is_empty());
-        for path in recipes {
-            let text = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                !text.contains("td-mta"),
-                "{} names td-mta; revisit its affected-check mapping",
-                path.display()
-            );
-        }
         let roster = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
-        assert!(
-            !roster.contains("td-mta"),
-            "td-mta now enters a recipe closure"
-        );
+        let names: Vec<&str> = WORKSPACE_EXEMPT.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["td-agent", "td-mta"]);
+        let texts: Vec<(PathBuf, String)> = recipes
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path).unwrap();
+                (path, text)
+            })
+            .collect();
+        for name in names {
+            for (path, text) in &texts {
+                assert!(
+                    !text.contains(name),
+                    "{} names {name}; revisit its affected-check mapping",
+                    path.display()
+                );
+            }
+            assert!(!roster.contains(name), "{name} now enters a recipe closure");
+        }
+        // Each pinned edge set is sorted, as the comparison reads it.
+        for (name, edges) in WORKSPACE_EXEMPT {
+            assert!(edges.windows(2).all(|w| w[0] < w[1]), "{name}: {edges:?}");
+        }
+    }
+
+    /// td-agent's own commands and the format check, and no target, for every
+    /// path inside it, while its edges are the pinned ones (DESIGN.md §17).
+    #[test]
+    fn agent_only_changes_run_own_tests_and_lints_without_distro_checks() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        if !roster.iter().any(|c| c.name == "td-agent") {
+            eprintln!("SKIP: td-agent is not on this roster");
+            return;
+        }
+        for path in [
+            "td-agent/src/x.rs",
+            "td-agent/src/main.rs",
+            "td-agent/tests/shared_modules.rs",
+            "td-agent/Cargo.toml",
+            "td-agent/Cargo.lock",
+        ] {
+            let selection = compute_selection(&root, &[path.to_string()]);
+            assert!(
+                selection.targets.is_empty(),
+                "{path}: {:?}",
+                selection.targets
+            );
+            assert_eq!(selection.preflights, ["cargo-test"], "{path}");
+            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            assert!(commands.first().is_some_and(|c| is_format_check(c)));
+            let (format, own): (Vec<&String>, Vec<&String>) =
+                commands.iter().partition(|c| is_format_check(c));
+            assert_eq!(format.len(), 1, "{path}: {commands:?}");
+            assert!(
+                own.iter()
+                    .all(|c| cmd_manifest_crate(c) == Some("td-agent")),
+                "{path}: {commands:?}"
+            );
+            for action in ["cargo test", "cargo clippy"] {
+                assert!(
+                    own.iter().any(|c| c.contains(action)),
+                    "{path}: no {action}: {commands:?}"
+                );
+            }
+            let output = path_output(&root, path);
+            assert!(output.contains("--manifest-path td-agent/Cargo.toml"));
+            assert!(!output.contains("--workspace"), "{output}");
+            assert!(!output.contains("td-builder check"), "{output}");
+            assert!(!output.contains("discovered crate"), "{output}");
+        }
+        for path in [
+            "td-agent-extra/src/main.rs",
+            "td-agent/../td-sh/src/main.rs",
+        ] {
+            assert_eq!(
+                cargo_test_cmds(&root, &[path.to_string()]).unwrap(),
+                gate_cmds()
+            );
+            assert!(path_output(&root, path).contains("td-builder check"));
+        }
+        // A crate td-agent reads brings td-agent with it, and so the
+        // workspace pass.
+        let ui = cargo_test_cmds(&root, &["td-ui/src/messages.rs".to_string()]).unwrap();
+        assert!(ui.iter().any(|c| c.contains("--workspace")));
+        assert!(ui.iter().any(|c| cmd_manifest_crate(c) == Some("td-agent")));
+        // Together with td-mta it is two crates, and no exemption.
+        let both = cargo_test_cmds(
+            &root,
+            &[
+                "td-agent/src/main.rs".to_string(),
+                "td-mta/src/lib.rs".to_string(),
+            ],
+        )
+        .unwrap();
+        assert!(both.iter().any(|c| c.contains("--workspace")));
+    }
+
+    /// An edge td-agent gains or loses is a graph the workspace's reader
+    /// assertions have not seen: the whole list runs.
+    #[test]
+    fn agent_source_graph_changes_restore_workspace_coverage() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture =
+            Fixture(std::env::temp_dir().join(format!("td-agent-graph-{}", std::process::id())));
+        let root = fixture.0.clone();
+        std::fs::remove_dir_all(&root).ok();
+        for name in ["td-agent", "td-news", "td-ui", "td-mail"] {
+            let base = root.join(name);
+            std::fs::create_dir_all(base.join("src")).unwrap();
+            let mut manifest = format!("[package]\nname = \"{name}\"\n");
+            if name == "td-agent" {
+                manifest.push_str("\n[dependencies]\ntd-ui = { path = \"../td-ui\" }\n");
+            }
+            std::fs::write(base.join("Cargo.toml"), manifest).unwrap();
+            std::fs::write(base.join("src/lib.rs"), "").unwrap();
+        }
+        let shared = "const SHARED: &str = \"../td-news/src/json.rs\";\n";
+        std::fs::write(root.join("td-agent/src/lib.rs"), shared).unwrap();
+        let changed = ["td-agent/src/lib.rs".to_string()];
+        let all = cargo_test_cmds_all(&root).unwrap();
+        let narrowed = cargo_test_cmds(&root, &changed).unwrap();
+        assert_eq!(narrowed.len(), 3, "{narrowed:?}");
+        assert!(narrowed
+            .iter()
+            .all(|c| is_format_check(c) || cmd_manifest_crate(c) == Some("td-agent")));
+        // A third crate read: the workspace's assertions would name it.
+        std::fs::write(
+            root.join("td-agent/src/lib.rs"),
+            format!("{shared}const MAIL: &str = \"../td-mail/src/json.rs\";\n"),
+        )
+        .unwrap();
+        assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
+        // An edge lost is a changed set too.
+        std::fs::write(root.join("td-agent/src/lib.rs"), "").unwrap();
+        assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
     }
 
     /// The rendered line and the executed list come from one call, so the dry

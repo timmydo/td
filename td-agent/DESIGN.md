@@ -15,7 +15,9 @@ submission.
 
 ## Status
 
-Design only: no crate, recipe or entry script exists yet. The decisions
+The crate and its gate exist (§17); the window, the conversation
+processes and the store are the rest of increment 4, and no recipe or
+entry script exists yet. The decisions
 below that were the user's to make were made on 2026-10-01 and
 2026-10-02:
 
@@ -1834,22 +1836,28 @@ roster crates a diff touches and every crate that reads them. Measured on
 2026-10-02:
 
 - a path in no roster crate selects every crate and the `check` target,
-  which is what `td-agent/src/` does until `td-agent/Cargo.toml` exists,
-  so the crate increment adds its manifest and lock in the same commit as
-  its source;
+  which is what `td-agent/src/` did before `td-agent/Cargo.toml` existed,
+  so the crate increment added its manifest and lock in the same commit
+  as its source;
 - a path in a discovered crate with no `map_path` arm of its own selects
   that crate's preflight and also the whole `check` target, since which
   recipe embeds a new crate is for its author to say;
 - every narrowed preflight keeps the tests and clippy of the builder,
   recipes and engine workspace, because recipes embed crate sources and
   the builder's tests assert exact reader sets;
-- td-mta alone escapes both: its own `map_path` arm adds only the
-  `cargo-test` preflight, and `cargo_test_cmds` drops the workspace pass
-  while its only outgoing edge is exactly `td-crypto`. A builder test
-  (`mail_gate_exemption_requires_no_distribution_recipe`) holds that no
-  recipe and no seed roster names it.
+- td-mta escaped both, and still does: its own `map_path` arm adds
+  only the `cargo-test` preflight, and `cargo_test_cmds` drops the
+  workspace pass while its only outgoing edge is exactly `td-crypto`. A
+  builder test holds that no recipe and no seed roster names it.
 
-td-agent is laid out to get td-mta's treatment:
+td-agent is laid out to get td-mta's treatment, and the crate increment
+gave it that: `WORKSPACE_EXEMPT` in `affected.rs` lists each exempt crate
+with its sorted, pinned edges, and
+`workspace_exemption_requires_no_distribution_recipe` holds every crate on
+it to no recipe and no seed roster. `td-builder affected-checks --path
+td-agent/src/main.rs` selects the format check and td-agent's test and
+clippy commands, and no check target. It is laid out for that as
+follows:
 
 - no crate depends on it, so a td-agent change selects td-agent alone; a
   change to a crate it reads selects td-agent as well, as it should;

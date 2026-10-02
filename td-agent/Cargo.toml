@@ -1,0 +1,34 @@
+[package]
+name = "td-agent"
+version = "0.1.0"
+edition = "2021"
+description = "td's agent harness: conversations with language models in a td-ui window"
+license = "MIT"
+
+# td-agent is a TARGET-built application, not part of the control-plane
+# engine workspace: standalone, its own workspace root, with a lock that
+# names itself and the one sibling it draws on (DESIGN.md §1). An explicit
+# empty `[workspace]` keeps cargo from walking up to an outer checkout's
+# manifest from a nested worktree, as td-news's does.
+[workspace]
+
+# Its own tests and lints and nothing else of the gate while no recipe names
+# it (DESIGN.md §17; the pinned edges live in builder/src/affected.rs). The
+# control socket's tests bind under owner-checked fixtures, as td-ui's do.
+[package.metadata.td-gate]
+clippy-all-targets = true
+trusted-test-root = true
+
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
+
+# The shared UI toolkit, by the one sibling-dependency spelling the lock
+# guard admits (AGENTS.md 'Rust code').
+[dependencies]
+td-ui = { path = "../td-ui" }
