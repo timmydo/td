@@ -867,6 +867,71 @@ fn store_read_pool() {
     }
 }
 
+fn header_raw() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_raw::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    fn budget(records: u64) -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100,
+                records,
+                ..Charge::default()
+            },
+        )
+    }
+    let before = COUNTERS.snapshot();
+    let mut cursor = Cursor::new(b" a\r\n\t\0\xff\xef\xbf\xbe");
+    let saved = cursor;
+    let expected = [' ', 'a', '\r', '\n', '\t', '�', '�'];
+    let mut meter = budget(100);
+    for _ in 0..2 {
+        let mut written = 0;
+        let mut done = false;
+        for _ in 0..30 {
+            match cursor.poll(Tick(1), &mut meter).unwrap() {
+                Status::Scalar(value) => {
+                    assert_eq!(Some(&value), expected.get(written));
+                    written += 1;
+                }
+                Status::Yield => {}
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(written, expected.len());
+        assert!(cursor.is_encoding_problem());
+        assert_eq!(
+            cursor.poll(Tick(100), &mut meter).unwrap(),
+            Status::Complete
+        );
+        cursor = saved;
+    }
+    let mut cursor = Cursor::new(b"a");
+    assert!(matches!(
+        cursor.poll(Tick(1), &mut budget(0)),
+        Err(Error::Work(_))
+    ));
+    let mut fresh = budget(10);
+    let remaining = fresh.remaining();
+    assert!(matches!(
+        cursor.poll(Tick(1), &mut fresh),
+        Err(Error::Work(_))
+    ));
+    assert_eq!(fresh.remaining(), remaining);
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "Raw header projection allocated"
+    );
+}
+
 fn mime_unfold() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -1611,6 +1676,7 @@ fn main() {
         mime_charset();
         mime_checkpoints();
         mime_unfold();
+        header_raw();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1698,6 +1764,7 @@ fn main() {
     mime_charset();
     mime_checkpoints();
     mime_unfold();
+    header_raw();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

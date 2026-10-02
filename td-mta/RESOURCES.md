@@ -770,6 +770,14 @@ The isolated allocation interval covers single-byte source/output fragments,
 fold/nonfold endings, stable completion and fresh-meter refusal retries with
 unchanged Rust counters. Full header-form composition remains unqualified.
 
+The resident Raw header cursor fits 64 bytes including its immutable source
+reference and UTF-8 decoder. It fits the same 2 KiB decoder/HTML/snippet
+state and a future 256-byte decoding cursor checkpoint; no retained
+header string is allocated. A dedicated interval covers raw scalar decoding,
+NUL removal, malformed/noncharacter replacement, replay, completion and
+fresh-meter refusal without changing Rust allocation counters. Source
+collection and the complete projection worker stack remain unqualified.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

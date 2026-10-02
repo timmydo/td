@@ -1225,7 +1225,15 @@ Initial independently landable increments:
   short output, replay charges, sticky refusal and allocation counters.
   Charset/form composition, encoded words, NFC and protocol output remain open.
 
-Implement header-form composition, encoded words, address/date parsing,
+- **M06g — resident Raw header projection:** implemented immutable-source
+  scalar iteration, maximal-subpart UTF-8 replacement before NUL removal,
+  I-JSON noncharacter replacement, and preservation of folds/other text.
+  Charge decode/filter/replay work; retain sticky failure and stable completion.
+  Cover the H02 scanner-to-Raw fixture, all 66 noncharacters, boundary neighbors,
+  invalid fragments separated by NUL, copied-state replay and allocation.
+  Header selection, collection and JSON/JMAP integration remain open.
+
+Implement other header-form composition, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME
 serialization for structured outgoing email, including attachment streaming,

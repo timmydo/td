@@ -743,6 +743,12 @@ space or tab, retaining the whitespace and every nonfold octet. It supports
 fragmentation and output backpressure within the 32 KiB conversion region;
 form-specific text processing and protocol integration remain separate.
 
+The resident Raw header cursor composes UTF-8 replacement with NUL removal
+and I-JSON noncharacter replacement, preserving folds and original text.
+It streams scalars from the existing header arena, with charged work and no
+owned strings. Header selection, source collection and JSON/JMAP output
+remain separate.
+
 ## 10. HTTP and JMAP
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,

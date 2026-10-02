@@ -846,6 +846,32 @@ never return a partial unfolded value as success. Copied state may later join
 an owner-bound source checkpoint; restoration must retain the live meter and
 owner retirement status, never revive a failed operation with fresh work.
 
+### 1.17 Resident Raw header projection
+
+header_raw::Cursor borrows a resident immutable header value, selected after
+successful header scanning and aggregate header-arena admission. It decodes
+UTF-8 with maximal-subpart replacement, then drops NUL and replaces Unicode
+noncharacters with U+FFFD for I-JSON. Removing NUL never joins broken UTF-8
+fragments. Preserve leading/trailing whitespace, folds, capitalization,
+literal encoded words, valid unassigned scalars and decomposed text. Raw form
+never unfolds, decodes encoded words or applies NFC.
+
+Each poll returns one Scalar, Yield for a removed NUL, or Complete. It visits
+at most four source bytes and inspects at most one decoded scalar. Charset
+decoding charges source visits and one scalar record, including the fixed Raw
+filter work and removed NUL. No second scalar record is needed; a maximal
+ASCII header thus fits the default record allowance before other projection
+work. Serialization charges output bytes.
+position is the resident source-byte cursor. The encoding diagnostic records
+malformed UTF-8/noncharacter replacement, is provisional until completion,
+and does not flag the policy's NUL removal. A copied cursor retains the same
+source reference; owner-bound restoration retains the live meter and must
+never revive a failed operation. Work refusal retires the cursor even with a
+fresh meter; discard provisional output. Completed state is stable without
+further work. The owner brackets deterministic turns with fresh clock checks.
+Source collection, header selection, JSON serialization and JMAP activation
+remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

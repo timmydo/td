@@ -10,6 +10,7 @@ pub mod format;
 pub mod frame_changes;
 pub mod gateway_policy;
 pub mod generations;
+pub mod header_raw;
 pub mod ids;
 pub mod limits;
 pub mod mailbox_parents;

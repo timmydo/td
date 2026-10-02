@@ -90,18 +90,19 @@ thread-anchor policy in section 5 is separately defined.
 
 Raw values exclude the terminating line ending, preserve leading whitespace
 and folds, replace malformed UTF-8 using one U+FFFD per maximal invalid
-subpart, and drop NUL. Text form unfolds an accepted line ending followed by
-SP/HTAB, removes initial SP, decodes only properly placed RFC 2047 encoded
-words with known charsets, removes their encoded NUL/control characters, then
-applies NFC. Whitespace between adjacent valid encoded words is ignored as RFC
-2047 requires. Bad placement or unknown charset leaves the encoded word
-literal; malformed payload of an otherwise decodable word uses replacement and
-resumes. Unfolding removes the accepted line ending, not the following
-whitespace. Encoded words longer than RFC 2047's 75-character ceiling remain
-literal. Decode adjacent words separately; do not join invalid split multibyte
-sequences across words. Their invalid fragments produce replacement. No
-blanket trim changes trailing spaces or an initial tab. All decoding is
-independent of chunk size.
+subpart, and drop NUL. Remove NUL after UTF-8 replacement so its removal
+never joins broken byte sequences. Text form unfolds an accepted line ending
+followed by SP/HTAB, removes initial SP, decodes only properly placed RFC
+2047 encoded words with known charsets, removes their encoded NUL/control
+characters, then applies NFC. Whitespace between adjacent valid encoded
+words is ignored as RFC 2047 requires. Bad placement or unknown charset
+leaves the encoded word literal; malformed payload of an otherwise decodable
+word uses replacement and resumes. Unfolding removes the accepted line
+ending, not the following whitespace. Encoded words longer than RFC 2047's
+75-character ceiling remain literal. Decode adjacent words separately; do
+not join invalid split multibyte sequences across words. Their invalid
+fragments produce replacement. No blanket trim changes trailing spaces or an
+initial tab. All decoding is independent of chunk size.
 
 Supported charset labels (ASCII case insensitive) are utf-8, us-ascii,
 iso-8859-1 and windows-1252; aliases utf8, ascii, latin1 and cp1252 map to
