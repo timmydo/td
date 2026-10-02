@@ -130,20 +130,32 @@ the same verified deployment and with a key made for the run, directly from
 its kernel and live selector with both tokens appended, the ISO attached
 read-only as a virtio disk and an empty sparse disk after it. Once
 `TD-SETUP-LIVE-READY` is seen it drives the wizard through QEMU's emulated
-keyboard, pressing each key only after td-setup has said the state that key
-is for: welcome, the one listed destination, a username, hostname and time
-zone typed a key at a time, the service's review of exactly those, and back
-from the review until td-setup says the service released it. A lost or
-garbled evidence line fails the run as soon as a later line shows the gap,
-and a state that does not follow its key within five minutes fails it then.
-Under that token the session keeps the drive's keyboard: the autotest
-Claude terminal evidence, whose window would map on the wizard's workspace
-and take the keys, does not run, and the greeter parks rather than reboot
-the live boot when its health transaction settles. QEMU's own count of
-changes to the target, writes, discards and zone appends alike, must then
-be zero, and the target must have no allocated block. It does not consent
-or install: the rest of increment 7's flow, and booting that medium through
-firmware, are still to be proven; `./test-iso` boots it through firmware by
+keyboard, acting only after td-setup has said the state the act is for:
+welcome, the one listed destination, a username, hostname and time zone
+typed a key at a time, the service's review of exactly those, back from the
+review until td-setup says the service released it, and the same review
+again. Enter on it asks for consent, which the drive gives as a person
+does: the secure attention chord, the menu's `I`, and Enter only once a
+capture of the compositor's prompt shows, pixel for pixel above its
+countdown, exactly td-authd's rows for that disk, its size and serial, the
+host, the account and the deployment's prefix, and nothing else; Enter
+again while that prompt stays and nothing is written, since the compositor
+drops an Enter stamped before its prompt's receipt; then Escape once the
+menu's notice says the system is installed. QEMU's own count of changes to
+the target, writes, discards and zone appends alike, must be zero when the
+review is released, when consent is asked and at every Enter on the prompt,
+and must not be by the installed notice. The run ends once td-setup says
+the installation completed, and the target must then hold the installer's
+GPT layout, primary and backup whole. A lost or garbled evidence line fails
+the run as soon as a later line shows the gap, and a state that does not
+follow its act within five minutes, or an installed notice that does not
+follow consent within half an hour, fails it then; so does td-setup saying
+the installation failed. Under that token the session keeps the drive's
+keyboard: the autotest Claude terminal evidence, whose window would map on
+the wizard's workspace and take the keys, does not run, and the greeter
+parks rather than reboot the live boot when its health transaction settles.
+Booting the installed disk, and that medium, through firmware are still to
+be proven (increment 7); `./test-iso` boots the medium through firmware by
 hand.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
@@ -1121,12 +1133,13 @@ not discover `/etc/zoneinfo` automatically.
    destinations and invalid plans without modifying their bytes. The
    service opens its consent channel within this increment, proven by the
    full-system QEMU oracle driving it as both peers; td-authd's intake and
-   the compositor's presentation keep their own tests until increment 7.
+   the compositor's presentation are proven end to end in increment 6.
 6. Add the native wizard, target recipe and live startup integration. Use
    native compositor tests for navigation, rendering, input, errors and
    progress; fixtures cannot grant ordinary clients trusted consent. A live
    boot starts the wizard ("Live startup"), and `qemu-boot-live` drives it
-   with physical keys to the service's review.
+   with physical keys through the service's review and the compositor's
+   consent to an installed disposable disk.
 7. Activate the complete profile only after the end-to-end QEMU evidence:
    boot the ISO, complete the UI flow onto a disposable disk, detach the
    media, boot that disk through firmware, and observe the configured

@@ -4883,7 +4883,10 @@ fn boot_source(
         .map(PhysicalInputController::new);
     let mut setup_input = match (source, qmp_path) {
         (BootSource::LiveSetup { script, .. }, Some(path)) => {
-            Some(setup_input::SetupInputController::new(path, script))
+            let capture = path.with_file_name("attention.ppm");
+            Some(setup_input::SetupInputController::new(
+                path, capture, script,
+            ))
         }
         _ => None,
     };
@@ -4918,17 +4921,7 @@ fn boot_source(
             }
         }
         if let Some(controller) = setup_input.as_mut() {
-            match controller.progress(&evidence).and_then(|done| {
-                // Every write the guest made is QEMU's to count, whether or
-                // not it allocated a block before the machine stops.
-                match done.then(|| controller.target_writes()).transpose()? {
-                    Some(0) | None => Ok(done),
-                    Some(writes) => Err(format!(
-                        "the target disk took {writes} writes from a wizard that \
-                         never consented"
-                    )),
-                }
-            }) {
+            match controller.progress(&evidence) {
                 Ok(true) => {
                     let sent = child.kill().is_ok();
                     marker_killed = child
@@ -12341,53 +12334,66 @@ mod tests {
 
     #[test]
     fn setup_steps_match_only_states_said_after_the_last_acted_on() {
-        let script = [
-            setup_input::SetupStep {
-                shown: "page=a".into(),
-                keys: Vec::new(),
-            },
-            setup_input::SetupStep {
-                shown: "page=b".into(),
-                keys: Vec::new(),
-            },
-        ];
-        let mut controller =
-            setup_input::SetupInputController::new(PathBuf::from("/nonexistent/qmp"), &script);
+        let step = |shown: &str| setup_input::SetupStep {
+            shown: shown.into(),
+            act: setup_input::Act::Keys(Vec::new()),
+            untouched: false,
+            within: setup_input::STEP_TIMEOUT,
+        };
+        let script = [step("page=a"), step("page=b")];
+        let controller = || {
+            setup_input::SetupInputController::new(
+                PathBuf::from("/nonexistent/qmp"),
+                PathBuf::from("/nonexistent/attention.ppm"),
+                &script,
+            )
+        };
+        let mut first = controller();
         let mut evidence = ConsoleEvidence::default();
         evidence.td_setup_shown = vec![(1, "page=a".into())];
         // Nothing is driven before the live session says it is ready.
-        assert_eq!(controller.progress(&evidence), Ok(false));
-        assert_eq!(controller.awaiting(), Some("page=a"));
+        assert_eq!(first.progress(&evidence), Ok(false));
+        assert_eq!(first.awaiting(), Some("page=a"));
         evidence.target = true;
         evidence.td_setup_shown.clear();
-        assert_eq!(controller.progress(&evidence), Ok(false));
+        assert_eq!(first.progress(&evidence), Ok(false));
         // `b` said before `a` does not answer the step after `a`.
         evidence.td_setup_shown = vec![(1, "page=b".into()), (2, "page=a".into())];
-        assert_eq!(controller.progress(&evidence), Ok(false));
-        assert_eq!(controller.awaiting(), Some("page=b"));
+        assert_eq!(first.progress(&evidence), Ok(false));
+        assert_eq!(first.awaiting(), Some("page=b"));
         evidence.td_setup_shown.push((3, "page=b extra=1".into()));
-        assert_eq!(controller.progress(&evidence), Ok(true));
-        assert_eq!(controller.awaiting(), None);
+        assert_eq!(first.progress(&evidence), Ok(true));
+        assert_eq!(first.awaiting(), None);
         // A state that does not follow within the step timeout fails.
-        let mut controller =
-            setup_input::SetupInputController::new(PathBuf::from("/nonexistent/qmp"), &script);
+        let mut later = controller();
         let mut waiting = ConsoleEvidence::default();
         waiting.target = true;
         let start = Instant::now();
-        assert_eq!(controller.progress_at(&waiting, start), Ok(false));
+        assert_eq!(later.progress_at(&waiting, start), Ok(false));
         assert_eq!(
-            controller.progress_at(&waiting, start + Duration::from_secs(300)),
+            later.progress_at(&waiting, start + Duration::from_secs(300)),
             Ok(false)
         );
-        assert!(controller
+        assert!(later
             .progress_at(&waiting, start + Duration::from_secs(301))
             .unwrap_err()
             .contains("did not show \"page=a\" within 300s"));
+        // A failed or unknown installation fails the drive at once; the
+        // states before it do not.
+        for state in ["page=failed", "page=unknown"] {
+            let mut later = controller();
+            let mut failed = ConsoleEvidence::default();
+            failed.target = true;
+            failed.td_setup_shown = vec![(1, "page=a".into()), (2, state.into())];
+            assert!(later.progress(&failed).unwrap_err().contains(state));
+            let mut later = controller();
+            failed.td_setup_shown = vec![(1, "page=a".into())];
+            assert_eq!(later.progress(&failed), Ok(false));
+        }
         // A lost line fails the drive at once.
-        let mut controller =
-            setup_input::SetupInputController::new(PathBuf::from("/nonexistent/qmp"), &script);
+        let mut later = controller();
         evidence.td_setup_lost = Some("lost".into());
-        assert!(controller.progress(&evidence).is_err());
+        assert!(later.progress(&evidence).is_err());
         // A step's every token must be the state's.
         assert!(setup_input::matches("page=a x=1 y=2", "page=a y=2"));
         assert!(!setup_input::matches("page=a x=1", "page=a x=12"));

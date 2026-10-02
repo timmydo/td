@@ -1,7 +1,8 @@
 //! `qemu-boot-live`: the production live profile boots from its own medium
 //! into the graphical session, opens the installer wizard, and a person's
 //! keys carry it through the destination and settings pages to the
-//! installation service's review and back (td-install/INSTALLER.md
+//! installation service's review, back, to a second review, and through
+//! the compositor's consent to an installed disk (td-install/INSTALLER.md
 //! increment 6).
 //!
 //! The medium is `build-iso`'s, composed by the same function from the same
@@ -16,15 +17,22 @@
 //! Once the live session says the wizard is ready, every key is pressed
 //! through QEMU's emulated keyboard only after td-setup says it showed the
 //! state that key is for, so a key cannot land on a page or field it was
-//! not meant for. The run ends once td-setup says the service released the
-//! review it left; QEMU's own count of writes, discards and zone appends
-//! on the target must then be zero, and the target must still have no
-//! allocated block.
+//! not meant for. When td-setup says the service released the review it
+//! left, and again when it asks for consent to the second, QEMU's own count
+//! of writes, discards and zone appends on the target must be zero.
+//! Consent is given as a person gives it: the secure attention chord, the
+//! menu's `I`, and Enter only once the compositor's prompt shows, pixel for
+//! pixel and nothing else, exactly the disk, its size and serial, the host,
+//! the account and the deployment's prefix reviewed (Enter again while the
+//! prompt stays and nothing is written, since the compositor drops an Enter
+//! stamped before its receipt); then Escape from the installed notice, by
+//! which the target must have been written. The run ends once td-setup says
+//! the installation completed, and the target must then hold the
+//! installer's whole GPT layout.
 use super::build_iso::{live_medium, LiveMedium};
 use super::install::{system_target_capacity, TargetDisk};
-use super::setup_input::{typed, SetupStep};
+use super::setup_input::{disk_prompt_rows, typed, Act, SetupStep, STEP_TIMEOUT};
 use super::*;
-use std::os::unix::fs::MetadataExt;
 
 const TD_SETUP_LIVE_MARKER: &str = td_recipe::ladder::TD_SETUP_LIVE_MARKER;
 /// The live volume is half of RAM and the stock session runs on the rest.
@@ -64,12 +72,16 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             .ok_or("live payload length overflow")?;
     }
     let target_name = "target.raw";
-    let target = TargetDisk::with_capacity(
-        &scratch.dir,
-        target_name,
-        system_target_capacity(payload_bytes)?,
-    )?;
-    let script = script()?;
+    let capacity = system_target_capacity(payload_bytes)?;
+    let target = TargetDisk::with_capacity(&scratch.dir, target_name, capacity)?;
+    let script = script(&disk_prompt_rows(
+        TARGET_KERNEL_NAME,
+        capacity,
+        super::setup_input::TARGET_SERIAL,
+        HOSTNAME,
+        USERNAME,
+        &id,
+    )?)?;
     let timeout = boot_timeout();
     let tokens = format!(
         "{AUTOTEST_CMDLINE_TOKEN} {} {}",
@@ -109,33 +121,99 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         println!("   [qemu-boot-live] td-setup showed {sequence}: {state}");
     }
     require_live_session(&result)?;
-    let allocated = fs::metadata(scratch.dir.join(target_name))
-        .map_err(|error| format!("stat the target disk: {error}"))?
-        .blocks();
-    if allocated != 0 {
-        return Err(format!(
-            "the withdrawn review left {allocated} allocated blocks on the target disk"
-        ));
-    }
+    require_partitioned(&scratch.dir.join(target_name), capacity)?;
     println!(
         "PASS: the live medium booted its signed deployment into the graphical \
          session; the installer wizard, focused with td-authd's setup intake \
          bound, took physical keys through the destination and settings pages \
          to the service's review of {TARGET_KERNEL_NAME} for {USERNAME}@{HOSTNAME} \
-         in {ZONE}; the review left was released, and the target took no write"
+         in {ZONE}, released it untouched and reviewed again; consent went \
+         through the compositor's secure attention prompt showing exactly that \
+         disk, its size and serial, host, account and deployment prefix, \
+         td-setup said the installation completed, and the target holds the \
+         installer's GPT layout"
     );
     Ok(())
 }
 
+/// The installed target holds a whole, consistent GPT, primary and backup,
+/// with exactly the installer's layout: the ESP from the first aligned
+/// sector, then the volume to the last usable sector.
+fn require_partitioned(path: &Path, capacity: u64) -> Result<(), String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    const SECTOR: u64 = 512;
+    let protocol = |error: String| format!("the installed target's GPT: {error}");
+    let entries = td_engine::gpt::entry_array_sectors(SECTOR).map_err(protocol)?;
+    let read = |offset: u64, sectors: u64| -> Result<Vec<u8>, String> {
+        let length = sectors
+            .checked_mul(SECTOR)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or("GPT read length overflow")?;
+        let mut bytes = vec![0u8; length];
+        File::open(path)
+            .and_then(|mut file| {
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(&mut bytes)
+            })
+            .map_err(|error| format!("read the installed target's GPT: {error}"))?;
+        Ok(bytes)
+    };
+    let disk_sectors = capacity / SECTOR;
+    let backup_sectors = entries.checked_add(1).ok_or("GPT size overflow")?;
+    let primary = read(0, backup_sectors.checked_add(1).ok_or("GPT size overflow")?)?;
+    let backup = read(
+        disk_sectors
+            .checked_sub(backup_sectors)
+            .and_then(|sector| sector.checked_mul(SECTOR))
+            .ok_or("the target is smaller than a GPT")?,
+        backup_sectors,
+    )?;
+    let table = td_engine::gpt::parse(&primary, &backup, SECTOR).map_err(protocol)?;
+    let align = td_boot_protocol::PARTITION_ALIGN_BYTES / SECTOR;
+    let esp_end = align + td_boot_protocol::ESP_BYTES / SECTOR - 1;
+    let layout: Vec<_> = table
+        .partitions
+        .iter()
+        .map(|part| {
+            (
+                part.type_guid,
+                part.name.as_str(),
+                part.start_lba,
+                part.end_lba,
+            )
+        })
+        .collect();
+    let expected = [
+        (
+            td_engine::gpt::TYPE_ESP,
+            td_boot_protocol::ESP_PARTITION_NAME,
+            align,
+            esp_end,
+        ),
+        (
+            td_engine::gpt::TYPE_LINUX_FS,
+            td_boot_protocol::VOLUME_PARTITION_NAME,
+            esp_end + 1,
+            td_engine::gpt::last_usable_lba(SECTOR, disk_sectors).map_err(protocol)?,
+        ),
+    ];
+    if table.disk_sectors != disk_sectors || layout != expected {
+        return Err(format!(
+            "the installed target's GPT has {} sectors and partitions {layout:?}, \
+             not {disk_sectors} and {expected:?}",
+            table.disk_sectors
+        ));
+    }
+    Ok(())
+}
+
 /// Welcome, the one destination, the settings typed a key at a time, the
-/// review of exactly those, and back from it until the service has
-/// released the review. Every key waits on its own state.
-fn script() -> Result<Vec<SetupStep>, String> {
+/// review of exactly those, back from it until the service has released
+/// the review, the same review again, consent to it showing `rows`, and the
+/// completed installation. Every act waits on its own state.
+fn script(rows: &[String]) -> Result<Vec<SetupStep>, String> {
     fn press(steps: &mut Vec<SetupStep>, shown: String, key: &'static str) {
-        steps.push(SetupStep {
-            shown,
-            keys: vec![key],
-        });
+        steps.push(SetupStep::press(shown, key));
     }
     fn prefix(text: &str, index: usize) -> Result<&str, String> {
         text.get(..=index)
@@ -187,20 +265,35 @@ fn script() -> Result<Vec<SetupStep>, String> {
         );
     }
     press(&mut steps, format!("{shown} zone={ZONE}"), "ret");
-    press(
-        &mut steps,
-        format!(
-            "page=review disk={TARGET_KERNEL_NAME} username={USERNAME} \
-             hostname={HOSTNAME} zone={ZONE}"
-        ),
-        "esc",
+    let review = format!(
+        "page=review disk={TARGET_KERNEL_NAME} username={USERNAME} \
+         hostname={HOSTNAME} zone={ZONE}"
     );
+    press(&mut steps, review.clone(), "esc");
     steps.push(SetupStep {
-        shown: format!(
-            "{} zone={ZONE} withdrawal=none",
-            settings(3, USERNAME, HOSTNAME)
-        ),
-        keys: Vec::new(),
+        untouched: true,
+        ..SetupStep::press(
+            format!(
+                "{} zone={ZONE} withdrawal=none",
+                settings(3, USERNAME, HOSTNAME)
+            ),
+            "ret",
+        )
+    });
+    press(&mut steps, review, "ret");
+    steps.push(SetupStep {
+        shown: "page=consent".into(),
+        act: Act::Consent(rows.to_vec()),
+        untouched: true,
+        within: STEP_TIMEOUT,
+    });
+    // td-authd ends the attention only once the installation finished, so
+    // td-setup's next poll says so.
+    steps.push(SetupStep {
+        shown: "page=complete".into(),
+        act: Act::Keys(Vec::new()),
+        untouched: false,
+        within: STEP_TIMEOUT,
     });
     Ok(steps)
 }
@@ -214,8 +307,8 @@ fn require_live_session(result: &BootResult) -> Result<(), String> {
         .any(|line| line.trim_end() == TD_SETUP_LIVE_MARKER);
     if !result.marker_killed || !result.evidence.target || !ready {
         return Err(format!(
-            "the live session did not carry the installer wizard to its review and back: \
-             {}\n{}",
+            "the live session did not carry the installer wizard through its review \
+             and consent to an installation: {}\n{}",
             result.reason,
             tail(&result.console, 160)
         ));
@@ -229,18 +322,137 @@ mod tests {
 
     #[test]
     fn the_script_types_only_its_closed_keys_and_waits_on_distinct_states() {
-        let script = script().unwrap();
-        // One step per key, and the last waits on the release.
+        let rows = vec!["ROW".to_string()];
+        let script = script(&rows).unwrap();
         let typed_keys = USERNAME.len() + HOSTNAME.len() + ZONE_SEEK.len();
-        // The three tabs and Enter, Escape, and the release.
-        assert_eq!(script.len(), 3 + typed_keys + 4 + 1 + 1);
-        for step in &script[..script.len() - 1] {
+        // The three tabs and Enter; Escape; Enter from the release and from
+        // the second review; consent; and the completion.
+        assert_eq!(script.len(), 3 + typed_keys + 4 + 1 + 2 + 1 + 1);
+        let (consent, last) = (&script[script.len() - 2], &script[script.len() - 1]);
+        for step in &script[..script.len() - 2] {
             assert!(step.shown.starts_with("page="), "{}", step.shown);
-            assert_eq!(step.keys.len(), 1, "{}", step.shown);
-            assert!(super::super::setup_input::setup_key(step.keys[0]));
+            let Act::Keys(keys) = &step.act else {
+                panic!("{} does not press", step.shown);
+            };
+            assert_eq!(keys.len(), 1, "{}", step.shown);
+            assert!(super::super::setup_input::setup_key(keys[0]));
+            assert_eq!(step.within, STEP_TIMEOUT);
         }
-        let last = script.last().unwrap();
-        assert!(last.keys.is_empty() && last.shown.ends_with(" withdrawal=none"));
+        // The target is untouched at the release and at the consent asked.
+        let untouched: Vec<&str> = script
+            .iter()
+            .filter(|step| step.untouched)
+            .map(|step| step.shown.as_str())
+            .collect();
+        assert_eq!(untouched.len(), 2);
+        assert!(untouched[0].ends_with(" withdrawal=none"));
+        assert_eq!(untouched[1], "page=consent");
+        assert!(matches!(&consent.act, Act::Consent(shown) if *shown == rows));
+        assert_eq!(last.shown, "page=complete");
+        assert!(matches!(&last.act, Act::Keys(keys) if keys.is_empty()));
+        assert_eq!(last.within, STEP_TIMEOUT);
+        // The same review is asked twice, and consent follows the second.
+        let reviews: Vec<usize> = (0..script.len())
+            .filter(|index| script[*index].shown.starts_with("page=review "))
+            .collect();
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(script[reviews[0]].shown, script[reviews[1]].shown);
+        assert_eq!(reviews[1] + 1, script.len() - 2);
+        // The installed target must carry exactly the installer's layout.
+        let dir = std::env::temp_dir().join(format!("td-live-gpt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("target.raw");
+        let capacity = 2 * 1024 * 1024 * 1024u64;
+        let sectors = capacity / 512;
+        let last = td_engine::gpt::last_usable_lba(512, sectors).unwrap();
+        let write = |volume_end: u64, esp_name: &str| {
+            let table = td_engine::gpt::build(&td_engine::gpt::Layout {
+                sector_size: 512,
+                disk_sectors: sectors,
+                disk_guid: td_engine::gpt::Guid([7; 16]),
+                align_sectors: 2048,
+                partitions: vec![
+                    td_engine::gpt::Partition {
+                        type_guid: td_engine::gpt::TYPE_ESP,
+                        unique_guid: td_engine::gpt::Guid([1; 16]),
+                        start_lba: 2048,
+                        end_lba: 2048 + 1024 * 1024 - 1,
+                        attributes: 0,
+                        name: esp_name.into(),
+                    },
+                    td_engine::gpt::Partition {
+                        type_guid: td_engine::gpt::TYPE_LINUX_FS,
+                        unique_guid: td_engine::gpt::Guid([2; 16]),
+                        start_lba: 2048 + 1024 * 1024,
+                        end_lba: volume_end,
+                        attributes: 0,
+                        name: td_boot_protocol::VOLUME_PARTITION_NAME.into(),
+                    },
+                ],
+            })
+            .unwrap();
+            let file = File::create(&image).unwrap();
+            file.set_len(capacity).unwrap();
+            use std::os::unix::fs::FileExt as _;
+            file.write_all_at(&table.primary, table.primary_offset)
+                .unwrap();
+            file.write_all_at(&table.backup, table.backup_offset)
+                .unwrap();
+        };
+        write(last, td_boot_protocol::ESP_PARTITION_NAME);
+        assert_eq!(require_partitioned(&image, capacity), Ok(()));
+        assert!(require_partitioned(&image, capacity + 512).is_err());
+        write(last - 1, td_boot_protocol::ESP_PARTITION_NAME);
+        assert!(require_partitioned(&image, capacity).is_err());
+        write(last, "other");
+        assert!(require_partitioned(&image, capacity).is_err());
+        // Nor is a whole table for a disk one sector shorter.
+        {
+            use std::os::unix::fs::FileExt as _;
+            let short = sectors - 1;
+            let table = td_engine::gpt::build(&td_engine::gpt::Layout {
+                sector_size: 512,
+                disk_sectors: short,
+                disk_guid: td_engine::gpt::Guid([7; 16]),
+                align_sectors: 2048,
+                partitions: vec![
+                    td_engine::gpt::Partition {
+                        type_guid: td_engine::gpt::TYPE_ESP,
+                        unique_guid: td_engine::gpt::Guid([1; 16]),
+                        start_lba: 2048,
+                        end_lba: 2048 + 1024 * 1024 - 1,
+                        attributes: 0,
+                        name: td_boot_protocol::ESP_PARTITION_NAME.into(),
+                    },
+                    td_engine::gpt::Partition {
+                        type_guid: td_engine::gpt::TYPE_LINUX_FS,
+                        unique_guid: td_engine::gpt::Guid([2; 16]),
+                        start_lba: 2048 + 1024 * 1024,
+                        end_lba: td_engine::gpt::last_usable_lba(512, short).unwrap(),
+                        attributes: 0,
+                        name: td_boot_protocol::VOLUME_PARTITION_NAME.into(),
+                    },
+                ],
+            })
+            .unwrap();
+            let file = File::create(&image).unwrap();
+            file.set_len(capacity).unwrap();
+            file.write_all_at(&table.primary, 0).unwrap();
+            file.write_all_at(&table.backup, capacity - table.backup.len() as u64)
+                .unwrap();
+        }
+        assert!(require_partitioned(&image, capacity).is_err());
+        // A damaged backup is not a whole table.
+        write(last, td_boot_protocol::ESP_PARTITION_NAME);
+        {
+            use std::os::unix::fs::FileExt as _;
+            let file = fs::OpenOptions::new().write(true).open(&image).unwrap();
+            file.write_all_at(b"X", capacity - 512 + 16).unwrap();
+        }
+        assert!(require_partitioned(&image, capacity).is_err());
+        fs::write(&image, b"short").unwrap();
+        assert!(require_partitioned(&image, capacity).is_err());
+        fs::remove_dir_all(&dir).unwrap();
         // The defaults the script starts from are td-setup's.
         let settings = include_str!("../../../../../../td-setup/src/settings.rs");
         assert!(settings.contains(&format!("const DEFAULT_ZONE: &str = \"{DEFAULT_ZONE}\";")));

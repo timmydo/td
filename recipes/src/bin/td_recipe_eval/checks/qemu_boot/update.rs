@@ -917,7 +917,7 @@ pub(crate) fn run_cli(args: &[String]) -> Result<()> {
 // and their Unicode mapping to that face.
 const ASCII_HEX: &str = "000000000000000000000000000000000000000008080808080808000808000000002222222200000000000000000000000000001212127e24247e484848000000000000083e4948380e09493e08000000000000314a4a340808162929460000000000001c222214182945424639000000000808080800000000000000000000000000040808101010101010080804000000002010100808080808081010200000000000000008492a1c2a49080000000000000000000808087f080808000000000000000000000000000000180808100000000000000000003c000000000000000000000000000000000000181800000000000002020408081010204040000000000000182442464a52624224180000000000000818280808080808083e0000000000003c4242020c102040407e0000000000003c4242021c020242423c000000000000040c142444447e0404040000000000007e4040407c020202423c0000000000001c2040407c424242423c0000000000007e0202040404080808080000000000003c4242423c424242423c0000000000003c4242423e02020204380000000000000000181800000018180000000000000000001818000000180808100000000000000204081020100804020000000000000000007e0000007e0000000000000000004020100804081020400000000000003c4242020408080008080000000000001c224a565252524e201e00000000000018242442427e424242420000000000007c4242427c424242427c0000000000003c42424040404042423c000000000000784442424242424244780000000000007e4040407c404040407e0000000000007e4040407c40404040400000000000003c424240404e4242463a000000000000424242427e42424242420000000000003e08080808080808083e0000000000001f040404040404444438000000000000424448506060504844420000000000004040404040404040407e000000000000424266665a5a4242424200000000000042626252524a4a4646420000000000003c42424242424242423c0000000000007c4242427c40404040400000000000003c4242424242425a663c0300000000007c4242427c48444442420000000000003c424240300c0242423c0000000000007f0808080808080808080000000000004242424242424242423c00000000000041414122222214140808000000000000424242425a5a6666424200000000000042422424181824244242000000000000414122221408080808080000000000007e02020408102040407e00000000000e080808080808080808080e0000000000404020101008080402020000000000701010101010101010101070000000182442000000000000000000000000000000000000000000000000007f00002010080000000000000000000000000000000000003c42023e4242463a00000000004040405c6242424242625c00000000000000003c4240404040423c00000000000202023a4642424242463a00000000000000003c42427e4040423c00000000000c1010107c10101010101000000000000000023a44444438203c42423c0000004040405c624242424242420000000000080800180808080808083e00000000000404000c04040404040404483000000040404044485060504844420000000000180808080808080808083e0000000000000000764949494949494900000000000000005c6242424242424200000000000000003c4242424242423c00000000000000005c6242424242625c40400000000000003a4642424242463a02020000000000005c6242404040404000000000000000003c4240300c02423c0000000000001010107c10101010100c0000000000000000424242424242463a00000000000000004242422424241818000000000000000041494949494949360000000000000000424224181824424200000000000000004242424242261a02023c0000000000007e0204081020407e00000000000c10100808102010080810100c000008080808080808080808080808080000003008081010080408101008083000000031494600000000000000000000";
 
-fn read_capture(path: &Path) -> Result<Vec<u8>> {
+pub(super) fn read_capture(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|file| file.take(1280 * 800 * 3 + 128).read_to_end(&mut bytes))
@@ -925,7 +925,7 @@ fn read_capture(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn ppm(bytes: &[u8]) -> Result<&[u8]> {
+pub(super) fn ppm(bytes: &[u8]) -> Result<&[u8]> {
     let body = bytes
         .strip_prefix(b"P6\n1280 800\n255\n")
         .ok_or("expected a 1280x800 RGB QMP screenshot")?;
@@ -935,7 +935,7 @@ fn ppm(bytes: &[u8]) -> Result<&[u8]> {
     Ok(body)
 }
 
-fn ascii_pixel(character: u8, x: usize, y: usize) -> Result<bool> {
+pub(super) fn ascii_pixel(character: u8, x: usize, y: usize) -> Result<bool> {
     if !(32..=126).contains(&character) || x >= 8 || y >= 16 {
         return Err("unsupported prompt glyph".into());
     }
@@ -947,7 +947,7 @@ fn ascii_pixel(character: u8, x: usize, y: usize) -> Result<bool> {
     Ok(row & (0x80 >> x) != 0)
 }
 
-fn row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
+pub(super) fn row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
     if text.len() > 77 || top + 32 > 800 {
         return Err("prompt row does not fit the display".into());
     }
@@ -972,8 +972,8 @@ fn row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
 }
 
 // The attention menu uses the small chrome face; consent uses Unifont.
-// Rows are space, colon, then A through Z.
-const MENU_GLYPHS: [[u8; 7]; 28] = [
+// Rows are space, colon, A through Z, then hyphen.
+const MENU_GLYPHS: [[u8; 7]; 29] = [
     [0, 0, 0, 0, 0, 0, 0],
     [0, 4, 4, 0, 4, 4, 0],
     [14, 17, 17, 31, 17, 17, 17],
@@ -1002,9 +1002,10 @@ const MENU_GLYPHS: [[u8; 7]; 28] = [
     [17, 17, 10, 4, 10, 17, 17],
     [17, 17, 10, 4, 4, 4, 4],
     [31, 1, 2, 4, 8, 16, 31],
+    [0, 0, 0, 31, 0, 0, 0],
 ];
 
-fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
+pub(super) fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
     if text.len() > 102 || top > 800 - 14 {
         return Err("menu row does not fit the display".into());
     }
@@ -1017,6 +1018,7 @@ fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
                             b' ' => 0,
                             b':' => 1,
                             b'A'..=b'Z' => usize::from(character - b'A') + 2,
+                            b'-' => 28,
                             _ => return Err("unsupported menu glyph".into()),
                         };
                         let bits = MENU_GLYPHS
@@ -1041,7 +1043,12 @@ fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
 }
 
 fn menu_matches(bytes: &[u8]) -> Result<bool> {
-    let pixels = ppm(bytes)?;
+    menu_pixels_match(ppm(bytes)?)
+}
+
+/// Whether a capture's pixels are the attention menu offering a pending
+/// installation.
+pub(super) fn menu_pixels_match(pixels: &[u8]) -> Result<bool> {
     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
         && menu_row_matches(pixels, 456, "I: REVIEW PENDING SYSTEM INSTALLATION")?)
 }
@@ -1307,6 +1314,45 @@ mod tests {
         let entry = b"P6\n1280 800\n255\n".len() + 456 * 3840;
         bytes[entry..entry + 14 * 3840].fill(0);
         assert!(!menu_matches(&bytes).unwrap());
+    }
+
+    /// A notice row drawn from the compositor's own chrome glyphs, hyphen
+    /// included, matches only where and as it is drawn.
+    #[test]
+    fn menu_notice_rows_match_the_chrome_font_with_its_hyphen() {
+        let chrome = include_str!("../../../../../../td-compositor/src/ui.rs");
+        let text = "SYSTEM INSTALLED - RESTART TO BOOT IT";
+        let top = 312;
+        let mut pixels = [24, 32, 40].repeat(1280 * 800);
+        for (column, character) in text.chars().enumerate() {
+            let prefix = format!("b'{character}' => [");
+            let rows = chrome
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(&prefix)?.strip_suffix("],"))
+                .unwrap_or("0, 0, 0, 0, 0, 0, 0");
+            for (y, bits) in rows
+                .split(',')
+                .map(|row| row.trim().parse::<u8>().unwrap())
+                .enumerate()
+            {
+                for x in 0..5 {
+                    if bits & (1 << (4 - x)) == 0 {
+                        continue;
+                    }
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let offset =
+                                ((top + y * 2 + dy) * 1280 + 24 + column * 12 + x * 2 + dx) * 3;
+                            pixels[offset..offset + 3].fill(255);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(menu_row_matches(&pixels, top, text).unwrap());
+        assert!(!menu_row_matches(&pixels, top + 36, text).unwrap());
+        assert!(!menu_row_matches(&pixels, top, "SYSTEM INSTALLED   RESTART TO BOOT IT").unwrap());
+        assert!(menu_row_matches(&pixels, top, "a").is_err());
     }
 
     #[test]

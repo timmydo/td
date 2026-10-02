@@ -206,7 +206,7 @@ td-recipe-eval build-run <name>      # build one recipe into /td/store
 td-recipe-eval qemu-boot-session     # one offline graphical session (pass/fail)
 td-recipe-eval qemu-boot-system      # install/update/recovery boot sequence
 td-recipe-eval qemu-install          # disposable offline ISO installation test
-td-recipe-eval qemu-boot-live        # live medium's wizard driven to a review
+td-recipe-eval qemu-boot-live        # live medium's wizard driven through consent to an install
 ```
 
 To build a bootable live ISO of the system, signed with a key made for that
