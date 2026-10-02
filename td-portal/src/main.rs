@@ -61,6 +61,7 @@ mod handles;
 mod message;
 #[path = "../../td-busd/src/name.rs"]
 mod name;
+mod open_uri;
 mod secret;
 #[path = "../../td-secret/src/store.rs"]
 #[allow(dead_code, reason = "firstboot and the console share the store writer")]
@@ -215,6 +216,21 @@ const INTROSPECTION_XML: &str = r#"<node>
     <method name="SaveFiles">
       <arg type="s" name="parent_window" direction="in"/>
       <arg type="s" name="title" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.OpenURI">
+    <method name="OpenURI">
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="uri" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <method name="OpenFile">
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="h" name="fd" direction="in"/>
       <arg type="a{sv}" name="options" direction="in"/>
       <arg type="o" name="handle" direction="out"/>
     </method>
@@ -1210,6 +1226,7 @@ fn serve(
         match event {
             ServiceEvent::Audit => {
                 secret::expire(connection, &mut state)?;
+                open_uri::expire(connection, &mut state)?;
                 begin_active_audit(connection, &mut state)?;
                 continue;
             }
@@ -1263,6 +1280,9 @@ struct ServiceState {
     application_policy: Option<app_policy::Policy>,
     secrets: BTreeMap<u32, secret::Pending>,
     secret_receipts: BTreeMap<String, secret::Receipt>,
+    open_uris: BTreeMap<u32, open_uri::Pending>,
+    /// Expired browser calls by serial, with the browser's unique name.
+    open_uri_stale: BTreeMap<u32, String>,
     handles: Handles,
     pending: BTreeMap<u32, PendingOpen>,
     pending_audits: BTreeMap<u32, String>,
@@ -1283,6 +1303,9 @@ fn consume_bus_frame(
     let frame = match frame {
         IncomingFrame::Descriptors { bytes, count } => {
             let (call, _) = message::decode(&bytes, count).map_err(message_error)?;
+            if open_uri::is_open_file(&call) {
+                return open_uri::refuse_open_file(connection, &call);
+            }
             if call.kind == MessageType::MethodCall
                 && call.flags & message::FLAG_NO_REPLY_EXPECTED == 0
             {
@@ -1323,6 +1346,7 @@ fn consume_bus_frame(
         return Err(io::Error::other("a portal call carried trailing bytes"));
     }
     if secret::identity_reply(connection, state, &incoming)?
+        || open_uri::reply(connection, state, &incoming)?
         || consume_active_audit_reply(connection, state, &incoming)?
         || consume_identity_reply(connection, state, events, &incoming)?
     {
@@ -1338,6 +1362,12 @@ fn consume_bus_frame(
     if is_open_file_call(&incoming) {
         begin_open_file(connection, state, &incoming)?;
         return Ok(());
+    }
+    if open_uri::is_call(&incoming) {
+        return open_uri::begin(connection, state, &incoming);
+    }
+    if open_uri::is_open_file(&incoming) {
+        return open_uri::refuse_open_file(connection, &incoming);
     }
     let departed = owner_departure(&incoming)?.map(str::to_string);
     let outbound = dispatch(
@@ -1356,10 +1386,12 @@ fn consume_bus_frame(
             ));
         }
         cancel_dialog(state, &path)?;
+        open_uri::close(state, &path);
     }
     if let Some(owner) = departed {
         state.pending.retain(|_, pending| pending.owner != owner);
         state.secrets.retain(|_, pending| pending.owner != owner);
+        open_uri::depart(state, &owner);
         state
             .secret_receipts
             .retain(|_, receipt| receipt.owner != owner);
@@ -3102,6 +3134,7 @@ fn known_property_interface(interface: &str) -> bool {
             | SECRET_INTERFACE
             | BACKGROUND_INTERFACE
             | FILE_CHOOSER_INTERFACE
+            | open_uri::INTERFACE
             | PROPERTIES_INTERFACE
             | INTROSPECT_INTERFACE
             | PEER_INTERFACE
@@ -3114,6 +3147,7 @@ fn interface_version(interface: &str) -> Option<u32> {
         SETTINGS_INTERFACE => Some(SETTINGS_VERSION),
         BACKGROUND_INTERFACE => Some(BACKGROUND_VERSION),
         FILE_CHOOSER_INTERFACE => Some(FILE_CHOOSER_VERSION),
+        open_uri::INTERFACE => Some(open_uri::VERSION),
         _ => None,
     }
 }
@@ -3398,6 +3432,30 @@ fn probe(paths: &Paths) -> Result<(), String> {
         "org.freedesktop.portal.Error.NotAllowed",
         "credential caller is not an authenticated application",
     )?;
+    // OpenURI is live and refuses a file before reserving a Request; no
+    // browser is needed to prove that.
+    let file_refusal = connection
+        .call_outcome(
+            PORTAL_NAME,
+            PORTAL_PATH,
+            open_uri::INTERFACE,
+            "OpenURI",
+            "ssa{sv}",
+            |writer| {
+                writer.string("")?;
+                writer.string("file:///etc/passwd")?;
+                writer.array("{sv}", |_| Ok(()))
+            },
+        )
+        .map_err(|error| format!("the OpenURI file probe failed: {error}"))?;
+    require_exact_remote_error(
+        file_refusal,
+        &portal_sender,
+        open_uri::INTERFACE,
+        "OpenURI",
+        UNSUPPORTED_OPEN,
+        open_uri::UNSUPPORTED_FILE,
+    )?;
     let unique = connection
         .unique
         .as_deref()
@@ -3630,6 +3688,7 @@ mod confinement {
         ("lib.rs", include_str!("lib.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("secret.rs", include_str!("secret.rs")),
+        ("open_uri.rs", include_str!("open_uri.rs")),
         ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
         (
             "app_policy.rs",
@@ -4280,9 +4339,13 @@ mod tests {
 
     #[test]
     fn save_methods_are_advertised_but_explicitly_unsupported() {
+        let chooser = INTROSPECTION_XML
+            .split("<interface name=")
+            .find(|block| block.starts_with("\"org.freedesktop.portal.FileChooser\""))
+            .unwrap();
         for method in ["OpenFile", "SaveFile", "SaveFiles"] {
             let needle = format!("<method name=\"{method}\">");
-            assert_eq!(INTROSPECTION_XML.matches(&needle).count(), 1);
+            assert_eq!(chooser.matches(&needle).count(), 1);
         }
         let settings = Settings::parse(settings::DEFAULT_CONFIG).unwrap();
         for method in ["SaveFile", "SaveFiles"] {
