@@ -657,6 +657,25 @@ pub fn qemu_install_cli(args: &[String]) -> Result<(), String> {
     )
 }
 
+/// Boot the production live medium into its session and the installer wizard.
+pub fn qemu_boot_live_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {
+        return Err("usage: qemu-boot-live [system-x86-64]".into());
+    }
+    let targets = [STEM];
+    ensure_targets_provenance(&targets)?;
+    let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
+    let name = scratch_name("qemu-boot-live", &[STEM]);
+    let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
+    if let Err(error) = crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Automatic)
+    {
+        eprintln!("   [warm] {error} — continuing; the build reports what it cannot resolve");
+    }
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::live::run(&runner)
+}
+
 /// Install the production system from an ISO inside a disposable QEMU machine.
 pub fn qemu_install_system_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";

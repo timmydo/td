@@ -47,8 +47,8 @@ The UI runs without disk-writing privileges. A root-owned installation
 service admits only typed installation operations over a private local
 channel. The UI cannot select executables, shell commands, arbitrary paths,
 mount options or a different deployment source. The live profile is to grant
-only the paired installer session access to this service; until the wizard
-ships (increment 6) td-authd admits any peer of the session's user
+only the paired installer session access to this service; today td-authd
+admits any peer of the session's user, the wizard among them
 (td-authd/DESIGN.md "Whole-disk installation intake"). This authority does
 not depend on `su`, empty passwords, or a reusable elevation grant.
 Compositor-owned trusted consent must bind destructive execution to the
@@ -84,9 +84,43 @@ never answers cannot hold the window, and td-authd serves the next installer
 once it reaps that service. Disks the window stopped waiting for are
 dropped. With a disk selected, Enter continues to the settings step
 described below and Escape there goes back to the list, keeping the drafts.
-Its library also has pure, unconnected progress and completion views. The
-release live profile must wait for later navigation, its paired service,
-trusted consent, and end-to-end installation evidence.
+Its library also has pure, unconnected progress and completion views. A
+live boot starts the window in the graphical session ("Live startup"); the
+release profile still waits for end-to-end installation evidence
+(increment 7).
+
+### Live startup
+
+The system image carries td-setup, and on a live boot (`td.live=1`, which
+only the live selector's handoff sets; td-install/MEDIA.md "Live boot") the
+session's `[setup]` td-svc unit starts it once the compositor runs, the
+session's own windows are placed and Firefox's window has mapped (on a live
+boot Firefox is ready only then): as the human user, unjailed and without
+disk authority, on the compositor's socket by `WAYLAND_DISPLAY`. The unit
+first makes the empty third workspace active, so the wizard maps there
+alone, with the whole output and the keyboard; a third tile beside the
+shell and Firefox would be smaller than its smallest page. A window that
+maps later, such as a restarted terminal or Firefox, still maps on the
+active workspace and shares it. The unit is ready when the compositor's
+layout report names a window with td-setup's app id; it is never restarted,
+so a wizard that exits is not relaunched behind the person, and an
+installed boot's unit exits at once. Under the autotest token a live boot
+prints `TD-SETUP-LIVE-READY` once td-setup's is the one window with its app
+id, visible, focused and at least 752x480, and td-authd's setup intake
+exists; `td-recipe-eval qemu-boot-live` boots the medium `build-iso`
+composes, from the same verified deployment and with a key made for the
+run, directly from its kernel and live selector with the token appended and
+the ISO attached read-only as a virtio disk, and requires that line. It
+does not drive the wizard: that is increment 7's oracle. No automated check
+boots that medium through firmware; `./test-iso` does so by hand.
+
+Starting the wizard grants it nothing a session program lacked: td-authd
+admits any UID-1000 peer at the intake, and on a live boot those include
+the session's shell, its fetch service and the VM guest helper. The intake
+serves one installation service per session generation, so a peer that
+reaches it first turns the wizard away and can drive its own review as far
+as the compositor's consent prompt, which names the disk it would erase.
+Restricting the intake to the wizard is a later increment.
 
 The destination page is a pure view over `Destination` values supplied by
 the service. It shows capacity, model, kernel name, device number, sequence,
@@ -324,9 +358,9 @@ it on a live boot and answers its consent channel. Execution requires fresh
 trusted consent bound to that whole value and revalidates the selected disk
 under a retained exclusive claim. Neither matching plan bytes nor possession
 of the nonce grants consent. No public request, reconnect or service restart
-may silently retry erasure. The live profile does not yet start the wizard
-(increment 6), so a live boot's installer is whatever UID-1000 peer td-authd
-admits, and erasure still needs the person's physical consent.
+may silently retry erasure. A live boot starts the wizard ("Live startup"),
+but td-authd admits any UID-1000 peer as its installer, not only the wizard;
+erasure still needs the person's physical consent.
 
 ## Installation service protocol
 
@@ -1058,7 +1092,8 @@ not discover `/etc/zoneinfo` automatically.
    the compositor's presentation keep their own tests until increment 7.
 6. Add the native wizard, target recipe and live startup integration. Use
    native compositor tests for navigation, rendering, input, errors and
-   progress; fixtures cannot grant ordinary clients trusted consent.
+   progress; fixtures cannot grant ordinary clients trusted consent. A live
+   boot starts the wizard ("Live startup"), proven by `qemu-boot-live`.
 7. Activate the complete profile only after the end-to-end QEMU evidence:
    boot the ISO, complete the UI flow onto a disposable disk, detach the
    media, boot that disk through firmware, and observe the configured

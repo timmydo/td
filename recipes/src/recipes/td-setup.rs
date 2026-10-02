@@ -4,8 +4,8 @@ use crate::types::Recipe;
 /// pure installer plan and toolkit are Cargo siblings. The toolkit's font,
 /// notices and Wayland codec reach the compositor tree by relative source
 /// paths, so all four trees are staged.
-/// This produces a target artifact; the live profile will select it only when
-/// the wizard and its paired service are complete.
+/// The system image carries it, and a live boot's session starts it
+/// (td-install/INSTALLER.md "Live startup").
 pub fn recipe() -> Recipe {
     Recipe::rust("td-setup", "0.1.0")
         .local_source("td-setup")

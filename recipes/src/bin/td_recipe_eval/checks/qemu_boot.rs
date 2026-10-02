@@ -31,6 +31,7 @@
 pub(crate) mod build_iso;
 pub(crate) mod efi;
 pub(crate) mod install;
+pub(crate) mod live;
 pub(crate) mod media;
 pub(crate) mod secret;
 pub(crate) mod test_iso;

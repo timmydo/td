@@ -1139,6 +1139,10 @@ pub const TD_FIREFOX_BOOT_MARKER: &str = "TD-FIREFOX-FIRST-WINDOW-READY";
 // reported ready: the program started on the configuration td-firstboot
 // provisioned and did not exit on it.
 pub const TD_MAIL_BOOT_MARKER: &str = "TD-MAIL-RUNNING";
+// Printed by the `setup-evidence` unit on a live boot under the autotest
+// token once the installer wizard's window is the focused one and
+// td-authd's setup intake is bound for it.
+pub const TD_SETUP_LIVE_MARKER: &str = "TD-SETUP-LIVE-READY";
 pub const TD_NEWS_BOOT_MARKER: &str = "TD-NEWS-RUNNING";
 // Printed by the `fetch-evidence` unit under the autotest token once
 // td-fetchd's probe, as the UI user, has asked the fetch service for a

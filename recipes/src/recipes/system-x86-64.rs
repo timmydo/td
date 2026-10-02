@@ -30,8 +30,8 @@ use crate::ladder::{
     TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
     TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
     TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
-    TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_TXT_RUNTIME_MARKER,
-    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
+    TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -1216,6 +1216,27 @@ const WINDOW_RECORD: &str = "^window id=[^ ]* object=[^ ]* workspace=[^ ]* x=[^ 
                              width=[^ ]* height=[^ ]* visible=[^ ]* focused=[^ ]* \
                              fullscreen=[^ ]* floating=[^ ]* parent=[^ ]* app_id=";
 
+/// As `WINDOW_RECORD`, for the one window that is visible and holds the
+/// keyboard.
+const FOCUSED_WINDOW_RECORD: &str =
+    "^window id=[^ ]* object=[^ ]* workspace=[^ ]* x=[^ ]* y=[^ ]* \
+                                     width=[^ ]* height=[^ ]* visible=true focused=true \
+                                     fullscreen=[^ ]* floating=[^ ]* parent=[^ ]* app_id=";
+
+/// The app id td-setup's window sets (td-setup/src/window.rs).
+const SETUP_APP_ID: &str = "td-setup";
+
+/// td-authd's setup intake on a live boot (td-authd/src/disk_install.rs).
+const SETUP_INTAKE_SOCKET: &str = "/run/td-authd/1000/setup";
+
+/// The empty workspace a live boot's wizard maps on alone: its pages need
+/// a tile of at least td-setup's minimum, which no third tile beside the
+/// shell and Firefox on the first is.
+const SETUP_WORKSPACE: u8 = 3;
+/// td-setup's smallest supported page (td-setup/src/lib.rs).
+const SETUP_MIN_WIDTH: u16 = 752;
+const SETUP_MIN_HEIGHT: u16 = 480;
+
 /// The td-term terminfo entry as the image stages it: the one store file
 /// td-jail admits at a fixed mode, `0444`, which the staging copy loses and
 /// the mode-fixing step restores; the root-tree check reads it back.
@@ -1249,7 +1270,7 @@ fn td_portal_settings_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 46] = [
+const TD_SVC_UNITS: [&str; 48] = [
     "hostname",
     "td-firstboot",
     "release-source",
@@ -1283,6 +1304,8 @@ const TD_SVC_UNITS: [&str; 46] = [
     "news-evidence",
     "shell-workspace",
     "placement-evidence",
+    "setup",
+    "setup-evidence",
     "firefox-tls-setup",
     "firefox-tls-origin",
     "firefox-autotest",
@@ -1788,6 +1811,36 @@ fn build_td_svc_conf() -> String {
          requires=shell-workspace\n\
          timeout={application_place}\n\
          \n\
+         # The installer wizard, on a live boot only (td-install/INSTALLER.md):\n\
+         # once the session's own windows are placed and Firefox's has mapped,\n\
+         # the view moves to an empty workspace and the wizard maps there\n\
+         # alone, whole-output and holding the keyboard. It runs as the human\n\
+         # user, unjailed and without disk authority, and reaches root's\n\
+         # installation service only through td-authd's setup intake. An\n\
+         # installed boot's exec exits 0 at once and its probe passes.\n\
+         # restart=never: a wizard that exits is not relaunched behind the\n\
+         # person mid-installation.\n\
+         [setup]\n\
+         type=daemon\n\
+         cgroup=session\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) /bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {setup_workspace} || exit 1; exec /bin/td-login exec-primary -- /bin/env WAYLAND_DISPLAY={wayland_socket} /bin/td-setup;; *) exit 0;; esac'\n\
+         after=wayland,placement-evidence,firefox\n\
+         requires=wayland\n\
+         ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{setup_app_id} title=\"'\n\
+         ready-timeout=30\n\
+         restart=never\n\
+         \n\
+         # Boot evidence on a live boot under the autotest token only: the\n\
+         # wizard's is the one window with its app id, visible and focused,\n\
+         # its tile holds td-setup's smallest page, and td-authd's live setup\n\
+         # intake is bound for it. The record's sizes precede its title.\n\
+         [setup-evidence]\n\
+         type=oneshot\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) || exit 1; /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"{window_record}{setup_app_id} title=\")\" -eq 1 || exit 1; window=$(/bin/echo \"$layout\" | /bin/grep \"{focused_record}{setup_app_id} title=\") || exit 1; width=${{window#* width=}}; width=${{width%% *}}; height=${{window#* height=}}; height=${{height%% *}}; /bin/td-util test \"$width\" -ge {setup_min_width} && /bin/td-util test \"$height\" -ge {setup_min_height} && /bin/td-util test -e {setup_intake} && /bin/echo {setup_marker}'\n\
+         after=setup,firefox-tls-setup\n\
+         requires=setup\n\
+         timeout={application_place}\n\
+         \n\
          # The HTTPS origin uses a source-built TLS implementation. Setup mints\n\
          # an ephemeral CA plus localhost identity under /run; the root-owned CA\n\
          # and exact policy are the only two extra files td-jail will admit into\n\
@@ -1835,7 +1888,7 @@ fn build_td_svc_conf() -> String {
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
          after=audio,busd,portal,wayland,firefox-files,firefox-autotest,firefox-tls-origin,placement-evidence\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
-         ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
+         ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{firefox_app_id} title=\" || exit 1;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
          restart=always\n\
          \n\
@@ -2021,6 +2074,14 @@ fn build_td_svc_conf() -> String {
         mail_program = entry_program(TD_MAIL_ENTRY),
         news_program = entry_program(TD_NEWS_ENTRY),
         window_record = WINDOW_RECORD,
+        focused_record = FOCUSED_WINDOW_RECORD,
+        live_cmdline_token = td_boot_protocol::LIVE_CMDLINE_TOKEN,
+        setup_app_id = SETUP_APP_ID,
+        setup_intake = SETUP_INTAKE_SOCKET,
+        setup_marker = TD_SETUP_LIVE_MARKER,
+        setup_min_height = SETUP_MIN_HEIGHT,
+        setup_min_width = SETUP_MIN_WIDTH,
+        setup_workspace = SETUP_WORKSPACE,
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
         fetch_marker = TD_FETCH_BOOT_MARKER,
@@ -4302,7 +4363,8 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-update}/bin/td-update".into(),
         link: "{root}/real-root/bin/td-update".into(),
     });
-    // The installer core a live boot serves from; nothing starts it yet.
+    // The installer core a live boot serves from, started by td-authd for
+    // the installer wizard below.
     steps.push(Step::CopyTree {
         from: "{in:td-install}".into(),
         dest: "{root}/real-root{in:td-install}".into(),
@@ -4310,6 +4372,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     steps.push(Step::Symlink {
         target: "{in:td-install}/bin/td-install".into(),
         link: "{root}/real-root/bin/td-install".into(),
+    });
+    // The installer wizard, a static td-ui client the live session starts
+    // ([setup]); it holds no disk authority.
+    steps.push(Step::CopyTree {
+        from: "{in:td-setup}".into(),
+        dest: "{root}/real-root{in:td-setup}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-setup}/bin/td-setup".into(),
+        link: "{root}/real-root/bin/td-setup".into(),
     });
     // The software UI is static and owns no dynamic runtime closure.
     steps.push(Step::CopyTree {
@@ -5418,6 +5490,7 @@ pub fn recipe() -> Recipe {
             "td-vm-guest",
             "td-update",
             "td-install",
+            "td-setup",
             "td-audio",
             "td-compositor",
             "td-busd",
@@ -6299,10 +6372,15 @@ mod tests {
             Some("wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot")
         );
         let firefox_ready = unit_key("firefox", "ready").unwrap_or_default();
+        let live = td_boot_protocol::LIVE_CMDLINE_TOKEN;
         assert_eq!(
             firefox_ready,
             format!(
-                "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in \
+                "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live} \"*) \
+                 layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket \
+                 {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | \
+                 /bin/grep -q \"{WINDOW_RECORD}{FIREFOX_APP_ID} title=\" || exit 1;; \
+                 esac; case \" $(/bin/cat /proc/cmdline) \" in \
                  *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-login exec-primary -- \
                  /bin/td-compositor probe-application \
                  {FIREFOX_WINDOW_READY_SOCKET} {FIREFOX_APP_ID} \
@@ -7568,6 +7646,112 @@ mod tests {
         ] {
             assert!(installed.unwrap() < indexed && indexed < packed);
         }
+    }
+
+    /// The wizard is in the image and starts only on a live boot, as the
+    /// human user on the compositor's socket, once the session's own windows
+    /// are placed; its evidence needs both tokens and names its window
+    /// focused and td-authd's intake bound.
+    #[test]
+    fn the_installer_wizard_starts_only_on_a_live_boot() {
+        let recipe = recipe();
+        assert!(recipe
+            .native_inputs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|input| input == "td-setup"));
+        let steps = recipe.steps.unwrap();
+        assert!(steps
+            .iter()
+            .any(|step| matches!(step, Step::Symlink { target, link }
+            if target == "{in:td-setup}/bin/td-setup" && link == "{root}/real-root/bin/td-setup")));
+        assert!(steps
+            .iter()
+            .any(|step| matches!(step, Step::CopyTree { from, dest }
+            if from == "{in:td-setup}" && dest == "{root}/real-root{in:td-setup}")));
+        let gate =
+            |token: &str| format!("case \" $(/bin/cat /proc/cmdline) \" in *\" {token} \"*)");
+        let live = gate(td_boot_protocol::LIVE_CMDLINE_TOKEN);
+        assert_eq!(
+            unit_key("setup", "exec").unwrap(),
+            format!(
+                "/bin/sh -c '{live} /bin/td-login exec-primary -- /bin/td-ctl --socket \
+                 {CONTROL_SOCKET} workspace {SETUP_WORKSPACE} || exit 1; \
+                 exec /bin/td-login exec-primary -- /bin/env \
+                 WAYLAND_DISPLAY={WAYLAND_SOCKET} /bin/td-setup;; *) exit 0;; esac'"
+            )
+        );
+        // An empty workspace: neither the shell's nor the applications'.
+        assert!((2..=9).contains(&SETUP_WORKSPACE));
+        assert_ne!(SETUP_WORKSPACE, TERMINAL_APPLICATION_WORKSPACE);
+        // Firefox is ready on a live boot only once its window has mapped,
+        // so it cannot map after the wizard and take its keyboard.
+        assert!(unit_key("firefox", "ready").unwrap().starts_with(&format!(
+            "/bin/sh -c '{live} layout=$(/bin/td-login exec-primary -- /bin/td-ctl \
+             --socket {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | \
+             /bin/grep -q \"{WINDOW_RECORD}{FIREFOX_APP_ID} title=\" || exit 1;; esac; "
+        )));
+        let ready = unit_key("setup", "ready").unwrap();
+        assert!(ready.starts_with(&format!("/bin/sh -c '{live} :;; *) exit 0;; esac; ")));
+        assert!(ready.contains(&format!("{WINDOW_RECORD}{SETUP_APP_ID} title=")));
+        for (key, value) in [
+            ("type", "daemon"),
+            ("cgroup", "session"),
+            ("restart", "never"),
+            ("requires", "wayland"),
+        ] {
+            assert_eq!(unit_key("setup", key).as_deref(), Some(value), "{key}");
+        }
+        for earlier in ["wayland", "placement-evidence", "firefox"] {
+            assert!(ordered_before(earlier, "setup"), "{earlier}");
+        }
+        let evidence = unit_key("setup-evidence", "exec").unwrap();
+        assert!(evidence.starts_with(&format!(
+            "/bin/sh -c '{} :;; *) exit 0;; esac; {live} :;; *) exit 0;; esac; ",
+            gate(AUTOTEST_CMDLINE_TOKEN)
+        )));
+        for part in [
+            format!(
+                "/bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \
+                 \"{WINDOW_RECORD}{SETUP_APP_ID} title=\")\" -eq 1 || exit 1; "
+            ),
+            format!(
+                "window=$(/bin/echo \"$layout\" | /bin/grep \
+                 \"{FOCUSED_WINDOW_RECORD}{SETUP_APP_ID} title=\") || exit 1; "
+            ),
+            format!(
+                "width=${{window#* width=}}; width=${{width%% *}}; \
+                 height=${{window#* height=}}; height=${{height%% *}}; \
+                 /bin/td-util test \"$width\" -ge {SETUP_MIN_WIDTH} && \
+                 /bin/td-util test \"$height\" -ge {SETUP_MIN_HEIGHT} && "
+            ),
+            format!("/bin/td-util test -e {SETUP_INTAKE_SOCKET}"),
+            format!("/bin/echo {TD_SETUP_LIVE_MARKER}'"),
+        ] {
+            assert!(evidence.contains(&part), "{part}");
+        }
+        assert_eq!(
+            unit_key("setup-evidence", "requires").as_deref(),
+            Some("setup")
+        );
+        // The names are the ones their owners use.
+        assert!(include_str!("../../../td-authd/src/disk_install.rs")
+            .contains(&format!("const SOCKET: &str = \"{SETUP_INTAKE_SOCKET}\";")));
+        assert!(include_str!("../../../td-setup/src/window.rs")
+            .contains(&format!("set_app_id(\"{SETUP_APP_ID}\")")));
+        assert!(
+            include_str!("../../../td-setup/src/service.rs").contains(&format!(
+                "pub const SOCKET: &str = \"{SETUP_INTAKE_SOCKET}\";"
+            ))
+        );
+        let pages = include_str!("../../../td-setup/src/lib.rs");
+        assert!(pages.contains(&format!(
+            "pub(crate) const MIN_PAGE_WIDTH: usize = {SETUP_MIN_WIDTH};"
+        )));
+        assert!(pages.contains(&format!(
+            "pub(crate) const MIN_PAGE_HEIGHT: usize = {SETUP_MIN_HEIGHT};"
+        )));
     }
 
     #[test]
