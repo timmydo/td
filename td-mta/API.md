@@ -774,6 +774,15 @@ key bytes before reusing value scratch, and reports row/table progress separatel
 from completion. Completion carries row counts and the same UTC sample; full
 physical graph/aggregate validity, parent chains, blobs and pins stay external.
 
+`store_fs::TableSweep` verifies and replays every selected checkpoint table
+against a supplied LoadedOverlay. Constructor admits total selected file bytes;
+merge callbacks enforce a total final-row allowance. Each advance opens, steps
+or finishes one table. Only selected digest/EOF and successful replay completion
+release its record buffer for the next table. Finish returns CompleteTables plus
+the original scratch. Selected history, references, blobs, real pins and full
+activation remain separate. TableInput/TableReplay finish_reuse expose that
+same checked scratch transfer without weakening existing finish semantics.
+
 `store_fs::BlobSweep` walks supplied final blob rows and verifies each named
 private file. Enumeration, opening, one bounded chunk and digest/EOF completion
 are separate advances. Row/total-byte limits precede file opening and full view

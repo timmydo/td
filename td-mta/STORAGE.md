@@ -1347,8 +1347,38 @@ actual view pins/barriers, all-table and final-reference validation, and staged
 output durability/publication still belong to the coordinator. No ReadView,
 transaction or recovery activation is granted by completion.
 
+`TableInput::finish_reuse` returns the original record buffer only after the
+same selected digest, exact extent and EOF checks as finish. TableReplay's
+matching method additionally requires residual overlay sink work to succeed;
+its callbacks remain provisional until that completion. Existing finish methods
+use those same paths and discard the returned scratch borrow.
+
+`store_fs::TableSweep` validates/replays all 11 selected checkpoint tables
+against one supplied LoadedOverlay. Constructor checks selected active identity
+and admits the checked sum of all descriptor file lengths before any table I/O.
+Each advance opens one table, performs one replay advance, or completes one
+selected table and its remaining overlay rows. Declared table exhaustion alone
+is not verification. Only after digest/EOF and replay completion may it drop the
+completed file and transfer the one original record buffer to the next table.
+
+A finite total-row allowance counts final rows emitted by all merges, including
+residual overlay rows, rather than checkpoint input rows. Deletions may yield
+zero final rows despite nonempty checkpoint input. These are admission bounds,
+not physical-call or elapsed-time bounds: one replay advance/completion can
+process the existing bounded set of intervening/residual overlay operations.
+The caller admits that full work and checks deadlines between advances.
+
+Errors retire the sweep and cannot yield completion or reusable-scratch evidence.
+After every table verified, a separate advance reports Complete; repeat completion
+performs no I/O. Consuming finish returns CompleteTables and the original record
+buffer. Evidence carries the loaded identity, per-table final-row counts, total
+rows and selected table bytes. It proves all selected checkpoint files and their
+replay against the supplied captured overlay; retained history, direct references,
+blobs, aggregate rules, actual pins and publication remain separate obligations.
+The caller retains immutable view or stopped-store exclusion throughout.
+
 `TableInput::into_lookup` validates the requested key and table, then creates
-that same selected replay with a borrowed target key and separate caller result
+a selected TableReplay with a borrowed target key and separate caller result
 buffer. Each advance performs one replay step and copies only the matching
 row value and last-change sequence. No match or absence is exposed until
 finish validates the complete selected table and drains residual overlay rows.

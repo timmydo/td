@@ -87,7 +87,8 @@ submission recipient-count/ordinal coverage separately from queue state policy.
 A mailbox sweep now enumerates and roots every supplied parent chain with
 separate row/get budgets and no growing visited set. A blob sweep connects
 final rows to private-file, chunked digest and EOF verification under finite
-row/byte budgets.
+row/byte budgets. A selected-table sweep now verifies and replays all 11
+checkpoint tables using one reusable record buffer and finite byte/row limits.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

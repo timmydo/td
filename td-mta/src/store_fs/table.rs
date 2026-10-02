@@ -34,6 +34,12 @@ mod next;
 pub(super) use next::probe as probe_next;
 pub use next::{CompleteNext, NextError, TableNext};
 
+#[path = "table/sweep.rs"]
+mod sweep;
+#[cfg(test)]
+pub(super) use sweep::probe as probe_sweep;
+pub use sweep::{CompleteTables, TableSweep, TableSweepError, TableSweepLimits, TableSweepStep};
+
 const MAX_TABLE_READ_CALLS: usize = 64;
 #[derive(Debug)]
 pub enum TableInputError {
@@ -192,8 +198,14 @@ impl<'r, C: Crypto> TableInput<'r, '_, '_, '_, C> {
         Ok(Some(record))
     }
 }
-impl<'r, C: Crypto> TableInput<'r, '_, '_, '_, C> {
+impl<'r, 'b, C: Crypto> TableInput<'r, '_, '_, 'b, C> {
     pub fn finish(self) -> Result<CompleteTable<'r>, TableInputError> {
+        self.finish_reuse().map(|(complete, _)| complete)
+    }
+    /// Return the original record scratch only after selected digest/EOF checks.
+    pub fn finish_reuse(
+        self,
+    ) -> Result<(CompleteTable<'r>, &'b mut [u8; MAX_RECORD_BYTES]), TableInputError> {
         if self.failed {
             return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
         }
@@ -204,7 +216,7 @@ impl<'r, C: Crypto> TableInput<'r, '_, '_, '_, C> {
         let file = self.file.finish()?;
         self.selection
             .check_table(self.crypto, self.table, summary)?;
-        Ok(CompleteTable { file, summary })
+        Ok((CompleteTable { file, summary }, self.scratch))
     }
 }
 /// One table bound to its supplied Selection; whole-graph validity/pins remain external.

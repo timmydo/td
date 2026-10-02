@@ -162,6 +162,16 @@ still account for those costs and concurrent owners within the ledger.
   Each step admits one next/open/read/completion operation and its deadline.
   Allocation probes cover empty/populated views and row/byte refusal over
   prepared files at both supported root lengths.
+  TableSweep retains one TableReplay, selected metadata/overlay borrows and
+  scalar/per-table counts. With the shipped Provider its compiled state fits
+  4 KiB on the worker stack. Completion also moves one TableReplay out of
+  the retained option and uses Merge's temporary 1 KiB key; those temporaries
+  are charged to the same worker stack, whose full qualification remains pending.
+  The same charged record partition transfers between
+  tables only after completion; no per-table arena is allocated. Descriptor
+  byte totals are admitted before table I/O and a finite row allowance covers
+  final merge output. Per-step overlay work retains Merge's bounded cost.
+  Allocation probes cover all-table replay and scratch reuse at both roots.
   Frame-change collection has its own 4096 slots of at most 24 bytes each,
   a separate 96 KiB reservation per view. Retained changes may coexist with
   get/next result storage; their memory never aliases those partitions. This

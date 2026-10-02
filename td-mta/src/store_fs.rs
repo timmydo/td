@@ -27,8 +27,9 @@ pub use blob_sweep::{BlobSweep, BlobSweepError, BlobSweepStep, CompleteBlobSweep
 #[path = "store_fs/table.rs"]
 mod table;
 pub use table::{
-    CompleteLookup, CompleteNext, CompleteReplay, CompleteTable, LookupError, NextError,
-    TableInput, TableInputError, TableLookup, TableNext, TableReplay, TableReplayError,
+    CompleteLookup, CompleteNext, CompleteReplay, CompleteTable, CompleteTables, LookupError,
+    NextError, TableInput, TableInputError, TableLookup, TableNext, TableReplay, TableReplayError,
+    TableSweep, TableSweepError, TableSweepLimits, TableSweepStep,
 };
 #[path = "store_fs/active_overlay.rs"]
 mod active_overlay;

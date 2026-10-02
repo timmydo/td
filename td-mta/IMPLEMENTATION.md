@@ -955,6 +955,13 @@ service activation. Each part lands independently:
     files/views, cumulative limits, late corruption, missing files, source/order
     faults and view movement through every phase. Existing allocation probes
     cover fixed prepared files. Physical view completeness and actual pins remain.
+  - **M05d20 — complete selected-table replay:** implemented all-table
+    sequencing with byte/final-row budgets and one reusable record buffer.
+    Reclaim scratch only after selected digest/EOF and residual merge completion;
+    count every final row and retire failures. Tests cover all selected files,
+    deletion overlays, exact/short admission, missing late files and changed
+    final extents. Allocation probes check both root bounds. Retained history,
+    cross-row/blob checks, actual view pins and activation remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

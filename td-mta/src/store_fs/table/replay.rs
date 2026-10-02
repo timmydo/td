@@ -59,7 +59,7 @@ impl<'r, 'c, 'm, 't, C: Crypto> TableInput<'r, 'c, 'm, 't, C> {
         })
     }
 }
-impl<'r, 'o, 'b, 's, C: Crypto> TableReplay<'r, '_, '_, '_, 'o, 'b, 's, C> {
+impl<'r, 't, 'o, 'b, 's, C: Crypto> TableReplay<'r, '_, '_, 't, 'o, 'b, 's, C> {
     pub const fn is_failed(&self) -> bool {
         self.failed
     }
@@ -89,16 +89,32 @@ impl<'r, 'o, 'b, 's, C: Crypto> TableReplay<'r, '_, '_, '_, 'o, 'b, 's, C> {
         self,
         sink: impl FnMut(Record<'_>) -> Result<(), E>,
     ) -> Result<CompleteReplay<'r, 'o, 'b, 's>, Error<E>> {
+        self.finish_reuse(sink).map(|(complete, _)| complete)
+    }
+    /// Reclaim record scratch after selected completion and residual sink work.
+    pub fn finish_reuse<E>(
+        self,
+        sink: impl FnMut(Record<'_>) -> Result<(), E>,
+    ) -> Result<
+        (
+            CompleteReplay<'r, 'o, 'b, 's>,
+            &'t mut [u8; crate::format::table::MAX_RECORD_BYTES],
+        ),
+        Error<E>,
+    > {
         if self.failed {
             return Err(Error::Failed);
         }
-        let table = self.input.finish().map_err(Error::Input)?;
+        let (table, scratch) = self.input.finish_reuse().map_err(Error::Input)?;
         let rows = self.merge.finish(sink).map_err(Error::Merge)?;
-        Ok(CompleteReplay {
-            table,
-            active: self.active,
-            rows,
-        })
+        Ok((
+            CompleteReplay {
+                table,
+                active: self.active,
+                rows,
+            },
+            scratch,
+        ))
     }
 }
 /// Selected table/prefix completion only. Final references, pins and any
