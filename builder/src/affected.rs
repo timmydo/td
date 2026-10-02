@@ -5817,6 +5817,7 @@ mod tests {
                 "td-mail",
                 "td-mta",
                 "td-news",
+                "td-open",
                 "td-pass",
                 "td-photo",
                 "td-portal",
@@ -8220,6 +8221,7 @@ mod tests {
                 "td-mail",
                 "td-mta",
                 "td-news",
+                "td-open",
                 "td-pass",
                 "td-photo",
                 "td-portal",
@@ -8238,10 +8240,11 @@ mod tests {
         // commands three, as td-setup's are; td-dua, td-news, td-review and
         // td-term, toolkit consumers with no native case, add two each. The
         // test-only P-256 oracle connects td-secret to td-crypto and then
-        // td-mta, adding two commands each; the installation fixture,
-        // reading td-install's codecs, adds two.
+        // td-mta, adding two commands each, and td-open, which mounts
+        // td-secret's descriptor module, adds two; the installation
+        // fixture, reading td-install's codecs, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 60, "{comp:?}");
+        assert_eq!(comp.len(), 62, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -8297,6 +8300,7 @@ mod tests {
                 "td-mail",
                 "td-mta",
                 "td-news",
+                "td-open",
                 "td-pass",
                 "td-photo",
                 "td-portal",

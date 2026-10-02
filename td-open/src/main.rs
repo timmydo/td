@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(
     test,
     allow(
@@ -9,11 +9,14 @@
     )
 )]
 
-//! td-open — hands one `http` or `https` link to the browser through the
-//! desktop portal's `OpenURI` and waits for its answer (APPLICATIONS.md
-//! §W.6). A jailed application's manifest names it as `$BROWSER`, which
-//! td-ui's link opener runs with the link as its one argument; the portal,
-//! not this program, decides what is a link and who opens it.
+//! td-open — hands one `http` or `https` link, or one local file, to the
+//! browser through the desktop portal and waits for its answer
+//! (APPLICATIONS.md §W.6). A jailed application's manifest names it as
+//! `$BROWSER` and `$OPENER`: td-ui's opener runs it with a link or a
+//! `file://` URL, and td-mail's attachment opener with a path. A link goes
+//! to `OpenURI`; a file is opened here, in the application's own view, and
+//! its descriptor goes to `OpenFile`, which copies it for the browser. The
+//! portal, not this program, decides what is opened and by whom.
 
 #[path = "../../td-busd/src/message.rs"]
 #[allow(
@@ -33,19 +36,29 @@ mod name;
     reason = "the shared broker codec is broader than one client"
 )]
 mod wire;
+// The shared credential-descriptor module (UNSAFE.md §12, §23): td-open
+// sends one descriptor with OpenFile and receives none.
+#[path = "../../td-secret/src/sys.rs"]
+#[allow(
+    dead_code,
+    reason = "the shared descriptor module also receives and adopts"
+)]
+mod sys;
 
 use message::{Message, MessageType};
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use wire::{Endian, Value};
 
-const USAGE: &str = "usage: td-open LINK";
+const USAGE: &str = "usage: td-open LINK|FILE-URL|PATH";
 const BUS: &str = "org.freedesktop.DBus";
 const BUS_PATH: &str = "/org/freedesktop/DBus";
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
@@ -58,6 +71,11 @@ const MAX_AUTH_LINE: usize = 512;
 const MAX_UNRELATED: usize = 64;
 /// The portal fails a request after 20 seconds; this outlasts it.
 const DEADLINE: Duration = Duration::from_secs(30);
+/// Opening a FIFO for reading would otherwise wait for a writer before the
+/// regular-file check could refuse it; a regular file's reads ignore it.
+const O_NONBLOCK: i32 = 0o4000;
+/// A terminal named as the file must not become this process's.
+const O_NOCTTY: i32 = 0o400;
 
 fn main() -> ExitCode {
     match run(std::env::args_os().skip(1).collect()) {
@@ -69,11 +87,94 @@ fn main() -> ExitCode {
     }
 }
 
+/// What the one argument names: a link the portal hands on as it is, or a
+/// file this program opens and passes by descriptor.
+enum Target {
+    Link(String),
+    File(File),
+}
+
+/// `argument` as a link, a `file://` URL or an absolute path. The file is
+/// opened read-only here, so the portal sees exactly what this application
+/// can read.
+fn target(argument: &OsString) -> Result<Target, String> {
+    let bytes = argument.as_encoded_bytes();
+    let path = if bytes.first() == Some(&b'/') {
+        argument.clone()
+    } else {
+        let text = argument.to_str().ok_or("the argument is not UTF-8")?;
+        let scheme = text.split_once(':').map(|(scheme, _)| scheme);
+        match scheme {
+            Some(scheme)
+                if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+            {
+                return Ok(Target::Link(text.to_string()))
+            }
+            Some(scheme) if scheme.eq_ignore_ascii_case("file") => file_url_path(text)?,
+            _ => return Err(USAGE.into()),
+        }
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOCTTY)
+        .open(&path)
+        .map_err(|e| format!("cannot open the file: {e}"))?;
+    if !file
+        .metadata()
+        .map_err(|e| format!("cannot inspect the file: {e}"))?
+        .is_file()
+    {
+        return Err("only a regular file can be opened".into());
+    }
+    Ok(Target::File(file))
+}
+
+/// The absolute local path a `file:` URL names: an empty or `localhost`
+/// authority, then the percent-decoded path.
+fn file_url_path(url: &str) -> Result<OsString, String> {
+    let rest = url.get(5..).ok_or("not a file URL")?;
+    let rest = rest.strip_prefix("//").ok_or("not a local file URL")?;
+    let path = match rest.get(..9).zip(rest.get(9..)) {
+        Some((host, path)) if host.eq_ignore_ascii_case("localhost") => path,
+        _ => rest,
+    };
+    if !path.starts_with('/') {
+        return Err("not a local file URL".into());
+    }
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte != b'%' {
+            decoded.push(byte);
+            continue;
+        }
+        let (Some(high), Some(low)) = (bytes.next().and_then(hex), bytes.next().and_then(hex))
+        else {
+            return Err("the file URL has a malformed escape".into());
+        };
+        decoded.push(high << 4 | low);
+    }
+    if decoded.contains(&0) {
+        return Err("the file URL names a NUL".into());
+    }
+    Ok(OsString::from_vec(decoded))
+}
+
+fn hex(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn run(arguments: Vec<OsString>) -> Result<(), String> {
-    let [link] = arguments.as_slice() else {
+    let [argument] = arguments.as_slice() else {
         return Err(USAGE.into());
     };
-    let link = link.to_str().ok_or("the link is not UTF-8")?;
+    let target = target(argument)?;
     let address = std::env::var("DBUS_SESSION_BUS_ADDRESS")
         .map_err(|_| "no session bus in this environment")?;
     let uid = fs::metadata("/proc/self")
@@ -82,7 +183,7 @@ fn run(arguments: Vec<OsString>) -> Result<(), String> {
     open(
         &bus_path(&address)?,
         uid,
-        link,
+        &target,
         Instant::now()
             .checked_add(DEADLINE)
             .ok_or("deadline overflow")?,
@@ -173,7 +274,9 @@ impl Client {
         Err("oversized bus authentication line".into())
     }
 
-    fn authenticate(&mut self, uid: u32) -> Result<(), String> {
+    /// Authenticates as `uid`, asking for descriptor passing when this
+    /// client will send one.
+    fn authenticate(&mut self, uid: u32, descriptors: bool) -> Result<(), String> {
         let identity = uid
             .to_string()
             .bytes()
@@ -183,7 +286,22 @@ impl Client {
         if !self.line()?.starts_with("OK ") {
             return Err("the session bus refused authentication".into());
         }
+        if descriptors {
+            self.write(b"NEGOTIATE_UNIX_FD\r\n")?;
+            if self.line()?.trim_end() != "AGREE_UNIX_FD" {
+                return Err("the session bus refused descriptor passing".into());
+            }
+        }
         self.write(b"BEGIN\r\n")
+    }
+
+    /// Writes `frame` with `file`'s descriptor attached to its first bytes.
+    fn write_with(&mut self, frame: &[u8], file: &File) -> Result<(), String> {
+        self.stream
+            .set_write_timeout(Some(self.remaining()?))
+            .map_err(|e| e.to_string())?;
+        let sent = sys::send_with_fd(&self.stream, frame, file.as_raw_fd());
+        sent.map_err(|e| self.failure(&e))
     }
 
     fn frame(&mut self) -> Result<Vec<u8>, String> {
@@ -259,14 +377,14 @@ fn one_string(frame: &[u8], signature: &str) -> Result<String, String> {
     }
 }
 
-fn open(bus: &Path, uid: u32, link: &str, deadline: Instant) -> Result<(), String> {
+fn open(bus: &Path, uid: u32, target: &Target, deadline: Instant) -> Result<(), String> {
     let stream = connect(bus, deadline)?;
     let mut client = Client {
         stream,
         deadline,
         serial: 0,
     };
-    client.authenticate(uid)?;
+    client.authenticate(uid, matches!(target, Target::File(_)))?;
     let unique = one_string(&client.bus_call("Hello", None)?, "s")?;
     if !name::valid_unique_name(&unique) {
         return Err("the bus assigned an invalid name".into());
@@ -277,25 +395,55 @@ fn open(bus: &Path, uid: u32, link: &str, deadline: Instant) -> Result<(), Strin
         return Err("the portal has an invalid name".into());
     }
     let path = request_path(&unique).ok_or("cannot derive the portal request")?;
-    let call =
-        message::Builder::method_call(Endian::Little, PORTAL_PATH, Some(OPEN_URI), "OpenURI")
-            .destination(PORTAL)
-            .body("ssa{sv}", |writer| {
-                writer.string("")?;
-                writer.string(link)?;
-                writer.array("{sv}", |writer| {
-                    writer.dict_entry(|writer| {
-                        writer.string("handle_token")?;
-                        writer.variant("s", |writer| writer.string(TOKEN))
-                    })
-                })
+    let options = |writer: &mut wire::Writer| {
+        writer.array("{sv}", |writer| {
+            writer.dict_entry(|writer| {
+                writer.string("handle_token")?;
+                writer.variant("s", |writer| writer.string(TOKEN))
             })
-            .map_err(|e| e.to_string())?;
+        })
+    };
     // The portal sends the Response to this connection directly, which the
     // broker delivers without a match rule. It may precede the reply that
     // names its path, so both are read in one loop.
     let serial = client.next_serial()?;
-    client.write(&call.serial(serial).encode().map_err(|e| e.to_string())?)?;
+    match target {
+        Target::Link(link) => {
+            let call = message::Builder::method_call(
+                Endian::Little,
+                PORTAL_PATH,
+                Some(OPEN_URI),
+                "OpenURI",
+            )
+            .destination(PORTAL)
+            .serial(serial)
+            .body("ssa{sv}", |writer| {
+                writer.string("")?;
+                writer.string(link)?;
+                options(writer)
+            })
+            .map_err(|e| e.to_string())?;
+            client.write(&call.encode().map_err(|e| e.to_string())?)?;
+        }
+        Target::File(file) => {
+            let call = message::Builder::method_call(
+                Endian::Little,
+                PORTAL_PATH,
+                Some(OPEN_URI),
+                "OpenFile",
+            )
+            .destination(PORTAL)
+            .serial(serial)
+            .unix_fds(1)
+            .body("sha{sv}", |writer| {
+                writer.string("")?;
+                writer.unix_fd(0);
+                options(writer)
+            })
+            .map_err(|e| e.to_string())?;
+            client.write_with(&call.encode().map_err(|e| e.to_string())?, file)?;
+        }
+    }
     let mut answered = false;
     let mut response = None;
     for _ in 0..MAX_UNRELATED {
@@ -333,7 +481,7 @@ fn open(bus: &Path, uid: u32, link: &str, deadline: Instant) -> Result<(), Strin
             return match code {
                 0 => Ok(()),
                 1 => Err("the request was cancelled".into()),
-                _ => Err("the portal could not open the link in the browser".into()),
+                _ => Err("the portal could not open it in the browser".into()),
             };
         }
     }
@@ -419,6 +567,33 @@ mod tests {
             .unwrap()
     }
 
+    /// One call, with whatever descriptors arrived with its first bytes,
+    /// read back to their contents.
+    fn read_call_with(stream: &mut UnixStream) -> (Vec<u8>, u32, String, Vec<Vec<u8>>) {
+        let mut head = [0u8; 16];
+        let mut have = 0;
+        let mut files = Vec::new();
+        while have < head.len() {
+            let received = sys::recv_with_fds(stream, &mut head[have..]).unwrap();
+            assert!(received.count > 0, "the client closed");
+            have += received.count;
+            for fd in received.fds {
+                let mut file = sys::take_received(fd).unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                files.push(bytes);
+            }
+        }
+        let total = message::frame_len(&head).unwrap().unwrap();
+        let mut bytes = head.to_vec();
+        bytes.resize(total, 0);
+        stream.read_exact(&mut bytes[16..]).unwrap();
+        let (call, _) = message::decode(&bytes, files.len() as u32).unwrap();
+        let member = call.fields.member.unwrap().to_string();
+        let serial = call.serial;
+        (bytes, serial, member, files)
+    }
+
     fn read_call(stream: &mut UnixStream) -> (Vec<u8>, u32, String) {
         let mut head = [0u8; 16];
         stream.read_exact(&mut head).unwrap();
@@ -450,6 +625,16 @@ mod tests {
     /// A broker and portal in one: answers the client's setup and then its
     /// OpenURI as `answer` says. Returns the OpenURI call it received.
     fn broker(name: &str, answer: Answer) -> (PathBuf, thread::JoinHandle<Vec<u8>>) {
+        broker_receiving(name, answer, Default::default())
+    }
+
+    /// As `broker`, keeping the contents of the descriptors the open call
+    /// carried in `received`.
+    fn broker_receiving(
+        name: &str,
+        answer: Answer,
+        received: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) -> (PathBuf, thread::JoinHandle<Vec<u8>>) {
         let root = std::env::temp_dir().join(format!("td-open-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir(&root).unwrap();
@@ -467,9 +652,22 @@ mod tests {
             stream
                 .write_all(b"OK 0123456789abcdef0123456789abcdef\r\n")
                 .unwrap();
-            let mut begin = [0u8; 7];
-            stream.read_exact(&mut begin).unwrap();
-            assert_eq!(&begin, b"BEGIN\r\n");
+            let mut line = Vec::new();
+            while !line.ends_with(b"\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                line.push(byte[0]);
+            }
+            // As td-busd, descriptors cross only after negotiation; a plain
+            // read drops them and the call's declared count then fails.
+            let negotiated = line == b"NEGOTIATE_UNIX_FD\r\n";
+            if negotiated {
+                stream.write_all(b"AGREE_UNIX_FD\r\n").unwrap();
+                let mut begin = [0u8; 7];
+                stream.read_exact(&mut begin).unwrap();
+                assert_eq!(&begin, b"BEGIN\r\n");
+            } else {
+                assert_eq!(line, b"BEGIN\r\n");
+            }
             for (member, owner) in [("Hello", ":1.5"), ("GetNameOwner", ":1.2")] {
                 let (_, serial, called) = read_call(&mut stream);
                 assert_eq!(called, member);
@@ -478,8 +676,15 @@ mod tests {
                     .write_all(&frame(reply, BUS, 1, "s", |w| w.string(owner)))
                     .unwrap();
             }
-            let (open_call, serial, member) = read_call(&mut stream);
-            assert_eq!(member, "OpenURI");
+            let (open_call, serial, member, files) = if negotiated {
+                read_call_with(&mut stream)
+            } else {
+                let (call, serial, member) = read_call(&mut stream);
+                (call, serial, member, Vec::new())
+            };
+            assert_eq!(negotiated, member == "OpenFile", "{member}");
+            assert!(member == "OpenURI" || member == "OpenFile", "{member}");
+            *received.lock().unwrap() = files;
             let (path, responses, signals_first) = match answer {
                 Answer::BusError => {
                     let error = message::Builder::error(
@@ -528,6 +733,10 @@ mod tests {
         }
     }
 
+    fn link(text: &str) -> Target {
+        Target::Link(text.into())
+    }
+
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
     }
@@ -541,7 +750,7 @@ mod tests {
     #[test]
     fn the_link_goes_to_the_portal_and_its_success_is_the_answer() {
         let (socket, worker) = broker("success", request(vec![(":1.9", 2), (":1.2", 0)], false));
-        open(&socket, 1000, "https://example.org/a", deadline()).unwrap();
+        open(&socket, 1000, &link("https://example.org/a"), deadline()).unwrap();
         let call = finish(&socket, worker);
         let (call, _) = message::decode(&call, 0).unwrap();
         assert_eq!(call.fields.destination, Some(PORTAL));
@@ -556,7 +765,7 @@ mod tests {
     #[test]
     fn a_response_before_the_reply_is_still_the_answer() {
         let (socket, worker) = broker("first", request(vec![(":1.2", 0)], true));
-        open(&socket, 1000, "https://example.org/a", deadline()).unwrap();
+        open(&socket, 1000, &link("https://example.org/a"), deadline()).unwrap();
         finish(&socket, worker);
     }
 
@@ -565,7 +774,7 @@ mod tests {
         for (code, text) in [(2, "could not open"), (1, "cancelled")] {
             let (socket, worker) =
                 broker(&format!("code{code}"), request(vec![(":1.2", code)], false));
-            let error = open(&socket, 1000, "https://example.org/", deadline()).unwrap_err();
+            let error = open(&socket, 1000, &link("https://example.org/"), deadline()).unwrap_err();
             assert!(error.contains(text), "{error}");
             finish(&socket, worker);
         }
@@ -574,7 +783,7 @@ mod tests {
     #[test]
     fn the_bus_answering_for_the_portal_fails_at_once() {
         let (socket, worker) = broker("bus", Answer::BusError);
-        let error = open(&socket, 1000, "https://example.org/", deadline()).unwrap_err();
+        let error = open(&socket, 1000, &link("https://example.org/"), deadline()).unwrap_err();
         assert_eq!(error, "org.freedesktop.DBus.Error.NoReply: the portal left");
         finish(&socket, worker);
     }
@@ -588,7 +797,7 @@ mod tests {
         };
         let (socket, worker) = broker("other", answer);
         let started = Instant::now();
-        let error = open(&socket, 1000, "https://example.org/", deadline()).unwrap_err();
+        let error = open(&socket, 1000, &link("https://example.org/"), deadline()).unwrap_err();
         assert!(error.contains("another request"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(4));
         finish(&socket, worker);
@@ -604,11 +813,111 @@ mod tests {
         let error = open(
             &socket,
             1000,
-            "https://example.org/",
+            &link("https://example.org/"),
             Instant::now() + Duration::from_millis(200),
         )
         .unwrap_err();
         assert!(error.contains("in time"), "{error}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_argument_is_a_link_a_file_url_or_an_absolute_path() {
+        let root = std::env::temp_dir().join(format!("td-open-{}-target", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let file = root.join("a report.pdf");
+        fs::write(&file, b"pdf").unwrap();
+        assert!(matches!(
+            target(&"HTTPS://example.org/".into()),
+            Ok(Target::Link(link)) if link == "HTTPS://example.org/"
+        ));
+        let url = format!("file://{}", root.join("a%20report.pdf").display());
+        assert!(matches!(target(&url.into()), Ok(Target::File(_))));
+        let url = format!("file://localhost{}", root.join("a%20report.pdf").display());
+        assert!(matches!(target(&url.into()), Ok(Target::File(_))));
+        let url = format!(
+            "FILE://LocalHost{}",
+            root.join("a%20report%2Epdf").display()
+        );
+        assert!(matches!(target(&url.into()), Ok(Target::File(_))));
+        // A FIFO with no writer is refused at once rather than waited on.
+        // Anonymous pipes never wait, so only a named one shows this.
+        let fifo = root.join("fifo");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let path = fifo.clone();
+            thread::spawn(move || {
+                let _ = sender.send(target(&path.into()).is_err());
+            });
+            assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(true));
+        } else {
+            eprintln!("SKIP: no mkfifo to make a named pipe");
+        }
+        assert!(matches!(target(&file.clone().into()), Ok(Target::File(_))));
+        for refused in [
+            "relative.pdf".to_string(),
+            "file:relative".into(),
+            "file://host/x".into(),
+            "file://localhostx/y".into(),
+            "FILE:/single-slash".into(),
+            "file:///x%2".into(),
+            "file:///x%00y".into(),
+            "mailto:a@example.org".into(),
+            root.display().to_string(),
+            root.join("absent").display().to_string(),
+        ] {
+            assert!(target(&refused.clone().into()).is_err(), "{refused}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_goes_to_open_file_with_its_descriptor() {
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (socket, worker) =
+            broker_receiving("file", request(vec![(":1.2", 0)], false), received.clone());
+        let path = socket.parent().unwrap().join("attachment.pdf");
+        fs::write(&path, b"%PDF attachment").unwrap();
+        let Target::File(file) = target(&path.clone().into()).unwrap() else {
+            panic!("a path is a file");
+        };
+        open(&socket, 1000, &Target::File(file), deadline()).unwrap();
+        let call = finish(&socket, worker);
+        let (call, _) = message::decode(&call, 1).unwrap();
+        assert_eq!(call.fields.member, Some("OpenFile"));
+        assert_eq!(call.fields.unix_fds, Some(1));
+        assert_eq!(call.fields.signature, Some("sha{sv}"));
+        assert!(matches!(
+            call.args()[..],
+            [Value::Str(""), Value::UnixFd(0), Value::Array(_)]
+        ));
+        assert_eq!(*received.lock().unwrap(), vec![b"%PDF attachment".to_vec()]);
+    }
+
+    #[test]
+    fn the_descriptor_module_is_only_sent_through() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.contains("#![deny(unsafe_code)]"));
+        assert!(source.contains("#[path = \"../../td-secret/src/sys.rs\"]"));
+        assert_eq!(source.matches("sys::send_with_fd(").count(), 1);
+        for absent in [
+            "sys::recv_with_fds(",
+            "sys::take_received(",
+            "sys::discard_received(",
+            "from_raw_fd",
+        ] {
+            assert!(!source.contains(absent), "{absent}");
+        }
+        // Every `unsafe` in production source is the crate root's lint name.
+        assert_eq!(source.matches("unsafe").count(), 1);
+        assert_eq!(source.matches("unsafe_code").count(), 1);
     }
 }

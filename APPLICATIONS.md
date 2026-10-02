@@ -9656,7 +9656,8 @@ remote-control `OpenURL` itself, after the broker authenticates the
 holder, and the §B.2 suffix grant lets Firefox hold that
 profile-suffixed name. (2) **LANDED.**
 `td-open LINK` is a td-owned static program, dependency-free Rust that
-mounts td-busd's message codec, built by its own recipe and copied with
+mounts td-busd's message codec (and, since (3), td-secret's descriptor
+module), built by its own recipe and copied with
 its debug companion into both the `mail` and `news` closures at
 `/app/bin/td-open`; both manifests set `BROWSER=/app/bin/td-open`. It
 authenticates to the session bus as the application's UID, calls
@@ -9674,15 +9675,21 @@ an attachment, or td-news's digest, needs `OpenURI.OpenFile`. **The
 portal side LANDED** (§E row 4) as a copy rather than a grant: the
 descriptor's bytes go into a directory only the portal writes and only
 Firefox reads, so no application gains a filesystem grant and Firefox
-never opens a path an application can still change. The helper side,
-`td-open` passing a file's descriptor, is the next increment. (4) The
+never opens a path an application can still change. **The helper side
+LANDED** too: `td-open` takes an absolute path or a local `file://` URL
+(empty or `localhost` authority, percent-decoded) besides a link, opens
+the file read-only in the application's own view, requires a regular
+file, negotiates descriptor passing with the bus and sends
+`OpenFile("", h 0, {handle_token})` with that one descriptor (UNSAFE.md
+§23). The mail manifest also names it as `$OPENER`, which td-mail runs
+with a saved attachment's path; td-news's digest reaches it as the
+`file://` URL td-ui's opener passes to `$BROWSER`. (4) The
 application-side change in the two crates: prefer `$BROWSER` when set
 before probing `xdg-open`, so the manifest environment is enough and no
 `sh -c` is involved. Both programs' links do, through td-ui's opener,
 so with (1) and (2) a link from td-news or td-mail opens in the running
-Firefox. td-mail's attachments wait on (3), and td-news's digest, a
-`file://` URL `OpenURI` refuses, would need its own descriptor path to
-`OpenFile`.
+Firefox, and with (3) td-mail's attachments and td-news's digest open
+there as read-only copies.
 
 ### W.7 Relaunching a shipped application without root
 

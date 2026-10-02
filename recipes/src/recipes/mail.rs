@@ -28,6 +28,8 @@ const OPENER_ENTRY: &str = "/app/bin/td-open";
 pub fn recipe() -> Recipe {
     let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY)
         .and_then(|declaration| declaration.with_environment("BROWSER", OPENER_ENTRY))
+        // Saved attachments open through the same helper, by descriptor.
+        .and_then(|declaration| declaration.with_environment("OPENER", OPENER_ENTRY))
     else {
         return invalid_recipe("declaration");
     };
@@ -210,7 +212,7 @@ mod tests {
         // manifest names it as the browser.
         assert_eq!(
             declaration.environment().collect::<Vec<_>>(),
-            [("BROWSER", OPENER_ENTRY)]
+            [("BROWSER", OPENER_ENTRY), ("OPENER", OPENER_ENTRY)]
         );
         for (file, dest) in [
             (format!("{{in:{OPENER}}}/bin/{OPENER}"), "{out}/files/bin"),

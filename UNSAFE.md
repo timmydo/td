@@ -14,8 +14,8 @@ in `builder/src/sys.rs` and the low-level conversions in `nar.rs` and
 can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
-`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-TWO
-numbered target-side exceptions, NINETEEN of them live, each a standalone
+`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-THREE
+numbered target-side exceptions, TWENTY of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary (the crate itself
 `#![deny(unsafe_code)]`s); the seventeenth, eighteenth and twenty-second are retired and
@@ -27,9 +27,10 @@ carries the same different shape for general descriptor forwarding. Sections
 6 and 10 argue the two separately. The eleventh, `td-profiler`, also owns the
 pointer accesses into the perf ring mapping whose lifetime and bounds that
 same module controls. The twelfth, `td-portal`, is the canonical record of the
-shared credential-descriptor syscall module (also compiled by td-secret, §15)
-and its one additional scoped adoption of freshly received descriptors into
-File ownership; the private Wayland dialog that once drove it now runs over
+shared credential-descriptor syscall module (also compiled by td-secret, §15,
+and td-open, §23) and its one additional scoped adoption of freshly received
+descriptors into File ownership; the private Wayland dialog that once drove it
+now runs over
 td-ui's transport (§19). The
 thirteenth, `td-audio`, is back to the plain shape: one syscall-instruction
 layer, no descriptor adoption and no mapping, because the ALSA transfer mode
@@ -51,7 +52,7 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts nineteen live surfaces in twenty-two numbered entries. The
+roster counts twenty live surfaces in twenty-three numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
@@ -59,7 +60,8 @@ value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
 The twenty-second, `td-mta`, is retired: its production library and binary
 forbid the keyword and use safe std filesystem APIs. Test allocators remain
-separate.
+separate. The twenty-third, `td-open`, compiles §12's module to send one
+file's descriptor to the portal and adopts none.
 
 The host-only `td-vm-registrar` binary in `td-vm` has one separately
 recorded account-authentication surface, H1 below. The existing `td-review`,
@@ -113,7 +115,7 @@ own entry.
 | 9 | `td-jail` | `close(2)`, `ioctl(2)` with three value-pinned requests, `wait4(2)`, `kill(2)` with two fixed signals, `setsid(2)`, `capget(2)`, `capset(2)`, `pivot_root(2)`, `prctl(2)`, `mount(2)`, `umount2(2)`, `unshare(2)` with two value-pinned namespace sets, `prlimit64(2)` with one value-pinned resource, `seccomp(2)` with one value-pinned operation and two exact flag values |
 | 10 | `td-busd` | `recvmsg(2)`, `sendmsg(2)`, `getsockopt(2)` with two value-pinned options; plus a SECOND scoped allow for descriptor adoption — see [§10](#10-td-busd--the-session-bus-broker) |
 | 11 | `td-profiler` | `close(2)`, `mmap(2)`, `munmap(2)`, `ioctl(2)` with four pinned requests, `setgroups(2)`, `setgid(2)`, `setuid(2)`, `clock_gettime(2)`, `perf_event_open(2)`, `socket(2)`, `bind(2)`, `recvfrom(2)` for fixed kernel CPU notifications |
-| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the shared credential-descriptor module (also compiled by td-secret, §15); one scoped received-descriptor adoption. The Wayland dialog's descriptor passing moved to td-ui (§19) |
+| 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the shared credential-descriptor module (also compiled by td-secret, §15, and td-open, §23); one scoped received-descriptor adoption. The Wayland dialog's descriptor passing moved to td-ui (§19) |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption. The clipboard destination's `fcntl(2)` status commands moved to td-ui (§19) |
 | 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies and the portable vault's logind sleep-delay inhibitor; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
@@ -124,6 +126,7 @@ own entry.
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
 | 22 | `td-mta` | retired: production library and binary forbid `unsafe`; filesystem access uses safe std APIs |
+| 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering. This is a program-role boundary,
@@ -2026,9 +2029,9 @@ here and in `td-profiler/DESIGN.md`.
 `syscall5` instruction: `recvmsg(2)`, `sendmsg(2)`, and `close(2)`, plus one
 function-scoped `File::from_raw_fd` adoption. Safe `UnixStream` carries every
 descriptor-free message; the raw layer carries only descriptors. §12 is this
-module's canonical record: td-portal and td-secret (§15) both compile the same
-physical source with `#[path = "../../td-secret/src/sys.rs"]` and neither has
-an independent copy. It borrows the stream and the descriptor it sends; no
+module's canonical record: td-portal, td-secret (§15) and td-open (§23) all
+compile the same physical source with `#[path = "../../td-secret/src/sys.rs"]`
+and none has an independent copy. It borrows the stream and the descriptor it sends; no
 socket creation, connection, path lookup, or caller-selected ancillary type
 enters the surface.
 
@@ -3027,6 +3030,25 @@ amends this section and `td-install/DESIGN.md`.
 The production library and binary forbid `unsafe_code` throughout. Filesystem
 operations use safe std APIs under STORAGE.md's stable-path deployment contract.
 Only the separate test executables retain the T1/T2 exceptions below.
+
+## 23. `td-open` — one descriptor to the portal
+
+td-open, the `$BROWSER`/`$OPENER` helper the mail and news packages ship
+(APPLICATIONS.md §W.6), compiles §12's `td-secret/src/sys.rs` by `#[path]`
+to hand one local file to `OpenURI.OpenFile`. It adds no syscall, ancillary
+kind or allowance: the module's two scoped allowances are its own, the crate
+root `deny`s `unsafe_code`, and td-open's production source calls exactly
+one function of it, `send_with_fd`, once. The descriptor is a `File` td-open
+itself opened read-only from the path or `file://` URL it was given, after
+checking that it is a regular file, and it is borrowed for the one
+`sendmsg`; the frame it starts is OpenFile's, declaring one descriptor, on a
+connection that negotiated descriptor passing with the bus. td-open receives
+no descriptor, so it makes no receive, adoption or disposal call; the module's
+receive path is reachable only from its own tests. A confinement test in
+`td-open/src/main.rs` pins the mount, the `deny`, the one send call site,
+and the absence of every other module call, of `unsafe` blocks or functions,
+of a scoped allow and of `from_raw_fd`. Receiving a descriptor, a second send
+site or any other use of the module is an amendment here.
 
 ## H1. `td-vm-registrar` — host Git account enrollment
 

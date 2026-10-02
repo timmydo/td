@@ -1,16 +1,18 @@
 use crate::types::Recipe;
 
-/// td-open, the link opener the `mail` and `news` packages ship at
-/// `/app/bin/td-open` and name as `$BROWSER` (APPLICATIONS.md §W.6). It
-/// hands one link to the desktop portal's `OpenURI`, so the applications
+/// td-open, the link and file opener the `mail` and `news` packages ship
+/// at `/app/bin/td-open` and name as `$BROWSER` (and mail as `$OPENER`)
+/// (APPLICATIONS.md §W.6). It hands one link to the desktop portal's
+/// `OpenURI`, or one file's descriptor to `OpenFile`, so the applications
 /// carry no D-Bus code of their own. Built as td-news is: a static Cargo
 /// build from the checkout's `td-open/` tree, with td-busd staged beside it
-/// for the broker codec the crate mounts by `#[path]`, and a committed lock
+/// for the broker codec and td-secret for the shared descriptor module
+/// (UNSAFE.md §12, §23) the crate mounts by `#[path]`, and a committed lock
 /// naming the crate alone.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-open", "0.1.0")
         .local_source("td-open")
-        .local_source_trees(&["td-busd"])
+        .local_source_trees(&["td-busd", "td-secret"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -34,7 +36,10 @@ mod tests {
         assert_eq!(recipe.name, "td-open");
         assert_eq!(recipe.source_input.as_deref(), Some("td-open-source"));
         assert_eq!(recipe.local_source.as_deref(), Some("td-open"));
-        assert_eq!(recipe.local_source_trees, Some(vec!["td-busd".into()]));
+        assert_eq!(
+            recipe.local_source_trees,
+            Some(vec!["td-busd".into(), "td-secret".into()])
+        );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-open"));
         assert_eq!(recipe.cargo_lock.as_deref(), Some("td-open/Cargo.lock"));
         assert_eq!(recipe.static_link, Some(true));
@@ -59,9 +64,14 @@ mod tests {
             .lines()
             .filter_map(|line| line.strip_prefix("#[path = \""))
             .collect();
-        assert_eq!(mounts.len(), 3);
-        assert!(mounts
-            .iter()
-            .all(|mount| mount.starts_with("../../td-busd/src/")));
+        assert_eq!(mounts.len(), 4);
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.starts_with("../../td-busd/src/"))
+                .count(),
+            3
+        );
+        assert!(mounts.contains(&"../../td-secret/src/sys.rs\"]"));
     }
 }
