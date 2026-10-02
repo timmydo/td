@@ -725,6 +725,12 @@ source partition and brackets refill/decode turns with clock and work
 checks. It retains the source pin and refuses unsupported QP; part
 authorization, nested source ownership and MIME structure remain separate.
 
+The raw header scanner emits bounded name/value source extents, preserves
+folded bytes, and identifies the body boundary under the file parsing policy.
+It enforces the supplied header allowance and charges bounded work without
+allocating per-field strings. Source retention, aggregate MIME admission and
+header normalization remain with later integration.
+
 ## 10. HTTP and JMAP
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,

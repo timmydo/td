@@ -19,19 +19,23 @@ cells remain at most 64 bytes; variable strings are source extents, not
 strings owned per descriptor. RESOURCES.md's six decode rings,
 parser/conversion scratch and fixed sort buffers cover the operations below.
 
-header_bytes bounds the sum of all entity headers in one parse, including the
-root exactly once. SMTP can check that root alone before later MIME work; this
-does not grant a second header arena or a second allowance. Each fresh
-attached-message parse applies the same aggregate bound. mime_depth counts the
-root as one; mime_parts includes containers and leaves. The six locator stages
-are a separate bound. Nesting in comments/quoted constructs is capped at 32; a
+header_bytes bounds the sum of all entity headers in one parse, including
+the root exactly once. Count each recognized field's bytes, including its
+line endings and folds, but exclude the empty separator line and body. A
+tentative field name is not a header until a colon establishes its grammar;
+visiting such bytes still consumes work, even if the line becomes body. SMTP
+can check that root alone before later MIME work; this does not grant a
+second header arena or a second allowance. Each fresh attached-message parse
+applies the same aggregate bound. mime_depth counts the root as one;
+mime_parts includes containers and leaves. The six locator stages are a
+separate bound. Nesting in comments/quoted constructs is capped at 32; a
 parser uses explicit frames. Header field names have the RFC
-printable-ASCII-except-colon grammar; accept RFC 5322 obsolete SP/HTAB between
-the name and colon without including that whitespace in the reported field
-name. A line need not fit an I/O chunk. Boundary values follow RFC 2046's
-1..70 character grammar. Parameter/field/address/ID lists stream within
-header_bytes; there is no unbounded heap list and no silent prefix accepted as
-a complete property.
+printable-ASCII-except-colon grammar; accept RFC 5322 obsolete SP/HTAB
+between the name and colon without including that whitespace in the reported
+field name. A line need not fit an I/O chunk. Boundary values follow RFC
+2046's 1..70 character grammar. Parameter/field/address/ID lists stream
+within header_bytes; there is no unbounded heap list and no silent prefix
+accepted as a complete property.
 
 Malformed input and resource failure are distinct. For raw reception, root
 headers exceeding header_bytes are a declared message-size refusal before

@@ -867,6 +867,64 @@ fn store_read_pool() {
     }
 }
 
+fn mime_headers() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        mime_headers::{Scanner, Status},
+        ports::{Deadline, Tick},
+    };
+    let before = COUNTERS.snapshot();
+    let bytes = b"X: a\r\n\tmore\n\nbody";
+    let mut scanner = Scanner::new(0, 12);
+    let mut meter = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100,
+            records: 1,
+            ..Charge::default()
+        },
+    );
+    let mut offset = 0;
+    let mut fields = 0;
+    let mut done = false;
+    for _ in 0..100 {
+        let end = (offset + 1).min(bytes.len());
+        let step = scanner
+            .poll(
+                bytes.get(offset..end).unwrap(),
+                end == bytes.len(),
+                Tick(1),
+                &mut meter,
+            )
+            .unwrap();
+        offset += step.consumed;
+        match step.status {
+            Status::Field(field) => {
+                fields += 1;
+                assert_eq!((field.value_start, field.value_end), (2, 11));
+            }
+            Status::Complete(end) => {
+                assert_eq!((end.body_start, end.header_bytes), (13, 12));
+                done = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(done);
+    assert_eq!(fields, 1);
+    let mut refused = Scanner::new(0, 0);
+    assert_eq!(
+        refused.poll(b"X:", true, Tick(1), &mut meter),
+        Err(td_mta::mime_headers::Error::HeaderLimit)
+    );
+    assert_eq!(
+        refused.poll(b"", true, Tick(100), &mut meter),
+        Err(td_mta::mime_headers::Error::HeaderLimit)
+    );
+    assert_eq!(COUNTERS.snapshot(), before, "header scanner allocated");
+}
+
 fn mime_input() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -1261,6 +1319,7 @@ fn main() {
         store_pinned_blobs();
         mime_base64();
         mime_input();
+        mime_headers();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1344,6 +1403,7 @@ fn main() {
     store_pinned_blobs();
     mime_base64();
     mime_input();
+    mime_headers();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

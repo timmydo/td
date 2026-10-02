@@ -739,6 +739,14 @@ separate functional test uses the real verified pinned body reader. These
 checks do not qualify combined filesystem allocation, nested-source
 checkpoint memory, full worker stacks or service RSS.
 
+The raw header scanner uses at most 128 bytes of inline state within parser
+state and returns one 32-byte field descriptor at a time. It holds no source
+buffer or per-field string; long tentative names consume charged work with
+constant memory. The caller's existing header arena owns any retained bytes.
+A dedicated allocation interval covers single-byte fragmentation, folded
+field emission, body detection and sticky limit refusal with unchanged Rust
+counters. This does not qualify a full parser stack or source collection.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

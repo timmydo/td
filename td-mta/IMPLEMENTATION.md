@@ -1193,6 +1193,14 @@ Initial independently landable increments:
   pinned-body path; qualify core allocations with a synthetic source. Nested
   source checkpoints, QP and protocol integration remain open.
 
+- **M06c — raw header scanner:** implemented fixed state and source extents,
+  256-transition turns, field work charging and exact body/header boundaries.
+  Handle split CRLF, bare LF/CR, folds, obsolete name whitespace, malformed
+  lines and EOF without a line buffer. Enforce the supplied header allowance
+  only for recognized headers; ambiguous names remain work-bounded. Cover
+  fragmented fixtures, bounds, failures and an isolated allocation interval.
+  Collection, aggregate MIME admission and normalized header forms remain open.
+
 Implement bounded header unfolding, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME

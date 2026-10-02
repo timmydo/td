@@ -743,6 +743,39 @@ decoder, adapter errors and work refusal remain distinct fixed errors.
 Reader checkpoint restoration, nested source chains, QP and protocol output
 remain separate.
 
+### 1.14 Raw header scanner
+
+mime_headers::Scanner consumes successive source chunks with an absolute
+starting offset, caller-supplied remaining aggregate header allowance and
+explicit EOF. It returns consumed bytes and one Field, Complete, NeedInput
+or Yield. Field carries checked name/value half-open source extents; names
+exclude obsolete whitespace before the colon, and values exclude their last
+line ending while retaining folds and leading whitespace. No value decoding
+or source access occurs. Caller input resumes at consumed, including after a
+zero-consumption field event. Every emitted field is provisional until the
+scan completes successfully. Once EOF is observed, later input is ignored;
+a pending field event is followed by Complete at the retained EOF.
+
+CRLF and bare LF end lines, including split CRLF; bare CR remains data.
+Empty lines end headers. An invalid field or unattached continuation begins
+the body at that line's start, even if tentative name bytes were already
+consumed. Complete reports the authoritative body offset and recognized
+header byte count; the input cursor alone is not a body boundary. EOF after
+recognized headers yields an empty body. Headers include field endings and
+folds, exclude the empty separator, and count exactly once. The caller owns
+aggregate accounting across entities and raw source retention. A long
+ambiguous name uses only scalar state and is subject to the work budget;
+once its colon arrives the whole candidate is checked against the byte cap.
+
+Each turn performs at most 256 transitions, emitting at most one field.
+Charge every source lookahead, including one revisited after a field event,
+and one record per emitted field. EOF checks consume no source byte but
+still check the deadline. The caller brackets deterministic turns with fresh
+clock/cancellation checks. HeaderLimit, offset overflow and work failures are
+distinct and sticky; terminal completion is stable without later work. No
+partial field list is a successful result after refusal. Header collection,
+unfolding, Unicode and MIME tree integration remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
