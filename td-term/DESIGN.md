@@ -443,8 +443,15 @@ client can present, so rendering is coalesced to the latest state behind the
 frame in flight, and the buffer rules are the client's: a submitted buffer is
 reused or mutated only after its `wl_buffer.release`, at most three stay live,
 and a resize paints into a replacement while the old buffer waits for its
-release. Every glyph and decoration is clipped to the surface before pixels
-are visited, and a surface smaller than the grid renders its visible corner.
+release. The client writes each frame whole into its buffer's pool file, so
+td-term makes those files in `XDG_RUNTIME_DIR` when it is absolute and a
+directory private to td-term's account that the account can write and
+search, which a session's runtime directory is and which is memory, and
+otherwise in the temporary directory, which may be a disk the written pages
+go back to. A memory directory's size bounds the buffers: a frame the
+directory has no room for fails its present, and the terminal with it.
+Every glyph and decoration is clipped to the surface before pixels are
+visited, and a surface smaller than the grid renders its visible corner.
 
 C0 BEL, an atomically dropped keyboard event, or an atomically dropped reply
 sets one coalesced visual-bell bit in the model. The renderer presents that

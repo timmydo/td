@@ -599,7 +599,12 @@ impl Window {
         let font = td_ui::font::pinned()?;
         let cell = render::cell_size(&font, None);
         let fallback = default_size(cell)?;
-        let mut client = Client::new(stream, std::env::temp_dir())?;
+        let pools = session::pool_directory(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            session::current_uid(Path::new(PROC_STATUS)).ok(),
+            std::env::temp_dir(),
+        );
+        let mut client = Client::new(stream, pools)?;
         client.want_primary();
         let waker = client.connection().waker()?;
         // Before the first frame: a machine whose devpts is missing should
@@ -2829,8 +2834,15 @@ mod tests {
     /// clipboard and a primary selection, both devices created:
     /// `(window, peer)`.
     fn fixture() -> (Window, UnixStream) {
+        // A path of its own: tests run in parallel, and a readiness socket
+        // another fixture still holds is refused, not replaced.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         fixture_for(Profile::Td {
-            ready_socket: std::env::temp_dir().join("td-term-unused-ready"),
+            ready_socket: std::env::temp_dir().join(format!(
+                "td-term-unused-ready-{}-{serial}",
+                std::process::id()
+            )),
         })
     }
 

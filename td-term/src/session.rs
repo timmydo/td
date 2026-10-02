@@ -277,6 +277,29 @@ fn private_directory(path: &Path, uid: u32, follow: bool) -> Result<(), String> 
     Ok(())
 }
 
+/// Where the window's frame buffers are backed: the session's runtime
+/// directory when it is absolute and private to `uid`, else `temporary`.
+/// A frame is written whole into its pool file every present, and a
+/// runtime directory is memory, where a temporary directory may be a disk
+/// that writes those pages back.
+pub fn pool_directory(runtime: Option<&OsStr>, uid: Option<u32>, temporary: PathBuf) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    // The owner must also be able to make files there.
+    let writable = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.mode() & 0o300 == 0o300)
+    };
+    match (runtime.map(Path::new), uid) {
+        (Some(runtime), Some(uid))
+            if runtime.is_absolute()
+                && private_directory(runtime, uid, true).is_ok()
+                && writable(runtime) =>
+        {
+            runtime.to_path_buf()
+        }
+        _ => temporary,
+    }
+}
+
 /// Writes td-term's compiled entry under `runtime` (the session's
 /// `XDG_RUNTIME_DIR`, which must already be private to `uid`) and answers
 /// the directory holding it. Each directory below is made, or found, private
@@ -676,6 +699,54 @@ mod tests {
         }
         std::fs::remove_dir_all(&runtime).unwrap();
         assert!(install_runtime_terminfo(Path::new("run/user"), uid, &entry).is_err());
+    }
+
+    #[test]
+    fn frame_buffers_are_backed_in_a_private_runtime_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = current_uid(Path::new("/proc/self/status")).unwrap();
+        let scratch = std::env::temp_dir().join(format!("td-term-pools-{}", std::process::id()));
+        // A run that failed before cleaning up leaves its directory behind.
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir(&scratch).unwrap();
+        let runtime = scratch.join("runtime");
+        let temporary = PathBuf::from("/tmp");
+        let pools = |runtime: &Path, uid: Option<u32>| {
+            pool_directory(Some(runtime.as_os_str()), uid, temporary.clone())
+        };
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        assert_eq!(
+            pool_directory(None, Some(uid), temporary.clone()),
+            temporary
+        );
+        assert_eq!(pools(&runtime, Some(uid)), temporary, "missing");
+        std::fs::write(&runtime, b"").unwrap();
+        mode(&runtime, 0o600);
+        assert_eq!(pools(&runtime, Some(uid)), temporary, "a file");
+        std::fs::remove_file(&runtime).unwrap();
+        // Modes are set after creation, which the umask cannot narrow.
+        std::fs::create_dir(&runtime).unwrap();
+        mode(&runtime, 0o755);
+        assert_eq!(pools(&runtime, Some(uid)), temporary, "open");
+        mode(&runtime, 0o750);
+        assert_eq!(pools(&runtime, Some(uid)), temporary, "group");
+        mode(&runtime, 0o500);
+        assert_eq!(pools(&runtime, Some(uid)), temporary, "unwritable");
+        mode(&runtime, 0o700);
+        assert_eq!(pools(&runtime, Some(uid)), runtime);
+        assert_eq!(pools(&runtime, Some(uid + 1)), temporary, "another's");
+        assert_eq!(pools(&runtime, None), temporary, "no uid");
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&runtime, &link).unwrap();
+        assert_eq!(pools(&link, Some(uid)), link, "a link to a private one");
+        assert_eq!(
+            pools(Path::new("run/user"), Some(uid)),
+            temporary,
+            "relative"
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
