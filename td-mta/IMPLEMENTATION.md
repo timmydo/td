@@ -778,6 +778,15 @@ service activation. Each part lands independently:
     kinds, empty/large files, limits, corruption, changed extents and provider
     errors. Allocation probes cover success/refusal at both root bounds.
     Final owning-reference resolution and actual pins remain coordinator work.
+  - **M05d7 — bounded replay overlay:** implemented immutable supplied frame
+    bytes and caller-owned operation cells, complete contiguous frame validation,
+    in-place descriptor sorting and latest-key lookup/iteration with tombstones.
+    All operations count toward the cap; CHANGE records never become rows.
+    Limits::plan checks the 32-byte compiled cell budget. Tests cover independent
+    last-write comparison, sequence/ordinal ties, corruption/truncation, full
+    operation capacity and scratch reuse; allocation instrumentation covers
+    8192 operations and lookups/refusals. Filesystem prefix loading, checkpoint
+    merge, final reference validation and live pins remain integration work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

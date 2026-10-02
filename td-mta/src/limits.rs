@@ -7,6 +7,7 @@ pub const MIB: usize = 1024 * KIB;
 pub const OUTBOUND_RECIPIENT_BATCH: usize = 100;
 /// Owned operation offsets/ordinal/type/kind, including Option layout.
 pub const OPERATION_SLOT_BYTES: usize = 32;
+pub const JOURNAL_SLOT_BYTES: usize = 32;
 /// Planned provider session ceiling, not a measured worst-case bound.
 pub const TLS_SESSION_BYTES: usize = 512 * KIB;
 /// Planned provider construction/handshake ceiling; qualification remains required.
@@ -182,6 +183,10 @@ impl Limits {
         self.validate_ranges()?;
         for (valid, rule) in [
             (
+                std::mem::size_of::<crate::overlay::Cell>() <= JOURNAL_SLOT_BYTES,
+                "journal index exceeds its operation slot",
+            ),
+            (
                 std::mem::size_of::<Option<crate::ports::StagedOperation>>()
                     <= OPERATION_SLOT_BYTES,
                 "operation index exceeds its staging slot",
@@ -232,7 +237,11 @@ impl Limits {
         let json_descriptors = product("JSON tokens", self.json_tokens, 16)?;
         let mime_descriptors = product("MIME parts", self.mime_parts, 64)?;
         let recipient_bytes = product("SMTP recipients", self.smtp_recipients, 320)?;
-        let journal_descriptors = product("journal descriptors", self.journal_operations, 32)?;
+        let journal_descriptors = product(
+            "journal descriptors",
+            self.journal_operations,
+            JOURNAL_SLOT_BYTES,
+        )?;
         let mutation_slots = product(
             "transaction operation index",
             self.frame_operations,

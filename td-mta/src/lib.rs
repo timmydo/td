@@ -11,6 +11,7 @@ pub mod generations;
 pub mod ids;
 pub mod limits;
 pub mod observability;
+pub mod overlay;
 pub mod ownership;
 pub mod ports;
 pub mod smtp_wire;

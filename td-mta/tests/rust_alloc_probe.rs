@@ -760,6 +760,90 @@ fn store_temporary_files() {
     );
 }
 
+fn journal_overlay() {
+    use td_mta::{
+        format::{
+            container::JournalHeader, frame, key::Key, operation::Operation, Sequence, Table,
+            FRAME_FOOTER_BYTES, FRAME_HEADER_BYTES, JOURNAL_HEADER_BYTES, MAX_FRAME_OPERATIONS,
+            MAX_JOURNAL_OPERATIONS, OPERATION_HEADER_BYTES,
+        },
+        ids::{AccountId, StoreEpoch, ThreadId},
+        overlay::{Cell, Overlay},
+    };
+    let mut header = [0; JOURNAL_HEADER_BYTES];
+    JournalHeader {
+        account: AccountId::from_bytes([3; 16]),
+        epoch: StoreEpoch::from_bytes([4; 16]),
+        segment: 1,
+        base: Sequence::from_u64(0),
+    }
+    .encode(&td_crypto::Provider, &mut header)
+    .unwrap();
+    let frame_length = FRAME_HEADER_BYTES
+        + FRAME_FOOTER_BYTES
+        + MAX_FRAME_OPERATIONS * (OPERATION_HEADER_BYTES + 16);
+    let mut bytes = Vec::with_capacity(frame_length * 2);
+    for sequence in 1..=2 {
+        let mut encoded = vec![0; frame_length];
+        let mut offset = FRAME_HEADER_BYTES;
+        for ordinal in 0..MAX_FRAME_OPERATIONS {
+            let key = [(ordinal % 251) as u8; 16];
+            offset += Operation::delete(Table::Threads, &key)
+                .unwrap()
+                .encode(encoded.get_mut(offset..).unwrap())
+                .unwrap();
+        }
+        frame::seal(
+            &td_crypto::Provider,
+            Sequence::from_u64(sequence),
+            MAX_FRAME_OPERATIONS,
+            &mut encoded,
+        )
+        .unwrap();
+        bytes.extend_from_slice(&encoded);
+    }
+    let mut cells = vec![Cell::EMPTY; MAX_JOURNAL_OPERATIONS];
+    let before = COUNTERS.snapshot();
+    {
+        let overlay = Overlay::decode(
+            &td_crypto::Provider,
+            black_box(&header),
+            black_box(&bytes),
+            &mut cells,
+        )
+        .unwrap();
+        assert_eq!(overlay.operation_count(), MAX_JOURNAL_OPERATIONS);
+        for id in 0..=250 {
+            assert!(overlay
+                .get(Key::Thread(ThreadId::from_bytes([id; 16])))
+                .unwrap()
+                .is_some());
+            assert!(
+                overlay
+                    .next(Table::Threads, Some(&[id; 16]))
+                    .unwrap()
+                    .is_some()
+                    == (id != 250)
+            );
+        }
+        assert!(overlay
+            .get(Key::Thread(ThreadId::from_bytes([255; 16])))
+            .unwrap()
+            .is_none());
+    }
+    assert!(Overlay::decode(
+        &td_crypto::Provider,
+        &header,
+        &bytes,
+        cells.get_mut(..MAX_JOURNAL_OPERATIONS - 1).unwrap()
+    )
+    .is_err());
+    *bytes.last_mut().unwrap() ^= 1;
+    assert!(Overlay::decode(&td_crypto::Provider, &header, &bytes, &mut cells).is_err());
+    assert!(!before.invalid);
+    assert_eq!(COUNTERS.snapshot(), before, "journal overlay allocated");
+}
+
 fn main() {
     allocation_counter::Counters::verify_model();
     forwarding();
@@ -843,6 +927,7 @@ fn main() {
     }
     store_directories();
     store_temporary_files();
+    journal_overlay();
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }

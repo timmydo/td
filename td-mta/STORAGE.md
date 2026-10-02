@@ -948,6 +948,31 @@ heap allocation or whole-mailbox map is allowed. The writer/checkpointer has
 its own bounded scratch reservation; these bytes are additional to the 8 MiB
 combined index cache and must appear in the memory ledger.
 
+`overlay::Overlay::decode` implements the supplied-byte replay index. Its
+inputs are a separate 96-byte journal header, at most 4 MiB of immutable frame
+bytes and caller-owned cells capped at 8192. It validates every contiguous
+complete frame and operation through the shared journal verifier, records
+checked key/value offsets with sequence and in-frame ordinal, and sorts cells
+in place without allocating. Every stored operation consumes a cell, including
+CHANGE and repeated updates to one key. Partial/corrupt supplied frames refuse;
+this adapter performs no incomplete-tail repair. Frame-header and truncated
+frame errors retain the shared verifier's Frame classification.
+
+The returned overlay borrows both buffers and exposes the journal Summary for
+selected-prefix binding. get returns the latest operation on a key; None means
+no overlay entry, while DELETE is an explicit tombstone. next returns latest
+operations in canonical key order, strictly after the caller's validated cursor,
+including tombstones. CHANGE descriptors are sorted apart and never appear as
+rows. Results preserve sequence and ordinal. This validates supplied bytes and
+replay order only: the caller must separately establish physical extent,
+selection, complete final-row invariants and actual view pins.
+
+Construction synchronously bounds work by the supplied frame bytes and
+operation count, then sorts at most 8192 descriptors. The coordinator admits
+that entire work unit and checks its deadline around construction. Failed
+construction may overwrite scratch cells and exposes no partial overlay. After
+byte/cell admission, reuse clears cells before parsing. No whole checkpoint or mailbox map is constructed.
+
 Read an object from that bounded overlay or its sorted checkpoint table.
 Listings merge a sequential table cursor with sorted overlay entries. Sparse
 key/offset indexes and folder/date/search indexes are disposable disk files

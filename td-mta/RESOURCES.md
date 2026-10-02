@@ -72,6 +72,15 @@ still account for those costs and concurrent owners within the ledger.
   Nested parsing and transfer decoding share that reservation.
 - Read view: 4 MiB journal prefix, 32 bytes per journal operation, 128 KiB
   cursor/value scratch. Backup consumes an existing view.
+  The replay Overlay borrows the immutable frame arena and at most 8192
+  caller-owned Cell values. Limits::plan checks each compiled Cell fits the
+  32-byte journal slot. Cells retain offsets, lengths, sequence, ordinal,
+  tag and operation kind; in-place unstable sorting adds no heap inventory.
+  Construction bounds work by the entire arena/count; point/next lookup uses
+  binary search and a fixed 1024-byte key scratch for typed get. The dedicated
+  allocation probe builds and sorts 8192 operations with repeated/permuted keys,
+  performs successful/absent point and next lookups, and refuses a short slot
+  buffer and corrupt frame without Rust allocations after cold preparation.
 - Writer: one journal arena and descriptor array, one 1 MiB frame, and
   256 KiB table/manifest/value scratch, a separate 1 MiB input key/value
   arena and 4096 operation slots of 32 bytes. The latter bounds the actual

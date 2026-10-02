@@ -47,8 +47,10 @@ verified prefix boundary through physical EOF. Explicit tail repair rechecks
 CURRENT and the scanned file identity/extent, truncates only that suffix and
 syncs before confirming the repaired extent. Referenced-blob input now checks
 exact length, streams SHA-256 and requires whole-file EOF and digest equality
-against a supplied row. Complete selected-graph/final-view validation and
-committed mail publication remain unimplemented.
+against a supplied row. The supplied-byte replay overlay now validates complete
+frames, sorts bounded descriptors and resolves latest operations/tombstones.
+Complete selected-graph/final-view validation and committed mail publication
+remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can
