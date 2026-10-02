@@ -457,8 +457,7 @@ impl PermissionPolicy {
         name: &str,
         access: BusAccess,
     ) -> Result<PermissionPolicy, String> {
-        validate_bus_name(name)?;
-        validate_bus_access(name, access)?;
+        validate_bus_entry(name, access)?;
         if self.session_bus.contains_key(name) {
             return Err(format!("duplicate session bus name {name:?}"));
         }
@@ -878,7 +877,6 @@ fn apply_filesystem(state: &mut ParseState, key: &str, value: &str) -> Result<()
 }
 
 fn apply_session_bus(state: &mut ParseState, key: &str, value: &str) -> Result<(), String> {
-    validate_bus_name(key)?;
     if state.policy.session_bus.contains_key(key) {
         return Err(format!("duplicate session bus name {key:?}"));
     }
@@ -888,7 +886,7 @@ fn apply_session_bus(state: &mut ParseState, key: &str, value: &str) -> Result<(
         ));
     }
     let access = BusAccess::parse(value)?;
-    validate_bus_access(key, access)?;
+    validate_bus_entry(key, access)?;
     state.policy.session_bus.insert(key.to_string(), access);
     Ok(())
 }
@@ -1074,6 +1072,52 @@ fn validate_bus_name(name: &str) -> Result<(), String> {
     }
     if components < 2 {
         return Err("session bus name must contain at least one `.'".into());
+    }
+    Ok(())
+}
+
+/// The broker's reserved name and namespace roots (td-busd `policy`).
+const RESERVED_BUS_ROOTS: [&str; 3] = [
+    "org.freedesktop.DBus",
+    "org.freedesktop.portal",
+    "org.freedesktop.impl.portal",
+];
+
+/// The fewest components a `BASE.*` grant's base may have.
+const MIN_BUS_SUFFIX_BASE_COMPONENTS: usize = 3;
+
+/// One `[Session Bus Policy]` entry: an exact name, or for `own` alone the
+/// suffix grant `BASE.*`, which covers the names under `BASE`
+/// (APPLICATIONS.md §B.2). td-busd's `app_policy::owned_grant` is the same
+/// rule at the broker.
+fn validate_bus_entry(name: &str, access: BusAccess) -> Result<(), String> {
+    let Some(base) = name.strip_suffix(".*") else {
+        validate_bus_name(name)?;
+        return validate_bus_access(name, access);
+    };
+    validate_bus_name(base)?;
+    if access != BusAccess::Own {
+        return Err(format!(
+            "session bus suffix grant {name:?} is admitted only for `own'"
+        ));
+    }
+    if base.split('.').count() < MIN_BUS_SUFFIX_BASE_COMPONENTS {
+        return Err(format!(
+            "session bus suffix grant {name:?} needs a base of at least \
+             {MIN_BUS_SUFFIX_BASE_COMPONENTS} components"
+        ));
+    }
+    let under = |name: &str, prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    };
+    if RESERVED_BUS_ROOTS
+        .iter()
+        .any(|root| under(base, root) || under(root, base))
+    {
+        return Err(format!(
+            "session bus suffix grant {name:?} would cover a reserved name"
+        ));
     }
     Ok(())
 }
@@ -1691,7 +1735,8 @@ mod tests {
             ("org..Service", "empty component"),
             ("org.7zip.Service", "must begin"),
             (":1.20", "must begin"),
-            ("org.example.*", "must begin"),
+            ("org.example.*", "only for `own'"),
+            ("org.*.Service", "must begin"),
             ("org.example.Service/Child", "outside"),
         ] {
             let got = PermissionPolicy::new()
@@ -1847,6 +1892,43 @@ mod tests {
             PermissionPolicy::new()
                 .with_session_bus(name, BusAccess::Talk)
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_own_suffix_grant_is_narrow_and_round_trips() {
+        let policy = PermissionPolicy::new()
+            .with_session_bus("org.mozilla.firefox", BusAccess::Own)
+            .unwrap()
+            .with_session_bus("org.mozilla.firefox.*", BusAccess::Own)
+            .unwrap();
+        let text = policy.to_keyfile();
+        assert!(text.contains("org.mozilla.firefox.*=own\n"), "{text}");
+        assert_eq!(PermissionPolicy::parse(&text).unwrap(), policy);
+        for (name, access, reason) in [
+            ("org.mozilla.firefox.*", BusAccess::Talk, "only for `own'"),
+            ("org.mozilla.firefox.*", BusAccess::See, "only for `own'"),
+            ("org.mozilla.*", BusAccess::Own, "at least 3"),
+            ("org.freedesktop.impl.*", BusAccess::Own, "reserved name"),
+            ("org.freedesktop.portal.*", BusAccess::Own, "reserved"),
+            (
+                "org.freedesktop.impl.portal.Access.*",
+                BusAccess::Own,
+                "reserved",
+            ),
+            ("org.freedesktop.DBus.Debug.*", BusAccess::Own, "reserved"),
+            ("org.mozilla.firefox.**", BusAccess::Own, "must begin"),
+            ("org.mozilla.*.firefox", BusAccess::Own, "must begin"),
+        ] {
+            let got = PermissionPolicy::new()
+                .with_session_bus(name, access)
+                .unwrap_err();
+            assert!(got.contains(reason), "{name:?}: {got}");
+            let file = format!(
+                "format=1\n\n[Session Bus Policy]\n{name}={}\n",
+                access.as_str()
+            );
+            assert!(PermissionPolicy::parse(&file).is_err(), "{name:?}");
         }
     }
 

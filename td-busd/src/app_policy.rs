@@ -43,7 +43,7 @@ impl Policy {
                 || !uids.insert(rule.uid)
                 || !names.insert(rule.application.clone())
                 || rule.owned.len() > MAX_OWNED
-                || rule.owned.iter().any(|name| !owned_name(name))
+                || rule.owned.iter().any(|name| !owned_grant(name))
             {
                 return Err("invalid or duplicate application policy entry".into());
             }
@@ -232,17 +232,57 @@ pub(crate) fn application_name(name: &str) -> bool {
         })
 }
 
+/// The reserved names and namespace roots no grant may reach.
+const RESERVED_ROOTS: [&str; 3] = [
+    "org.freedesktop.DBus",
+    "org.freedesktop.portal",
+    "org.freedesktop.impl.portal",
+];
+
+/// The fewest components a suffix grant's base may have, so that no grant
+/// spans a vendor's whole namespace.
+const MIN_SUFFIX_BASE_COMPONENTS: usize = 3;
+
+/// One `own` grant as the deployment records it: an exact well-known name,
+/// or `BASE.*` for the names one or more components below `BASE`.
+pub(crate) fn owned_grant(grant: &str) -> bool {
+    match grant.strip_suffix(".*") {
+        Some(base) => {
+            owned_name(base)
+                && base.split('.').count() >= MIN_SUFFIX_BASE_COMPONENTS
+                && !RESERVED_ROOTS.iter().any(|root| overlaps(base, root))
+        }
+        None => owned_name(grant),
+    }
+}
+
+/// Whether `base` equals `root` or lies inside or above it, by components.
+fn overlaps(base: &str, root: &str) -> bool {
+    let under = |name: &str, prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    };
+    under(base, root) || under(root, base)
+}
+
+/// Whether `grant` admits the well-known `name`: the name itself, or for
+/// `BASE.*` a name under `BASE` but never `BASE`.
+pub(crate) fn grant_covers(grant: &str, name: &str) -> bool {
+    match grant.strip_suffix(".*") {
+        Some(base) => name
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(|rest| !rest.is_empty()),
+        None => grant == name,
+    }
+}
+
 // This source is also compiled by recipes; broker tests cross-check its
 // reserved-name decisions against policy::is_reserved_name.
 pub(crate) fn owned_name(name: &str) -> bool {
     name.len() <= 255
         && name.contains('.')
-        && ![
-            "org.freedesktop.DBus",
-            "org.freedesktop.portal",
-            "org.freedesktop.impl.portal",
-        ]
-        .contains(&name)
+        && !RESERVED_ROOTS.contains(&name)
         && !name.starts_with("org.freedesktop.portal.")
         && !name.starts_with("org.freedesktop.impl.portal.")
         && name.split('.').all(|part| {
@@ -355,6 +395,34 @@ mod tests {
         for uid in [992, 993, 1001, 65534, 65538] {
             assert!(!policy.admits(uid));
         }
+    }
+
+    #[test]
+    fn a_policy_row_carries_a_narrow_suffix_grant_and_registers_it_exactly() {
+        let text = "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox,org.mozilla.firefox.*\n";
+        let policy = Policy::parse(text).unwrap();
+        assert_eq!(policy.to_tsv(), text);
+        let grants = vec!["org.mozilla.firefox".into(), "org.mozilla.firefox.*".into()];
+        policy.registration(65536, "firefox", &[], &grants).unwrap();
+        assert!(policy
+            .registration(65536, "firefox", &[], &["org.mozilla.firefox".into()])
+            .is_err());
+        for wide in ["org.mozilla.*", "org.freedesktop.impl.*"] {
+            let text = text.replace("org.mozilla.firefox.*", wide);
+            assert!(Policy::parse(&text).is_err(), "{wide}");
+        }
+        assert!(grant_covers(
+            "org.mozilla.firefox.*",
+            "org.mozilla.firefox.ZGVmYXVsdC1yZWxlYXNl"
+        ));
+        assert!(!grant_covers(
+            "org.mozilla.firefox.*",
+            "org.mozilla.firefox"
+        ));
+        assert!(!grant_covers(
+            "org.mozilla.firefox",
+            "org.mozilla.firefox.A"
+        ));
     }
 
     #[test]

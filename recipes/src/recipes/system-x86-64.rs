@@ -8330,6 +8330,42 @@ mod tests {
         assert!(real_root_steps(&system).is_err());
     }
 
+    /// The engine's permission parser and the broker's deployment grammar
+    /// are separate copies of APPLICATIONS.md §B.2's own-grant rule, and the
+    /// policy this image derives passes through both.
+    #[test]
+    fn engine_and_broker_grade_own_grants_alike() {
+        use td_engine::permissions::{BusAccess, PermissionPolicy};
+        for grant in [
+            "org.mozilla.firefox",
+            "org.mozilla.firefox.*",
+            "org.mpris.MediaPlayer2.firefox.*",
+            "org.mozilla.*",
+            "org.*",
+            "org.freedesktop.*",
+            "org.freedesktop.DBus",
+            "org.freedesktop.DBus.*",
+            "org.freedesktop.DBus.Debug.*",
+            "org.freedesktop.portal",
+            "org.freedesktop.portal.*",
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.impl.*",
+            "org.freedesktop.impl.portal.Access.*",
+            "org.mozilla.firefox.**",
+            "org.mozilla.*.firefox",
+            "org.mozilla.firefox*",
+            "org.7zip.App.*",
+        ] {
+            assert_eq!(
+                PermissionPolicy::new()
+                    .with_session_bus(grant, BusAccess::Own)
+                    .is_ok(),
+                bus_application_policy::owned_grant(grant),
+                "{grant}"
+            );
+        }
+    }
+
     #[test]
     fn broker_policy_is_derived_from_the_deployments_principals_and_grants() {
         let text = build_bus_application_policy(&SYSTEM).unwrap();
@@ -8355,7 +8391,7 @@ mod tests {
         }
         assert_eq!(
             policy.for_name("firefox").unwrap().owned,
-            ["org.mozilla.firefox"]
+            ["org.mozilla.firefox", "org.mozilla.firefox.*"]
         );
         let file = etc_files(&SYSTEM)
             .unwrap()

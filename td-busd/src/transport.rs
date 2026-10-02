@@ -2760,13 +2760,16 @@ impl<'a> Connection<'a> {
         else {
             return Ok(None);
         };
-        let Some(owned) = self.well_known_names(
+        let Some(owned) = self.graded_names(
             message,
             &grants,
             crate::lineage::MAX_OWNED_NAMES,
-            "that list of names cannot be read",
-            "a name an instance may own must be a bus name",
+            (
+                "that list of names cannot be read",
+                "a name an instance may own must be a bus name",
+            ),
             wants_reply,
+            owned_grant,
         )?
         else {
             return Ok(None);
@@ -2822,6 +2825,27 @@ impl<'a> Connection<'a> {
         malformed: &str,
         wants_reply: bool,
     ) -> Result<Option<Vec<String>>, Ended> {
+        self.graded_names(
+            message,
+            seq,
+            most,
+            (unreadable, malformed),
+            wants_reply,
+            crate::name::valid_well_known_name,
+        )
+    }
+
+    /// `well_known_names` with the grader a parameter: `Register`'s owned
+    /// list also admits §D's `BASE.*` suffix grant.
+    fn graded_names(
+        &mut self,
+        message: &message::Message<'_>,
+        seq: &crate::wire::Seq<'_>,
+        most: usize,
+        (unreadable, malformed): (&str, &str),
+        wants_reply: bool,
+        grade: fn(&str) -> bool,
+    ) -> Result<Option<Vec<String>>, Ended> {
         let Ok(values) = seq.values(most) else {
             self.refuse_if_wanted(
                 message,
@@ -2833,10 +2857,7 @@ impl<'a> Connection<'a> {
         };
         let mut names = Vec::with_capacity(values.len());
         for value in &values {
-            let Some(name) = value
-                .as_str()
-                .filter(|name| crate::name::valid_well_known_name(name))
-            else {
+            let Some(name) = value.as_str().filter(|name| grade(name)) else {
                 self.refuse_if_wanted(
                     message,
                     "org.freedesktop.DBus.Error.InvalidArgs",
@@ -3549,6 +3570,18 @@ fn on_the_jail_object(message: &message::Message<'_>) -> bool {
 
 fn on_the_portal_object(message: &message::Message<'_>) -> bool {
     message.fields.path == Some(PORTAL_PATH)
+}
+
+/// One `Register` owned entry: a well-known name, or a §B.2 `BASE.*` suffix
+/// grant over one (`app_policy::owned_grant`). An exact reserved name is
+/// refused after grading, with its own `Refused` error.
+fn owned_grant(name: &str) -> bool {
+    match name.strip_suffix(".*") {
+        Some(base) => {
+            crate::name::valid_well_known_name(base) && crate::app_policy::owned_grant(name)
+        }
+        None => crate::name::valid_well_known_name(name),
+    }
 }
 
 /// The most bytes in a td application identity.
@@ -9370,6 +9403,76 @@ mod tests {
         assert_eq!(answer.kind, message::MessageType::MethodReturn);
         assert_eq!(answer.fields.reply_serial, Some(7));
         assert_eq!(answer.fields.sender, Some(app_name.as_str()));
+    }
+
+    /// §D's suffix grant: Firefox's profile-derived remote-control name is
+    /// taken under `org.mozilla.firefox.*` and reached by an unconfined
+    /// caller, while the bare base stays outside the suffix grant.
+    #[test]
+    fn a_suffix_grant_takes_and_routes_a_name_under_its_base() {
+        if !pidfd_available() {
+            return;
+        }
+        let remote = "org.mozilla.firefox.ZGVmYXVsdC1yZWxlYXNl";
+        let (bus, free, jailed) = mixed_bus_granting(&["org.mozilla.firefox.*"]);
+        let (mut app, app_name) = Peer::arrive(jailed);
+        let (mut caller, _) = Peer::arrive(free);
+
+        app.send(&request_name("org.mozilla.firefox", 0, 2));
+        let frame = app.answer();
+        let (refusal, _) = message::decode(&frame, 0).expect("decode");
+        assert_eq!(
+            refusal.fields.error_name,
+            Some("org.freedesktop.DBus.Error.AccessDenied"),
+            "the suffix grant covered its own base"
+        );
+
+        app.send(&request_name(remote, 0, 3));
+        assert_eq!(name_code(&app.answer()), (1, Some(3)));
+        assert!(bus.holds(&app_name, remote));
+        let _acquired = app.frame();
+
+        caller.send(&peer_call(remote, 7, "https://example.org/"));
+        let frame = app.frame();
+        let (arrived, _) = message::decode(&frame, 0).expect("decode the call");
+        assert_eq!(arrived.fields.destination, Some(remote));
+    }
+
+    /// `Register` records a suffix grant and refuses one wider than §D admits.
+    #[test]
+    fn registration_admits_only_a_narrow_suffix_grant() {
+        let (mut peer, hear, instances) = registering_peer_watching();
+        peer.send(&jail_call("Register", 2, "ssasas", |writer| {
+            writer.string("fixture")?;
+            writer.string("fixture")?;
+            writer.array("s", |_| Ok(()))?;
+            writer.array("s", |array| array.string("org.mozilla.firefox.*"))
+        }));
+        let frame = peer.frame();
+        let (reply, _) = message::decode(&frame, 0).expect("decode Register's reply");
+        assert_eq!(reply.kind, message::MessageType::MethodReturn);
+        assert_eq!(
+            instances.granted("fixture"),
+            Some(vec!["org.mozilla.firefox.*".to_string()])
+        );
+        for (serial, wide) in [(3, "org.mozilla.*"), (4, "org.freedesktop.impl.*")] {
+            peer.send(&jail_call("Register", serial, "ssasas", |writer| {
+                writer.string("other")?;
+                writer.string("other")?;
+                writer.array("s", |_| Ok(()))?;
+                writer.array("s", |array| array.string(wide))
+            }));
+            let frame = peer.frame();
+            let (reply, _) = message::decode(&frame, 0).expect("decode the refusal");
+            assert_eq!(
+                reply.fields.error_name,
+                Some("org.freedesktop.DBus.Error.InvalidArgs"),
+                "{wide} was recorded"
+            );
+        }
+        assert_eq!(instances.granted("other"), None);
+        drop(peer);
+        let _ = ended(&hear);
     }
 
     /// The grant a registration carried is the grant the registry recorded.

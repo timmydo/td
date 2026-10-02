@@ -1117,15 +1117,23 @@ override file is not launch authority yet; its exact path, ownership and editor
 lifecycle remain a separate landing. The format does not pretend a lexical
 parser performed those filesystem operations.
 
-Session-bus keys are exact well-known names, never unique names or wildcards,
-and their values are the ordered capabilities `see`, `talk` and `own` — an
-`own` entry confers the two below it, which is what `BusAccess::allows`
-states and what the broker implements. Applications cannot own the broker,
-the reserved `org.freedesktop.portal.*` and `org.freedesktop.impl.portal.*`
-names, or the two bare namespace roots. Resource values are bounded positive
-decimal integers. Memory is a byte count capped at
-9,223,372,036,854,767,616, the largest 4096-byte-aligned value below the first
-value the pinned kernel rounds to its unlimited page-counter sentinel, and
+Session-bus keys are exact well-known names, never unique names or general
+wildcards, and their values are the ordered capabilities `see`, `talk` and
+`own` — an `own` entry confers the two below it, which is what
+`BusAccess::allows` states and what the broker implements. The one exception
+is the `own`-only suffix grant `BASE.*`, which covers every well-known name
+one or more components below `BASE` and never `BASE` itself. Its base has at
+least three components and neither equals, lies inside, nor lies above
+`org.freedesktop.DBus`, `org.freedesktop.portal` or
+`org.freedesktop.impl.portal`, so `org.mozilla.firefox.*` is admitted and
+`org.mozilla.*`, `org.freedesktop.impl.*` or `org.freedesktop.DBus.Debug.*`
+is refused; `see` and `talk` take no suffix form. Applications cannot own the
+broker, the reserved `org.freedesktop.portal.*` and
+`org.freedesktop.impl.portal.*` names, or the two bare namespace roots.
+Resource values are bounded positive decimal integers. Memory is a byte
+count capped at 9,223,372,036,854,767,616, the largest 4096-byte-aligned value
+below the first value the pinned kernel rounds to its unlimited page-counter
+sentinel, and
 `pids-max` is a task/TID count capped at the kernel's 4,194,304-task limit.
 `cpu-max` is a quota and period in microseconds, separated by one space. The
 quota is 1,000 through 17,592,186,044,415 and the period is 1,000 through
@@ -1522,7 +1530,8 @@ its canonical manifest, spec and launcher.
 **Dynamic-package admission has now LANDED.** Firefox's recipe binds the exact
 25.08 platform as a marked payload, generates its manifest and launcher, and
 compiles the first td policy: Wayland, shared network, one writable/create
-Downloads grant and the exact bare `org.mozilla.firefox` bus name. X11,
+Downloads grant, the bare `org.mozilla.firefox` bus name and the
+`org.mozilla.firefox.*` suffix grant for its remote-control name. X11,
 blanket devices, development access, audio, printing and smart cards remain
 absent. The runtime-major environment table forces
 `LIBGL_ALWAYS_SOFTWARE=1`; Firefox's own declaration selects Wayland without
@@ -1810,17 +1819,14 @@ For `td-busd`, full Firefox fidelity needs:
   `org.mozilla.firefox.*` and `org.mpris.MediaPlayer2.firefox.*`. The
   MECHANISM and the GRANT are both landed — see §D. `td.Jail1`'s registration
   carries the permission file's `[Session Bus Policy]` `own` entries, and a
-  sandboxed application holds exactly the names they list. What is still owed
-  is the `.*` on BOTH families here, and a first version of this paragraph
-  got that wrong by claiming the bullet was discharged and attributing the
-  residual to MPRIS alone. Session-bus keys are EXACT names, and both starred
-  families carry a suffix the application picks at run time: MPRIS appends a
-  per-instance number, and Firefox's remote-control name appends an encoding
-  of the profile path. Neither can be written in a permission file, so what
-  an `own` entry can express today is the BARE `org.mozilla.firefox` — enough
-  to prove the path end to end, not enough for the two features this bullet
-  is about. Media keys, player integration and remote control need an
-  amendment admitting a suffix form for `own`, not more broker work;
+  sandboxed application holds exactly the names they list. Both starred
+  families carry a suffix the application picks at run time: MPRIS appends
+  a per-instance number, and Firefox's remote-control name appends an
+  encoding of the profile. §B.2's `own`-only `BASE.*` suffix grant now
+  expresses both, and the Firefox
+  package grants `org.mozilla.firefox.*` beside the bare name so that its
+  remote-control name, which `OpenURI` (§E) calls, can be held. MPRIS is
+  not granted; media keys and player integration remain unbuilt;
 - `AddMatch`/`RemoveMatch`, authenticated sender stamping and per-recipient
   broadcast filtering are landed — see §D. Portal, MPRIS, file-manager and
   accessibility delivery now depends on the corresponding service and grant,
@@ -5259,8 +5265,8 @@ the predeclared service list they are deliberately NOT merged with: `services`
 names what an instance may activate on its own listener and `owned` names what
 it may take on the session bus, and a registration that confused the two would
 grant ownership of names an application only meant to answer for. They are
-graded on arrival as well-known names, bounded at 32, and recorded on the
-instance.
+graded on arrival as well-known names or §B.2 suffix grants, bounded at 32,
+and recorded on the instance.
 
 The grant travels with the IDENTITY rather than being looked up when a name is
 asked for. Identity is resolved once at accept and never recomputed, and the
@@ -5270,16 +5276,28 @@ grant the connection still holds, or find a different instance that registered
 the same name in between. One walk answers about one instance and the grant is
 part of that answer.
 
-They are EXACT names. A grant of `org.mozilla.firefox` is not a grant of
-`org.mozilla.firefox.Anything`, which is this file's own rule for session-bus
-keys and is enforced by string equality with no prefix arm to argue through
-later. The cost is stated rather than buried: an application whose names carry
-a runtime-generated suffix cannot express its grant in this file at all, which
-is exactly the MPRIS case §B.3.2 names: the instance suffix on
-`org.mpris.MediaPlayer2.firefox.instance<N>` is chosen by the application at
-startup. Admitting a suffix form
-is an amendment to the key rule above, not a widening of the broker, and it is
-owed before media keys and player integration work.
+They are exact names or the one suffix form §B.2's key rule admits. A grant
+of `org.mozilla.firefox` is not a grant of `org.mozilla.firefox.Anything`; a
+grant of `org.mozilla.firefox.*` is, and is not a grant of the bare base. One
+shared predicate, `app_policy::grant_covers`, decides both owning and
+addressing, and `app_policy::owned_grant` grades a suffix grant wherever one
+is recorded: the deployment table, `Register`'s owned list and the engine's
+permission parser. `may_own` still refuses a reserved name before it consults
+any grant. The form exists for names an application derives at run time.
+Firefox's remote-control name appends an encoding of its profile, and the
+portal's `OpenURI` (§E) hands links to the instance that holds it, so the
+Firefox package grants `org.mozilla.firefox.*`. MPRIS's
+`org.mpris.MediaPlayer2.firefox.instance<N>` is expressible the same way but
+is not granted: media keys and player integration remain unbuilt.
+
+A suffix grant reaches a namespace, and that reach is stated rather than
+implied. Because `own` implies `talk`, the jailed holder may address every
+name under its base, including one an unconfined same-uid process holds,
+and an unconfined process may itself take a name under that base, as it may
+take any unreserved name. Neither is an escape from the jail, but it means a
+name under a suffix grant is not evidence of who holds it: a consumer such as
+the portal's `OpenURI` must resolve the holder and require the broker to place
+it in the granted application before calling it.
 
 **An `own` entry carries the `see` and `talk` it implies.** `BusAccess` is an
 ORDERED capability — `own` allows `talk` allows `see` — so a file that grants

@@ -96,14 +96,14 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// of the identity, so this is a comparison against a fixed set rather than a
 /// lookup that could answer differently twice on one connection.
 ///
-/// EXACT names, never wildcards, and the equality below is the whole rule.
-/// §D says session-bus keys are exact well-known names, so a grant of
-/// `org.example.Thing` is not a grant of `org.example.Thing.Sub`, and there
-/// is no prefix arm here to argue about later. The cost is recorded rather
-/// than hidden: an application whose names carry a runtime-generated suffix —
-/// MPRIS players are the case §B.3.2 names — cannot express its grant in this
-/// file at all, and admitting a suffix form is an amendment to §D rather than
-/// a widening of this function.
+/// A grant is an exact name or §D's one suffix form, `BASE.*`, and
+/// `app_policy::grant_covers` is the whole rule. An exact grant of
+/// `org.example.Thing` is not a grant of `org.example.Thing.Sub`; a suffix
+/// grant covers the names under its base and not the base itself. The suffix
+/// form exists for names an application derives at run time, such as
+/// Firefox's remote-control name, which appends an encoding of its profile.
+/// The deployment grammar (`app_policy::owned_grant`) keeps a suffix base at
+/// three or more components and away from every reserved namespace.
 ///
 /// `Unknown` owns nothing, which needs saying because the arms are no longer
 /// symmetrical: an unprovable peer has no permission file to consult, and the
@@ -124,7 +124,9 @@ pub fn may_own(caller: &Identity, name: &str) -> bool {
     }
     match caller {
         Identity::Unconfined => true,
-        Identity::Jailed { owned, .. } => owned.iter().any(|granted| granted == name),
+        Identity::Jailed { owned, .. } => owned
+            .iter()
+            .any(|granted| crate::app_policy::grant_covers(granted, name)),
         Identity::Unknown(_) | Identity::Launcher => false,
     }
 }
@@ -219,7 +221,11 @@ pub fn may_see(caller: &Identity, own: Option<&str>, target: &str) -> bool {
         // grant, it is a peer the broker could not place at all.
         Identity::Unknown(_) | Identity::Launcher => told_already,
         Identity::Jailed { owned, .. } => {
-            told_already || is_portal_name(target) || owned.iter().any(|granted| granted == target)
+            told_already
+                || is_portal_name(target)
+                || owned
+                    .iter()
+                    .any(|granted| crate::app_policy::grant_covers(granted, target))
         }
     }
 }
@@ -506,7 +512,7 @@ mod tests {
         assert!(!may_own(&firefox, "org.freedesktop.FileManager1"));
     }
 
-    /// EXACT names. A grant is not a namespace.
+    /// An EXACT grant is not a namespace; only §B.2's `BASE.*` form is.
     ///
     /// The suffix case is the one that matters in practice, because it is
     /// what an MPRIS player would need and what a prefix rule would quietly
@@ -526,6 +532,68 @@ mod tests {
             "org.mpris.MediaPlayer2.firefox.instance1",
         ] {
             assert!(!may_own(&firefox, near), "{near} was covered by the grant");
+        }
+    }
+
+    /// §D's suffix form covers the names under its base, for owning and for
+    /// addressing alike, and nothing beside or above it.
+    #[test]
+    fn a_suffix_grant_covers_only_the_names_under_its_base() {
+        let firefox = granted(&["org.mozilla.firefox", "org.mozilla.firefox.*"]);
+        for under in [
+            "org.mozilla.firefox.ZGVmYXVsdC1yZWxlYXNl",
+            "org.mozilla.firefox.a.b",
+        ] {
+            assert!(may_own(&firefox, under), "{under}");
+            assert!(may_talk(&firefox, Some(":1.4"), under), "{under}");
+        }
+        let suffix_only = granted(&["org.mozilla.firefox.*"]);
+        assert!(!may_own(&suffix_only, "org.mozilla.firefox"));
+        assert!(!may_see(&suffix_only, Some(":1.4"), "org.mozilla.firefox"));
+        for outside in [
+            "org.mozilla.firefox.",
+            "org.mozilla.firefoxx.A",
+            "org.mozilla.thunderbird.A",
+            "org.mozilla.A",
+        ] {
+            assert!(!may_own(&suffix_only, outside), "{outside}");
+            assert!(!may_see(&suffix_only, Some(":1.4"), outside), "{outside}");
+        }
+    }
+
+    /// The deployment grammar keeps a suffix base narrow and off every
+    /// reserved namespace, and `may_own` refuses reserved names whatever a
+    /// grant says.
+    #[test]
+    fn suffix_grants_never_reach_a_reserved_or_vendor_wide_namespace() {
+        use crate::app_policy::owned_grant;
+        assert!(owned_grant("org.mozilla.firefox.*"));
+        assert!(owned_grant("org.mozilla.firefox"));
+        for refused in [
+            "org.mozilla.*",
+            "org.*",
+            "*",
+            ".*",
+            "org.freedesktop.*",
+            "org.freedesktop.impl.*",
+            "org.freedesktop.portal.*",
+            "org.freedesktop.portal.Desktop.*",
+            "org.freedesktop.impl.portal.Access.*",
+            "org.freedesktop.DBus.*",
+            "org.freedesktop.DBus.Debug.*",
+            "org.mozilla.firefox.**",
+            "org.mozilla.*.firefox",
+            "org.mozilla.firefox*",
+        ] {
+            assert!(!owned_grant(refused), "{refused}");
+        }
+        let broad = granted(&["org.freedesktop.*"]);
+        for name in [
+            "org.freedesktop.portal.Desktop",
+            "org.freedesktop.impl.portal.Access",
+            "org.freedesktop.DBus",
+        ] {
+            assert!(!may_own(&broad, name), "{name}");
         }
     }
 
