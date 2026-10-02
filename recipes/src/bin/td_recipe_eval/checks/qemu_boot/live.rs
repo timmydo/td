@@ -35,8 +35,10 @@
 //! must bind the volume the image holds and the medium's deployment, activate
 //! the account and host the wizard was given, report a healthy deployment and
 //! flip the compositor's pages, with a fresh machine identity the second
-//! boot keeps. The configured time zone and the session's home are not yet
-//! observed (increment 7).
+//! boot keeps, and each boot's status bar must end its clock in the
+//! configured zone's offset, captured from the display. The offset does not
+//! name the zone; the saved name and the session's home are not yet read
+//! back (increment 7).
 use super::build_iso::{live_medium, LiveMedium};
 use super::install::{
     cold_boots, image_volume_identity, installation_timeout, system_target_capacity, ColdBoots,
@@ -57,6 +59,9 @@ const ZONE_SEEK: &str = "asia/tok";
 const ZONE: &str = "Asia/Tokyo";
 /// What the settings page starts at: the catalog's UTC.
 const DEFAULT_ZONE: &str = "Etc/UTC";
+/// How the installed session's status bar ends its clock in `ZONE`, which
+/// keeps nine hours ahead of UTC all year.
+const ZONE_ON_BAR: &str = " UTC+09:00";
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
@@ -122,6 +127,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         &scratch.dir,
         timeout,
@@ -138,6 +144,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     // The medium is detached: the disk the wizard installed boots alone
     // through firmware, as the account and host it was given.
     let uuid = image_volume_identity(&scratch.dir.join(target_name))?;
+    let zone_on_bar = |pixels: &[u8]| update::bar_ends_with(pixels, ZONE_ON_BAR);
     cold_boots(
         &qemu,
         &Firmware {
@@ -159,6 +166,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 900,
             ),
             label: "qemu-boot-live",
+            screen: Some(ScreenExpect {
+                what: "the status bar's clock in the configured zone",
+                check: &zone_on_bar,
+            }),
         },
     )?;
     println!(
@@ -173,7 +184,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          installer's GPT layout; with the medium detached, the installed disk \
          cold-booted through firmware twice, alone and renamed behind a decoy, \
          as a healthy {USERNAME}@{HOSTNAME} with its volume {uuid} bound, a \
-         fresh machine identity kept across both, and compositor page flips"
+         fresh machine identity kept across both, and compositor page flips, \
+         its status bar's clock ending{ZONE_ON_BAR} for {ZONE}"
     );
     Ok(())
 }
@@ -510,5 +522,22 @@ mod tests {
         assert!(typed("a b").is_err());
         // The zone the seek types finds is the one the review expects.
         assert!(ZONE.to_ascii_lowercase().starts_with(ZONE_SEEK));
+    }
+
+    /// The bar ends its clock in the zone's offset, as the compositor's
+    /// clock writes it from the zone /etc/timezone names.
+    #[test]
+    fn the_bar_shows_the_chosen_zone_as_its_offset() {
+        // Asia/Tokyo has kept UTC+09:00, without daylight saving, since 1951.
+        assert_eq!((ZONE, ZONE_ON_BAR), ("Asia/Tokyo", " UTC+09:00"));
+        let clock = include_str!("../../../../../../td-compositor/src/clock.rs");
+        assert!(clock.contains("\"UTC{sign}{:02}:{:02}\","));
+        assert!(clock.contains(
+            "\"{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {suffix}\""
+        ));
+        let bar = include_str!("../../../../../../td-compositor/src/bar.rs");
+        assert!(
+            bar.contains("Clock::load(Path::new(\"/etc/timezone\"), Path::new(\"/etc/zoneinfo\"))")
+        );
     }
 }

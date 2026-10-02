@@ -921,7 +921,7 @@ pub(super) fn read_capture(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|file| file.take(1280 * 800 * 3 + 128).read_to_end(&mut bytes))
-        .map_err(|e| format!("read prompt capture {}: {e}", path.display()))?;
+        .map_err(|e| format!("read display capture {}: {e}", path.display()))?;
     Ok(bytes)
 }
 
@@ -971,9 +971,10 @@ pub(super) fn row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool>
     Ok(true)
 }
 
-// The attention menu uses the small chrome face; consent uses Unifont.
-// Rows are space, colon, A through Z, then hyphen.
-const MENU_GLYPHS: [[u8; 7]; 29] = [
+// The attention menu and the status bar use the small chrome face; consent
+// uses Unifont. Rows are space, colon, A through Z, hyphen, plus, then 0
+// through 9.
+const MENU_GLYPHS: [[u8; 7]; 40] = [
     [0, 0, 0, 0, 0, 0, 0],
     [0, 4, 4, 0, 4, 4, 0],
     [14, 17, 17, 31, 17, 17, 17],
@@ -1003,7 +1004,34 @@ const MENU_GLYPHS: [[u8; 7]; 29] = [
     [17, 17, 10, 4, 4, 4, 4],
     [31, 1, 2, 4, 8, 16, 31],
     [0, 0, 0, 31, 0, 0, 0],
+    [0, 4, 4, 31, 4, 4, 0],
+    [14, 17, 19, 21, 25, 17, 14],
+    [4, 12, 4, 4, 4, 4, 14],
+    [14, 17, 1, 2, 4, 8, 31],
+    [30, 1, 1, 14, 1, 1, 30],
+    [2, 6, 10, 18, 31, 2, 2],
+    [31, 16, 16, 30, 1, 1, 30],
+    [14, 16, 16, 30, 17, 17, 14],
+    [31, 1, 2, 4, 8, 8, 8],
+    [14, 17, 17, 14, 17, 17, 14],
+    [14, 17, 17, 15, 1, 1, 14],
 ];
+
+/// The chrome face's rows for `character`, top first, five bits each.
+fn chrome_glyph(character: u8) -> Result<&'static [u8; 7]> {
+    let index = match character {
+        b' ' => 0,
+        b':' => 1,
+        b'A'..=b'Z' => usize::from(character - b'A') + 2,
+        b'-' => 28,
+        b'+' => 29,
+        b'0'..=b'9' => usize::from(character - b'0') + 30,
+        _ => return Err("unsupported chrome glyph".into()),
+    };
+    MENU_GLYPHS
+        .get(index)
+        .ok_or_else(|| "missing chrome glyph".to_string())
+}
 
 pub(super) fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<bool> {
     if text.len() > 102 || top > 800 - 14 {
@@ -1014,16 +1042,8 @@ pub(super) fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<
             let on = if let Some(column) = x.checked_sub(24) {
                 match text.as_bytes().get(column / 12) {
                     Some(character) if column % 12 < 10 => {
-                        let index = match character {
-                            b' ' => 0,
-                            b':' => 1,
-                            b'A'..=b'Z' => usize::from(character - b'A') + 2,
-                            b'-' => 28,
-                            _ => return Err("unsupported menu glyph".into()),
-                        };
-                        let bits = MENU_GLYPHS
-                            .get(index)
-                            .and_then(|rows| rows.get(y / 2))
+                        let bits = chrome_glyph(*character)?
+                            .get(y / 2)
                             .ok_or("missing menu glyph row")?;
                         bits & (1 << (4 - column % 12 / 2)) != 0
                     }
@@ -1035,6 +1055,66 @@ pub(super) fn menu_row_matches(pixels: &[u8], top: usize, text: &str) -> Result<
             let expected: &[u8] = if on { &[255, 255, 255] } else { &[24, 32, 40] };
             let offset = ((top + y) * 1280 + x) * 3;
             if pixels.get(offset..offset + 3) != Some(expected) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// The status bar's band, colours and text row (td-compositor/src/bar.rs):
+/// the chrome face doubled, 12 pixels a character, 5 pixels down a 24-pixel
+/// band, ink and background as the compositor's BGRX constants scan out.
+const BAR_HEIGHT: usize = 24;
+const BAR_TEXT_TOP: usize = 5;
+const BAR_INK: [u8; 3] = [0xe0, 0xc8, 0xd0];
+const BAR_BACKGROUND: [u8; 3] = [0x20, 0x14, 0x18];
+
+/// Whether the status bar's line ends with `text`: drawn exactly in its
+/// cells, ending where the bar's last ink is, with nothing after it.
+pub(super) fn bar_ends_with(pixels: &[u8], text: &str) -> Result<bool> {
+    let pixel = |x: usize, y: usize| pixels.get((y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3);
+    if pixels.len() != 1280 * 800 * 3 {
+        return Err("expected a 1280x800 RGB capture".into());
+    }
+    let Some(&last) = text.as_bytes().last() else {
+        return Err("no bar text to find".into());
+    };
+    // The bar's last ink column, which the text's last glyph must end on.
+    let Some(end) = (0..1280usize)
+        .rev()
+        .find(|&x| (0..BAR_HEIGHT).any(|y| pixel(x, y) == Some(&BAR_INK[..])))
+    else {
+        return Ok(false);
+    };
+    let rows = chrome_glyph(last)?;
+    let rightmost = (0..5usize)
+        .rev()
+        .find(|&column| rows.iter().any(|bits| bits & (1 << (4 - column)) != 0))
+        .ok_or("the bar text ends in a blank glyph")?;
+    let Some(start) = end
+        .checked_sub(rightmost * 2 + 1)
+        .and_then(|origin| origin.checked_sub((text.len() - 1) * 12))
+    else {
+        return Ok(false);
+    };
+    for y in 0..BAR_HEIGHT {
+        for x in start..1280 {
+            let column = x - start;
+            let on = match (
+                text.as_bytes().get(column / 12),
+                y.checked_sub(BAR_TEXT_TOP),
+            ) {
+                (Some(character), Some(row)) if column % 12 < 10 && row < 14 => {
+                    let bits = chrome_glyph(*character)?
+                        .get(row / 2)
+                        .ok_or("missing bar glyph row")?;
+                    bits & (1 << (4 - column % 12 / 2)) != 0
+                }
+                _ => false,
+            };
+            let expected = if on { &BAR_INK } else { &BAR_BACKGROUND };
+            if pixel(x, y) != Some(&expected[..]) {
                 return Ok(false);
             }
         }
@@ -1314,6 +1394,96 @@ mod tests {
         let entry = b"P6\n1280 800\n255\n".len() + 456 * 3840;
         bytes[entry..entry + 14 * 3840].fill(0);
         assert!(!menu_matches(&bytes).unwrap());
+    }
+
+    /// Every chrome glyph the oracles draw is the compositor's own.
+    #[test]
+    fn chrome_glyphs_are_the_compositors() {
+        let chrome = include_str!("../../../../../../td-compositor/src/ui.rs");
+        for character in b" :ABCDEFGHIJKLMNOPQRSTUVWXYZ-+0123456789" {
+            let rows = chrome_glyph(*character).unwrap();
+            let line = format!(
+                "b'{}' => [{}],",
+                char::from(*character),
+                rows.map(|row| row.to_string()).join(", ")
+            );
+            assert!(chrome.contains(&line), "{line}");
+        }
+        assert!(chrome_glyph(b'a').is_err());
+        let bar = include_str!("../../../../../../td-compositor/src/bar.rs");
+        for line in [
+            "pub const BAR_HEIGHT: usize = 24;",
+            "const TEXT_TOP: usize = 5;",
+            "const SCALE: usize = 2;",
+            "pub(crate) const BACKGROUND: [u8; 4] = [0x18, 0x14, 0x20, 0];",
+            "pub(crate) const INK: [u8; 4] = [0xd0, 0xc8, 0xe0, 0];",
+            "[net, load, memory, uptime, clock].join(SEPARATOR)",
+            // The band is the screen's top, and the line is drawn in it at
+            // the text row, doubled, in ink, after the cells.
+            "let bar = (0, 0, width, BAR_HEIGHT);",
+            "        text_left,\n        TEXT_TOP,\n        SCALE,\n        text,\n        INK,\n",
+        ] {
+            assert!(bar.contains(line), "{line}");
+        }
+        assert!(chrome.contains("pub(crate) const GLYPH_ADVANCE: usize = 6;"));
+        assert!(chrome.contains("pub(crate) const GLYPH_WIDTH: usize = 5;"));
+    }
+
+    /// The bar's line is matched at its end, exactly, and nowhere else.
+    #[test]
+    fn the_bar_line_is_matched_at_its_end() {
+        let bar = |text: &str, left: usize| {
+            let mut pixels = [24, 32, 40].repeat(1280 * 800);
+            // The compositor's BGRX constants as RGB, written out here
+            // rather than taken from the matcher's own.
+            for y in 0..24 {
+                for x in 0..1280 {
+                    pixels[(y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3]
+                        .copy_from_slice(&[0x20, 0x14, 0x18]);
+                }
+            }
+            for (column, character) in text.bytes().enumerate() {
+                for (row, bits) in chrome_glyph(character).unwrap().iter().enumerate() {
+                    for bit in 0..5 {
+                        if bits & (1 << (4 - bit)) == 0 {
+                            continue;
+                        }
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let x = left + column * 12 + bit * 2 + dx;
+                                let y = 5 + row * 2 + dy;
+                                pixels[(y * 1280 + x) * 3..(y * 1280 + x) * 3 + 3]
+                                    .copy_from_slice(&[0xe0, 0xc8, 0xd0]);
+                            }
+                        }
+                    }
+                }
+            }
+            pixels
+        };
+        let line = "NET ETH0 DOWN  UP 3M  2026-10-02 10:00:00 UTC+09:00";
+        for left in [8, 39, 100] {
+            assert!(bar_ends_with(&bar(line, left), " UTC+09:00").unwrap());
+        }
+        let drawn = bar(line, 8);
+        assert!(!bar_ends_with(&drawn, " UTC+08:00").unwrap());
+        assert!(!bar_ends_with(&drawn, " UTC-09:00").unwrap());
+        assert!(!bar_ends_with(&drawn, "UTC+09:0").unwrap());
+        assert!(!bar_ends_with(&bar("2026-10-02 10:00:00 UTC", 8), " UTC+09:00").unwrap());
+        // Text after it, or a stray pixel beside it, is not this end.
+        assert!(!bar_ends_with(&bar(&format!("{line}0"), 8), " UTC+09:00").unwrap());
+        let mut stray = drawn.clone();
+        let x = 8 + (line.len() - 10) * 12 + 11;
+        stray[(1280 + x) * 3..(1280 + x) * 3 + 3].copy_from_slice(&[0xe0, 0xc8, 0xd0]);
+        assert!(!bar_ends_with(&stray, " UTC+09:00").unwrap());
+        // Nor is a mark of another colour after it, such as a pointer.
+        let mut marked = drawn.clone();
+        marked[(2 * 1280 + 1270) * 3..(2 * 1280 + 1270) * 3 + 3].copy_from_slice(&[255, 0, 0]);
+        assert!(!bar_ends_with(&marked, " UTC+09:00").unwrap());
+        assert!(!bar_ends_with(&[24, 32, 40].repeat(1280 * 800), " UTC+09:00").unwrap());
+        assert!(bar_ends_with(&drawn, "").is_err());
+        assert!(bar_ends_with(&drawn, "utc").is_err());
+        assert!(bar_ends_with(&drawn, "UTC ").is_err());
     }
 
     /// A notice row drawn from the compositor's own chrome glyphs, hyphen

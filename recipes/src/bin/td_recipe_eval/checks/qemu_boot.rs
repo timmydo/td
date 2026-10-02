@@ -661,6 +661,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         runner.scratch_dir(),
     )?;
@@ -715,6 +716,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         runner.scratch_dir(),
     )?;
@@ -849,6 +851,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         runner.scratch_dir(),
     )?;
@@ -1418,6 +1421,7 @@ fn boot_system_once(
             physical_input,
             capture_firefox_audio,
             tpm_socket: None,
+            screen: None,
         },
         scratch,
         boot_timeout(),
@@ -1453,6 +1457,7 @@ fn boot_failed_target_once(
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         scratch,
     )?;
@@ -2667,6 +2672,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         runner.scratch_dir(),
     )?;
@@ -2751,6 +2757,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         runner.scratch_dir(),
     )?;
@@ -2894,6 +2901,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         },
         runner.scratch_dir(),
     )?;
@@ -4448,6 +4456,126 @@ struct BootPlan<'a> {
     capture_firefox_audio: bool,
     /// Private swtpm control socket; never a host TPM passthrough.
     tpm_socket: Option<&'a Path>,
+    /// What the display must come to show once the target marker is seen; a
+    /// marker kill waits for it, and a boot that ends without it fails.
+    screen: Option<ScreenExpect<'a>>,
+}
+
+/// A capture the display must come to show: what it is, and the check of
+/// a 1280x800 capture's RGB pixels.
+#[derive(Clone, Copy)]
+struct ScreenExpect<'a> {
+    what: &'a str,
+    check: &'a dyn Fn(&[u8]) -> Result<bool, String>,
+}
+
+/// How long the display may take to show what a plan expects after its
+/// marker, and how often it is captured meanwhile.
+const SCREEN_TIMEOUT: Duration = Duration::from_secs(120);
+const SCREEN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Captures the display through QMP, once the boot reached its marker,
+/// until the plan's check accepts a capture.
+struct ScreenWatch<'a> {
+    expect: ScreenExpect<'a>,
+    path: PathBuf,
+    capture: PathBuf,
+    qmp: Option<Qmp>,
+    next: Option<Instant>,
+    until: Option<Instant>,
+    seen: bool,
+    /// Why the latest capture could not be judged, if it could not.
+    failed: Option<String>,
+}
+
+impl<'a> ScreenWatch<'a> {
+    fn new(expect: ScreenExpect<'a>, path: PathBuf) -> Self {
+        let capture = path.with_file_name("screen.ppm");
+        Self {
+            expect,
+            path,
+            capture,
+            qmp: None,
+            next: None,
+            until: None,
+            seen: false,
+            failed: None,
+        }
+    }
+
+    /// At most one capture per call, once `target` is seen. A capture that
+    /// fails or differs is retried until the deadline, so a display still
+    /// settling is not yet a failure, and a QEMU that died meanwhile is
+    /// reported by its exit rather than by its socket.
+    fn poll(&mut self, target: bool) -> Result<(), String> {
+        if self.seen || !target {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let until = match self.until {
+            Some(until) => until,
+            None => {
+                let until = now
+                    .checked_add(SCREEN_TIMEOUT)
+                    .ok_or("screen deadline overflow")?;
+                self.until = Some(until);
+                until
+            }
+        };
+        if now >= until {
+            return Err(format!(
+                "the display did not show {} within {}s of the marker{}",
+                self.expect.what,
+                SCREEN_TIMEOUT.as_secs(),
+                self.failure()
+            ));
+        }
+        if self.next.is_some_and(|next| now < next) {
+            return Ok(());
+        }
+        self.next = now.checked_add(SCREEN_INTERVAL);
+        match self.capture_matches(until) {
+            // Only a capture judged within the deadline counts.
+            Ok(matched) => {
+                self.seen = matched && Instant::now() < until;
+                self.failed = None;
+            }
+            Err(error) => {
+                self.qmp = None;
+                self.failed = Some(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// One capture, its QMP I/O bounded by the watch's own deadline.
+    fn capture_matches(&mut self, until: Instant) -> Result<bool, String> {
+        let deadline = qmp_deadline(QMP_IO_TIMEOUT)?.min(until);
+        if self.qmp.is_none() {
+            self.qmp = Some(Qmp::connect_until(&self.path, deadline)?);
+        }
+        let filename = qmp_json_path(&self.capture)?;
+        self.qmp
+            .as_mut()
+            .ok_or("QMP controller disappeared before the screen capture")?
+            .exchange_until(
+                &format!(
+                    "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{filename}}}}}"
+                ),
+                deadline,
+            )
+            .map_err(|error| format!("capture the display: {error}"))?;
+        let capture = update::read_capture(&self.capture)?;
+        (self.expect.check)(update::ppm(&capture)?)
+    }
+
+    /// The latest capture's failure, as a clause, if it failed.
+    fn failure(&self) -> String {
+        self.failed
+            .as_ref()
+            .map(|error| format!("; its last capture failed: {error}"))
+            .unwrap_or_default()
+    }
 }
 
 /// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0 to
@@ -4694,7 +4822,12 @@ fn boot_source(
     // this.)
     let serial = format!("file:{}", console_path.display());
     static QMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let qmp_scratch = if plan.physical_input || matches!(source, BootSource::LiveSetup { .. }) {
+    // QEMU's QMP socket serves one client at a time.
+    let input = plan.physical_input || matches!(source, BootSource::LiveSetup { .. });
+    if input && plan.screen.is_some() {
+        return Err("a screen expectation cannot share QMP with an input controller".into());
+    }
+    let qmp_scratch = if input || plan.screen.is_some() {
         Some(Scratch {
             dir: create_qmp_scratch_dir(&env::temp_dir(), &QMP_SEQ)?,
         })
@@ -4881,6 +5014,10 @@ fn boot_source(
         .clone()
         .filter(|_| plan.physical_input)
         .map(PhysicalInputController::new);
+    let mut screen = plan
+        .screen
+        .zip(qmp_path.clone())
+        .map(|(expect, path)| ScreenWatch::new(expect, path));
     let mut setup_input = match (source, qmp_path) {
         (BootSource::LiveSetup { script, .. }, Some(path)) => {
             let capture = path.with_file_name("attention.ppm");
@@ -4942,7 +5079,19 @@ fn boot_source(
                 }
             }
         }
-        if evidence.target && plan.kill_on_marker {
+        if let Some(watch) = screen.as_mut() {
+            if let Err(error) = watch.poll(evidence.target) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let console = String::from_utf8_lossy(&buf);
+                return Err(format!(
+                    "{error}. Last serial output:\n{}",
+                    tail(&console, 80)
+                ));
+            }
+        }
+        let screen_waits = screen.as_ref().is_some_and(|watch| !watch.seen);
+        if evidence.target && plan.kill_on_marker && !screen_waits {
             let sent = child.kill().is_ok();
             marker_killed = child
                 .wait()
@@ -5051,6 +5200,18 @@ fn boot_source(
     let mut reason = format_end_reason(end, evidence.target);
     if let Some(state) = awaiting {
         reason.push_str(&format!("; the wizard script still awaited {state:?}"));
+    }
+    // A boot that never reached its marker fails on that, not on its display.
+    if let Some(watch) = screen
+        .as_ref()
+        .filter(|watch| !watch.seen && (watch.until.is_some() || evidence.target))
+    {
+        return Err(format!(
+            "{reason}; the display never showed {}{}. Last serial output:\n{}",
+            watch.expect.what,
+            watch.failure(),
+            tail(&console, 80)
+        ));
     }
     if final_flooded || audio_flooded {
         return Err(format!(
@@ -8899,6 +9060,39 @@ mod tests {
         );
     }
 
+    /// Nothing is captured before the marker; a capture that cannot be
+    /// taken is retried, and the deadline then fails naming it.
+    #[test]
+    fn a_screen_watch_retries_until_its_deadline() {
+        let check = |_: &[u8]| -> Result<bool, String> { Ok(true) };
+        let expect = ScreenExpect {
+            what: "the bar",
+            check: &check,
+        };
+        let socket = env::temp_dir()
+            .join(format!("td-screen-watch-{}", std::process::id()))
+            .join("qmp.sock");
+        let mut watch = ScreenWatch::new(expect, socket);
+        watch.poll(false).unwrap();
+        assert!(watch.until.is_none() && watch.next.is_none());
+        watch.poll(true).unwrap();
+        assert!(!watch.seen && watch.until.is_some());
+        assert!(watch
+            .failed
+            .as_deref()
+            .unwrap()
+            .starts_with("connect QMP socket"));
+        watch.until = Some(Instant::now());
+        let error = watch.poll(true).unwrap_err();
+        assert!(
+            error.starts_with(
+                "the display did not show the bar within 120s of the marker; \
+                 its last capture failed: connect QMP socket"
+            ),
+            "{error}"
+        );
+    }
+
     #[test]
     fn qmp_arg_doubles_path_commas_and_keeps_option_separators() {
         assert_eq!(
@@ -12423,6 +12617,7 @@ mod tests {
             physical_input: false,
             capture_firefox_audio: false,
             tpm_socket: None,
+            screen: None,
         };
         let kernel = Path::new("/nonexistent/bzImage");
         let live = BootSource::LiveSetup {

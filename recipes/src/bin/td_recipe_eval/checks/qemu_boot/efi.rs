@@ -48,6 +48,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
                 physical_input: false,
                 capture_firefox_audio: false,
                 tpm_socket: None,
+                screen: None,
             },
             &scratch.dir,
             if present {

@@ -1918,6 +1918,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                     name: &name,
                     timeout,
                     label: "qemu-install-system",
+                    screen: None,
                 },
             )?;
             require_new_installation(&installations, &first, &name)?;
@@ -1983,6 +1984,9 @@ pub(super) struct ColdBoots<'a> {
     pub(super) name: &'a str,
     pub(super) timeout: Duration,
     pub(super) label: &'a str,
+    /// What each boot's display must come to show once it reports success,
+    /// before it is stopped.
+    pub(super) screen: Option<ScreenExpect<'a>>,
 }
 
 /// What an installed disk must boot as: its volume, deployment, account
@@ -2011,6 +2015,7 @@ pub(super) fn cold_boots(
         name,
         timeout,
         label,
+        screen,
     } = *run;
     let mut first: Option<BootResult> = None;
     for count in 1..=2 {
@@ -2027,6 +2032,7 @@ pub(super) fn cold_boots(
         boot_plan.mem = INSTALLED_SYSTEM_MEMORY_MIB;
         // Stock audio supervision needs the emulated sound device.
         boot_plan.audio = true;
+        boot_plan.screen = screen;
         println!("   [{label}] cold system boot {count}, {name} media detached");
         let result = boot_source(
             qemu,
@@ -2400,6 +2406,7 @@ fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
         physical_input: false,
         capture_firefox_audio: false,
         tpm_socket: None,
+        screen: None,
     }
 }
 

@@ -160,9 +160,16 @@ disk: each boot must bind the volume UUID read from the image's own
 superblock and the medium's deployment, activate the wizard's account and
 host (the primary profile and hostname reports), acknowledge a healthy
 deployment and flip the compositor's pages, with a machine-id and host key
-the first boot created and the second found. Observing the configured time
-zone and the session's persistent home in the compositor, and booting the
-medium itself through firmware, are still to be proven (increment 7);
+the first boot created and the second found. Once a boot reports
+success, its display is captured through QMP, at most once a second for
+two minutes and before the boot is stopped, until the status bar's clock
+ends in the configured zone's offset, UTC+09:00 for Asia/Tokyo, in the
+compositor's own glyphs; a boot whose display never shows it fails. The
+offset is what the session observably applied: it does not tell Asia/Tokyo
+from another zone at UTC+09:00, so that the volume saved the chosen name
+rests on the review page and td-install's tests. Reading the saved name
+and the session's persistent home from the installed volume, and booting
+the medium itself through firmware, are still to be proven (increment 7);
 `./test-iso` boots the medium through firmware by hand.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
@@ -1153,8 +1160,9 @@ not discover `/etc/zoneinfo` automatically.
    media, boot that disk through firmware, and observe the configured
    account in the compositor with its settings and persistent home.
    Increment 6 proves the flow and the firmware boots with the account
-   and host reported; this adds booting the ISO through firmware and the
-   compositor-observed settings and home.
+   and host reported and the zone's offset on the compositor's clock;
+   this adds booting the ISO through firmware, the saved zone name and
+   the persistent home.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media
