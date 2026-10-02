@@ -55,7 +55,10 @@ impl LockedRoot {
         })
     }
 }
-fn validate_view(selection: Selection<'_>, view: ViewIdentity) -> Result<(), FormatError> {
+pub(super) fn validate_view(
+    selection: Selection<'_>,
+    view: ViewIdentity,
+) -> Result<(), FormatError> {
     let selected = selection.manifest().header();
     if view.account != selected.account
         || view.epoch != selected.epoch
@@ -119,15 +122,15 @@ impl CompleteActive<'_> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod fixture {
+pub(super) mod fixture {
     use super::*;
     use crate::{
         ids::AccountId,
         store_paths::{AccountEntry, Name},
     };
     use std::{fs, os::unix::fs::PermissionsExt};
-    pub(super) const ACCOUNT: AccountId = AccountId::from_bytes([0x33; 16]);
-    pub(super) fn hex(text: &str) -> Vec<u8> {
+    pub(crate) const ACCOUNT: AccountId = AccountId::from_bytes([0x33; 16]);
+    pub(crate) fn hex(text: &str) -> Vec<u8> {
         let text: String = text.split_whitespace().collect();
         let (pairs, rest) = text.as_bytes().as_chunks::<2>();
         assert!(rest.is_empty());
@@ -136,7 +139,7 @@ mod fixture {
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
-    pub(super) fn journal() -> Vec<u8> {
+    pub(crate) fn journal() -> Vec<u8> {
         let mut bytes = hex(include_str!(
             "../../tests/fixtures/format-v1/active-journal-two.hex"
         ));
@@ -145,14 +148,14 @@ mod fixture {
         )));
         bytes
     }
-    pub(super) fn write(root: &LockedRoot, bytes: &[u8]) {
+    pub(crate) fn write(root: &LockedRoot, bytes: &[u8]) {
         let name = Name::account(ACCOUNT, AccountEntry::Journal(Number::new(2).unwrap())).unwrap();
         let mut buffer = [0; super::super::MAX_PATH_BYTES];
         let path = root.root.directory.join(&name, &mut buffer).unwrap();
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    pub(super) fn append(root: &LockedRoot, bytes: &[u8]) {
+    pub(crate) fn append(root: &LockedRoot, bytes: &[u8]) {
         use std::io::Write;
         let name = Name::account(ACCOUNT, AccountEntry::Journal(Number::new(2).unwrap())).unwrap();
         let mut buffer = [0; super::super::MAX_PATH_BYTES];
@@ -170,7 +173,7 @@ mod fixture {
         manifest: Vec<u8>,
     }
     impl Bytes {
-        pub(super) fn selection(&self) -> Selection<'_> {
+        pub(crate) fn selection(&self) -> Selection<'_> {
             Selection::decode(
                 &td_crypto::Provider,
                 ACCOUNT,
@@ -180,7 +183,7 @@ mod fixture {
             )
             .unwrap()
         }
-        pub(super) fn view(&self, through: u64, length: u64) -> ViewIdentity {
+        pub(crate) fn view(&self, through: u64, length: u64) -> ViewIdentity {
             let selected = self.selection().manifest().header();
             ViewIdentity {
                 account: selected.account,

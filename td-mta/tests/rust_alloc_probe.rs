@@ -19,7 +19,7 @@ use td_crypto::Digest;
 
 // Compile the same filesystem sources with their cfg(test) fixture so the
 // namespace-mapped test identity needs no production root-policy exception.
-use td_mta::{bounded, config, format, ids, ports, store_paths};
+use td_mta::{bounded, config, format, ids, overlay, ports, store_paths};
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
 pub mod measured_store_fs;

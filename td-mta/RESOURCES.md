@@ -624,6 +624,19 @@ reads, admission and premature-finish refusal, checksum mismatch and sticky
 I/O failure at both root bounds. Fixture publication precedes measurement.
 It grants no runtime pin or whole-service memory qualification.
 
+Active-overlay loading reuses the admitted journal arena and Cell array;
+frames exclude the 96-byte header kept on stack. It retains one CompletePrefix,
+borrowed Overlay and ViewIdentity with no additional frame buffer or pool.
+A single 128-read budget covers header and captured payload; each read is at
+most 64 KiB, so a full 4 MiB payload needs 64 full reads plus the header. Short
+reads consume the same budget, and exhaustion returns WouldBlock. Validation
+and in-place sorting are one bounded synchronous work unit, admitted in full
+with deadline checks around it. The existing allocation interval covers empty
+and populated loads, tombstone lookup and byte/slot refusal before and after I/O
+at both root bounds;
+fixture creation and arena/cell preparation precede measurement. This establishes
+primitive allocation behavior, not full-service RSS or runtime pin ownership.
+
 Selection loading uses caller-owned scratch totaling 5032 bytes: FORMAT (80),
 CURRENT (120) and maximum manifest (4832). It retains at most one input File
 at a time in addition to the root and LOCK; opening uses the same transient

@@ -24,6 +24,9 @@ pub use blob::{BlobInput, BlobInputError, CompleteBlob};
 #[path = "store_fs/table.rs"]
 mod table;
 pub use table::{CompleteTable, TableInput, TableInputError};
+#[path = "store_fs/active_overlay.rs"]
+mod active_overlay;
+pub use active_overlay::{LoadedOverlay, OverlayInputError};
 #[path = "store_fs/active.rs"]
 mod active;
 #[path = "store_fs/journal_input.rs"]

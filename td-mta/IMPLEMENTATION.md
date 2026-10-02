@@ -785,8 +785,17 @@ service activation. Each part lands independently:
     Limits::plan checks the 32-byte compiled cell budget. Tests cover independent
     last-write comparison, sequence/ordinal ties, corruption/truncation, full
     operation capacity and scratch reuse; allocation instrumentation covers
-    8192 operations and lookups/refusals. Filesystem prefix loading, checkpoint
-    merge, final reference validation and live pins remain integration work.
+    8192 operations and lookups/refusals.
+  - **M05d8 — active-overlay loading:** implemented selected prefix loading into
+    caller frame/cell arenas, early header binding, one shared 128-read budget
+    and final sequence/offset binding. Refuse impossible cell capacity before I/O;
+    exact per-operation capacity is checked during decode. Classify buffer-size
+    refusal as InvalidInput. Retain the consumed prefix descriptor
+    alongside the borrowed overlay. Tests cover suffix growth, identity and
+    admission refusal, corruption/cut frames, endpoint mismatch and exact read
+    budget/error boundaries; allocation probes cover short/maximum roots.
+    Checkpoint merge, final reference validation and live pins remain integration
+    work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

@@ -973,6 +973,29 @@ that entire work unit and checks its deadline around construction. Failed
 construction may overwrite scratch cells and exposes no partial overlay. After
 byte/cell admission, reuse clears cells before parsing. No whole checkpoint or mailbox map is constructed.
 
+`LockedRoot::load_active_overlay` connects the replay index to private prefix
+input. Before opening, validate the supplied view's selected active identity,
+sequence/offset bounds, explicit admitted byte ceiling, frame capacity, cell
+ceiling and one-cell-per-frame lower bound. Exact cell sufficiency is established
+during decoding; every stored operation needs a slot. All undersized/oversized
+caller buffers return Io(InvalidInput), distinct from malformed journal bytes.
+Read and bind the 96-byte header before any frame bytes. Fill only the captured
+frame extent in the caller arena, sharing at most 128 explicit read attempts
+across header and payload (each at most 64 KiB). Short reads consume attempts;
+errors, exhaustion or an unavailable captured prefix refuse with no returned
+partial overlay. No automatic retry or incomplete-tail repair occurs.
+
+After prefix consumption, require its extent still exists, decode/sort the
+arena, then bind the complete summary to the captured sequence and offset.
+Later suffix appends remain outside the view and do not require physical EOF.
+LoadedOverlay retains the CompletePrefix and supplied ViewIdentity while
+borrowing frame/cell storage; no extra frame arena is allocated. This data does
+not create a runtime pin or validate history_floor. The caller supplies actual
+pin/barrier ownership, stable namespace, admission for the entire bounded
+read/hash/sort operation and deadline checks around it. Blocking std I/O is not
+interruptible by that deadline. Full selected-graph and final-row/reference
+validation remain separate prerequisites to serving.
+
 Read an object from that bounded overlay or its sorted checkpoint table.
 Listings merge a sequential table cursor with sorted overlay entries. Sparse
 key/offset indexes and folder/date/search indexes are disposable disk files

@@ -98,6 +98,7 @@ pub fn run(mut snapshot: impl FnMut()) {
     let repair_update = super::super::input::prepare_repair_probe();
     let recovery_probe = super::super::input::prepare_recovery_probe();
     let mut history_scratch = vec![0; crate::format::MAX_FRAME_BYTES];
+    let mut overlay_cells = [crate::overlay::Cell::EMPTY; 2];
     let mut selection_scratch = super::super::SelectionScratch::new();
     snapshot();
     for fixture in [&short, &long] {
@@ -113,6 +114,12 @@ pub fn run(mut snapshot: impl FnMut()) {
             &fixture.root,
             &active_probe,
             history_scratch.as_mut_slice().try_into().unwrap(),
+        );
+        super::super::active_overlay::probe(
+            &fixture.root,
+            &active_probe,
+            &mut history_scratch,
+            &mut overlay_cells,
         );
         super::super::input::probe_recovery(
             &fixture.root,

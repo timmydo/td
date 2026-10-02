@@ -49,6 +49,8 @@ syncs before confirming the repaired extent. Referenced-blob input now checks
 exact length, streams SHA-256 and requires whole-file EOF and digest equality
 against a supplied row. The supplied-byte replay overlay now validates complete
 frames, sorts bounded descriptors and resolves latest operations/tombstones.
+The active-overlay loader reads a captured private prefix into caller arenas,
+binds its selected header/endpoint and retains the consumed prefix descriptor.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
