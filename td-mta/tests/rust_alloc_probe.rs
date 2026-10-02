@@ -845,6 +845,17 @@ fn store_journal_publication() {
     }
 }
 
+fn store_pinned_reads() {
+    let mut samples = [COUNTERS.snapshot(); 32];
+    let mut slots = samples.iter_mut();
+    measured_store_fs::probe_pinned_reads(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "pinned read scope allocated");
+    }
+}
+
 fn journal_overlay() {
     use td_mta::{
         format::{
@@ -1057,6 +1068,7 @@ fn main() {
         store_verify_account();
         store_reserved_append();
         store_journal_publication();
+        store_pinned_reads();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1135,6 +1147,7 @@ fn main() {
     store_verify_account();
     store_reserved_append();
     store_journal_publication();
+    store_pinned_reads();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

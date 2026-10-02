@@ -1098,6 +1098,13 @@ service activation. Each part lands independently:
     writer; standalone append retains stopped-store exclusion. Runtime pool
     leases and performance, allocation and whole-worker stack qualification
     remain pending.
+  - **M05e3e — pinned-read allocation probe:** implemented sixteen intervals
+    across short/maximum roots and successful queries, append during an old
+    read scope, early/late deadlines, work/scratch refusal and ignored query
+    error. Include selection/replay/file validation, get/next/changes,
+    temporary cleanup and pin disposal; require every Rust allocator counter
+    unchanged. Fixtures, arena creation and session startup/teardown stay cold.
+    Small fixtures do not qualify maximum data, native allocation or worker RSS.
   - **M05e3 — committed visibility:** runtime integration remains pending.
     Connect scoped queries to admitted scratch-pool leases; retain
     generation/history ownership across live checkpoint and retention changes.

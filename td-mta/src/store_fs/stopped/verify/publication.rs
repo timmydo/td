@@ -363,7 +363,7 @@ impl<'r, 'a> JournalSession<'r, 'a> {
 }
 
 #[cfg(test)]
-pub use tests::probe as probe_journal_publication;
+pub use tests::{probe as probe_journal_publication, probe_reads as probe_pinned_reads};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -590,6 +590,193 @@ mod tests {
             }
         }
     }
+    #[derive(Clone, Copy)]
+    enum ReadProbeCase {
+        Queries,
+        Append,
+        InitialDeadline,
+        OverlayDeadline,
+        CallbackDeadline,
+        WorkLimit,
+        ShortScratch,
+        IgnoredError,
+    }
+    struct ReadProbeClock {
+        inner: TestClock,
+        expired: std::sync::atomic::AtomicBool,
+    }
+    impl Clock for ReadProbeClock {
+        fn sample(&self) -> Result<Time, PolicyError> {
+            if self.expired.load(Ordering::Relaxed) {
+                Ok(Time {
+                    utc_ms: 123,
+                    monotonic: Tick(100),
+                })
+            } else {
+                self.inner.sample()
+            }
+        }
+    }
+    /// Measure complete scoped reads, including preparation and temporary disposal.
+    pub fn probe_reads(mut snapshot: impl FnMut()) {
+        use super::super::{
+            super::super::tests::Fixture,
+            tests::{owned_fixture_with, Scratch},
+        };
+        for maximum in [false, true] {
+            for case in [
+                ReadProbeCase::Queries,
+                ReadProbeCase::Append,
+                ReadProbeCase::InitialDeadline,
+                ReadProbeCase::OverlayDeadline,
+                ReadProbeCase::CallbackDeadline,
+                ReadProbeCase::WorkLimit,
+                ReadProbeCase::ShortScratch,
+                ReadProbeCase::IgnoredError,
+            ] {
+                let fixture = if maximum {
+                    Fixture::maximum_root()
+                } else {
+                    Fixture::new()
+                };
+                let (_dir, verified, mut startup) = owned_fixture_with(fixture);
+                let mut scratch = Scratch::new();
+                let successor = frame(3);
+                let captured_frame = frame(2);
+                let good = TestClock::new(u64::MAX);
+                let clock = ReadProbeClock {
+                    inner: TestClock::new(match case {
+                        ReadProbeCase::InitialDeadline => 0,
+                        ReadProbeCase::OverlayDeadline => 3,
+                        _ => u64::MAX,
+                    }),
+                    expired: std::sync::atomic::AtomicBool::new(false),
+                };
+                with_ledger(|ledger| {
+                    verified
+                        .with_journal(
+                            &Provider,
+                            &good,
+                            ledger,
+                            start(),
+                            startup.journal(),
+                            |session, _| {
+                                snapshot();
+                                let mut old = session.capture().unwrap();
+                                let mut request = read_request();
+                                if matches!(case, ReadProbeCase::WorkLimit) {
+                                    request.query.limits.steps = 0;
+                                }
+                                let mut buffers = scratch.read();
+                                if matches!(case, ReadProbeCase::ShortScratch) {
+                                    buffers.frames = &mut [];
+                                }
+                                let result = old.with_read_view(
+                                    &Provider,
+                                    &clock,
+                                    request,
+                                    buffers,
+                                    |view| {
+                                        if matches!(case, ReadProbeCase::Append) {
+                                            assert_eq!(
+                                                session
+                                                    .commit(
+                                                        &Provider,
+                                                        &good,
+                                                        deadline(),
+                                                        &successor,
+                                                        budget()
+                                                    )
+                                                    .unwrap()
+                                                    .committed_sequence
+                                                    .number(),
+                                                3
+                                            );
+                                        }
+                                        if matches!(case, ReadProbeCase::IgnoredError) {
+                                            assert_eq!(
+                                                view.next_change(
+                                                    read_request().query.after,
+                                                    format::ObjectType::Mailbox
+                                                ),
+                                                Err(PolicyError::Invalid)
+                                            );
+                                            return Ok(0);
+                                        }
+                                        let through = inspect_reader(view)?;
+                                        if matches!(case, ReadProbeCase::CallbackDeadline) {
+                                            clock.expired.store(true, Ordering::Relaxed);
+                                        }
+                                        Ok(through)
+                                    },
+                                );
+                                match case {
+                                    ReadProbeCase::Queries | ReadProbeCase::Append => {
+                                        assert_eq!(result.unwrap(), 2)
+                                    }
+                                    ReadProbeCase::InitialDeadline
+                                    | ReadProbeCase::OverlayDeadline
+                                    | ReadProbeCase::CallbackDeadline => assert!(matches!(
+                                        result,
+                                        Err(PinnedReadError::Policy(PolicyError::Deadline))
+                                    )),
+                                    ReadProbeCase::WorkLimit => assert!(matches!(
+                                        result,
+                                        Err(PinnedReadError::Policy(PolicyError::Capacity))
+                                    )),
+                                    ReadProbeCase::ShortScratch => {
+                                        assert!(matches!(result, Err(PinnedReadError::Overlay(_))))
+                                    }
+                                    ReadProbeCase::IgnoredError => assert!(matches!(
+                                        result,
+                                        Err(PinnedReadError::Policy(PolicyError::Invalid))
+                                    )),
+                                }
+                                if matches!(case, ReadProbeCase::OverlayDeadline) {
+                                    assert_eq!(clock.inner.calls.load(Ordering::Relaxed), 4);
+                                    assert_eq!(
+                                        scratch.read().frames.get(..captured_frame.len()),
+                                        Some(captured_frame.as_slice())
+                                    );
+                                }
+                                assert_eq!(
+                                    old.with_read_view(
+                                        &Provider,
+                                        &good,
+                                        read_request(),
+                                        scratch.read(),
+                                        inspect_reader
+                                    )
+                                    .unwrap(),
+                                    2
+                                );
+                                let mut new = session.capture().unwrap();
+                                assert_eq!(
+                                    new.with_read_view(
+                                        &Provider,
+                                        &good,
+                                        read_request(),
+                                        scratch.read(),
+                                        inspect_reader
+                                    )
+                                    .unwrap(),
+                                    if matches!(case, ReadProbeCase::Append) {
+                                        3
+                                    } else {
+                                        2
+                                    }
+                                );
+                                drop(new);
+                                drop(old);
+                                snapshot();
+                            },
+                        )
+                        .unwrap();
+                });
+            }
+        }
+    }
+
     fn read_request() -> PinnedReadRequest {
         let limits = super::super::tests::limits();
         PinnedReadRequest {

@@ -286,7 +286,7 @@ still account for those costs and concurrent owners within the ledger.
   allocator counters unchanged, including frees. This does not qualify
   maximum datasets, concurrent worker stacks, native allocation, session
   startup or whole-service RSS. Runtime read scratch-pool leasing remains
-  pending; query scopes below require their own allocation qualification.
+  pending; query scopes are qualified separately below.
 
   Pinned query preparation borrows one captured pin exclusively and reuses
   caller selection, replay frame/cell, record and change partitions. Its
@@ -296,9 +296,22 @@ still account for those costs and concurrent owners within the ledger.
   record/change scratch, then lends ValidationView (the existing 4 KiB state
   bound) only within a callback. No second recovery-frame arena or heap-owned
   reader is created. File validation and full-table row scans repeat per scope
-  and query respectively; this is a bounded fallback. Actual pool admission,
-  the complete preparation/query stack and allocation behavior need separate
-  qualification. No per-pin heap, new worker or additional arena is admitted.
+  and query respectively; this is a bounded fallback. Actual pool admission
+  and the complete preparation/query stack still need qualification. No
+  per-pin heap, new worker or additional arena is admitted.
+
+  The Rust allocation probe measures complete pinned read scopes in sixteen
+  intervals at short and maximum roots. Cases cover successful get/next/change
+  reads, an append during an old reader callback, deadlines before preparation,
+  after overlay loading or at callback completion, work/scratch refusal and
+  ignored query errors. Each interval also retries the old pin and queries a
+  fresh pin, then drops both. Selection loading, captured-prefix replay,
+  table/history validation, query I/O and temporary disposal run inside
+  measurement. Fixtures, buffer allocation, owned verification, session startup
+  and owner teardown remain cold. Every counter, including frees and peak,
+  must remain unchanged. These small empty-final-state and short-history
+  fixtures do not qualify maximum data, native allocation, worker stacks or
+  whole-service RSS.
 
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
