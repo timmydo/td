@@ -184,6 +184,12 @@ still account for those costs and concurrent owners within the ledger.
   sweep, can create additional stack temporaries; whole-worker stack
   qualification remains pending. It transfers the existing record buffer from
   table to history work and returns the existing change slots, adding no arena.
+  ReservedAppend adds an exclusive borrow of the existing WriterLedger and one
+  existing append ticket; the combined state fits 2 KiB. ReconciledAppend retains
+  only the durable evidence and fits 1 KiB. The guard allocates no
+  ledger, arena or reservation cells. Caller-owned fixed quota/slot backing is
+  reused, with full charges retained on abandonment until recovery. Production
+  stack/allocation qualification remains pending for this composed append path.
   JournalAppend and SyncedAppend each fit 1 KiB of Provider state. An append
   borrows the existing immutable transaction-frame buffer until finish/drop and
   keeps one writable descriptor after comparing it to the consumed scan's

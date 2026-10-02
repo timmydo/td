@@ -14,6 +14,10 @@ use std::{
     os::unix::fs::FileExt,
 };
 
+#[path = "append/reserved.rs"]
+mod reserved;
+pub use reserved::{ReconciledAppend, ReservedAppend, ReservedAppendError};
+
 const MAX_WRITE_CALLS: usize = 64;
 #[derive(Debug)]
 pub enum AppendError {
@@ -322,7 +326,7 @@ mod tests {
         store_paths::{AccountEntry, Name, Number},
     };
     use td_crypto::Provider;
-    fn setup() -> (Fixture, LockedRoot, ProbeBytes) {
+    pub(super) fn setup() -> (Fixture, LockedRoot, ProbeBytes) {
         let dir = Fixture::new();
         let root = dir.locked();
         root.create_accounts_directory().unwrap();
@@ -342,7 +346,7 @@ mod tests {
         fixture::write(&root, &fixture::journal());
         (dir, root, bytes)
     }
-    fn scan<'r>(root: &'r LockedRoot, bytes: &ProbeBytes) -> ScannedJournal<'r> {
+    pub(super) fn scan<'r>(root: &'r LockedRoot, bytes: &ProbeBytes) -> ScannedJournal<'r> {
         let mut scratch: Box<[u8; MAX_FRAME_BYTES]> = vec![0; MAX_FRAME_BYTES]
             .into_boxed_slice()
             .try_into()
@@ -358,7 +362,7 @@ mod tests {
         while input.next_frame().unwrap().is_some() {}
         input.finish().unwrap()
     }
-    fn next(sequence: u64) -> Vec<u8> {
+    pub(super) fn next(sequence: u64) -> Vec<u8> {
         let mut frame = fixture::journal()[96..].to_vec();
         format::frame::seal(&Provider, Sequence::from_u64(sequence), 2, &mut frame).unwrap();
         frame
@@ -394,7 +398,7 @@ mod tests {
         assert_eq!(recovered.summary().through(), complete.through());
         assert!(!recovered.has_incomplete_tail());
     }
-    struct Faults {
+    pub(super) struct Faults {
         mode: u8,
         writes: usize,
         syncs: usize,
@@ -402,7 +406,7 @@ mod tests {
         reads: usize,
     }
     impl Faults {
-        fn new(mode: u8) -> Self {
+        pub(super) fn new(mode: u8) -> Self {
             Self {
                 mode,
                 writes: 0,
@@ -593,7 +597,7 @@ mod tests {
             assert_eq!(std::fs::read(path).unwrap(), original);
         }
     }
-    fn many(sequence: u64, count: usize, large: bool) -> Vec<u8> {
+    pub(super) fn many(sequence: u64, count: usize, large: bool) -> Vec<u8> {
         use crate::format::{
             operation::Operation,
             row::{MailboxRow, Row, MAX_MAILBOX_NAME},

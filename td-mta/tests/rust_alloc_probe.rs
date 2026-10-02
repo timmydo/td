@@ -20,8 +20,12 @@ use td_crypto::Digest;
 // Compile filesystem and checker sources with their cfg(test) fixtures.
 // Filesystem fixtures need no production exception for the mapped test identity.
 use td_mta::{
-    bounded, change_cursor, config, format, frame_changes, ids, merge, overlay, ports, store_paths,
+    bounded, change_cursor, config, format, frame_changes, ids, limits, merge, overlay, ownership,
+    ports, store_paths,
 };
+#[path = "../src/admission.rs"]
+#[allow(unused)] // Keep the private append guard in this measured source compilation.
+mod admission;
 #[path = "../src/row_references.rs"]
 #[allow(unused)]
 mod measured_row_references;

@@ -1043,10 +1043,15 @@ service activation. Each part lands independently:
     uncertain effects for recovery. Tests cover partial writes, sync/confirmation
     faults, pre-write refusal, premature finish, replay, large frames and caps.
     Runtime reservations, final transaction policy and visibility remain external.
-  - **M05e2 — append admission integration:** planned; bind the existing writer
-    ledger's exact frame ticket to append ownership and every terminal outcome.
-    Preserve pending charges and stop admission on uncertainty or abandonment;
-    never convert a write/sync error into proof that nothing was written.
+  - **M05e2 — append admission integration:** implemented the reservation-bound
+    adapter using the existing writer ledger and exact frame ticket. Check prior
+    journal counters and actual frame bounds before any write. Hold the ledger
+    exclusively, stop admission and retain busy charges on uncertainty or drop,
+    and reconcile actual durable frame bytes/operations before returning evidence.
+    Tests cover conservative-to-actual accounting, independent reservations,
+    constructor refusal, every append fault, every abandonment phase and failed
+    bookkeeping. Account/generation ownership, work/deadline orchestration and
+    final mutation policy remain caller responsibilities.
   - **M05e3 — committed visibility:** planned; publish sequence and byte offset
     together only after durable append and reservation reconciliation, retaining
     selected-generation ownership for readers. Add crash/fault ordering oracles

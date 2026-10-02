@@ -352,6 +352,19 @@ impl<'a> WriterLedger<'a> {
             actual,
         })
     }
+    pub(crate) fn guard_append<'b>(
+        &'b mut self,
+        frame: FrameId,
+        actual: FrameBudget,
+        now: Tick,
+    ) -> Result<GuardedAppend<'b, 'a>, Error> {
+        let ticket = self.begin_append(frame, actual, now)?;
+        Ok(GuardedAppend {
+            ledger: self,
+            ticket,
+            complete: false,
+        })
+    }
     pub fn complete_append(
         &mut self,
         ticket: &mut AppendTicket,
@@ -398,6 +411,32 @@ impl<'a> WriterLedger<'a> {
         })
     }
 }
+/// Private adapter capability; uncertainty and abandonment preserve busy charges.
+pub(crate) struct GuardedAppend<'b, 'a> {
+    ledger: &'b mut WriterLedger<'a>,
+    ticket: AppendTicket,
+    complete: bool,
+}
+impl GuardedAppend<'_, '_> {
+    pub(crate) fn stop(&mut self) {
+        self.ledger.phase = Phase::Stopped;
+    }
+    /// The filesystem adapter supplies durable whole-frame evidence before this call.
+    pub(crate) fn synced(mut self) -> Result<(), Error> {
+        self.ledger
+            .complete_append(&mut self.ticket, AppendResult::Synced)?;
+        self.complete = true;
+        Ok(())
+    }
+}
+impl Drop for GuardedAppend<'_, '_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.stop();
+        }
+    }
+}
+
 fn ordinary(charges: &Charges) -> Result<(), Error> {
     if charges.iter().any(|c| {
         matches!(
@@ -601,6 +640,32 @@ mod tests {
             }
         }
         Err(Error::Busy)
+    }
+    #[test]
+    fn guarded_completion_error_stops_admission_and_preserves_pending(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let p = plan()?;
+        let mut states = [const { SlotState::EMPTY }; 8];
+        let mut cells = [const { Cell::EMPTY }; 8];
+        let mut ledger = WriterLedger::new(&p, 1232, recovered(160, 2)?, &mut states, &mut cells)?;
+        let job = grant(&mut ledger, &[], Some(FrameBudget::new(1000, 4)?))?;
+        let mut guard = ledger.guard_append(
+            job.frame().ok_or(Error::Invalid)?,
+            FrameBudget::new(160, 2)?,
+            Tick(2),
+        )?;
+        // Simulate inconsistent completion bookkeeping after durable physical I/O.
+        guard.ticket.actual = FrameBudget::new(1000, 4)?;
+        assert!(guard.synced().is_err());
+        assert_eq!(ledger.phase(), Phase::Stopped);
+        assert_eq!(ledger.used(Kind::ActiveJournalBytes)?, 160);
+        assert_eq!(ledger.pending(Kind::ActiveJournalBytes)?, 1000);
+        assert_eq!(ledger.pending(Kind::ActiveJournalOperations)?, 4);
+        assert_eq!(
+            ledger.cancel(job),
+            Err(Error::Logical(logical::Error::Busy))
+        );
+        Ok(())
     }
     #[test]
     fn ordinary_extension_respects_quota_deadline_frame_and_writer_state(

@@ -821,6 +821,17 @@ Only consuming complete finish yields SyncedAppend endpoint/count evidence.
 Caller reservations, writer serialization, graph policy, deadline/work checks,
 atomic visibility and acknowledgment remain external. No writable handle escapes.
 
+`ScannedJournal::append_reserved` binds that physical append to the existing
+WriterLedger's exact frame ticket after checking prior journal counts. The caller
+supplies the correct account ledger and stopped-store exclusion (no live readers
+or writers) through completion. ReservedAppend holds an exclusive ledger borrow;
+step errors and unfinished drop stop admission
+and preserve busy charges. Successful finish first obtains durable evidence, then
+reconciles actual frame bytes/operations before returning ReconciledAppend, whose
+durable evidence is accessible by shared reference only. Constructor refusal
+starts no new effect; bookkeeping refusal after durable I/O is uncertain and
+stops admission. Runtime publication and client acknowledgment remain external.
+
 `StoppedStore::capture_journal` wraps a bounded stopped scan using caller frame
 scratch and a physical byte ceiling. Advances yield scalar frame progress or
 provisional End; finish verifies EOF and returns CapturedJournal with a derived

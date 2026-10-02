@@ -53,10 +53,15 @@ macro_rules! settings {
     };
 }
 
+#[path = "admission/logical.rs"]
 pub mod logical;
+#[path = "admission/quota.rs"]
 pub mod quota;
+#[path = "admission/timers.rs"]
 pub mod timers;
+#[path = "admission/work.rs"]
 pub mod work;
+#[path = "admission/writer.rs"]
 pub mod writer;
 
 settings! { DiskLimits {

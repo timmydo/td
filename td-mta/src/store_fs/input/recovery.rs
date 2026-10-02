@@ -19,7 +19,10 @@ use std::io;
 
 #[path = "recovery/append.rs"]
 mod append;
-pub use append::{AppendError, AppendStep, JournalAppend, SyncedAppend};
+pub use append::{
+    AppendError, AppendStep, JournalAppend, ReconciledAppend, ReservedAppend, ReservedAppendError,
+    SyncedAppend,
+};
 
 #[path = "recovery/repair.rs"]
 mod repair;
