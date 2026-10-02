@@ -687,6 +687,15 @@ service activation. Each part lands independently:
       uses the data-root owner as its trusted expected service identity.
       Configuration replacement during reload may refuse/retry; no hostile
       namespace writer or effective-UID verification claim.
+      - **M05b2d1 — selected-store inputs:** implemented a typed private-file
+        reader for FORMAT, CURRENT, tables, manifests, journals and blobs.
+        Enforce private ancestor/file policy, identity and byte ceilings;
+        bound each caller-buffer read, retire errors, require full extent and
+        observed physical EOF for completion. Tests cover truncated/growing
+        files, stale size, partial/failed reads, roles, modes, links and limits;
+        the allocation interval covers success and refusal/error paths.
+        Parser/digest/selection binding remains M05d. Operator-config/secrets
+        loading and concurrent active-journal prefix reads remain separate.
     - **M05b2e — recovery evidence:** local temporary-folder process tests
       exercise the common std API on the host. XFS deployment crash/power-loss
       qualification is release evidence; no xfsprogs prerequisite for ordinary

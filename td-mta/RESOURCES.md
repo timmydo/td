@@ -597,6 +597,15 @@ or filesystem adapter code changes. This does not measure kernel page cache,
 native-library allocations, directory enumeration or the whole service RSS.
 Admission integration remains required before activation.
 
+Each StoreReader/CompleteFile owns one File and generated Name, scalar extent
+(and reader progress/failure fields), plus the existing LOCK borrow. Opening
+uses fixed path buffers and transient parent handles. Reads use caller slices
+and return after one explicit operation of at most 64 KiB. Completion adds a
+length query and a one-byte EOF probe. The same allocation interval exercises
+complete reads, random reads, ceiling/role refusal, injected read errors, early
+EOF and completion-probe failure at both root bounds. No per-file heap buffer,
+new allocator hook or runtime pool is introduced.
+
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 

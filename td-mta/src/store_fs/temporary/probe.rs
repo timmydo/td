@@ -85,6 +85,7 @@ pub fn run(mut snapshot: impl FnMut()) {
     snapshot();
     for fixture in [&short, &long] {
         super::current::probe(&fixture.root, fixture.account);
+        super::super::input::probe(&fixture.root, fixture.account);
         super::publication::probe(&fixture.root, fixture.account);
         assert!(
             matches!(fixture.root.create_accounts_directory(), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)

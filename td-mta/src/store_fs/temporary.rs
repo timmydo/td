@@ -149,7 +149,12 @@ impl SyncedTemporary<'_> {
     }
 }
 
-fn read_extent(file: &File, length: u64, offset: u64, output: &mut [u8]) -> io::Result<usize> {
+pub(super) fn read_extent(
+    file: &File,
+    length: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> io::Result<usize> {
     let remaining = length
         .checked_sub(offset)
         .ok_or(io::ErrorKind::InvalidInput)?;

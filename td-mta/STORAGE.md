@@ -319,6 +319,44 @@ even if temporary cleanup fails, but this low-level call still returns an error.
 Recovery must reconcile orphan links before reuse; a caller cannot replay the
 mutation or release charges by interpreting only the underlying I/O error kind.
 
+### Bounded private store inputs
+
+`LockedRoot::open_format` and `open_account_file` admit typed read-only names.
+Account roles are limited to CURRENT, tables, manifests, journals and blobs;
+directories, LOCK and temporary output refuse before I/O. The caller authorizes
+the account, pins the selected file/generation and charges read work. FORMAT is
+capped at its 80-byte container; account files take an explicit byte ceiling
+no larger than i64::MAX. These are I/O limits, not proof of valid format.
+
+Check every private ancestor, then non-following file metadata: regular type,
+data-root owner, exact mode 0600, one hard link and length within the ceiling.
+Open read-only, repeat file policy and compare device/inode and length. Retain
+that File and the LOCK borrow; no raw handle, cloning or writes are exposed.
+The trusted stable-namespace contract still applies. A file with an extra orphan
+link must be reconciled before selected-store reading; input does not repair it.
+
+StoreReader reads sequentially into caller slices, at most one explicit read
+and 64 KiB per call. Empty slices return zero without establishing EOF. Any
+actual read error, zero before the recorded end or impossible read count retires
+the reader; subsequent calls return BrokenPipe. A short read advances by only
+its confirmed bytes, and the caller returns to its work/deadline meter between
+calls. This does not interrupt a blocking std operation.
+
+Consuming `finish` requires every recorded byte to have been returned, unchanged
+file length and a successful one-byte physical EOF probe. Incomplete consumption,
+truncation, growth or a failed probe yields no completion. Success returns a
+CompleteFile retaining the descriptor, name, length and LOCK borrow, with the
+same bounded random-read API as completed output. It proves extent consumption
+and observed EOF only: the caller must feed the exact bytes to the format/hash
+verifiers and check their summaries against selection metadata. It proves no
+current pathname binding, read-view pin, parser validity or authorization.
+
+Use this completion path for quiescent recovery or pinned immutable files.
+Reading a concurrently growing active journal through a committed prefix needs
+a separate prefix-bound adapter; full physical EOF is not that prefix. Secret
+and operator-config files also retain their separate SCHEMA.md policy and loader
+work. No public config-check/service readiness is granted by this store reader.
+
 ### Expected CURRENT replacement
 
 `CurrentUpdate::prepare` encodes a next CURRENT and either expected absence or

@@ -9,6 +9,9 @@ use std::{
 
 #[path = "store_fs/create_directory.rs"]
 mod create_directory;
+#[path = "store_fs/input.rs"]
+mod input;
+pub use input::{CompleteFile, StoreReader};
 #[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{
