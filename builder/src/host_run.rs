@@ -1,6 +1,7 @@
-//! `td-builder host-run NAME [ARG...]` — the checkout's td-news or td-mail on
-//! this host, unjailed, with the fetch service it needs served for it. The
-//! repository-root `./news` and `./mail` entry scripts exec this.
+//! `td-builder host-run NAME [ARG...]` — the checkout's td-news, td-mail or
+//! td-agent on this host, unjailed, with the fetch service it needs served for
+//! it. The repository-root `./news`, `./mail` and `./agent` entry scripts exec
+//! this.
 //!
 //! A development fixture, not host mode's jail (APPLICATIONS.md §X.7): the
 //! application runs as the caller under the session's Wayland display, and
@@ -26,6 +27,7 @@ fn crate_of(name: &str) -> Option<&'static str> {
     match name {
         "news" => Some("td-news"),
         "mail" => Some("td-mail"),
+        "agent" => Some("td-agent"),
         _ => None,
     }
 }
@@ -37,8 +39,8 @@ fn checkout(root: &Path, crate_dir: &str) -> Result<(), String> {
     for dir in ["net", crate_dir] {
         if !root.join(dir).join("Cargo.toml").is_file() {
             return Err(format!(
-                "{} is not the td checkout ({dir}/Cargo.toml is not under it): run ./news or \
-                 ./mail from the repository root",
+                "{} is not the td checkout ({dir}/Cargo.toml is not under it): run ./news, \
+                 ./mail or ./agent from the repository root",
                 root.display()
             ));
         }
@@ -222,11 +224,11 @@ fn launch(root: &Path, name: &str, args: &[String]) -> Result<Infallible, String
 /// `args` are the verb's own: the name, then the application's arguments.
 pub(crate) fn run(args: &[String]) -> ExitCode {
     let Some(name) = args.first().map(String::as_str) else {
-        eprintln!("usage: td-builder host-run news|mail [ARG...]");
+        eprintln!("usage: td-builder host-run news|mail|agent [ARG...]");
         return ExitCode::from(2);
     };
     if crate_of(name).is_none() {
-        eprintln!("usage: td-builder host-run news|mail [ARG...]");
+        eprintln!("usage: td-builder host-run news|mail|agent [ARG...]");
         return ExitCode::from(2);
     }
     let root = match std::env::current_dir() {
@@ -265,10 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn the_names_are_the_two_applications() {
+    fn the_names_are_the_three_applications() {
         assert_eq!(crate_of("news"), Some("td-news"));
         assert_eq!(crate_of("mail"), Some("td-mail"));
+        assert_eq!(crate_of("agent"), Some("td-agent"));
         assert_eq!(crate_of("td-news"), None);
+        assert_eq!(crate_of("td-agent"), None);
         assert_eq!(crate_of(""), None);
     }
 

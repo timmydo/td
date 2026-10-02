@@ -1,48 +1,96 @@
-//! td-agent: td's agent harness (DESIGN.md).
-//!
-//! The crate is `std` and td-ui. Two modules, `json` and `toml`, are td's
-//! shared std modules, copied whole from td-news and never edited here;
-//! `tests/shared_modules.rs` holds them byte-identical to td-news's. What
-//! td-agent does not call of them stays, allowed on its `mod` line rather
-//! than trimmed: a binary crate exports nothing, so `dead_code` fires here
-//! and not in the module's own crate. `td_fetch`, the third, joins with the
-//! model client that first calls it (DESIGN.md §18, increment 5).
-//!
-//! `unsafe` is forbidden for the whole crate (DESIGN.md §2).
+//! td-agent's program: the window process by default, and a conversation
+//! process when the window starts one (DESIGN.md §2).
 
 #![forbid(unsafe_code)]
 
-#[allow(dead_code)]
-mod json;
-// td-news lints only its shipped targets; td-agent lints its tests too
-// (`clippy-all-targets`), and the module's own tests unwrap and index as
-// test code may. Its production code is still linted in the binary.
-#[allow(dead_code)]
-#[cfg_attr(
-    test,
-    allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)
-)]
-mod toml;
-
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: td-agent [--help]\n\
+use td_agent::store::{Id, Role, StateDir};
+
+const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
+\x20      td-agent --help\n\
 \n\
-td-agent is td's agent harness. This build carries its crate and gate\n\
-only: the window, the conversation processes and the store land next\n\
-(td-agent/DESIGN.md §18, increment 4).\n";
+td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
+conversations, the orchestrator first, beside the open one. There is no\n\
+model yet: a message is logged and shown, and its turn ends \"no model\".\n\
+\n\
+Keys: C-Return sends the composer (Return is a newline); C-n starts a\n\
+conversation; C-PageUp and C-PageDown open the one above or below; F6\n\
+and S-F6 move the focus between the list, the transcript and the\n\
+composer. The control socket speaks td-ui's driven protocol.\n\
+\n\
+State: $XDG_STATE_HOME/td-agent. Configuration:\n\
+$XDG_CONFIG_HOME/td-agent/config (TOML; unknown keys are refused).\n";
+
+/// `td-agent conversation ID --state-dir DIR [--create ROLE]`: the
+/// window starts these; a person does not.
+fn conversation(args: &[String]) -> Result<(), String> {
+    let usage = "usage: td-agent conversation ID --state-dir ABSOLUTE-DIR [--create ROLE]";
+    let (id, rest) = args.split_first().ok_or(usage)?;
+    let id = Id::parse(id).ok_or_else(|| format!("{id:?} is not a conversation id"))?;
+    let (state, create) = match rest {
+        [flag, dir] if flag == "--state-dir" => (dir, None),
+        [flag, dir, create, role] if flag == "--state-dir" && create == "--create" => {
+            let role = Role::parse(role).ok_or_else(|| format!("{role:?} is not a role"))?;
+            (dir, Some(role))
+        }
+        _ => return Err(usage.into()),
+    };
+    let state = PathBuf::from(state);
+    if !state.is_absolute() {
+        return Err(format!("{} is not an absolute path", state.display()));
+    }
+    td_agent::conversation::run(&StateDir::at(state), &id, create)
+}
+
+fn window(args: &[String]) -> Result<(), String> {
+    let control = match args {
+        [] => None,
+        [flag, path] if flag == "--control-socket" => {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "the control socket {} is not an absolute path",
+                    path.display()
+                ));
+            }
+            Some(path)
+        }
+        _ => return Err(USAGE.trim_end().into()),
+    };
+    let config_path = td_agent::config::path(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    );
+    if config_path.is_none() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "td-agent: no configuration is read: neither XDG_CONFIG_HOME nor HOME is an absolute path"
+        );
+    }
+    let config = td_agent::config::load(config_path.as_deref())?;
+    let state = StateDir::from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))?;
+    let program = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
+    td_agent::window::run(config, state, program, control)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--help" | "-h") if args.len() == 1 => {
+    let result = match args.split_first() {
+        Some((first, rest)) if first == "conversation" => conversation(rest),
+        Some((first, [])) if first == "--help" || first == "-h" => {
             let _ = std::io::stdout().lock().write_all(USAGE.as_bytes());
-            ExitCode::SUCCESS
+            return ExitCode::SUCCESS;
         }
-        _ => {
-            let _ = std::io::stderr().lock().write_all(USAGE.as_bytes());
-            ExitCode::from(2)
+        _ => window(&args),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr().lock(), "td-agent: {e}");
+            ExitCode::FAILURE
         }
     }
 }

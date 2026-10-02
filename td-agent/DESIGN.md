@@ -15,11 +15,12 @@ submission.
 
 ## Status
 
-The crate and its gate exist (§17); the window, the conversation
-processes and the store are the rest of increment 4, and no recipe or
-entry script exists yet. The decisions
-below that were the user's to make were made on 2026-10-01 and
-2026-10-02:
+Increments 3 and 4 of §18 are built: td-ui's message list, and the
+crate with its gate, the window and conversation processes, the store
+and `./agent`, with local echo and no model. Where building them
+settled a point the design left open, the section says so under "As
+built". No recipe names td-agent yet. The decisions below that were the
+user's to make were made on 2026-10-01 and 2026-10-02:
 
 - **Use:** both coding and general assistance, coding first.
 - **Run target:** an unjailed checkout launch on a development host first
@@ -216,6 +217,48 @@ It is not a security boundary. Both personalities run unconfined as the
 human and both hold the key; the jail is the boundary, as before. A
 conversation with nothing running that is not open has no process, and
 opening it starts one from its log.
+
+**As built (increment 4).** Nothing runs in the background yet, so only
+the open conversation has a process; switching shuts the old socketpair
+and that process exits, or is killed if it has not within 2 s, since it
+would hold its conversation's lock against the next.
+
+- **Locks** are std's `File::try_lock`, `flock(LOCK_EX | LOCK_NB)`, on
+  `window.lock` at the top of the state directory and `lock` in each
+  conversation's directory. The kernel drops one when its holder exits,
+  however it exits, so there is no stale lock and no pid to judge, and
+  std opens every file close-on-exec, so no child inherits one. It needs
+  no `unsafe`. A conversation process waits up to 3 s for its directory's
+  lock, for an earlier process of the same conversation still exiting,
+  and is then refused; a second window process is refused at once,
+  before it connects to the display.
+- **Frames** are a four-byte big-endian length and that many bytes of one
+  JSON object, at most 1 MiB, refused from the header before anything is
+  allocated for it. A stream may end only between frames. A human's
+  message is at most 128 KiB of text, which JSON escaping keeps within
+  the frame and log-line bounds; the window and the conversation process
+  each refuse a longer one by name.
+- **The child** is `td-agent conversation <id> --state-dir <dir>
+  [--create <role>]`, with its end of the socketpair as standard input
+  and output. It replays its log up the socketpair (a `hello`, then every
+  event), and exits when the socketpair closes. A turn is whole in the
+  log before the window hears of it, so a window that closes the
+  socketpair mid-turn interrupts nothing, and the child exits as it
+  would between turns.
+- **Restarts.** A child that exits, closes its socketpair or sends a
+  malformed frame is killed and started again from its log, up to three
+  times in a row without an acknowledgement; then the conversation is
+  marked failed until it is opened again, which `Return` or a click on
+  its row does. The window keeps each human message until the child
+  acknowledges its delivery id, and resends the unacknowledged ones to
+  the next child of that conversation, after a restart or when a
+  conversation switched away from is opened again; the child logs each
+  id once. A resend that fails shuts the socketpair, so the restart runs
+  again rather than a child waiting on half a frame. A message the
+  window cannot hand on at all, to a failed conversation or none, stays
+  in the composer, and one the child refuses comes back to it with why,
+  after any newer draft and never over its selection; one the composer
+  cannot take is written whole to standard error.
 
 ## 3. The orchestrator and conversations
 
@@ -450,6 +493,22 @@ jail instance is ever given that directory.
 The window is the window process's alone; conversation processes draw
 nothing (§2).
 
+**As built (increment 4).** There are no workspaces yet, so each
+conversation counts as a workspace of its own: the list is the
+orchestrator, then every other conversation, most recently active first,
+with the state of the open one (`starting`, `idle`, `restarting` or
+`failed`; a closed one shows none), and `C-n` starts a conversation
+rather than a workspace card. `F6` and `S-F6` move the focus between the
+list, the transcript and the composer, and `Return` on a list row opens
+it. The transcript holds what td-ui's message list bounds it to (16 MiB
+of text); past that it drops its oldest messages an eighth at a time and
+says so, and the log keeps every one. The status row is the state, a
+notice when there is one, `no model`, the mode, `no limits` and `0
+background`. The split's share is the file `layout` in the state
+directory. The driven control socket is opt-in, `--control-socket PATH`,
+and its actions are `new`, `previous`, `next`, `send`, `focus-next` and
+`focus-previous`.
+
 ## 5. Model client
 
 **Dialect.** OpenAI Chat Completions as OpenRouter serves it at
@@ -628,6 +687,26 @@ rather than resending; a background process is recorded as lost.
 Messages between conversations carry delivery ids, the window process
 keeps undelivered ones in the state directory, and a receiver logs each
 id once, so a restart neither loses nor repeats a delivery.
+
+**As built (increment 4).** `meta` is a JSON object at version 1 whose
+workspace, model, mode and parent are null until the increments that set
+them. `prefix` is empty, since there is no request yet. The log holds a
+user message with its delivery id, a `turn` effect started and finished
+(`no model`), an interruption, and a notice. A user message and its
+started record are synced together, and the finished record when the
+turn ends. On load, a torn final line is truncated away and a notice
+saying so is appended; a whole line that does not parse, or a sequence
+gap, refuses the log; a user message logged without its turn's start,
+the process having died between the two lines, is given one; and an
+effect started and not finished gets one interruption record. A log
+longer than 256 MiB is refused rather than read, so a message is
+accepted only while the log has room for it at its longest and 64 KiB
+more for the records that follow it, and refused by name past that.
+Files are opened without following a final symbolic link, and
+directories are created mode 0700. The human's unacknowledged messages
+are kept in the window process's memory (§2), not the state directory:
+there is not yet a message between conversations to keep there. One
+still held when the window closes is written whole to standard error.
 
 ## 7. Workspaces
 
@@ -1724,6 +1803,17 @@ path = "~/src/reference"
 write = false
 ```
 
+**As built (increment 4).** Every key above is known by name. `mode` is
+read and checked. Each other key that is present is accepted and named
+on standard error with the §18 increment that first reads it, and the
+status row counts them, so a setting that does nothing yet is said and
+never silently ignored; its value is checked by that increment. `limits`
+is refused with the reason above, and any other key is refused with the
+list of known keys. A missing file is every default, and a file longer
+than 1 MiB is refused. A relative `XDG_CONFIG_HOME` or `XDG_STATE_HOME`
+is ignored, as the XDG base directory rules say, for `$HOME/.config` or
+`$HOME/.local/state`.
+
 ## 16. Prior art: opencode
 
 opencode is the open agent closest to td-agent's shape, with
@@ -1864,9 +1954,10 @@ follows:
 - no recipe, recipe test or seed roster names it until packaging. Its
   copies of the shared modules are held identical by its own test reading
   td-news's, not by the recipe test;
-- its outgoing edges are pinned: exactly `td-news` (that test) and
-  `td-ui` (its dependency), plus `td-compositor` from the increment that
-  declares `native-compositor-tests`, since that opt-in adds the edge.
+- its outgoing edges are pinned: exactly `td-compositor`, `td-news` (that
+  test) and `td-ui` (its dependency). `td-compositor` joined with the
+  window increment, which declared `native-compositor-tests`, since that
+  opt-in adds the edge.
   The pinned set lives in `affected.rs` beside td-mta's, and a diff whose
   edges differ from it takes the workspace pass, because the builder's
   reader-set assertions name td-agent once it reads td-ui;
@@ -1886,6 +1977,20 @@ follows:
   and those tests stay few, in one process-test file; the rest of the
   window's logic is tested against td-ui's widget state without a
   compositor.
+
+**As built (increment 4).** The window increment declared
+`native-compositor-tests`, with one case in `tests/control_process.rs`:
+keys typed through the headless compositor's seat send a message to the
+orchestrator, start a conversation and send there (`Return` a newline,
+`C-Return` the send), and switch back, each result read from the store.
+`tests/processes.rs` drives the built program's conversation personality
+over real socketpairs: a killed child restarted from its log and going
+on from it, a child failing every start left failed after three
+restarts, a child exiting when its socketpair closes, a second writer
+of one conversation and a second window refused, and the configuration
+refusals. The window's keys, focus, list order, status row and divider
+are tested against its widget state in `src/ui.rs` and the driven
+actions in `src/control.rs`.
 
 ## 18. Increments
 

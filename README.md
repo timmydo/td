@@ -60,11 +60,11 @@ Build the system and boot it under QEMU:
 ```
 
 `./start` is the repository-root convenience wrapper for
-`td-recipe-eval run system-x86-64`. `./news` and `./mail` run the
-checkout's two applications on this host instead, unjailed and as you,
-under your Wayland session, with td's fetch service started for each
-launch (`td-builder host-run`, APPLICATIONS.md §X.7); they need cargo
-and a C compiler on `PATH` (or `TD_CC_HOME`) and nothing else of the
+`td-recipe-eval run system-x86-64`. `./news`, `./mail` and `./agent` run
+the checkout's fetching applications on this host instead, unjailed and as
+you, under your Wayland session, with td's fetch service started for each
+launch (`td-builder host-run`, APPLICATIONS.md §X.7); they need cargo and
+a C compiler on `PATH` (or `TD_CC_HOME`) and nothing else of the
 toolchain, and crates.io reachable the first time, for td-net's
 dependencies.
 It boots a selector initramfs, verifies the current deployment on a persistent
@@ -84,13 +84,14 @@ fixture proves corrupted-current fallback.
 JetBrains Mono Nerd Font that td-ui and td-term draw with in
 `~/.local/share/fonts/jetbrains-mono-nerd` (under `$XDG_DATA_HOME` when
 that is set), so td programs run on this host draw with it rather than
-Unifont (`td-builder install-fonts`). `./install-apps` builds td-editor,
-td-mail, td-news, td-photo, td-review, td-taskmgr and td-term in release
-mode with those tools and installs them for you, every program built
-before any is installed (`td-builder install-apps`). Each runs by name from
-`~/.local/bin`; td-news and td-mail there are links to an installed td-net
-that serves their fetch service for each run, as `./news` and `./mail` do,
-with the programs themselves in `~/.local/lib/td`.
+Unifont (`td-builder install-fonts`). `./install-apps` builds td-agent,
+td-editor, td-mail, td-news, td-photo, td-review, td-taskmgr and td-term
+in release mode with those tools and installs them for you, every program
+built before any is installed (`td-builder install-apps`). Each runs by
+name from `~/.local/bin`; td-news, td-mail and td-agent there are links to
+an installed td-net that serves their fetch service for each run, as
+`./news`, `./mail` and `./agent` do, with the programs themselves in
+`~/.local/lib/td`.
 
 ### Hand it to somebody who has not built td
 

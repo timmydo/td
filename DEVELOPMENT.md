@@ -65,14 +65,14 @@ still runs it. `ready` remains required for documentation updates.
 
 The repository-root entry scripts are `./start`, `./build-qcow` and
 `./build-iso`, which build the system through the Cargo runner, `./test-iso`,
-which boots a retained ISO with a private QEMU disk, `./news` and `./mail`,
-which run the checkout's two applications on this host unjailed
-(`td-builder host-run`, APPLICATIONS.md §X.7), `./install-fonts`, which
-installs the pinned outline face for td programs run on this host
+which boots a retained ISO with a private QEMU disk, `./news`, `./mail` and
+`./agent`, which run the checkout's fetching applications on this host
+unjailed (`td-builder host-run`, APPLICATIONS.md §X.7), `./install-fonts`,
+which installs the pinned outline face for td programs run on this host
 (`td-builder install-fonts`), and `./install-apps`, which builds the desktop
 programs in release mode and installs them for this host's user (`td-builder
-install-apps`, APPLICATIONS.md §X.7). `tests/start.sh` and
-`tests/host-run.sh` prove their bootstrap.
+install-apps`, APPLICATIONS.md §X.7). `tests/start.sh` and `tests/host-run.sh`
+prove their bootstrap.
 
 `ready` runs the selected checks once over the branch tip. It does not prove
 that an intermediate commit is green, so keep every commit independently

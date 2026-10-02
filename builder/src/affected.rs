@@ -1125,6 +1125,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // logic the builder's cargo tests cover.
     if p == "news"
         || p == "mail"
+        || p == "agent"
         || p == "install-fonts"
         || p == "install-apps"
         || p == "tests/host-run.sh"
@@ -1725,7 +1726,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 /// The shell scripts' syntax check, one `bash -n` per script: given several
 /// names at once, bash checks the first and hands the rest to it as its
 /// arguments.
-const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso test-iso host-preflight.sh news mail install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
+const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso test-iso host-preflight.sh news mail agent install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
 
 /// The repository-wide format check, as the preflights spell it: this binary's
 /// `gate-crates fmt --all` (`check_format`).
@@ -2858,6 +2859,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("news", "host-run-entry");
     assert_preflight!("mail", "shell-syntax");
     assert_preflight!("mail", "host-run-entry");
+    assert_preflight!("agent", "shell-syntax");
+    assert_preflight!("agent", "host-run-entry");
     assert_preflight!("install-fonts", "shell-syntax");
     assert_preflight!("install-fonts", "host-run-entry");
     assert_preflight!("install-apps", "shell-syntax");
@@ -4699,11 +4702,11 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads
 /// td-crypto, its one dependency. td-agent reads td-news, whose shared
-/// modules its test holds identical, and td-ui, its one dependency
-/// (td-agent/DESIGN.md §17); declaring `native-compositor-tests` adds
-/// td-compositor, which joins this list in the same landing.
+/// modules its test holds identical, td-ui, its one dependency, and
+/// td-compositor, the test tool its `native-compositor-tests` opt-in builds
+/// (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
-    ("td-agent", &["td-news", "td-ui"]),
+    ("td-agent", &["td-compositor", "td-news", "td-ui"]),
     ("td-mta", &["td-crypto"]),
 ];
 
@@ -5737,6 +5740,7 @@ mod tests {
         assert_eq!(
             readers_of("td-compositor"),
             [
+                "td-agent",
                 "td-authd",
                 "td-editor",
                 "td-jail",
@@ -8268,15 +8272,15 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        // td-photo's, td-mail's and td-pass's native cases make their
-        // commands three, as td-setup's are; td-agent, td-dua, td-news,
-        // td-review and td-term, toolkit consumers with no native case, add
-        // two each. The test-only P-256 oracle connects td-secret to td-crypto
-        // and then td-mta, adding two commands each, and td-open, which mounts
-        // td-secret's descriptor module, adds two; the installation
-        // fixture, reading td-install's codecs, adds two.
+        // td-agent's, td-photo's, td-mail's and td-pass's native cases make
+        // their commands three, as td-setup's are; td-dua, td-news, td-review
+        // and td-term, toolkit consumers with no native case, add two each.
+        // The test-only P-256 oracle connects td-secret to td-crypto and then
+        // td-mta, adding two commands each, and td-open, which mounts
+        // td-secret's descriptor module, adds two; the installation fixture,
+        // reading td-install's codecs, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 64, "{comp:?}");
+        assert_eq!(comp.len(), 65, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -8823,12 +8827,15 @@ mod tests {
             Fixture(std::env::temp_dir().join(format!("td-agent-graph-{}", std::process::id())));
         let root = fixture.0.clone();
         std::fs::remove_dir_all(&root).ok();
-        for name in ["td-agent", "td-news", "td-ui", "td-mail"] {
+        for name in ["td-agent", "td-compositor", "td-news", "td-ui", "td-mail"] {
             let base = root.join(name);
             std::fs::create_dir_all(base.join("src")).unwrap();
             let mut manifest = format!("[package]\nname = \"{name}\"\n");
             if name == "td-agent" {
-                manifest.push_str("\n[dependencies]\ntd-ui = { path = \"../td-ui\" }\n");
+                manifest.push_str(
+                    "\n[package.metadata.td-gate]\nnative-compositor-tests = true\n\n\
+                     [dependencies]\ntd-ui = { path = \"../td-ui\" }\n",
+                );
             }
             std::fs::write(base.join("Cargo.toml"), manifest).unwrap();
             std::fs::write(base.join("src/lib.rs"), "").unwrap();
@@ -8838,7 +8845,8 @@ mod tests {
         let changed = ["td-agent/src/lib.rs".to_string()];
         let all = cargo_test_cmds_all(&root).unwrap();
         let narrowed = cargo_test_cmds(&root, &changed).unwrap();
-        assert_eq!(narrowed.len(), 3, "{narrowed:?}");
+        // The format check, then td-agent's test, native and clippy legs.
+        assert_eq!(narrowed.len(), 4, "{narrowed:?}");
         assert!(narrowed
             .iter()
             .all(|c| is_format_check(c) || cmd_manifest_crate(c) == Some("td-agent")));
@@ -10398,7 +10406,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  for f in start build-qcow build-iso test-iso host-preflight.sh news mail install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
+                "  for f in start build-qcow build-iso test-iso host-preflight.sh news mail agent install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
                 "",

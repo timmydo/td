@@ -18,6 +18,17 @@ license = "MIT"
 [package.metadata.td-gate]
 clippy-all-targets = true
 trusted-test-root = true
+# The window is a live Wayland client; its one native case launches it
+# under the real headless compositor (tests/control_process.rs). This
+# opt-in builds that binary for the gate and adds it as a test-only edge,
+# which builder/src/affected.rs pins beside td-news and td-ui.
+native-compositor-tests = true
+
+# The library is the program's modules, so the process tests can drive
+# them. It has no doc tests: the shared json module's example names the
+# crate it was copied from.
+[lib]
+doctest = false
 
 [lints.clippy]
 unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?

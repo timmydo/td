@@ -247,6 +247,6 @@ fn the_names_are_listed_for_the_installer() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "td-mail\ntd-news\n"
+        "td-agent\ntd-mail\ntd-news\n"
     );
 }

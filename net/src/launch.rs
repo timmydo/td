@@ -1,7 +1,7 @@
 // td-launch — run one application with a fetch service of its own, for a
-// host that has no session fetch service (APPLICATIONS.md §X.7). td-news and
-// td-mail hold no network client: on td the jail binds them td-fetchd's
-// socket. Run elsewhere, this applet serves one for the launch:
+// host that has no session fetch service (APPLICATIONS.md §X.7). td-news,
+// td-mail and td-agent hold no network client: on td the jail binds them
+// td-fetchd's socket. Run elsewhere, this applet serves one for the launch:
 //
 //   td-net launch PROGRAM [ARG...]
 //
@@ -21,9 +21,9 @@
 // directory named for a pid no longer running, which the next launch
 // sweeps, judging by its own pid namespace.
 //
-// Invoked by an application's name (`td-news`, `td-mail`) through a link to
-// this binary, it launches the program of that name beside the binary the
-// link resolves to, refusing one that is this binary.
+// Invoked by an application's name (`td-news`, `td-mail`, `td-agent`)
+// through a link to this binary, it launches the program of that name
+// beside the binary the link resolves to, refusing one that is this binary.
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 /// The applications a link to this binary may name: those that fetch
 /// through the service.
-pub(crate) const LAUNCHED: &[&str] = &["td-mail", "td-news"];
+pub(crate) const LAUNCHED: &[&str] = &["td-agent", "td-mail", "td-news"];
 
 /// How long a freshly started service may take to answer its probe.
 const SERVICE_START: Duration = Duration::from_secs(5);
@@ -319,9 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn the_names_are_the_two_fetching_applications() {
+    fn the_names_are_the_three_fetching_applications() {
         assert_eq!(launches(OsStr::new("td-news")), Some("td-news"));
         assert_eq!(launches(OsStr::new("td-mail")), Some("td-mail"));
+        assert_eq!(launches(OsStr::new("td-agent")), Some("td-agent"));
         assert_eq!(launches(OsStr::new("td-editor")), None);
         assert_eq!(launches(OsStr::new("td-net")), None);
     }

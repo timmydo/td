@@ -10558,63 +10558,65 @@ unsafe surface available for free.
 
 ### X.7 An unjailed checkout launch
 
-`./news` and `./mail` at the repository root run the checkout's td-news
-and td-mail on the host in one word, and they are not §X.1's host mode:
-no jail, no materialized package, no td-busd, no confinement of any
-kind. The application runs as the caller, with the caller's whole
-privilege, under the caller's Wayland session. Each is an entry script
-in `./start`'s shape that builds the Cargo runner into the checkout's
-own target directory, the linker the host has named for rustc when `cc`
-is not on PATH (`TD_CC_HOME`'s, else `gcc`, as the seed provisioning
-resolves it), and execs `td-builder host-run NAME`, whose whole logic is
-dependency-free Rust in the builder. The verb resolves the host's own
-cargo and C compiler the same way, with no static or musl requirement,
-since nothing it builds enters a build; builds the checkout's td-net and
-the application, taking each binary from cargo's own report of where it
-put it; and becomes `td-net launch APP`, the multicall's `launch`
-applet, which serves the application's fetch service itself, in a
-runtime directory of the launch's own under the session's
-(`$XDG_RUNTIME_DIR/td-launch/PID`, mode 0700), and then becomes the
-application, by exec, with that directory as its `XDG_RUNTIME_DIR` and
-the session's display made absolute. The application keeps the launch's
-pid, terminal and exit status, so a shell's Ctrl-C and wait reach it as
-they reach any program. td-net's `fetchd` applet is started at
-`td-fetch/socket` there with `--exit-with-parent PID`, the launch's pid,
-in a process group of its own, so a terminal's signals pass it by: once
-its parent is no longer that pid, the application having ended however
-it ended, it removes the socket it bound, when that is still the one
-there, and the socket's directory when empty, and exits. td-net forbids
-`unsafe`, so that watch, not a parent-death signal, ties the service to
-the application. Invoked by the name `td-news` or `td-mail` through a
-link, td-net is `td-net launch` of the program of that name beside the
-binary the link resolves to, refusing one that is td-net itself by its
-device and inode; `launch` itself takes a path, never a name to look up
-on `PATH`. Two launches side by side are two services, neither the
-other's to take away; the session's own `td-fetch/socket` is never
-touched, so a direct `cargo run` still gets the application's named
-refusal, which now names the launcher; and a launch leaves only an empty
-directory named for its pid, which the next launch sweeps once that pid
-is no longer running, judging by its own pid namespace, which is the
-session's. A program the application starts (a browser for a link, a
-pager) inherits its runtime directory, which holds no session bus, audio
-or other socket of the session's and is swept once the application has
-ended; and a `WAYLAND_SOCKET` descriptor the launch inherited is held by
-the service as well, so the compositor sees it close only when both end.
-The service stays the application's child, unreaped should it end first;
-and, in a background process group of its own, it is stopped by a
-terminal set to `tostop` when it writes an error there, its fetches then
-waiting until the application ends. Every fetch
-the applications make goes through that service, as on td, since they
-carry no network client of their own; that is a property of the
-applications, not a boundary this launch enforces, and nothing of §W's
-confinement holds here. This section's two-configuration rule reads the
-launch as availability: the applications run here as they run on td,
-the jail is what is absent, and a feature owes this launcher nothing.
+`./news`, `./mail` and `./agent` at the repository root run the
+checkout's td-news, td-mail and td-agent on the host in one word, and
+they are not §X.1's host mode: no jail, no materialized package, no
+td-busd, no confinement of any kind. The application runs as the caller,
+with the caller's whole privilege, under the caller's Wayland session.
+Each is an entry script in `./start`'s shape that builds the Cargo
+runner into the checkout's own target directory, the linker the host has
+named for rustc when `cc` is not on PATH (`TD_CC_HOME`'s, else `gcc`, as
+the seed provisioning resolves it), and execs `td-builder host-run
+NAME`, whose whole logic is dependency-free Rust in the builder. The
+verb resolves the host's own cargo and C compiler the same way, with no
+static or musl requirement, since nothing it builds enters a build;
+builds the checkout's td-net and the application, taking each binary
+from cargo's own report of where it put it; and becomes `td-net launch
+APP`, the multicall's `launch` applet, which serves the application's
+fetch service itself, in a runtime directory of the launch's own under
+the session's (`$XDG_RUNTIME_DIR/td-launch/PID`, mode 0700), and then
+becomes the application, by exec, with that directory as its
+`XDG_RUNTIME_DIR` and the session's display made absolute. The
+application keeps the launch's pid, terminal and exit status, so a
+shell's Ctrl-C and wait reach it as they reach any program. td-net's
+`fetchd` applet is started at `td-fetch/socket` there with
+`--exit-with-parent PID`, the launch's pid, in a process group of its
+own, so a terminal's signals pass it by: once its parent is no longer
+that pid, the application having ended however it ended, it removes the
+socket it bound, when that is still the one there, and the socket's
+directory when empty, and exits. td-net forbids `unsafe`, so that watch,
+not a parent-death signal, ties the service to the application. Invoked
+by the name `td-news`, `td-mail` or `td-agent` through a link, td-net is
+`td-net launch` of the program of that name beside the binary the link
+resolves to, refusing one that is td-net itself by its device and inode;
+`launch` itself takes a path, never a name to look up on `PATH`. Two
+launches side by side are two services, neither the other's to take
+away; the session's own `td-fetch/socket` is never touched, so a direct
+`cargo run` still gets the application's named refusal, which now names
+the launcher; and a launch leaves only an empty directory named for its
+pid, which the next launch sweeps once that pid is no longer running,
+judging by its own pid namespace, which is the session's. A program the
+application starts (a browser for a link, a pager) inherits its runtime
+directory, which holds no session bus, audio or other socket of the
+session's and is swept once the application has ended; and a
+`WAYLAND_SOCKET` descriptor the launch inherited is held by the service
+as well, so the compositor sees it close only when both end. The service
+stays the application's child, unreaped should it end first; and, in a
+background process group of its own, it is stopped by a terminal set to
+`tostop` when it writes an error there, its fetches then waiting until
+the application ends. Every fetch the applications make goes through
+that service, as on td, since they carry no network client of their own
+(td-agent makes none until its model client, td-agent/DESIGN.md §18);
+that is a property of the applications, not a boundary this launch
+enforces, and nothing of §W's confinement holds here. This section's
+two-configuration rule reads the launch as availability: the
+applications run here as they run on td, the jail is what is absent, and
+a feature owes this launcher nothing.
 
 `./install-apps` (`td-builder install-apps`) installs host builds of the
 desktop programs for the caller, as unconfined as a launch. Those that
-need no service go in `~/.local/bin`. td-news and td-mail, the names
-`td-net launch --names` prints, go in `~/.local/lib/td` beside a host
+need no service go in `~/.local/bin`. td-news, td-mail and td-agent, the
+names `td-net launch --names` prints, go in `~/.local/lib/td` beside a host
 build of td-net, and their names in `~/.local/bin` are links to it:
 td-net invoked by one of those names is `td-net launch` of the program
 of that name beside the binary the link resolves to, so an installed
