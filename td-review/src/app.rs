@@ -1,4 +1,4 @@
-//! TUI state machine: branch list -> branch review -> land log.
+//! The window's state machine: branch list -> branch review -> land log.
 
 use std::collections::VecDeque;
 use std::io;
@@ -6,7 +6,7 @@ use std::io;
 use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
 use crate::land::{self, Mode, Outcome, Preview};
 use crate::record;
-use crate::term::{self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
+use crate::view::{self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
 use crate::worktrees;
 
 pub enum Flow {
@@ -88,7 +88,6 @@ struct Reviewing {
     oid: String,
     /// The base tip the pane was rendered against, re-checked for the same reason.
     base_oid: String,
-    range: String,
     lines: Vec<Line>,
     empty: bool,
 }
@@ -186,8 +185,8 @@ impl App {
     ///
     /// Every return to the list drops, including from help and the review pane
     /// where no row can have moved. Knowing which reveals are safe would mean
-    /// tracking what the list looked like when it was last drawn, to save two
-    /// `stty` calls and a `q j` somebody has to press twice.
+    /// tracking what the list looked like when it was last drawn, to save a
+    /// `q j` somebody has to press twice.
     fn show_list(&mut self) {
         self.screen = Screen::List;
         self.stale_typeahead = true;
@@ -201,9 +200,8 @@ impl App {
     }
 
     /// Drop typeahead now that the prompt is on screen. A failure here is fatal
-    /// rather than a note: `drain_input` leaves the tty at VMIN=0 when its
-    /// restore fails, and every later read would return empty — indistinguishable
-    /// from a closed tty, so the loop would exit successfully mid-confirmation.
+    /// rather than a note: a drain that did not happen leaves the inputs typed
+    /// before the prompt to answer it.
     pub fn settle_prompt(&mut self, term: &mut dyn Ui) -> io::Result<()> {
         if !self.stale_typeahead {
             return Ok(());
@@ -266,7 +264,7 @@ impl App {
 
     // ---------------------------------------------------------------- render
 
-    pub fn render(&self, rows: usize, cols: usize) -> String {
+    pub fn render(&self, rows: usize, cols: usize) -> Frame {
         let mut f = Frame::new(rows, cols);
         match self.screen {
             Screen::List => self.render_list(&mut f),
@@ -274,7 +272,7 @@ impl App {
             Screen::Log => self.render_log(&mut f),
             Screen::Help => self.render_help(&mut f),
         }
-        f.finish()
+        f
     }
 
     fn title(&self, f: &mut Frame, text: &str) {
@@ -333,7 +331,9 @@ impl App {
             return;
         }
         if self.status.is_empty() {
-            f.push_text(keys, Style::dim());
+            // The status row's ground with nothing to report: muted, so the
+            // hints read as chrome rather than as a note somebody raised.
+            f.push_text(keys, Style::dim().with_invert());
         } else {
             f.push_text(
                 &format!(" {}", self.status),
@@ -433,6 +433,7 @@ impl App {
 
         let height = f.room().saturating_sub(1);
         let top = scroll_top(self.sel, self.top, height);
+        f.scrollbar(height, self.view.len(), top);
         if self.view.is_empty() {
             f.push_blank();
             f.push_text("  no branches match", Style::dim());
@@ -442,8 +443,7 @@ impl App {
                 continue;
             };
             let selected = row == self.sel;
-            // Padded by measured columns: `{:<width$}` counts chars, so a
-            // double-width name would shift the subject column right.
+            // Padded by measured cells, as the name column was sized.
             let (name, cols) = clip_cols(&b.refname, name_width);
             // `cells` was built from `view` in this order, so the miss is only
             // reachable if that stopped being true.
@@ -470,6 +470,7 @@ impl App {
             } else {
                 Style::PLAIN
             };
+            f.pick(&b.refname);
             f.push_text(&text, style);
         }
         self.footer(
@@ -485,8 +486,11 @@ impl App {
             return;
         };
         let name = r.refname.as_str();
-        let total = r.lines.len();
+        // Wrapped to the window, so a long diff line is read whole: the pane
+        // is the only view of the diff there is.
+        let total = view::wrapped_len(&r.lines, f.cols);
         let height = f.rows.saturating_sub(2);
+        let scroll = self.scroll.min(total.saturating_sub(height));
         let pos = if total <= height {
             "all".to_string()
         } else {
@@ -494,24 +498,27 @@ impl App {
             // which reads as 80% when the last line is already on screen.
             format!(
                 "{}%",
-                (self.scroll.saturating_add(height).min(total) * 100) / total.max(1)
+                (scroll.saturating_add(height).min(total) * 100) / total.max(1)
             )
         };
         self.title(f, &format!(" review  {name}  vs {}   [{pos}]", self.base));
-        for line in r.lines.iter().skip(self.scroll).take(height) {
+        f.scrollbar(height, total, scroll);
+        for line in &view::wrap_window(&r.lines, f.cols, scroll, height) {
             f.push(line);
         }
         self.footer(
             f,
-            " j/k scroll · space/b page · g/G top/end · p pager · s squash · r rebase now · q back",
+            " j/k scroll · space/b page · g/G top/end · s squash · r rebase now · q back",
         );
     }
 
     fn render_log(&self, f: &mut Frame) {
         self.title(f, &format!(" {}", self.log_title));
         let height = f.rows.saturating_sub(2);
-        let top = self.log_scroll.min(self.log.len().saturating_sub(height));
-        for line in self.log.iter().skip(top).take(height) {
+        let total = view::wrapped_len(&self.log, f.cols);
+        let top = self.log_scroll.min(total.saturating_sub(height));
+        f.scrollbar(height, total, top);
+        for line in &view::wrap_window(&self.log, f.cols, top, height) {
             f.push(line);
         }
         self.footer(f, " j/k scroll · q back to branches");
@@ -522,6 +529,7 @@ impl App {
         let height = f.rows.saturating_sub(2);
         let lines = help_lines();
         let top = self.help_scroll.min(lines.len().saturating_sub(height));
+        f.scrollbar(height, lines.len(), top);
         for line in lines.iter().skip(top).take(height) {
             f.push(line);
         }
@@ -550,7 +558,7 @@ impl App {
                     }
                     _ => {
                         self.log_scroll =
-                            scroll_by(self.log_scroll, key, self.log.len(), term.size().0);
+                            scroll_by(self.log_scroll, key, self.log_rows(term), term.size().0);
                     }
                 }
                 Ok(Flow::Continue)
@@ -593,10 +601,8 @@ impl App {
     }
 
     fn handle_list(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
-        // Title, column header and status bar — plus the stale-base banner when
-        // it is drawn, or a page would step past the last visible row.
-        let chrome = if self.base_stale.is_some() { 4 } else { 3 };
-        let height = term.size().0.saturating_sub(chrome).max(1);
+        // Or a page would step past the last visible row.
+        let height = term.size().0.saturating_sub(self.list_chrome()).max(1);
         match key {
             Key::Char('q') | Key::Ctrl('c') => return Ok(Flow::Quit),
             Key::Char('?') => self.screen = Screen::Help,
@@ -869,7 +875,9 @@ impl App {
             }
             Key::Ctrl('c') => return Ok(Flow::Quit),
             Key::Char('?') => self.screen = Screen::Help,
-            Key::Char('p') => self.open_pager(term)?,
+            // No pager: the window is no terminal to hand one, and the pane
+            // is the whole diff. `p` stays unbound here rather than taking
+            // the list's push.
             Key::Char('s') => self.ask_squash(),
             // No confirmation, as `p` and `P` have none: the keystroke is the
             // decision. What `r` can do is bounded before it starts — it only
@@ -889,7 +897,7 @@ impl App {
                 }
             }
             _ => {
-                let total = self.reviewing.as_ref().map_or(0, |r| r.lines.len());
+                let total = self.review_rows(term.size().1);
                 self.scroll = scroll_by(self.scroll, key, total, rows);
             }
         }
@@ -931,6 +939,98 @@ impl App {
         Ok(Flow::Continue)
     }
 
+    /// A press on the list row showing `refname` in the frame it was made
+    /// on: it selects that branch, and `double` — the second press of a double
+    /// click on the same row — reviews it, as Enter does. Read by name rather
+    /// than by position, because the list can have scrolled, filtered or been
+    /// laid out again since that frame was drawn; a branch no longer listed is
+    /// nothing. A press answers no prompt and is nothing off the list. One
+    /// under the filter's bar ends the editing, as Enter would, so the review
+    /// a double click opens takes its keys.
+    pub fn pick(&mut self, refname: &str, double: bool, rows: usize) -> io::Result<()> {
+        if self.prompt.is_some() || !matches!(self.screen, Screen::List) {
+            return Ok(());
+        }
+        let Some(index) = self
+            .view
+            .iter()
+            .position(|&i| self.branches.get(i).is_some_and(|b| b.refname == refname))
+        else {
+            return Ok(());
+        };
+        if self.editing_filter {
+            self.editing_filter = false;
+            self.stale_typeahead = true;
+        }
+        self.status.clear();
+        self.sel = index;
+        let height = rows.saturating_sub(self.list_chrome()).max(1);
+        self.top = scroll_top(self.sel, self.top, height);
+        if double {
+            self.open_review()?;
+        }
+        Ok(())
+    }
+
+    /// Wheel travel of `delta` rows (down is positive) over a `rows` by
+    /// `cols` frame: the list's selection moves, a pane scrolls. A wheel
+    /// answers nothing, so over a delete or a sweep it scrolls the plan, as
+    /// `j` and `k` do, and over the other prompts it does nothing at all.
+    pub fn wheel(&mut self, delta: isize, rows: usize, cols: usize) {
+        let by = |at: usize, total: usize| {
+            let height = rows.saturating_sub(2).max(1);
+            let at = if delta < 0 {
+                at.saturating_sub(delta.unsigned_abs())
+            } else {
+                at.saturating_add(delta.unsigned_abs())
+            };
+            at.min(total.saturating_sub(height))
+        };
+        match (&self.prompt, &self.screen) {
+            (Some(Prompt::Delete { .. } | Prompt::Sweep { .. }), _) | (None, Screen::Log) => {
+                self.log_scroll = by(self.log_scroll, view::wrapped_len(&self.log, cols));
+            }
+            (Some(_), _) => {}
+            (None, Screen::List) => {
+                let height = rows.saturating_sub(self.list_chrome()).max(1);
+                self.sel = if delta < 0 {
+                    self.sel.saturating_sub(delta.unsigned_abs())
+                } else {
+                    step(self.sel, delta.unsigned_abs(), self.view.len())
+                };
+                self.top = scroll_top(self.sel, self.top, height);
+            }
+            (None, Screen::Review) => {
+                self.scroll = by(self.scroll, self.review_rows(cols));
+            }
+            (None, Screen::Help) => {
+                self.help_scroll = by(self.help_scroll, help_lines().len());
+            }
+        }
+    }
+
+    /// Rows the review pane's lines take, wrapped to `cols`.
+    fn review_rows(&self, cols: usize) -> usize {
+        self.reviewing
+            .as_ref()
+            .map_or(0, |r| view::wrapped_len(&r.lines, cols))
+    }
+
+    /// Rows the log takes, wrapped to the window.
+    fn log_rows(&self, term: &dyn Ui) -> usize {
+        view::wrapped_len(&self.log, term.size().1)
+    }
+
+    /// Rows the list's frame spends on anything but branches: title, column
+    /// header and status bar, plus the stale-base banner when it is drawn.
+    fn list_chrome(&self) -> usize {
+        if self.base_stale.is_some() {
+            4
+        } else {
+            3
+        }
+    }
+
     fn handle_prompt(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
         match self.prompt {
             Some(Prompt::Squash) => match key {
@@ -947,7 +1047,8 @@ impl App {
             // remote the delete would reach, and that can be longer than the
             // screen.
             Some(Prompt::Delete { .. }) if is_scroll(key) => {
-                self.log_scroll = scroll_by(self.log_scroll, key, self.log.len(), term.size().0);
+                self.log_scroll =
+                    scroll_by(self.log_scroll, key, self.log_rows(term), term.size().0);
             }
             Some(Prompt::Delete { .. }) => {
                 let Some(Prompt::Delete { short, targets }) = self.prompt.take() else {
@@ -970,7 +1071,8 @@ impl App {
             // Same as a delete: the plan can outrun the screen, so scrolling it
             // is not answering it.
             Some(Prompt::Sweep { .. }) if is_scroll(key) => {
-                self.log_scroll = scroll_by(self.log_scroll, key, self.log.len(), term.size().0);
+                self.log_scroll =
+                    scroll_by(self.log_scroll, key, self.log_rows(term), term.size().0);
             }
             Some(Prompt::Sweep { .. }) => {
                 let Some(Prompt::Sweep { paths }) = self.prompt.take() else {
@@ -993,8 +1095,8 @@ impl App {
                     self.log.extend(lines);
                     self.log_to_end(term);
                 }
-                // Esc means "leave it" too: raw mode disables ISIG, so `d`
-                // and `l` would otherwise be the ONLY ways out of this prompt
+                // Esc means "leave it" too, and so does closing the window:
+                // `d` and `l` must not be the ONLY ways out of this prompt,
                 // and the safe one must not need a guess.
                 Key::Char('l') | Key::Char('L') | Key::Esc => return Ok(Flow::Quit),
                 _ => {}
@@ -1015,7 +1117,7 @@ impl App {
     /// does — the outcome of a step is the line that matters.
     fn log_to_end(&mut self, term: &dyn Ui) {
         let height = term.size().0.saturating_sub(2);
-        self.log_scroll = self.log.len().saturating_sub(height);
+        self.log_scroll = self.log_rows(term).saturating_sub(height);
     }
 
     fn open_review(&mut self) -> io::Result<()> {
@@ -1034,30 +1136,16 @@ impl App {
             }
         };
         let empty = preview.is_empty();
-        let range = format!("{}..{}", preview.merge_base, preview.branch_oid);
         let lines = preview_lines(branch, &preview, &self.base, self.now);
         self.reviewing = Some(Reviewing {
             refname,
             oid: preview.branch_oid.clone(),
             base_oid: preview.base_oid.clone(),
-            range,
             lines,
             empty,
         });
         self.scroll = 0;
         self.screen = Screen::Review;
-        Ok(())
-    }
-
-    fn open_pager(&mut self, term: &mut dyn Ui) -> io::Result<()> {
-        let Some(range) = self.reviewing.as_ref().map(|r| r.range.clone()) else {
-            return Ok(());
-        };
-        let git = &self.git;
-        let result = term.suspend_run(&mut || git.run_interactive(&["diff", &range]))?;
-        if let Err(e) = result {
-            self.note(format!("pager: {e}"), Style::fg(RED));
-        }
         Ok(())
     }
 
@@ -1143,7 +1231,7 @@ impl App {
                     });
                 }
                 self.log_to_end(term);
-                // A listing hiccup must not tear down the TUI after a good land.
+                // A listing hiccup must not close the window after a good land.
                 self.refresh_quietly();
             }
             // Both leave work in the index or tree, so both need the bail-out.
@@ -1204,7 +1292,7 @@ impl App {
             ),
         });
         self.log_to_end(term);
-        // A listing hiccup must not tear down the TUI after a successful push.
+        // A listing hiccup must not close the window after a successful push.
         self.refresh_quietly();
         // Only sweep once the work is genuinely published somewhere, and only
         // over the remotes the push actually reached — a mirror that rejected
@@ -1398,10 +1486,10 @@ impl App {
         // The proof runs only where the row has not already settled the matter,
         // and the pane says it is running only where it is: it ends in an
         // `ls-remote`, and this used to be a local key, so with the previous
-        // frame still on screen an unreachable remote is a TUI that has
-        // stopped — raw mode has cleared `ISIG`, so there is not even a Ctrl-C
-        // out of it. Every other network step here says what it is doing
-        // first, and none of them says it when it is doing nothing.
+        // frame still on screen an unreachable remote is a window that has
+        // stopped answering its keys. Every other network step here says what
+        // it is doing first, and none of them says it when it is doing
+        // nothing.
         //
         // Each target's proof is then KEPT rather than recomputed for the
         // record: it is the base oid this actually held against, and re-reading
@@ -1645,7 +1733,8 @@ impl App {
     /// out of here that RETURNS reaches `refresh_quietly`, so `reload` sets it
     /// — and `show_list` sets it again when the list is next revealed, which is
     /// the keystroke that matters when a delete happened with the log pane up.
-    /// The two `?` returns end the TUI, so there is nothing left to mis-aim.
+    /// The two `?` returns close the window, so there is nothing left to
+    /// mis-aim.
     fn run_delete(
         &mut self,
         short: &str,
@@ -1770,7 +1859,6 @@ fn help_lines() -> Vec<Line> {
         &[
             ("j / k, space / b", "scroll"),
             ("g / G", "top / end"),
-            ("p", "open the same diff in your own pager"),
             ("s", "land it squashed: one commit on the base — asks first"),
             ("r", "land it rebased: its own commits, replayed"),
             ("", "lands on the keystroke — no confirmation"),
@@ -1815,11 +1903,11 @@ fn help_lines() -> Vec<Line> {
 }
 
 /// Width of the branch-name column: the longest name, measured in the same
-/// display columns `clip_cols` and the row padding use — a char count would size
-/// the column too narrow for a double-width name and clip it needlessly.
+/// cells `clip_cols` and the row padding use, one a scalar, as the window
+/// draws them.
 fn name_column<'a>(names: impl Iterator<Item = &'a String>) -> usize {
     names
-        .map(|n| term::sanitize(n, MAX_NAME_COL).1)
+        .map(|n| view::sanitize(n, MAX_NAME_COL).1)
         .max()
         .unwrap_or(20)
         .clamp(12, MAX_NAME_COL)
@@ -1835,7 +1923,7 @@ fn name_column<'a>(names: impl Iterator<Item = &'a String>) -> usize {
 /// column stops at `MAX_NAME_COL`: a name clipped with an ellipsis is still
 /// that name, while `10/100!` clipped to six is `10/100`, a verdict that reads
 /// as agreement. One outlier branch therefore costs every row some SUBJECT,
-/// which the frame's own clip bounds — a row is sanitized to the terminal
+/// which the frame's own clip bounds — a row is sanitized to the window's
 /// width like any other, so nothing but that subject is lost.
 fn fitted<'a>(cells: impl Iterator<Item = &'a str>, floor: usize) -> usize {
     cells
@@ -1918,7 +2006,7 @@ fn takes_nothing(b: &Branch, prospect: git::Prospect) -> bool {
 }
 
 /// A row's READY cell and whether it is de-emphasised — pure, so the rule is
-/// testable without a terminal or a repo, as `worktrees::decide` is.
+/// testable without a window or a repo, as `worktrees::decide` is.
 ///
 /// `landed` outranks the record because the column answers "is there anything
 /// here for me", and a record is only an answer while something is left to
@@ -1967,16 +2055,15 @@ pub fn ready_cell(
     }
 }
 
-/// Clip to `max` display COLUMNS with an ellipsis, returning the text and the
-/// columns it occupies. Char counts would let a CJK or emoji branch name spill
-/// into the subject column.
+/// Clip to `max` cells with an ellipsis, returning the text and the cells it
+/// occupies: one a scalar, as `view::sanitize` measures and the window draws.
 fn clip_cols(text: &str, max: usize) -> (String, usize) {
     // One column of headroom tells truncation apart from an exact fit.
-    let (probe, w) = term::sanitize(text, max.saturating_add(1));
+    let (probe, w) = view::sanitize(text, max.saturating_add(1));
     if w <= max {
         return (probe, w);
     }
-    let (mut out, mut w) = term::sanitize(text, max.saturating_sub(1));
+    let (mut out, mut w) = view::sanitize(text, max.saturating_sub(1));
     if max > 0 {
         out.push('\u{2026}');
         w += 1;
@@ -2162,6 +2249,25 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
     out
 }
 
+/// An app reviewing one branch of a repository that is not there, for a test
+/// that drives the state machine without git.
+#[cfg(test)]
+pub(crate) fn reviewing_fixture() -> App {
+    let mut app = App::new(
+        Git::new(std::path::PathBuf::from("/nonexistent")),
+        "main".to_string(),
+    );
+    app.reviewing = Some(Reviewing {
+        refname: "origin/b00".to_string(),
+        oid: "1".repeat(40),
+        base_oid: "2".repeat(40),
+        lines: vec![Line::plain("diff")],
+        empty: false,
+    });
+    app.screen = Screen::Review;
+    app
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2169,8 +2275,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    /// A `Ui` that records frames instead of writing them. The state machine is
-    /// only reachable from a test through this: `Terminal` needs a real tty.
+    /// A `Ui` that records frames' text instead of showing them. The state
+    /// machine is only reachable from a test through this: the window needs a
+    /// compositor.
     struct FakeUi {
         frames: Vec<String>,
         drains: usize,
@@ -2196,24 +2303,17 @@ mod tests {
             (24, 80)
         }
 
-        fn draw(&mut self, frame: String) -> io::Result<()> {
-            self.frames.push(frame);
+        fn draw(&mut self, frame: Frame) -> io::Result<()> {
+            self.frames.push(frame.text());
             Ok(())
         }
 
         fn drain_input(&mut self) -> io::Result<()> {
             self.drains += 1;
             if self.drain_fails {
-                return Err(io::Error::other("stty restore failed"));
+                return Err(io::Error::other("drain failed"));
             }
             Ok(())
-        }
-
-        fn suspend_run(
-            &mut self,
-            body: &mut dyn FnMut() -> io::Result<()>,
-        ) -> io::Result<io::Result<()>> {
-            Ok(body())
         }
     }
 
@@ -4382,14 +4482,13 @@ mod tests {
         app.settle_prompt(&mut ui).unwrap();
         assert_eq!(
             ui.drains, 1,
-            "the tty must be drained before the answer is read"
+            "the input must be drained before the answer is read"
         );
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A failed VMIN restore leaves every later read returning empty, which the
-    /// loop cannot tell from a closed tty. It must surface as an error, not as
-    /// a silent successful exit with a confirmation pending.
+    /// A drain that did not happen leaves the inputs typed before the prompt
+    /// to answer it. It must surface as an error, not be read past.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
     fn a_failed_drain_is_an_error_not_a_quiet_exit() {
@@ -4455,22 +4554,23 @@ mod tests {
         assert_eq!(clip_cols("abc", 0), (String::new(), 0));
     }
 
-    /// The name column is terminal cells, not chars: five double-width glyphs
-    /// are ten columns wide and must be clipped like any other ten-column name.
+    /// The name column is the window's cells, one a scalar: nine CJK glyphs
+    /// are nine cells and are clipped like any other nine-cell name.
     #[test]
-    fn a_wide_branch_name_is_measured_in_columns() {
-        let (text, cols) = clip_cols("日本語日本語日本語", 10);
-        assert_eq!(cols, 10);
-        assert!(text.chars().count() < 9, "clipped by columns, got {text:?}");
+    fn a_wide_branch_name_is_measured_in_cells() {
+        let (text, cols) = clip_cols("日本語日本語日本語", 8);
+        assert_eq!(cols, 8);
+        assert_eq!(text, "日本語日本語日\u{2026}");
+        assert_eq!(clip_cols("日本語日本語日本語", 9).1, 9);
     }
 
     /// The column must be sized in the same unit it is clipped and padded in,
-    /// or a double-width name is clipped to make room it did not need.
+    /// or a name is clipped to make room it did not need.
     #[test]
-    fn the_name_column_is_sized_in_columns_too() {
+    fn the_name_column_is_sized_in_cells_too() {
         let wide = "origin/日本語日本語日本語".to_string();
         let width = name_column([&wide].into_iter());
-        assert_eq!(width, term::sanitize(&wide, MAX_NAME_COL).1);
+        assert_eq!(width, view::sanitize(&wide, MAX_NAME_COL).1);
         assert_eq!(
             clip_cols(&wide, width).0,
             wide,
@@ -4533,26 +4633,6 @@ mod tests {
         assert_eq!(diff_style(" context"), Style::PLAIN);
     }
 
-    /// A frame line with its escape sequences removed, so a column can be
-    /// located by offset: rows carry different styles, and a dim row's `\x1b[2m`
-    /// would otherwise put its text two bytes further along than a plain one's.
-    fn unstyled(line: &str) -> String {
-        let mut out = String::new();
-        let mut chars = line.chars();
-        while let Some(c) = chars.next() {
-            if c != '\x1b' {
-                out.push(c);
-                continue;
-            }
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        }
-        out
-    }
-
     /// Both counted columns are sized to the view, so ONE branch's wide numbers
     /// must not shift that branch's row alone. Asserted where it is visible —
     /// every drawn name starting in the same place — because a width computed
@@ -4584,12 +4664,8 @@ mod tests {
         app.now = 1_700_000_600;
         app.apply_filter();
 
-        let frame = app.render(24, 100);
-        let offsets: Vec<usize> = frame
-            .lines()
-            .map(unstyled)
-            .filter_map(|l| l.find("origin/b"))
-            .collect();
+        let frame = app.render(24, 100).text();
+        let offsets: Vec<usize> = frame.lines().filter_map(|l| l.find("origin/b")).collect();
         assert_eq!(offsets.len(), 3, "all three rows drawn");
         assert!(
             offsets.windows(2).all(|w| w.first() == w.last()),
@@ -4633,7 +4709,7 @@ mod tests {
 
         for sel in [0usize, 10, 25, 39] {
             app.sel = sel;
-            let frame = app.render(24, 100);
+            let frame = app.render(24, 100).text();
             let mut rows = 0usize;
             for line in frame.lines() {
                 let Some(at) = line.find("origin/b") else {
@@ -4661,6 +4737,161 @@ mod tests {
             }
             assert!(rows > 1, "nothing was drawn to check at sel={sel}");
         }
+    }
+
+    fn listed_app(n: u32) -> App {
+        let mut app = App::new(Git::new(PathBuf::from("/nonexistent")), "main".to_string());
+        app.branches = (0..n)
+            .map(|i| Branch {
+                refname: format!("origin/b{i:02}"),
+                commit: "1".repeat(40),
+                committed_unix: 1_700_000_000,
+                author: "a".to_string(),
+                subject: "s".to_string(),
+                counts: Some((1, 0)),
+            })
+            .collect();
+        app.readiness = (0..n).map(|_| record::Readiness::Ready).collect();
+        app.prospects = vec![git::Prospect::Outstanding; n as usize];
+        app.apply_filter();
+        app
+    }
+
+    /// The rows a frame shows, by the branch each names: what a press is read
+    /// against.
+    fn picks(frame: &Frame) -> Vec<(usize, String)> {
+        (0..frame.rows)
+            .filter_map(|row| frame.picked(row).map(|r| (row, r.to_string())))
+            .collect()
+    }
+
+    /// The frame names the branch drawn on each of its rows — below the title,
+    /// the stale-base banner when it shows and the header, from the row the
+    /// list is scrolled to — and on no other row.
+    #[test]
+    fn the_frame_names_the_branch_on_each_row() {
+        let mut app = listed_app(40);
+        // 24 rows: title, header, 21 branches, status.
+        let frame = app.render(24, 100);
+        let rows = picks(&frame);
+        assert_eq!(rows.len(), 21);
+        assert_eq!(rows.first(), Some(&(2, "origin/b00".to_string())));
+        assert_eq!(rows.last(), Some(&(22, "origin/b20".to_string())));
+        app.sel = 30;
+        let frame = app.render(24, 100);
+        let text = frame.text();
+        for (row, name) in picks(&frame) {
+            let drawn = text.lines().nth(row).unwrap_or_default();
+            assert!(drawn.contains(&name), "{name} is not on row {row}: {drawn}");
+        }
+        app.base_stale = Some(("origin/main".to_string(), 1));
+        assert_eq!(
+            picks(&app.render(24, 100)).first().map(|(row, _)| *row),
+            Some(3)
+        );
+        // A frame with no room for a branch names none.
+        assert!(picks(&app.render(4, 100)).is_empty());
+    }
+
+    /// A press selects the branch it named, wherever the list has moved it
+    /// since, and a branch no longer listed is nothing.
+    #[test]
+    fn a_press_selects_the_branch_it_named() {
+        let mut app = listed_app(40);
+        app.pick("origin/b07", false, 24).unwrap();
+        assert_eq!(app.sel, 7);
+        app.filter = "b3".to_string();
+        app.apply_filter();
+        app.pick("origin/b35", false, 24).unwrap();
+        let name = app
+            .view
+            .get(app.sel)
+            .and_then(|&i| app.branches.get(i))
+            .map(|b| b.refname.clone());
+        assert_eq!(name.as_deref(), Some("origin/b35"));
+        let sel = app.sel;
+        app.pick("origin/b07", false, 24).unwrap();
+        assert_eq!(app.sel, sel, "filtered out: nothing");
+    }
+
+    /// A press answers no prompt and selects nothing under one, nothing off
+    /// the list takes a press at all, and one made under the filter's bar ends
+    /// the editing, so the keys after it are the list's.
+    #[test]
+    fn a_press_answers_no_prompt_and_ends_the_filter() {
+        let mut app = listed_app(5);
+        app.prompt = Some(Prompt::Sweep { paths: Vec::new() });
+        app.pick("origin/b03", true, 24).unwrap();
+        assert_eq!(app.sel, 0);
+        assert!(app.prompt.is_some());
+        app.prompt = None;
+        app.screen = Screen::Help;
+        app.pick("origin/b03", true, 24).unwrap();
+        assert_eq!(app.sel, 0);
+        assert!(matches!(app.screen, Screen::Help));
+        app.screen = Screen::List;
+        app.editing_filter = true;
+        app.pick("origin/b03", false, 24).unwrap();
+        assert_eq!(app.sel, 3);
+        assert!(!app.editing_filter);
+        assert!(app.stale_typeahead());
+    }
+
+    /// The wheel moves the list's selection and scrolls a pane, within their
+    /// ends — wrapped rows counted — and over the squash confirmation it does
+    /// nothing: any key but `y` there is a no, and a wheel is not a key.
+    #[test]
+    fn the_wheel_scrolls_and_answers_nothing() {
+        let mut app = listed_app(40);
+        app.wheel(3, 24, 80);
+        assert_eq!(app.sel, 3);
+        app.wheel(-10, 24, 80);
+        assert_eq!(app.sel, 0);
+        app.wheel(100, 24, 80);
+        assert_eq!(app.sel, 39);
+
+        app.screen = Screen::Log;
+        app.log = (0..30).map(|i| Line::plain(format!("{i}"))).collect();
+        app.wheel(5, 24, 80);
+        assert_eq!(app.log_scroll, 5);
+        app.wheel(50, 24, 80);
+        assert_eq!(app.log_scroll, 30 - 22);
+        app.log.push(Line::plain("x".repeat(200)));
+        app.wheel(50, 24, 80);
+        assert_eq!(app.log_scroll, 31 + 2 - 22, "a long line is three rows");
+
+        app.screen = Screen::Review;
+        app.reviewing = Some(Reviewing {
+            refname: "origin/b00".to_string(),
+            oid: "1".repeat(40),
+            base_oid: "2".repeat(40),
+            lines: (0..50).map(|i| Line::plain(format!("{i}"))).collect(),
+            empty: false,
+        });
+        app.prompt = Some(Prompt::Squash);
+        app.wheel(4, 24, 80);
+        assert_eq!(app.scroll, 0);
+        assert!(matches!(app.prompt, Some(Prompt::Squash)));
+        app.prompt = None;
+        app.wheel(4, 24, 80);
+        assert_eq!(app.scroll, 4);
+    }
+
+    /// The review pane wraps a line too long for the window, so the end of a
+    /// long diff line is on screen, and scrolls over the wrapped rows.
+    #[test]
+    fn the_review_pane_shows_a_long_line_whole() {
+        let mut app = reviewing_fixture();
+        let long = format!("+{}END", "x".repeat(150));
+        if let Some(r) = app.reviewing.as_mut() {
+            r.lines = vec![Line::plain("head"), Line::new(long, diff_style("+"))];
+        }
+        let text = app.render(10, 60).text();
+        assert!(text.contains("END"), "{text}");
+        assert!(text.contains("\u{21aa}"), "{text}");
+        let mut ui = FakeUi::new();
+        app.handle(Key::Char('G'), &mut ui).unwrap();
+        assert_eq!(app.scroll, 0, "four rows fit eight: nothing to scroll");
     }
 
     /// What the list reports for one branch: what a landing would find there.

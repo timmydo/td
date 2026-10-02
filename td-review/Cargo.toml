@@ -3,7 +3,7 @@ name = "td-review"
 version = "0.1.0"
 edition = "2021"
 default-run = "td-review"
-description = "Host-side integrator TUI: review branches against main, squash-land them, push to every remote"
+description = "The integrator's window: review branches against main, land them, push to every remote"
 license = "GPL-3.0-or-later"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
@@ -23,6 +23,12 @@ gate-test-args = "--bins"
 [[bin]]
 name = "td-review"
 path = "src/main.rs"
+
+# The toolkit the window draws with, by the one sibling-dependency spelling
+# the lock guard admits (AGENTS.md 'Rust code'): the lock lists this crate
+# and td-ui and nothing else.
+[dependencies]
+td-ui = { path = "../td-ui" }
 
 [lints.rust]
 unsafe_code = "forbid"

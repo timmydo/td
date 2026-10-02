@@ -179,6 +179,21 @@ text bounds and dialog permits over it are `editor` and the `editor_*`
 modules, so a program embeds the document pane through the toolkit alone
 (see "Editor core" below).
 
+Moved (increment 30): td-review, the integrator's branch review and
+landing tool, from a raw terminal of its own (`stty`, the alternate
+screen, its own escape decoder and a `less` pager) onto the widget
+window. Its panes are rows of styled text over a scrolled region, so it
+paints them in the raster's cells through `text_run` with the warm
+palette and a `Scrollbar`, and reads the window's chords. It is the first
+consumer to run its state machine off the window thread: every key can
+start a git process that takes as long as the network does, so a worker
+owns the program and the window paints the frame it sent last. Inputs
+cross to the worker stamped with the newest frame painted whole a dwell
+before the window read them, and the program's typeahead drop discards
+those stamped before the frame that raised a confirmation (td-review's
+`window.rs`). The toolkit
+is unchanged; td-review is a host tool, not yet a recipe consumer.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -3144,3 +3159,7 @@ regressions. Those increments extend the original sequence below.
     hand-rolled entries and lists in td-taskmgr, td-setup, td-mail,
     td-news, `finder` and `confirmations` may adopt them, each in its
     own landing. Landed.
+30. td-review on the widget window: the integrator's tool paints its
+    panes as styled rows through `text_run` and reads the window's
+    chords, its state machine on a worker thread with frame-stamped
+    inputs, its terminal layer and pager deleted. Landed.

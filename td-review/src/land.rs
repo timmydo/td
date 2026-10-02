@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 
 use crate::git::{Git, HeadClaim, MergeResult, NO_PUSH, SKIP_PUSH_ALL};
-use crate::term::{Line, Style, CYAN, GREEN, RED, YELLOW};
+use crate::view::{Line, Style, CYAN, GREEN, RED, YELLOW};
 
 /// How a branch is taken onto the base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -747,7 +747,7 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
     // descends from where it started, by exactly the commits that were picked,
     // is `head_before..HEAD` known to be ours alone to remove. They report
     // rather than propagate, as does everything below — the commits are on the
-    // base now, and an error out of here would tear the TUI down with them
+    // base now, and an error out of here would tear the window down with them
     // landed and nothing on screen saying so.
     if !git.contains(&head_after, &head_before).unwrap_or(false) {
         return Ok(left_standing(
@@ -1053,7 +1053,7 @@ fn partition_landed(
 
 /// What a delete of `short` would touch: (deletable, diverged). `only` limits the
 /// search to the remotes it names; `landed_oid` filters out remotes whose tip the
-/// landing never took. The single place both the TUI and the CLI decide this.
+/// landing never took. The single place both the window and the CLI decide this.
 pub fn delete_plan(
     git: &Git,
     short: &str,
@@ -1220,7 +1220,7 @@ pub struct PushAllTargets {
 }
 
 /// Split every configured remote into the ones a push-all takes and the ones
-/// `remote.<name>.skipPushAll` excuses. The one place both the TUI's `P` and
+/// `remote.<name>.skipPushAll` excuses. The one place both the window's `P` and
 /// the CLI's `--push` decide this; `p` and a hand-typed `git push <remote>`
 /// name a remote and so go there whatever it has configured.
 pub fn push_all_targets(git: &Git) -> io::Result<PushAllTargets> {

@@ -1,4 +1,5 @@
-//! td-review — the integrator's branch review and landing TUI. It replays the
+//! td-review — the integrator's branch review and landing window, drawn with
+//! td-ui on whatever Wayland compositor the environment names. It replays the
 //! branch's own commits onto the base (`r`, and the default headless mode) or
 //! squashes them into one (`s`), then a separate `p`/`P` push, driven with
 //! plumbing so each step's outcome is visible and testable. A `w` sweep removes
@@ -10,7 +11,8 @@ mod app;
 mod git;
 mod land;
 mod record;
-mod term;
+mod view;
+mod window;
 mod worktrees;
 
 use std::env;
@@ -18,10 +20,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use app::{App, Flow};
+use app::App;
 use git::{now_unix, Git};
 use land::Outcome;
-use term::{scrub, scrub_lines, Terminal};
+use view::{scrub, scrub_lines};
 
 const USAGE: &str = "\
 usage: td-review [options]
@@ -31,13 +33,13 @@ usage: td-review [options]
 options:
   -C, --repo <path>   work tree to operate on (default: current directory)
   -b, --base <name>   branch to review against and land into (default: main)
-      --list          print the branch table and exit (no TUI)
+      --list          print the branch table and exit (no window)
       --preview <br>  print what landing <br> would stage, and exit
       --land <branch> land <branch> non-interactively, replaying its own
                       commits onto the base; needs --yes
       --squash        with --land, collapse them into one commit instead
       --push          with --land, also push the base to every remote (`P`;
-                      the TUI's `p` pushes to the base's remote alone). A
+                      the window's `p` pushes to the base's remote alone). A
                       remote with `remote.<name>.skipPushAll` set is left out
                       of this and of `P`, and of nothing else
       --expect <oid>  with --land, require the branch to still be at <oid>
@@ -53,13 +55,13 @@ options:
       --yes           confirm a non-interactive --land, --delete or sweep
   -h, --help          this text
 
-keys (TUI):
+keys (window; it opens on $WAYLAND_DISPLAY):
   j/k move   enter review   r reload   / filter   D delete   w worktrees
-  ? help   q quit
+  ? help   q quit   a click selects a row, a double click reviews it
   f fetch the base's remote   F fetch every remote
   p push the base to its remote   P push the base to every remote that has
   not set remote.<name>.skipPushAll
-  in review: j/k or space/b scroll, p pager, s squash + land, r rebase + land
+  in review: j/k or space/b scroll, s squash + land, r rebase + land
   landing commits only; p publishes it afterwards, unconfirmed, and
   deletes the branches it published from the remotes it reached
 ";
@@ -226,27 +228,27 @@ fn run(args: Args) -> io::Result<ExitCode> {
         return show_preview(&git, &args.base, &branch).map(|()| ExitCode::SUCCESS);
     }
     if let Some(branch) = args.delete.clone() {
-        // Hand-named on the command line, like `D` in the TUI: no landed oid to
+        // Hand-named on the command line, like `D` in the window: no landed oid to
         // filter by, so every pushable remote carrying it is a target.
         return delete_headless(&git, &args.base, &branch, args.yes, None);
     }
     if let Some(branch) = args.land.clone() {
         return land_headless(&git, &args.base, &branch, &args);
     }
-    run_tui(git, args.base).map(|()| ExitCode::SUCCESS)
+    run_window(git, args.base).map(|()| ExitCode::SUCCESS)
 }
 
 fn list_branches(git: &Git, base: &str) -> io::Result<()> {
     let branches = git.branches(base)?;
-    // Resolved once for the whole run, as the TUI does: a base that moved
+    // Resolved once for the whole run, as the window does: a base that moved
     // mid-listing would leave two rows describing different bases.
     let base_tree = git.resolve_base(base).ok();
     let now = now_unix();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for b in &branches {
-        // Both halves of the verdict from the same two functions the TUI's rows
-        // use — this column showing a record where the TUI showed what a
+        // Both halves of the verdict from the same two functions the window's rows
+        // use — this column showing a record where the window showed what a
         // LANDING would find is how a branch already on the base came to read
         // `ok` in one of them. Per ROW rather than per run, so the listing
         // still streams: the merge behind each is a process, and a run of them
@@ -254,9 +256,9 @@ fn list_branches(git: &Git, base: &str) -> io::Result<()> {
         let ready = app::readiness_of(git, base, b);
         let prospect = git.prospect_of(base_tree.as_ref(), b);
         // Refnames and subjects are untrusted; --list prints straight to a
-        // terminal, so neutralise them here as the TUI's frame does.
+        // terminal, so neutralise them here as the window's frame does.
         //
-        // The TUI's floor width, not a hand-typed copy of it. Unlike the TUI
+        // The window's floor width, not a hand-typed copy of it. Unlike the window
         // this cannot GROW to an outsized verdict (that needs every row first,
         // which is the pause above): `10/100!` overruns it and shifts its own
         // row, as it did when this column was narrower still.
@@ -321,7 +323,7 @@ fn prune_worktrees(git: &Git, base: &str, yes: bool) -> io::Result<ExitCode> {
 }
 
 /// Print what landing `branch` would stage, without staging it — the same
-/// preview the review pane renders, for a look that does not open the TUI.
+/// preview the review pane renders, for a look that does not open the window.
 fn show_preview(git: &Git, base: &str, branch: &str) -> io::Result<()> {
     let p = land::preview(git, base, branch)?;
     let stdout = io::stdout();
@@ -356,8 +358,8 @@ fn delete_headless(
     let (named, short) = git::split_remote(branch, &remotes);
     // Post-land cleanup considers every remote — so it can SAY which ones it
     // leaves alone — and deletes only from those the push REACHED, as the
-    // TUI's sweep does: a remote that did not take the landing must keep its
-    // copy of the branch, which since `skipPushAll` includes one that was
+    // window's sweep does: a remote that did not take the landing must keep
+    // its copy of the branch, which since `skipPushAll` includes one that was
     // never asked. The oid filter is what makes even the reached ones safe; an
     // ad-hoc `--delete origin/x` touches only the remote it names.
     let landed_oid = landed.map(|(oid, _)| oid);
@@ -520,22 +522,11 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_tui(git: Git, base: String) -> io::Result<()> {
+fn run_window(git: Git, base: String) -> io::Result<()> {
+    let title = format!("td-review {}", scrub(&git.repo().display().to_string()));
     let mut app = App::new(git, base);
+    // Read before the window opens, so a repository git cannot list is an
+    // error on the command line rather than a window that shows nothing.
     app.reload()?;
-    let mut term = Terminal::open()?;
-    loop {
-        let (rows, cols) = term.size();
-        term.draw(app.render(rows, cols))?;
-        // The prompt is on screen now: drop anything typed while the last
-        // command ran, before reading the answer.
-        app.settle_prompt(&mut term)?;
-        let keys = term.read_keys()?;
-        if keys.is_empty() {
-            return Ok(()); // tty closed
-        }
-        if matches!(app.feed(keys, &mut term)?, Flow::Quit) {
-            return Ok(());
-        }
-    }
+    window::run(app, title)
 }

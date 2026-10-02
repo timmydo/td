@@ -1,7 +1,8 @@
-//! Capturing wrapper around the `git` CLI plus the few queries the review TUI
+//! Capturing wrapper around the `git` CLI plus the few queries the review window
 //! needs. Everything runs with the pager and colour disabled so parsed output
-//! is plain text, and with `GIT_TERMINAL_PROMPT=0` so a credential prompt fails
-//! loudly instead of deadlocking behind the alternate screen.
+//! is plain text, and with `GIT_TERMINAL_PROMPT=0` and stdin closed so a
+//! credential prompt fails loudly instead of waiting on a terminal nobody is
+//! looking at.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -769,35 +770,6 @@ impl Git {
                 args.join(" "),
                 run.failure()
             )))
-        }
-    }
-
-    /// Run git with the terminal handed over (pager, colour, prompts) for the
-    /// "open this diff in my own pager" escape hatch. Stdio is bound to
-    /// `/dev/tty` rather than inherited, so the pager still works when
-    /// td-review's own stdin or stdout is redirected.
-    pub fn run_interactive(&self, args: &[&str]) -> io::Result<()> {
-        let open = |write: bool| -> io::Result<std::fs::File> {
-            std::fs::OpenOptions::new()
-                .read(!write)
-                .write(write)
-                .open("/dev/tty")
-        };
-        let status = Command::new("git")
-            .current_dir(&self.repo)
-            .args(args)
-            .stdin(Stdio::from(open(false)?))
-            .stdout(Stdio::from(open(true)?))
-            .stderr(Stdio::from(open(true)?))
-            .status()
-            .map_err(|e| io::Error::new(e.kind(), format!("running git: {e}")))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(match status.code() {
-                Some(c) => format!("git {} exited with status {c}", args.join(" ")),
-                None => format!("git {} terminated by signal", args.join(" ")),
-            }))
         }
     }
 

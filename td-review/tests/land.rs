@@ -1227,7 +1227,7 @@ fn a_non_conflict_merge_failure_is_not_reported_as_a_conflict() -> Res<()> {
 
 #[test]
 fn refuses_a_branch_that_moved_since_it_was_reviewed() -> Res<()> {
-    // The TUI pins the reviewed tip and passes it as --expect; a concurrent
+    // The window pins the reviewed tip and passes it as --expect; a concurrent
     // fetch must not slip new commits into the landing.
     let s = scenario("moved")?;
     let stale = git(&s.work, &["rev-parse", "origin/work-0001-feature~1"])?
@@ -1356,7 +1356,7 @@ fn a_hook_rejection_leaves_the_squash_staged_and_says_so() -> Res<()> {
     Ok(())
 }
 
-/// `--preview` is the non-TUI review path, so its diff has to stay readable:
+/// `--preview` is the windowless review path, so its diff has to stay readable:
 /// a newline is a control character and blanket scrubbing folds the whole thing
 /// onto one line.
 #[test]
@@ -1668,7 +1668,7 @@ fn a_remote_that_opts_out_of_push_all_is_left_out_and_still_pushable_by_name() -
 /// `--delete-landed` sweeps the remotes the push REACHED, which is no longer
 /// every pushable one: a remote that sat the push-all out never took the
 /// landing, so deleting its copy of the branch would leave that remote with
-/// neither. The TUI's sweep was already scoped this way for a mirror that
+/// neither. The window's sweep was already scoped this way for a mirror that
 /// rejected a push; an opt-out is the same shape.
 #[test]
 fn the_landed_sweep_spares_a_branch_on_a_remote_the_push_all_left_out() -> Res<()> {
@@ -1981,7 +1981,7 @@ fn lands_onto_a_base_other_than_main() -> Res<()> {
 fn flag_combinations_that_do_nothing_are_rejected() -> Res<()> {
     let s = scenario("flags")?;
     // Each row pins the message it must be rejected WITH: several of these
-    // combinations also fail for want of a tty, which would green the assertion
+    // combinations also fail for want of a window, which would green the assertion
     // without the guard ever running.
     for (args, want) in [
         (
@@ -2108,7 +2108,7 @@ fn a_remote_head_symref_is_not_offered_as_a_branch() -> Res<()> {
 /// `ok` — a cell that means "ready to land" beside a landing that refuses it.
 /// Its tip no longer merges (the base moved onto a file it also added), which
 /// is what stops the tree question answering and what left this row saying `ok`
-/// after the TUI's had learnt to say `landed`.
+/// after the window's had learnt to say `landed`.
 #[test]
 fn list_says_landed_for_a_branch_the_base_carries_and_no_longer_merges() -> Res<()> {
     let s = scenario("list-carried")?;
@@ -2151,7 +2151,7 @@ fn list_says_landed_for_a_branch_the_base_carries_and_no_longer_merges() -> Res<
     // The A/B cell is the second field, and it answers the same question the
     // word does: nothing to take. Pinned HERE because this column has already
     // drifted between the two paths once, which is what `--list` sharing the
-    // TUI's own two functions is for.
+    // window's own two functions is for.
     assert!(
         row.split_whitespace()
             .nth(1)

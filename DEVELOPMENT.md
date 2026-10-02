@@ -226,7 +226,8 @@ local or draft work.
 
 ## Land
 
-A single integrator lands from another clone with `td-review`. It lists remote
+A single integrator lands from another clone with `td-review`, which opens a
+td-ui window on the session's Wayland compositor. It lists remote
 branches and their review records, `r` replays the branch's commits onto main,
 `p` pushes, and `w` sweeps fully landed worktrees. Rebase landing preserves
 each commit, subject, body, and review record. The post-push branch and worktree
