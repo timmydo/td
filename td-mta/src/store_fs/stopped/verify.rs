@@ -26,8 +26,8 @@ mod publication;
 pub use publication::{probe_journal_publication, probe_pinned_reads, probe_read_pool};
 pub use publication::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
-    PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead, ReadPoolError,
-    ReadScratchPool, ReadScratchSlot,
+    PinnedBlob, PinnedBlobInput, PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead,
+    ReadPoolError, ReadScratchPool, ReadScratchSlot,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -512,12 +512,15 @@ mod tests {
         }
     }
     fn blob(store: &StoppedStore) {
+        blob_bytes(store, b"abc", BlobKind::Message);
+    }
+    fn blob_bytes(store: &StoppedStore, bytes: &[u8], kind: BlobKind) {
         let id = BlobId::from_bytes([0x44; 16]);
         let mut digest = Provider.sha256().unwrap();
-        digest.update(b"abc").unwrap();
+        digest.update(bytes).unwrap();
         let row = Row::Blob(BlobRow {
-            kind: BlobKind::Message,
-            length: 3,
+            kind,
+            length: bytes.len() as u64,
             digest: digest.finish().unwrap(),
             created_at: 0,
         });
@@ -535,21 +538,24 @@ mod tests {
         journal.extend_from_slice(&frame);
         fixture::write(&store.root, &journal);
         for entry in [
-            AccountEntry::Messages,
+            if kind == BlobKind::Message {
+                AccountEntry::Messages
+            } else {
+                AccountEntry::Uploads
+            },
             AccountEntry::Temporary,
-            AccountEntry::Shard(BlobKind::Message, 0x44),
+            AccountEntry::Shard(kind, 0x44),
         ] {
             store.root.create_account_directory(ACCOUNT, entry).unwrap();
         }
         let mut file = store
             .root
-            .create_temporary(ACCOUNT, Number::new(900).unwrap(), 3)
+            .create_temporary(ACCOUNT, Number::new(900).unwrap(), bytes.len() as u64)
             .unwrap();
-        file.write(b"abc").unwrap();
-        file.sync()
-            .unwrap()
-            .publish_blob(BlobKind::Message, id)
-            .unwrap();
+        for chunk in bytes.chunks(super::super::super::MAX_FILE_STEP_BYTES) {
+            file.write(chunk).unwrap();
+        }
+        file.sync().unwrap().publish_blob(kind, id).unwrap();
     }
     #[test]
     fn actual_current_drives_empty_tail_and_blob_verification_with_reusable_scratch() {
@@ -716,6 +722,21 @@ mod tests {
         let clock = TestClock::new(u64::MAX, 0);
         let verified = store
             .verify_owned_account(&Provider, &clock, ACCOUNT, limits(), scratch.borrowed())
+            .unwrap();
+        (dir, verified, scratch)
+    }
+    pub(super) fn owned_blob_fixture(
+        bytes: &[u8],
+        kind: BlobKind,
+    ) -> (super::super::super::tests::Fixture, VerifiedStore, Scratch) {
+        let (dir, store, _) = prepare();
+        blob_bytes(&store, bytes, kind);
+        let mut scratch = Scratch::new();
+        let clock = TestClock::new(u64::MAX, 0);
+        let mut request = limits();
+        request.data.blob_bytes = bytes.len() as u64;
+        let verified = store
+            .verify_owned_account(&Provider, &clock, ACCOUNT, request, scratch.borrowed())
             .unwrap();
         (dir, verified, scratch)
     }

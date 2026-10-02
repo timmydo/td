@@ -1119,6 +1119,13 @@ service activation. Each part lands independently:
     fresh pin and drop both leases inside measurement; require every Rust
     allocator counter unchanged. Setup, startup, poison/unwind paths, native
     allocation and whole-worker/RSS qualification remain separate.
+  - **M05e4a — pinned immutable body reads:** implemented captured BlobRow
+    lookup and a bounded sequential digest input borrowing one pooled view.
+    Consuming EOF/extent/digest completion returns a bounded random reader of
+    the same file. Preserve one deadline/watermark and terminal body errors
+    across all stages; retain the view pin until body drop. Existing cursor
+    memory covers state. Authorization, worker integration, MIME locators and
+    combined allocation/stack qualification remain separate.
   - **M05e3 — committed visibility:** runtime integration remains pending.
     Connect pooled queries to worker ownership and queue admission; retain
     generation/history ownership across live checkpoint and retention changes.

@@ -18,7 +18,9 @@ use std::sync::{atomic::AtomicU64, Mutex, TryLockError};
 mod pool;
 #[cfg(test)]
 pub use pool::probe_read_pool;
-pub use pool::{PooledRead, ReadPoolError, ReadScratchPool, ReadScratchSlot};
+pub use pool::{
+    PinnedBlob, PinnedBlobInput, PooledRead, ReadPoolError, ReadScratchPool, ReadScratchSlot,
+};
 
 #[path = "publication/read.rs"]
 mod read;
@@ -1356,7 +1358,11 @@ mod tests {
     pub(super) fn with_ledger(run: impl FnOnce(WriterLedger<'_>)) {
         with_ledger_usage(160, 2, run);
     }
-    fn with_ledger_usage(bytes: u64, operations: u64, run: impl FnOnce(WriterLedger<'_>)) {
+    pub(super) fn with_ledger_usage(
+        bytes: u64,
+        operations: u64,
+        run: impl FnOnce(WriterLedger<'_>),
+    ) {
         let plan = DiskLimits::default()
             .plan(
                 &Limits::default().plan().unwrap(),

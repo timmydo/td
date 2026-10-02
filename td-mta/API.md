@@ -852,8 +852,8 @@ pins can query their old prefix while the session appends beyond it; no
 writer/publication lock is held during reads or callbacks. Tables and retained
 history stay immutable throughout the session. This deliberately rechecks
 physical files per scope and scans tables per row query; it is a bounded
-fallback, not a performance qualification. Blob-body reads and live
-checkpoint/retention transitions remain separate.
+fallback, not a performance qualification. Live checkpoint/retention
+transitions remain separate.
 
 ReadScratchSlot::new takes caller-owned PinnedReadScratch at startup,
 requires exact admitted replay-byte, replay-cell and change-cell extents,
@@ -879,6 +879,37 @@ publication locking or callbacks. Drop returns the pin and backing even after
 callback unwind; it briefly locks each owner separately. Backing remains
 provisional data between uses and has no secure-erasure guarantee. Startup
 allocation and the protocol worker/queue ownership remain caller duties.
+
+PooledRead::open_blob_input looks up the supplied root BlobId in its captured
+view, copies the authoritative BlobRow and opens that typed immutable path.
+The caller must authorize the account/root blob and admit query work before
+entry; this primitive does not establish email visibility or upload-lease
+access. Refuse a missing row, oversized body or incompatible descriptor
+layout. A byte cap cannot exceed i64::MAX. The returned PinnedBlobInput
+exclusively borrows the pooled view, so its pin and scratch cannot be returned
+or reused while body access exists. At most one body descriptor is retained
+per pooled view; no writable or raw file accessor is exposed.
+
+Input reads process at most 64 KiB and incrementally hash the bytes. They
+remain provisional until consuming finish checks exact consumption, unchanged
+extent, physical EOF and the authoritative digest. Success returns PinnedBlob,
+which implements BlobReader with bounded random reads from that same verified
+descriptor. It retains the original view borrow. The query's absolute deadline
+and a shared monotonic watermark span lookup, open, every input read, finish
+and subsequent random reads. Post-work time/source failure overrides an earlier
+result; any body-step failure is terminal, with subsequent calls returning the
+same fixed error without further clock or I/O work. Errors may have changed
+caller output. Dropping the body owner releases its descriptor and view borrow;
+it does not mechanically retire the writer or the pooled view. A present
+row with missing, truncated or invalid-length bytes returns Corrupt, as does
+a digest mismatch. Other I/O and caller-argument failures retain their fixed
+error classes. The caller must route Corrupt through the service-health and
+mutation-stop policy below; this primitive does not implement that wiring.
+
+These checks rely on immutable blob files in the stable private namespace.
+The completed reader does not rehash each range. Service authorization,
+worker admission, MIME/derived locators and protocol acknowledgment remain
+separate. The existing blocking-I/O deadline limitation still applies.
 
 JournalSession::commit serializes one immutable frame under a separate
 writer mutex. It installs a frame-only reservation, advances bounded

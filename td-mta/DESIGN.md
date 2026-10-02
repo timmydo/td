@@ -125,7 +125,10 @@ scope over its captured prefix, with caller scratch, full physical-file checks
 and one monotonic deadline. Later appended bytes stay invisible to old readers,
 which do not hold the writer lock. A fixed read scratch pool now pairs each
 lease with a captured pin and returns both on drop. Startup verifies and
-clears caller backing; captures and reads allocate no new backing. Worker
+clears caller backing; captures and reads allocate no new backing. A pooled
+view can now lend an immutable body input bound to its captured BlobRow.
+Sequential integrity checks produce a bounded random reader of the same
+descriptor; one deadline and the view borrow survive that transition. Worker
 scheduling, live checkpoint/retention transitions and protocol mutations
 remain unimplemented.
 

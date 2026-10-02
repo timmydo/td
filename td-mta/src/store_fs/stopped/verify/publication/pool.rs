@@ -11,6 +11,10 @@ use crate::{
 };
 use std::sync::{Mutex, TryLockError};
 
+#[path = "pool/blob.rs"]
+mod blob;
+pub use blob::{PinnedBlob, PinnedBlobInput};
+
 #[derive(Debug)]
 pub enum ReadPoolError {
     InvalidBacking,
@@ -230,7 +234,7 @@ mod tests {
     use crate::{format::table::MAX_RECORD_BYTES, limits::Limits};
     use td_crypto::Provider;
 
-    struct Backing {
+    pub(super) struct Backing {
         selection: SelectionScratch,
         frames: Vec<u8>,
         cells: Vec<overlay::Cell>,
@@ -238,7 +242,7 @@ mod tests {
         changes: Vec<frame_changes::Cell>,
     }
     impl Backing {
-        fn new(plan: &ResourcePlan) -> Self {
+        pub(super) fn new(plan: &ResourcePlan) -> Self {
             Self {
                 selection: SelectionScratch::new(),
                 frames: vec![0xa5; plan.limits().journal_bytes],
@@ -250,7 +254,7 @@ mod tests {
                 changes: vec![frame_changes::Cell::EMPTY; plan.limits().frame_operations],
             }
         }
-        fn borrow(&mut self) -> PinnedReadScratch<'_> {
+        pub(super) fn borrow(&mut self) -> PinnedReadScratch<'_> {
             PinnedReadScratch {
                 selection: &mut self.selection,
                 frames: &mut self.frames,

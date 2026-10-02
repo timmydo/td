@@ -32,9 +32,9 @@ pub use verify::{
 };
 pub use verify::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
-    OwnedVerifyError, PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead,
-    ReadPoolError, ReadScratchPool, ReadScratchSlot, VerifiedAccount, VerifiedStore, VerifyError,
-    VerifyLimits, VerifyScratch,
+    OwnedVerifyError, PinnedBlob, PinnedBlobInput, PinnedReadError, PinnedReadRequest,
+    PinnedReadScratch, PooledRead, ReadPoolError, ReadScratchPool, ReadScratchSlot,
+    VerifiedAccount, VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
 };
 
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.

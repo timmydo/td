@@ -291,15 +291,15 @@ still account for those costs and concurrent owners within the ledger.
   Pinned query preparation borrows one captured pin exclusively and reuses
   caller selection, replay frame/cell, record and change partitions. Its
   5032-byte SelectionScratch uses 5 KiB of the existing 292 KiB cursor/value
-  reservation. Pool bookkeeping takes another 1 KiB, leaving 57 KiB for
-  cursor/history/index/checksum state. It keeps one LoadedOverlay descriptor
-  while the existing table/history sweeps reuse record/change scratch, then
-  lends ValidationView (the existing 4 KiB state bound) only within a
-  callback. No second recovery-frame arena or heap-owned reader is created.
-  File validation and full-table row scans repeat per scope and query
-  respectively; this is a bounded fallback. The complete preparation/query
-  stack still needs qualification. No per-pin heap, new worker or additional
-  arena is admitted.
+  reservation. Pool bookkeeping takes 1 KiB and pinned-body state takes 4
+  KiB, leaving 53 KiB for cursor/history/index/checksum state. It keeps one
+  LoadedOverlay descriptor while the existing table/history sweeps reuse
+  record/change scratch, then lends ValidationView (the existing 4 KiB state
+  bound) only within a callback. No second recovery-frame arena or
+  heap-owned reader is created. File validation and full-table row scans
+  repeat per scope and query respectively; this is a bounded fallback. The
+  complete preparation/query stack still needs qualification. No per-pin
+  heap, new worker or additional arena is admitted.
 
   The Rust allocation probe measures complete pinned read scopes in sixteen
   intervals at short and maximum roots. Cases cover successful get/next/change
@@ -340,6 +340,16 @@ still account for those costs and concurrent owners within the ledger.
   short retained history. Poison, unwinding, native allocation, maximum
   datasets and complete worker stacks are outside this probe's measured
   scope.
+
+  A pooled view lends at most one PinnedBlobInput or PinnedBlob at a time.
+  Their combined compiled state is capped at 4 KiB during construction,
+  reserved from existing cursor/value space. This covers the descriptor,
+  digest, clock and terminal-error state across the consuming handoff. A
+  fixed 64-byte BlobRow lookup buffer uses the worker stack. Sequential and
+  random reads use caller output and at most 64 KiB per call, without a
+  whole-body arena. The descriptor retains the pooled view's pin and backing
+  until drop. No arena size or planning total changes; allocation and complete
+  worker-stack/RSS qualification for this combined path remain separate.
 
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
@@ -644,7 +654,7 @@ concrete structures require a ledger amendment before admission is enabled.
 | Reservation | Partition |
 | --- | --- |
 | Body work, 96 KiB/job | Six 8 KiB nested-decode rings (NestedPartId::MAX_STEPS); 16 KiB parser/boundary/locator state; 32 KiB conversion/output |
-| Read cursor/value, 292 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 57 KiB cursors, history streaming, sparse-index lookups and checksums; 96 KiB retained frame changes |
+| Read cursor/value, 292 KiB/view | 68 KiB table-record input; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 4 KiB pinned-body input/reader state; 53 KiB cursors, history streaming, sparse-index lookups and checksums; 96 KiB retained frame changes |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB frame-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
 | Log, 128 KiB | 384 queued fixed event cells of at most 256 bytes (96 KiB); 16 KiB encoder/output; 16 KiB rotation/drop counters and emergency status |

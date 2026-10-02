@@ -619,7 +619,7 @@ selected tables/history immutable and prevents reclamation. Active-prefix
 readers stop at their captured offset even if a later append is complete,
 partial or failed. Only this owned session path permits queries concurrently
 with physical append; standalone append still requires stopped-store
-exclusion. This scope adds no namespace mutation or blob reader.
+exclusion. This scope adds no namespace mutation.
 Revalidating files per scope and rescanning tables per row is a bounded
 fallback; full-service performance and allocation qualification remain open.
 
@@ -639,6 +639,27 @@ read I/O, publication locking or user callbacks. Returned scratch is reused
 without a per-query allocation or erasure promise. No lease can outlive its
 pool or session. Worker scheduling, queue tickets and live namespace changes
 remain separate; this is the admitted scratch ownership boundary.
+
+A pooled view can lend one pin-bound blob input. Resolve its BlobId through
+the captured metadata view and enforce the caller's byte ceiling before
+opening the row's immutable message/upload path. The caller separately
+establishes account and root-object authorization. The input holds an exclusive
+borrow of the pooled view for its whole lifetime. Sequential reads hash at most
+64 KiB per step; bytes are provisional until complete consumption, EOF, extent
+and digest checks succeed. Consuming finish returns a bounded random reader
+of the same descriptor, retaining that borrow and its pin.
+
+One monotonic watermark and the query deadline cover metadata lookup, body
+opening, reads, digest completion and random reads. Check time before and
+after each body operation; a late failure discards success and overrides an
+earlier I/O result. A failed input/reader stores a fixed terminal error and
+performs no further clock or I/O work. Dropping it releases the body descriptor
+and borrow, allowing the pooled view to be reused. This adds no mutation or
+reclamation path; completed ranges rely on the retained immutable namespace.
+Missing/truncated bytes and invalid extents for an existing committed row
+are Corrupt, including errors during later range reads. Digest mismatch is
+also Corrupt. Callers must apply the service-health/mutation-stop policy;
+resource release does not authorize ignoring the corruption.
 
 A commit reserves one frame, performs bounded write/sync/confirmation and
 exact ledger reconciliation, releases the empty reservation, then replaces
