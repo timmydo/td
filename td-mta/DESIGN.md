@@ -79,6 +79,8 @@ source, hides earlier changes and returns reusable slots only after selected
 completion. A sequential scan now coordinates cursor draining and checked
 source transitions with the same arena. Actual view-pin integration remains
 separate.
+Direct owning references now have a bounded supplied-row checker with at most
+two lookups; whole-graph enumeration and physical blob verification remain.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

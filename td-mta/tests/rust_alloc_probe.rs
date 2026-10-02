@@ -17,11 +17,14 @@ use allocation_shim::TD_MTA_ALLOCATION_COUNTERS as COUNTERS;
 use std::hint::black_box;
 use td_crypto::Digest;
 
-// Compile the same filesystem sources with their cfg(test) fixture so the
-// namespace-mapped test identity needs no production root-policy exception.
+// Compile filesystem and checker sources with their cfg(test) fixtures.
+// Filesystem fixtures need no production exception for the mapped test identity.
 use td_mta::{
     bounded, change_cursor, config, format, frame_changes, ids, merge, overlay, ports, store_paths,
 };
+#[path = "../src/row_references.rs"]
+#[allow(unused)]
+mod measured_row_references;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
 pub mod measured_store_fs;
@@ -87,6 +90,7 @@ fn hot_paths() {
         store_frame_parts();
         store_complete_frames();
         store_paths();
+        measured_row_references::tests::probe();
         let mut line = td_mta::smtp_wire::LineReader::new(&mut scratch).unwrap();
         assert!(!line.feed(black_box(b"EHLO example")).unwrap().complete);
         assert!(line.feed(black_box(b".test\r\n")).unwrap().complete);

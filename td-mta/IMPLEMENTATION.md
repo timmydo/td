@@ -918,6 +918,14 @@ service activation. Each part lands independently:
     exact continuation, I/O refusal and exhausted ranges without I/O. Existing
     allocation probes cover source transfer/reclaim. Runtime ReadView integration
     and early-page validity/pins remain future.
+  - **M05d15 — direct final-row references:** implemented supplied-source
+    validation with at most two typed targets and one ReadView get per advance.
+    Check identity around lookups, source/target sequence ceilings, blob kinds,
+    recipient ordinal bounds and lease account/expiry; omit historical IDs.
+    Tests cover every table, missing/malformed targets, view movement, time
+    boundary, incomplete/terminal state and fixed lookup counts. Existing
+    allocation instrumentation covers the helper. Whole-graph enumeration,
+    physical blob verification, parent cycles and real pins remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

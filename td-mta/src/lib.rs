@@ -18,6 +18,7 @@ pub mod observability;
 pub mod overlay;
 pub mod ownership;
 pub mod ports;
+pub mod row_references;
 pub mod smtp_wire;
 pub mod store_fs;
 pub mod store_paths;

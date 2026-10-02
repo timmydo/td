@@ -119,6 +119,17 @@ still account for those costs and concurrent owners within the ledger.
   No visited-ID collection, pool or additional result arena is created. The
   allocation probe covers a rooted chain, a cycle, a missing target and read
   exhaustion using a fixed view and caller buffer after cold preparation.
+  ReferenceCheck retains at most two typed direct targets, borrowed source key,
+  identity/time and scalar progress. Its compiled state fits 512 stack bytes;
+  the source key uses the caller's existing key storage while each get borrows
+  the separate result buffer. A key borrowed from next's Record also retains
+  the shared value-buffer lifetime: the driver first detaches it into existing
+  independent cursor/key scratch and decodes from that borrow before reuse.
+  That scratch remains separately charged; ReferenceCheck allocates none.
+  Total lookup count is at most two. No collection
+  or arena is added. Allocation instrumentation checks all source table kinds,
+  live/expired leases, historical-ID omission, zero-target completion and sticky
+  missing-target refusal using a fixed view and stack scratch.
   Frame-change collection has its own 4096 slots of at most 24 bytes each,
   a separate 96 KiB reservation per view. Retained changes may coexist with
   get/next result storage; their memory never aliases those partitions. This

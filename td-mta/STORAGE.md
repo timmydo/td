@@ -899,6 +899,46 @@ the caller also checks deadlines between advances. An advance after completion
 performs no get, but still refuses a changed view. Failed or unfinished walks
 cannot produce completion.
 
+`row_references::ReferenceCheck` validates direct owning references of one
+supplied final row. Validate the source key/value and sequence ceiling first,
+then retain only the borrowed source key and at most two copied typed targets.
+Each advance performs at most one get through the supplied ReadView, checks
+exact identity before and after it, validates the target row/key and sequence,
+and requires the expected blob kind or recipient ordinal below the owning
+submission's recipient_count. View movement takes precedence over a returned
+row, absence or lookup error. Missing targets, invalid kinds/counts, malformed
+rows, future sequences and lookup failures retire the whole check.
+
+Email requires a message blob and thread; membership requires email/mailbox;
+keyword and thread anchor require email; submission requires its transmitted
+message blob; recipient requires submission; a mailbox's immediate parent must
+exist. This direct check does not detect parent cycles; ParentWalk handles the
+full chain separately. Submission email/thread/identity/notification IDs and
+import mappings remain historical and cause no lookup. Blob and thread rows
+have no outgoing owning references.
+
+A lease must name the view's account even when expired. Its upload blob is a
+required target only while expires_at is strictly later than the supplied UTC
+millisecond sample. The driver supplies a trusted clock sample and refuses
+clock failure; completion retains that sample, so it is not timeless lease
+validity or permission to reclaim bytes. Device authorization/revocation remains
+separate. CompleteReferences binds the supplied source key/sequence, identity,
+time and successful lookup count. It grants no proof that the supplied source
+was read from disk, that a blob file exists/hashes correctly, that all rows were
+checked or that actual pins are held. The coordinator checks every final row,
+blob contents, mailbox chains and aggregate invariants before activation.
+
+Source key bytes must remain valid until completion; target lookup uses a
+separate caller result buffer and releases borrowed target rows before the next
+advance. ReadView::next ties the returned Record's key and value lifetimes
+together. To reuse that value buffer for reference lookups, copy/re-derive the
+source key into independent existing cursor/key scratch and decode from that
+separate borrow before creating ReferenceCheck. The helper does not detach a
+Record's shared borrow or obtain another arena implicitly. A zero-target check still verifies identity on its first advance.
+Completed checks perform no more lookups but continue rejecting identity change;
+failed/unfinished checks cannot finish. At most two gets are performed, each
+subject to the view's work/scratch limits and caller deadline admission.
+
 Thread assignment does not depend on disposable indexes or rescanning every
 body. Store at most one anchor per email: its first syntactically valid
 Message-ID within a 1004-byte ceiling (four-byte length plus ID plus 16-byte

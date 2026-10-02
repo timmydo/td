@@ -756,6 +756,17 @@ request the next frame. Complete occurs only after the pinned endpoint boundary,
 including an empty range. This helper reads no files, coalesces no JMAP events
 and supplies no live pin, selected-history validation or protocol activation.
 
+`row_references::ReferenceCheck` checks one supplied final row's direct owning
+references through ReadView, at most one get per advance and two gets total.
+It validates source/target rows and sequence ceilings, expected blob kinds,
+recipient ordinals, account-bound lease expiry and exact view identity around
+lookups. Historical IDs cause no lookup. Completion records supplied source,
+identity and wall-time sample; full graph/blob/parent-cycle validation and actual
+pins remain coordinator requirements. Its source key borrow stays separate from
+the caller's target-result scratch. A key from next's Record must first be
+detached/re-decoded into independent key scratch to end the shared key/value
+borrow before reusing that value buffer for target lookups.
+
 `store_fs::ChangeRoute` selects the source for a NeedFrame sequence using
 selected manifest metadata and captured ViewIdentity. It validates retained
 coverage through the checkpoint, then returns a history descriptor index or
