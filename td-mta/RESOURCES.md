@@ -716,6 +716,18 @@ it cannot repeatedly search from the same position. M06 must prove linear
 replay in run length at the fixed six-stage ceiling, including refills and
 simultaneous nested lookahead. Every replay byte/transition is charged.
 
+The initial MIME base64 decoder keeps at most 32 bytes of inline state,
+including at most three pending output octets. It borrows caller buffers and
+yields after 256 input/output/EOF transitions. Source visits and emitted
+bytes consume the enclosing work meter; record charging remains with MIME
+object traversal. Its copied state fits inside a future source-position
+checkpoint rather than copying any ring. No arena or process-budget total
+changes. The Rust allocation probe covers construction,
+empty/normal/malformed input with single-byte output, completion and sticky
+work refusal in one interval with every counter unchanged. This does not
+qualify nested sources, maximum bodies, complete parser stacks or service
+RSS.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

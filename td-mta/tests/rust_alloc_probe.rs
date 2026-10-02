@@ -867,6 +867,68 @@ fn store_read_pool() {
     }
 }
 
+fn mime_base64() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_base64::{Decoder, Status},
+        ports::{Deadline, Tick},
+    };
+    let before = COUNTERS.snapshot();
+    for (input, expected, problem) in [
+        (b"TWFu".as_slice(), b"Man".as_slice(), false),
+        (b"T!Q==Z".as_slice(), b"M".as_slice(), true),
+        (b"".as_slice(), b"".as_slice(), false),
+    ] {
+        let mut decoder = Decoder::default();
+        let mut meter = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 6,
+                output_bytes: 3,
+                ..Charge::default()
+            },
+        );
+        let mut input_at = 0;
+        let mut output_at = 0;
+        loop {
+            let mut byte = [0; 1];
+            let step = decoder
+                .poll(
+                    black_box(input.get(input_at..).unwrap()),
+                    &mut byte,
+                    true,
+                    Tick(1),
+                    &mut meter,
+                )
+                .unwrap();
+            input_at += step.consumed;
+            if step.written != 0 {
+                assert_eq!(byte.first(), expected.get(output_at));
+                output_at += step.written;
+            }
+            if step.status == Status::Complete {
+                break;
+            }
+        }
+        assert_eq!(input_at, input.len());
+        assert_eq!(output_at, expected.len());
+        assert_eq!(decoder.is_encoding_problem(), problem);
+    }
+    let mut decoder = Decoder::default();
+    let mut meter = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+    assert_eq!(
+        decoder.poll(b"T", &mut [], true, Tick(1), &mut meter),
+        Err(Stop::IoBytes)
+    );
+    assert_eq!(
+        decoder.poll(b"", &mut [], true, Tick(1), &mut meter),
+        Err(Stop::IoBytes)
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME base64 allocated");
+}
+
 fn store_pinned_blobs() {
     let mut samples = [COUNTERS.snapshot(); 40];
     let mut slots = samples.iter_mut();
@@ -1093,6 +1155,7 @@ fn main() {
         store_pinned_reads();
         store_read_pool();
         store_pinned_blobs();
+        mime_base64();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1174,6 +1237,7 @@ fn main() {
     store_pinned_reads();
     store_read_pool();
     store_pinned_blobs();
+    mime_base64();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

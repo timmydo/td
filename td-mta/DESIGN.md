@@ -713,6 +713,12 @@ service or hiding an accepted raw message. POLICY.md defines decoding,
 charsets, opaque-message access and property behavior; CASES.md names their
 independent fixtures. Their implementation still gates the Mail capability.
 
+The first transfer-decoding primitive implements the frozen base64 octets
+using fixed inline state and caller buffers. It charges source/output work,
+yields after bounded transitions and preserves malformed-input diagnostics.
+It supplies no MIME structure, nested-source ownership, charset conversion
+or protocol projection yet.
+
 ## 10. HTTP and JMAP
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,

@@ -1172,6 +1172,18 @@ power-loss ordering; include the fault I/O model and later VM evidence.
 
 **Depends on:** M02/M04. **Own:** address/header/date/MIME codecs and test corpus.
 
+Initial independently landable increments:
+
+- **M06a — stable base64 transfer decoder:** implemented fixed copied state,
+  caller-buffer progress and at most 256 transitions per turn. Charge all
+  source visits/output, preserve exact malformed-input octets and
+  diagnostics, and retire work failures. Tests cover M01 vectors, every
+  fixture split, small output, all tail pad-bit values, charged
+  backpressure, checkpoint replay and deadlines. An isolated allocation
+  interval covers basic successful/malformed/refused paths. Nested source
+  ownership, quoted-printable, headers, charsets, Unicode and protocol
+  integration remain open.
+
 Implement bounded header unfolding, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME

@@ -676,6 +676,35 @@ EHLO, AUTH and transaction reset remain M17. M07e must account for these
 borrowed reservations within the complete outbound session ledger before
 activation; this API grants no new resource allowance.
 
+### 1.12 MIME base64 octets
+
+mime_base64::Decoder implements POLICY.md's stable base64 transfer octets.
+poll borrows encoded input and output, returning exact consumed/written
+prefixes and NeedInput, NeedOutput, Yield or Complete. last marks EOF at the
+end of the supplied slice; retain its unconsumed suffix and repeat last
+until completion. Empty output is backpressure. After Complete, later polls
+return Complete with zero consumption/output and no meter work, even if the
+shared meter has since stopped. Use a fresh decoder for another body.
+Encoding problems are recoverable diagnostics, provisional until Complete.
+Padding ends the alphabet, but trailing bytes still require validation.
+
+One poll performs at most 256 transitions. Each consumed octet, including
+discarded bytes/whitespace and replay, charges Meter.io_bytes; each emitted
+octet charges output_bytes before copying. EOF consumes one transition.
+These fixed-cost byte transitions do not consume the examined-record
+counter; enclosing MIME object traversal charges its own records. Meter
+deadlines are checked at entry and every transition. The deterministic
+decoder receives the coordinator's sampled Tick; the caller must bracket
+turns with fresh clock and cancellation checks. A work/deadline refusal is
+sticky in both decoder and meter, may leave partial caller output and must
+not become a partial successful body.
+
+Decoder is fixed, Copy state. A checkpoint must separately retain its source
+position and enclosing job meter; restoring decoder state never refunds
+charged work. Source extents, nested rings, filesystem reads,
+QP/charset/NFC, part authorization and protocol output remain separate. No
+body buffer, source reader or heap owner is stored in the decoder.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
