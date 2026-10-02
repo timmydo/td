@@ -274,9 +274,19 @@ still account for those costs and concurrent owners within the ledger.
   preallocated; startup reuses selection and recovery-frame scratch,
   returning the frame to the scoped callback. Reader pins use a bounded
   counter (configured one through eight) and a borrowed owner plus copied
-  identity, without a new pool or arena. Actual read scratch leasing,
-  whole-worker stack and allocation qualification remain pending. No
-  filesystem I/O occurs under the publication mutex.
+  identity, without a new pool or arena. No filesystem I/O occurs under the
+  publication mutex. The Rust allocation probe measures public commit and
+  reader capture/drop in sixteen intervals: short and maximum roots crossed
+  with repeated public commits, an initial deadline followed by success,
+  deadlines after write/sync/reconciliation/publication, malformed frame
+  refusal and capacity/lock contention. Reservations, physical append,
+  reconciliation and visibility run inside measurement; fixture creation,
+  owned verification, ledger/session startup, frame construction and owner
+  teardown remain cold. It uses small 160-byte frames and requires all
+  allocator counters unchanged, including frees. This does not qualify
+  maximum datasets, concurrent worker stacks, native allocation, session
+  startup or whole-service RSS. Actual read scratch leasing and serving
+  query I/O remain pending.
 
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves

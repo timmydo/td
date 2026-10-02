@@ -27,7 +27,7 @@ pub use validation::{
 #[path = "stopped/verify.rs"]
 mod verify;
 #[cfg(test)]
-pub use verify::probe_verify_account;
+pub use verify::{probe_journal_publication, probe_verify_account};
 pub use verify::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
     OwnedVerifyError, VerifiedAccount, VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,

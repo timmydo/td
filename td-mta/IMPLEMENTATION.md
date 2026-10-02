@@ -1081,6 +1081,13 @@ service activation. Each part lands independently:
     failures after reservation permanently retire writes, including a late
     deadline after publication. Serving query I/O, scratch leases and live
     checkpoint/retention transitions remain separate.
+  - **M05e3c — publication allocation probe:** implemented sixteen observation
+    intervals across short/maximum roots, repeated public commit calls, reader
+    capture/drop, capacity and lock contention, constructor refusal and
+    deadlines before admission or after write/sync/reconciliation/publication.
+    Require unchanged Rust allocator counters; setup, session startup and
+    teardown remain cold. Small frames qualify these paths; maximum data,
+    native allocation, worker stacks and whole-service RSS remain separate.
   - **M05e3 — committed visibility:** serving integration remains pending.
     Connect identity pins to read scratch and immutable prefix queries; retain
     generation/history ownership across live checkpoint and retention changes.

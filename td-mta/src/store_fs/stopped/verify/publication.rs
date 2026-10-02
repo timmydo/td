@@ -359,6 +359,9 @@ impl<'r, 'a> JournalSession<'r, 'a> {
 }
 
 #[cfg(test)]
+pub use tests::probe as probe_journal_publication;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::super::tests::owned_fixture;
@@ -373,6 +376,216 @@ mod tests {
     };
     use std::sync::atomic::Ordering;
     use td_crypto::Provider;
+
+    #[derive(Clone, Copy)]
+    enum ProbeCase {
+        Chain,
+        InitialDeadline,
+        WrittenDeadline,
+        SyncedDeadline,
+        ReconciledDeadline,
+        PublishedDeadline,
+        CorruptFrame,
+        Contention,
+    }
+    /// Fixture, ledger, verification, session startup and cleanup remain cold.
+    pub fn probe(mut snapshot: impl FnMut()) {
+        use super::super::super::super::tests::Fixture;
+        use super::super::tests::owned_fixture_with;
+        for maximum in [false, true] {
+            for case in [
+                ProbeCase::Chain,
+                ProbeCase::InitialDeadline,
+                ProbeCase::WrittenDeadline,
+                ProbeCase::SyncedDeadline,
+                ProbeCase::ReconciledDeadline,
+                ProbeCase::PublishedDeadline,
+                ProbeCase::CorruptFrame,
+                ProbeCase::Contention,
+            ] {
+                let fixture = if maximum {
+                    Fixture::maximum_root()
+                } else {
+                    Fixture::new()
+                };
+                let (_dir, verified, mut scratch) = owned_fixture_with(fixture);
+                let initial = verified.identity();
+                let mut first = frame(3);
+                let second = frame(4);
+                if matches!(case, ProbeCase::CorruptFrame) {
+                    *first.last_mut().unwrap() ^= 1;
+                }
+                let fault = match case {
+                    ProbeCase::InitialDeadline => 0,
+                    ProbeCase::WrittenDeadline => 5,
+                    ProbeCase::SyncedDeadline => 7,
+                    ProbeCase::ReconciledDeadline => 11,
+                    ProbeCase::PublishedDeadline => 12,
+                    _ => u64::MAX,
+                };
+                let request_clock = TestClock::new(fault);
+                let good_clock = TestClock::new(u64::MAX);
+                with_ledger(|ledger| {
+                    verified
+                        .with_journal(
+                            &Provider,
+                            &good_clock,
+                            ledger,
+                            start(),
+                            scratch.journal(),
+                            |session, _| {
+                                snapshot();
+                                let old = session.capture().unwrap();
+                                if matches!(case, ProbeCase::Contention) {
+                                    let other = session.capture().unwrap();
+                                    assert!(matches!(
+                                        session.capture(),
+                                        Err(JournalError::Policy(PolicyError::Capacity))
+                                    ));
+                                    drop(other);
+                                    let writer = session.writer.lock().unwrap();
+                                    assert!(matches!(
+                                        session.commit(
+                                            &Provider,
+                                            &good_clock,
+                                            deadline(),
+                                            &first,
+                                            budget()
+                                        ),
+                                        Err(CommitError::Rejected(JournalError::Policy(
+                                            PolicyError::Busy
+                                        )))
+                                    ));
+                                    drop(writer);
+                                    let published = session.published.lock().unwrap();
+                                    assert!(matches!(
+                                        session.capture(),
+                                        Err(JournalError::Policy(PolicyError::Busy))
+                                    ));
+                                    drop(published);
+                                }
+                                let result = session.commit(
+                                    &Provider,
+                                    &request_clock,
+                                    deadline(),
+                                    &first,
+                                    budget(),
+                                );
+                                let through = match case {
+                                    ProbeCase::Chain => {
+                                        assert_eq!(
+                                            result.unwrap().committed_sequence,
+                                            Sequence::from_u64(3)
+                                        );
+                                        assert_eq!(
+                                            session
+                                                .commit(
+                                                    &Provider,
+                                                    &good_clock,
+                                                    deadline(),
+                                                    &second,
+                                                    budget()
+                                                )
+                                                .unwrap()
+                                                .committed_sequence,
+                                            Sequence::from_u64(4)
+                                        );
+                                        4
+                                    }
+                                    ProbeCase::Contention => {
+                                        assert_eq!(
+                                            result.unwrap().committed_sequence,
+                                            Sequence::from_u64(3)
+                                        );
+                                        3
+                                    }
+                                    ProbeCase::InitialDeadline => {
+                                        assert!(matches!(
+                                            result,
+                                            Err(CommitError::Rejected(JournalError::Policy(
+                                                PolicyError::Deadline
+                                            )))
+                                        ));
+                                        assert_eq!(
+                                            session
+                                                .commit(
+                                                    &Provider,
+                                                    &good_clock,
+                                                    deadline(),
+                                                    &first,
+                                                    budget()
+                                                )
+                                                .unwrap()
+                                                .committed_sequence,
+                                            Sequence::from_u64(3)
+                                        );
+                                        3
+                                    }
+                                    ProbeCase::CorruptFrame => {
+                                        assert!(matches!(
+                                            result,
+                                            Err(CommitError::Stopped(JournalError::Append(_)))
+                                        ));
+                                        2
+                                    }
+                                    ProbeCase::WrittenDeadline
+                                    | ProbeCase::SyncedDeadline
+                                    | ProbeCase::ReconciledDeadline
+                                    | ProbeCase::PublishedDeadline => {
+                                        assert!(matches!(
+                                            result,
+                                            Err(CommitError::Stopped(JournalError::Policy(
+                                                PolicyError::Deadline
+                                            )))
+                                        ));
+                                        if matches!(case, ProbeCase::PublishedDeadline) {
+                                            3
+                                        } else {
+                                            2
+                                        }
+                                    }
+                                };
+                                if matches!(
+                                    case,
+                                    ProbeCase::WrittenDeadline
+                                        | ProbeCase::SyncedDeadline
+                                        | ProbeCase::ReconciledDeadline
+                                        | ProbeCase::PublishedDeadline
+                                        | ProbeCase::CorruptFrame
+                                ) {
+                                    assert!(matches!(
+                                        session.commit(
+                                            &Provider,
+                                            &good_clock,
+                                            deadline(),
+                                            &second,
+                                            budget()
+                                        ),
+                                        Err(CommitError::Stopped(JournalError::Policy(
+                                            PolicyError::WriterStopped
+                                        )))
+                                    ));
+                                }
+                                let new = session.capture().unwrap();
+                                assert_eq!(old.identity(), initial);
+                                assert_eq!(
+                                    new.identity().committed_sequence,
+                                    Sequence::from_u64(through)
+                                );
+                                assert_eq!(
+                                    new.identity().committed_offset,
+                                    96 + (through - 1) * 160
+                                );
+                                drop(new);
+                                drop(old);
+                                snapshot();
+                            },
+                        )
+                        .unwrap();
+                });
+            }
+        }
+    }
 
     struct TestClock {
         calls: AtomicU64,

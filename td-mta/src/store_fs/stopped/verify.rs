@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "verify/publication.rs"]
 mod publication;
+#[cfg(test)]
+pub use publication::probe_journal_publication;
 pub use publication::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
 };
@@ -692,7 +694,12 @@ mod tests {
         assert_eq!(clock.calls.load(Ordering::Relaxed), 1);
     }
     pub(super) fn owned_fixture() -> (super::super::super::tests::Fixture, VerifiedStore, Scratch) {
-        let (dir, store, _) = prepare();
+        owned_fixture_with(super::super::super::tests::Fixture::new())
+    }
+    pub(super) fn owned_fixture_with(
+        dir: super::super::super::tests::Fixture,
+    ) -> (super::super::super::tests::Fixture, VerifiedStore, Scratch) {
+        let (dir, store, _) = super::super::tests::prepare_fixture(dir);
         fixture::write(&store.root, &fixture::journal());
         let mut scratch = Scratch::new();
         let clock = TestClock::new(u64::MAX, 0);

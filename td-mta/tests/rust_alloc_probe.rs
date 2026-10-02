@@ -834,6 +834,17 @@ fn store_reserved_append() {
     }
 }
 
+fn store_journal_publication() {
+    let mut samples = [COUNTERS.snapshot(); 32];
+    let mut slots = samples.iter_mut();
+    measured_store_fs::probe_journal_publication(|| *slots.next().unwrap() = COUNTERS.snapshot());
+    assert!(slots.next().is_none());
+    assert!(samples.iter().all(|sample| !sample.invalid));
+    for [before, after] in samples.as_chunks::<2>().0 {
+        assert_eq!(before, after, "scoped journal publication allocated");
+    }
+}
+
 fn journal_overlay() {
     use td_mta::{
         format::{
@@ -1045,6 +1056,7 @@ fn main() {
         store_temporary_files();
         store_verify_account();
         store_reserved_append();
+        store_journal_publication();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1122,6 +1134,7 @@ fn main() {
     store_temporary_files();
     store_verify_account();
     store_reserved_append();
+    store_journal_publication();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();
