@@ -225,12 +225,15 @@ fn terminal_command(
     terminal: Program,
     account: impl FnOnce() -> std::io::Result<crate::primary_account::PrimaryAccount>,
 ) -> std::io::Result<Command> {
-    if terminal == Program::TaskManager {
-        let mut command = Command::new("/bin/td-taskmgr");
+    if let Some(program) = terminal.desktop_program() {
+        let mut command = Command::new(program);
         command.env(
             "WAYLAND_DISPLAY",
             format!("/run/td-compositor/{uid}/wayland-0"),
         );
+        if terminal.starts_in_account_home() {
+            command.current_dir(account()?.home());
+        }
         return Ok(command);
     }
     let mut command = Command::new("/bin/td-term");
@@ -257,7 +260,9 @@ fn terminal_command(
         Program::Claude => {
             command.args(["--command", "/bin/cttyhack", "--stdin", "/bin/claude"]);
         }
-        Program::Home | Program::Task | Program::TaskManager => {}
+        Program::Home | Program::Task => {}
+        // Desktop programs returned above; listed so a new kind is a decision.
+        Program::TaskManager | Program::Editor | Program::Photo => {}
     }
     Ok(command)
 }
@@ -278,10 +283,16 @@ pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
         [uid, generation, handle, program] if program == "taskmgr" => {
             (uid, generation, handle, Program::TaskManager)
         }
+        [uid, generation, handle, program] if program == "editor" => {
+            (uid, generation, handle, Program::Editor)
+        }
+        [uid, generation, handle, program] if program == "photo" => {
+            (uid, generation, handle, Program::Photo)
+        }
         _ => {
-            return Err(
-                "terminal-exec requires UID GENERATION HANDLE [task|codex|claude|taskmgr]".into(),
-            )
+            return Err("terminal-exec requires UID GENERATION HANDLE \
+                 [task|codex|claude|taskmgr|editor|photo]"
+                .into())
         }
     };
     let uid = number(uid, 1000..=1000)?;
@@ -311,7 +322,7 @@ pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
         crate::primary_account::load,
     )
     .map_err(|error| error.to_string())?;
-    Err(format!("exec session terminal: {}", command.exec()))
+    Err(format!("exec session program: {}", command.exec()))
 }
 
 fn generation() -> Result<String, String> {
@@ -389,6 +400,8 @@ enum Program {
     Codex,
     Claude,
     TaskManager,
+    Editor,
+    Photo,
 }
 
 impl Program {
@@ -399,6 +412,28 @@ impl Program {
             Self::Codex => Some("codex"),
             Self::Claude => Some("claude"),
             Self::TaskManager => Some("taskmgr"),
+            Self::Editor => Some("editor"),
+            Self::Photo => Some("photo"),
+        }
+    }
+
+    /// The fixed system program a desktop request execs directly, with no
+    /// terminal around it.
+    fn desktop_program(self) -> Option<&'static str> {
+        match self {
+            Self::TaskManager => Some("/bin/td-taskmgr"),
+            Self::Editor => Some("/bin/td-editor"),
+            Self::Photo => Some("/bin/td-photo"),
+            Self::Home | Self::Task | Self::Codex | Self::Claude => None,
+        }
+    }
+
+    /// Whether a desktop program starts in the account home, where its file
+    /// dialogs begin. The task manager has no files to open.
+    fn starts_in_account_home(self) -> bool {
+        match self {
+            Self::Editor | Self::Photo => true,
+            Self::Home | Self::Task | Self::Codex | Self::Claude | Self::TaskManager => false,
         }
     }
 }
@@ -410,6 +445,8 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [5] => Ok(Request::Start(Program::Codex)),
         [6] => Ok(Request::Start(Program::Claude)),
         [7] => Ok(Request::Start(Program::TaskManager)),
+        [8] => Ok(Request::Start(Program::Editor)),
+        [9] => Ok(Request::Start(Program::Photo)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);

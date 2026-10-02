@@ -520,7 +520,8 @@ spawn and shorter than the channel frame deadline. Failure kills and reaps
 the trusted validator and closes the channel. There is no caller-provided
 executable, environment, directory path, account, uid or argument vector. A
 typed program kind selects a fixed executable and, for terminals, either
-the account home or td's fixed task worktree. All
+the account home or td's fixed task worktree; the editor and photo tool
+start in the account home. All
 authority-spawned credential-helper children replace stdin, stdout and stderr
 with `/dev/null`, clear the environment, and start from `/`. The task variant's
 eventual td-term child enters only the fixed worktree described below. Replacing
@@ -544,6 +545,8 @@ Subsequent payloads are exact byte records:
 | `05` | `81` plus a process handle for Codex in the fixed task worktree |
 | `06` | `81` plus a process handle for Claude in the fixed task worktree |
 | `07` | `81` plus a process handle for the human task manager |
+| `08` | `81` plus a process handle for the human text editor |
+| `09` | `81` plus a process handle for the human photo tool |
 
 A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
 request, trailing byte, unknown handle, wait error, timeout or transport
@@ -566,8 +569,9 @@ increase without reuse; exhaustion fails before spawn. The peer must send a
 request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
-terminal-exec UID GENERATION HANDLE [task|codex|claude|taskmgr]` in a new process group.
-The optional literal selects requests `04`, `05`, `06`, or `07`; it is not a pathname.
+terminal-exec UID GENERATION HANDLE
+[task|codex|claude|taskmgr|editor|photo]` in a new process group. The
+optional literal selects requests `04` through `09`; it is not a pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
@@ -585,9 +589,27 @@ to the verified human environment. It keeps the outer PID namespace and
 ordinary human credentials, including kernel signal permission checks.
 No authority descriptor, extra capability or elevation enters the program.
 The program is a source-built system tool, not a jailed application.
-An older authority closes the entire launch channel on unknown request
-07; its paired compositor then restarts. The image ships both peers
-atomically. The exact new record is additive within TDLA002, without
+
+Requests `08` and `09` are the same shape for the editor and the photo
+tool the image ships: after the same checks they exec `/bin/td-editor` or
+`/bin/td-photo` with no arguments and the same single added
+`WAYLAND_DISPLAY`. Unlike the task manager, each starts in the verified
+account home, derived through the shared primary-account reader as the
+task terminal's worktree is, so its file dialogs begin there rather than
+at `/`. No request carries a path, file or argument.
+
+td-review has no request, deliberately. It needs a git repository, every
+fixed one it could open lies under the human's `src`, which Claude's
+application view can write (§Application filesystem grants), and its git
+honours that repository's configuration (hooks, fsmonitor, ssh command).
+Launched unconfined from a desktop card it would run whatever a jailed
+agent planted there as the human. A request for it needs either a
+repository no application can write or a git invocation that ignores
+repository-configured commands.
+
+An older authority closes the entire launch channel on an unknown request
+`07` through `09`; its paired compositor then restarts. The image ships
+both peers atomically. The exact new record is additive within TDLA002, without
 negotiation or mixed-version compatibility.
 
 For terminal requests it execs `/bin/td-term run --socket

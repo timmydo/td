@@ -8228,6 +8228,9 @@ the system PID view outside application namespaces. It receives no root
 credentials, capability grant or authority channel; process controls use
 ordinary kernel permission checks. The compositor exposes its Task Manager
 card only in authority mode. This does not add an elevation operation.
+td-editor and td-photo are launched by fixed requests 08 and 09 under the
+same checks, starting in the account home rather than at `/`, each with its
+own card in authority mode. td-review has none: see td-authd/DESIGN.md.
 
 ### L.1 Elevation — consent without a secret
 

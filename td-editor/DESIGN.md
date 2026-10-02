@@ -1075,10 +1075,13 @@ above name them, links the binary fully static and splits its debug
 companion. The system image (`recipes/src/recipes/system-x86-64.rs`)
 copies the complete recipe output, companion included, into the immutable
 root and links `/bin/td-editor` to it, as it does td-photo's; the editor
-is run from the terminal and receives no authority, socket or credential
-of its own. Its realized-output check, `td-editor-test`, requires and asserts
-the static binary and runs `--help`, an empty `--replay` and
-`--font-license` on the target; that check is the target-artifact coverage
+is run from the terminal or from the launcher's Text Editor card, which
+the authority-mode compositor starts through fixed request 08 as the
+human, in the account home (td-authd/DESIGN.md). Either way it receives
+no authority, socket or credential of its own. Its realized-output check,
+`td-editor-test`, requires and asserts the static binary and runs
+`--help`, an empty `--replay` and `--font-license` on the target; that
+check is the target-artifact coverage
 an editor, toolkit or compositor edit selects, in place of the former
 editor-only host gate exemption.
 

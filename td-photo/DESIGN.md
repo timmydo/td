@@ -2472,10 +2472,12 @@ static and splits its debug companion: the td-editor and td-taskmgr shape,
 with a lock that lists only td-photo and td-ui. The system image
 (`recipes/src/recipes/system-x86-64.rs`) copies the complete recipe output,
 companion included, into the immutable root and links `/bin/td-photo` to
-it; the tool is run from the terminal and receives no authority, socket or
-credential of its own. Every retained file of the three trees moves the
-`td-photo-source` row of `seed/seed-digests.txt`; DESIGN.md is excluded
-from staging and from the hash.
+it; the tool is run from the terminal or from the launcher's Photos card,
+which the authority-mode compositor starts through fixed request 09 as the
+human, in the account home (td-authd/DESIGN.md). Either way it receives no
+authority, socket or credential of its own. Every retained file of the
+three trees moves the `td-photo-source` row of `seed/seed-digests.txt`;
+DESIGN.md is excluded from staging and from the hash.
 
 The realized-output check `td-photo-test` requires and asserts the static
 binary, runs `--help` and an empty `--replay` on the target, then compiles

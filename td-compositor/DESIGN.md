@@ -2507,17 +2507,22 @@ The launcher is a compositor-owned overlay, so opening it never depends on an
 already-running client. Its registry has a terminal entry that starts a
 `td-term`, one application entry for the admitted application the image names
 with `--launcher-application` (otherwise an input-monitor entry that starts
-`td-ui-demo`), a Task Manager entry in authority mode, and an explicit
-close entry. Task Manager issues fixed private request 07 and uses the
-human credentials and system PID view described in td-authd/DESIGN.md.
-Direct development mode hides that entry; the standalone task manager
-runs directly on the user's Wayland session. Mail and news carry
+`td-ui-demo`), three desktop-program entries in authority mode, and an
+explicit close entry. The desktop programs are system tools the image
+ships beside the terminal: Task Manager, Text Editor and Photos issue
+fixed private requests 07, 08 and 09, and run with the human credentials
+described in td-authd/DESIGN.md (the task manager with its system PID
+view). No request carries a path or argument. td-review is not among them,
+for the repository-trust reason td-authd/DESIGN.md gives. Direct
+development mode hides those entries and refuses their requests; there the
+programs run directly on the user's Wayland session. Mail and news carry
 launcher declarations of their own, but the image names Firefox alone, so the
 card does not show them; showing them is the relaunch work APPLICATIONS.md §W.7
 defers, and it grows the card. The application entry's uppercase label and
 lowercase search term are derived from the exact bounded application name; the
 compositor does not carry a fixture- or Firefox-specific card. The terminal is
-FIRST, so it is what an unfiltered Enter opens. The card reserves space for four entries; direct mode shows three.
+FIRST, so it is what an unfiltered Enter opens. The card reserves space
+for six entries; direct mode shows three.
 `registry_entries_are_searchable_and_fit_the_card` refuses overflow. Each entry
 owns a label, lowercase search terms, and a typed launch request. The pure
 launcher model stores a bounded 64-byte ASCII filter, requires every

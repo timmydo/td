@@ -451,7 +451,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     };
     runtime.enable_attention(options.terminal_authority);
     runtime.set_launcher_application(options.launcher_application.as_deref());
-    runtime.set_launcher_task_manager(options.terminal_authority);
+    runtime.set_launcher_authority(options.terminal_authority);
     if let Some((((path, app_id), content_rgb_a), content_rgb_b)) = options
         .application_ready_socket
         .as_deref()
@@ -1076,7 +1076,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xb4a0b3a238faf2b6;
+    const AUTHORITY_FINGERPRINT: u64 = 0x473bb8edda8e706f;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xbad9a1ce43bb1449;
     const AUTHORITY: &str = include_str!("authority.rs");

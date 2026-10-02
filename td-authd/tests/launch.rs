@@ -133,6 +133,8 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[5]).unwrap(), Request::Start(Program::Codex));
     assert_eq!(request(&[6]).unwrap(), Request::Start(Program::Claude));
     assert_eq!(request(&[7]).unwrap(), Request::Start(Program::TaskManager));
+    assert_eq!(request(&[8]).unwrap(), Request::Start(Program::Editor));
+    assert_eq!(request(&[9]).unwrap(), Request::Start(Program::Photo));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -146,7 +148,9 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![5, 0],
         vec![6, 0],
         vec![7, 0],
-        vec![8],
+        vec![8, 0],
+        vec![9, 0],
+        vec![10],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -583,6 +587,40 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
 }
 
 #[test]
+fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
+    for (program, selection, binary) in [
+        (Program::Editor, "editor", "/bin/td-editor"),
+        (Program::Photo, "photo", "/bin/td-photo"),
+    ] {
+        let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, program);
+        assert_eq!(wrapper.get_program(), "/bin/td-login");
+        assert_eq!(wrapper.get_args().last().unwrap(), selection);
+        for name in ["alice", "bob"] {
+            let command = terminal_command(
+                1000,
+                "000102030405060708090a0b0c0d0e0f",
+                17,
+                program,
+                || Ok(primary(name)),
+            )
+            .unwrap();
+            assert_eq!(command.get_program(), binary);
+            let home = format!("/home/{name}");
+            assert_eq!(command.get_current_dir(), Some(std::path::Path::new(&home)));
+            let arguments: Vec<_> = command.get_args().collect();
+            assert!(arguments.is_empty(), "{binary}: {arguments:?}");
+            assert_eq!(
+                command.get_envs().collect::<Vec<_>>(),
+                vec![(
+                    std::ffi::OsStr::new("WAYLAND_DISPLAY"),
+                    Some(std::ffi::OsStr::new("/run/td-compositor/1000/wayland-0"))
+                )]
+            );
+        }
+    }
+}
+
+#[test]
 fn task_and_agent_directories_follow_the_validated_primary_account() {
     for name in ["alice", "bob"] {
         for program in [Program::Task, Program::Codex, Program::Claude] {
@@ -607,13 +645,15 @@ fn task_and_agent_directories_follow_the_validated_primary_account() {
 }
 
 #[test]
-fn only_workspace_launches_require_the_primary_account() {
+fn only_launches_placed_in_the_account_require_the_primary_account() {
     for program in [
         Program::Home,
         Program::TaskManager,
         Program::Task,
         Program::Codex,
         Program::Claude,
+        Program::Editor,
+        Program::Photo,
     ] {
         let mut loaded = false;
         let result = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {

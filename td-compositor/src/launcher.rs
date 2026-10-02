@@ -5,13 +5,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const CARD_WIDTH: usize = 480;
-const CARD_HEIGHT: usize = 252;
+const CARD_HEIGHT: usize = 336;
 const CARD_PADDING: usize = 24;
 const MAX_LAUNCHED_CLIENTS: usize = 16;
 const MAX_APPLICATION_NAME_BYTES: usize = 32;
 const RESERVED_APPLICATION_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 const UI_ENTRY_INDEX: usize = 1;
-const ENTRY_COUNT: usize = 4;
+/// The rows before the authority's desktop programs: terminal, then the
+/// application or monitor.
+const LEADING_ENTRIES: usize = UI_ENTRY_INDEX + 1;
+/// The leading rows, the desktop programs, and close, which is always last.
+const ENTRY_COUNT: usize = LEADING_ENTRIES + AUTHORITY_ENTRIES.len() + 1;
 /// Where the first row's text starts below the card's top, how far apart
 /// rows are, and the highlight drawn behind the selected one. One set of
 /// numbers for the paint and the pointer, so a click lands on the row it
@@ -45,6 +49,21 @@ pub enum LaunchRequest {
     Terminal,
     TaskTerminal,
     TaskManager,
+    Editor,
+    Photo,
+}
+
+impl LaunchRequest {
+    /// The fixed authority program a request names, when it names one the
+    /// authority starts as the human: the desktop programs the image ships.
+    fn authority_program(self) -> Option<crate::authority::Program> {
+        match self {
+            Self::TaskManager => Some(crate::authority::Program::TaskManager),
+            Self::Editor => Some(crate::authority::Program::Editor),
+            Self::Photo => Some(crate::authority::Program::Photo),
+            Self::UiDemo | Self::Terminal | Self::TaskTerminal => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +87,26 @@ const CLOSE_ENTRY: Entry = Entry {
     request: None,
 };
 
+// The image's desktop programs, each a fixed authority request: shown only
+// when the compositor has that authority, as the task manager is.
+const AUTHORITY_ENTRIES: [Entry; 3] = [
+    Entry {
+        label: "TASK MANAGER",
+        search: "task manager processes cpu memory network disk",
+        request: Some(LaunchRequest::TaskManager),
+    },
+    Entry {
+        label: "TEXT EDITOR",
+        search: "text editor edit write notes file",
+        request: Some(LaunchRequest::Editor),
+    },
+    Entry {
+        label: "PHOTOS",
+        search: "photos photo image picture viewer",
+        request: Some(LaunchRequest::Photo),
+    },
+];
+
 const DIRECT_UI_ENTRY: Entry = Entry {
     label: "NEW INPUT MONITOR",
     search: "new input monitor demo wayland",
@@ -83,7 +122,7 @@ struct ApplicationEntry {
 fn entry_at(
     application: Option<&ApplicationEntry>,
     index: usize,
-    task_manager: bool,
+    authority: bool,
 ) -> Option<Entry<'_>> {
     match index {
         0 => Some(TERMINAL_ENTRY),
@@ -95,12 +134,11 @@ fn entry_at(
             }),
             None => Some(DIRECT_UI_ENTRY),
         },
-        2 if task_manager => Some(Entry {
-            label: "TASK MANAGER",
-            search: "task manager processes cpu memory network disk",
-            request: Some(LaunchRequest::TaskManager),
-        }),
-        3 => Some(CLOSE_ENTRY),
+        index if index == ENTRY_COUNT - 1 => Some(CLOSE_ENTRY),
+        index if authority => index
+            .checked_sub(LEADING_ENTRIES)
+            .and_then(|at| AUTHORITY_ENTRIES.get(at))
+            .copied(),
         _ => None,
     }
 }
@@ -162,7 +200,7 @@ pub struct Launcher {
     query: String,
     matches: Vec<usize>,
     application: Option<ApplicationEntry>,
-    task_manager: bool,
+    authority: bool,
 }
 
 pub struct LaunchOptions {
@@ -247,12 +285,17 @@ impl LaunchBackend {
                 authority.launch_task()?;
                 Ok(Vec::new())
             }
-            Self::Authority(authority) if request == LaunchRequest::TaskManager => {
-                authority.launch_selected(crate::authority::Program::TaskManager)?;
-                Ok(Vec::new())
-            }
-            // LiveInputTarget activates the configured scene before calling us.
-            Self::Authority(_) => Err("configured application is activation-only".into()),
+            Self::Authority(authority) => match request.authority_program() {
+                Some(program) => {
+                    authority.launch_selected(program)?;
+                    Ok(Vec::new())
+                }
+                // LiveInputTarget activates the configured scene before calling us.
+                None if request == LaunchRequest::UiDemo => {
+                    Err("configured application is activation-only".into())
+                }
+                None => Err(format!("{request:?} has no authority program")),
+            },
         }
     }
 }
@@ -317,12 +360,12 @@ impl Launcher {
             query: String::with_capacity(filter::MAX_QUERY_BYTES),
             matches: vec![0, UI_ENTRY_INDEX, ENTRY_COUNT - 1],
             application: None,
-            task_manager: false,
+            authority: false,
         }
     }
 
-    pub(crate) fn set_task_manager(&mut self, available: bool) {
-        self.task_manager = available;
+    pub(crate) fn set_authority(&mut self, available: bool) {
+        self.authority = available;
         self.refresh_matches();
     }
 
@@ -361,9 +404,7 @@ impl Launcher {
                 let request = self
                     .matches
                     .get(self.selected)
-                    .and_then(|index| {
-                        entry_at(self.application.as_ref(), *index, self.task_manager)
-                    })
+                    .and_then(|index| entry_at(self.application.as_ref(), *index, self.authority))
                     .map(|entry| entry.request);
                 let request = request?;
                 self.visible = false;
@@ -391,7 +432,7 @@ impl Launcher {
     fn refresh_matches(&mut self) {
         self.matches.clear();
         for index in 0..ENTRY_COUNT {
-            let Some(entry) = entry_at(self.application.as_ref(), index, self.task_manager) else {
+            let Some(entry) = entry_at(self.application.as_ref(), index, self.authority) else {
                 continue;
             };
             if filter::matches(entry.search, &self.query) {
@@ -489,7 +530,7 @@ impl Launcher {
             );
         }
         for (match_index, entry_index) in self.matches.iter().enumerate() {
-            let Some(entry) = entry_at(self.application.as_ref(), *entry_index, self.task_manager)
+            let Some(entry) = entry_at(self.application.as_ref(), *entry_index, self.authority)
             else {
                 continue;
             };
@@ -546,8 +587,7 @@ impl Launcher {
         self.matches
             .iter()
             .filter_map(|index| {
-                entry_at(self.application.as_ref(), *index, self.task_manager)
-                    .map(|entry| entry.label)
+                entry_at(self.application.as_ref(), *index, self.authority).map(|entry| entry.label)
             })
             .collect()
     }
@@ -705,8 +745,8 @@ pub(crate) fn launch_command(
     // activates the observed surface through Runtime and must never create a
     // second process over the same persistent profile.
     let (program, published_ready, tracked_ready) = match (request, &options.application) {
-        (LaunchRequest::TaskManager, _) => {
-            return Err("task manager is not configured for this development launcher".into());
+        (LaunchRequest::TaskManager | LaunchRequest::Editor | LaunchRequest::Photo, _) => {
+            return Err("desktop programs are not configured for this development launcher".into());
         }
         (LaunchRequest::UiDemo, Some(_)) => {
             return Err("configured launcher application is activation-only".to_string());
@@ -1068,7 +1108,10 @@ mod tests {
             .saturating_add(ENTRY_COUNT.saturating_sub(1).saturating_mul(ROW_STEP))
             .saturating_add(glyph_height);
         assert!(final_row <= CARD_HEIGHT);
-        for entry in [TERMINAL_ENTRY, CLOSE_ENTRY, DIRECT_UI_ENTRY] {
+        for entry in [TERMINAL_ENTRY, CLOSE_ENTRY, DIRECT_UI_ENTRY]
+            .into_iter()
+            .chain(AUTHORITY_ENTRIES)
+        {
             assert!(entry.search.is_ascii());
             assert_eq!(entry.search, entry.search.to_ascii_lowercase());
             for word in entry.label.split_ascii_whitespace() {
@@ -1383,25 +1426,68 @@ mod tests {
 }
 
 #[cfg(test)]
-mod task_manager_tests {
+mod authority_entry_tests {
     use super::*;
     #[test]
-    fn task_manager_entry_is_enabled_only_for_the_fixed_authority() {
+    fn desktop_program_entries_are_enabled_only_for_the_fixed_authority() {
         let mut launcher = Launcher::new();
-        assert!(!launcher.matched_labels().contains(&"TASK MANAGER"));
-        launcher.set_task_manager(true);
         launcher.apply(LauncherAction::Open);
-        assert_eq!(launcher.matched_labels().len(), 4);
-        for character in "process".chars() {
-            launcher.apply(LauncherAction::Insert(character));
-        }
-        assert_eq!(launcher.matched_labels(), ["TASK MANAGER"]);
         assert_eq!(
-            launcher.apply(LauncherAction::Activate),
-            Some(LaunchRequest::TaskManager)
+            launcher.matched_labels(),
+            ["NEW TERMINAL", "NEW INPUT MONITOR", "CLOSE LAUNCHER"]
         );
-        launcher.set_task_manager(false);
+        launcher.set_authority(true);
+        launcher.apply(LauncherAction::Open);
+        assert_eq!(
+            launcher.matched_labels(),
+            [
+                "NEW TERMINAL",
+                "NEW INPUT MONITOR",
+                "TASK MANAGER",
+                "TEXT EDITOR",
+                "PHOTOS",
+                "CLOSE LAUNCHER",
+            ]
+        );
+        for (word, label, request) in [
+            ("process", "TASK MANAGER", LaunchRequest::TaskManager),
+            ("editor", "TEXT EDITOR", LaunchRequest::Editor),
+            ("picture", "PHOTOS", LaunchRequest::Photo),
+        ] {
+            launcher.apply(LauncherAction::Open);
+            for character in word.chars() {
+                launcher.apply(LauncherAction::Insert(character));
+            }
+            assert_eq!(launcher.matched_labels(), [label], "{word}");
+            assert_eq!(launcher.apply(LauncherAction::Activate), Some(request));
+            assert!(request.authority_program().is_some());
+        }
+        launcher.set_authority(false);
         launcher.apply(LauncherAction::Open);
         assert_eq!(launcher.matched_labels().len(), 3);
+        for request in [
+            LaunchRequest::UiDemo,
+            LaunchRequest::Terminal,
+            LaunchRequest::TaskTerminal,
+        ] {
+            assert!(request.authority_program().is_none());
+        }
+    }
+
+    #[test]
+    fn the_development_launcher_refuses_every_desktop_program() {
+        let options = LaunchOptions {
+            socket: PathBuf::from("/run/user/1000/wayland-0"),
+            client: Some(PathBuf::from("/bin/td-ui-demo")),
+            terminal: PathBuf::from("/bin/td-term"),
+            application: None,
+        };
+        for request in [
+            LaunchRequest::TaskManager,
+            LaunchRequest::Editor,
+            LaunchRequest::Photo,
+        ] {
+            assert!(launch_command(&options, request, 1).is_err(), "{request:?}");
+        }
     }
 }
