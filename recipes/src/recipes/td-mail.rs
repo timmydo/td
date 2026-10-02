@@ -129,4 +129,19 @@ mod tests {
         assert_eq!(client.as_deref(), Some("32 * 1024 * 1024"));
         assert_eq!(client, service);
     }
+
+    /// Likewise the streamed frame's bound: a client holding a smaller one
+    /// would refuse the service's full frames as the protocol misread.
+    #[test]
+    fn the_client_frame_bound_is_the_service_bound() {
+        let bound = |text: &str| {
+            text.lines()
+                .find_map(|line| line.trim_start().strip_prefix("const MAX_CHUNK: usize ="))
+                .map(|rest| rest.trim_end_matches(';').trim().to_string())
+        };
+        let client = bound(include_str!("../../../td-mail/src/td_fetch.rs"));
+        let service = bound(include_str!("../../../net/src/fetchd.rs"));
+        assert_eq!(client.as_deref(), Some("64 * 1024"));
+        assert_eq!(client, service);
+    }
 }

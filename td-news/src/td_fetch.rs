@@ -12,6 +12,11 @@
 //! bad head before the body is through, so the request is written whole
 //! before anything is read, and a failed write is not the outcome: the
 //! reply is.
+//!
+//! A streamed request (`get_stream`, `post_stream`) asks for the body as
+//! the origin sends it: the reply head ends in `stream` rather than
+//! `body N`, and the body comes as `chunk N` frames of at most 64 KiB each,
+//! closed by an `end` line or an `error` line.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
@@ -28,9 +33,18 @@ const DEFAULT_LIMIT: u64 = 64 * 1024 * 1024;
 /// The most a request body may carry: the service refuses one past it.
 #[allow(dead_code)]
 pub const MAX_REQUEST_BODY: u64 = 32 * 1024 * 1024;
-/// The service answers within its budgets (a minute for the head, five for
-/// the origin); this only bounds a service that has gone away mid-reply.
+/// The service's bound on one streamed frame.
+#[allow(dead_code)]
+const MAX_CHUNK: usize = 64 * 1024;
+/// The service answers a counted request within its budgets (a minute for
+/// the head, five for the origin); this, the longest any one read or write
+/// here waits, bounds a service that has gone away mid-reply, and a stream
+/// whose origin keeps it alive without a frame, which the service would
+/// end only at its total.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(420);
+/// The wait for a streamed reply's head: the service's thirty-minute total
+/// for a stream, and a minute for the service itself.
+const STREAM_HEAD_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 const NO_REPLY: &str = "the service closed without a reply";
 
 #[derive(Debug)]
@@ -48,6 +62,106 @@ impl Response {
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A streamed reply: its head, then its body a frame at a time as the
+/// origin sends it. Dropping it closes the connection, which is how a
+/// caller stops a stream early; the service then closes the origin's.
+/// Neither application streams yet; the stream's items, like `post`, stay
+/// in the one text all the same.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Stream {
+    pub status: u16,
+    /// Names in lower case, in the order the origin sent them.
+    pub headers: Vec<(String, String)>,
+    reader: BufReader<UnixStream>,
+    frames: Frames,
+}
+
+#[allow(dead_code)]
+impl Stream {
+    /// The first value of `name` (lower case), if any.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The next piece of the body, at most 64 KiB, or `None` once the
+    /// service has said the body is whole. An error ends the stream as
+    /// well: every call after an error or a `None` is `None`.
+    pub fn next_chunk(&mut self) -> Result<Option<&[u8]>, Error> {
+        self.frames.next(&mut self.reader)
+    }
+}
+
+/// The body side of a stream: what was asked for, what has come, and one
+/// frame's buffer, reused.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct Frames {
+    limit: u64,
+    received: u64,
+    buffer: Vec<u8>,
+    done: bool,
+}
+
+#[allow(dead_code)]
+impl Frames {
+    fn new(limit: u64) -> Frames {
+        Frames {
+            limit,
+            received: 0,
+            buffer: Vec::new(),
+            done: false,
+        }
+    }
+
+    fn next(&mut self, reader: &mut impl BufRead) -> Result<Option<&[u8]>, Error> {
+        if self.done {
+            return Ok(None);
+        }
+        // Whatever this frame turns out to be, nothing after a failed one
+        // can be read as framing; a good one reopens the stream below.
+        self.done = true;
+        let line = read_line(reader).map_err(|e| match e {
+            Error::Io(m) if m == NO_REPLY => Error::Io("the service closed mid-stream".into()),
+            other => other,
+        })?;
+        if line == "end" {
+            return Ok(None);
+        }
+        if let Some(value) = line.strip_prefix("error ") {
+            return Err(fault(value));
+        }
+        let count = line
+            .strip_prefix("chunk ")
+            .ok_or_else(|| Error::Io(format!("stream line {line:?}")))?;
+        // Digits as the service writes them, no sign and no leading zero.
+        let count = Some(count)
+            .filter(|text| text.bytes().all(|b| b.is_ascii_digit()) && !text.starts_with('0'))
+            .and_then(|text| text.parse::<usize>().ok())
+            .filter(|count| (1..=MAX_CHUNK).contains(count))
+            .ok_or_else(|| Error::Io(format!("chunk {count:?}")))?;
+        // The service applies the limit; this is the client not taking its
+        // word for it.
+        let received = self.received.saturating_add(count as u64);
+        if received > self.limit {
+            return Err(Error::Io(format!(
+                "the service sent {received} bytes past the {} asked for",
+                self.limit
+            )));
+        }
+        self.buffer.resize(count, 0);
+        reader
+            .read_exact(&mut self.buffer)
+            .map_err(|e| Error::Io(format!("read chunk: {e}")))?;
+        self.received = received;
+        self.done = false;
+        Ok(Some(&self.buffer))
     }
 }
 
@@ -115,6 +229,30 @@ pub fn post(
     request("POST", url, headers, body, limit, None)
 }
 
+/// `get`, with the body handed over as the origin sends it, `limit`
+/// bounding the frames' sum.
+#[allow(dead_code)]
+pub fn get_stream(
+    url: &str,
+    headers: &[(&str, &str)],
+    limit: Option<u64>,
+    redirects: Option<u32>,
+) -> Result<Stream, Error> {
+    stream("GET", url, headers, &[], limit, redirects)
+}
+
+/// `post`, with the reply's body handed over as the origin sends it: a
+/// model's tokens as they are generated, say.
+#[allow(dead_code)]
+pub fn post_stream(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: Option<u64>,
+) -> Result<Stream, Error> {
+    stream("POST", url, headers, body, limit, None)
+}
+
 fn request(
     method: &str,
     url: &str,
@@ -123,14 +261,61 @@ fn request(
     limit: Option<u64>,
     redirects: Option<u32>,
 ) -> Result<Response, Error> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let (mut reader, written) = send(method, url, headers, body, limit, redirects, false)?;
+    settle(read_reply(&mut reader, limit), written)
+}
+
+fn stream(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: Option<u64>,
+    redirects: Option<u32>,
+) -> Result<Stream, Error> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let (mut reader, written) = send(method, url, headers, body, limit, redirects, true)?;
+    // A streamed head may take the service's whole total to come, the
+    // origin's every step within its idle deadline; the frames then come
+    // within that deadline of each other.
+    let timed = |reader: &BufReader<UnixStream>, wait: Duration| {
+        reader
+            .get_ref()
+            .set_read_timeout(Some(wait))
+            .map_err(|e| Error::Io(e.to_string()))
+    };
+    timed(&reader, STREAM_HEAD_TIMEOUT)?;
+    let head = read_stream_head(&mut reader);
+    let (status, headers) = settle(head, written)?;
+    timed(&reader, REPLY_TIMEOUT)?;
+    Ok(Stream {
+        status,
+        headers,
+        reader,
+        frames: Frames::new(limit),
+    })
+}
+
+/// Connect and write the request whole: the reader for the reply, and how
+/// the write went, which matters only if the reply says nothing.
+fn send(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    limit: u64,
+    redirects: Option<u32>,
+    stream: bool,
+) -> Result<(BufReader<UnixStream>, std::io::Result<()>), Error> {
     check_head(url, headers)?;
     let path = socket_path().ok_or_else(|| Error::Io("no td-fetch socket".into()))?;
-    let mut stream = UnixStream::connect(&path).map_err(|e| Error::Io(format!("connect: {e}")))?;
+    let mut socket = UnixStream::connect(&path).map_err(|e| Error::Io(format!("connect: {e}")))?;
     // Both directions: a service that stopped reading a large body would
     // otherwise hold the writer past the reply's own bound.
-    stream
+    socket
         .set_read_timeout(Some(REPLY_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(REPLY_TIMEOUT)))
+        .and_then(|()| socket.set_write_timeout(Some(REPLY_TIMEOUT)))
         .map_err(|e| Error::Io(e.to_string()))?;
     let mut head = format!("{PROTOCOL}\nmethod {method}\nurl {url}\n");
     for (name, value) in headers {
@@ -140,21 +325,26 @@ fn request(
         head.push_str(value);
         head.push('\n');
     }
-    head.push_str(&format!("limit {}\n", limit.unwrap_or(DEFAULT_LIMIT)));
+    head.push_str(&format!("limit {limit}\n"));
     if let Some(redirects) = redirects {
         head.push_str(&format!("redirects {redirects}\n"));
+    }
+    if stream {
+        head.push_str("stream\n");
     }
     head.push_str(&format!("body {}\n\n", body.len()));
     // Written whole before anything is read; the service may already have
     // answered and closed, and then the reply is what matters, not EPIPE.
-    let written = stream
+    let written = socket
         .write_all(head.as_bytes())
-        .and_then(|()| stream.write_all(body))
-        .and_then(|()| stream.flush());
-    let mut reader = BufReader::new(stream);
-    let reply = read_reply(&mut reader, limit.unwrap_or(DEFAULT_LIMIT));
+        .and_then(|()| socket.write_all(body))
+        .and_then(|()| socket.flush());
+    Ok((BufReader::new(socket), written))
+}
+
+fn settle<T>(reply: Result<T, Error>, written: std::io::Result<()>) -> Result<T, Error> {
     match (reply, written) {
-        (Ok(response), _) => Ok(response),
+        (Ok(reply), _) => Ok(reply),
         (Err(error), Ok(())) => Err(error),
         // The write broke because the service closed its end. If it said
         // anything first, that is the answer; only silence leaves the
@@ -211,7 +401,32 @@ fn read_line(reader: &mut impl BufRead) -> Result<String, Error> {
     String::from_utf8(raw).map_err(|_| Error::Io("a reply line that is not UTF-8".into()))
 }
 
-fn read_reply(reader: &mut impl BufRead, limit: u64) -> Result<Response, Error> {
+/// How a reply head said its body comes.
+enum Framing {
+    /// Counted: this many bytes after the head.
+    Body(u64),
+    /// As `chunk` frames to an `end` or `error` line.
+    Stream,
+}
+
+struct Head {
+    status: u16,
+    headers: Vec<(String, String)>,
+    framing: Framing,
+}
+
+/// An `error` line's `kind: reason`, as the error it names.
+fn fault(value: &str) -> Error {
+    let (kind, reason) = value.split_once(": ").unwrap_or((value, ""));
+    match kind {
+        "refused" => Error::Refused(reason.to_string()),
+        "malformed" => Error::Malformed(reason.to_string()),
+        "transport" => Error::Transport(reason.to_string()),
+        _ => Error::Io(format!("error {value:?}")),
+    }
+}
+
+fn read_head(reader: &mut impl BufRead) -> Result<Head, Error> {
     let first = read_line(reader)?;
     if first != PROTOCOL {
         return Err(Error::Io(format!(
@@ -220,7 +435,7 @@ fn read_reply(reader: &mut impl BufRead, limit: u64) -> Result<Response, Error> 
     }
     let mut status = None;
     let mut headers = Vec::new();
-    let mut body_len = 0u64;
+    let mut framing = None;
     loop {
         let line = read_line(reader)?;
         if line.is_empty() {
@@ -244,24 +459,40 @@ fn read_reply(reader: &mut impl BufRead, limit: u64) -> Result<Response, Error> 
                     value.strip_prefix(' ').unwrap_or(value).to_string(),
                 ));
             }
+            "body" | "stream" if framing.is_some() => {
+                return Err(Error::Io("a reply framed twice".into()));
+            }
             "body" => {
-                body_len = value
-                    .parse::<u64>()
-                    .map_err(|_| Error::Io(format!("body {value:?}")))?;
+                framing = Some(Framing::Body(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| Error::Io(format!("body {value:?}")))?,
+                ));
             }
-            "error" => {
-                let (kind, reason) = value.split_once(": ").unwrap_or((value, ""));
-                return Err(match kind {
-                    "refused" => Error::Refused(reason.to_string()),
-                    "malformed" => Error::Malformed(reason.to_string()),
-                    "transport" => Error::Transport(reason.to_string()),
-                    _ => Error::Io(format!("error {value:?}")),
-                });
-            }
+            "stream" if line == "stream" => framing = Some(Framing::Stream),
+            "error" => return Err(fault(value)),
             other => return Err(Error::Io(format!("reply key {other:?}"))),
         }
     }
     let status = status.ok_or_else(|| Error::Io("a reply with no status".into()))?;
+    Ok(Head {
+        status,
+        headers,
+        framing: framing.unwrap_or(Framing::Body(0)),
+    })
+}
+
+fn read_reply(reader: &mut impl BufRead, limit: u64) -> Result<Response, Error> {
+    let Head {
+        status,
+        headers,
+        framing,
+    } = read_head(reader)?;
+    let Framing::Body(body_len) = framing else {
+        return Err(Error::Io(
+            "a streamed reply to a request for one body".into(),
+        ));
+    };
     // The service applies the limit; this is the client not taking its
     // word for it.
     if body_len > limit {
@@ -285,6 +516,17 @@ fn read_reply(reader: &mut impl BufRead, limit: u64) -> Result<Response, Error> 
         headers,
         body,
     })
+}
+
+/// A streamed reply's head; its frames are the `Stream`'s to read.
+fn read_stream_head(reader: &mut impl BufRead) -> Result<(u16, Vec<(String, String)>), Error> {
+    let head = read_head(reader)?;
+    match head.framing {
+        Framing::Stream => Ok((head.status, head.headers)),
+        Framing::Body(_) => Err(Error::Io(
+            "one body in reply to a request for a stream".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +679,270 @@ mod tests {
             "{err}"
         );
         server.join().unwrap();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The frames read from `wire` until the stream is over, and the error
+    /// that ended it if one did; a call past the end is checked to stay
+    /// ended.
+    fn drain(wire: &[u8], limit: u64) -> (Vec<Vec<u8>>, Option<Error>) {
+        let mut reader = BufReader::new(wire);
+        let mut frames = Frames::new(limit);
+        let mut got = Vec::new();
+        loop {
+            let ended = match frames.next(&mut reader) {
+                Ok(Some(bytes)) => {
+                    got.push(bytes.to_vec());
+                    continue;
+                }
+                Ok(None) => None,
+                Err(e) => Some(e),
+            };
+            assert!(matches!(frames.next(&mut reader), Ok(None)));
+            return (got, ended);
+        }
+    }
+
+    #[test]
+    fn a_stream_is_read_a_frame_at_a_time_to_its_end() {
+        // What follows `end` is never read as the body.
+        let (got, end) = drain(b"chunk 5\nhellochunk 3\n\nabend\nchunk 1\nx", DEFAULT_LIMIT);
+        assert_eq!(got, [b"hello".to_vec(), b"\nab".to_vec()]);
+        assert!(end.is_none(), "{end:?}");
+        let (got, end) = drain(
+            b"chunk 2\nhierror transport: the origin sent nothing for 120s\n",
+            DEFAULT_LIMIT,
+        );
+        assert_eq!(got, [b"hi".to_vec()]);
+        assert!(
+            matches!(end, Some(Error::Transport(ref m)) if m == "the origin sent nothing for 120s"),
+            "{end:?}"
+        );
+        let (_, end) = drain(b"error refused: response over 10 bytes\n", DEFAULT_LIMIT);
+        assert!(
+            matches!(end, Some(Error::Refused(ref m)) if m == "response over 10 bytes"),
+            "{end:?}"
+        );
+        // A frame at the bound is taken whole, and a sum at the limit is
+        // within it.
+        let mut wire = format!("chunk {MAX_CHUNK}\n").into_bytes();
+        wire.extend(vec![b'z'; MAX_CHUNK]);
+        wire.extend_from_slice(b"end\n");
+        let (got, end) = drain(&wire, MAX_CHUNK as u64);
+        assert_eq!(got, [vec![b'z'; MAX_CHUNK]]);
+        assert!(end.is_none(), "{end:?}");
+    }
+
+    #[test]
+    fn a_stream_keeps_its_bounds_and_its_framing() {
+        let long = format!("chunk {}", "1".repeat(MAX_LINE)).into_bytes();
+        for (wire, limit, frames, reason) in [
+            (b"chunk 0\n".to_vec(), DEFAULT_LIMIT, 0, "chunk \"0\""),
+            (
+                format!("chunk {}\n", MAX_CHUNK + 1).into_bytes(),
+                DEFAULT_LIMIT,
+                0,
+                "chunk \"65537\"",
+            ),
+            (b"chunk x\n".to_vec(), DEFAULT_LIMIT, 0, "chunk \"x\""),
+            (b"chunk -1\n".to_vec(), DEFAULT_LIMIT, 0, "chunk \"-1\""),
+            (
+                b"chunk +5\nhello".to_vec(),
+                DEFAULT_LIMIT,
+                0,
+                "chunk \"+5\"",
+            ),
+            (
+                b"chunk 05\nhello".to_vec(),
+                DEFAULT_LIMIT,
+                0,
+                "chunk \"05\"",
+            ),
+            (
+                b"chunk 4\nabcdchunk 4\nefgh".to_vec(),
+                6,
+                1,
+                "the service sent 8 bytes past the 6 asked for",
+            ),
+            (b"chunk 5\nab".to_vec(), DEFAULT_LIMIT, 0, "read chunk: "),
+            (
+                b"chunk 2\nab".to_vec(),
+                DEFAULT_LIMIT,
+                1,
+                "the service closed mid-stream",
+            ),
+            (b"body 3\n".to_vec(), DEFAULT_LIMIT, 0, "stream line"),
+            (
+                b"error bogus\n".to_vec(),
+                DEFAULT_LIMIT,
+                0,
+                "error \"bogus\"",
+            ),
+            (long, DEFAULT_LIMIT, 0, "past the bound"),
+        ] {
+            let (got, end) = drain(&wire, limit);
+            assert_eq!(got.len(), frames, "{reason}");
+            assert!(
+                matches!(end, Some(Error::Io(ref m)) if m.contains(reason)),
+                "{reason}: {end:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_head_and_a_counted_head_are_not_taken_for_each_other() {
+        let mut reader = BufReader::new(
+            &b"td-fetch 1\nstatus 200\nheader content-type: text/event-stream\nstream\n\nchunk 1\nx"[..],
+        );
+        let (status, headers) = read_stream_head(&mut reader).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers,
+            [("content-type".to_string(), "text/event-stream".to_string())]
+        );
+        // The frames follow the head on the same reader.
+        let mut frames = Frames::new(DEFAULT_LIMIT);
+        assert_eq!(frames.next(&mut reader).unwrap(), Some(&b"x"[..]));
+        let stream_head = |wire: &[u8]| read_stream_head(&mut BufReader::new(wire));
+        assert!(matches!(
+            stream_head(b"td-fetch 1\nstatus 200\nbody 0\n\n"),
+            Err(Error::Io(ref m)) if m.contains("one body")
+        ));
+        assert!(matches!(
+            stream_head(b"td-fetch 1\nstatus 200\n\n"),
+            Err(Error::Io(ref m)) if m.contains("one body")
+        ));
+        assert!(matches!(
+            stream_head(b"td-fetch 1\nstatus 200\nstream yes\n\n"),
+            Err(Error::Io(ref m)) if m.contains("reply key")
+        ));
+        assert!(matches!(
+            reply(b"td-fetch 1\nstatus 200\nstream\n\n"),
+            Err(Error::Io(ref m)) if m.contains("streamed reply")
+        ));
+        assert!(matches!(
+            reply(b"td-fetch 1\nstatus 200\nstream\nbody 0\n\n"),
+            Err(Error::Io(ref m)) if m.contains("framed twice")
+        ));
+        // A refusal before the head is the same error either way.
+        assert!(matches!(
+            stream_head(b"td-fetch 1\nerror refused: loopback address\n\n"),
+            Err(Error::Refused(ref m)) if m == "loopback address"
+        ));
+    }
+
+    /// The request a client wrote, head lines to the blank one and the
+    /// body it announced.
+    fn read_request(reader: &mut impl BufRead) -> (String, Vec<u8>) {
+        let mut head = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\n" || line.is_empty() {
+                break;
+            }
+            if let Some(count) = line.strip_prefix("body ") {
+                length = count.trim_end().parse().unwrap();
+            }
+            head.push_str(&line);
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).unwrap();
+        (head, body)
+    }
+
+    #[test]
+    fn a_stream_is_asked_for_and_read_over_the_socket() {
+        let _env = crate::testing::env_lock();
+        let dir = std::env::temp_dir().join(format!("td-fetch-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(SOCKET_DIRECTORY)).unwrap();
+        let socket = dir.join(SOCKET_DIRECTORY).join(SOCKET_FILE);
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for turn in 0..4 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                asked.push(read_request(&mut reader));
+                let mut out = &stream;
+                match turn {
+                    0 => {
+                        let _ = out.write_all(b"td-fetch 1\nerror refused: scheme \"ftp\"\n\n");
+                    }
+                    1 => {
+                        let _ = out.write_all(
+                            b"td-fetch 1\nstatus 200\nheader content-type: text/event-stream\nstream\n\nchunk 6\ndata: ",
+                        );
+                        // The rest once the client holds the first frame:
+                        // a frame is handed over as it comes.
+                        let _ = wait.recv_timeout(Duration::from_secs(10));
+                        let _ = out.write_all(b"chunk 4\nhi\n\nend\n");
+                    }
+                    2 => {
+                        let _ = out.write_all(b"td-fetch 1\nstatus 200\nbody 2\n\nok");
+                    }
+                    _ => {
+                        let _ = out.write_all(
+                            b"td-fetch 1\nstatus 302\nheader location: /x\nstream\n\nend\n",
+                        );
+                    }
+                }
+            }
+            asked
+        });
+        let err = post_stream("ftp://h/", &[], b"", None).unwrap_err();
+        assert!(
+            matches!(err, Error::Refused(ref m) if m == "scheme \"ftp\""),
+            "{err}"
+        );
+        let url = "https://openrouter.ai/api/v1/chat/completions";
+        let mut stream = post_stream(
+            url,
+            &[("content-type", "application/json")],
+            b"{\"stream\":true}",
+            Some(1024),
+        )
+        .unwrap();
+        assert_eq!(stream.status, 200);
+        assert_eq!(stream.header("content-type"), Some("text/event-stream"));
+        assert_eq!(stream.next_chunk().unwrap(), Some(&b"data: "[..]));
+        go.send(()).unwrap();
+        assert_eq!(stream.next_chunk().unwrap(), Some(&b"hi\n\n"[..]));
+        assert_eq!(stream.next_chunk().unwrap(), None);
+        assert_eq!(stream.next_chunk().unwrap(), None);
+        // The counted path's request is as it was; the streamed GET's
+        // differs from it by the one line.
+        let response = get("https://h/feed", &[], None, Some(0)).unwrap();
+        assert_eq!(response.body, b"ok");
+        let mut stream = get_stream("https://h/feed", &[], None, Some(0)).unwrap();
+        assert_eq!(
+            (stream.status, stream.header("location")),
+            (302, Some("/x"))
+        );
+        assert_eq!(stream.next_chunk().unwrap(), None);
+        let asked = server.join().unwrap();
+        assert_eq!(
+            asked[1],
+            (
+                format!(
+                    "{PROTOCOL}\nmethod POST\nurl {url}\nheader content-type: application/json\nlimit 1024\nstream\nbody 15\n"
+                ),
+                b"{\"stream\":true}".to_vec()
+            )
+        );
+        assert_eq!(
+            asked[2].0,
+            format!("{PROTOCOL}\nmethod GET\nurl https://h/feed\nlimit {DEFAULT_LIMIT}\nredirects 0\nbody 0\n")
+        );
+        assert_eq!(
+            asked[3].0,
+            format!("{PROTOCOL}\nmethod GET\nurl https://h/feed\nlimit {DEFAULT_LIMIT}\nredirects 0\nstream\nbody 0\n")
+        );
         std::env::remove_var("XDG_RUNTIME_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }

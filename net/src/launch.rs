@@ -43,7 +43,7 @@ const PROBE_BUDGET: Duration = Duration::from_secs(2);
 const PROBE_PACE: Duration = Duration::from_millis(50);
 /// This binary as the kernel holds it, which a rebuild or reinstall that
 /// replaces the file on disk does not change.
-const SELF: &str = "/proc/self/exe";
+pub(crate) const SELF: &str = "/proc/self/exe";
 
 /// `td-launch PROGRAM [ARG...]`, `args[0]` being the applet's name.
 pub fn run(args: &[String]) {

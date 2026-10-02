@@ -9820,6 +9820,94 @@ webpki-roots, and no decoder. So:
    `http.rs`'s connect deadline: ureq's one deadline, which supersedes
    its per-read and per-write timeouts. A bounded number of
    connections are served at once; the rest wait.
+
+   A request may carry a `stream` line, with no value; without it the
+   above is the whole protocol, unchanged. With it, the reply head ends
+   in `stream` where it would say `body N`, and the body follows as
+   frames, each `chunk N`, a line, and then N bytes, N from 1 to 64 KiB,
+   written as soon as the origin's bytes are read; the stream closes with
+   an `end` line, or with an `error kind: reason` line, cut at the line
+   bound, when the origin breaks off mid-body, a bound is passed or the
+   limit is crossed. A refusal or a failure before the origin's head is
+   the same `error` head a counted request gets. Every rule above holds
+   for a streamed request: the scheme and address policy, the line,
+   header and body bounds, the redirect and `POST` rules, identity
+   encoding, and the response limit, which bounds the sum of the frames;
+   the frame that would cross it is not sent, and the stream ends `error
+   refused: response over N bytes`.
+
+   ureq cannot interrupt a read, and an origin can keep one going past
+   any deadline: a head or a chunk header a byte at a time, or a chunk
+   size line that never ends, which ureq gathers into memory without a
+   bound. So a streamed request's exchange with its origin runs in a
+   process of its own, `td-fetchd origin`, the same binary started again
+   under that name, which reads the request on its stdin and writes the
+   streamed reply on its stdout for the service to relay frame by frame.
+   The five minutes are replaced by three bounds. An idle deadline of
+   two minutes is on every read and write against the origin, the
+   handshake, the head and every redirect included: with no
+   whole-exchange deadline set, ureq leaves these to the socket's own
+   timeouts, and since it clears them on a connection it keeps for
+   reuse, the process keeps none and makes each redirect's connection
+   afresh. A total of thirty minutes is kept by the relay, which waits
+   on the process in slices of a quarter second and kills it at the
+   total whatever it is waiting on; writing the head or a frame to the
+   client is held to the total too, so a client that stops reading
+   cannot keep the process past it: a write still waiting at the total
+   ends the connection, and any last line is written once the process is
+   gone. A memory bound of 64 MiB, the request body's cap and room for
+   the binary, TLS and the frames, is kept by the process itself, which
+   reads its own resident and swapped size every 10 ms and ends with a
+   status of its own past it, or as a failure if it cannot read it; the
+   relay ends the stream `error refused` naming the bound, and what the
+   process can hold is the bound and what it takes in within one look.
+   Two minutes is twice `http.rs`'s stall bound because a model's first
+   token after a long prompt, or reasoning it does not stream, can be a
+   minute of silence from a provider that sends no comment to fill it;
+   thirty minutes is six times the counted budget, tens of thousands of
+   tokens at a slow provider's rate, and still an end to an origin that
+   keeps a stream alive a byte at a time. All three are the service's,
+   the same for every request: a client wanting less closes the
+   connection, which is how an application interrupts a stream. A client
+   says nothing after its request, so between slices the relay reads its
+   connection, and a close, even of its writing half only, or a byte out
+   of turn ends the stream and kills the process within a quarter
+   second, whether or not the origin is sending. Each frame written to
+   the client has the client budget to itself, within the total, and the
+   client module waits for a streamed head as long as the total and a
+   minute more, and for each later frame seven minutes.
+
+   The process dies with the service. Its pipes close when the service
+   does, which ends it at its next read of the request or write of a
+   frame; a read the origin keeps going would hold it, and td-net
+   forbids `unsafe`, so no parent-death signal can be armed: the process
+   instead checks, before it reads its request, that its parent is the
+   service that named itself on its command line, and looks again every
+   10 ms, ending when the service is gone. A name lookup that never
+   answers is ended the same ways and by the total.
+
+   A streamed request holds a worker only while its request is read, and
+   a refused one while its one-line refusal is written: once it holds
+   one of eight places for streams, its worker's place goes back, so
+   open streams do not delay counted requests, and a ninth streamed
+   request is refused by name until one ends. A place is given back
+   after its process has been killed and reaped. Each stream costs a
+   process, about 3 MiB resident with two threads before it connects,
+   and its exchange's TLS state, beside two threads in the service: one
+   relays to the client, and one hands the request over, holding its
+   body until the process has it, then reads the process's reply. At
+   most six of a stream's frames are in the service at once: four
+   waiting, one being read from the process and one being written. A
+   client slow to read holds the process back rather than growing the
+   service. In all, the service holds at most four counted requests'
+   bodies, each up to the larger cap, and eight streams' request bodies
+   of up to 32 MiB with their frames; the eight processes hold up to
+   their bound each, and what one look lets past it. The client module
+   carries `get_stream` and `post_stream`, whose `Stream` hands over a
+   frame at a time and holds each frame to 64 KiB, a bound a recipe test
+   holds to the service's, and their sum to the limit; neither
+   application calls them, and td-agent's model client
+   (`td-agent/DESIGN.md` §5) is the first that will.
 4. Evidence. The boot VM has no route out, so the evidence is the socket
    and the policy: `[fetch-evidence]` connects as the UI user, asks for
    a loopback URL and expects the exact refusal; inside the jail, the
@@ -9829,8 +9917,17 @@ webpki-roots, and no decoder. So:
    as an exact line and required by the oracle. Host side, the crate's
    own tests, which the `net-test` preflight runs, serve the applet
    against a std `TcpListener` on loopback under a test-only allow flag
-   and pin the framing, the caps, the header rules and the redirects;
-   no recipe check builds td-net.
+   and pin the framing, the caps, the header rules and the redirects,
+   and, running the built binary as the service with test-only shortened
+   bounds that only the allow flag admits, a streamed request's frames
+   as they arrive, the idle deadline, the total and the memory bound
+   each ending a stream and the origin's connection with it, the limit
+   over the frames' sum, an origin's failure mid-body, a client's
+   hang-up during the origin's silence and while a write to a client
+   that stopped reading waits, such a client held to the total, open
+   streams leaving the workers to counted requests and a ninth refused,
+   and the origin process ending with a killed service; no recipe check
+   builds td-net.
 5. What this buys, exactly: the applications hold no socket but a unix
    one, resolve no names, carry no trust store, and their closures are
    std; TLS trust, timeouts and body caps live in one reviewed place,
@@ -9842,13 +9939,15 @@ webpki-roots, and no decoder. So:
    reaches, since the tier's crate forbids `unsafe` and cannot enumerate
    the interfaces; and a name that answers the resolver one way now and
    another way later is defended only as far as the address it returned
-   is the one connected to; and a name lookup is outside every deadline,
-   since ureq resolves through a blocking call, so a resolver that hangs
-   holds a worker until it answers. All four are recorded as gaps. §L's
-   claim list gains the sentence: `sockets=fetch` mediates the
-   transport, not the destinations. §B.6's row "Nothing on the target
-   fetches" and §B.7's "reuse only in the control plane" are amended by
-   the landing that ships the applet, in that landing.
+   is the one connected to; and a name lookup is outside every deadline
+   of a counted request, since ureq resolves through a blocking call, so
+   a resolver that hangs holds a worker until it answers (a streamed
+   request's lookup is in its origin process, which the total ends).
+   All four are recorded as gaps. §L's claim list gains the sentence:
+   `sockets=fetch` mediates the transport, not the destinations. §B.6's
+   row "Nothing on the target fetches" and §B.7's "reuse only in the
+   control plane" are amended by the landing that ships the applet, in
+   that landing.
 
 **Sequencing.** (1) The fetch service, proven in the boot with the
 current pinned `tn` and `tmc` switched to it: the last pin bump. (2) The

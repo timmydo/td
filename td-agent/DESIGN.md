@@ -524,18 +524,19 @@ generated, and billed, before failing. Anything else is shown with the
 provider's message. With streaming, an `error` object can arrive inside a
 200 stream; every chunk is checked for one.
 
-**Transport and streaming.** `td-fetch 1` is one buffered request per
-connection, with a body cap and a five-minute deadline over the whole
-exchange. It cannot stream. The first model-client increment uses it with
+**Transport and streaming.** `td-fetch 1` answers a request with one
+buffered body by default, under a body cap and a five-minute deadline over
+the whole exchange. The first model-client increment uses that with
 `stream: false`: correct, but silent until each response completes, and a
 response that runs past five minutes fails. Streaming is its own work,
 in two increments (§18):
 
-1. **td-net:** the fetch service gains a streamed response mode. The request
-   head carries `stream`, and the reply after its head is a sequence of
-   `chunk N` frames ending in `end` or `error reason`. The total deadline is
-   replaced by an idle deadline between bytes, with a bounded total. That
-   increment amends APPLICATIONS.md §W.8 in the same landing.
+1. **td-net (landed):** the fetch service's streamed response mode. The
+   request head carries `stream`, and the reply after its head is a
+   sequence of `chunk N` frames ending in `end` or `error kind: reason`,
+   read through the client module's `post_stream`. The five minutes are
+   replaced by a two-minute idle deadline on every origin read and write
+   and a thirty-minute total, both the service's (APPLICATIONS.md §W.8).
 2. **td-agent:** an SSE reader over those frames. It handles `data:` lines,
    skips `:` comment lines (OpenRouter's `: OPENROUTER PROCESSING`), stops at
    `data: [DONE]`, and bounds each event. Tool-call fragments are assembled
@@ -2001,7 +2002,5 @@ Messages dialect.
 - **Human review.** Whether td-agent should offer the human a review
   checkout of the publish repository, so that writing git commands never
   run in a jail-written worktree.
-- **Streaming deadlines.** The idle and total bounds for the fetch stream
-  mode, and whether they are per request or the client's to ask for.
 - **Transcript rendering.** Plain text first; which Markdown subset, if any,
   is worth rendering in the message list. Rendering never fetches.
