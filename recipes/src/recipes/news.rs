@@ -15,9 +15,16 @@ const APPLICATION_SEARCH_TERMS: &[&str] = crate::ladder::TD_NEWS_SEARCH_TERMS;
 /// The source-built static binary this package wraps, and its recipe.
 const PROGRAM: &str = "td-news";
 const PROGRAM_RECIPE: &str = "td-news";
+/// The link opener the manifest names as `$BROWSER`: td-ui's opener runs
+/// it with the link, and it hands the link to the portal's `OpenURI`
+/// (APPLICATIONS.md §W.6).
+const OPENER: &str = "td-open";
+const OPENER_ENTRY: &str = "/app/bin/td-open";
 
 pub fn recipe() -> Recipe {
-    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY) else {
+    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY)
+        .and_then(|declaration| declaration.with_environment("BROWSER", OPENER_ENTRY))
+    else {
         return invalid_recipe("declaration");
     };
     let Ok(launcher) = LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
@@ -29,8 +36,9 @@ pub fn recipe() -> Recipe {
     // window the program draws in as well as the one the jail requires of
     // every application. No terminal grant: the reader draws through
     // td-ui, and a pty would be a descriptor nothing reads. No bus name:
-    // the program has no D-Bus client, and the image's one bus-holding
-    // application stays Firefox (system-x86-64's tripwire).
+    // the opener is a portal client, which the default grant admits, and
+    // the image's one bus-holding application stays Firefox
+    // (system-x86-64's tripwire).
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
@@ -46,7 +54,7 @@ pub fn recipe() -> Recipe {
     };
 
     Recipe::mesboot(APPLICATION_NAME, "0.1")
-        .inputs(&[PROGRAM_RECIPE])
+        .inputs(&[PROGRAM_RECIPE, OPENER])
         .payload_inputs(&["static-runtime"])
         .steps(vec![
             Step::MkDir {
@@ -77,6 +85,14 @@ pub fn recipe() -> Recipe {
                     "{{in:{PROGRAM_RECIPE}}}/lib/debug/.td-assembly-exception"
                 )],
                 dest: "{out}/lib/debug".into(),
+            },
+            Step::CopyFiles {
+                files: vec![format!("{{in:{OPENER}}}/bin/{OPENER}")],
+                dest: "{out}/files/bin".into(),
+            },
+            Step::CopyFiles {
+                files: vec![format!("{{in:{OPENER}}}/lib/debug/bin/{OPENER}.debug")],
+                dest: "{out}/lib/debug/files/bin".into(),
             },
             Step::validate_static_application(&declaration),
         ])
@@ -111,7 +127,10 @@ mod tests {
         assert_eq!(declaration.runtime(), "static-runtime");
         assert_eq!(declaration.entry(), APPLICATION_ENTRY);
         assert_eq!(declaration.alias(), None);
-        assert_eq!(recipe.inputs, Some(vec![PROGRAM_RECIPE.into()]));
+        assert_eq!(
+            recipe.inputs,
+            Some(vec![PROGRAM_RECIPE.into(), OPENER.into()])
+        );
         assert_eq!(recipe.payload_inputs, Some(vec!["static-runtime".into()]));
         let launcher = recipe.application_launcher.as_ref().expect("launcher");
         assert_eq!(launcher.display_name(), APPLICATION_DISPLAY_NAME);
@@ -154,6 +173,28 @@ mod tests {
                 if files == &[format!("{{in:{PROGRAM_RECIPE}}}/lib/debug/.td-assembly-exception")]
                     && dest == "{out}/lib/debug"
         )));
+        // The opener ships beside the program, with its companion, and the
+        // manifest names it as the browser.
+        assert_eq!(
+            declaration.environment().collect::<Vec<_>>(),
+            [("BROWSER", OPENER_ENTRY)]
+        );
+        for (file, dest) in [
+            (format!("{{in:{OPENER}}}/bin/{OPENER}"), "{out}/files/bin"),
+            (
+                format!("{{in:{OPENER}}}/lib/debug/bin/{OPENER}.debug"),
+                "{out}/lib/debug/files/bin",
+            ),
+        ] {
+            assert!(steps.iter().any(|step| matches!(
+                step,
+                Step::CopyFiles { files, dest: to } if files == &[file.clone()] && to == dest
+            )));
+        }
+        assert_eq!(
+            td_engine::target_profile::output_assembly_exceptions(OPENER),
+            td_engine::target_profile::output_assembly_exceptions(PROGRAM_RECIPE)
+        );
         assert!(
             !steps
                 .iter()

@@ -116,6 +116,7 @@ pub const RUST_PROFILED_RECIPES: [&str; 40] = [
     "td-net",
     "td-netd",
     "td-news",
+    "td-open",
     "td-photo",
     "td-photo-test",
     "td-portal",

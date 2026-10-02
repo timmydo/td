@@ -1397,8 +1397,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // roster split), so a retained edit selects no local-source preflight;
     // the source takes the cargo-test preflight and the realized-output proofs
     // (the `news` and `mail` package checks, td-firstboot-test,
-    // rust-userland-auto-test) through recipe-checks.
-    if (p.starts_with("td-news/") || p.starts_with("td-mail/")) && !p.contains("..") {
+    // rust-userland-auto-test) through recipe-checks. td-open, the link
+    // opener both packages ship, is built and proved the same way.
+    if (p.starts_with("td-news/") || p.starts_with("td-mail/") || p.starts_with("td-open/"))
+        && !p.contains("..")
+    {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -2602,6 +2605,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("td-news/README.md", "local-source-roster");
     assert_no_preflight!("td-news/Cargo.lock", "local-source-roster");
     // td-mail: the same shape, the same routing.
+    assert_target!("td-open/src/main.rs", "check");
+    assert_target!("td-open/src/main.rs", "recipe-checks");
+    assert_preflight!("td-open/src/main.rs", "cargo-test");
     assert_target!("td-mail/src/main.rs", "check");
     assert_target!("td-mail/src/main.rs", "recipe-checks");
     assert_target!("td-mail/src/tui/mod.rs", "recipe-checks");
@@ -5727,6 +5733,7 @@ mod tests {
                 "td-compositor",
                 "td-jail",
                 "td-login",
+                "td-open",
                 "td-portal",
                 "td-secret"
             ]
@@ -8240,6 +8247,7 @@ mod tests {
                 "td-mail",
                 "td-mta",
                 "td-news",
+                "td-open",
                 "td-pass",
                 "td-photo",
                 "td-portal",

@@ -15,6 +15,7 @@ td-install-qemu-test-source td-install-qemu-test
 td-mail-source td-mail td-ui,td-compositor
 td-net-source net engine,td-boot
 td-news-source td-news td-ui,td-compositor
+td-open-source td-open td-busd
 td-photo-source td-photo td-ui,td-compositor
 td-portal-source td-portal td-secret,td-busd,td-compositor,engine,td-ui
 td-review-source td-review td-ui,td-compositor

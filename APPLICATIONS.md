@@ -9595,15 +9595,15 @@ td-news's HTML digest goes the same way as a `file://` URL
 through `$OPENER` or `xdg-open`; it ran its editor through `sh -c` too,
 until W.5 (a
 plain-word editor command then ran directly, until composing moved
-into its window, §W.5 "Reworked"). Inside the jail none of those
-exist: the `mail` and `news` packages are static binaries
-on the data-only `static-runtime`, so `PATH=/app/bin:/usr/bin` holds only the
-application itself, there is no `sh`, no `xdg-open`, `$BROWSER` is
-unset, and `/bin/firefox` is a host path the jail does not see. Outside
-the jail the image has no `xdg-open` either, so the unjailed behaviour
-was already "no browser opener available". The portal is the designed
-answer (§E, row 4): `.OpenURI` starts the configured browser for `http`
-and `https` and refuses `file`; it is listed as absent in rung 22.
+into its window, §W.5 "Reworked"). Before the plan below, none of
+those existed inside the jail: the `mail` and `news` packages are
+static binaries on the data-only `static-runtime`, so
+`PATH=/app/bin:/usr/bin` held only the packaged programs, there is no
+`sh`, no `xdg-open`, `$BROWSER` was unset, and `/bin/firefox` is a
+host path the jail does not see. Outside the jail the image has no
+`xdg-open` either, so the unjailed behaviour was already "no browser
+opener available". The portal is the designed answer (§E, row 4):
+`.OpenURI` hands `http` and `https` to the browser and refuses `file`.
 Composing mail had the same shape until td-editor (W.5) shipped inside
 the `mail` closure at `/app/bin/td-editor`, and has none now that
 td-mail composes in its own window; links and attachments are what
@@ -9619,24 +9619,36 @@ application-start`), and a second jail per click would only forward
 the URL anyway. The portal therefore calls the running Firefox's
 remote-control `OpenURL` itself, after the broker authenticates the
 holder, and the §B.2 suffix grant lets Firefox hold that
-profile-suffixed name. (2) A
-td-owned helper, `td-open URL`, dependency-free Rust reusing td-portal's
-client-side D-Bus codec, packaged into each application's store
-closure as `/app/bin/td-open`. The applications then need no D-Bus code:
-`td-news`'s configured browser command and `td-mail`'s opener become
-`/app/bin/td-open`, and the manifests set `BROWSER=/app/bin/td-open`.
-(3) Attachments: saving goes to the `xdg-download` grant the mail
+profile-suffixed name. (2) **LANDED.**
+`td-open LINK` is a td-owned static program, dependency-free Rust that
+mounts td-busd's message codec, built by its own recipe and copied with
+its debug companion into both the `mail` and `news` closures at
+`/app/bin/td-open`; both manifests set `BROWSER=/app/bin/td-open`. It
+authenticates to the session bus as the application's UID, calls
+`OpenURI` with its own `handle_token`, waits up to 30 seconds for that
+Request's `Response`, and exits 0 only for response 0. The applications
+carry no D-Bus code, and neither needs a bus name: a portal call is the
+default grant. td-ui's opener discards the helper's stderr and reports
+only that it started, so a link that does not open is diagnosed from
+the portal's `TD-PORTAL-OPEN-URI` journal line, which names the caller,
+scheme, response and outcome. A browser command in an application's
+own configuration still takes precedence over `$BROWSER`. (3)
+Attachments: saving goes to the `xdg-download` grant the mail
 manifest carries, which is the directory Firefox already shares. Opening
 an attachment needs `OpenURI.OpenFile`, the descriptor-taking member §E
 marks NotSupported in v1 because the handler runs in another sandbox; it
 lands after (1) with the descriptor forwarded to the handler's jail as a
 read-only grant, which is the Documents-portal shape without FUSE.
-(4) The application-side change in the two crates:
-prefer `$BROWSER` when set before probing `xdg-open`, so the manifest
-environment is enough and no `sh -c` is involved. Both programs'
-links now do (td-ui's opener); td-mail's attachments remain, and
-td-news's digest, a `file://` URL `OpenURI` refuses, would need its
-own descriptor path to `OpenFile`.
+Until it does, opening a saved attachment in the jail still finds
+neither `$OPENER` nor `xdg-open` and reports that, and the saved file
+is reachable from Firefox's download directory. (4) The
+application-side change in the two crates: prefer `$BROWSER` when set
+before probing `xdg-open`, so the manifest environment is enough and no
+`sh -c` is involved. Both programs' links do, through td-ui's opener,
+so with (1) and (2) a link from td-news or td-mail opens in the running
+Firefox. td-mail's attachments wait on (3), and td-news's digest, a
+`file://` URL `OpenURI` refuses, would need its own descriptor path to
+`OpenFile`.
 
 ### W.7 Relaunching a shipped application without root
 

@@ -19,9 +19,16 @@ const APPLICATION_SEARCH_TERMS: &[&str] = crate::ladder::TD_MAIL_SEARCH_TERMS;
 /// The source-built static binary this package wraps, and its recipe.
 const PROGRAM: &str = "td-mail";
 const PROGRAM_RECIPE: &str = "td-mail";
+/// The link opener the manifest names as `$BROWSER`: td-ui's opener runs
+/// it with the link, and it hands the link to the portal's `OpenURI`
+/// (APPLICATIONS.md §W.6).
+const OPENER: &str = "td-open";
+const OPENER_ENTRY: &str = "/app/bin/td-open";
 
 pub fn recipe() -> Recipe {
-    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY) else {
+    let Ok(declaration) = ApplicationDeclaration::new("static-runtime", APPLICATION_ENTRY)
+        .and_then(|declaration| declaration.with_environment("BROWSER", OPENER_ENTRY))
+    else {
         return invalid_recipe("declaration");
     };
     let Ok(launcher) = LauncherDeclaration::new(APPLICATION_DISPLAY_NAME, APPLICATION_SEARCH_TERMS)
@@ -33,7 +40,8 @@ pub fn recipe() -> Recipe {
     // window the program draws in as well as the one the jail requires of
     // every application. No terminal grant: the client draws through td-ui,
     // and a pty would be a descriptor nothing reads. The credential client
-    // needs only the default portal grant; mail still owns no bus name.
+    // and the link opener need only the default portal grant; mail still
+    // owns no bus name.
     let Ok(permissions) = PermissionPolicy::new()
         .with_socket(PermissionSocket::Wayland)
         .and_then(|permissions| permissions.with_socket(PermissionSocket::Fetch))
@@ -52,7 +60,7 @@ pub fn recipe() -> Recipe {
     };
 
     Recipe::mesboot(APPLICATION_NAME, "0.1")
-        .inputs(&[PROGRAM_RECIPE, "td-secret"])
+        .inputs(&[PROGRAM_RECIPE, "td-secret", OPENER])
         .payload_inputs(&["static-runtime"])
         .steps(vec![
             Step::MkDir {
@@ -92,6 +100,14 @@ pub fn recipe() -> Recipe {
                 files: vec!["{in:td-secret}/lib/debug/bin/td-secret.debug".into()],
                 dest: "{out}/lib/debug/files/bin".into(),
             },
+            Step::CopyFiles {
+                files: vec![format!("{{in:{OPENER}}}/bin/{OPENER}")],
+                dest: "{out}/files/bin".into(),
+            },
+            Step::CopyFiles {
+                files: vec![format!("{{in:{OPENER}}}/lib/debug/bin/{OPENER}.debug")],
+                dest: "{out}/lib/debug/files/bin".into(),
+            },
             Step::validate_static_application(&declaration),
         ])
         .application(declaration)
@@ -125,13 +141,15 @@ mod tests {
         assert_eq!(declaration.runtime(), "static-runtime");
         assert_eq!(declaration.entry(), APPLICATION_ENTRY);
         assert_eq!(declaration.alias(), None);
-        // No editor: composing is in td-mail's window, so the manifest
-        // carries no environment and the package no second program but
-        // the credential helper.
-        assert_eq!(declaration.environment().count(), 0);
+        // No editor: composing is in td-mail's window, so the package's
+        // other programs are the credential helper and the link opener.
         assert_eq!(
             recipe.inputs,
-            Some(vec![PROGRAM_RECIPE.into(), "td-secret".into()])
+            Some(vec![
+                PROGRAM_RECIPE.into(),
+                "td-secret".into(),
+                OPENER.into()
+            ])
         );
         assert_eq!(recipe.payload_inputs, Some(vec!["static-runtime".into()]));
         let launcher = recipe.application_launcher.as_ref().expect("launcher");
@@ -186,6 +204,28 @@ mod tests {
         // the helper's boundary set must be td-mail's exactly.
         assert_eq!(
             td_engine::target_profile::output_assembly_exceptions("td-secret"),
+            td_engine::target_profile::output_assembly_exceptions(PROGRAM_RECIPE)
+        );
+        // The opener ships beside the program, with its companion, and the
+        // manifest names it as the browser.
+        assert_eq!(
+            declaration.environment().collect::<Vec<_>>(),
+            [("BROWSER", OPENER_ENTRY)]
+        );
+        for (file, dest) in [
+            (format!("{{in:{OPENER}}}/bin/{OPENER}"), "{out}/files/bin"),
+            (
+                format!("{{in:{OPENER}}}/lib/debug/bin/{OPENER}.debug"),
+                "{out}/lib/debug/files/bin",
+            ),
+        ] {
+            assert!(steps.iter().any(|step| matches!(
+                step,
+                Step::CopyFiles { files, dest: to } if files == &[file.clone()] && to == dest
+            )));
+        }
+        assert_eq!(
+            td_engine::target_profile::output_assembly_exceptions(OPENER),
             td_engine::target_profile::output_assembly_exceptions(PROGRAM_RECIPE)
         );
         assert!(

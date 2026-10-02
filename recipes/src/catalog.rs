@@ -442,6 +442,7 @@ mod tests {
                 "td-install",
                 "td-mail",
                 "td-news",
+                "td-open",
                 "td-photo",
                 "td-portal",
                 "td-review",
