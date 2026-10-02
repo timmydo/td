@@ -184,6 +184,16 @@ still account for those costs and concurrent owners within the ledger.
   sweep, can create additional stack temporaries; whole-worker stack
   qualification remains pending. It transfers the existing record buffer from
   table to history work and returns the existing change slots, adding no arena.
+  DataValidation retains one ValidationView, the four fixed sweep states and
+  their scalar completion evidence. Provider state fits 8 KiB on the existing
+  worker stack; only one sweep does I/O at a time. Construction/moves and inner
+  lookup/replay/reference temporaries remain additional stack work awaiting
+  whole-worker qualification. No arena is added. Caller key/value storage is
+  reused for every phase, with value storage becoming blob chunk scratch;
+  record/change scratch borrows end on finish/drop independently of the retained
+  CheckedData file/owner proof. Finite row, parent-get and blob-byte limits plus
+  the reader work/deadline bounds apply. Existing component allocation probes
+  remain; this composition adds no whole-service allocation or RSS claim.
   ValidationView retains the checked snapshot borrow, one ChangeScan, a clock
   guard and scalar limits. Its Provider state fits 4 KiB, excluding the temporary
   TableLookup/TableNext constructed during a row call and their existing merge

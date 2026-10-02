@@ -61,6 +61,7 @@ pub struct ValidationView<'a, C: Crypto> {
     guard: Guard<'a>,
     limits: ReadLimits,
     failed: Option<Error>,
+    utc_ms: i64,
 }
 impl CheckedFiles<'_, '_, '_, '_, '_> {
     /// One fixed-kind forward change scan; caller admits blocking std I/O and scratch.
@@ -75,10 +76,11 @@ impl CheckedFiles<'_, '_, '_, '_, '_> {
         if request.limits.steps == 0 {
             return Err(Error::Capacity);
         }
+        let sampled = clock.sample()?;
         let mut guard = Guard {
             clock,
             deadline: request.deadline,
-            last: clock.sample()?.monotonic,
+            last: sampled.monotonic,
         };
         guard.check()?;
         for tag in 1..=format::TABLE_COUNT {
@@ -134,10 +136,18 @@ impl CheckedFiles<'_, '_, '_, '_, '_> {
             guard,
             limits: request.limits,
             failed: None,
+            utc_ms: sampled.utc_ms,
         })
     }
 }
 impl<C: Crypto> ValidationView<'_, C> {
+    pub(super) const fn utc_ms(&self) -> i64 {
+        self.utc_ms
+    }
+    pub(super) fn check_deadline(&mut self) -> Result<(), Error> {
+        self.begin()?;
+        self.finish(Ok(()))
+    }
     pub const fn is_failed(&self) -> bool {
         self.failed.is_some()
     }

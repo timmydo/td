@@ -489,6 +489,47 @@ same scratch after the failed view is dropped. An absolute deadline cannot
 interrupt a blocking std filesystem operation. Runtime view leases, service
 activation and complete logical validation remain separate.
 
+### Validating final references and blob data
+
+`CheckedFiles::validate_data` borrows one ValidationView and the same stopped
+owner. Run the existing direct-reference, recipient, mailbox and blob sweeps
+in that order. Each advance performs one underlying sweep step, with the
+supplied key/value partitions reused throughout. The blob phase reuses value
+storage for chunks. All references and files belong to the captured identity;
+the complete physical-file check precedes this pass. This checks the direct
+owning references, recipient coverage/current queue consistency, rooted mailbox
+parent chains, and every final blob row's private file/digest/extent/EOF.
+
+Before constructing the reader, admit the physically counted total final rows
+against DataLimits.rows. That finite allowance also bounds each later sweep;
+it is not a cumulative physical-read budget. Separate total parent-get and
+blob-byte ceilings apply. ValidationReadRequest still supplies per-call work,
+per-input table/source byte ceilings and one absolute monotonic deadline.
+Reference expiry uses the UTC value from the view's first clock sample. It is
+one captured observation, not a new authorization or a moving expiry cutoff.
+Full-table get/next scans remain a bounded fallback, not a performance claim.
+
+Check the deadline around every sweep step, including blob opens, chunks and
+completion that do not call ReadView. A retired view already checked its final
+result and is not sampled again; preserve that nested failure. Otherwise a
+late clock/deadline failure takes precedence over the step result. Any error
+retires the coordinator; later calls do no clock or I/O work. Repeated
+successful completion checks the deadline without I/O. Consuming finish
+also checks it,
+so an expired completed coordinator cannot return success. Blocking std calls
+still cannot be interrupted.
+
+Completion requires all four sweep evidences. Compare direct-reference counts
+for all eleven tables against physical replay counts, then compare recipient,
+mailbox and blob totals with their respective reference counts. CheckedData
+retains those evidences and the CheckedFiles borrow; its lifetime keeps stopped
+ownership while the separate reader scratch lifetime ends. Caller record/change
+scratch can therefore be reused while inspecting the result. Incomplete/error
+state cannot produce CheckedData. No repair, cleanup, mutation or activation
+is performed. Mailbox configuration/mutation policy, transaction history and
+worker fences, tail repair, orphan/quota accounting, runtime leases and service
+authorization remain separate obligations.
+
 ### Loading the selected metadata
 
 `LockedRoot::load_selection` is the first recovery input step. Its caller must

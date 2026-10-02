@@ -1,6 +1,6 @@
 //! Read-only ownership of a cooperatively locked store during offline validation.
 use super::{
-    ChangeInputError, ChangeScan, ChangeScanRequest, HistorySweep, HistorySweepError,
+    BlobSweep, ChangeInputError, ChangeScan, ChangeScanRequest, HistorySweep, HistorySweepError,
     HistorySweepLimits, LoadedOverlay, LockedRoot, OverlayInputError, SelectionError,
     SelectionScratch, TableInput, TableInputError, TableSweep, TableSweepError, TableSweepLimits,
 };
@@ -15,8 +15,9 @@ use crate::{
 #[path = "stopped/validation.rs"]
 mod validation;
 pub use validation::{
-    CheckedFiles, FileValidation, ReadLimits, ValidationError, ValidationLimits,
-    ValidationReadRequest, ValidationStep, ValidationView,
+    CheckedData, CheckedFiles, DataError, DataLimits, DataStep, DataValidation, FileValidation,
+    ReadLimits, ValidationError, ValidationLimits, ValidationReadRequest, ValidationStep,
+    ValidationView,
 };
 
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.
@@ -75,6 +76,15 @@ impl StoppedStore {
     ) -> Result<LoadedOverlay<'r, 'b, 's>, OverlayInputError> {
         self.root
             .load_active_overlay(crypto, selection, view, max_bytes, frames, cells)
+    }
+    fn blobs<'r, 'c, C: Crypto>(
+        &'r self,
+        crypto: &'c C,
+        identity: ViewIdentity,
+        rows: u64,
+        bytes: u64,
+    ) -> BlobSweep<'r, 'c, C> {
+        BlobSweep::new(&self.root, crypto, identity, rows, bytes)
     }
     // Keep the validation child on the read-only owner's surface.
     fn open_table<'r, 'c, 'm, 'b, C: Crypto>(

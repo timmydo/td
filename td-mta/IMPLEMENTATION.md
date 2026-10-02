@@ -998,6 +998,14 @@ service activation. Each part lands independently:
     exercise all states, definitive/uncertain results, historical replies,
     retryable unknowns, group combinations and sticky sweep failures. Transition
     history, worker fences and complete logical graph integration remain separate.
+  - **M05d26 — owned final-data validation:** implemented ordered composition
+    of direct references, recipient queue consistency, mailbox parent walks and
+    final blob files over one offline ValidationView. Bracket every step and
+    consuming completion with the deadline, compare counts against physical
+    replay and retain stopped ownership independently of reusable scratch.
+    Real selected-file tests cover populated/empty success and errors in every
+    phase, budgets, sticky failure and deadlines after blob reads/completion.
+    Recovery repair/accounting, mutation policy and activation remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

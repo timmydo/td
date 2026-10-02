@@ -25,7 +25,7 @@ use td_mta::{
 #[path = "../src/row_references.rs"]
 #[allow(unused)]
 mod measured_row_references;
-use td_mta::{mailbox_parents, row_references};
+use td_mta::{mailbox_parents, mailbox_sweep, recipient_sweep, reference_sweep, row_references};
 #[path = "../src/mailbox_sweep.rs"]
 #[allow(unused)]
 mod measured_mailbox_sweep;

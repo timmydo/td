@@ -11,6 +11,10 @@ use crate::{
     ports::{Crypto, Error as PolicyError, ViewIdentity},
 };
 
+#[path = "data.rs"]
+mod data;
+pub use data::{CheckedData, DataError, DataLimits, DataStep, DataValidation};
+
 #[path = "view.rs"]
 mod view;
 pub use view::{ReadLimits, ValidationReadRequest, ValidationView};

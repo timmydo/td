@@ -808,6 +808,17 @@ This supplies offline validation reads, without service authorization, runtime
 pool leases, complete logical invariants or activation. The existing blocking
 std I/O duration limitation remains; a deadline check cannot interrupt a syscall.
 
+`CheckedFiles::validate_data` drives direct references, recipient queue checks,
+mailbox parent chains and blob verification under the same stopped owner and
+ValidationView. DataLimits bounds total final rows, parent gets and blob bytes;
+each advance performs one underlying sweep step and brackets its full work with
+deadline checks. Retired view errors preserve their nested source without more
+clock work. Completion compares every table's physical/reference counts and the
+three specialized totals. Consuming finish rechecks the deadline and returns
+CheckedData retaining the file proof/owner, while releasing reader scratch.
+Any error retires the coordinator; repair/accounting, mutation policy, runtime
+leases and service activation remain separate.
+
 `store_fs::HistorySweep` verifies every retained selected history segment,
 admitting total descriptor bytes and frames before I/O. Advances open, read one
 bounded frame, or complete one selected file; only digest/EOF completion releases
