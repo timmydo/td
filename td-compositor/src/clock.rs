@@ -8,7 +8,11 @@ use std::path::Path;
 #[derive(Debug)]
 pub enum Clock {
     Utc,
-    Local(Zone),
+    /// The zone the setting names, and its rules.
+    Local {
+        name: String,
+        zone: Zone,
+    },
     Unavailable,
 }
 
@@ -51,7 +55,10 @@ impl Clock {
         }
         let bytes = read_bounded(&path, MAX_BYTES)?;
         let zone = Zone::parse(&bytes).ok_or("invalid or unsupported timezone data")?;
-        Ok(Self::Local(zone))
+        Ok(Self::Local {
+            name: name.to_owned(),
+            zone,
+        })
     }
 
     pub fn stamp(&self, epoch: Option<u64>) -> String {
@@ -62,7 +69,7 @@ impl Clock {
         let epoch = i64::try_from(epoch?).ok()?;
         let offset = match self {
             Self::Utc => 0,
-            Self::Local(zone) => zone.offset_at(epoch)?,
+            Self::Local { zone, .. } => zone.offset_at(epoch)?,
             Self::Unavailable => return None,
         };
         let local = epoch.checked_add(i64::from(offset))?;
@@ -163,6 +170,7 @@ mod tests {
         fs::rename(scratch.zones(), scratch.0.join("immutable")).unwrap();
         symlink("immutable", scratch.zones()).unwrap();
         let clock = scratch.load().unwrap();
+        assert!(matches!(&clock, Clock::Local { name, .. } if name == "Europe/London"));
         fs::write(scratch.0.join("saved"), "broken").unwrap();
         fs::remove_file(scratch.zones().join("Europe/London")).unwrap();
         assert_eq!(clock.stamp(Some(4_102_444_800)), "2100-01-01 00:00:00 UTC");
@@ -235,8 +243,10 @@ mod tests {
             ("<+0545>-5:45", "1970-01-01 05:45:00 UTC+05:45"),
             ("LMT-0:09:21", "1970-01-01 00:09:21 UTC+00:09:21"),
         ] {
-            let clock =
-                Clock::Local(Zone::parse(&fixture(&[], &[(0, false, "UTC")], footer)).unwrap());
+            let clock = Clock::Local {
+                name: "Etc/Test".into(),
+                zone: Zone::parse(&fixture(&[], &[(0, false, "UTC")], footer)).unwrap(),
+            };
             let text = clock.stamp(Some(0));
             assert_eq!(text, expected);
             assert!(text.chars().all(crate::text::covered));
@@ -257,8 +267,11 @@ mod tests {
         assert_eq!(Clock::Utc.stamp(None), "CLOCK ?");
         assert_eq!(Clock::Utc.stamp(Some(u64::MAX)), "CLOCK ?");
         assert_eq!(
-            Clock::Local(Zone::parse(&fixture(&[], &[(0, false, "UTC")], "<-00>0")).unwrap())
-                .stamp(Some(0)),
+            Clock::Local {
+                name: "Etc/Test".into(),
+                zone: Zone::parse(&fixture(&[], &[(0, false, "UTC")], "<-00>0")).unwrap(),
+            }
+            .stamp(Some(0)),
             "CLOCK ?"
         );
     }

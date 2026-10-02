@@ -1,6 +1,7 @@
 use crate::clock::Clock;
 use crate::text::{Text, CELL_HEIGHT};
 use crate::ui;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -566,6 +567,18 @@ pub fn paint(
     );
 }
 
+/// Said once per compositor process, since the offset on the bar does not
+/// name the zone and an installed system's choice should be observable by
+/// name: the zone, `none` when no setting selected UTC, or `unavailable`.
+fn zone_report(clock: &Clock) -> String {
+    let name = match clock {
+        Clock::Local { name, .. } => name.as_str(),
+        Clock::Utc => "none",
+        Clock::Unavailable => "unavailable",
+    };
+    format!("\ntd-compositor: clock zone {name}\n")
+}
+
 /// At most this many failures are named between good paints. Deduplication
 /// alone bounds the REPEATED fault and not the alternating one: a framebuffer
 /// failing every other paint, or two faults taking turns, is a fresh error
@@ -664,6 +677,13 @@ pub fn start(
                     Clock::Unavailable
                 }
             };
+            // One write beginning a line of its own, as the boot markers are:
+            // the console is shared with other writers' unterminated output.
+            let mut out = io::stdout().lock();
+            let _ = out
+                .write_all(zone_report(&clock).as_bytes())
+                .and_then(|()| out.flush());
+            drop(out);
             let mut reported = Reported::default();
             loop {
                 // A paint failure is REPORTED, never fatal: the bar is the
@@ -1476,14 +1496,15 @@ Local:
             crate::framebuffer::Framebuffer::test_file(&path, 320, 200, 320 * 4).unwrap();
         let runtime = Mutex::new(crate::runtime::Runtime::new(framebuffer));
         let fixture = Fixture::new("0.42 0.31 0.28 2/517 9182\n", MEMINFO, "187245.31 91.2\n");
-        let clock = Clock::Local(
-            crate::timezone::Zone::parse(&crate::timezone::fixture(
+        let clock = Clock::Local {
+            name: "Asia/Tokyo".into(),
+            zone: crate::timezone::Zone::parse(&crate::timezone::fixture(
                 &[],
                 &[(0, false, "UTC")],
                 "JST-9",
             ))
             .unwrap(),
-        );
+        };
         let mut reported = Reported::default();
         assert_eq!(
             tick(
@@ -1522,7 +1543,23 @@ Local:
             load_centi: Some(42),
             ..Readings::default()
         };
-        let local = line(&Clock::Local(zone), &readings);
+        let tokyo = Clock::Local {
+            name: "Asia/Tokyo".into(),
+            zone,
+        };
+        assert_eq!(
+            zone_report(&tokyo),
+            "\ntd-compositor: clock zone Asia/Tokyo\n"
+        );
+        assert_eq!(
+            zone_report(&Clock::Utc),
+            "\ntd-compositor: clock zone none\n"
+        );
+        assert_eq!(
+            zone_report(&Clock::Unavailable),
+            "\ntd-compositor: clock zone unavailable\n"
+        );
+        let local = line(&tokyo, &readings);
         assert!(local.ends_with("1970-01-01 09:00:00 UTC+09:00"));
         let unavailable = line(&Clock::Unavailable, &readings);
         assert!(unavailable.contains("LOAD 0.42"));

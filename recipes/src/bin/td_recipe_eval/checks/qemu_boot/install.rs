@@ -1912,6 +1912,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
                     id: &id,
                     username: protocol::USERNAME,
                     hostname: protocol::HOSTNAME,
+                    zone: None,
                 },
                 &ColdBoots {
                     scratch: &scratch.dir,
@@ -1997,6 +1998,8 @@ pub(super) struct Installed<'a> {
     pub(super) id: &'a str,
     pub(super) username: &'a str,
     pub(super) hostname: &'a str,
+    /// The zone the session's clock must name, when the oracle chose one.
+    pub(super) zone: Option<&'a str>,
 }
 
 /// Cold-boots the installed `target` through firmware twice, its media
@@ -2137,6 +2140,7 @@ fn validate_installed_system(
             id,
             username: protocol::USERNAME,
             hostname: protocol::HOSTNAME,
+            zone: Some(protocol::TIMEZONE_ID),
         },
         fresh,
     )
@@ -2155,6 +2159,7 @@ fn validate_installed_as(
         id,
         username,
         hostname,
+        zone,
     } = *installed;
     require(
         result,
@@ -2223,33 +2228,69 @@ fn validate_installed_as(
     {
         return Err(format!("installed system identity: expected fresh={fresh}, new={}, stable={}, host key present={}\n{}", result.evidence.firstboot_new, result.evidence.firstboot_stable, result.evidence.host_key.is_some(), tail(&result.console, 100)));
     }
-    require_identity_files(result, fresh)?;
+    require_identity_files(result, username, fresh)?;
+    if let Some(zone) = zone {
+        require_clock_zone(result, zone)?;
+    }
     validate_compositor_boot(result)
 }
 
-/// td-firstboot's word on the machine-id and the host key themselves: a
-/// fresh machine created both, and a kept one found both, the host key
-/// the one it reported. Its new-machine marker alone would also follow a
-/// created authorized_keys beside a copied host key.
-fn require_identity_files(result: &BootResult, fresh: bool) -> Result<(), String> {
+/// Each compositor process says on a line of its own which zone its clock
+/// loaded, or that none was set or it could not load; a supervised restart
+/// says it again. At least one, and every one this boot printed, must name
+/// `zone`.
+fn require_clock_zone(result: &BootResult, zone: &str) -> Result<(), String> {
+    let named: Vec<_> = result
+        .console
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.starts_with("td-compositor: clock zone"))
+        .map(|line| {
+            line.strip_prefix("td-compositor: clock zone ")
+                .unwrap_or_default()
+        })
+        .collect();
+    if named.is_empty() || named.iter().any(|name| *name != zone) {
+        return Err(format!(
+            "installed session's clock named {named:?}, not {zone:?}\n{}",
+            tail(&result.console, 100)
+        ));
+    }
+    Ok(())
+}
+
+/// td-firstboot's word on the machine-id, the host key and the account's
+/// home themselves: a fresh machine created all three, and a kept one found
+/// them, the host key the one it reported and the home the account's, each
+/// the only report of its kind. Its new-machine marker alone would also
+/// follow a created authorized_keys beside a copied host key.
+fn require_identity_files(result: &BootResult, username: &str, fresh: bool) -> Result<(), String> {
     let outcome = if fresh { "created" } else { "present" };
     let fingerprint = result
         .evidence
         .host_key
         .as_deref()
         .ok_or("installed system reported no host key")?;
-    for expected in [
+    for (expected, kind) in [
         format!("td-firstboot: machine-id {outcome}"),
         format!("td-firstboot: host key {outcome} {fingerprint}"),
-    ] {
-        let found = result
+        format!("td-firstboot: primary home {outcome} /var/home/{username}"),
+    ]
+    .iter()
+    .zip([
+        "td-firstboot: machine-id",
+        "td-firstboot: host key",
+        "td-firstboot: primary home",
+    ]) {
+        let reports: Vec<_> = result
             .console
             .lines()
-            .filter(|line| line.trim_end() == expected)
-            .count();
-        if found != 1 {
+            .map(str::trim_end)
+            .filter(|line| line.starts_with(kind))
+            .collect();
+        if reports != [expected.as_str()] {
             return Err(format!(
-                "installed system reported {expected:?} {found} times, not once\n{}",
+                "installed system reported {reports:?}, not only {expected:?}\n{}",
                 tail(&result.console, 100)
             ));
         }
@@ -2559,7 +2600,7 @@ mod tests {
         BootResult {
             evidence, exited_clean: false, marker_killed: true,
             reason: "fixture".into(),
-            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\ntd-firstboot: machine-id created\ntd-firstboot: host key created ssh-ed25519 AAAA\nTD-HOSTNAME-READY {}\nTD-PRIMARY-PROFILE-READY {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME, protocol::USERNAME),
+            console: format!("TD-BOOT-VOLUME uuid /dev/vda2\nTD-BOOT-SELECTED-CURRENT deployment\ntd-firstboot: machine-id created\ntd-firstboot: host key created ssh-ed25519 AAAA\nTD-HOSTNAME-READY {}\ntd-firstboot: primary home created /var/home/{}\nTD-PRIMARY-PROFILE-READY {}\ntd-compositor: clock zone {}\n{SYSTEM_BOOT_SUCCESS_MARKER}\n", protocol::HOSTNAME, protocol::USERNAME, protocol::USERNAME, protocol::TIMEZONE_ID),
             elapsed: Duration::ZERO, firefox_audio: FirefoxAudioCapture::NotRequested,
         }
     }
@@ -2619,6 +2660,7 @@ mod tests {
             id: "deployment",
             username: "dana",
             hostname: "td-wizard",
+            zone: None,
         };
         let mut result = healthy_system();
         assert!(validate_installed_as(&result, "/dev/vda2", &installed, true).is_err());
@@ -2631,6 +2673,10 @@ mod tests {
                 format!("TD-PRIMARY-PROFILE-READY {}\n", protocol::USERNAME),
                 "TD-PRIMARY-PROFILE-READY dana\n",
             ),
+            (
+                format!("primary home created /var/home/{}\n", protocol::USERNAME),
+                "primary home created /var/home/dana\n",
+            ),
         ] {
             assert_eq!(result.console.matches(&fixture).count(), 1);
             result.console = result.console.replace(&fixture, given);
@@ -2639,6 +2685,47 @@ mod tests {
         assert!(
             validate_installed_system(&result, "uuid", "/dev/vda2", "deployment", true).is_err()
         );
+        // A chosen zone must be the one every session's clock named.
+        let tokyo = Installed {
+            zone: Some("Asia/Tokyo"),
+            ..installed
+        };
+        assert!(validate_installed_as(&result, "/dev/vda2", &tokyo, true).is_err());
+        let fixture_zone = format!("td-compositor: clock zone {}\n", protocol::TIMEZONE_ID);
+        assert_eq!(result.console.matches(&fixture_zone).count(), 1);
+        let console = result.console.replace(&fixture_zone, "");
+        for (lines, ok) in [
+            ("td-compositor: clock zone Asia/Tokyo\n", true),
+            (
+                "td-compositor: clock zone Asia/Tokyo\r\ntd-compositor: clock zone Asia/Tokyo\n",
+                true,
+            ),
+            ("td-compositor: clock zone Asia/Seoul\n", false),
+            ("td-compositor: clock zone none\n", false),
+            (
+                "td-compositor: clock zone Asia/Tokyo\ntd-compositor: clock zone none\n",
+                false,
+            ),
+            ("td-compositor: clock zone Asia/Tokyo/X\n", false),
+            ("td-compositor: clock zone Asia/Tokyo \n", true),
+            ("td-compositor: clock zone unavailable\n", false),
+            (
+                "td-compositor: clock zone Asia/Tokyo\ntd-compositor: clock zone \n",
+                false,
+            ),
+            (
+                "td-compositor: clock zone Asia/Tokyo\ntd-compositor: clock zoneAsia/Tokyo\n",
+                false,
+            ),
+        ] {
+            result.console = format!("{console}{lines}");
+            assert_eq!(
+                validate_installed_as(&result, "/dev/vda2", &tokyo, true).is_ok(),
+                ok,
+                "{lines:?}"
+            );
+        }
+        result.console = console;
         for other in [
             Installed {
                 username: "dano",
@@ -3173,6 +3260,29 @@ mod tests {
         assert!(
             validate_installed_system(&second, "uuid", "/dev/vda2", "deployment", false).is_ok()
         );
+        let kept = second.console.clone();
+        let home = format!(
+            "td-firstboot: primary home present /var/home/{}\n",
+            protocol::USERNAME
+        );
+        let zone = format!("td-compositor: clock zone {}\n", protocol::TIMEZONE_ID);
+        for broken in [
+            kept.replace("primary home present", "primary home created"),
+            kept.replace(&home, ""),
+            kept.replace(&home, &format!("{home}{home}")),
+            kept.replace(&zone, ""),
+            kept.replace(&zone, "td-compositor: clock zone none\n"),
+            kept.replace(&zone, "td-compositor: clock zone unavailable\n"),
+        ] {
+            second.console = broken;
+            assert!(
+                validate_installed_system(&second, "uuid", "/dev/vda2", "deployment", false)
+                    .is_err(),
+                "{}",
+                second.console
+            );
+        }
+        second.console = kept;
         // A fresh machine must have created both the machine-id and the host
         // key, the one it reported, each said once.
         let fresh = |console: &str| {
@@ -3189,6 +3299,37 @@ mod tests {
             created.replace(
                 "td-firstboot: machine-id created\n",
                 "td-firstboot: machine-id created\ntd-firstboot: machine-id created\n",
+            ),
+            created.replace("primary home created", "primary home present"),
+            created.replace(
+                &format!("primary home created /var/home/{}\n", protocol::USERNAME),
+                &format!(
+                    "primary home created /var/home/{0}\ntd-firstboot: primary home created /var/home/{0}\n",
+                    protocol::USERNAME
+                ),
+            ),
+            created.replace(
+                &format!("primary home created /var/home/{}\n", protocol::USERNAME),
+                &format!(
+                    "primary home created /var/home/{0}\ntd-firstboot: primary home present /var/home/{0}\n",
+                    protocol::USERNAME
+                ),
+            ),
+            created.replace(
+                &format!("primary home created /var/home/{}\n", protocol::USERNAME),
+                &format!(
+                    "primary home created /var/home/{}\ntd-firstboot: primary home created /var/home/tester\n",
+                    protocol::USERNAME
+                ),
+            ),
+            created.replace(
+                "td-firstboot: machine-id created\n",
+                "td-firstboot: machine-id created\ntd-firstboot: machine-id present\n",
+            ),
+            created.replace("created /var/home/", "created /home/"),
+            created.replace(
+                &format!("primary home created /var/home/{}\n", protocol::USERNAME),
+                "",
             ),
         ] {
             assert!(fresh(&broken).is_err(), "{broken}");

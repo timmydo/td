@@ -197,8 +197,9 @@ admission against `/root-image` with the same td-firstboot; the verified
 source remains stable on read-only media. The fixture checks the exact
 mode-0644 saved file in the mounted @var. Every installed full-system boot must
 report exactly one `TD-PRIMARY-PROFILE-READY alice`, after production account
-publication and home preparation. The existing SSH, terminal, ownership and
-application probes then run as that account. The live fixture unmounts
+publication and home preparation, and exactly one primary-home report:
+`created` on its first boot and `present` after. The existing SSH,
+terminal, ownership and application probes then run as that account. The live fixture unmounts
 its temporary EROFS view after installing, retaining the read-only loop
 binding until its VM ends. That phase neither reuses loop0 nor unmounts
 the source; installed boots start in a fresh kernel. The tiny sentinel

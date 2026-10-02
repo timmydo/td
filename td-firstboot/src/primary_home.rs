@@ -43,7 +43,7 @@ fn directory(path: &Path, owner: (u32, u32), mode: u32) -> Result<File, String> 
 
 /// The caller has authenticated ROOT and mounted its persistent /var. No
 /// account consumer or competing privileged writer may run during this step.
-pub(crate) fn prepare(root: &Path) -> Result<String, String> {
+pub(crate) fn prepare(root: &Path) -> Result<(String, crate::Outcome), String> {
     let primary = principals::primary_in_root(root)
         .map_err(|error| format!("primary account in {}: {error}", root.display()))?;
     let logical_root = root;
@@ -54,14 +54,14 @@ pub(crate) fn prepare(root: &Path) -> Result<String, String> {
         .map_err(|error| format!("{}: {error}", logical_root.join("var/home").display()))?;
     let uid = principals::primary_account::UID;
     let home = primary.persistent_home();
-    ensure_home(&homes, primary.name(), (uid, uid))
+    let outcome = ensure_home(&homes, primary.name(), (uid, uid))
         .map_err(|error| format!("{}: {error}", home.display()))?;
     home.to_str()
-        .map(str::to_owned)
+        .map(|home| (home.to_owned(), outcome))
         .ok_or_else(|| "primary home is not UTF-8".into())
 }
 
-fn ensure_home(parent: &File, name: &str, owner: (u32, u32)) -> Result<(), String> {
+fn ensure_home(parent: &File, name: &str, owner: (u32, u32)) -> Result<crate::Outcome, String> {
     ensure_home_at(parent, name, owner, SystemTime::now())
 }
 
@@ -70,7 +70,7 @@ fn ensure_home_at(
     name: &str,
     owner: (u32, u32),
     now: SystemTime,
-) -> Result<(), String> {
+) -> Result<crate::Outcome, String> {
     let destination = child(parent, name);
     match fs::symlink_metadata(&destination) {
         Ok(_) => {
@@ -80,7 +80,7 @@ fn ensure_home_at(
                     .and_then(|()| home.sync_all())
                     .map_err(|error| format!("restore primary-home private mode: {error}"))?;
             }
-            return Ok(());
+            return Ok(crate::Outcome::Present);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect primary home: {error}")),
@@ -119,6 +119,7 @@ fn ensure_home_at(
                 .map_err(|error| format!("finish primary-home staging: {error}"))?;
             fs::rename(&temporary, &destination)
                 .and_then(|()| parent.sync_all())
+                .map(|()| crate::Outcome::Created)
                 .map_err(|error| format!("publish primary home: {error}"))
         })();
         if result.is_err() {
@@ -177,7 +178,10 @@ mod tests {
         let parent = scratch.parent();
         let metadata = parent.metadata().unwrap();
         let owner = (metadata.uid(), metadata.gid());
-        ensure_home(&parent, "alice", owner).unwrap();
+        assert_eq!(
+            ensure_home(&parent, "alice", owner).unwrap(),
+            crate::Outcome::Created
+        );
         let home = scratch.0.join("alice");
         let before = fs::metadata(&home).unwrap();
         assert_eq!(
@@ -185,7 +189,10 @@ mod tests {
             (owner.0, owner.1, 0o700)
         );
         fs::write(home.join("kept"), "persistent state").unwrap();
-        ensure_home(&parent, "alice", owner).unwrap();
+        assert_eq!(
+            ensure_home(&parent, "alice", owner).unwrap(),
+            crate::Outcome::Present
+        );
         assert_eq!(fs::metadata(&home).unwrap().ino(), before.ino());
         assert_eq!(
             fs::read_to_string(home.join("kept")).unwrap(),
@@ -208,7 +215,10 @@ mod tests {
         let old = UNIX_EPOCH
             .checked_sub(std::time::Duration::from_secs(1))
             .unwrap();
-        ensure_home_at(&parent, "alice", owner, old).unwrap();
+        assert_eq!(
+            ensure_home_at(&parent, "alice", owner, old).unwrap(),
+            crate::Outcome::Created
+        );
         assert_eq!(
             fs::read_to_string(stale.join("kept")).unwrap(),
             "unknown old state"
@@ -229,7 +239,10 @@ mod tests {
         let before = fs::metadata(&home).unwrap();
         for mode in [0o755, 0o777, 0o1700, 0o2700] {
             fs::set_permissions(&home, fs::Permissions::from_mode(mode)).unwrap();
-            ensure_home(&parent, "alice", owner).unwrap();
+            assert_eq!(
+                ensure_home(&parent, "alice", owner).unwrap(),
+                crate::Outcome::Present
+            );
             let retained = fs::metadata(&home).unwrap();
             assert_eq!(retained.ino(), before.ino());
             assert_eq!((retained.uid(), retained.gid()), owner);

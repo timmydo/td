@@ -397,9 +397,13 @@ Unix epoch, such as the previous evening west of Greenwich. The
 clock still samples nonnegative Unix seconds; an unavailable, pre-epoch,
 or unrepresentable system sample displays `CLOCK ?`. Invalid settings
 or data also display `CLOCK ?`, with one startup diagnostic, while other
-status fields continue. The suffix is the actual offset, `UTC` or
-`UTC+HH:MM` / `UTC-HH:MM`, adding seconds for historical sub-minute
-offsets. It does not use an ambiguous timezone abbreviation. Existing
+status fields continue. Each compositor process also reports its clock
+once, as one write beginning a line of its own on standard output:
+`td-compositor: clock zone NAME`, `none` when no setting selected UTC, or
+`unavailable` when the setting or its data refused. A session's zone is
+then observable by name and not only as the offset the bar draws. The
+suffix is the actual offset, `UTC` or `UTC+HH:MM` / `UTC-HH:MM`, adding
+seconds for historical sub-minute offsets. It does not use an ambiguous timezone abbreviation. Existing
 strip clipping still applies to the longer field.
 
 The target recipe runs the clock, timezone and bar tests. Fixtures cover

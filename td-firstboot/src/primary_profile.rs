@@ -171,8 +171,13 @@ pub(crate) fn prepare(root: &Path) -> Result<String, String> {
     if published.name() != expected {
         return Err("published primary account does not match the selected name".into());
     }
-    let home = crate::primary_home::prepare(root)?;
-    let marker = format!("TD-PRIMARY-PROFILE-READY {expected}\n");
+    let (home, outcome) = crate::primary_home::prepare(root)?;
+    // Said like the identity files: the installed system's second boot
+    // must find the home its first created.
+    let marker = format!(
+        "td-firstboot: primary home {} {home}\nTD-PRIMARY-PROFILE-READY {expected}\n",
+        outcome.name()
+    );
     io::stderr()
         .lock()
         .write_all(marker.as_bytes())

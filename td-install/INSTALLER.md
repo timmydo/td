@@ -166,19 +166,19 @@ cold-boots through firmware twice, alone and then renamed behind a decoy
 disk: each boot must bind the volume UUID read from the image's own
 superblock and the medium's deployment, activate the wizard's account and
 host (the primary profile and hostname reports), acknowledge a healthy
-deployment and flip the compositor's pages, with a machine-id and host key
-the first boot created and the second found. Once a boot reports
+deployment and flip the compositor's pages, with a machine-id, host key and
+the account's home under `/var/home` that the first boot created and the
+second found, and with every compositor session's clock naming
+Asia/Tokyo. Once a boot reports
 success, its display is captured through QMP, at most once a second for
 two minutes and before the boot is stopped, until the status bar's clock
 ends in the configured zone's offset, UTC+09:00 for Asia/Tokyo, drawn as
 the compositor draws it from the image's outline face; a boot whose
-display never shows it fails. The offset is what the session observably
-applied: it does not tell Asia/Tokyo from another zone at UTC+09:00, so
-that the volume saved the chosen name rests on the review page and
-td-install's tests. Reading the saved name and the session's persistent
-home from the installed volume, and booting the medium itself through
-firmware, are still to be proven (increment 7); `./test-iso` boots the
-medium through firmware by hand.
+display never shows it fails. The name and the offset come from the one
+clock the compositor loaded from `/etc/timezone`. The session's own use of
+its home across boots, and booting the medium itself through firmware, are
+still to be proven (increment 7); `./test-iso` boots the medium through
+firmware by hand.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
 admits any UID-1000 peer at the intake, and on a live boot those include
@@ -966,11 +966,18 @@ that private record to release the same bind before `/var`, after the
 application and portal views are released. Invalid home ownership or
 type stops boot and requires inspection from a trusted recovery
 environment; user changes to home permissions do not prevent boot.
-A successful profile emits `TD-PRIMARY-PROFILE-READY NAME` on stderr after
-account readback and home preparation; stdout contains only the home path.
+A successful profile emits `td-firstboot: primary home created|present
+/var/home/NAME`, saying whether this boot published the home or found it,
+and then `TD-PRIMARY-PROFILE-READY NAME` on stderr after account readback
+and home preparation; stdout contains only the home path. Installed-boot
+oracles require the home line once, `created` on a new machine and
+`present` on a kept one.
 The full-system QEMU installer selects `alice` from the verified ISO payload
 before formatting and requires exactly one matching marker on every installed
-boot. This covers persistence across media removal and repeated boots.
+boot, with the home line; its application boot, which runs to a clean
+shutdown, must also have every compositor session's clock name
+Europe/London, the zone it chose. This covers persistence across media
+removal and repeated boots.
 The stock QEMU boot instead requires exactly one `tester` profile marker,
 covering the branch with no saved username. This does not add a live account
 rename, migrate another home, enroll a PIN or provide the wizard's
@@ -1167,10 +1174,10 @@ not discover `/etc/zoneinfo` automatically.
    boot the ISO, complete the UI flow onto a disposable disk, detach the
    media, boot that disk through firmware, and observe the configured
    account in the compositor with its settings and persistent home.
-   Increment 6 proves the flow and the firmware boots with the account
-   and host reported and the zone's offset on the compositor's clock;
-   this adds booting the ISO through firmware, the saved zone name and
-   the persistent home.
+   Increment 6 proves the flow and the firmware boots with the account,
+   host and home reported and the zone named by the compositor's clock
+   and shown on it; this adds booting the ISO through firmware and the
+   session's own use of its persistent home.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media

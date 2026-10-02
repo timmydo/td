@@ -34,11 +34,11 @@
 //! firmware twice, alone and then renamed behind a decoy disk, and each boot
 //! must bind the volume the image holds and the medium's deployment, activate
 //! the account and host the wizard was given, report a healthy deployment and
-//! flip the compositor's pages, with a fresh machine identity the second
-//! boot keeps, and each boot's status bar must end its clock in the
-//! configured zone's offset, captured from the display. The offset does not
-//! name the zone; the saved name and the session's home are not yet read
-//! back (increment 7).
+//! flip the compositor's pages, with a fresh machine identity and home the
+//! second boot keeps; each boot's compositor must name the configured zone
+//! for its clock, and its status bar, captured from the display, must end
+//! that clock in the zone's offset. The session's own use of its home is not
+//! yet observed (increment 7).
 use super::build_iso::{live_medium, LiveMedium};
 use super::install::{
     cold_boots, image_volume_identity, installation_timeout, system_target_capacity, ColdBoots,
@@ -171,6 +171,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             id: &id,
             username: USERNAME,
             hostname: HOSTNAME,
+            zone: Some(ZONE),
         },
         &ColdBoots {
             scratch: &scratch.dir,
@@ -198,8 +199,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          installer's GPT layout; with the medium detached, the installed disk \
          cold-booted through firmware twice, alone and renamed behind a decoy, \
          as a healthy {USERNAME}@{HOSTNAME} with its volume {uuid} bound, a \
-         fresh machine identity kept across both, and compositor page flips, \
-         its status bar's clock ending{ZONE_ON_BAR} for {ZONE}"
+         fresh machine identity and /var/home/{USERNAME} created then found, \
+         and compositor page flips, its clock naming {ZONE} and its status \
+         bar ending{ZONE_ON_BAR}"
     );
     Ok(())
 }
@@ -553,5 +555,11 @@ mod tests {
         assert!(
             bar.contains("Clock::load(Path::new(\"/etc/timezone\"), Path::new(\"/etc/zoneinfo\"))")
         );
+        // The lines the installed-boot oracle reads are the ones written.
+        assert!(bar.contains("\"\\ntd-compositor: clock zone {name}\\n\""));
+        let profile = include_str!("../../../../../../td-firstboot/src/primary_profile.rs");
+        assert!(profile.contains(
+            "\"td-firstboot: primary home {} {home}\\nTD-PRIMARY-PROFILE-READY {expected}\\n\""
+        ));
     }
 }
