@@ -1112,6 +1112,13 @@ service activation. Each part lands independently:
     retries reuse the same backing. Capacity, contention, poison and mismatched
     admission refuse explicitly. Existing memory reservations cover the
     bookkeeping; pool allocation and whole-worker qualification remain open.
+  - **M05e3g — pooled-read allocation probe:** implemented sixteen measured
+    intervals at short/maximum roots using full preallocated read backing.
+    Cover queries, callback append, deadline/work refusal, full pools and
+    slot/publication contention or capacity. Retry the old reader, read a
+    fresh pin and drop both leases inside measurement; require every Rust
+    allocator counter unchanged. Setup, startup, poison/unwind paths, native
+    allocation and whole-worker/RSS qualification remain separate.
   - **M05e3 — committed visibility:** runtime integration remains pending.
     Connect pooled queries to worker ownership and queue admission; retain
     generation/history ownership across live checkpoint and retention changes.

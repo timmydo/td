@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[path = "verify/publication.rs"]
 mod publication;
 #[cfg(test)]
-pub use publication::{probe_journal_publication, probe_pinned_reads};
+pub use publication::{probe_journal_publication, probe_pinned_reads, probe_read_pool};
 pub use publication::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
     PinnedReadError, PinnedReadRequest, PinnedReadScratch, PooledRead, ReadPoolError,

@@ -323,9 +323,23 @@ still account for those costs and concurrent owners within the ledger.
   view). Runtime constructors enforce those compiled layout ceilings. No
   arena size or total changes. Capture is a bounded try-lock scan; drop
   briefly locks to return backing, without resetting poison. No lock spans
-  query I/O or callbacks. These ownership tests do not qualify complete
-  worker stacks, allocations across pool operations, service startup or
-  whole-service RSS.
+  query I/O or callbacks. Complete worker stacks, service startup and
+  whole-service RSS remain unqualified. Pool allocation measurements follow
+  below.
+
+  The Rust allocation probe measures sixteen pool intervals at short and
+  maximum roots: normal queries, append during an old reader callback,
+  initial deadline, zero-step work refusal after preparation, pool capacity,
+  slot contention, publication contention and publication capacity. It calls
+  public capture and pooled queries, retries the old reader, reads a fresh
+  pin, and drops both leases before the closing snapshot. Every Rust
+  allocator counter must stay unchanged. Both full-size scratch sets are
+  allocated and touched before measurement; fixture creation, owned
+  verification, frame creation, pool/session startup and owner teardown
+  remain cold. Query data remains small and empty in its final state, with
+  short retained history. Poison, unwinding, native allocation, maximum
+  datasets and complete worker stacks are outside this probe's measured
+  scope.
 
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves

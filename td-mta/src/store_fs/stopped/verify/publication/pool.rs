@@ -215,6 +215,9 @@ impl PooledRead<'_, '_, '_, '_, '_> {
 }
 
 #[cfg(test)]
+pub use tests::probe as probe_read_pool;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::super::super::tests::owned_fixture;
@@ -254,6 +257,176 @@ mod tests {
                 cells: &mut self.cells,
                 record: &mut self.record,
                 changes: &mut self.changes,
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum ProbeCase {
+        Queries,
+        Append,
+        Deadline,
+        WorkLimit,
+        Full,
+        SlotBusy,
+        JournalBusy,
+        JournalFull,
+    }
+    /// Allocate/touch full backing and verify the fixture before measuring pool operations.
+    pub fn probe(mut snapshot: impl FnMut()) {
+        use super::super::super::super::super::tests::Fixture;
+        use super::super::super::tests::owned_fixture_with;
+        for maximum in [false, true] {
+            for case in [
+                ProbeCase::Queries,
+                ProbeCase::Append,
+                ProbeCase::Deadline,
+                ProbeCase::WorkLimit,
+                ProbeCase::Full,
+                ProbeCase::SlotBusy,
+                ProbeCase::JournalBusy,
+                ProbeCase::JournalFull,
+            ] {
+                let fixture = if maximum {
+                    Fixture::maximum_root()
+                } else {
+                    Fixture::new()
+                };
+                let (_dir, verified, mut startup) = owned_fixture_with(fixture);
+                let plan = Limits::default().plan().unwrap();
+                let mut a = Backing::new(&plan);
+                let mut b = Backing::new(&plan);
+                let mut slots = [
+                    ReadScratchSlot::new(&plan, a.borrow()).unwrap(),
+                    ReadScratchSlot::new(&plan, b.borrow()).unwrap(),
+                ];
+                let pool = ReadScratchPool::new(&plan, &mut slots).unwrap();
+                let clock = TestClock::new(u64::MAX);
+                let early = TestClock::new(0);
+                let next_frame = frame(3);
+                with_ledger(|ledger| {
+                    verified
+                        .with_journal(
+                            &Provider,
+                            &clock,
+                            ledger,
+                            start(),
+                            startup.journal(),
+                            |session, _| {
+                                snapshot();
+                                match case {
+                                    ProbeCase::Full => {
+                                        let a = pool.capture(session).unwrap();
+                                        let b = pool.capture(session).unwrap();
+                                        assert!(matches!(
+                                            pool.capture(session),
+                                            Err(ReadPoolError::Capacity)
+                                        ));
+                                        drop(a);
+                                        drop(b);
+                                    }
+                                    ProbeCase::SlotBusy => {
+                                        let a = pool.slots[0].scratch.lock().unwrap();
+                                        let b = pool.slots[1].scratch.lock().unwrap();
+                                        assert!(matches!(
+                                            pool.capture(session),
+                                            Err(ReadPoolError::Busy)
+                                        ));
+                                        drop(a);
+                                        drop(b);
+                                    }
+                                    ProbeCase::JournalBusy => {
+                                        let guard = session.published.lock().unwrap();
+                                        assert!(matches!(
+                                            pool.capture(session),
+                                            Err(ReadPoolError::Journal(JournalError::Policy(
+                                                PolicyError::Busy
+                                            )))
+                                        ));
+                                        drop(guard);
+                                    }
+                                    ProbeCase::JournalFull => {
+                                        let a = session.capture().unwrap();
+                                        let b = session.capture().unwrap();
+                                        assert!(matches!(
+                                            pool.capture(session),
+                                            Err(ReadPoolError::Journal(JournalError::Policy(
+                                                PolicyError::Capacity
+                                            )))
+                                        ));
+                                        drop(a);
+                                        drop(b);
+                                    }
+                                    _ => (),
+                                }
+                                let mut old = pool.capture(session).unwrap();
+                                let mut request = read_request();
+                                if matches!(case, ProbeCase::WorkLimit) {
+                                    request.query.limits.steps = 0;
+                                }
+                                let source: &dyn Clock = if matches!(case, ProbeCase::Deadline) {
+                                    &early
+                                } else {
+                                    &clock
+                                };
+                                let result =
+                                    old.with_read_view(&Provider, source, request, |view| {
+                                        if matches!(case, ProbeCase::Append) {
+                                            session
+                                                .commit(
+                                                    &Provider,
+                                                    &clock,
+                                                    deadline(),
+                                                    &next_frame,
+                                                    budget(),
+                                                )
+                                                .unwrap();
+                                        }
+                                        inspect_reader(view)
+                                    });
+                                match case {
+                                    ProbeCase::Deadline => assert!(matches!(
+                                        result,
+                                        Err(PinnedReadError::Policy(PolicyError::Deadline))
+                                    )),
+                                    ProbeCase::WorkLimit => assert!(matches!(
+                                        result,
+                                        Err(PinnedReadError::Policy(PolicyError::Capacity))
+                                    )),
+                                    _ => assert_eq!(result.unwrap(), 2),
+                                }
+                                assert_eq!(
+                                    old.with_read_view(
+                                        &Provider,
+                                        &clock,
+                                        read_request(),
+                                        inspect_reader
+                                    )
+                                    .unwrap(),
+                                    2
+                                );
+                                let mut new = pool.capture(session).unwrap();
+                                let expected = if matches!(case, ProbeCase::Append) {
+                                    3
+                                } else {
+                                    2
+                                };
+                                assert_eq!(
+                                    new.with_read_view(
+                                        &Provider,
+                                        &clock,
+                                        read_request(),
+                                        inspect_reader
+                                    )
+                                    .unwrap(),
+                                    expected
+                                );
+                                drop(new);
+                                drop(old);
+                                snapshot();
+                            },
+                        )
+                        .unwrap();
+                });
             }
         }
     }

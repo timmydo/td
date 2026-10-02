@@ -16,6 +16,8 @@ use std::sync::{atomic::AtomicU64, Mutex, TryLockError};
 
 #[path = "publication/pool.rs"]
 mod pool;
+#[cfg(test)]
+pub use pool::probe_read_pool;
 pub use pool::{PooledRead, ReadPoolError, ReadScratchPool, ReadScratchSlot};
 
 #[path = "publication/read.rs"]
