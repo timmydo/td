@@ -18,6 +18,9 @@ pub use input::{
 #[path = "store_fs/selection.rs"]
 mod selection;
 pub use selection::{SelectionError, SelectionScratch, SelectionStage};
+#[path = "store_fs/blob.rs"]
+mod blob;
+pub use blob::{BlobInput, BlobInputError, CompleteBlob};
 #[path = "store_fs/table.rs"]
 mod table;
 pub use table::{CompleteTable, TableInput, TableInputError};

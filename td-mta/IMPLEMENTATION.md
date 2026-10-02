@@ -771,6 +771,13 @@ service activation. Each part lands independently:
     refusal and errors before/after effects. Allocation probes share the
     existing arena at both root bounds. Finish graph/replay and reference
     validation before opening pins or mutation admission.
+  - **M05d6 — referenced blob integrity:** implemented supplied account/ID/row
+    input with admitted length, exact private file size, incremental SHA-256
+    and physical EOF/digest completion. One caller-buffer read is at most
+    64 KiB; I/O/hash errors retire input. Tests cover known digest, both blob
+    kinds, empty/large files, limits, corruption, changed extents and provider
+    errors. Allocation probes cover success/refusal at both root bounds.
+    Final owning-reference resolution and actual pins remain coordinator work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

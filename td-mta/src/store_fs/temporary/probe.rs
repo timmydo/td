@@ -92,12 +92,16 @@ pub fn run(mut snapshot: impl FnMut()) {
     drop(super::super::history::prepare_probe(&long.root));
     let active_probe = super::super::active::prepare_probe(&short.root);
     drop(super::super::active::prepare_probe(&long.root));
+    for fixture in [&short, &long] {
+        super::super::blob::prepare_probe(&fixture.root);
+    }
     let repair_update = super::super::input::prepare_repair_probe();
     let recovery_probe = super::super::input::prepare_recovery_probe();
     let mut history_scratch = vec![0; crate::format::MAX_FRAME_BYTES];
     let mut selection_scratch = super::super::SelectionScratch::new();
     snapshot();
     for fixture in [&short, &long] {
+        super::super::blob::probe(&fixture.root);
         super::super::selection::probe(&fixture.root, &mut selection_scratch);
         super::super::table::probe(&fixture.root, &table_probe, &mut table_scratch);
         super::super::history::probe(

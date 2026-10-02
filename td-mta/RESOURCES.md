@@ -606,6 +606,15 @@ complete reads, random reads, ceiling/role refusal, injected read errors, early
 EOF and completion-probe failure at both root bounds. No per-file heap buffer,
 new allocator hook or runtime pool is introduced.
 
+BlobInput retains one StoreReader, fixed provider digest state and supplied
+account/ID/row fields. It hashes directly from caller read storage with a
+64 KiB step ceiling. No whole-blob buffer or additional arena is reserved.
+CompleteBlob retains one CompleteFile, account/ID/kind and observed digest.
+The existing allocation interval measures complete reads/digest/EOF, random
+reads, admission and premature-finish refusal, checksum mismatch and sticky
+I/O failure at both root bounds. Fixture publication precedes measurement.
+It grants no runtime pin or whole-service memory qualification.
+
 Selection loading uses caller-owned scratch totaling 5032 bytes: FORMAT (80),
 CURRENT (120) and maximum manifest (4832). It retains at most one input File
 at a time in addition to the root and LOCK; opening uses the same transient

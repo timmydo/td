@@ -358,6 +358,26 @@ not that prefix. Secret
 and operator-config files also retain their separate SCHEMA.md policy and loader
 work. No public config-check/service readiness is granted by this store reader.
 
+### Verifying referenced blob bytes
+
+`LockedRoot::open_blob_input` takes an account, typed BlobId, supplied final
+BlobRow and explicit admitted byte ceiling. Require the row length to fit
+that ceiling, private path/file policy and exact physical length before
+returning input. The caller supplies authorization and the real pinned view
+or stopped-store barrier. A supplied descriptor is not proof of a live owning
+reference. Deleted historical PUTs do not require old bodies merely because
+they occur in retained history; the replayed final view determines live blobs.
+
+BlobInput reads at most one explicit 64 KiB chunk into caller storage and
+hashes exactly the bytes returned. Bytes are provisional until completion.
+Empty reads never establish EOF. Any I/O or digest failure retires the input;
+the caller's buffer may already have changed when an error is returned.
+Consuming finish requires whole consumption, unchanged length and observed
+physical EOF, then final SHA-256 equality with the supplied digest.
+CompleteBlob retains the read-only file, account/ID/kind and observed digest.
+This verifies supplied blob bytes only. Full selected-graph, replay and final
+owning-reference validation remain required before mutation or serving.
+
 ### Loading the selected metadata
 
 `LockedRoot::load_selection` is the first recovery input step. Its caller must
