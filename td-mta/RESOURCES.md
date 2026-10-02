@@ -728,6 +728,17 @@ work refusal in one interval with every counter unchanged. This does not
 qualify nested sources, maximum bodies, complete parser stacks or service
 RSS.
 
+The first transfer-input owner borrows a BlobReader and at most the existing
+6 KiB stage byte partition. Its inline compiled state fits 256 bytes; it
+retains no extra body arena or thread. One poll refills that partition or
+performs a 256-transition decode turn, with one shared clock watermark and
+charged requested I/O plus resident byte visits/output. A synthetic-source
+allocation interval covers identity/base64 construction, short output,
+completion and sticky work refusal with every Rust counter unchanged. A
+separate functional test uses the real verified pinned body reader. These
+checks do not qualify combined filesystem allocation, nested-source
+checkpoint memory, full worker stacks or service RSS.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

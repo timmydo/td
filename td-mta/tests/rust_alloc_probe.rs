@@ -867,6 +867,110 @@ fn store_read_pool() {
     }
 }
 
+fn mime_input() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_base64::Status,
+        mime_input::{Error, Reader},
+        ports::{BlobReader, Clock, Deadline, Error as PolicyError, Tick, Time},
+        wire::TransferEncoding,
+    };
+    struct Source;
+    impl BlobReader for Source {
+        fn len(&self) -> u64 {
+            10
+        }
+        fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
+            let input = b"xxT!Q==Zyy"
+                .get(offset as usize..)
+                .ok_or(PolicyError::Invalid)?;
+            let count = input.len().min(output.len());
+            output
+                .get_mut(..count)
+                .unwrap()
+                .copy_from_slice(input.get(..count).unwrap());
+            Ok(count)
+        }
+    }
+    struct TimeSource;
+    impl Clock for TimeSource {
+        fn sample(&self) -> Result<Time, PolicyError> {
+            Ok(Time {
+                utc_ms: 0,
+                monotonic: Tick(2),
+            })
+        }
+    }
+    let before = COUNTERS.snapshot();
+    for encoding in [TransferEncoding::Identity, TransferEncoding::Base64] {
+        let mut source = Source;
+        let mut buffer = [0; 2];
+        let mut reader = Reader::new(&mut source, 2, 6, encoding, &mut buffer).unwrap();
+        let mut meter = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 32,
+                output_bytes: 8,
+                ..Charge::default()
+            },
+        );
+        let expected = if encoding == TransferEncoding::Identity {
+            b"T!Q==Z".as_slice()
+        } else {
+            b"M".as_slice()
+        };
+        let mut at = 0;
+        let mut complete = false;
+        for _ in 0..20 {
+            let mut output = [0; 1];
+            let step = reader
+                .poll(black_box(&TimeSource), &mut meter, &mut output)
+                .unwrap();
+            if step.written != 0 {
+                assert_eq!(output.first(), expected.get(at));
+                at += step.written;
+            }
+            if step.status == Status::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        assert_eq!(at, expected.len());
+        assert_eq!(reader.position(), expected.len() as u64);
+        assert_eq!(
+            reader.is_encoding_problem(),
+            encoding == TransferEncoding::Base64
+        );
+        assert_eq!(
+            meter.charge(Tick(100), Charge::default()),
+            Err(Stop::Deadline)
+        );
+        assert_eq!(
+            reader
+                .poll(&TimeSource, &mut meter, &mut [])
+                .unwrap()
+                .status,
+            Status::Complete
+        );
+    }
+    let mut source = Source;
+    let mut buffer = [0; 2];
+    let mut reader = Reader::new(&mut source, 2, 6, TransferEncoding::Base64, &mut buffer).unwrap();
+    let mut meter = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+    assert_eq!(
+        reader.poll(&TimeSource, &mut meter, &mut []),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    assert_eq!(
+        reader.poll(&TimeSource, &mut meter, &mut []),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME source input allocated");
+}
+
 fn mime_base64() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -1156,6 +1260,7 @@ fn main() {
         store_read_pool();
         store_pinned_blobs();
         mime_base64();
+        mime_input();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1238,6 +1343,7 @@ fn main() {
     store_read_pool();
     store_pinned_blobs();
     mime_base64();
+    mime_input();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

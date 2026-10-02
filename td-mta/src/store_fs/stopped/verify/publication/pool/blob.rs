@@ -431,6 +431,58 @@ mod tests {
         }
     }
     #[test]
+    fn transfer_input_borrows_verified_body_with_bounded_extent() {
+        with_blob(
+            b"prefixT!Q==Zsuffix",
+            BlobKind::Message,
+            |_dir, pool, session| {
+                let clock = TestClock::new(u64::MAX);
+                let mut view = pool.capture(session).unwrap();
+                let mut input = view
+                    .open_blob_input(&Provider, &clock, read_request(), ID, 18)
+                    .unwrap();
+                assert_eq!(input.read(&mut [0; 18]).unwrap(), 18);
+                let mut body = input.finish().unwrap();
+                let mut backing = [0; 2];
+                let mut reader = crate::mime_input::Reader::new(
+                    &mut body,
+                    6,
+                    6,
+                    crate::wire::TransferEncoding::Base64,
+                    &mut backing,
+                )
+                .unwrap();
+                let mut meter = crate::admission::work::Meter::new(
+                    deadline(),
+                    crate::admission::work::Charge {
+                        io_bytes: 100,
+                        output_bytes: 100,
+                        ..crate::admission::work::Charge::default()
+                    },
+                );
+                let mut written = 0;
+                let mut complete = false;
+                for _ in 0..20 {
+                    let mut output = [0; 1];
+                    let step = reader.poll(&clock, &mut meter, &mut output).unwrap();
+                    if step.written != 0 {
+                        assert_eq!(output, *b"M");
+                        written += step.written;
+                    }
+                    if step.status == crate::mime_base64::Status::Complete {
+                        complete = true;
+                        break;
+                    }
+                }
+                assert!(complete);
+                assert_eq!(written, 1);
+                assert_eq!(reader.position(), 1);
+                assert!(reader.is_encoding_problem());
+                assert_eq!(body.read_at(0, &mut [0; 6]).unwrap(), 6);
+            },
+        );
+    }
+    #[test]
     fn body_keeps_old_identity_across_delete_and_releases_pool_on_drop() {
         with_blob(b"abc", BlobKind::Message, |_dir, pool, session| {
             let clock = TestClock::new(u64::MAX);

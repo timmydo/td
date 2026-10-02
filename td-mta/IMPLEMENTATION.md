@@ -1184,6 +1184,15 @@ Initial independently landable increments:
   ownership, quoted-printable, headers, charsets, Unicode and protocol
   integration remain open.
 
+- **M06b — bounded transfer input:** implemented a live body-reader borrow
+  and checked encoded extent with caller source backing. Refill or decode
+  one bounded turn under shared monotonic/deadline/work checks; support
+  identity/base64 and refuse QP explicitly. Preserve terminal
+  errors/completion and diagnose source-contract failures. Cover exact
+  ranges, short reads, backpressure, clock faults, work refusal and a real
+  pinned-body path; qualify core allocations with a synthetic source. Nested
+  source checkpoints, QP and protocol integration remain open.
+
 Implement bounded header unfolding, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME

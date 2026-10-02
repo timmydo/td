@@ -705,6 +705,44 @@ charged work. Source extents, nested rings, filesystem reads,
 QP/charset/NFC, part authorization and protocol output remain separate. No
 body buffer, source reader or heap owner is stored in the decoder.
 
+### 1.13 Bounded transfer input
+
+mime_input::Reader borrows a live BlobReader, caller buffer of 1..=6144 bytes
+and checked offset/length. The caller must establish account/root/part
+authorization and reproduce the exact MIME descriptor; a bounds check alone
+grants none of those. Identity and base64 are implemented; QuotedPrintable
+refuses explicitly. Unknown transfer tokens use identity bytes with a
+diagnostic supplied by the MIME parser. The source borrow retains the
+underlying body owner's pin. No raw file accessor or complete body
+allocation is added.
+
+Each poll performs either one source read of at most 6 KiB or one decoder
+turn of at most 256 transitions; identity copies at most 256 bytes. Refill
+returns Yield without decoding in that turn. Charge the entire requested
+read capacity before I/O, including short or failed reads; charge each later
+resident source visit and emitted byte again during decoding. Thus a full
+successful read and its traversal consume two source-byte charges. NeedInput
+is internal; public progress is Yield, NeedOutput or Complete with exact
+written bytes. Identity returns Yield after a bounded copy while more bytes
+remain, including when that copy fills the output; NeedOutput means its
+nonempty input received an empty output slice. Base64 can also return
+NeedOutput after filling a nonempty slice with pending decoded bytes. In
+both cases the caller consumes written bytes before polling again with
+available output. A short successful read is allowed; zero progress before the
+declared extent end or a count beyond the requested slice is Corrupt. Never
+probe outside that extent.
+
+One monotonic watermark and Meter deadline bracket every active turn. A
+post-work clock/budget refusal overrides its earlier result; any failure is
+sticky without later I/O or clock calls. Output and position may already
+reflect work and remain provisional on error. Complete is retained only
+after the final bracket succeeds and later polls return zero-progress
+Complete without work. position counts emitted decoded octets; encoding
+diagnostics become final at completion. Invalid extents/backing, unavailable
+decoder, adapter errors and work refusal remain distinct fixed errors.
+Reader checkpoint restoration, nested source chains, QP and protocol output
+remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

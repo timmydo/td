@@ -16,6 +16,7 @@ pub mod mailbox_parents;
 pub mod mailbox_sweep;
 pub mod merge;
 pub mod mime_base64;
+pub mod mime_input;
 pub mod observability;
 pub mod overlay;
 pub mod ownership;
