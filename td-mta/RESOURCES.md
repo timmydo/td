@@ -779,6 +779,14 @@ the driver separately bounds initial location and each frame read. Existing
 allocation instrumentation drains maximum changes, filters an empty result and
 checks changed-view refusal without new hooks. No resource allowance changes.
 
+ChangeRoute borrows its already admitted selected manifest and stores one
+ViewIdentity, fitting a compiled 512-byte stack ceiling. A lookup examines at
+most the format's 64 history descriptors, retaining no separate index or file
+handles. Existing allocation instrumentation covers history/active routing and
+below-floor/changed-view refusal. Physical frame location and complete-view
+memory remain
+separate work; this helper changes no arena or concurrency allowance.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a

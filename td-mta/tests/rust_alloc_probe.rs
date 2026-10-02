@@ -451,6 +451,35 @@ fn store_manifests() {
         selection.check_table(&crypto, Table::Mailboxes, summary),
         Err(Error::Format(FormatError::InvalidValue))
     );
+    let bound_view = td_mta::ports::ViewIdentity {
+        account: header.account,
+        epoch: header.epoch,
+        generation: header.generation,
+        checkpoint: header.through,
+        segment: header.active_segment,
+        committed_offset: 228,
+        committed_sequence: header.through.successor().unwrap(),
+        history_floor: Sequence::default(),
+    };
+    let route = td_mta::store_fs::ChangeRoute::new(selection, bound_view).unwrap();
+    assert_eq!(
+        route.source(bound_view, header.through),
+        Ok(td_mta::store_fs::ChangeSource::History { index: 0 })
+    );
+    assert_eq!(
+        route.source(bound_view, bound_view.committed_sequence),
+        Ok(td_mta::store_fs::ChangeSource::Active)
+    );
+    assert_eq!(
+        route.source(bound_view, Sequence::default()),
+        Err(td_mta::ports::Error::HistoryLost)
+    );
+    let mut changed = bound_view;
+    changed.generation += 1;
+    assert_eq!(
+        route.source(changed, header.through),
+        Err(td_mta::ports::Error::Conflict)
+    );
     let mut journal_bytes = [0; 96];
     let journal = JournalHeader {
         account: header.account,

@@ -756,6 +756,15 @@ request the next frame. Complete occurs only after the pinned endpoint boundary,
 including an empty range. This helper reads no files, coalesces no JMAP events
 and supplies no live pin, selected-history validation or protocol activation.
 
+`store_fs::ChangeRoute` selects the source for a NeedFrame sequence using
+selected manifest metadata and captured ViewIdentity. It validates retained
+coverage through the checkpoint, then returns a history descriptor index or
+Active only within `(history_floor, committed_sequence]`. Changed identity is
+Conflict; missing history is HistoryLost and future sequences are Invalid.
+This immutable lookup performs no I/O and does not retire on a caller error.
+The driver still validates/opens files, locates the frame under a work budget
+and holds real pins; a source choice is not serving authorization.
+
 BlobReader is an already authorized, opened, immutable file with a live owner
 pin held until it closes. Store::open_blob requires Access and borrows the
 view, retaining that ownership until the reader drops. It checks live message/

@@ -894,6 +894,14 @@ service activation. Each part lands independently:
     maximum frames, partial cursors, filtering/actions/duplicates, empty ranges,
     view changes and frame substitution. Allocation instrumentation covers
     draining and refusal. File location, real pins and serving remain future.
+  - **M05d14g — selected change routing:** implemented retained coverage checks
+    and bounded source choice over selected metadata/captured view fields. Map
+    an exact required sequence to a history descriptor or the active prefix,
+    refusing missing history, future frames and changed identity. Tests cover
+    all 64 descriptors, segment/floor/checkpoint/endpoint boundaries, missing
+    coverage and invalid views. Existing allocation instrumentation covers both
+    source types and below-floor/changed-view refusal. Physical frame location
+    and real pins remain future.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

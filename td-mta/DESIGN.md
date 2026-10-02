@@ -72,8 +72,10 @@ change slots, requiring EOF/digest binding at completion. Active change input
 shares that operation reader while stopping at a captured prefix, allowing
 append growth and binding completion to its sequence/offset. A supplied-frame
 cursor now checks captured identity, retained floors and endpoint
-boundaries while draining supplied checked frames. File location and actual
-view-pin integration remain separate.
+boundaries while draining supplied checked frames. A selected-route helper
+checks retained coverage and chooses a history descriptor or the captured active
+segment. Byte location within segments and actual view-pin integration remain
+separate.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

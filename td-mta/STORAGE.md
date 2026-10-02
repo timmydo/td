@@ -603,6 +603,25 @@ verification input: no frame becomes serving data before selected completion,
 final-view validation and actual pin/barrier checks. Retained history-floor and
 live next_change policy remain separate; no extra frame arena is reserved.
 
+`ChangeRoute` binds selected metadata to supplied active ViewIdentity fields
+using the same active-range validator. It rejects an inverted retained floor/end
+and requires contiguous selected history coverage from the floor through the
+checkpoint whenever the floor precedes that checkpoint. The decoded manifest
+already guarantees ordered, contiguous history segments ending at the checkpoint;
+the route checks that its first retained base reaches the requested floor.
+Missing coverage is HistoryLost, never an empty successful history result.
+
+`source` requires the identical full captured identity and a requested frame
+sequence strictly after the floor and no later than the committed endpoint.
+A sequence through the checkpoint maps to its selected history descriptor index;
+a later sequence maps to Active. History bases are exclusive and through values
+inclusive. At most 64 selected descriptors are examined; no directory scan,
+filesystem call or new collection is used. The immutable lookup reports Conflict
+on a changed view, HistoryLost below/at the floor and Invalid beyond the endpoint.
+It grants no file-open authority or proof of physical availability, journal
+integrity, final-view validity or real pins. Locating bytes within the selected
+segment retains its own work budget; this helper supplies only a source choice.
+
 ### Scanning a stopped active journal
 
 `LockedRoot::scan_active_journal` is read-only recovery input. The caller holds
