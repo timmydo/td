@@ -224,3 +224,22 @@ pub enum Reply {
         keys: Option<Vec<KeyLabel>>,
     },
 }
+
+/// What the host did, as the window learns it.
+#[derive(Debug, Eq, PartialEq)]
+pub enum HostEvent {
+    /// The host's lock and sleep are watched from now on.
+    Watched,
+    /// The session was locked.
+    Lock,
+    /// The system is about to sleep; sleep waits, where it can, until
+    /// the window has locked.
+    Suspend,
+    /// The host's lock and sleep can no longer be watched, and why.
+    Lost(String),
+    /// They could not be watched at all, and why.
+    Unwatched(String),
+    /// They are watched, but sleep did not wait for the lock: refused
+    /// at the start, or at the first sleep without a delay.
+    Undelayed,
+}

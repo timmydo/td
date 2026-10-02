@@ -25,7 +25,8 @@ use td_ui::window::{Clipboard, Input, PointerPhase};
 
 use crate::plain::{self, Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, EntryId, Failure, Item, KeyLabel, Keys, Op, PinUse, Reply,
+    Answer, Ask, Change, Command, EntryId, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse,
+    Reply,
 };
 
 /// The largest title, search or find text a field holds; td-secret
@@ -139,6 +140,41 @@ struct Notebook {
     reading: Option<EntryId>,
 }
 
+/// Why the host locked the notebook.
+#[derive(Clone, Copy, Debug)]
+enum HostCause {
+    Screen,
+    Sleep,
+    Lost,
+}
+
+impl HostCause {
+    fn locking(self) -> &'static str {
+        match self {
+            Self::Screen => "Locking with the screen",
+            Self::Sleep => "Locking for sleep",
+            Self::Lost => "Locking: the host's events stopped",
+        }
+    }
+
+    fn locked(self) -> &'static str {
+        match self {
+            Self::Screen => "Locked with the screen",
+            Self::Sleep => "Locked for sleep",
+            Self::Lost => "Locked as the host's events stopped",
+        }
+    }
+}
+
+/// What a host lock interrupted.
+#[derive(Clone, Copy, Debug, Default)]
+struct Interrupted {
+    /// The open entry had unsaved edits.
+    edits: bool,
+    /// A change was being published.
+    write: bool,
+}
+
 enum Busy {
     Unlock(Op),
     Create(Op),
@@ -148,6 +184,9 @@ enum Busy {
         op: Op,
         tab: Option<TabId>,
         point: Option<SavePoint>,
+        /// The body's revision the save sent, so an edit made since can
+        /// be told from the edits it carries.
+        revision: Option<u64>,
         title: Text,
         then: Option<Then>,
     },
@@ -241,6 +280,17 @@ pub struct App {
     /// What an export that finished during a lock wrote, shown with the
     /// locked view that follows.
     exported: Option<String>,
+    /// Why the host locked the notebook, shown with the locked view
+    /// until the next unlock.
+    host_locked: Option<HostCause>,
+    /// The host's lock is watched, or its failure has been told.
+    host_ready: bool,
+    /// What a host lock interrupted, reported at the next unlock.
+    interrupted: Interrupted,
+    /// Why the host's lock and sleep are not, or not fully, watched.
+    host_warning: Option<String>,
+    /// The host's lock is known not to be watched.
+    unwatched: bool,
     next_op: Op,
     status: String,
     drag: Option<Drag>,
@@ -276,6 +326,11 @@ impl App {
             chooser: None,
             next_chooser: 0,
             exported: None,
+            host_locked: None,
+            host_ready: false,
+            interrupted: Interrupted::default(),
+            host_warning: None,
+            unwatched: false,
             next_op: 0,
             status: "Opening the notebook".to_owned(),
             drag: None,
@@ -401,6 +456,7 @@ impl App {
                 }
                 self.busy = None;
                 self.end_prompt();
+                self.host_locked = None;
                 let count = entries.len();
                 match notebook(entries) {
                     Ok(notebook) => {
@@ -409,10 +465,20 @@ impl App {
                         self.set_keys(keys);
                         self.refilter(None);
                         self.relayout();
-                        self.say(match count {
+                        let mut status = match count {
                             1 => "Unlocked: 1 entry".to_owned(),
                             count => format!("Unlocked: {count} entries"),
+                        };
+                        let interrupted = std::mem::take(&mut self.interrupted);
+                        status.push_str(match (interrupted.edits, interrupted.write) {
+                            (true, true) => {
+                                ". The host's lock gave up edits and may have stopped a change"
+                            }
+                            (true, false) => ". The host's lock gave up unsaved edits",
+                            (false, true) => ". The host's lock may have stopped a change",
+                            (false, false) => "",
                         });
+                        self.say(status);
                     }
                     Err(text) => {
                         // The thread holds the vault it just opened.
@@ -532,16 +598,174 @@ impl App {
         if let (Some(keys), Some(view)) = (&keys, layout::keys(self.surface)) {
             list.set_items(keys.len(), (!keys.is_empty()).then_some(0), view);
         }
-        let status = match &keys {
-            Some(_) => "Locked: choose a key and press Unlock",
-            None => "No notebook yet: Create enrolls a primary and then a backup key",
-        };
-        match self.exported.take() {
-            Some(note) => self.say(format!("{note}. {status}")),
-            None => self.say(status),
-        }
         self.phase = Phase::Locked { keys, list };
         self.focus = Focus::Keys;
+        let note = self.exported.take();
+        self.say_locked(note);
+    }
+
+    /// The locked view's status: what it follows, why it locked, what to
+    /// do, and any warning about the host, short enough for the row.
+    fn say_locked(&mut self, note: Option<String>) {
+        let Phase::Locked { keys, .. } = &self.phase else {
+            return;
+        };
+        let status = match keys {
+            Some(_) => format!(
+                "{}: choose a key and press Unlock",
+                self.host_locked.map_or("Locked", HostCause::locked)
+            ),
+            None => "No notebook yet: Create enrolls a primary and then a backup key".to_owned(),
+        };
+        let parts: Vec<String> = note
+            .into_iter()
+            .chain([status])
+            .chain(self.host_warning.clone())
+            .collect();
+        self.say(parts.join(". "));
+    }
+
+    /// What the host did. A lock or sleep locks at once, asking nothing
+    /// and giving up unsaved edits, which the next unlock reports; a host
+    /// whose lock cannot be watched is warned of. Unlocking waits until
+    /// the watch has started or its failure has been told.
+    pub fn host(&mut self, event: HostEvent) {
+        self.redraw = true;
+        let cause = match event {
+            HostEvent::Watched => {
+                self.host_ready = true;
+                return;
+            }
+            HostEvent::Lock => HostCause::Screen,
+            HostEvent::Suspend => HostCause::Sleep,
+            HostEvent::Lost(reason) => {
+                self.host_ready = true;
+                self.unwatched = true;
+                self.warn(
+                    format!("Screen lock no longer watched: {reason}"),
+                    format!(
+                        "The screen lock is no longer watched ({reason}): lock the notebook \
+                         before leaving it"
+                    ),
+                );
+                HostCause::Lost
+            }
+            HostEvent::Unwatched(reason) => {
+                self.host_ready = true;
+                self.unwatched = true;
+                return self.warn(
+                    format!("Screen lock not watched: {reason}"),
+                    format!(
+                        "The screen lock is not watched ({reason}): lock the notebook before \
+                         leaving it"
+                    ),
+                );
+            }
+            HostEvent::Undelayed => {
+                self.host_ready = true;
+                if !self.unwatched {
+                    self.warn(
+                        "Sleep may come before the lock".to_owned(),
+                        "Sleep does not wait for the notebook to lock, so it may lock only on \
+                         waking"
+                            .to_owned(),
+                    );
+                }
+                return;
+            }
+        };
+        self.host_lock(cause);
+    }
+
+    /// Keeps `short` for the locked status and says `long` where the
+    /// notebook is open.
+    fn warn(&mut self, short: String, long: String) {
+        self.host_warning = Some(short);
+        match self.phase {
+            // A prompt's instruction stays; the warning shows next time.
+            Phase::Locked { .. } if self.busy.is_none() => self.say_locked(None),
+            Phase::Unlocked(_) => self.say(long),
+            _ => {}
+        }
+    }
+
+    /// Whether unlocking must wait for the host's lock to be watched.
+    fn awaiting_host(&mut self) -> bool {
+        if !self.host_ready {
+            self.say("Starting to watch the host's screen lock: try again in a moment");
+        }
+        !self.host_ready
+    }
+
+    /// Locks for the host: the operation in flight is abandoned, and the
+    /// vault's thread is told to lock even when nothing shows unlocked,
+    /// so an unlock that finished as it was cancelled is dropped too.
+    fn host_lock(&mut self, cause: HostCause) {
+        match self.phase {
+            // Nothing is held, or nothing is under way.
+            Phase::Opening | Phase::Refused(_) => return,
+            Phase::Locked { .. } if self.busy.is_none() => return,
+            // The thread already has its lock; another would answer late,
+            // over whatever the locked view is then doing.
+            Phase::Locking => {
+                self.host_locked = Some(cause);
+                return;
+            }
+            _ => {}
+        }
+        self.interrupted.edits |= self.edited_unsaved();
+        self.interrupted.write |= matches!(
+            self.busy,
+            Some(
+                Busy::Save { .. }
+                    | Busy::Delete { .. }
+                    | Busy::Keys { .. }
+                    | Busy::Create(_)
+                    | Busy::Import(_)
+            )
+        );
+        if self.busy.is_some() {
+            self.out.push(Out::Cancel);
+        }
+        self.out.push(Out::Send(Command::Lock));
+        self.clear();
+        self.host_locked = Some(cause);
+        self.say(cause.locking());
+    }
+
+    /// Whether a lock now gives up edits: during a save, only those made
+    /// since it was sent, since the save itself may yet commit.
+    fn edited_unsaved(&self) -> bool {
+        let Some(Busy::Save {
+            tab,
+            revision,
+            title,
+            ..
+        }) = &self.busy
+        else {
+            return self.dirty();
+        };
+        let body = tab.is_some_and(|tab| {
+            self.pane
+                .editor()
+                .document(tab)
+                .is_ok_and(|document| Some(document.revision()) != *revision)
+        });
+        let renamed = match &self.phase {
+            Phase::Unlocked(notebook) => notebook.title.text() != title.as_str(),
+            _ => false,
+        };
+        body || renamed
+    }
+
+    /// Nothing is held or under way: the vault's thread has answered the
+    /// last lock, or none was asked for.
+    pub fn settled(&self) -> bool {
+        self.busy.is_none()
+            && matches!(
+                self.phase,
+                Phase::Opening | Phase::Refused(_) | Phase::Locked { .. }
+            )
     }
 
     /// An unsaved-changes question asked while an operation was in flight
@@ -928,20 +1152,26 @@ impl App {
         let Phase::Locked { keys, list } = &self.phase else {
             return;
         };
-        match (keys, list.selected()) {
-            (Some(_), Some(key)) => {
+        match (keys.is_some(), list.selected()) {
+            (true, Some(_)) if !self.host_ready => {
+                self.awaiting_host();
+            }
+            (true, Some(key)) => {
                 let op = self.op();
                 self.out.push(Out::Send(Command::Unlock { op, key }));
                 self.busy = Some(Busy::Unlock(op));
                 self.say("Unlocking");
             }
-            (Some(_), None) => self.say("Choose a key to unlock with"),
-            (None, _) => self.create(),
+            (true, None) => self.say("Choose a key to unlock with"),
+            (false, _) => self.create(),
         }
     }
 
     fn create(&mut self) {
-        if self.busy.is_some() || !matches!(self.phase, Phase::Locked { keys: None, .. }) {
+        if self.busy.is_some()
+            || !matches!(self.phase, Phase::Locked { keys: None, .. })
+            || self.awaiting_host()
+        {
             return;
         }
         let op = self.op();
@@ -1162,10 +1392,19 @@ impl App {
         };
         let op = self.op();
         self.out.push(Out::Send(Command::Apply { op, change }));
+        let tab = tab.map(|(tab, _)| tab);
+        let revision = tab.and_then(|tab| {
+            self.pane
+                .editor()
+                .document(tab)
+                .ok()
+                .map(|document| document.revision())
+        });
         self.busy = Some(Busy::Save {
             op,
-            tab: tab.map(|(tab, _)| tab),
+            tab,
             point,
+            revision,
             title,
             then,
         });
@@ -1618,6 +1857,9 @@ impl App {
         let Some(key) = list.selected().filter(|&key| key < keys.len()) else {
             return self.say("Choose a key to import the copy with");
         };
+        if self.awaiting_host() {
+            return;
+        }
         let op = self.op();
         self.out.push(Out::Send(Command::Import { op, key }));
         self.busy = Some(Busy::Import(op));

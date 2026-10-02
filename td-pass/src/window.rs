@@ -10,7 +10,7 @@ use td_ui::raster::{Raster, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input};
 
 use crate::app::{App, Out};
-use crate::backend::Client;
+use crate::backend::{Client, Host};
 
 /// The longest a turn waits for the vault's answer; the caret's blink is
 /// paced by the same turns.
@@ -19,6 +19,7 @@ const POLL_MS: u64 = 50;
 struct Session {
     app: App,
     client: Client,
+    host: Host,
     lister: Sender<Ask>,
     listings: Receiver<Listed>,
 }
@@ -121,6 +122,9 @@ impl Handler for Session {
         while let Some(reply) = self.client.try_recv() {
             self.app.reply(reply);
         }
+        while let Some(event) = self.host.try_next() {
+            self.app.host(event);
+        }
         while let Ok(listed) = self.listings.try_recv() {
             self.app.listed(
                 listed.chooser,
@@ -130,7 +134,12 @@ impl Handler for Session {
             );
         }
         self.app.tick(now);
-        self.flush()
+        let flow = self.flush();
+        // Sleep waits until the vault's thread has dropped the vault.
+        if self.app.settled() {
+            self.host.release();
+        }
+        flow
     }
 
     fn wait_ms(&self, _now: u64) -> u64 {
@@ -193,6 +202,7 @@ pub fn run() -> Result<(), String> {
     let mut session = Session {
         app: App::new()?,
         client: crate::backend::start()?,
+        host: crate::backend::watch_host(),
         lister,
         listings,
     };

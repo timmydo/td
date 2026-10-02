@@ -1,18 +1,21 @@
 //! The vault's thread: it alone holds td-secret's standalone `Host`, the
 //! unlocked `Vault` and the enrolled keys' credentials, and serves the
-//! window's commands in order. A token operation blocks this thread, not
+//! window's commands in order. `Host` here (td-secret's `HostEvents`)
+//! watches the host's lock and sleep from a thread of its own and keeps
+//! the sleep delays for the window, which holds no vault. A token operation blocks this thread, not
 //! the window; its prompts travel to the window and wait for the answer
 //! with the operation's number. The window abandons an operation through
 //! `Client::cancel`, which cancels its token session and declines the
 //! prompt it may be waiting on.
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use td_secret::pass;
 
 use crate::plain::{Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, Failure, Item, KeyLabel, Keys, Op, PinUse, Reply, Role,
+    Answer, Ask, Change, Command, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse, Reply, Role,
 };
 
 // The window offers no copy larger than td-secret reads.
@@ -84,6 +87,94 @@ impl Client {
 
     pub fn try_recv(&self) -> Option<Reply> {
         self.replies.try_recv().ok()
+    }
+}
+
+/// The host's lock and sleep, as the window sees them. Watching starts
+/// on a thread of its own, so a slow system bus never holds the window;
+/// the delays sleep waits on are kept here until the window has locked.
+pub struct Host {
+    starting: Option<Receiver<Result<pass::HostEvents, String>>>,
+    events: Option<pass::HostEvents>,
+    /// Each delay and when it came: none is held past `DELAY_HOLD`, so a
+    /// vault thread that never answers holds no later sleep.
+    delays: Vec<(Instant, pass::SleepDelay)>,
+    /// Told once: sleep went on without a delay.
+    undelayed: bool,
+    note: Option<HostEvent>,
+}
+
+/// Longer than logind lets a delay hold sleep by default (five
+/// seconds); a host that allows more gets thirty.
+const DELAY_HOLD: Duration = Duration::from_secs(30);
+
+pub fn watch_host() -> Host {
+    let (started, starting) = mpsc::channel();
+    // A thread that cannot start drops its sender, which reads as
+    // unwatched on the first poll.
+    let _ = std::thread::Builder::new()
+        .name("host-watch".to_owned())
+        .spawn(move || {
+            let _ = started.send(pass::HostEvents::watch());
+        });
+    Host {
+        starting: Some(starting),
+        events: None,
+        delays: Vec::new(),
+        undelayed: false,
+        note: None,
+    }
+}
+
+impl Host {
+    /// The next thing the host did, without waiting.
+    pub fn try_next(&mut self) -> Option<HostEvent> {
+        self.delays.retain(|(at, _)| at.elapsed() < DELAY_HOLD);
+        if let Some(note) = self.note.take() {
+            return Some(note);
+        }
+        if let Some(starting) = &self.starting {
+            let started = match starting.try_recv() {
+                Ok(started) => started,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    Err("td-pass could not start watching them".to_owned())
+                }
+            };
+            self.starting = None;
+            match started {
+                Ok(events) => {
+                    self.undelayed = !events.delays_sleep();
+                    self.events = Some(events);
+                    return Some(if self.undelayed {
+                        HostEvent::Undelayed
+                    } else {
+                        HostEvent::Watched
+                    });
+                }
+                Err(reason) => return Some(HostEvent::Unwatched(reason)),
+            }
+        }
+        match self.events.as_mut()?.try_next()? {
+            pass::HostEvent::Lock => Some(HostEvent::Lock),
+            pass::HostEvent::Suspend(delay) => {
+                if !delay.held() && !self.undelayed {
+                    self.undelayed = true;
+                    self.note = Some(HostEvent::Undelayed);
+                }
+                self.delays.push((Instant::now(), delay));
+                Some(HostEvent::Suspend)
+            }
+            pass::HostEvent::Lost(reason) => {
+                self.events = None;
+                Some(HostEvent::Lost(reason))
+            }
+        }
+    }
+
+    /// The window has locked: sleep may go on.
+    pub fn release(&mut self) {
+        self.delays.clear();
     }
 }
 

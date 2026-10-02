@@ -157,6 +157,28 @@ standalone. No refusal falls back to the other mode.
   and every buffer the compositor has released at once, one still
   attached when released. A paste lands only where it was asked: one
   for a replaced entry or an ended prompt is dropped.
+- - - **Host lock.** The window watches the host's screen lock and sleep
+  through td-secret's `pass::HostEvents` (`td-secret/PORTABLE.md`), on a
+  thread of its own so a slow system bus never holds it; unlock, create
+  and import wait until the watch has started or its failure has been
+  told. A screen lock, sleep, or the events being lost locks at once
+  without the unsaved-changes question: the operation in flight is
+  cancelled, every edit is given up, and the vault thread is told to
+  lock even when nothing shows unlocked, so an unlock that finished as
+  it was cancelled is dropped too; one already locking sends no second
+  lock. Sleep waits, through logind's delay, until that thread has
+  answered the lock; a delay is never held past thirty seconds, longer
+  than logind's default maximum. The locked status says why it locked,
+  and the next unlock says, once and without keeping either, that
+  unsaved edits were given up (during a save, only edits made since it
+  was sent) or that a save, delete, key change, creation or import under
+  way may have been stopped. Before the first editing session the locked
+  view says that a screen lock or sleep locks the notebook too; while
+  the watch starts, that unlocking waits for it; on a host whose events
+  cannot be watched, or are lost, to lock the notebook before leaving
+  it, with the reason in the status, where a narrow row may cut it.
+  Sleep that does not wait, at the start or at a later sleep, is warned
+  of in the status. A warning waits behind a prompt's instruction.
 - **Frames.** td-ui keeps each frame in a file in the directory it is
   given. The window gives it `$XDG_RUNTIME_DIR` or `/dev/shm`, whichever
   `/proc/self/mountinfo` shows on tmpfs or ramfs first, and refuses to
@@ -176,23 +198,32 @@ their keys when the window grows, and painting the notebook, its keys
 view, its prompt and dialogs and each locked view, export into the
 folder the finder accepts, import of a chosen copy with one of its keys,
 a copy given up or unread, the finder painted, filtered and closed by
-Ctrl+L or the strip's Lock, and a listing for a closed finder dropped.
-The vault thread's tests pin that a prompt takes only its operation's
-answer, that cancel declines once and that a key command without an open
-notebook is refused, as are a copy that cannot be read and an export or
-import without a notebook; the files' tests that a copy is written new
-and private, never over another, and read to its bound, and how folders
-are listed; the frame directory's, the mount table's rules. Confinement
-tests pin the source inventory, that pure files reach no system, vault
-or compositor and only the toolkit's drawing, widget and editor modules,
-that td-secret is named only by the vault thread and the worker
-dispatch, the two reads the window makes itself, that it lists folders
-only through `src/files.rs`, that pure files call no path method that
-reaches the file system, that copies are written and read only through
-`src/files.rs` in those ways, and the vault-document policy.
+Ctrl+L or the strip's Lock, a listing for a closed finder dropped, a
+host lock or sleep that asks nothing and is reported at the next unlock,
+closes a question and gives up a copy being imported, sleep during a
+save and an edit made after it was sent, a host lock during an unlock or
+a key change, no second lock while locking, nothing locked while nothing
+is held, unlocking waiting for the watch, a warning waiting behind a
+prompt and keeping why it locked, and the warnings for a host not
+watched, not delaying sleep, or lost. The vault thread's tests pin that
+a prompt takes only its operation's answer, that cancel declines once
+and that a key command without an open notebook is refused, as are a
+copy that cannot be read and an export or import without a notebook; the
+files' tests that a copy is written new and private, never over another,
+and read to its bound, and how folders are listed; the frame
+directory's, the mount table's rules. Confinement tests pin the source
+inventory, that pure files reach no system, vault or compositor and only
+the toolkit's drawing, widget and editor modules, that td-secret is
+named only by the vault thread's file, for the vault and the host's
+events, and the worker dispatch, the two reads the window makes itself,
+that it lists folders only through `src/files.rs`, that pure files call
+no path method that reaches the file system, that copies are written and
+read only through `src/files.rs` in those ways, and the vault-document
+policy.
 
-Not yet: the native compositor cases, host lock and suspend integration,
-td mode, and the recipe and image integration of increment 5.
+Not yet: the native compositor cases, the host lock and sleep evidence
+on the supported host, td mode, and the recipe and image integration of
+increment 5.
 
 ## Delivery and proof
 

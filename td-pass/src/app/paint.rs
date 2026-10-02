@@ -116,6 +116,26 @@ impl Composition for Frame<'_> {
                     damage,
                     sink,
                 );
+                // Said before the first editing session, as the design asks.
+                let host = if app.unwatched {
+                    "The screen lock is not watched here: lock the notebook before leaving it."
+                } else if !app.host_ready {
+                    "Starting to watch the screen lock; unlocking waits for it."
+                } else {
+                    "A screen lock or sleep locks the notebook too, giving up unsaved edits."
+                };
+                line(
+                    surface,
+                    Rect {
+                        y: body.y + row,
+                        height: row as u32,
+                        ..body
+                    },
+                    host,
+                    PAPER,
+                    damage,
+                    sink,
+                );
                 if let (Some(keys), Some(view)) = (keys, layout::keys(surface)) {
                     let labels: Vec<String> = keys
                         .iter()

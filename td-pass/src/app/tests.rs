@@ -37,6 +37,13 @@ impl Clipboard for Board {
     }
 }
 
+/// A new app whose host's lock is watched, so it may unlock.
+fn watched() -> App {
+    let mut app = App::new().unwrap();
+    app.host(HostEvent::Watched);
+    app
+}
+
 fn key(app: &mut App, board: &mut Board, chord: &str) {
     app.input(
         Input::Key {
@@ -90,7 +97,7 @@ fn op_of(out: &[Out]) -> Op {
 /// An app unlocked with the primary key over `entries`, its PIN typed
 /// at the prompt.
 fn unlocked(board: &mut Board, entries: Vec<Item>) -> App {
-    let mut app = App::new().unwrap();
+    let mut app = watched();
     assert!(matches!(app.take_out()[..], [Out::Send(Command::Open)]));
     app.reply(Reply::Opened {
         keys: Some(vec![
@@ -499,7 +506,7 @@ fn rename_saves_only_the_title_and_delete_asks_first() {
 #[test]
 fn declining_the_prompt_answers_decline_and_a_cancel_reads_as_cancelled() {
     let mut board = Board::default();
-    let mut app = App::new().unwrap();
+    let mut app = watched();
     app.take_out();
     app.reply(Reply::Opened { keys: None });
     key(&mut app, &mut board, "Return");
@@ -533,7 +540,7 @@ fn declining_the_prompt_answers_decline_and_a_cancel_reads_as_cancelled() {
 #[test]
 fn the_pin_field_is_masked_and_refuses_copy() {
     let mut board = Board::default();
-    let mut app = App::new().unwrap();
+    let mut app = watched();
     app.take_out();
     app.reply(Reply::Opened {
         keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
@@ -881,7 +888,7 @@ fn a_paste_goes_only_where_it_was_asked() {
     assert_eq!(text(&app), "");
     // A PIN paste ends with its prompt.
     app.reply(Reply::Locked { keys: None });
-    let mut app = App::new().unwrap();
+    let mut app = watched();
     app.reply(Reply::Opened {
         keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
     });
@@ -1402,7 +1409,7 @@ fn export_writes_into_the_folder_the_finder_accepts() {
 
 /// An app whose account holds no notebook.
 fn empty() -> App {
-    let mut app = App::new().unwrap();
+    let mut app = watched();
     app.take_out();
     app.reply(Reply::Opened { keys: None });
     app
@@ -1670,5 +1677,433 @@ fn an_export_that_finishes_during_a_lock_is_reported_with_the_locked_view() {
         app.status,
         "Exported an encrypted copy to /home/u/td-pass-notebook-r1.tdpass. \
          Locked: choose a key and press Unlock"
+    );
+}
+
+fn primary_only() -> Option<Vec<KeyLabel>> {
+    Some(vec![label(Role::Primary, "0a0b0c0d")])
+}
+
+/// Unlocks a locked app again with its first key; the prompts are not
+/// what is tested.
+fn unlock_again(app: &mut App, board: &mut Board) {
+    key(app, board, "Return");
+    let op = op_of(&app.take_out());
+    app.reply(Reply::Unlocked {
+        op,
+        entries: vec![item(1, "Bank")],
+        keys: two_keys(),
+    });
+    assert!(matches!(app.phase, Phase::Unlocked(_)));
+}
+
+#[test]
+fn a_host_lock_asks_nothing_and_the_next_unlock_reports_the_edits() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "body");
+    key(&mut app, &mut board, "Return");
+    typed(&mut app, &mut board, "x");
+    assert!(app.dirty());
+    assert!(!app.settled());
+    app.host(HostEvent::Lock);
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+    assert!(app.dialog.is_none());
+    assert!(matches!(app.phase, Phase::Locking));
+    assert_eq!(app.pane.editor().tabs().count(), 0);
+    assert!(app.take_withdrawal());
+    assert!(app.take_scrub());
+    assert_eq!(app.status, "Locking with the screen");
+    // Sleep waits on the thread's answer, not on the window alone.
+    assert!(!app.settled());
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    assert!(app.settled());
+    assert_eq!(
+        app.status,
+        "Locked with the screen: choose a key and press Unlock"
+    );
+    unlock_again(&mut app, &mut board);
+    assert_eq!(
+        app.status,
+        "Unlocked: 1 entry. The host's lock gave up unsaved edits"
+    );
+    // Reported once: a lock of the person's own, with nothing unsaved,
+    // reports nothing.
+    key(&mut app, &mut board, "C-l");
+    app.take_out();
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    assert_eq!(app.status, "Locked: choose a key and press Unlock");
+    unlock_again(&mut app, &mut board);
+    assert_eq!(app.status, "Unlocked: 1 entry");
+}
+
+#[test]
+fn sleep_during_a_save_cancels_it_and_the_unlock_says_it_may_not_be_saved() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = saving(&mut app, &mut board);
+    app.host(HostEvent::Suspend);
+    let out = app.take_out();
+    assert!(
+        matches!(out[..], [Out::Cancel, Out::Send(Command::Lock)]),
+        "{out:?}"
+    );
+    assert!(app.busy.is_none());
+    // The save's late result changes nothing shown.
+    app.reply(Reply::Committed {
+        op,
+        id: [1; 16],
+        revision: Some(2),
+    });
+    assert!(matches!(app.phase, Phase::Locking));
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    assert_eq!(
+        app.status,
+        "Locked for sleep: choose a key and press Unlock"
+    );
+    // The edits went with the save, which may have committed.
+    unlock_again(&mut app, &mut board);
+    assert_eq!(
+        app.status,
+        "Unlocked: 1 entry. The host's lock may have stopped a change"
+    );
+}
+
+#[test]
+fn an_edit_made_after_a_save_was_sent_is_reported_given_up() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    saving(&mut app, &mut board);
+    typed(&mut app, &mut board, "y");
+    app.host(HostEvent::Lock);
+    app.take_out();
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    unlock_again(&mut app, &mut board);
+    assert_eq!(
+        app.status,
+        "Unlocked: 1 entry. The host's lock gave up edits and may have stopped a change"
+    );
+}
+
+#[test]
+fn a_host_lock_during_an_unlock_has_the_thread_lock_as_well() {
+    let mut board = Board::default();
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Opened {
+        keys: primary_only(),
+    });
+    // Locked and idle: nothing to do.
+    app.host(HostEvent::Lock);
+    assert!(app.take_out().is_empty());
+    assert!(app.settled());
+    key(&mut app, &mut board, "Return");
+    let op = op_of(&app.take_out());
+    app.reply(Reply::Ask {
+        op,
+        ask: Ask {
+            operation: "unlock",
+            role: Role::Primary,
+            key: Some("0a0b0c0d".to_owned()),
+            pin: None,
+        },
+    });
+    assert!(app.prompt.is_some());
+    app.host(HostEvent::Suspend);
+    let out = app.take_out();
+    assert!(
+        matches!(out[..], [Out::Cancel, Out::Send(Command::Lock)]),
+        "{out:?}"
+    );
+    assert!(app.prompt.is_none());
+    assert!(!app.settled());
+    // An unlock that finished as it was cancelled shows nothing; the
+    // thread drops its vault on the lock that follows.
+    app.reply(Reply::Unlocked {
+        op,
+        entries: vec![item(1, "Bank")],
+        keys: two_keys(),
+    });
+    assert!(matches!(app.phase, Phase::Locking));
+    assert!(!app.settled());
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    assert!(app.settled());
+    // Nothing was being edited.
+    unlock_again(&mut app, &mut board);
+    assert_eq!(app.status, "Unlocked: 1 entry");
+}
+
+#[test]
+fn nothing_held_has_nothing_to_lock() {
+    let mut app = watched();
+    app.take_out();
+    app.host(HostEvent::Lock);
+    assert!(app.take_out().is_empty());
+    assert!(app.settled());
+    app.reply(Reply::Refused {
+        text: "swap is on".to_owned(),
+    });
+    app.host(HostEvent::Suspend);
+    assert!(app.take_out().is_empty());
+    assert!(app.settled());
+    assert_eq!(app.status, "swap is on");
+}
+
+#[test]
+fn a_host_that_is_not_watched_is_warned_of_on_the_locked_view() {
+    let mut board = Board::default();
+    let mut app = App::new().unwrap();
+    app.take_out();
+    app.host(HostEvent::Unwatched("no system bus".to_owned()));
+    assert!(app.unwatched);
+    // A weaker warning does not hide it.
+    app.host(HostEvent::Undelayed);
+    app.reply(Reply::Opened {
+        keys: primary_only(),
+    });
+    assert_eq!(
+        app.status,
+        "Locked: choose a key and press Unlock. Screen lock not watched: no system bus"
+    );
+    // Told, so the notebook may be unlocked.
+    key(&mut app, &mut board, "Return");
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::Unlock { .. })]
+    ));
+
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    app.host(HostEvent::Undelayed);
+    assert_eq!(
+        app.status,
+        "Sleep does not wait for the notebook to lock, so it may lock only on waking"
+    );
+    assert_eq!(
+        app.host_warning.as_deref(),
+        Some("Sleep may come before the lock")
+    );
+    assert!(!app.unwatched);
+    app.host(HostEvent::Lost("the system bus closed".to_owned()));
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+    assert!(app.unwatched);
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    assert_eq!(
+        app.status,
+        "Locked as the host's events stopped: choose a key and press Unlock. \
+         Screen lock no longer watched: the system bus closed"
+    );
+}
+
+#[test]
+fn unlocking_waits_until_the_host_s_lock_is_watched() {
+    let mut board = Board::default();
+    let mut app = App::new().unwrap();
+    app.take_out();
+    app.reply(Reply::Opened {
+        keys: primary_only(),
+    });
+    key(&mut app, &mut board, "Return");
+    assert!(app.take_out().is_empty());
+    assert_eq!(
+        app.status,
+        "Starting to watch the host's screen lock: try again in a moment"
+    );
+    app.host(HostEvent::Watched);
+    key(&mut app, &mut board, "Return");
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::Unlock { .. })]
+    ));
+
+    // Creation waits as well.
+    let mut app = App::new().unwrap();
+    app.take_out();
+    app.reply(Reply::Opened { keys: None });
+    key(&mut app, &mut board, "Return");
+    assert!(app.take_out().is_empty());
+    app.host(HostEvent::Undelayed);
+    key(&mut app, &mut board, "Return");
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::Create { .. })]
+    ));
+}
+
+#[test]
+fn a_host_event_while_locking_sends_no_second_lock() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    key(&mut app, &mut board, "C-l");
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+    app.host(HostEvent::Lock);
+    app.host(HostEvent::Suspend);
+    assert!(app.take_out().is_empty());
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    assert_eq!(
+        app.status,
+        "Locked for sleep: choose a key and press Unlock"
+    );
+    // Locked and idle, a later event leaves the status as it is.
+    app.host(HostEvent::Lock);
+    assert!(app.take_out().is_empty());
+    assert_eq!(
+        app.status,
+        "Locked for sleep: choose a key and press Unlock"
+    );
+}
+
+#[test]
+fn a_host_lock_during_a_key_change_says_it_may_be_stopped() {
+    let mut board = Board::default();
+    let mut app = keys_view(&mut board);
+    key(&mut app, &mut board, "Insert");
+    let op = op_of(&app.take_out());
+    app.host(HostEvent::Lock);
+    let out = app.take_out();
+    assert!(
+        matches!(out[..], [Out::Cancel, Out::Send(Command::Lock)]),
+        "{out:?}"
+    );
+    app.reply(Reply::Keys {
+        op,
+        keys: two_keys(),
+    });
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    unlock_again(&mut app, &mut board);
+    assert_eq!(
+        app.status,
+        "Unlocked: 1 entry. The host's lock may have stopped a change"
+    );
+}
+
+#[test]
+fn a_host_lock_closes_the_question_it_finds() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank"), item(2, "Mail")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "body");
+    key(&mut app, &mut board, "Return");
+    typed(&mut app, &mut board, "x");
+    key(&mut app, &mut board, "C-l");
+    assert!(app.dialog.is_some());
+    assert!(app.take_out().is_empty());
+    app.host(HostEvent::Suspend);
+    assert!(app.dialog.is_none());
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+    assert!(matches!(app.phase, Phase::Locking));
+}
+
+#[test]
+fn a_host_lock_gives_up_a_copy_being_imported() {
+    let mut board = Board::default();
+    let mut app = empty();
+    key(&mut app, &mut board, "C-o");
+    asked(&mut app);
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/media/usb"),
+        Ok(listing("/media/usb", &[], &["copy.tdpass"])),
+        None,
+    );
+    key(&mut app, &mut board, "Return");
+    let op = op_of_read(&app.take_out());
+    app.reply(Reply::Copy {
+        op,
+        keys: two_keys().labels,
+    });
+    assert!(matches!(app.phase, Phase::Importing { .. }));
+    key(&mut app, &mut board, "Return");
+    let op = op_of(&app.take_out());
+    app.host(HostEvent::Lock);
+    let out = app.take_out();
+    assert!(
+        matches!(out[..], [Out::Cancel, Out::Send(Command::Lock)]),
+        "{out:?}"
+    );
+    // A cancelled import may still have placed the copy.
+    app.reply(Reply::Unlocked {
+        op,
+        entries: vec![item(1, "Bank")],
+        keys: two_keys(),
+    });
+    assert!(matches!(app.phase, Phase::Locking));
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    unlock_again(&mut app, &mut board);
+    assert_eq!(
+        app.status,
+        "Unlocked: 1 entry. The host's lock may have stopped a change"
+    );
+}
+
+#[test]
+fn a_warning_waits_behind_a_prompt() {
+    let mut board = Board::default();
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Opened {
+        keys: primary_only(),
+    });
+    key(&mut app, &mut board, "Return");
+    let op = op_of(&app.take_out());
+    app.reply(Reply::Ask {
+        op,
+        ask: Ask {
+            operation: "unlock",
+            role: Role::Primary,
+            key: Some("0a0b0c0d".to_owned()),
+            pin: None,
+        },
+    });
+    let asking = app.status.clone();
+    app.host(HostEvent::Undelayed);
+    assert_eq!(app.status, asking);
+    assert_eq!(
+        app.host_warning.as_deref(),
+        Some("Sleep may come before the lock")
+    );
+}
+
+#[test]
+fn a_later_warning_keeps_why_the_notebook_locked() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    app.host(HostEvent::Suspend);
+    app.take_out();
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    app.host(HostEvent::Undelayed);
+    assert_eq!(
+        app.status,
+        "Locked for sleep: choose a key and press Unlock. Sleep may come before the lock"
+    );
+    unlock_again(&mut app, &mut board);
+    key(&mut app, &mut board, "C-l");
+    app.take_out();
+    app.reply(Reply::Locked {
+        keys: primary_only(),
+    });
+    assert_eq!(
+        app.status,
+        "Locked: choose a key and press Unlock. Sleep may come before the lock"
     );
 }

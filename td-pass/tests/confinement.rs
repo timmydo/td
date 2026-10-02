@@ -199,8 +199,8 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
             assert!(!source(name).contains("std::fs"), "{name}");
         }
     }
-    // The backend reaches td-secret's standalone host and nothing else of
-    // the crate.
+    // The backend reaches td-secret's standalone host and its host events,
+    // and nothing else of the crate.
     let backend = source("backend.rs");
     assert!(backend.contains("use td_secret::pass;"));
     assert_eq!(backend.matches("td_secret").count(), 1);
