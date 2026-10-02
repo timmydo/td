@@ -1120,6 +1120,105 @@ fn mime_checkpoints() {
     assert_eq!(COUNTERS.snapshot(), before, "transfer checkpoint allocated");
 }
 
+fn body_charset() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        body_charset::{Error, Plan, Prescan, Selection, Status},
+        mime_charset::Charset,
+        ports::{Deadline, Tick},
+    };
+    fn budget(records: u64) -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100,
+                records,
+                ..Charge::default()
+            },
+        )
+    }
+    let before = COUNTERS.snapshot();
+    assert_eq!(Plan::from_label(None), Plan::Prescan);
+    assert_eq!(
+        Plan::from_label(Some(b"unknown")),
+        Plan::Selected(Selection {
+            charset: Charset::Utf8,
+            is_encoding_problem: true
+        })
+    );
+    for (source, charset, problem) in [
+        (b"ascii".as_slice(), Charset::Ascii, false),
+        (b"caf\xc3\xa9", Charset::Utf8, true),
+        (b"caf\xc3\xa9\xff", Charset::Ascii, true),
+    ] {
+        let mut scan = Prescan::default();
+        let mut work = budget(100);
+        let prefix = source.len() - 1;
+        for byte in source.get(..prefix).unwrap() {
+            let step = scan
+                .poll(std::slice::from_ref(byte), false, Tick(1), &mut work)
+                .unwrap();
+            assert_eq!(step.consumed, 1);
+        }
+        let saved = scan;
+        for _ in 0..2 {
+            let mut pos = prefix;
+            let mut done = false;
+            for _ in 0..100 {
+                let end = (pos + 1).min(source.len());
+                let step = scan
+                    .poll(
+                        source.get(pos..end).unwrap(),
+                        end == source.len(),
+                        Tick(1),
+                        &mut work,
+                    )
+                    .unwrap();
+                pos += step.consumed;
+                if let Status::Complete(selection) = step.status {
+                    assert_eq!(
+                        selection,
+                        Selection {
+                            charset,
+                            is_encoding_problem: problem
+                        }
+                    );
+                    assert_eq!(pos, source.len());
+                    let remaining = work.remaining();
+                    assert_eq!(
+                        scan.poll(b"ignored", true, Tick(100), &mut work)
+                            .unwrap()
+                            .status,
+                        step.status
+                    );
+                    assert_eq!(work.remaining(), remaining);
+                    done = true;
+                    break;
+                }
+            }
+            assert!(done);
+            scan = saved;
+        }
+    }
+    let mut scan = Prescan::default();
+    assert_eq!(
+        scan.poll(b"a", true, Tick(1), &mut budget(0)),
+        Err(Error::Work(Stop::Records))
+    );
+    let mut fresh = budget(100);
+    let remaining = fresh.remaining();
+    assert_eq!(
+        scan.poll(b"", true, Tick(1), &mut fresh),
+        Err(Error::Work(Stop::Records))
+    );
+    assert_eq!(fresh.remaining(), remaining);
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "body charset prescan allocated"
+    );
+}
+
 fn mime_charset() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -1673,6 +1772,7 @@ fn main() {
         mime_base64();
         mime_input();
         mime_headers();
+        body_charset();
         mime_charset();
         mime_checkpoints();
         mime_unfold();
@@ -1761,6 +1861,7 @@ fn main() {
     mime_base64();
     mime_input();
     mime_headers();
+    body_charset();
     mime_charset();
     mime_checkpoints();
     mime_unfold();

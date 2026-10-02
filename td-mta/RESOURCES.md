@@ -778,6 +778,14 @@ NUL removal, malformed/noncharacter replacement, replay, completion and
 fresh-meter refusal without changing Rust allocation counters. Source
 collection and the complete projection worker stack remain unqualified.
 
+Body charset prescan fits 64 bytes in the existing 2 KiB decoder/HTML/snippet
+state and future decoding cursor checkpoint. It borrows caller fragments
+and retains no source, body copy or output buffer. Its isolated allocation
+interval covers label selection, single-byte fragments, valid/malformed body
+completion, copied-state replay and fresh-meter refusal with unchanged Rust
+counters. Actual transfer-source rewinding and full body worker stacks remain
+unqualified; their scans must share the live work budget.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

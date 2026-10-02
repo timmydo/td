@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod body_charset;
 pub mod bounded;
 pub mod change_cursor;
 pub mod clock;

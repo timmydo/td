@@ -735,8 +735,10 @@ header normalization remain with later integration.
 
 The bounded charset decoder covers the policy's four charset families with
 fixed state across source fragments. It preserves valid scalars and reports
-replacement diagnostics; unknown-label heuristics, header filtering, NFC and
-JSON projection remain separate.
+replacement diagnostics. A bounded body prescan supplies the frozen
+absent/ASCII-label UTF-8 heuristic and unknown-label fallback; the owner
+replays the same immutable transfer-decoded source for final decoding. Header
+filtering, NFC and JSON projection remain separate.
 
 A fixed-state unfolding primitive removes accepted line endings only before
 space or tab, retaining the whitespace and every nonfold octet. It supports

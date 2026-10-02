@@ -872,6 +872,38 @@ further work. The owner brackets deterministic turns with fresh clock checks.
 Source collection, header selection, JSON serialization and JMAP activation
 remain separate.
 
+### 1.18 Body charset selection and prescan
+
+body_charset::Plan takes an optional, already-unquoted label. Absent and
+ASCII labels require Prescan; other known labels select their exact decoder.
+Unknown labels select UTF-8 replacement and mark an encoding problem. Keep
+the original label for MIME properties; an absent property remains us-ascii
+regardless of the selected decoder. Label syntax/admission belongs to the
+parameter parser, not this selector.
+
+Prescan reads the complete transfer-decoded body through caller fragments.
+It selects UTF-8 only when every byte is valid UTF-8 and at least one scalar
+is non-ASCII; otherwise select ASCII. A selection is available only at EOF,
+never for a valid prefix. Promotion or malformed input records an encoding
+problem. This diagnostic combines with transfer decoding, the final charset
+decoder and JSON projection; it never clears another stage's diagnostic.
+Explicit Latin-1/Windows-1252/UTF-8 and unknown-label fallback bypass this
+heuristic. Prescan does not reject valid Unicode noncharacters; projection
+replaces those separately.
+
+Each poll inspects at most four bytes and one scalar, returning exact
+consumed progress with NeedInput, Yield, or Complete(Selection). Retain the
+unconsumed suffix and EOF flag on Yield. Charset decoding charges source
+visits and one scalar record including the high-byte classification. The
+final constant selection step checks the deadline without charging a scalar
+record. Both prescan and final decoding consume the live work meter. The
+owner retains the immutable source binding, restores its transfer source for
+the final pass, brackets turns with fresh clock/cancellation checks and
+preserves retirement across any saved state. Prescan owns neither a source
+nor a replay buffer. Refusal is sticky even with a fresh meter and exposes
+no selection; completed state is stable without work. MIME parameter
+integration, source rewind and body-value output remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -1233,6 +1233,13 @@ Initial independently landable increments:
   invalid fragments separated by NUL, copied-state replay and allocation.
   Header selection, collection and JSON/JMAP integration remain open.
 
+- **M06h — bounded body charset selection:** implemented direct label selection
+  and complete-body UTF-8 prescan for absent/ASCII labels. Preserve original
+  labels externally, report promotion/unknown/malformed diagnostics and charge
+  scan/replay work. Cover all split points, late malformed suffixes, scalar
+  boundaries, copied-state work, failure retirement and allocation counters.
+  MIME parameter binding, transfer-source rewind and body output remain open.
+
 Implement other header-form composition, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME
