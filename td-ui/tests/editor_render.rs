@@ -1024,3 +1024,79 @@ fn a_pane_paints_exactly_a_windows_document_region_and_nothing_outside_it() {
         }
     }
 }
+
+#[test]
+#[allow(clippy::unwrap_used, reason = "validated test scene")]
+fn inked_ranges_draw_their_glyphs_in_their_ink_and_a_selection_keeps_its_own() {
+    const GREEN: u32 = 0x4d6b3c;
+    const RED: u32 = 0x8a2f2f;
+    // "αβ" green, "δ" red; "β" selected; "γ" in no range. Scalars the
+    // window's own menu and status text never draw.
+    let editor = editor(
+        "αβ\nγδ",
+        Selection {
+            anchor: 2,
+            caret: 4,
+        },
+    );
+    let inks = [(0..4, GREEN), (7..9, RED)];
+    let geometry = geometry(400, 120, 1);
+    for focused in [false, true] {
+        let scene = Scene::new(
+            &editor,
+            geometry,
+            View {
+                focused,
+                caret_visible: false,
+                ..View::default()
+            },
+            &[],
+            Profile::Windows,
+        )
+        .unwrap()
+        .inks(&inks);
+        let mut glyphs = Vec::new();
+        scene.emit(geometry.bounds(), &mut |draw| {
+            if let Primitive::Glyph { scalar, style, .. } = draw.primitive {
+                glyphs.push((scalar, style.ink));
+            }
+        });
+        let ink = |wanted: char| {
+            glyphs
+                .iter()
+                .find(|(scalar, _)| *scalar == wanted)
+                .map(|(_, ink)| *ink)
+        };
+        assert_eq!(ink('α'), Some(GREEN));
+        assert_eq!(
+            ink('β'),
+            Some(if focused { raster::PAPER } else { GREEN }),
+            "a focused selection's paper ink wins; an unfocused one keeps the range's"
+        );
+        assert_eq!(ink('γ'), Some(raster::INK));
+        assert_eq!(ink('δ'), Some(RED));
+    }
+    // A range ending inside "β" (bytes 2..4) leaves it in INK.
+    let straddled = [(0..3, GREEN)];
+    let scene = Scene::new(
+        &editor,
+        geometry,
+        View {
+            focused: false,
+            caret_visible: false,
+            ..View::default()
+        },
+        &[],
+        Profile::Windows,
+    )
+    .unwrap()
+    .inks(&straddled);
+    let mut glyphs = Vec::new();
+    scene.emit(geometry.bounds(), &mut |draw| {
+        if let Primitive::Glyph { scalar, style, .. } = draw.primitive {
+            glyphs.push((scalar, style.ink));
+        }
+    });
+    assert!(glyphs.contains(&('α', GREEN)));
+    assert!(glyphs.contains(&('β', raster::INK)));
+}

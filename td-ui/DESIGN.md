@@ -2493,7 +2493,9 @@ the vault-document bullet below).
   most one test module, at the file's tail. Files, the clock, spelling,
   the control socket, replay and the reference preview stay td-editor's.
   The scene takes a spelling checker's status and marks as borrowed
-  values, not td-editor's spelling state.
+  values, not td-editor's spelling state, and a host's inks the same
+  way (`Scene::inks`, td-editor/DESIGN.md "Implemented
+  reference-renderer contract").
 - Permits bind an editor and a revision across the crate boundary. A
   `RevisionPoint` carries a private owner token only its `Editor` mints,
   and its tab and revision are read through accessors, so a consumer

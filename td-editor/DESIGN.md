@@ -1007,6 +1007,15 @@ admitted up to 16 Mi rows and 128 Mi columns. The adapter must clamp them
 with `Viewport` when the document or geometry changes; an admitted origin
 beyond the text draws a blank document area.
 
+`Scene::inks` borrows a host's byte ranges of the active document, in
+order and not overlapping, each with an ink (`0xRRGGBB`, as `INK` is)
+its glyphs are drawn in instead of `INK`. Only glyph ink changes:
+backgrounds, the selection's ground, underlines and the caret are drawn
+as without it, and a glyph selected while the view is focused keeps the
+selection's paper ink, so a selection reads the same over inked text. A
+glyph whose bytes lie across a range's edge, or in none, is drawn in
+`INK`. The editor's own window passes none.
+
 `Geometry` admits nonzero axes through 8192 and at most 32 MiB of tight
 four-byte pixels; those ceilings are td-ui's `raster::Surface`, which
 `Geometry::new` constructs and `Geometry::surface` reports. td-ui's `Raster`

@@ -328,6 +328,7 @@ pub struct Scene<'a> {
     caret: Option<Position>,
     spelling: &'a [std::ops::Range<usize>],
     spelling_status: Option<&'a str>,
+    inks: &'a [(std::ops::Range<usize>, u32)],
     link: Option<std::ops::Range<usize>>,
     notice: Option<&'a str>,
     scrollbars: [Option<Scrollbar>; 2],
@@ -426,6 +427,7 @@ impl<'a> Scene<'a> {
             caret,
             spelling: &[],
             spelling_status: None,
+            inks: &[],
             link: None,
             notice: None,
             scrollbars,
@@ -443,8 +445,17 @@ impl<'a> Scene<'a> {
         self
     }
 
+    /// Byte ranges of the active document drawn in an ink of their own
+    /// (`0xRRGGBB`, as `INK` is) rather than `INK`, in order and not
+    /// overlapping; a glyph inside none, or selected while focused, keeps
+    /// the ink it would have.
+    pub fn inks(mut self, inks: &'a [(std::ops::Range<usize>, u32)]) -> Self {
+        self.inks = inks;
+        self
+    }
+
     /// The link a Control-press would follow, in the active document's
-    /// bytes, underlined in the ink of its glyphs.
+    /// bytes, underlined in `INK`, or paper under a focused selection.
     pub fn link(mut self, link: Option<std::ops::Range<usize>>) -> Self {
         self.link = link;
         self
@@ -602,6 +613,7 @@ impl<'a> Scene<'a> {
         };
         let selection = doc.selection().range();
         let mut mark = 0;
+        let mut inked = 0;
         for (index, row) in layout
             .rows()
             .skip(self.view.origin.row)
@@ -637,6 +649,20 @@ impl<'a> Scene<'a> {
                         },
                     });
                 }
+                while self
+                    .inks
+                    .get(inked)
+                    .is_some_and(|(range, _)| range.end <= cell.bytes.start)
+                {
+                    inked += 1;
+                }
+                let ink = self
+                    .inks
+                    .get(inked)
+                    .filter(|(range, _)| {
+                        range.start <= cell.bytes.start && cell.bytes.end <= range.end
+                    })
+                    .map_or(INK, |(_, ink)| *ink);
                 if cell.scalar != '\t' {
                     sink(Draw {
                         clip,
@@ -648,7 +674,7 @@ impl<'a> Scene<'a> {
                                 if selected && self.view.focused {
                                     PAPER
                                 } else {
-                                    INK
+                                    ink
                                 },
                                 if selected {
                                     if self.view.focused {
