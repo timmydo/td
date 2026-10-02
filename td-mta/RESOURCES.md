@@ -728,6 +728,17 @@ work refusal in one interval with every counter unchanged. This does not
 qualify nested sources, maximum bodies, complete parser stacks or service
 RSS.
 
+The quoted-printable cursor fits 64 bytes of copied stage decoder state,
+including extent/run positions and at most two pending octets. It scans long
+whitespace runs without buffering and replays interior runs once from their
+exact start. Runs still present in the supplied fragment replay there within
+the same bounded turn; only earlier positions require external reposition.
+No line/body buffer or resource allowance grows. Its isolated
+allocation interval covers soft breaks, interior/trailing whitespace,
+malformed escapes, repositioning, short output, copied-state replay and
+sticky refusal. Integrating that state with transfer/nested source owners
+and their checkpoint backing remains separate.
+
 The first transfer-input owner borrows a BlobReader and at most the existing
 6 KiB stage byte partition. Its inline compiled state fits 256 bytes; it
 retains no extra body arena or thread. One poll refills that partition or

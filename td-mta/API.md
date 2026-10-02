@@ -978,6 +978,45 @@ The caller brackets deterministic turns with fresh clock/cancellation checks.
 Refusals latch even with a fresh meter; Complete remains stable without work.
 This primitive owns neither the source nor a response writer.
 
+### 1.21 Stable quoted-printable cursor
+
+mime_qp::Decoder implements POLICY.md section 3's stable QP octets using an
+immutable source extent length and a body-relative position. Before each
+poll, supply a fragment beginning at position(); bytes beyond that length
+are ignored. The constructor binds only a length: the enclosing source
+owner must preserve the same authorized bytes throughout decoding/replay.
+This pure cursor has no source handle, authorization or I/O authority.
+
+Progress returns consumed/written prefixes and NeedInput, NeedOutput, Yield,
+Reposition or Complete. Except for Reposition, advance the supplied fragment
+by consumed. On Reposition discard its remaining suffix and fetch from the
+new position() before polling again; previously written bytes still count.
+Rewinds begin at the exact literal whitespace/CR run, never at body origin.
+Rewinds into the same supplied fragment reuse that resident prefix during
+the current turn, retaining the 256-transition ceiling. Only an earlier
+target returns Reposition. A fixed pending pair retains malformed escape
+bytes or hard CRLF. Temporary
+empty input below the extent end means NeedInput; EOF comes only from the
+fixed length. Empty output is backpressure. Complete is cached without work.
+
+Decode case-insensitive =HH; retain encoded spaces/tabs. Scan optional soft
+break padding and literal whitespace to the next non-whitespace byte or EOF.
+Drop trailing literal whitespace; replay interior whitespace once with its
+original SP/HTAB ordering. Preserve hard line endings and malformed escape
+bytes, diagnose tolerated LF/EOF soft breaks, bare CR/LF and prohibited
+literal bytes. Flags are provisional until the full extent completes.
+
+One poll performs at most 256 transitions. Every examined source byte,
+including unconsumed lookahead and replay, charges io_bytes; each emitted
+byte charges output_bytes before copying. Fixed transitions need no separate
+record charge. EOF and active entry check the deadline. The caller brackets
+turns with fresh clock/cancellation checks. Errors retire the cursor even
+with a fresh meter and invalidate the whole provisional decoded body.
+Copied state retains neither source identity nor meter: its owner must keep
+both bindings and failure retirement, without refunds. Reader integration,
+nested source checkpoints and protocol output remain separate; the existing
+mime_input::Reader still explicitly refuses QP.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

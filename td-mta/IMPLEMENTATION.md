@@ -1254,6 +1254,14 @@ Initial independently landable increments:
   a composed transfer-text fixture and allocation counters. HTML truncation,
   response ownership and JMAP output remain open.
 
+- **M06k — bounded quoted-printable cursor:** implemented stable escapes,
+  soft/hard line endings, literal trailing-whitespace removal and exact
+  source-position replay for interior runs. Fixed copied state and charged
+  256-transition turns avoid growing buffers. Cover malformed fixtures,
+  fragment/output boundaries, long runs, replay/refusal and allocation.
+  Source ownership, nested checkpoints and transfer-reader integration remain
+  open; the reader still refuses QP.
+
 Implement other header-form composition, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME

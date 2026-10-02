@@ -1704,6 +1704,135 @@ fn mime_input() {
     assert_eq!(before, after, "MIME source input allocated");
 }
 
+fn mime_qp() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_qp::{Decoder, Status},
+        ports::{Deadline, Tick},
+    };
+    let mut long = [b' '; 513];
+    *long.last_mut().unwrap() = b'x';
+    let before = COUNTERS.snapshot();
+    for (input, expected, problem) in [
+        (
+            b"a=20\r\nb \t\r\nc=0A=QZ=".as_slice(),
+            b"a \r\nb\r\nc\n=QZ".as_slice(),
+            true,
+        ),
+        (b"ab= \t\r\ncd".as_slice(), b"abcd".as_slice(), false),
+        (b"=4".as_slice(), b"=4".as_slice(), true),
+        (b"".as_slice(), b"".as_slice(), false),
+        (long.as_slice(), long.as_slice(), false),
+    ] {
+        let mut decoder = Decoder::new(input.len() as u64);
+        let mut resident = Decoder::new(3);
+        let mut resident_work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 5,
+                output_bytes: 3,
+                ..Charge::default()
+            },
+        );
+        let mut resident_output = [0; 3];
+        assert_eq!(
+            resident
+                .poll(b"a b", &mut resident_output, Tick(1), &mut resident_work)
+                .unwrap()
+                .status,
+            Status::Complete
+        );
+        assert_eq!(resident_output, *b"a b");
+        assert_eq!(resident_work.remaining(), Charge::default());
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10000,
+                output_bytes: 10000,
+                ..Charge::default()
+            },
+        );
+        let mut written = 0;
+        let mut done = false;
+        for _ in 0..10000 {
+            let at = decoder.position() as usize;
+            let end = (at + 2).min(input.len());
+            let mut byte = [0; 1];
+            let step = decoder
+                .poll(
+                    black_box(input.get(at..end).unwrap()),
+                    &mut byte,
+                    Tick(1),
+                    &mut work,
+                )
+                .unwrap();
+            if step.written != 0 {
+                assert_eq!(byte.first(), expected.get(written));
+                written += step.written;
+            }
+            if step.status == Status::Complete {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(written, expected.len());
+        assert_eq!(decoder.is_encoding_problem(), problem);
+    }
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 20,
+            output_bytes: 20,
+            ..Charge::default()
+        },
+    );
+    let mut decoder = Decoder::new(4);
+    assert_eq!(
+        decoder
+            .poll(b"= ", &mut [], Tick(1), &mut work)
+            .unwrap()
+            .status,
+        Status::NeedInput
+    );
+    assert_eq!(
+        decoder
+            .poll(b"\tx", &mut [], Tick(1), &mut work)
+            .unwrap()
+            .status,
+        Status::Reposition
+    );
+    let saved = decoder;
+    for mut replay in [decoder, saved] {
+        let mut output = [0; 4];
+        assert_eq!(
+            replay
+                .poll(b" \tx", &mut output, Tick(1), &mut work)
+                .unwrap()
+                .status,
+            Status::Complete
+        );
+        assert_eq!(output, *b"= \tx");
+    }
+    assert_eq!(work.remaining().io_bytes, 10);
+    assert_eq!(work.remaining().output_bytes, 12);
+    let mut stopped = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+    let mut decoder = Decoder::new(1);
+    assert_eq!(
+        decoder.poll(b"x", &mut [], Tick(1), &mut stopped),
+        Err(Stop::IoBytes)
+    );
+    let remaining = work.remaining();
+    assert_eq!(
+        decoder.poll(b"x", &mut [], Tick(1), &mut work),
+        Err(Stop::IoBytes)
+    );
+    assert_eq!(work.remaining(), remaining);
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME quoted-printable allocated");
+}
+
 fn mime_base64() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -1993,6 +2122,7 @@ fn main() {
         store_read_pool();
         store_pinned_blobs();
         mime_base64();
+        mime_qp();
         mime_input();
         mime_headers();
         body_value();
@@ -2084,6 +2214,7 @@ fn main() {
     store_read_pool();
     store_pinned_blobs();
     mime_base64();
+    mime_qp();
     mime_input();
     mime_headers();
     body_value();

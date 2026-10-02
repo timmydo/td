@@ -757,6 +757,12 @@ share charged work and a monotonic clock watermark, preserving diagnostics
 and retirement. It stages one byte within fixed state; body-value projection
 and protocol output remain separate.
 
+A fixed quoted-printable cursor now implements the stable transfer policy
+with explicit source-position rewind requests. It scans and replays long
+whitespace runs using fixed state, with charged lookahead and bounded turns.
+Transfer-reader/source ownership and nested checkpoint integration remain
+separate; existing transfer readers still refuse QP.
+
 The plain body-value filter converts CRLF, replaces noncharacters for I-JSON
 and applies a UTF-8 scalar-boundary byte cap with fixed pending state. It keeps
 validating the remaining scalars after truncation so trailing diagnostics are
