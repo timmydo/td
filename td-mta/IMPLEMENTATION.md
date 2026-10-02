@@ -646,8 +646,16 @@ service activation. Each part lands independently:
         tests and injected short/write/sync errors cover these primitives.
         The dedicated allocation probe covers successful/failed operations at
         short and maximum root paths on the pinned host/musl builds. Logical
-        admission, directory creation, publication and cleanup remain separate
+        admission, publication and cleanup remain separate
         work.
+      - **M05b2c2 — exclusive directories:** implemented one-level creation of
+        the accounts entry and typed account/checkpoint directories, shared
+        private-parent checks,
+        umask normalization and new-directory/parent sync. Existing entries
+        refuse untouched. Uncertain/created failures retain accounting; tests
+        inject before/after creation and each sync. Allocation probes include
+        successful and refused directory operations. Directory creation does
+        not select a checkpoint or activate serving.
     - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
       bounded reading through EOF and opened-file identity checks. Deployment
       uses the data-root owner as its trusted expected service identity.

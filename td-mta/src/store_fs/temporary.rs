@@ -29,9 +29,9 @@ pub enum CreateError {
 impl std::fmt::Display for CreateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Uncreated(_) => f.write_str("temporary file was not created"),
-            Self::Attempted(_) => f.write_str("temporary creation has uncertain effects"),
-            Self::Created(_) => f.write_str("temporary file requires orphan accounting"),
+            Self::Uncreated(_) => f.write_str("private storage object was not created"),
+            Self::Attempted(_) => f.write_str("private storage creation has uncertain effects"),
+            Self::Created(_) => f.write_str("private storage object requires orphan accounting"),
         }
     }
 }
@@ -216,13 +216,6 @@ impl Progress {
     }
 }
 
-fn private_directory(path: &Path, owner: u32) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o7777 != 0o700 {
-        return Err(io::ErrorKind::PermissionDenied.into());
-    }
-    Ok(())
-}
 fn create(root: &Directory, name: &Name) -> Result<(File, File), CreateError> {
     create_using(root, name, open_new, prepare)
 }
@@ -233,34 +226,14 @@ fn create_using(
     prepare: impl FnOnce(&File, u32) -> io::Result<()>,
 ) -> Result<(File, File), CreateError> {
     let mut buffer = [0; MAX_PATH_BYTES];
-    let path = root
-        .join(name, &mut buffer)
+    let destination = root
+        .destination(name, &mut buffer)
         .map_err(CreateError::Uncreated)?;
-    let parent_path = path
-        .parent()
-        .ok_or_else(|| CreateError::Uncreated(io::ErrorKind::InvalidInput.into()))?;
-    let owner = root.metadata().map_err(CreateError::Uncreated)?.uid();
-    for ancestor in parent_path.ancestors() {
-        if ancestor.as_os_str().len() < root.length {
-            break;
-        }
-        private_directory(ancestor, owner).map_err(CreateError::Uncreated)?;
-    }
-    let parent = Directory::from_path(
-        parent_path
-            .to_str()
-            .ok_or_else(|| CreateError::Uncreated(io::ErrorKind::InvalidInput.into()))?,
-    )
-    .map_err(CreateError::Uncreated)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => return Err(CreateError::Uncreated(io::ErrorKind::AlreadyExists.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-        Err(error) => return Err(CreateError::Uncreated(error)),
-    }
+    super::require_absent(destination.path).map_err(CreateError::Uncreated)?;
     // Once open is issued, an error need not prove that no inode was created.
-    let file = open(path).map_err(CreateError::Attempted)?;
-    prepare(&file, owner).map_err(CreateError::Created)?;
-    Ok((file, parent.file))
+    let file = open(destination.path).map_err(CreateError::Attempted)?;
+    prepare(&file, destination.owner).map_err(CreateError::Created)?;
+    Ok((file, destination.parent.file))
 }
 fn open_new(path: &Path) -> io::Result<File> {
     OpenOptions::new()

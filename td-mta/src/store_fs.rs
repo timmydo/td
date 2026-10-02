@@ -7,6 +7,8 @@ use std::{
     path::Path,
 };
 
+#[path = "store_fs/create_directory.rs"]
+mod create_directory;
 #[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{CreateError, SyncedTemporary, TemporaryFile, MAX_FILE_STEP_BYTES};
@@ -168,6 +170,47 @@ impl Directory {
     pub fn metadata(&self) -> io::Result<Metadata> {
         self.file.metadata()
     }
+    fn destination<'a>(
+        &self,
+        name: &Name,
+        buffer: &'a mut [u8; MAX_PATH_BYTES],
+    ) -> io::Result<Destination<'a>> {
+        let path = self.join(name, buffer)?;
+        let parent_path = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let owner = self.metadata()?.uid();
+        for ancestor in parent_path.ancestors() {
+            if ancestor.as_os_str().len() < self.length {
+                break;
+            }
+            private_directory(ancestor, owner)?;
+        }
+        let parent =
+            Directory::from_path(parent_path.to_str().ok_or(io::ErrorKind::InvalidInput)?)?;
+        Ok(Destination {
+            path,
+            parent,
+            owner,
+        })
+    }
+}
+struct Destination<'a> {
+    path: &'a Path,
+    parent: Directory,
+    owner: u32,
+}
+fn private_directory(path: &Path, owner: u32) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o7777 != 0o700 {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    Ok(())
+}
+fn require_absent(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(io::ErrorKind::AlreadyExists.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 /// Cooperative process exclusion only; store-format recovery is still required.
 #[derive(Debug)]
@@ -285,13 +328,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    struct Fixture {
-        path: PathBuf,
+    pub(super) struct Fixture {
+        pub(super) path: PathBuf,
         directory: Directory,
         owner: u32,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "td-mta-lock-{}-{}",
@@ -311,6 +354,14 @@ mod tests {
         }
         fn lock(&self) -> Result<File, LockError> {
             acquire_lock(&self.directory, self.owner)
+        }
+        pub(super) fn locked(&self) -> LockedRoot {
+            let directory = Directory::from_path(self.path.to_str().unwrap()).unwrap();
+            let lock = acquire_lock(&directory, self.owner).unwrap();
+            LockedRoot {
+                root: PrivateRoot { directory },
+                _lock: lock,
+            }
         }
         fn reacquire(&self) -> File {
             let deadline = Instant::now() + Duration::from_secs(5);

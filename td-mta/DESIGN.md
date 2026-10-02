@@ -32,7 +32,8 @@ free-space probes. A retained std file lock provides cooperative writer
 exclusion. Physical EOF, selected-graph validation,
 complete final-view semantics and durable publication remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
-file/parent sync; it grants no publication or admission authority.
+file/parent sync. Typed private-directory creation also syncs the new directory
+and parent; neither primitive grants publication or admission authority.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.
 [API.md](API.md) defines the compiling M02c2 adapter contracts and implemented

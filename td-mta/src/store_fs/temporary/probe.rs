@@ -61,6 +61,32 @@ pub fn run(mut snapshot: impl FnMut()) {
     assert_eq!(long.path.as_os_str().len(), super::super::MAX_ROOT_BYTES);
     snapshot();
     for fixture in [&short, &long] {
+        assert!(
+            matches!(fixture.root.create_accounts_directory(), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)
+        );
+        let directory_account = AccountId::from_bytes([0x17; 16]);
+        for entry in [
+            AccountEntry::Root,
+            AccountEntry::Metadata,
+            AccountEntry::Checkpoints,
+            AccountEntry::Checkpoint(Number::new(u64::MAX).unwrap()),
+            AccountEntry::Temporary,
+            AccountEntry::Messages,
+            AccountEntry::Shard(crate::format::row::BlobKind::Message, 0xff),
+        ] {
+            let directory = fixture
+                .root
+                .create_account_directory(directory_account, entry)
+                .unwrap();
+            assert!(directory.metadata().unwrap().is_dir());
+            drop(directory);
+            assert!(
+                matches!(fixture.root.create_account_directory(directory_account, entry), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::AlreadyExists)
+            );
+        }
+        assert!(
+            matches!(fixture.root.create_account_directory(directory_account, AccountEntry::Current), Err(CreateError::Uncreated(e)) if e.kind() == io::ErrorKind::InvalidInput)
+        );
         for number in 1..=16 {
             let number = Number::new(number).unwrap();
             let mut file = fixture

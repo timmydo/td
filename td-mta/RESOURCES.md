@@ -567,6 +567,8 @@ module permits unused items in this second compilation, including omitted
 libtest helpers; normal library and unit-test builds remain the lint authority.
 
 At both short and maximum 254-byte root paths, the measured interval covers
+exclusive typed account/checkpoint/shard directory creation and sync, existing
+directory collisions and refusal of file entries passed as directory requests;
 exclusive create/prepare, 4 KiB write/read/sync/drop, existing-name collision,
 byte-limit and read-offset refusal, missing ancestors, injected open/preparation
 and sync failures, Interrupted attempt exhaustion, retired output refusal and

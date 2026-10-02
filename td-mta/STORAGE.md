@@ -197,6 +197,30 @@ Tests exercise the std lock primitive in private temporary directories even
 when the harness identity/ancestry cannot satisfy production root admission.
 These fixtures do not waive any production root policy.
 
+### Exclusive directory creation
+
+`LockedRoot::create_accounts_directory` and `create_account_directory` create
+one typed directory beneath an already durable, private parent. The latter
+accepts only directory variants of AccountEntry; file variants refuse before
+I/O. There is no recursive creation and no adoption of an existing name. Existing
+directories, files and symlinks refuse without chmod, removal or replacement.
+Every parent from the data root down must have its owner and exact mode 0700.
+These shared destination checks also apply to temporary files.
+
+Creation requests mode 0700, restores owner bits through the new pathname after
+umask (under the stable-namespace contract), verifies its owner/type/mode, and
+opens the checked directory. Sync the new directory and then its parent before
+success. Return a retained Directory for subsequent checked lookups. A newly
+created checkpoint directory gains no generation-selection authority.
+
+Use the same CreateError stages as private files: Uncreated before issuing
+creation, Attempted after a failed create call, Created for a later permission,
+validation, open or sync failure. Failures can leave a directory and never
+remove it automatically. Keep the operation's logical charges until cleanup or
+recovery establishes the effect. A collision or an incomplete hierarchy is not
+permission to repair it implicitly. The caller holds LOCK, charges the work and
+authorizes the account before entering this low-level primitive.
+
 ### Private temporary output
 
 `LockedRoot::create_temporary` exclusively creates
