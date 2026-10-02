@@ -8,8 +8,9 @@
 //!
 //! `DIR` holds the pinned outline face; without it only the bitmap face is
 //! timed. Each screen is fed to a model the size of the surface's grid and
-//! drawn `FRAMES` times after one untimed frame; a time is the median and
-//! the fastest frame.
+//! drawn `FRAMES` times after one untimed frame, whole and then with one
+//! cell changed per frame over the last; a time is the median and the
+//! fastest frame.
 
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -81,6 +82,29 @@ fn main() -> Result<()> {
                 )
             })?;
             println!("  render {screen:<8} {}", summary(&times));
+            // One cell changes in the middle row each frame, drawn over the
+            // last frame as td-term draws a keystroke's echo.
+            let mut drawn = vt_render::Drawn::new();
+            let mut held = false;
+            let mut letter = 0u8;
+            let middle = rows / 2 + 1;
+            let times = timed(frames, || {
+                letter = (letter + 1) % 26;
+                terminal.feed(format!("\x1b[{middle};1H{}", char::from(b'a' + letter)).as_bytes());
+                let snapshot = Snapshot::new(&terminal, true, false);
+                vt_render::render_changed(
+                    &snapshot,
+                    &palette,
+                    &font,
+                    face.as_mut(),
+                    std::hint::black_box(&mut pixels),
+                    (width, height),
+                    std::mem::replace(&mut held, true),
+                    &mut drawn,
+                )
+                .map(|_| ())
+            })?;
+            println!("  a row  {screen:<8} {}", summary(&times));
         }
     }
     let (columns, rows) = (width / font.width(), height / font.height());
@@ -152,9 +176,10 @@ fn screens(columns: usize, rows: usize) -> Vec<(&'static str, Vec<u8>)> {
     vec![("text", text), ("color", color), ("prompt", prompt)]
 }
 
-/// The client paints into its own frame and writes the whole frame into the
-/// buffer's backing file each present; this is that write, into a file made
-/// as the client makes it, in the directory td-term gives it.
+/// The client paints into its own frame and writes it into the buffer's
+/// backing file, whole when the file holds no frame; this is that whole
+/// write, into a file made as the client makes it, in the directory td-term
+/// gives it.
 fn copy_cost(bytes: usize, frames: usize) -> Result<()> {
     let dir = std::env::temp_dir();
     let file = backing_file(&dir, bytes)?;

@@ -722,34 +722,19 @@ pub fn render_with(
         _ => fill(pixels, palette.background()),
     }
     for row in 0..rows {
-        let Some(origin_y) = row.checked_mul(cell_height) else {
+        let surface = (width, height);
+        let painted = paint_row(
+            snapshot,
+            palette,
+            font,
+            outline.as_deref_mut(),
+            pixels,
+            surface,
+            columns,
+            row,
+        );
+        if !painted {
             break;
-        };
-        for column in 0..columns {
-            let Some(origin_x) = column.checked_mul(cell_width) else {
-                break;
-            };
-            let cell = snapshot.cell(row, column);
-            paint_cell(
-                pixels,
-                width,
-                height,
-                font,
-                outline.as_deref_mut(),
-                palette,
-                &cell,
-                (origin_x, origin_y),
-            );
-            if snapshot.linked(row, column) {
-                let ground = Ink::new(&cell.attributes, palette).background;
-                paint_link_rule(
-                    pixels,
-                    (width, height),
-                    ground,
-                    (origin_x, origin_y),
-                    (cell_width, cell_height),
-                );
-            }
         }
     }
 
@@ -770,6 +755,200 @@ pub fn render_with(
         invert_ring(pixels, width, height);
     }
     Ok(())
+}
+
+/// Paints the `columns` cells of the view's `row` that reach the surface,
+/// with a hovered link's rule; false when the row's origin overflows.
+#[allow(clippy::too_many_arguments)]
+fn paint_row(
+    snapshot: &Snapshot,
+    palette: &Palette,
+    font: &Font,
+    mut outline: Option<&mut Face>,
+    pixels: &mut [u8],
+    (width, height): (usize, usize),
+    columns: usize,
+    row: usize,
+) -> bool {
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
+    let Some(origin_y) = row.checked_mul(cell_height) else {
+        return false;
+    };
+    for column in 0..columns {
+        let Some(origin_x) = column.checked_mul(cell_width) else {
+            break;
+        };
+        let cell = snapshot.cell(row, column);
+        paint_cell(
+            pixels,
+            width,
+            height,
+            font,
+            outline.as_deref_mut(),
+            palette,
+            &cell,
+            (origin_x, origin_y),
+        );
+        if snapshot.linked(row, column) {
+            let ground = Ink::new(&cell.attributes, palette).background;
+            paint_link_rule(
+                pixels,
+                (width, height),
+                ground,
+                (origin_x, origin_y),
+                (cell_width, cell_height),
+            );
+        }
+    }
+    true
+}
+
+/// What `render_changed` last drew into a surface: everything a frame's
+/// pixels follow from that is not in its cells, and each view row's
+/// cells with whether each is a hovered link's. One serves one bitmap
+/// font, which has no identity to key on; the outline face is keyed by
+/// `Face::id`.
+#[derive(Debug, Default)]
+pub struct Drawn {
+    key: Option<Key>,
+    rows: Vec<Vec<(Cell, bool)>>,
+    cursor: Option<(usize, usize, bool)>,
+    bell: bool,
+    scratch: Vec<(Cell, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Key {
+    surface: (usize, usize),
+    cell: (usize, usize),
+    /// The outline face's identity, which changes with its sources or
+    /// sizing; none for the bitmap face alone.
+    face: Option<u64>,
+    palette: Palette,
+    grid: (usize, usize),
+}
+
+impl Drawn {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// `render_with`, into a surface that holds the frame this `drawn` last
+/// recorded when `held` says so: then only the view rows whose cells,
+/// hovered links or cursor differ are painted, and their pixel rows are
+/// answered. Anything else (`held` false, another surface, cell, face,
+/// palette or grid, or the bell in this frame or the last) paints the
+/// whole frame and answers none, meaning every row.
+#[allow(clippy::too_many_arguments)]
+pub fn render_changed(
+    snapshot: &Snapshot,
+    palette: &Palette,
+    font: &Font,
+    mut outline: Option<&mut Face>,
+    pixels: &mut [u8],
+    (width, height): (usize, usize),
+    held: bool,
+    drawn: &mut Drawn,
+) -> Result<Option<Vec<std::ops::Range<usize>>>, String> {
+    let (cell_width, cell_height) = cell_size(font, outline.as_deref());
+    let rows = snapshot.rows().min(height.div_ceil(cell_height.max(1)));
+    let columns = snapshot.columns().min(width.div_ceil(cell_width.max(1)));
+    let key = Key {
+        surface: (width, height),
+        cell: (cell_width, cell_height),
+        face: outline.as_deref().map(Face::id),
+        palette: palette.clone(),
+        grid: (rows, columns),
+    };
+    let cursor = snapshot
+        .cursor()
+        .map(|(row, column)| (row, column, snapshot.focused()));
+    let whole = !held || drawn.key.as_ref() != Some(&key) || snapshot.bell() || drawn.bell;
+    // Forgotten until this frame is painted, so a failed paint is redrawn
+    // whole.
+    drawn.key = None;
+    if whole {
+        render_with(
+            snapshot,
+            palette,
+            font,
+            outline.as_deref_mut(),
+            pixels,
+            width,
+            height,
+        )?;
+        drawn.rows.resize_with(rows, Vec::new);
+        for (row, cells) in drawn.rows.iter_mut().enumerate() {
+            cells.clear();
+            cells.extend(
+                (0..columns)
+                    .map(|column| (snapshot.cell(row, column), snapshot.linked(row, column))),
+            );
+        }
+    }
+    let mut changed: Vec<std::ops::Range<usize>> = Vec::new();
+    if !whole {
+        let expected = width
+            .checked_mul(height)
+            .and_then(|count| count.checked_mul(BYTES_PER_PIXEL));
+        if expected != Some(pixels.len()) {
+            return Err(format!(
+                "surface {width}x{height} does not match its pixels"
+            ));
+        }
+        let moved = |row: usize| {
+            cursor != drawn.cursor
+                && (cursor.is_some_and(|(at, _, _)| at == row)
+                    || drawn.cursor.is_some_and(|(at, _, _)| at == row))
+        };
+        for row in 0..rows {
+            drawn.scratch.clear();
+            drawn.scratch.extend(
+                (0..columns)
+                    .map(|column| (snapshot.cell(row, column), snapshot.linked(row, column))),
+            );
+            let Some(cells) = drawn.rows.get_mut(row) else {
+                return Err("drawn rows do not match the grid".into());
+            };
+            if *cells == drawn.scratch && !moved(row) {
+                continue;
+            }
+            std::mem::swap(cells, &mut drawn.scratch);
+            paint_row(
+                snapshot,
+                palette,
+                font,
+                outline.as_deref_mut(),
+                pixels,
+                (width, height),
+                columns,
+                row,
+            );
+            if let Some((cursor_row, column, _)) = cursor.filter(|(at, _, _)| *at == row) {
+                paint_cursor(
+                    pixels,
+                    width,
+                    height,
+                    font,
+                    outline.as_deref_mut(),
+                    palette,
+                    snapshot,
+                    (cursor_row, column),
+                );
+            }
+            let top = row.saturating_mul(cell_height);
+            let bottom = top.saturating_add(cell_height).min(height);
+            match changed.last_mut() {
+                Some(last) if last.end == top => last.end = bottom,
+                _ => changed.push(top..bottom),
+            }
+        }
+    }
+    drawn.cursor = cursor;
+    drawn.bell = snapshot.bell();
+    drawn.key = Some(key);
+    Ok((!whole).then_some(changed))
 }
 
 fn fill(pixels: &mut [u8], color: [u8; 3]) {

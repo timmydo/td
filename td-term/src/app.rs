@@ -28,7 +28,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use td_ui::client::{App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag, DISPLAY};
+use td_ui::client::{App, Changed, Client, ClipboardEvent, Handled, KeyboardEvent, Tag, DISPLAY};
 use td_ui::clipboard::{Incoming, Outgoing};
 use td_ui::data;
 use td_ui::face::{Face, Sizing, MAX_PIXELS_PER_EM, MIN_PIXELS_PER_EM};
@@ -583,6 +583,8 @@ pub struct Window {
     /// cell or at a size of its own, with its zoom; `None` draws every cell
     /// from the bitmap face.
     outline: Option<render::Zoom>,
+    /// What the last frame painted, so the next paints only what changed.
+    painted: render::Drawn,
     /// The browser command a link opens with; none, as in production, is
     /// `BROWSER` then `xdg-open` (td-ui's opener).
     browser: Option<String>,
@@ -651,6 +653,7 @@ impl Window {
             board: Board::default(),
             proof: Proof::default(),
             outline: None,
+            painted: render::Drawn::new(),
             browser: None,
             exit: 0,
         })
@@ -2466,11 +2469,24 @@ impl App for Window {
                 render::Edge::Bottom => snapshot.rows().saturating_sub(1),
             });
             let (palette, font, outline) = (&self.palette, &self.font, &mut self.outline);
+            let painted = &mut self.painted;
             let (width, height) = (wanted.size.width, wanted.size.height);
-            let presented = self.client.present(width, height, &mut |pixels| {
-                let outline = outline.as_mut().map(render::Zoom::face_mut);
-                render::render_with(&snapshot, palette, font, outline, pixels, width, height)
-            })?;
+            let presented = self
+                .client
+                .present_changed(width, height, &mut |pixels, held| {
+                    let outline = outline.as_mut().map(render::Zoom::face_mut);
+                    let changed = render::render_changed(
+                        &snapshot,
+                        palette,
+                        font,
+                        outline,
+                        pixels,
+                        (width, height),
+                        held,
+                        painted,
+                    )?;
+                    Ok(changed.map_or(Changed::All, Changed::Rows))
+                })?;
             if presented {
                 if took {
                     self.flash = Some(clock.saturating_add(BELL_FLASH_MS));

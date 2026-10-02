@@ -279,9 +279,9 @@ fn private_directory(path: &Path, uid: u32, follow: bool) -> Result<(), String> 
 
 /// Where the window's frame buffers are backed: the session's runtime
 /// directory when it is absolute and private to `uid`, else `temporary`.
-/// A frame is written whole into its pool file every present, and a
-/// runtime directory is memory, where a temporary directory may be a disk
-/// that writes those pages back.
+/// Every present writes frame rows into a pool file, and a runtime
+/// directory is memory, where a temporary directory may be a disk that
+/// writes those pages back.
 pub fn pool_directory(runtime: Option<&OsStr>, uid: Option<u32>, temporary: PathBuf) -> PathBuf {
     use std::os::unix::fs::MetadataExt;
     // The owner must also be able to make files there.

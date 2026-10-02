@@ -2753,3 +2753,213 @@ fn reference_lit(
         .checked_sub(1)
         .is_some_and(|left| font.pixel(glyph, left, glyph_row))
 }
+
+/// Drawn over the frame it last drew, `render_changed` leaves exactly the
+/// frame `render_with` paints whole, and every pixel row that differs from
+/// the last frame lies in the bands it answers: across text, wide
+/// characters, OSC 8 links and either hover, a hidden or overridden
+/// cursor, status lines, the alternate screen, scrollback, selections,
+/// focus, the bell, frames the surface does not hold and resizes cut short
+/// of or past the grid.
+#[test]
+fn a_frame_drawn_over_the_last_is_the_whole_frame() {
+    let mut seed = 0x1234_5678_9abc_def1_u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let extra: [&[u8]; 16] = [
+        b"\x1b[?25l",
+        b"\x1b[?25h",
+        b"\x1b[?5h",
+        b"\x1b[?5l",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+        "\u{4e2d}".as_bytes(),
+        "\u{1f600}".as_bytes(),
+        b"\x1b]8;;http://a\x1b\\L\x1b]8;;\x1b\\",
+        b"\x1b]8;;http://b\x1b\\MM\x1b]8;;\x1b\\",
+        b"\x1b[1;1H",
+        b"\x1b[3;6H",
+        b"\x1b[5;7H",
+        b"\x1b[2J",
+        b"\x1b[L",
+        b"\x1b[M",
+    ];
+    for outline in corpus_faces() {
+        let (cell_width, cell_height) = cell_size(face(), outline.as_ref());
+        let (rows, columns) = (5, 7);
+        let mut terminal = Terminal::new(rows, columns).unwrap();
+        let mut drawn = Drawn::new();
+        let mut kept_outline = outline.clone();
+        let mut whole_outline = outline.clone();
+        let mut size = (columns * cell_width, rows * cell_height);
+        let mut kept = vec![0x5a; size.0 * size.1 * BYTES_PER_PIXEL];
+        let mut held = false;
+        for step in 0..600 {
+            for _ in 0..next() % 4 {
+                if next() % 2 == 0 {
+                    terminal.feed(PIECES[next() as usize % PIECES.len()]);
+                } else {
+                    terminal.feed(extra[next() as usize % extra.len()]);
+                }
+            }
+            if next() % 6 == 0 {
+                terminal.feed(b"\x1b[12;1H\r\n");
+            }
+            if next() % 40 == 0 {
+                size = (
+                    columns * cell_width + next() as usize % 25 - 12,
+                    rows * cell_height + next() as usize % 25 - 12,
+                );
+                kept = vec![0x5a; size.0 * size.1 * BYTES_PER_PIXEL];
+                held = false;
+            }
+            let (width, height) = size;
+            let viewport = if next() % 3 == 0 {
+                next() as usize % 4
+            } else {
+                0
+            };
+            let selection = (next() % 4 == 0).then(|| Selection {
+                anchor: (next() as usize % rows, next() as usize % columns),
+                extent: (next() as usize % rows, next() as usize % columns),
+            });
+            let ids: Vec<u32> = (0..rows)
+                .flat_map(|r| (0..columns).map(move |c| (r, c)))
+                .filter_map(|(r, c)| terminal.cell(r, c).map(|cell| cell.attributes.link))
+                .filter(|id| *id != 0)
+                .collect();
+            let link = match next() % 4 {
+                0 => Some(Hover::Span(LinkSpan {
+                    row: next() as usize % rows,
+                    start: next() as usize % columns,
+                    end: 1 + next() as usize % columns,
+                })),
+                1 if !ids.is_empty() => Some(Hover::Link(ids[next() as usize % ids.len()])),
+                _ => None,
+            };
+            let status_text = ["", "find: a", "xxxxxxxxxxxxxxxx"][next() as usize % 3];
+            let status = (next() % 4 == 0).then_some(status_text);
+            let edge = if next() % 2 == 0 {
+                Edge::Top
+            } else {
+                Edge::Bottom
+            };
+            let mut snapshot = Snapshot::new(&terminal, next() % 3 != 0, next() % 29 == 0)
+                .scrolled_back(viewport)
+                .with_selection(selection)
+                .with_link(link)
+                .with_status(status, edge);
+            if next() % 5 == 0 {
+                snapshot = snapshot.with_cursor(Cursor {
+                    row: next() as usize % (rows + 2),
+                    column: next() as usize % (columns + 2),
+                    visible: next() % 4 != 0,
+                });
+            }
+            let use_held = held && next() % 50 != 0;
+            let before = kept.clone();
+            let bands = render_changed(
+                &snapshot,
+                palette(),
+                face(),
+                kept_outline.as_mut(),
+                &mut kept,
+                (width, height),
+                use_held,
+                &mut drawn,
+            )
+            .unwrap();
+            let mut whole = vec![0xa5; width * height * BYTES_PER_PIXEL];
+            render_with(
+                &snapshot,
+                palette(),
+                face(),
+                whole_outline.as_mut(),
+                &mut whole,
+                width,
+                height,
+            )
+            .unwrap();
+            assert!(kept == whole, "step {step}: {width}x{height}");
+            if let Some(bands) = bands {
+                let stride = width * BYTES_PER_PIXEL;
+                for y in 0..height {
+                    let row = y * stride..(y + 1) * stride;
+                    if kept[row.clone()] != before[row] {
+                        assert!(bands.iter().any(|b| b.contains(&y)), "step {step}: row {y}");
+                    }
+                }
+                for b in &bands {
+                    assert!(b.start < b.end && b.end <= height, "{bands:?}");
+                }
+            }
+            held = true;
+        }
+    }
+}
+
+/// Another outline face, or the bitmap face alone, drawn over a frame with
+/// the same `Drawn` is drawn whole, even where the cell and size match.
+#[test]
+fn a_frame_in_another_face_is_drawn_whole() {
+    // A clone draws the same glyphs; new styles do not.
+    let regular = outline_face();
+    assert_eq!(regular.clone().id(), regular.id());
+    let slanted = regular.clone().with_slant(None, None).unwrap();
+    assert_ne!(slanted.id(), regular.id());
+    let terminal = terminal(4, 6, b"ab\x1b[1mcd\x1b[m\r\nef\x1b[4mgh");
+    let snapshot = Snapshot::new(&terminal, true, false);
+    let faces = corpus_faces();
+    for before in &faces {
+        for after in &faces {
+            let (cell_width, cell_height) = cell_size(face(), before.as_ref());
+            let (width, height) = (6 * cell_width, 4 * cell_height);
+            let mut drawn = Drawn::new();
+            let mut pixels = vec![0; width * height * BYTES_PER_PIXEL];
+            let mut outline = before.clone();
+            render_changed(
+                &snapshot,
+                palette(),
+                face(),
+                outline.as_mut(),
+                &mut pixels,
+                (width, height),
+                false,
+                &mut drawn,
+            )
+            .unwrap();
+            let mut outline = after.clone();
+            let bands = render_changed(
+                &snapshot,
+                palette(),
+                face(),
+                outline.as_mut(),
+                &mut pixels,
+                (width, height),
+                true,
+                &mut drawn,
+            )
+            .unwrap();
+            let mut whole = vec![0; width * height * BYTES_PER_PIXEL];
+            let mut outline = after.clone();
+            render_with(
+                &snapshot,
+                palette(),
+                face(),
+                outline.as_mut(),
+                &mut whole,
+                width,
+                height,
+            )
+            .unwrap();
+            assert!(pixels == whole);
+            // The same face, or a clone of it, keeps drawing over the last.
+            let same = before.as_ref().map(Face::id) == after.as_ref().map(Face::id);
+            assert_eq!(bands.is_some(), same);
+        }
+    }
+}

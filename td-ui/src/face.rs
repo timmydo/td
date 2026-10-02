@@ -5,6 +5,7 @@
 //! environment, a clock, a descriptor or the filesystem: the consumer
 //! hands over the bytes.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::atlas::{Atlas, Slot, Style};
@@ -40,6 +41,9 @@ pub struct Cell {
 
 #[derive(Clone, Debug)]
 pub struct Face {
+    /// Unique to each face made, and each `with_slant`, within the process;
+    /// a clone keeps it, since it draws the same glyphs.
+    id: u64,
     regular: Arc<[u8]>,
     /// The bold, italic and bold italic styles, each with its pixels per
     /// font unit, since units per em may differ between styles.
@@ -54,6 +58,13 @@ pub struct Face {
     rasterizer: Rasterizer,
     outline: Outline,
     mask: Mask,
+}
+
+/// A face identity, unique within the process: at one a nanosecond, the
+/// count would take centuries to wrap.
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Face {
@@ -178,6 +189,7 @@ impl Face {
             .map(|bold| scale_of(&bold, pixels_per_em).map(|scale| (bold, scale)))
             .transpose()?;
         Ok(Self {
+            id: next_id(),
             regular,
             styles: [bold, None, None],
             scale,
@@ -208,6 +220,7 @@ impl Face {
         let [_, italic_slot, bold_italic_slot] = &mut self.styles;
         *italic_slot = scaled(italic)?;
         *bold_italic_slot = scaled(bold_italic)?;
+        self.id = next_id();
         // A slot covered, or found missing, before the change would
         // otherwise answer for the new styles.
         self.atlas.reset();
@@ -222,6 +235,13 @@ impl Face {
     /// fractional.
     pub fn pixels_per_em(&self) -> u16 {
         self.pixels_per_em
+    }
+
+    /// An identity no other face made in this process shares, but a clone,
+    /// which draws the same glyphs: a cache keyed on it holds one face's
+    /// pixels.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The size glyphs are covered at, unrounded.

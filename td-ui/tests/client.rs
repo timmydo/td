@@ -20,9 +20,9 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 use td_ui::client::{
-    run, App, Client, ClipboardEvent, Handled, KeyboardEvent, Kind, Tag, BUFFERS, COMPOSITOR,
-    DISPLAY, GLOBALS, INITIAL_DEADLINE, MESSAGES_PER_TURN, NAME_BYTES, OBJECTS, REGISTRY, SHM,
-    SURFACE, SYNC, TOPLEVEL, WM, XDG_SURFACE,
+    run, App, Changed, Client, ClipboardEvent, Handled, KeyboardEvent, Kind, Tag, BUFFERS,
+    COMPOSITOR, DISPLAY, GLOBALS, INITIAL_DEADLINE, MESSAGES_PER_TURN, NAME_BYTES, OBJECTS,
+    REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, WM, XDG_SURFACE,
 };
 use td_ui::data::{Board, ANNOUNCEMENTS, OFFER_LIMIT, PLAIN, UTF8};
 use td_ui::keyboard::Held;
@@ -2268,4 +2268,87 @@ fn the_loop_parks_an_event_until_its_right_arrives_and_keeps_wire_order() {
         "the parked event kept its place before the ping that carried its right"
     );
     assert!(drain(&peer).0.contains(&message(WM, 3, &[987])));
+}
+
+/// Presents an 8x8 frame through `present_changed`: the whole raster
+/// filled with `byte` when it holds no frame, else only `rows`.
+fn paint_rows(
+    p: &mut Probe,
+    peer: &UnixStream,
+    rows: std::ops::Range<usize>,
+    byte: u8,
+    held_expected: bool,
+) -> (Vec<Message>, Vec<File>) {
+    let stride = 8 * 4;
+    let presented = p
+        .client
+        .present_changed(8, 8, &mut |pixels, held| {
+            assert_eq!(held, held_expected);
+            if !held {
+                pixels.fill(byte);
+                return Ok(Changed::All);
+            }
+            pixels[rows.start * stride..rows.end * stride].fill(byte);
+            Ok(Changed::Rows(vec![rows.clone()]))
+        })
+        .unwrap();
+    assert!(presented);
+    drain(peer)
+}
+
+fn file_bytes(file: &File) -> Vec<u8> {
+    let mut bytes = vec![0; 8 * 8 * 4];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    bytes
+}
+
+/// A paint that changes part of a frame damages only the rows it changed,
+/// and each buffer's file is brought up to the raster by the rows that
+/// changed since that buffer last held a frame.
+#[test]
+fn a_partial_paint_writes_and_damages_only_what_changed() {
+    let (mut p, peer) = fixture();
+    configure(&mut p, 8, 8);
+    drain(&peer);
+    // Exactly one damage request, and that one `expected`.
+    let damaged = |messages: &[Message], expected: [u32; 4]| {
+        let count = messages
+            .iter()
+            .filter(|m| m.object == SURFACE && m.opcode == 9)
+            .count();
+        count == 1 && messages.contains(&message(SURFACE, 9, &expected))
+    };
+    // The first frame holds nothing to draw over.
+    let (messages, files) = paint_rows(&mut p, &peer, 0..0, 0x11, false);
+    assert!(damaged(&messages, [0, 0, 8, 8]));
+    let first = files.into_iter().next().unwrap();
+    assert_eq!(file_bytes(&first), p.client.pixels());
+    // The first buffer is still attached: a new one gets the whole frame,
+    // and the commit damages the two rows painted.
+    done(&mut p);
+    let (messages, files) = paint_rows(&mut p, &peer, 2..4, 0x22, true);
+    assert!(damaged(&messages, [0, 2, 8, 2]));
+    let second = files.into_iter().next().unwrap();
+    assert_eq!(file_bytes(&second), p.client.pixels());
+    // Released, the first buffer is drawn into again: it is brought up to
+    // date by rows 2..4 as well as the row this frame painted.
+    let id = p.client.buffers()[0].id();
+    p.event(message(id, 0, &[])).unwrap();
+    done(&mut p);
+    let (messages, files) = paint_rows(&mut p, &peer, 5..6, 0x33, true);
+    assert!(files.is_empty(), "no new buffer");
+    assert!(damaged(&messages, [0, 5, 8, 1]));
+    assert_eq!(file_bytes(&first), p.client.pixels());
+    assert_eq!(&p.client.pixels()[2 * 32..4 * 32], &[0x22; 64]);
+    // A frame that changed nothing still damages a row.
+    done(&mut p);
+    let (messages, _) = paint_rows(&mut p, &peer, 3..3, 0x55, true);
+    assert!(damaged(&messages, [0, 0, 8, 1]));
+    let id = p.client.buffers()[1].id();
+    p.event(message(id, 0, &[])).unwrap();
+    // A scrub zeroes the raster: the next paint is told it holds nothing.
+    p.client.scrub_frames().unwrap();
+    done(&mut p);
+    let (messages, _) = paint_rows(&mut p, &peer, 0..0, 0x44, false);
+    assert!(damaged(&messages, [0, 0, 8, 8]));
 }

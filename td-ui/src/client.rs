@@ -49,6 +49,9 @@ pub const GLOBALS: usize = 128;
 pub const NAME_BYTES: usize = 256;
 /// At most this many backing files stay live; a busy one is never rewritten.
 pub const BUFFERS: usize = 3;
+/// A frame damages at most this many bands of rows; more are one band from
+/// the first changed row to the last.
+pub const DAMAGE_BANDS: usize = 32;
 /// Events processed before the turn checks redraw and close again.
 pub const MESSAGES_PER_TURN: usize = 256;
 /// The first buffer must be submitted this soon after the registry request.
@@ -100,6 +103,17 @@ pub struct Buffer {
     busy: bool,
     /// Zeroed when the compositor releases it: a scrub found it attached.
     scrub: bool,
+    /// The frame, by the client's count, whose pixels the file holds; none
+    /// for a new or zeroed file.
+    holds: Option<u64>,
+}
+
+/// The pixel rows a paint changed in a raster that held the last frame:
+/// every row, or bands of rows, each `start..end`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Changed {
+    All,
+    Rows(Vec<std::ops::Range<usize>>),
 }
 
 impl Buffer {
@@ -229,6 +243,11 @@ pub struct Client<T: Tag> {
     objects: [Kind<T>; OBJECTS],
     buffers: Vec<Buffer>,
     pixels: Vec<u8>,
+    /// The extent of the whole frame `pixels` holds, if it holds one.
+    painted: Option<(usize, usize)>,
+    /// Frames painted, and the frame each pixel row last changed in.
+    frame: u64,
+    row_frames: Vec<u64>,
     configured: bool,
     pending_size: Option<(i32, i32)>,
     pending_activated: Option<bool>,
@@ -326,6 +345,9 @@ impl<T: Tag> Client<T> {
             objects,
             buffers: Vec::with_capacity(BUFFERS),
             pixels: Vec::new(),
+            painted: None,
+            frame: 0,
+            row_frames: Vec::new(),
             configured: false,
             pending_size: None,
             pending_activated: None,
@@ -1254,6 +1276,7 @@ impl<T: Tag> Client<T> {
         for buffer in &mut self.buffers {
             if buffer.scrub && zero(&buffer.file, buffer.bytes).is_ok() {
                 buffer.scrub = false;
+                buffer.holds = None;
             }
         }
     }
@@ -1342,6 +1365,24 @@ impl<T: Tag> Client<T> {
         height: usize,
         paint: &mut dyn FnMut(&mut [u8]) -> Result<()>,
     ) -> Result<bool> {
+        self.present_changed(width, height, &mut |pixels, _| {
+            paint(pixels).map(|()| Changed::All)
+        })
+    }
+
+    /// `present`, for a paint that can change only part of a frame. It is
+    /// told whether the raster still holds the last frame it painted, at
+    /// this extent, and answers which pixel rows it changed; a paint told
+    /// it does not hold one must paint every pixel, and its answer is
+    /// taken as `Changed::All`. The buffer's file is written only where
+    /// rows changed since it last held a frame, and the commit damages only
+    /// the rows this paint changed, or one row when it changed none.
+    pub fn present_changed(
+        &mut self,
+        width: usize,
+        height: usize,
+        paint: &mut dyn FnMut(&mut [u8], bool) -> Result<Changed>,
+    ) -> Result<bool> {
         if !self.can_present() {
             return Ok(false);
         }
@@ -1374,9 +1415,60 @@ impl<T: Tag> Client<T> {
             None => self.create_buffer(width, height, size)?,
         };
         self.pixels.resize(size, 0);
-        paint(&mut self.pixels)?;
-        let buffer = self.buffers.get(index).ok_or("buffer slot")?;
-        buffer.file.write_all_at(&self.pixels, 0).map_err(error)?;
+        // A paint that fails leaves the raster holding no known frame.
+        let held = self.painted.take() == Some((width, height));
+        let changed = paint(&mut self.pixels, held)?;
+        self.painted = Some((width, height));
+        let frame = self.frame.checked_add(1).ok_or("frame count")?;
+        self.frame = frame;
+        let bands = match changed {
+            Changed::Rows(bands) if held => Some(damage_bands(bands, height)),
+            _ => None,
+        };
+        match &bands {
+            Some(bands) => {
+                for band in bands {
+                    if let Some(rows) = self.row_frames.get_mut(band.clone()) {
+                        rows.fill(frame);
+                    }
+                }
+            }
+            None => {
+                self.row_frames.clear();
+                self.row_frames.resize(height, frame);
+            }
+        }
+        let stride = width * 4;
+        let buffer = self.buffers.get_mut(index).ok_or("buffer slot")?;
+        match buffer.holds {
+            // Only the rows changed since this file last held a frame.
+            Some(held_frame) => {
+                let mut row = 0;
+                while row < height {
+                    let stale = |row: &usize| {
+                        self.row_frames
+                            .get(*row)
+                            .is_none_or(|&changed| changed > held_frame)
+                    };
+                    if !stale(&row) {
+                        row += 1;
+                        continue;
+                    }
+                    let end = (row + 1..height)
+                        .find(|later| !stale(later))
+                        .unwrap_or(height);
+                    let (start, stop) = (row * stride, end * stride);
+                    let rows = self.pixels.get(start..stop).ok_or("raster rows")?;
+                    buffer
+                        .file
+                        .write_all_at(rows, start as u64)
+                        .map_err(error)?;
+                    row = end;
+                }
+            }
+            None => buffer.file.write_all_at(&self.pixels, 0).map_err(error)?,
+        }
+        buffer.holds = Some(frame);
         let id = buffer.id;
         let (w, h) = (
             u32::try_from(width).map_err(error)?,
@@ -1385,7 +1477,25 @@ impl<T: Tag> Client<T> {
         let callback = self.allocate_kind(Kind::Frame)?;
         self.connection.words(XDG_SURFACE, 3, &[0, 0, w, h])?;
         self.connection.words(SURFACE, 1, &[id, 0, 0])?;
-        self.connection.words(SURFACE, 9, &[0, 0, w, h])?;
+        // A frame that changed nothing still damages a row, so a compositor
+        // that repaints only for damage still repaints and calls back.
+        let bands = bands.map(|bands| {
+            if bands.is_empty() {
+                std::iter::once(0..height.min(1)).collect()
+            } else {
+                bands
+            }
+        });
+        match bands {
+            Some(bands) => {
+                for band in bands {
+                    let top = u32::try_from(band.start).map_err(error)?;
+                    let rows = u32::try_from(band.len()).map_err(error)?;
+                    self.connection.words(SURFACE, 9, &[0, top, w, rows])?;
+                }
+            }
+            None => self.connection.words(SURFACE, 9, &[0, 0, w, h])?,
+        }
         self.connection.words(SURFACE, 3, &[callback])?;
         self.connection.words(SURFACE, 6, &[])?;
         self.buffers.get_mut(index).ok_or("buffer slot")?.busy = true;
@@ -1402,6 +1512,7 @@ impl<T: Tag> Client<T> {
     /// now; a buffer still attached is zeroed when it is released. Copies
     /// the compositor made of a frame are its own.
     pub fn scrub_frames(&mut self) -> Result<()> {
+        self.painted = None;
         self.pixels.fill(0);
         for byte in self.pixels.spare_capacity_mut() {
             byte.write(0);
@@ -1413,6 +1524,7 @@ impl<T: Tag> Client<T> {
                 buffer.scrub = true;
             } else {
                 zero(&buffer.file, buffer.bytes)?;
+                buffer.holds = None;
             }
         }
         Ok(())
@@ -1451,6 +1563,7 @@ impl<T: Tag> Client<T> {
             bytes: size,
             busy: false,
             scrub: false,
+            holds: None,
         });
         Ok(index)
     }
@@ -1617,6 +1730,7 @@ impl<T: Tag> Client<T> {
                 if buffer.scrub {
                     zero(&buffer.file, buffer.bytes)?;
                     buffer.scrub = false;
+                    buffer.holds = None;
                 }
                 Handled::Done
             }
@@ -1872,6 +1986,35 @@ pub fn run<A: App>(app: &mut A) -> Result<()> {
     Ok(())
 }
 
+/// `bands` clipped to `height`, sorted and merged where they touch, empty
+/// ones dropped; more than `DAMAGE_BANDS` become one band over them all.
+fn damage_bands(
+    mut bands: Vec<std::ops::Range<usize>>,
+    height: usize,
+) -> Vec<std::ops::Range<usize>> {
+    for band in &mut bands {
+        band.end = band.end.min(height);
+    }
+    bands.retain(|band| band.start < band.end);
+    bands.sort_by_key(|band| band.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(bands.len());
+    for band in bands {
+        match merged.last_mut() {
+            Some(last) if band.start <= last.end => last.end = last.end.max(band.end),
+            _ => merged.push(band),
+        }
+    }
+    if merged.len() > DAMAGE_BANDS {
+        let start = merged.first().map_or(0, |band| band.start);
+        let end = merged.last().map_or(0, |band| band.end);
+        merged.truncate(1);
+        if let Some(band) = merged.first_mut() {
+            *band = start..end;
+        }
+    }
+    merged
+}
+
 /// Writes `size` zero bytes over a buffer's backing file.
 fn zero(file: &File, size: usize) -> Result<()> {
     static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
@@ -1974,5 +2117,17 @@ mod tests {
         assert_eq!(a.read(&mut [0]).unwrap(), 0);
         file.write_all_at(b"\0", 100).unwrap();
         assert!(read_keymap(file.into(), 1, size).is_err());
+    }
+
+    #[test]
+    fn damage_bands_are_clipped_sorted_merged_and_bounded() {
+        assert_eq!(
+            damage_bands(vec![6..9, 0..2, 2..3, 4..4, 12..20], 10),
+            [0..3, 6..9]
+        );
+        assert_eq!(damage_bands(vec![1..5, 3..7], 10), vec![(1..7)]);
+        let many: Vec<_> = (0..=DAMAGE_BANDS).map(|n| 2 * n..2 * n + 1).collect();
+        assert_eq!(damage_bands(many, 1000), vec![(0..2 * DAMAGE_BANDS + 1)]);
+        assert!(damage_bands(vec![3..3, 10..12], 10).is_empty());
     }
 }

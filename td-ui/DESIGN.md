@@ -334,7 +334,8 @@ of its own files may name each module.
   or `PixelsPerEm`) asks; `resized`, the face's styles again at another
   sizing with an empty atlas; `with_slant` over an italic and a bold
   italic style's shared bytes, covered at the face's size, which empties
-  the atlas; `cell`, `size` (unrounded),
+  the atlas; `id`, unique within the process to each face made and to
+  each `with_slant`, which a clone keeps; `cell`, `size` (unrounded),
   `pixels_per_em`, `atlas`, `take_dirty`, `style` (the style bold and
   italic ask for, as the face has it: bold italic falls to italic, then
   bold, and any style to regular) and `glyph`), `Cell` (`width`, `height`,
@@ -514,7 +515,10 @@ of its own files may name each module.
   `acknowledge`, `close`), presentation (`can_present` and `present`, which
   refuses an extent the raster could not paint, then paints through the
   caller's closure into the reused raster and submits under the three-buffer
-  rule; `buffers`, `pixels`, `frame_callback`, and `scrub_frames`), the
+  rule; `present_changed`, the same for a closure told whether the raster
+  holds the last frame at this extent that answers the pixel rows it
+  changed (`Changed`), at most `DAMAGE_BANDS` bands; `buffers`, `pixels`,
+  `frame_callback`, and `scrub_frames`), the
   devices (`seat`, `keyboard`, `pointer`, `entered` for the pointer's enter
   serial, `input` for the keyboard's state, and the repeat half of that
   state a consumer drives: `cancel_repeat`, `arm`, `repeat` and
@@ -648,7 +652,13 @@ of its own files may name each module.
   `Unit` (a cell, a word or a row) with `WORD_DELIMITERS`, foot's,
   `Cursor`, `Selection`, `render` of a snapshot into a tight XRGB8888
   surface over the bitmap `font::Font`, `render_with`, the same with an
-  optional outline `Face` on that face's cell, `cell_size` (the cell a
+  optional outline `Face` on that face's cell, `render_changed` with a
+  `Drawn`, the same over the frame it last drew, painting only the view
+  rows whose cells, hovered links or cursor differ and answering their
+  pixel rows, or the whole frame when the surface held none or its
+  surface, cell, face (by `id`), palette or grid moved or the bell is
+  in this frame or the last; one `Drawn` serves one bitmap font,
+  `cell_size` (the cell a
   grid is laid on: the outline face's, else the bitmap font's), `Zoom`
   (an outline face with the sizing it started at, stepped `ZoomTo::In`,
   `Out` or back to `Start` by `ZOOM_STEP`, foot's half a point), `ppm`
@@ -1181,9 +1191,16 @@ not frames, and stays its own).
   of the frame's pixel extent is preferred (the extent alone sizes the pool,
   so a consumer's other layout changes reuse it), a free one of another
   extent is destroyed and replaced, and while all three are busy nothing is
-  painted. The pointer image is one immutable 1536-byte ARGB8888 pool built
-  on the first `show_cursor` after ARGB is advertised, its role set before
-  its first attach; later calls only re-send `set_cursor` with the new
+  painted. A frame is painted into the client's one raster and written
+  into the buffer's file: whole when the file holds no frame (new, or
+  zeroed by a scrub), otherwise only the pixel rows changed since the
+  frame it holds, by the client's count of frames and the frame each
+  row last changed in. The commit damages the rows the paint answered,
+  one row when it answered none, or the whole buffer. A paint that fails
+  leaves the raster holding no frame, as a scrub does, so the next paint
+  is told so. The pointer image is one immutable 1536-byte ARGB8888 pool
+  built on the first `show_cursor` after ARGB is advertised, its role set
+  before its first attach; later calls only re-send `set_cursor` with the new
   serial, relying on core wl_surface content staying attached across pointer
   leave and unmapping (enter makes the pointer-image association undefined,
   not the cursor surface's committed contents). `run` starts every turn from
@@ -2963,7 +2980,9 @@ Until then, the CPU path is already GPU-shaped in cost as well as form:
 
 - a glyph is rasterized once per face and size;
 - a frame's text is a bounded blend per cell;
-- damage already confines frames to what changed.
+- damage confines frames to what changed: td-term repaints, writes and
+  damages only the rows that did (`vt_render::render_changed`,
+  `Client::present_changed`).
 
 Measured on the Mono Regular face, every one of its 12608 glyphs parses
 and covers in about 30 ms at 16 pixels per em. A frame needs only the

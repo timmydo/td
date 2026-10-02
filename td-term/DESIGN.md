@@ -437,13 +437,18 @@ cursor.
 
 The renderer consumes a complete terminal snapshot, a fixed palette, focus
 state, and cursor state. It performs no allocation in the cell loop
-beyond the outline face covering a glyph into its atlas on first use. A full
-redraw is acceptable for the initial profile. td-term draws only when td-ui's
-client can present, so rendering is coalesced to the latest state behind the
-frame in flight, and the buffer rules are the client's: a submitted buffer is
-reused or mutated only after its `wl_buffer.release`, at most three stay live,
-and a resize paints into a replacement while the old buffer waits for its
-release. The client writes each frame whole into its buffer's pool file, so
+beyond the outline face covering a glyph into its atlas on first use. A
+frame is drawn over the last one: td-ui's `render_changed` repaints only
+the view rows whose cells, hovered links or cursor changed, the client
+damages only their pixel rows, and it writes into a buffer only the rows
+changed since the frame that buffer holds. A new surface, cell, face or
+palette, a scrubbed raster, and a frame that rings the bell or follows one
+are drawn whole. td-term draws only when td-ui's client can present, so
+rendering is coalesced to the latest state behind the frame in flight,
+and the buffer rules are the client's: a submitted buffer is reused or
+mutated only after its `wl_buffer.release`, at most three stay live, and a
+resize paints into a replacement while the old buffer waits for its
+release. The client writes frame rows into its buffers' pool files, so
 td-term makes those files in `XDG_RUNTIME_DIR` when it is absolute and a
 directory private to td-term's account that the account can write and
 search, which a session's runtime directory is and which is memory, and
