@@ -1209,6 +1209,15 @@ Initial independently landable increments:
   allocation counters. Unknown-label handling, prescan, encoded words, NFC and
   protocol projection remain open.
 
+- **M06e — transfer source checkpoints:** implemented eight private slots in
+  caller-owned stage backing, cleared for each exclusive reader binding.
+  Retain exact encoded/decoded cursors, decoder/pending-output state and
+  completion; restore by discarding/refilling bytes at the saved cursor.
+  Charge checkpoint records and fresh pre/post clock checks, retain live
+  deadline/work state, and prevent cross-source or failed-owner revival.
+  Cover unread input, partial decoding, completion, rebinding, bad slots,
+  clock/work failure and allocation counters. Nested chains and QP remain open.
+
 Implement bounded header unfolding, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME

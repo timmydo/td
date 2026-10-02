@@ -722,7 +722,9 @@ or protocol projection yet.
 A bounded transfer-input owner now connects identity/base64 decoding to a
 borrowed immutable body reader and a checked encoded extent. It reuses one
 source partition and brackets refill/decode turns with clock and work
-checks. It retains the source pin and refuses unsupported QP; part
+checks. It retains the source pin and refuses unsupported QP. Optional exclusive
+stage checkpoint storage supports charged save/restore of the same source,
+without copying ring bytes or resetting the clock/work state. Part
 authorization, nested source ownership and MIME structure remain separate.
 
 The raw header scanner emits bounded name/value source extents, preserves

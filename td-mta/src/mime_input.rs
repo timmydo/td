@@ -12,6 +12,7 @@ pub enum Error {
     InvalidRange,
     InvalidBacking,
     UnsupportedEncoding,
+    InvalidCheckpoint,
     Policy(PolicyError),
     Work(Stop),
 }
@@ -21,6 +22,7 @@ impl std::fmt::Display for Error {
             Self::InvalidRange => "invalid encoded body extent",
             Self::InvalidBacking => "invalid transfer input backing",
             Self::UnsupportedEncoding => "transfer decoder is not implemented",
+            Self::InvalidCheckpoint => "invalid transfer source checkpoint",
             Self::Policy(_) => "transfer input adapter failed",
             Self::Work(_) => "transfer input work budget exhausted",
         })
@@ -33,11 +35,32 @@ pub struct Progress {
     /// NeedInput is internal and is never returned by this source owner.
     pub status: Status,
 }
+pub const CHECKPOINTS: usize = 8;
+#[derive(Clone, Copy)]
+struct Saved {
+    encoded: u64,
+    decoded: u64,
+    decoder: Decoder,
+    complete: bool,
+}
+/// Caller-owned stage storage. Binding a reader invalidates every old slot.
+/// Checkpoint contents are private and cannot migrate to another source owner.
+pub struct Checkpoints {
+    slots: [Option<Saved>; CHECKPOINTS],
+}
+impl Default for Checkpoints {
+    fn default() -> Self {
+        Self {
+            slots: [None; CHECKPOINTS],
+        }
+    }
+}
 /// This borrows a live body reader; extent validation does not authorize a part.
 /// Caller backing is one source stage's input partition, never a whole-body buffer.
 pub struct Reader<'r, 'b> {
     source: &'r mut dyn BlobReader,
     buffer: &'b mut [u8],
+    checkpoints: Option<&'b mut Checkpoints>,
     end: u64,
     fetched: u64,
     decoded: u64,
@@ -70,6 +93,7 @@ impl<'r, 'b> Reader<'r, 'b> {
         Ok(Self {
             source,
             buffer,
+            checkpoints: None,
             end,
             fetched: offset,
             decoded: 0,
@@ -81,6 +105,103 @@ impl<'r, 'b> Reader<'r, 'b> {
             failure: None,
             complete: false,
         })
+    }
+    pub fn with_checkpoints(
+        source: &'r mut dyn BlobReader,
+        offset: u64,
+        length: u64,
+        encoding: TransferEncoding,
+        buffer: &'b mut [u8],
+        checkpoints: &'b mut Checkpoints,
+    ) -> Result<Self, Error> {
+        let mut reader = Self::new(source, offset, length, encoding, buffer)?;
+        checkpoints.slots.fill(None);
+        reader.checkpoints = Some(checkpoints);
+        Ok(reader)
+    }
+    pub fn save_checkpoint(
+        &mut self,
+        slot: usize,
+        clock: &dyn Clock,
+        meter: &mut Meter,
+    ) -> Result<(), Error> {
+        self.checkpoint(slot, false, clock, meter)
+    }
+    pub fn restore_checkpoint(
+        &mut self,
+        slot: usize,
+        clock: &dyn Clock,
+        meter: &mut Meter,
+    ) -> Result<(), Error> {
+        self.checkpoint(slot, true, clock, meter)
+    }
+    fn checkpoint(
+        &mut self,
+        slot: usize,
+        restore: bool,
+        clock: &dyn Clock,
+        meter: &mut Meter,
+    ) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = (|| {
+            let now = self.sample(clock, meter)?;
+            let result = (|| {
+                meter
+                    .charge(
+                        now,
+                        Charge {
+                            records: 1,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(Error::Work)?;
+                if restore {
+                    let saved = self
+                        .checkpoints
+                        .as_ref()
+                        .and_then(|backing| backing.slots.get(slot))
+                        .copied()
+                        .flatten()
+                        .ok_or(Error::InvalidCheckpoint)?;
+                    self.fetched = saved.encoded;
+                    self.decoded = saved.decoded;
+                    self.decoder = saved.decoder;
+                    self.complete = saved.complete;
+                    // Source bytes are replayed from this exact cursor, never copied.
+                    self.used = 0;
+                    self.available = 0;
+                } else {
+                    let unread = self
+                        .available
+                        .checked_sub(self.used)
+                        .ok_or(Error::InvalidBacking)?;
+                    let saved = Saved {
+                        encoded: self
+                            .fetched
+                            .checked_sub(unread as u64)
+                            .ok_or(Error::InvalidRange)?,
+                        decoded: self.decoded,
+                        decoder: self.decoder,
+                        complete: self.complete,
+                    };
+                    let target = self
+                        .checkpoints
+                        .as_mut()
+                        .and_then(|backing| backing.slots.get_mut(slot))
+                        .ok_or(Error::InvalidCheckpoint)?;
+                    *target = Some(saved);
+                }
+                Ok(())
+            })();
+            self.sample(clock, meter)?;
+            result
+        })();
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
     }
     pub const fn position(&self) -> u64 {
         self.decoded
@@ -626,6 +747,315 @@ mod tests {
                     assert_eq!(reader.poll(&good, &mut meter, &mut output), Err(expected));
                 }
             }
+        }
+    }
+    fn checkpoint_budget() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10000,
+                output_bytes: 10000,
+                records: 100,
+                ..Charge::default()
+            },
+        )
+    }
+    fn drain(reader: &mut Reader<'_, '_>, meter: &mut Meter) -> Vec<u8> {
+        let mut result = Vec::new();
+        for _ in 0..100 {
+            let mut output = [0; 1];
+            let step = reader.poll(&TestClock::good(), meter, &mut output).unwrap();
+            result.extend_from_slice(&output[..step.written]);
+            if step.status == Status::Complete {
+                return result;
+            }
+        }
+        panic!("source did not finish");
+    }
+    #[test]
+    fn checkpoints_replay_unread_input_and_pending_output_without_refunding_work() {
+        assert!(std::mem::size_of::<Checkpoints>() <= 2048);
+        assert!(std::mem::size_of::<Saved>() <= 256);
+        for (bytes, encoding, expected) in [
+            (
+                b"abcdef".as_slice(),
+                TransferEncoding::Identity,
+                b"abcdef".as_slice(),
+            ),
+            (
+                b"T!WFuIQ==".as_slice(),
+                TransferEncoding::Base64,
+                b"Man!".as_slice(),
+            ),
+        ] {
+            for capacity in [1, 2, 6, INPUT_BYTES] {
+                let mut raw = b"prefix".to_vec();
+                raw.extend_from_slice(bytes);
+                raw.extend_from_slice(b"suffix");
+                let mut source = Source {
+                    bytes: &raw,
+                    max: usize::MAX,
+                    calls: 0,
+                    mode: 0,
+                };
+                let mut backing = [0; INPUT_BYTES];
+                let mut slots = Checkpoints::default();
+                let mut reader = Reader::with_checkpoints(
+                    &mut source,
+                    6,
+                    bytes.len() as u64,
+                    encoding,
+                    &mut backing[..capacity],
+                    &mut slots,
+                )
+                .unwrap();
+                assert!(std::mem::size_of_val(&reader) <= 256);
+                let clock = TestClock::good();
+                let mut meter = checkpoint_budget();
+                reader.save_checkpoint(0, &clock, &mut meter).unwrap();
+                assert_eq!(
+                    reader.poll(&clock, &mut meter, &mut []).unwrap().status,
+                    Status::Yield
+                );
+                reader.save_checkpoint(1, &clock, &mut meter).unwrap();
+                let mut first = [0; 1];
+                for _ in 0..20 {
+                    if reader.poll(&clock, &mut meter, &mut first).unwrap().written == 1 {
+                        break;
+                    }
+                }
+                assert_eq!(first, expected[..1]);
+                assert_eq!(reader.position(), 1);
+                reader.save_checkpoint(2, &clock, &mut meter).unwrap();
+                // Restore before draining, with unread ring bytes and pending output.
+                reader.restore_checkpoint(2, &clock, &mut meter).unwrap();
+                assert_eq!(drain(&mut reader, &mut meter), expected[1..]);
+                reader.save_checkpoint(7, &clock, &mut meter).unwrap();
+                for slot in [0, 1, 2, 7] {
+                    let before = meter.remaining();
+                    reader.restore_checkpoint(slot, &clock, &mut meter).unwrap();
+                    assert_eq!(meter.remaining().io_bytes, before.io_bytes);
+                    assert_eq!(meter.remaining().records, before.records - 1);
+                    let start = match slot {
+                        2 => 1,
+                        7 => expected.len(),
+                        _ => 0,
+                    };
+                    assert_eq!(reader.position(), start as u64);
+                    assert_eq!(drain(&mut reader, &mut meter), expected[start..]);
+                    assert_eq!(reader.position(), expected.len() as u64);
+                    assert_eq!(
+                        reader.is_encoding_problem(),
+                        encoding == TransferEncoding::Base64
+                    );
+                    if slot != 7 {
+                        assert!(meter.remaining().io_bytes < before.io_bytes);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn checkpoint_backing_is_exclusive_to_each_binding_and_bad_slots_retire() {
+        let mut slots = Checkpoints::default();
+        let mut source = Source {
+            bytes: b"abc",
+            max: 3,
+            calls: 0,
+            mode: 0,
+        };
+        let mut backing = [0; 3];
+        let clock = TestClock::good();
+        {
+            let mut reader = Reader::with_checkpoints(
+                &mut source,
+                0,
+                3,
+                TransferEncoding::Identity,
+                &mut backing,
+                &mut slots,
+            )
+            .unwrap();
+            reader
+                .save_checkpoint(0, &clock, &mut checkpoint_budget())
+                .unwrap();
+        }
+        for slot in [0, CHECKPOINTS, usize::MAX] {
+            let mut reader = Reader::with_checkpoints(
+                &mut source,
+                0,
+                3,
+                TransferEncoding::Identity,
+                &mut backing,
+                &mut slots,
+            )
+            .unwrap();
+            let mut meter = checkpoint_budget();
+            assert_eq!(
+                reader.restore_checkpoint(slot, &clock, &mut meter),
+                Err(Error::InvalidCheckpoint)
+            );
+            let calls = clock.calls.load(Ordering::Relaxed);
+            let before = meter.remaining();
+            assert_eq!(
+                reader.save_checkpoint(0, &clock, &mut meter),
+                Err(Error::InvalidCheckpoint)
+            );
+            assert_eq!(
+                reader.poll(&clock, &mut meter, &mut []),
+                Err(Error::InvalidCheckpoint)
+            );
+            assert_eq!(clock.calls.load(Ordering::Relaxed), calls);
+            assert_eq!(meter.remaining(), before);
+        }
+        let mut reader =
+            Reader::new(&mut source, 0, 3, TransferEncoding::Identity, &mut backing).unwrap();
+        assert_eq!(
+            reader.save_checkpoint(0, &clock, &mut checkpoint_budget()),
+            Err(Error::InvalidCheckpoint)
+        );
+        assert_eq!(source.calls, 0);
+    }
+    #[test]
+    fn checkpoints_keep_clock_watermark_and_refuse_after_retirement() {
+        for restore in [false, true] {
+            for mode in 0..3 {
+                for fault in 0..2 {
+                    let mut source = Source {
+                        bytes: b"abc",
+                        max: 3,
+                        calls: 0,
+                        mode: 0,
+                    };
+                    let mut backing = [0; 3];
+                    let mut slots = Checkpoints::default();
+                    let mut reader = Reader::with_checkpoints(
+                        &mut source,
+                        0,
+                        3,
+                        TransferEncoding::Identity,
+                        &mut backing,
+                        &mut slots,
+                    )
+                    .unwrap();
+                    let mut meter = checkpoint_budget();
+                    let good = TestClock::good();
+                    reader.save_checkpoint(0, &good, &mut meter).unwrap();
+                    let clock = TestClock {
+                        calls: AtomicU64::new(0),
+                        fault,
+                        mode,
+                    };
+                    let expected = match mode {
+                        0 => Error::Work(Stop::Deadline),
+                        1 => Error::Policy(PolicyError::Invalid),
+                        _ => Error::Policy(PolicyError::Busy),
+                    };
+                    let result = if restore {
+                        reader.restore_checkpoint(0, &clock, &mut meter)
+                    } else {
+                        reader.save_checkpoint(0, &clock, &mut meter)
+                    };
+                    assert_eq!(result, Err(expected));
+                    let before = meter.remaining();
+                    assert_eq!(
+                        reader.restore_checkpoint(0, &good, &mut meter),
+                        Err(expected)
+                    );
+                    assert_eq!(reader.poll(&good, &mut meter, &mut []), Err(expected));
+                    assert_eq!(meter.remaining(), before);
+                }
+            }
+        }
+        for fail_read in [false, true] {
+            let mut source = Source {
+                bytes: b"abc",
+                max: 3,
+                calls: 0,
+                mode: u8::from(fail_read),
+            };
+            let mut backing = [0; 3];
+            let mut slots = Checkpoints::default();
+            let mut reader = Reader::with_checkpoints(
+                &mut source,
+                0,
+                3,
+                TransferEncoding::Identity,
+                &mut backing,
+                &mut slots,
+            )
+            .unwrap();
+            let mut meter = checkpoint_budget();
+            let good = TestClock::good();
+            reader.save_checkpoint(0, &good, &mut meter).unwrap();
+            let expected = if fail_read {
+                let error = Error::Policy(PolicyError::Corrupt);
+                assert_eq!(reader.poll(&good, &mut meter, &mut []), Err(error));
+                error
+            } else {
+                assert_eq!(drain(&mut reader, &mut meter), b"abc");
+                let bad = TestClock {
+                    calls: AtomicU64::new(0),
+                    fault: 0,
+                    mode: 0,
+                };
+                assert_eq!(
+                    reader.restore_checkpoint(0, &bad, &mut meter),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                Error::Work(Stop::Deadline)
+            };
+            assert_eq!(
+                reader.restore_checkpoint(0, &good, &mut meter),
+                Err(expected)
+            );
+        }
+    }
+    #[test]
+    fn checkpoint_record_refusal_is_sticky_and_post_clock_error_wins() {
+        for late in [false, true] {
+            let mut source = Source {
+                bytes: b"",
+                max: 1,
+                calls: 0,
+                mode: 0,
+            };
+            let mut backing = [0; 1];
+            let mut slots = Checkpoints::default();
+            let mut reader = Reader::with_checkpoints(
+                &mut source,
+                0,
+                0,
+                TransferEncoding::Identity,
+                &mut backing,
+                &mut slots,
+            )
+            .unwrap();
+            let clock = TestClock {
+                calls: AtomicU64::new(0),
+                fault: if late { 1 } else { u64::MAX },
+                mode: 0,
+            };
+            let mut meter = if late {
+                checkpoint_budget()
+            } else {
+                budget(10, 10)
+            };
+            let expected = Error::Work(if late { Stop::Deadline } else { Stop::Records });
+            assert_eq!(
+                reader.save_checkpoint(CHECKPOINTS, &clock, &mut meter),
+                Err(expected)
+            );
+            let mut fresh = checkpoint_budget();
+            let before = fresh.remaining();
+            let calls = clock.calls.load(Ordering::Relaxed);
+            assert_eq!(
+                reader.restore_checkpoint(0, &clock, &mut fresh),
+                Err(expected)
+            );
+            assert_eq!(fresh.remaining(), before);
+            assert_eq!(clock.calls.load(Ordering::Relaxed), calls);
+            assert_eq!(source.calls, 0);
         }
     }
 }

@@ -867,6 +867,124 @@ fn store_read_pool() {
     }
 }
 
+fn mime_checkpoints() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        mime_base64::Status,
+        mime_input::{Checkpoints, Error, Reader, CHECKPOINTS},
+        ports::{BlobReader, Clock, Deadline, Error as PolicyError, Tick, Time},
+        wire::TransferEncoding,
+    };
+    struct Source;
+    impl BlobReader for Source {
+        fn len(&self) -> u64 {
+            12
+        }
+        fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, PolicyError> {
+            let input = b"xxTWFuTWFuyy"
+                .get(offset as usize..)
+                .ok_or(PolicyError::Invalid)?;
+            let count = input.len().min(output.len());
+            output
+                .get_mut(..count)
+                .unwrap()
+                .copy_from_slice(input.get(..count).unwrap());
+            Ok(count)
+        }
+    }
+    struct GoodClock;
+    impl Clock for GoodClock {
+        fn sample(&self) -> Result<Time, PolicyError> {
+            Ok(Time {
+                utc_ms: 0,
+                monotonic: Tick(1),
+            })
+        }
+    }
+    fn budget() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 1000,
+                output_bytes: 1000,
+                records: 100,
+                ..Charge::default()
+            },
+        )
+    }
+    fn drain(reader: &mut Reader<'_, '_>, meter: &mut Meter, expected: &[u8]) {
+        let mut position = 0;
+        for _ in 0..20 {
+            let mut output = [0; 1];
+            let step = reader.poll(&GoodClock, meter, &mut output).unwrap();
+            if step.written == 1 {
+                assert_eq!(output.first(), expected.get(position));
+            }
+            position += step.written;
+            if step.status == Status::Complete {
+                assert_eq!(position, expected.len());
+                return;
+            }
+        }
+        panic!("checkpoint replay did not complete");
+    }
+    let before = COUNTERS.snapshot();
+    let mut source = Source;
+    let mut backing = [0; 8];
+    let mut slots = Checkpoints::default();
+    let mut reader = Reader::with_checkpoints(
+        &mut source,
+        2,
+        8,
+        TransferEncoding::Base64,
+        &mut backing,
+        &mut slots,
+    )
+    .unwrap();
+    let mut meter = budget();
+    reader.save_checkpoint(0, &GoodClock, &mut meter).unwrap();
+    reader.poll(&GoodClock, &mut meter, &mut []).unwrap();
+    let mut first = [0; 1];
+    assert_eq!(
+        reader
+            .poll(&GoodClock, &mut meter, &mut first)
+            .unwrap()
+            .written,
+        1
+    );
+    assert_eq!(first, *b"M");
+    reader.save_checkpoint(1, &GoodClock, &mut meter).unwrap();
+    reader
+        .restore_checkpoint(1, &GoodClock, &mut meter)
+        .unwrap();
+    drain(&mut reader, &mut meter, b"anMan");
+    reader.save_checkpoint(2, &GoodClock, &mut meter).unwrap();
+    reader
+        .restore_checkpoint(1, &GoodClock, &mut meter)
+        .unwrap();
+    drain(&mut reader, &mut meter, b"anMan");
+    reader
+        .restore_checkpoint(0, &GoodClock, &mut meter)
+        .unwrap();
+    drain(&mut reader, &mut meter, b"ManMan");
+    reader
+        .restore_checkpoint(2, &GoodClock, &mut meter)
+        .unwrap();
+    drain(&mut reader, &mut meter, b"");
+    assert_eq!(
+        reader.restore_checkpoint(CHECKPOINTS, &GoodClock, &mut meter),
+        Err(Error::InvalidCheckpoint)
+    );
+    let mut fresh = budget();
+    let remaining = fresh.remaining();
+    assert_eq!(
+        reader.restore_checkpoint(0, &GoodClock, &mut fresh),
+        Err(Error::InvalidCheckpoint)
+    );
+    assert_eq!(fresh.remaining(), remaining);
+    assert_eq!(COUNTERS.snapshot(), before, "transfer checkpoint allocated");
+}
+
 fn mime_charset() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -1421,6 +1539,7 @@ fn main() {
         mime_input();
         mime_headers();
         mime_charset();
+        mime_checkpoints();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1506,6 +1625,7 @@ fn main() {
     mime_input();
     mime_headers();
     mime_charset();
+    mime_checkpoints();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

@@ -736,8 +736,14 @@ charged requested I/O plus resident byte visits/output. A synthetic-source
 allocation interval covers identity/base64 construction, short output,
 completion and sticky work refusal with every Rust counter unchanged. A
 separate functional test uses the real verified pinned body reader. These
-checks do not qualify combined filesystem allocation, nested-source
-checkpoint memory, full worker stacks or service RSS.
+checks do not qualify combined filesystem allocation, full worker stacks or
+service RSS. Optional Checkpoints backing holds eight private saved positions
+and decoder states fitting the existing 2 KiB stage checkpoint partition;
+each saved state is at most 256 bytes and the complete backing at most 2 KiB.
+The live Reader still fits 256 bytes. Binding clears old slots; save/restore
+copy no ring and allocate nothing. A synthetic-source allocation interval
+covers binding, save, replay, completion and sticky refusal. Nested source
+chains and their simultaneous checkpoint use remain unqualified.
 
 The raw header scanner uses at most 128 bytes of inline state within parser
 state and returns one 32-byte field descriptor at a time. It holds no source

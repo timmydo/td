@@ -737,11 +737,32 @@ post-work clock/budget refusal overrides its earlier result; any failure is
 sticky without later I/O or clock calls. Output and position may already
 reflect work and remain provisional on error. Complete is retained only
 after the final bracket succeeds and later polls return zero-progress
-Complete without work. position counts emitted decoded octets; encoding
-diagnostics become final at completion. Invalid extents/backing, unavailable
-decoder, adapter errors and work refusal remain distinct fixed errors.
-Reader checkpoint restoration, nested source chains, QP and protocol output
-remain separate.
+Complete without work until an earlier checkpoint is restored. position is
+the current decoded cursor and rewinds on restore; replayed output still
+consumes work. Encoding diagnostics describe that cursor's decoding history
+and become final at completion. Invalid extents/backing/checkpoints,
+unavailable decoder, adapter errors and work refusal remain distinct fixed
+errors.
+with_checkpoints exclusively borrows the stage's caller-owned Checkpoints
+storage and clears its eight private slots on every new binding. Save/restore
+use slot numbers; save replaces that slot's earlier point. The caller owns
+slot assignment across outstanding lookahead operations; nested slot scheduling
+is separate. No saved state can be supplied from another source.
+Each slot retains the exact consumed encoded cursor, decoded position, small
+base64 state (including pending output/diagnostic) and completion flag. Save
+subtracts unread buffered bytes from the fetched cursor. Restore discards the
+ring contents and refills from that cursor, never from the body origin.
+
+Checkpoint operations charge one record and bracket the bounded copy with
+the same fresh monotonic/deadline checks. A post-copy clock failure overrides
+an earlier slot error and retires the reader. Missing backing, unset/outside
+slots and all work/clock errors retire it too. Restore retains the current
+clock watermark, live job meter and every charge; it cannot revive a failed
+reader or extend its lifetime. Even a completed checkpoint requires a live
+restore operation before cached Complete can be polled. Source positions and
+slots remain private to the borrowed reader; drop/rebind cannot carry a saved
+point to a different body. Nested source chains, QP and protocol output remain
+separate.
 
 ### 1.14 Raw header scanner
 
