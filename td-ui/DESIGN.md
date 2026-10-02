@@ -198,6 +198,11 @@ pane (increment 31), so a diff is selected and copied as an article is
 in td-news; the pane's inks keep its colours, and the reading keys,
 selection and copy stay on the window thread, outside the stamps.
 
+Newly built (increment 32): the message list `messages`, a chat
+transcript with selectable text and whole-message copy, under "Shared
+message list" below. td-agent (`td-agent/DESIGN.md` §4) is its planned
+first consumer; nothing draws it yet.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -467,6 +472,11 @@ of its own files may name each module.
   range a consumer hands `emit`, which paints through `List::emit` with
   no row highlighted when nothing is selected. Activation, a double
   press and filtering stay with the consumer.
+- `messages`: `Message` (built from `new` with `text`, `section`,
+  `excerpt`, `status`, `verdict`, `source` and `collapsed`), `Tone`,
+  `Point`, `Shown`, `Key` with `from_chord`, `Event`, `Outcome`, `Error`,
+  the budgets and `COPY_LABEL` and `MORE`, and `Controller`, the message
+  list under "Shared message list" below.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output, and `OUTLINE_FACE`, one
@@ -1499,6 +1509,68 @@ caret column, the mask glyph rasterized to exactly the bullet, and the
 pixels around the field left untouched. td-editor keeps its scene-level
 render, ui and menu oracles.
 
+`tests/messages.rs` holds the message list through a clipboard that
+records each copy or refuses as told: bodies wrapped at a word, or
+within one too long for a row, across a newline, the row heights stacked
+at scales one through four; rows tiling the text, a space past the last
+column kept unshown with no empty row after it at the text's end or
+before a newline, and empty text and a trailing newline each an empty
+row; a tab drawn as a space and an escape as the replacement character;
+a reply, an excerpt and the first of two sections streamed in
+three-scalar pieces laid out, at every step and at both ends of the
+view, as the whole text is; a titled section and a message collapsed
+and opened by
+the title row, the header's mark and `Toggle`, hidden text left out of a
+select-all, an untitled section refused; scrolling by row, page, wheel,
+`Home` and `End` at every scale, a message arriving while scrolled back
+leaving the view and one arriving, or text streaming in, at the end
+followed; a resize at another scale and width, a rectangle too small
+for any row and back, and a trim of older messages keeping the first
+shown row; a view one header tall showing the header and not its gap; a
+fold pressed at the end keeping its title where it was; the scrollbar's
+thumb at the foot at the end, at the top at the start and the whole
+track disabled when everything fits; `NextMessage` and
+`PreviousMessage` focusing and revealing a header, and `Toggle` folding
+the focused message and revealing its header; a drag past the view
+scrolling a row a motion and asking a repaint when only the view moved;
+a drag across a header into the next message copying its text with a
+blank line between and no chrome, and past the view's foot running to
+the end; every press and drag between two places of a section with
+empty, leading and trailing lines and a wrapped row copying exactly the
+source between them, a select-all the whole text, and across messages a
+blank line between and nothing of a section only touched at its end; an
+empty section held whole keeping its place, as the whole-message copy
+does; Shift moving the head from the kept anchor; a double click
+selecting a word, its drag keeping it, the third press a first, a slow
+or distant second press a single click, a word wrapped across rows
+selected whole, one past a row's text nothing, and one running into an
+excerpt's hidden rows ending at its shown text's end; an excerpt cut at
+`EXCERPT_ROWS` with its more row, a
+select-all copy holding exactly the shown text and none of the labels,
+titles, status, verdict, button caption or more row, a press on a
+header starting no drag, and a drag over the more row ending at the
+excerpt's shown text; the header's button copying a message's sections
+whole at the press, its release nothing, `CopyMessage` copying a tool
+block's whole source rather than its excerpt, and a collapsed message
+copying whole; nothing to copy, a clipboard refusal handed back, a
+selection and a message past the clipboard's ceiling refused as too
+long, and a repeat never copying; an append keeping the selection and a
+replace clearing it, and a trim moving the selection and focus with
+their messages or dropping them with theirs; the label, text, section,
+source and whole-list bounds and their release on a trim; the row
+budget refusing a push and an append with the list left as it was; a
+trim never refused, laying out what fits of a list too long for its
+width; a rectangle too small laying nothing out until
+a resize gives it room and one outside the surface refused; a draw
+stream inside the rectangle naming the label, status, verdict mark, body
+and button caption with a body glyph at its cell, damage off the list
+drawing nothing; and pixel oracles at scales one through four for the
+header rule and ground, the focused message's highlight, the button's
+bezel, the selection's ground focused and unfocused, everything outside
+the list untouched, and a partial repaint equal to the whole inside its
+damage and untouched outside it. `tests/confinement.rs` holds the module
+among the pure set.
+
 `src/sys.rs` and `src/wayland.rs` carry the kernel tests moved from
 td-editor's adapter: close-on-exec duplication of an inherited stream,
 owned and closed received rights, the ancillary walk past unknown records
@@ -2477,6 +2549,132 @@ pixel oracles, and the disclosure box's exact plus and minus, its colour
 on a focused selection, its clipping to partial damage and its absence
 on a leaf, at scales 1-4.
 
+## Shared message list
+
+`messages::Controller` is a chat transcript over one rectangle, built
+for td-agent's conversations (`td-agent/DESIGN.md` §4) and general to
+any program that shows one. It owns its messages and their layout. A
+`Message` is a header label (its role or source: user, orchestrator,
+assistant, a tool's name), an optional status shown after the label and
+an optional verdict shown before the copy button, each in a `Tone`'s ink
+(a verdict with its mark, a tick, a cross or a dot), and up to
+`MAX_SECTIONS` sections of caller-supplied text in order. A section is
+untitled body text, or titled (reasoning, a tool's arguments), which
+collapses to its title row; an excerpt section shows at most
+`EXCERPT_ROWS` rows and `MORE` below them when it has more. A message
+may carry a `source`, the text its copy action copies in place of its
+sections: a tool block is a message whose sections are its arguments
+and the excerpt of its result, and whose source is the whole result the
+caller retains. Labels, statuses, verdicts and titles are nonempty,
+control-free and at most `MAX_LABEL_BYTES`; a section's text and a
+source are at most `MAX_TEXT_BYTES` (the clipboard's ceiling) of any
+text, a tab drawn as a space and another control scalar as the
+replacement character; at most `MAX_MESSAGES` messages and
+`MAX_TOTAL_BYTES` of text between them, and at most `MAX_LINES` laid-out
+rows. `push` appends, `append` adds text to a section as a reply streams
+in, `replace`, `set_status`, `set_verdict` and `set_source` change one,
+`set_collapsed` and `set_section_collapsed` fold one; each allocates
+fallibly and leaves the list as it was when refused. `remove_first`
+trims the oldest and is never refused: a trim cannot grow a layout, and
+a list left without one lays out again if what remains fits. A list
+given messages or text, or unfolded, while it had no layout (below),
+since nothing counts rows then, may lay out past
+`MAX_LINES` at its next width, which `resize` refuses with `Limit`
+until a trim makes room.
+
+The layout is rows in the cell model: a `ROW`-tall header, title, text
+and more rows a cell high, and a `GAP` below each message, all scaled.
+The rectangle less a `chrome::List`-sized scrollbar gutter holds the
+rows, text a cell in from each side. Text wraps at the columns that
+leave: a newline ends a row, a row breaks after the last space or tab
+that keeps its word whole, else within the word, and a space or tab
+reaching past the last column stays on its row unshown, so the rows tile
+the text between newlines; a newline right after it, or the text's end,
+adds no empty row. Appended text is wrapped from its section's last
+shown row on, since a row starts with nothing carried from the one
+before, so a reply streamed in small pieces is laid out as it arrives
+rather than rewrapped whole, and lays out as the whole text would. A
+header shows its open or shut mark, the
+label, the status two cells after it, the verdict a cell before a
+`chrome::Button` reading `COPY_LABEL` at the right, inset by
+`BUTTON_MARGIN`; the label and status stop a cell short of the verdict.
+Headers are `CHROME` under a `BORDER` rule, the focused message's
+`SELECTED_ROW`; text is `INK` on `PAPER`, selected text the text entry's
+`SELECTED` with paper ink while the list has focus and
+`INACTIVE_SELECTION` without; titles and the more row are
+`LINE_NUMBER`. A rectangle narrower than `MIN_COLUMNS` and the gutter,
+or shorter than a `ROW`, lays nothing out: `has_layout` is false, the
+list draws nothing and ignores input, the consumer shows its fallback,
+and a resize that gives it room lays it out again at the place it
+showed; one outside the surface is refused.
+
+The view scrolls by row: `Up` and `Down` a row, `PageUp` and `PageDown`
+to the first row the view did not hold whole and back, `Home` and `End`
+the ends, the wheel a row per row of travel, and a drag past the view's
+top or foot a row per motion. The last page is the earliest row from
+which the rest fit, but never past the last message's last header,
+title, text or more row, so a view too short for a header and its gap
+shows the header. At the end the list follows: a message arriving or text
+streaming in keeps the end shown; scrolled back, the first shown row
+keeps its place in the text through every change, resize and period
+without a layout (the row holding its start, or the title of a section
+folded over it). A fold the user asks for (a press or `Toggle`) keeps
+the first shown row rather than the end, so the row pressed stays where
+it was; the list follows again only if that leaves the view at the end.
+`PreviousMessage` and `NextMessage` focus a message, the first shown
+when none is, and scroll its header into view, as `Toggle` does.
+
+A selection is two `Point`s, a byte of a section of a message, so it
+spans messages in reading order. A press on text starts it, Shift
+extending the selection's head from its kept anchor, and the drag moves
+the head; a second press within `MULTI_CLICK_MS` of a click's release
+and four scaled pixels of it selects the word of letters and digits
+under it, across rows it wrapped over but not into text the section
+hides, and nothing past a row's text; its drag does not extend it.
+The pointer over chrome is the nearest point: a header its message's
+start, a title its section's, the more row its excerpt's shown end, the
+gap past the message's sections, above the view the first shown row's
+start and below the rows the last's end. Copying visits shown text
+only. A section's shown text is the source from its first shown row's
+start to its last's end, newlines and empty rows included; the
+selection's part of it is one piece, a section the selection only
+touches at an end gives none, an empty section strictly inside it an
+empty piece, and a blank line goes between two pieces. So a selection
+within a section copies exactly the source between its ends, newlines
+at either end included, a select-all copies what the whole-message copy
+would of a message with no `source`, nothing hidden and neither its
+first nor its last section empty, and no header, title, status,
+verdict, button or more row is ever copied; a collapsed section's and
+an excerpt's hidden text are not selected. A press on a header focuses its
+message and starts no selection; on its first three cells it folds the
+message, and on the copy button it copies the message whole. A press on
+a title row folds the section.
+
+Copies go through the window's `Clipboard` (see "Widget window") while
+the event is delivered, the button's at its press and the keys' at
+theirs, since a release, a repeat or a poll has no serial: `Copy`
+(`C-c`) copies the selection, `CopyMessage` (`C-S-c`) the focused
+message, and the button its own. A message's copy is its `source` when
+it has one, else every section's text whole, collapsed and excerpted
+ones included, a blank line between two. `Outcome` says `Copied`, the
+clipboard's `Refused`, or `NothingToCopy`; a copy past the clipboard's
+ceiling is refused as `TooLong` before the text is gathered. A repeat
+never copies or folds; navigation honours repeats. `select_all`,
+`clear_selection`, `selected_text` and `message_text` give a consumer
+the same without a key.
+
+The caller owns the clock, passed with each press and release in
+milliseconds, the key bindings (`Key::from_chord` is the default set:
+`Up`, `Down`, `PageUp` and `PageDown`; `Home` and `End`, and `C-Home`
+and `C-End`; `M-Up` and `M-Down`; `Return` to fold; `C-c`, `C-S-c` and
+`C-a`), routing the wheel and keys to the list when it has focus, focus
+itself (`Event::Focus`), and what a message means. Painting and input
+allocate nothing, but for the text a copy hands the clipboard and the
+rows a fold lays out, which it reserves fallibly as its setter does;
+nothing reads a clock, a file or the environment. `shown` and
+`copy_button` give a consumer the shown rows and a header's button for
+its driven read-back and its tests.
+
 ## Task-manager widgets
 
 [td-taskmgr](../td-taskmgr/DESIGN.md) is a planned consumer. Menus and
@@ -3207,3 +3405,8 @@ regressions. Those increments extend the original sequence below.
     with `Scene::inks` colouring its diff lines, scrolled by the reading
     keys and the wheel, selected by drag, word and line, and copied on
     `C-c` through the window's clipboard. Landed.
+32. The message list: `messages` under "Shared message list", a chat
+    transcript with collapsing, scrolling, selection across messages
+    and whole-message and tool-result copy through the window's
+    clipboard, with its oracles; td-agent's transcript is its first
+    consumer, in that program's own increment.

@@ -13,7 +13,8 @@
 //! wrapped text block, the tab strip, the button strip, the slider, the
 //! status row, the paged list and the single-line text entry) with the
 //! editing and selection state over the last two (`entry_model`,
-//! `list_model`), and the
+//! `list_model`), the chat transcript with its selectable, copyable text
+//! (`messages`), and the
 //! driving layer an agent or a test operates a consumer through (`control`:
 //! the frame, envelope, codecs and response lines; `control_socket`:
 //! private listener publication; `control_worker`: the bounded transport
@@ -85,6 +86,7 @@ pub mod keyboard;
 pub mod links;
 pub mod list_model;
 pub mod menus;
+pub mod messages;
 pub mod notices;
 pub mod open;
 pub mod pinned_face;
