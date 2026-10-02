@@ -374,7 +374,10 @@ invoking the selected-file checks, incomplete physical-tail recovery and
 selected graph publication; the byte codecs do not truncate, scan ahead or
 perform I/O.
 Retained-history I/O completion is implemented by the private adapter in
-[STORAGE.md](STORAGE.md#streaming-retained-history).
+[STORAGE.md](STORAGE.md#streaming-retained-history). Captured active-frame
+validation uses the same frame decoder with separate prefix completion and
+selected sequence/offset binding, specified in
+[STORAGE.md](STORAGE.md#validating-captured-active-frames).
 
 The complete-header/short-body distinction and every sync boundary are owned
 by STORAGE sections 5-6. A checksum-invalid complete final frame is corruption,

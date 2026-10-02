@@ -745,10 +745,19 @@ service activation. Each part lands independently:
     errors; the existing allocation interval covers both root bounds. Real
     pin ownership, active header/frame/selection validation and repair remain
     separate. Whole-file readers retain their exact extent/EOF contract.
-  - **M05d4b — active-prefix validation:** bind captured sequence/offset and
-    selected active identity, stream checked frames through an admitted arena,
-    then check the complete active summary. Share framing with retained history
-    while preserving distinct whole-file and prefix completion evidence.
+  - **M05d4b — active-prefix validation:** implemented supplied active identity
+    and captured sequence/offset checks before I/O, checked frame streaming
+    through caller scratch, and completion against the selected active summary.
+    Shared framing preserves retained history's physical EOF and active input's
+    distinct prefix evidence. Tests cover empty/populated prefixes with later
+    appends, invalid views/headers, cut frames, corrupt footers, physical
+    truncation and final sequence mismatch. Both adapters reuse one admitted
+    frame arena in the allocation fixture. Real pins/history retention,
+    ReadView's separate change cursor, tail repair and final-view checks remain.
+  - **M05d5 — stopped active-tail recovery:** classify actual incomplete EOF
+    separately from complete corrupt frames, retain the last valid boundary,
+    and truncate/sync only during exclusive recovery. Finish graph/replay and
+    reference validation before opening pins or mutation admission.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

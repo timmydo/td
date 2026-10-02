@@ -39,8 +39,10 @@ Retained-history input likewise yields one checked, provisional frame at a time
 and finishes only against the selected segment's extent, sequence and digest.
 Captured-prefix I/O now opens private journal files, allows append growth and
 returns distinct prefix completion without claiming physical EOF. Active
-prefix frame/selection validation, tail repair, complete selected-graph and
-final-view validation, and committed mail publication remain unimplemented.
+input validates supplied view identity/ranges, streams checked frames and binds
+completion to the captured sequence/offset. It still requires actual caller
+pin ownership. Tail repair, complete selected-graph/final-view validation and
+committed mail publication remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can

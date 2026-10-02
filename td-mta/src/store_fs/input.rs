@@ -233,11 +233,11 @@ pub(super) fn fill_exact(
 ) -> io::Result<()> {
     fill_exact_using(file, output, attempts, StoreReader::read)
 }
-pub(super) fn fill_exact_using<'r>(
-    file: &mut StoreReader<'r>,
+pub(super) fn fill_exact_using<R>(
+    file: &mut R,
     mut output: &mut [u8],
     attempts: &mut usize,
-    mut read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
+    mut read: impl FnMut(&mut R, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<()> {
     while !output.is_empty() {
         *attempts = attempts.checked_sub(1).ok_or(io::ErrorKind::WouldBlock)?;

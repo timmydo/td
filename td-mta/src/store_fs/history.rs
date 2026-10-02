@@ -1,73 +1,28 @@
 //! Retained-history streams; active prefix reads and incomplete-tail repair are separate.
-use super::{
-    input::{fill_exact, fill_exact_using},
-    CompleteFile, LockedRoot, StoreReader,
+pub use super::journal_input::Error as HistoryInputError;
+#[cfg(test)]
+use super::journal_input::MAX_READ_CALLS as MAX_HISTORY_READ_CALLS;
+use super::{journal_input::FrameInput, CompleteFile, LockedRoot, StoreReader};
+#[cfg(test)]
+use crate::format::{
+    container::Error as ContainerError, frame_header::Header as FrameHeader,
+    journal_stream::Error as StreamError, Sequence, FRAME_HEADER_BYTES,
 };
 use crate::{
     format::{
-        bindings::Selection,
-        container::Error as ContainerError,
-        frame::Frame,
-        frame_header::Header as FrameHeader,
-        journal_stream::{Error as StreamError, Summary, Verifier},
-        Error as FormatError, Sequence, FRAME_HEADER_BYTES, JOURNAL_HEADER_BYTES, MAX_FRAME_BYTES,
-        MAX_JOURNAL_FRAME_BYTES,
+        bindings::Selection, container::JournalHeader, frame::Frame, journal_stream::Summary,
+        Error as FormatError, JOURNAL_HEADER_BYTES, MAX_FRAME_BYTES, MAX_JOURNAL_FRAME_BYTES,
     },
     ports::Crypto,
     store_paths::{AccountEntry, Number},
 };
 use std::io;
-const MAX_HISTORY_READ_CALLS: usize = 64;
-#[derive(Debug)]
-pub enum HistoryInputError {
-    Io(io::Error),
-    Stream(StreamError),
-}
-impl From<io::Error> for HistoryInputError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-impl From<StreamError> for HistoryInputError {
-    fn from(e: StreamError) -> Self {
-        Self::Stream(e)
-    }
-}
-impl From<ContainerError> for HistoryInputError {
-    fn from(e: ContainerError) -> Self {
-        Self::Stream(e.into())
-    }
-}
-impl From<FormatError> for HistoryInputError {
-    fn from(e: FormatError) -> Self {
-        Self::Stream(e.into())
-    }
-}
-impl std::fmt::Display for HistoryInputError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "history input I/O: {e}"),
-            Self::Stream(e) => write!(f, "history input validation: {e}"),
-        }
-    }
-}
-impl std::error::Error for HistoryInputError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Stream(e) => Some(e),
-        }
-    }
-}
+
 pub struct HistoryInput<'r, 'c, 'm, 'b, C: Crypto> {
-    file: StoreReader<'r>,
-    verifier: Verifier<'c, C>,
+    stream: FrameInput<'c, 'b, C, StoreReader<'r>>,
     crypto: &'c C,
     selection: Selection<'m>,
     index: usize,
-    through: Sequence,
-    scratch: &'b mut [u8; MAX_FRAME_BYTES],
-    failed: bool,
 }
 impl LockedRoot {
     /// Caller holds a real recovery/view barrier and admits the read's bytes/work.
@@ -87,7 +42,7 @@ impl LockedRoot {
             return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
         }
         let segment = Number::new(descriptor.segment).map_err(|_| FormatError::InvalidValue)?;
-        let mut file = self.open_account_file(
+        let file = self.open_account_file(
             selection.current().account,
             AccountEntry::Journal(segment),
             descriptor.file_bytes,
@@ -95,96 +50,38 @@ impl LockedRoot {
         if file.len() != descriptor.file_bytes {
             return Err(io::Error::from(io::ErrorKind::InvalidData).into());
         }
-        let mut bytes = [0; JOURNAL_HEADER_BYTES];
-        let mut attempts = MAX_HISTORY_READ_CALLS;
-        fill_exact(&mut file, &mut bytes, &mut attempts)?;
-        let verifier = Verifier::new(crypto, &bytes)?;
-        let header = verifier.header();
-        if header.account != selection.current().account
-            || header.epoch != selection.store().epoch
-            || header.segment != descriptor.segment
-            || header.base != descriptor.base
-        {
-            return Err(FormatError::InvalidValue.into());
-        }
+        let expected = JournalHeader {
+            account: selection.current().account,
+            epoch: selection.store().epoch,
+            segment: descriptor.segment,
+            base: descriptor.base,
+        };
+        let stream = FrameInput::new(crypto, file, expected, scratch)?;
         Ok(HistoryInput {
-            file,
-            verifier,
+            stream,
             crypto,
             selection,
             index,
-            through: header.base,
-            scratch,
-            failed: false,
         })
     }
 }
 impl<'r, C: Crypto> HistoryInput<'r, '_, '_, '_, C> {
     pub fn is_failed(&self) -> bool {
-        self.failed
+        self.stream.is_failed()
     }
     /// One provisional frame; None is not physical EOF or selected completion.
     pub fn next_frame(&mut self) -> Result<Option<Frame<'_>>, HistoryInputError> {
-        self.next_frame_using(StoreReader::read)
+        self.stream.next_frame()
     }
+    #[cfg(test)]
     fn next_frame_using(
         &mut self,
-        mut read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
+        read: impl FnMut(&mut StoreReader<'r>, &mut [u8]) -> io::Result<usize>,
     ) -> Result<Option<Frame<'_>>, HistoryInputError> {
-        if self.failed {
-            return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
-        }
-        if self.file.position() == self.file.len() {
-            return Ok(None);
-        }
-        self.failed = true;
-        let remaining = self
-            .file
-            .len()
-            .checked_sub(self.file.position())
-            .ok_or(FormatError::InvalidValue)?;
-        if remaining < FRAME_HEADER_BYTES as u64 {
-            return Err(StreamError::Frame(FormatError::InvalidValue.into()).into());
-        }
-        let prefix = self
-            .scratch
-            .get_mut(..FRAME_HEADER_BYTES)
-            .ok_or(FormatError::Limit)?;
-        let mut attempts = MAX_HISTORY_READ_CALLS;
-        fill_exact_using(&mut self.file, prefix, &mut attempts, &mut read)?;
-        let header =
-            FrameHeader::decode(self.crypto, prefix).map_err(|e| StreamError::Frame(e.into()))?;
-        if header.sequence != self.through.successor()? {
-            return Err(StreamError::Frame(FormatError::InvalidValue.into()).into());
-        }
-        if header.frame_bytes as u64 > remaining {
-            return Err(StreamError::Frame(FormatError::InvalidValue.into()).into());
-        }
-        let bytes = self
-            .scratch
-            .get_mut(..header.frame_bytes)
-            .ok_or(FormatError::Limit)?;
-        fill_exact_using(
-            &mut self.file,
-            bytes
-                .get_mut(FRAME_HEADER_BYTES..)
-                .ok_or(FormatError::Limit)?,
-            &mut attempts,
-            &mut read,
-        )?;
-        let frame = self.verifier.push(bytes)?;
-        self.through = frame.header().sequence;
-        self.failed = false;
-        Ok(Some(frame))
+        self.stream.next_frame_using(read)
     }
-}
-impl<'r, C: Crypto> HistoryInput<'r, '_, '_, '_, C> {
     pub fn finish(self) -> Result<CompleteHistory<'r>, HistoryInputError> {
-        if self.failed {
-            return Err(io::Error::from(io::ErrorKind::BrokenPipe).into());
-        }
-        let summary = self.verifier.finish()?;
-        let file = self.file.finish()?;
+        let (file, summary) = self.stream.finish()?;
         self.selection
             .check_history_journal(self.crypto, self.index, summary)?;
         Ok(CompleteHistory { file, summary })
@@ -508,7 +405,7 @@ mod tests {
                 )))
             ));
             assert_eq!(calls, 0);
-            assert_eq!(input.file.position(), frame_end);
+            assert_eq!(input.stream.position(), frame_end);
             assert!(input.is_failed());
             assert!(
                 matches!(input.finish(), Err(HistoryInputError::Io(e)) if e.kind() == io::ErrorKind::BrokenPipe)
@@ -565,7 +462,7 @@ mod tests {
                     DecodeError::Invalid(_)
                 )))
             ));
-            assert_eq!(input.file.position(), end as u64);
+            assert_eq!(input.stream.position(), end as u64);
             assert!(input.is_failed());
             assert!(
                 matches!(input.next_frame(),Err(HistoryInputError::Io(e)) if e.kind()==io::ErrorKind::BrokenPipe)
@@ -622,7 +519,7 @@ mod tests {
         );
         assert_eq!(calls, MAX_HISTORY_READ_CALLS);
         assert_eq!(
-            input.file.position(),
+            input.stream.position(),
             (JOURNAL_HEADER_BYTES + FRAME_HEADER_BYTES) as u64
         );
         assert!(input.is_failed());

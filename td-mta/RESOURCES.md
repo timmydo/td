@@ -662,6 +662,16 @@ Fixture files precede measurement; output uses a fixed stack array. This
 qualifies primitive Rust allocations, not live read-view pinning or complete
 service memory.
 
+ActiveInput uses the same fixed journal frame reader as HistoryInput, with a
+PrefixReader in place of StoreReader and captured sequence/offset counters.
+It borrows an existing 1 MiB frame arena and Selection; complete active input
+retains one CompletePrefix and Summary. Shared framing preserves the existing
+64-call per-frame allowance and adds no dynamic dispatch or collection.
+The measured interval reuses the history frame arena sequentially for empty
+and populated active prefixes with an incomplete suffix, final binding and
+invalid-view/admission refusal. Literal active files and metadata are prepared
+before the snapshots. No extra per-view buffer or runtime pin pool is added.
+
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 

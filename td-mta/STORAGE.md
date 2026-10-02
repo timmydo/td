@@ -448,7 +448,7 @@ This is full-segment recovery/verification input. ReadView::next_change still
 needs its own streaming cursor that skips PUT bodies with bounded I/O; this
 frame-buffer adapter does not implement that API.
 
-Metadata, table and history readers share a private exact-read helper. It
+Metadata, table and both journal readers share a private exact-read helper. It
 consumes the caller's existing attempt counter across framing phases, advances
 only by confirmed returned bytes, and never retries errors. Empty destinations
 consume no attempt. Existing metadata/table completion rules remain unchanged.
@@ -479,9 +479,54 @@ Success returns CompletePrefix, a distinct read-only handle with random reads
 bounded to the captured extent. It cannot be converted into CompleteFile or
 its physical EOF evidence. Neither type alone establishes journal grammar,
 selection/sequence binding, a runtime pin, recovery validity or serving
-permission. Active-prefix frame validation and active-tail repair remain
-separate steps. Empty byte prefixes are expressible at this raw I/O layer;
-valid journal prefixes must contain the format header.
+permission. [Active-prefix frame validation](#validating-captured-active-frames)
+uses this completion; active-tail repair remains a separate step. Empty byte
+prefixes are expressible at this raw I/O layer; valid journal prefixes must
+contain the format header.
+
+### Validating captured active frames
+
+`LockedRoot::open_active_prefix` takes a supplied Selection and ViewIdentity,
+an admitted prefix-byte ceiling and caller-owned 1 MiB frame scratch. Before
+I/O, require the view's account, epoch, generation, checkpoint sequence and
+active segment to match that selection. Check the captured offset includes the
+96-byte header and no more than 4 MiB of frame bytes. Its sequence must not
+precede the checkpoint; the frame count cannot exceed 8192, and the byte range
+must fit the count times the minimum/maximum frame size. An empty prefix has
+exactly the checkpoint sequence and header bytes. Insufficient caller byte
+admission is InvalidInput; invalid identity/range retains a format error.
+
+Only those active identity fields are validated. ViewIdentity is caller data,
+not proof of pin ownership or committed bytes. Its history_floor is outside
+this adapter's meaning: complete ReadView acquisition must validate history
+retention and own the pins. The caller holds actual prefix ownership or a
+quiescent recovery barrier that keeps captured bytes immutable.
+
+Open the selected segment through PrefixReader, with the journal format cap
+as its opening physical ceiling. Caller admission covers only the captured
+prefix; ordinary suffix growth does not exhaust it. A physical file exceeding
+the format cap refuses as I/O InvalidData. Require the checksummed journal
+header to match the selected account, epoch, segment and base before returning
+ActiveInput. Existing or newly appended suffix bytes
+are outside the captured prefix, including an incomplete append.
+
+ActiveInput and HistoryInput share one private frame reader and error type.
+The common reader retains header-checksum-before-length, contiguous sequences,
+short-recorded-suffix rejection, one borrowed provisional frame per call, and
+one shared 64-read allowance for each frame header/remainder. The underlying
+input type fixes completion: history still requires physical EOF; active input
+requires only the captured prefix present and consumed. Any frame/read error
+retires the stream. None marks only the captured end.
+
+Consuming active `finish` checks the completed stream against the supplied
+captured sequence and offset through Selection::check_active_prefix. Success
+returns CompleteActive retaining CompletePrefix and the journal Summary. No
+active-prefix digest is stored in the manifest; per-frame integrity and actual
+writer/pin ownership establish the captured byte boundary. This operation
+neither validates live row references nor replays transactions, repairs tails,
+acquires runtime pins, implements ReadView::next_change or activates service.
+Full-prefix recovery/verification reuses an already admitted frame arena; it
+adds no per-view MiB reservation.
 
 ### Expected CURRENT replacement
 
