@@ -258,6 +258,57 @@ fn glyphs_are_covered_once_and_misses_are_remembered() {
     assert_eq!(face.style(true, false), Style::Bold);
 }
 
+/// '0' a 500-unit square, then each of `glyphs` a rectangle of that many
+/// units wide on the baseline.
+fn face_mapping(glyphs: &[(char, i32)]) -> Vec<u8> {
+    let mut outlines = vec![Glyph::Empty, Glyph::Simple(vec![rectangle(0, 0, 500, 500)])];
+    let map = |scalar: char, glyph: u16| {
+        let code = u32::from(scalar) as u16;
+        Segment::Delta(code, code, glyph.wrapping_sub(code))
+    };
+    let mut segments = vec![(0x30, map('0', 1))];
+    for &(scalar, width) in glyphs {
+        segments.push((u32::from(scalar), map(scalar, outlines.len() as u16)));
+        outlines.push(Glyph::Simple(vec![rectangle(0, 0, width, 500)]));
+    }
+    // Format 4 segments run in increasing code order.
+    segments.sort_by_key(|&(code, _)| code);
+    let segments = segments.into_iter().map(|(_, segment)| segment).collect();
+    let mut builder = Builder::new(outlines);
+    builder.format4 = segments;
+    builder.font()
+}
+
+#[test]
+fn a_scalar_the_face_lacks_is_covered_from_its_stand_in_after_every_style() {
+    let width = |slot: Slot| match slot {
+        Slot::Placed(entry) => entry.width,
+        other => panic!("{other:?}"),
+    };
+    // '▸' (U+25B8) is the stand-in for '⏵' (U+23F5).
+    let mut face = Face::new(face_mapping(&[('\u{25b8}', 250)]), None, 20).unwrap();
+    let slot = face.glyph(Style::Regular, '\u{23f5}');
+    assert_eq!(width(slot), 5);
+    assert!(face.take_dirty().is_some());
+    assert_eq!(face.atlas().get(Style::Regular, '\u{23f5}'), Some(slot));
+    assert_eq!(face.glyph(Style::Regular, '\u{23f5}'), slot);
+    assert_eq!(face.take_dirty(), None, "a hit writes nothing");
+    assert_eq!(face.glyph(Style::Regular, '\u{23f3}'), Slot::Missing);
+    // A face with the scalar draws its own.
+    let both = face_mapping(&[('\u{23f5}', 400), ('\u{25b8}', 250)]);
+    let mut face = Face::new(both.clone(), None, 20).unwrap();
+    assert_eq!(width(face.glyph(Style::Regular, '\u{23f5}')), 8);
+    // A bold style with only the stand-in takes the regular style's own
+    // glyph first.
+    let bold = face_mapping(&[('\u{25b8}', 250)]);
+    let mut face = Face::new(both, Some(bold.clone()), 20).unwrap();
+    assert_eq!(width(face.glyph(Style::Bold, '\u{23f5}')), 8);
+    // With neither in regular, the bold style's stand-in draws.
+    let mut face = Face::new(face_mapping(&[]), Some(bold), 20).unwrap();
+    assert_eq!(width(face.glyph(Style::Bold, '\u{23f5}')), 5);
+    assert_eq!(face.glyph(Style::Regular, '\u{23f5}'), Slot::Missing);
+}
+
 #[test]
 fn slanted_styles_resolve_to_what_the_face_has_and_have_their_own_scale() {
     let size = |slot: Slot| match slot {

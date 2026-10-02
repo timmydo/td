@@ -761,6 +761,23 @@ fn a_glyph_the_face_lacks_renders_a_visible_replacement() {
     assert_ne!(cell, cell_of(b"", ' '), "a missing glyph rendered as blank");
 }
 
+#[test]
+fn a_glyph_neither_face_has_renders_its_stand_in() {
+    // td-ui/DESIGN.md, "Stand-in glyphs": '⏵' draws as '▸', through the
+    // bitmap face alone and through an outline face that lacks both.
+    let (missing, drawn) = ('\u{23f5}', '\u{25b8}');
+    assert!(!face().covers(missing));
+    assert_eq!(cell_of(b"", missing), cell_of(b"", drawn));
+    assert_ne!(cell_of(b"", missing), cell_of(b"", '\u{fffd}'));
+    let mut outline = outline_face();
+    let mut draw_one = |scalar: char| {
+        let terminal = terminal(1, 1, scalar.to_string().as_bytes());
+        draw_outline(&Snapshot::new(&terminal, false, false), &mut outline).0
+    };
+    assert_eq!(draw_one(missing), draw_one(drawn));
+    assert_ne!(draw_one(missing), draw_one('\u{fffd}'));
+}
+
 // ---------------------------------------------------------------- cursor
 
 fn cursor_grid(focused: bool, visible: bool) -> Vec<u8> {

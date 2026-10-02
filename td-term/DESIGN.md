@@ -100,7 +100,8 @@ for td's shell and userland. It implements:
 
 UTF-8 scalars are initially single-cell glyphs. Wide cells, combining
 sequences, grapheme clustering, bidi, shaping, and emoji presentation require
-a separately pinned Unicode-data design. A missing glyph renders a visible
+a separately pinned Unicode-data design. A scalar neither face draws renders
+its stand-in (td-ui/DESIGN.md, "Stand-in glyphs") or, with none, a visible
 replacement cell. This limitation is part of the claimed profile rather than
 an accidental difference hidden by the test overlay.
 

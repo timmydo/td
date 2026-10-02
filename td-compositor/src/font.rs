@@ -36,11 +36,42 @@ const SEQUENCE_START: u8 = 0xfe;
 const MAX_DIMENSION: usize = 64;
 const MAX_GLYPHS: usize = 1 << 20;
 
-/// Drawn when the model holds a scalar the face has no glyph for. U+FFFD if
-/// the face carries it, else space: a terminal that silently drew nothing
-/// would misreport its own contents.
+/// Drawn when the model holds a scalar the face has no glyph or stand-in
+/// for. U+FFFD if the face carries it, else space: a terminal that
+/// silently drew nothing would misreport its own contents.
 const REPLACEMENT: char = '\u{fffd}';
 const BLANK: char = ' ';
+
+/// Single-cell status marks and spinner frames TUIs print that the pinned
+/// Unifont lacks -- it draws them 16 pixels wide, which the single-width
+/// import drops -- each with a glyph of like shape drawn in place of the
+/// replacement box. JetBrains Mono Nerd Font was probed to lack the keys
+/// too and to carry every value.
+const STAND_INS: [(char, char); 14] = [
+    ('\u{23f4}', '\u{25c2}'), // ⏴ ◂
+    ('\u{23f5}', '\u{25b8}'), // ⏵ ▸
+    ('\u{23f6}', '\u{25b4}'), // ⏶ ▴
+    ('\u{23f7}', '\u{25be}'), // ⏷ ▾
+    ('\u{23f8}', '\u{2016}'), // ⏸ ‖
+    ('\u{23f9}', '\u{25a0}'), // ⏹ ■
+    ('\u{23fa}', '\u{25cf}'), // ⏺ ●
+    ('\u{2714}', '\u{2713}'), // ✔ ✓
+    ('\u{2718}', '\u{2717}'), // ✘ ✗
+    // Spinner frames: neighbours in the cycle stay distinct.
+    ('\u{2722}', '+'),        // ✢
+    ('\u{2733}', '*'),        // ✳
+    ('\u{2736}', '\u{22c6}'), // ✶ ⋆
+    ('\u{273b}', '*'),        // ✻
+    ('\u{273d}', '\u{229b}'), // ✽ ⊛
+];
+
+/// The scalar drawn in place of one a face lacks, if it has a stand-in.
+pub fn stand_in(scalar: char) -> Option<char> {
+    STAND_INS
+        .iter()
+        .find(|&&(missing, _)| missing == scalar)
+        .map(|&(_, drawn)| drawn)
+}
 
 #[derive(Debug)]
 pub struct Font {
@@ -168,10 +199,14 @@ impl Font {
         self.map.contains_key(&scalar)
     }
 
-    /// Glyph index for a scalar, falling back rather than failing so the
-    /// renderer has no error path in its cell loop.
+    /// Glyph index for a scalar, else its stand-in's, falling back rather
+    /// than failing so the renderer has no error path in its cell loop.
     pub fn index(&self, scalar: char) -> usize {
-        self.map.get(&scalar).copied().unwrap_or(self.fallback)
+        self.map
+            .get(&scalar)
+            .or_else(|| stand_in(scalar).and_then(|drawn| self.map.get(&drawn)))
+            .copied()
+            .unwrap_or(self.fallback)
     }
 
     /// One row of a glyph's bitmap, already bounded. `row` beyond the cell
@@ -298,6 +333,29 @@ mod tests {
         // the fallback is what a model holding one would draw.
         assert!(!font.covers('漢'));
         assert_eq!(font.index('漢'), font.index('\u{fffd}'));
+    }
+
+    #[test]
+    fn a_scalar_with_a_stand_in_draws_it_and_others_draw_the_replacement() {
+        let font = unifont();
+        let replacement = font.index('\u{fffd}');
+        let mut keys: Vec<char> = STAND_INS.iter().map(|&(missing, _)| missing).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), STAND_INS.len(), "a duplicate key is dead");
+        for &(missing, drawn) in &STAND_INS {
+            // A key the face covered would never reach its stand-in, and a
+            // stand-in it lacked, or one that is itself a key, would draw the
+            // replacement box anyway.
+            assert!(!font.covers(missing), "U+{:04X} is covered", missing as u32);
+            assert!(font.covers(drawn), "U+{:04X} is missing", drawn as u32);
+            assert_eq!(stand_in(drawn), None);
+            assert_eq!(font.index(missing), font.index(drawn));
+            assert_ne!(font.index(missing), replacement);
+        }
+        assert_eq!(stand_in('\u{23f5}'), Some('\u{25b8}'));
+        assert_eq!(stand_in('A'), None);
+        assert_eq!(font.index('\u{23f3}'), replacement, "no stand-in");
     }
 
     #[test]

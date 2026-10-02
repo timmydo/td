@@ -2720,11 +2720,12 @@ rectangle and bearing.
 The executor looks each scalar up in the face's character map. It covers
 the glyph into the page on first use and blends it from the page after
 that. A scalar the bold style lacks is covered from the regular one, and
-one the face lacks draws from the Unifont face, as it does today. When the
-page is full it resets whole under a new epoch and fills again from the
-draws that follow, so its memory is bounded by its extent. The page
-reports the band of rows written since it was last taken, which is exactly
-the sub-image a GPU backend uploads.
+one the face lacks draws from its stand-in (see "Stand-in glyphs") or
+the Unifont face, as it does today. When the page is full it resets
+whole under a new epoch and fills again from the draws that follow, so
+its memory is bounded by its extent. The page reports the band of rows
+written since it was last taken, which is exactly the sub-image a GPU
+backend uploads.
 
 The blend is `background + (ink - background) * alpha / 255` per channel,
 using the `GlyphStyle`'s explicit background. The executor never reads the
@@ -2806,9 +2807,38 @@ Consumers thread that value through layout, hit testing and painting in
 place of the constants. The glyph is rasterized at the device pixel size
 (the base size times the integer scale), not drawn at 1x and doubled.
 
-A scalar the face lacks falls back to the Unifont glyph, centred in the
-cell. Wide cells (CJK) remain a separate decision; td-term/DESIGN.md §2
-already excludes them from the terminal profile.
+A scalar the face lacks falls back to its stand-in or the Unifont glyph,
+centred in the cell. Wide cells (CJK) remain a separate decision;
+td-term/DESIGN.md §2 already excludes them from the terminal profile.
+
+### Stand-in glyphs
+
+Some single-cell scalars that TUIs print as status marks and spinner
+frames are missing from the pinned Unifont. Unifont draws them 16 pixels
+wide, and the single-width import drops those glyphs. JetBrains Mono
+Nerd Font lacks them too. Claude Code's `⏵⏵` mode line, its `⏺` and
+`⏸`, and its `✢ ✳ ✶ ✻ ✽` spinner are examples.
+
+`font::stand_in` maps each such scalar to a glyph of like shape, for
+example `⏵` to `▸`, `⏺` to `●`, `⏸` to `‖` and `✔` to `✓`. The spinner
+frames map to `+ * ⋆ * ⊛`, so neighbouring frames stay distinct.
+
+`Face::glyph` tries the scalar in its style and then in regular before
+it tries the stand-in, and caches the result under the scalar.
+`Font::index` tries the stand-in before U+FFFD. So every td-ui draw
+through either face takes the stand-in, not only td-term's. The
+compositor's attention prompt draws only what `Font::covers` reports,
+and that is unchanged, so no stand-in reaches it. A scalar with no
+stand-in draws the replacement box as before.
+
+The table holds only scalars Unifont lacks, so a stand-in never
+replaces a real Unifont glyph. Every stand-in is a glyph Unifont
+carries and has no stand-in of its own. Tests pin both properties
+against the committed face. The pinned JetBrains Mono styles were
+probed to carry every stand-in. No test pins that, since no test reads
+that face, but an outline face lacking a stand-in still draws Unifont's.
+The table reads no other face and is not a fallback chain. Adding an
+entry is a reviewed change to that table.
 
 ### td-term
 

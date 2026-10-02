@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::atlas::{Atlas, Slot, Style};
 use crate::coverage::{Mask, Rasterizer};
+use crate::font::stand_in;
 use crate::sfnt::{Error, Font, Outline};
 
 pub const MIN_PIXELS_PER_EM: u16 = 6;
@@ -265,7 +266,8 @@ impl Face {
 
     /// The scalar's slot in `style`, as `style` resolves it from what the
     /// face has, covering it on a miss. A scalar a style lacks is covered
-    /// from the regular one; one the face lacks, or whose glyph it refuses,
+    /// from the regular one, and one the face lacks from its
+    /// `font::stand_in`; one neither covers, or whose glyph it refuses,
     /// is recorded missing so the caller's fallback answers without another
     /// parse. A placed entry is valid until the atlas's next reset, which
     /// any later miss may cause: a caller holding entries across lookups
@@ -280,20 +282,25 @@ impl Face {
         let styled = self
             .source(style)
             .map(|(bytes, scale)| (bytes.clone(), *scale));
-        let sources = styled
-            .into_iter()
-            .chain([(self.regular.clone(), self.scale)]);
-        let (outline, rasterizer, mask) = (&mut self.outline, &mut self.rasterizer, &mut self.mask);
-        let covered = sources.into_iter().any(|(bytes, scale)| {
-            Font::parse(&bytes)
-                .ok()
-                .and_then(|font| {
-                    let glyph = font.glyph(scalar)?;
-                    font.outline(glyph, outline).ok()?;
-                    rasterizer.rasterize(outline, scale, mask).ok()
-                })
-                .is_some()
+        let regular = (self.regular.clone(), self.scale);
+        let fonts = [styled.as_ref(), Some(&regular)].map(|source| {
+            source.and_then(|(bytes, scale)| Font::parse(bytes).ok().map(|font| (font, *scale)))
         });
+        let (outline, rasterizer, mask) = (&mut self.outline, &mut self.rasterizer, &mut self.mask);
+        // The scalar from its style or regular before its stand-in.
+        let covered = [Some(scalar), stand_in(scalar)]
+            .into_iter()
+            .flatten()
+            .any(|wanted| {
+                fonts.iter().flatten().any(|(font, scale)| {
+                    font.glyph(wanted)
+                        .and_then(|glyph| {
+                            font.outline(glyph, outline).ok()?;
+                            rasterizer.rasterize(outline, *scale, mask).ok()
+                        })
+                        .is_some()
+                })
+            });
         let covered = covered.then_some(());
         match covered {
             Some(()) => self.atlas.place(style, scalar, &self.mask),
