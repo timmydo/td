@@ -1201,6 +1201,14 @@ Initial independently landable increments:
   fragmented fixtures, bounds, failures and an isolated allocation interval.
   Collection, aggregate MIME admission and normalized header forms remain open.
 
+- **M06d — bounded charset decoding:** implemented exact label aliases and
+  fixed-state scalar decoding for UTF-8/ASCII/Latin-1/Windows-1252. Preserve
+  maximal invalid subparts across fragments, charge lookahead/replay/scalars,
+  retain EOF, and retire work failures. Cover all byte values, exhaustive
+  two-byte UTF-8 inputs, boundary/malformed fixtures, checkpoint work and
+  allocation counters. Unknown-label handling, prescan, encoded words, NFC and
+  protocol projection remain open.
+
 Implement bounded header unfolding, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME

@@ -731,6 +731,11 @@ It enforces the supplied header allowance and charges bounded work without
 allocating per-field strings. Source retention, aggregate MIME admission and
 header normalization remain with later integration.
 
+The bounded charset decoder covers the policy's four charset families with
+fixed state across source fragments. It preserves valid scalars and reports
+replacement diagnostics; unknown-label heuristics, header filtering, NFC and
+JSON projection remain separate.
+
 ## 10. HTTP and JMAP
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,

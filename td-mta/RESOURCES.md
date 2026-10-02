@@ -747,6 +747,16 @@ A dedicated allocation interval covers single-byte fragmentation, folded
 field emission, body detection and sticky limit refusal with unchanged Rust
 counters. This does not qualify a full parser stack or source collection.
 
+The charset decoder uses at most 32 bytes of copied state, fitting the 32
+KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
+fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No
+partition or process allowance grows. One turn inspects at most four source
+bytes and returns at most one scalar, with no owned string or arena. An
+isolated Rust allocation interval covers all four charsets, single-byte
+fragments, malformed UTF-8, replacement diagnostics, completion and sticky
+work refusal. No complete header normalization pipeline or worker-stack
+bound is claimed.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

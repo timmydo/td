@@ -867,6 +867,106 @@ fn store_read_pool() {
     }
 }
 
+fn mime_charset() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        mime_charset::{Charset, Decoder, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    let before = COUNTERS.snapshot();
+    for (charset, bytes, expected) in [
+        (
+            Charset::Utf8,
+            b"\xf0\x90\x80a".as_slice(),
+            ['�', 'a'].as_slice(),
+        ),
+        (Charset::Ascii, b"\xffa".as_slice(), ['�', 'a'].as_slice()),
+        (
+            Charset::Latin1,
+            b"\x80\xff".as_slice(),
+            ['\u{80}', 'ÿ'].as_slice(),
+        ),
+        (
+            Charset::Windows1252,
+            b"\x80\x81".as_slice(),
+            ['€', '�'].as_slice(),
+        ),
+    ] {
+        let mut decoder = Decoder::new(charset);
+        let mut meter = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100,
+                records: 100,
+                ..Charge::default()
+            },
+        );
+        let mut source = 0;
+        let mut output = ['\0'; 2];
+        let mut used = 0;
+        let mut done = false;
+        for _ in 0..20 {
+            let end = (source + 1).min(bytes.len());
+            let step = decoder
+                .poll(
+                    bytes.get(source..end).unwrap(),
+                    end == bytes.len(),
+                    Tick(1),
+                    &mut meter,
+                )
+                .unwrap();
+            source += step.consumed;
+            match step.status {
+                Status::Scalar(value) => {
+                    *output.get_mut(used).unwrap() = value;
+                    used += 1;
+                }
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+                Status::NeedInput => {}
+            }
+        }
+        assert!(done);
+        assert_eq!(output, expected);
+        assert_eq!(used, 2);
+        assert_eq!(decoder.is_encoding_problem(), charset != Charset::Latin1);
+        assert_eq!(
+            decoder
+                .poll(b"ignored", true, Tick(100), &mut meter)
+                .unwrap()
+                .status,
+            Status::Complete
+        );
+        let mut refused = Decoder::new(charset);
+        let mut meter = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+        assert!(matches!(
+            refused.poll(b"a", true, Tick(1), &mut meter),
+            Err(Error::Work(_))
+        ));
+        assert!(matches!(
+            refused.poll(b"", true, Tick(100), &mut meter),
+            Err(Error::Work(_))
+        ));
+        let mut fresh = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10,
+                records: 10,
+                ..Charge::default()
+            },
+        );
+        let remaining = fresh.remaining();
+        assert!(matches!(
+            refused.poll(b"a", true, Tick(1), &mut fresh),
+            Err(Error::Work(_))
+        ));
+        assert_eq!(fresh.remaining(), remaining);
+    }
+    assert_eq!(COUNTERS.snapshot(), before, "charset decoder allocated");
+}
+
 fn mime_headers() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -1320,6 +1420,7 @@ fn main() {
         mime_base64();
         mime_input();
         mime_headers();
+        mime_charset();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1404,6 +1505,7 @@ fn main() {
     mime_base64();
     mime_input();
     mime_headers();
+    mime_charset();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

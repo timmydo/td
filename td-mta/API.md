@@ -776,6 +776,31 @@ distinct and sticky; terminal completion is stable without later work. No
 partial field list is a successful result after refusal. Header collection,
 unfolding, Unicode and MIME tree integration remain separate.
 
+### 1.15 Bounded charset decoding
+
+mime_charset::Charset parses exactly POLICY.md's ten case-insensitive labels
+for UTF-8, ASCII, Latin-1 and Windows-1252. The caller has already unquoted
+the label; no whitespace trim or implicit unknown-label fallback occurs.
+Decoder returns one Scalar, NeedInput or Complete with consumed source bytes.
+Resume at the unconsumed suffix, including after zero-consumption replacement
+of a prefix retained from an earlier chunk. UTF-8 replaces one maximal invalid
+subpart at a time; incomplete valid prefixes become one replacement at EOF.
+ASCII high bytes and undefined Windows-1252 bytes each become U+FFFD and set
+the diagnostic. Latin-1 preserves C1 controls. Valid NUL and noncharacter
+scalars remain intact here; form-specific filtering and I-JSON replacement
+belong to projection.
+
+A turn visits at most four source bytes and emits at most one scalar. Every
+lookahead, including an invalid continuation revisited on the following turn,
+charges source work; each scalar charges one record. Output serialization
+charges its own bytes. The caller brackets deterministic turns with fresh
+clock/cancellation checks. Work refusal is sticky. An observed EOF is retained
+across its pending replacement; later input cannot extend that source.
+Complete remains stable without later work. Copy state fits 32 bytes and may
+join an owner-bound source checkpoint; restoring it never refunds the shared
+work meter. Unknown-label policy, absent-charset UTF-8 prescan, encoded words,
+NFC, source ownership and protocol projection remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
