@@ -1046,6 +1046,7 @@ fn main() {
     store_temporary_files();
     journal_overlay();
     journal_merge();
+    mailbox_parent_walks();
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }
@@ -1238,4 +1239,111 @@ fn store_complete_frames() {
     assert!(stream.push(bytes.get(..131).unwrap()).is_err());
     assert!(stream.push(&bytes).is_err());
     assert!(stream.finish().is_err());
+}
+
+fn mailbox_parent_walks() {
+    use td_mta::{
+        format::{
+            key::Key,
+            row::{MailboxRow, Row},
+            ObjectType, Sequence, Table,
+        },
+        ids::{AccountId, MailboxId, StoreEpoch},
+        mailbox_parents::{Error, ParentWalk},
+        ports::{self, ChangeCursor, ChangeStep, ReadView, Record, ViewIdentity},
+    };
+    struct View {
+        identity: ViewIdentity,
+        cycle: bool,
+    }
+    impl ReadView for View {
+        fn identity(&self) -> ViewIdentity {
+            self.identity
+        }
+        fn next_change(
+            &mut self,
+            _: ChangeCursor,
+            _: ObjectType,
+        ) -> Result<ChangeStep, ports::Error> {
+            Err(ports::Error::Invalid)
+        }
+        fn next<'a>(
+            &mut self,
+            _: Table,
+            _: Option<&[u8]>,
+            _: &'a mut [u8],
+            _: &'a mut [u8],
+        ) -> Result<Option<Record<'a>>, ports::Error> {
+            Err(ports::Error::Invalid)
+        }
+        fn get<'a>(
+            &mut self,
+            key: Key<'_>,
+            value: &'a mut [u8],
+        ) -> Result<Option<(Row<'a>, Sequence)>, ports::Error> {
+            let Key::Mailbox(id) = key else {
+                return Err(ports::Error::Invalid);
+            };
+            let parent = match id.as_bytes().first().copied() {
+                Some(0) => Some(1),
+                Some(1) => Some(if self.cycle { 0 } else { 2 }),
+                Some(2) => None,
+                _ => return Ok(None),
+            };
+            let row = Row::Mailbox(MailboxRow {
+                name: "folder",
+                parent: parent.map(|v| MailboxId::from_bytes([v; 16])),
+                role: None,
+                sort_order: 0,
+                subscribed: true,
+            });
+            let used = row.encode(value).map_err(|_| ports::Error::Capacity)?;
+            let row = Row::decode(
+                Table::Mailboxes,
+                value.get(..used).ok_or(ports::Error::Invalid)?,
+            )
+            .map_err(|_| ports::Error::Corrupt)?;
+            Ok(Some((row, Sequence::from_u64(5))))
+        }
+    }
+    let identity = ViewIdentity {
+        account: AccountId::from_bytes([1; 16]),
+        epoch: StoreEpoch::from_bytes([2; 16]),
+        generation: 1,
+        checkpoint: Sequence::from_u64(3),
+        segment: 1,
+        committed_offset: 256,
+        committed_sequence: Sequence::from_u64(5),
+        history_floor: Sequence::from_u64(0),
+    };
+    let mut value = [0; 64];
+    let before = COUNTERS.snapshot();
+    for (cycle, start, budget, expected) in [
+        (false, 0, 10, None),
+        (true, 0, 10, Some(Error::Cycle)),
+        (false, 0, 1, Some(Error::ReadLimit)),
+        (
+            false,
+            9,
+            10,
+            Some(Error::Missing(MailboxId::from_bytes([9; 16]))),
+        ),
+    ] {
+        let mut view = View { identity, cycle };
+        let mut walk =
+            ParentWalk::new(identity, MailboxId::from_bytes([start; 16]), budget).unwrap();
+        let result = loop {
+            if let Err(error) = walk.advance(&mut view, &mut value) {
+                assert!(walk.is_failed());
+                assert_eq!(walk.advance(&mut view, &mut value), Err(Error::Failed));
+                assert_eq!(walk.finish(), Err(Error::Failed));
+                break Err(error);
+            }
+            if walk.is_complete() {
+                break walk.finish();
+            }
+        };
+        assert_eq!(result.err(), expected);
+    }
+    assert_eq!(COUNTERS.snapshot(), before, "mailbox parent walk allocated");
 }

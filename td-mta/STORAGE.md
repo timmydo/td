@@ -742,6 +742,34 @@ silently recreating it. Historical IDs never pin their former targets or grant
 authorization. Lease device IDs retain provenance; revocation prevents use.
 Thread anchors must reference live emails and are removed with their email.
 
+`mailbox_parents::ParentWalk` checks one mailbox's parent chain through a
+caller-owned ReadView. Capture the full view identity and admit an explicit
+maximum number of lookups. Each advance performs at most one get, verifies the
+view identity before and after it, validates the returned mailbox row and
+sequence ceiling, then copies only its parent ID. Check the post-get identity
+before interpreting a found row, absence or an error. ChangedView takes
+precedence when the view moved. A missing row, invalid
+row, changed view, lookup error or exhausted read budget retires the walk. Budget
+exhaustion is a resource refusal, never proof of a cycle or a valid chain.
+
+The walker uses Brent's cycle detection: advance one current ID and compare
+against a saved ID replaced at power-of-two intervals. Reaching a root completes
+the chain. A valid chain containing N mailboxes, including the root, needs
+exactly N gets. At most 3*N gets suffice to detect a cycle among N reachable
+mailboxes; callers deriving a budget from a mailbox count must use checked
+arithmetic. Smaller admitted budgets may refuse a valid store. These are
+lookup counts, not physical-read or time bounds, and this helper does not
+enforce the separate configured mailbox-depth policy.
+Direct self-parent rows already fail local row validation. This uses fixed
+state rather than a growing visited-ID set. Completion reports the captured
+identity, start ID and lookup count. It owns no pin and validates no other
+mailbox chain or cross-row invariant. The coordinator must check every final
+mailbox under the same actual view, preserve lookup failures as failures, and
+retain its pins. The view owns each get's full work/scratch/deadline contract;
+the caller also checks deadlines between advances. An advance after completion
+performs no get, but still refuses a changed view. Failed or unfinished walks
+cannot produce completion.
+
 Thread assignment does not depend on disposable indexes or rescanning every
 body. Store at most one anchor per email: its first syntactically valid
 Message-ID within a 1004-byte ceiling (four-byte length plus ID plus 16-byte

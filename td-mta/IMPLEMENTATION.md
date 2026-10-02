@@ -831,6 +831,15 @@ service activation. Each part lands independently:
     short output, incomplete consumption and late corruption; allocation probes
     cover both root bounds. Existing scratch partitions fund both outputs.
     Indexed iteration, whole-graph recovery and live pins remain separate work.
+  - **M05d13 — mailbox parent chains:** implemented fixed-state cycle/missing-
+    target validation over one supplied ReadView, one get per advance. Bind
+    exact view identity before/after reads, validate rows/sequence ceilings,
+    retire on errors or explicit lookup-budget exhaustion, and expose
+    completion only at a root. Tests compare exhaustive small functional
+    graphs against an independent visited-set oracle, plus long chains,
+    changed views, malformed rows and sticky errors. The allocation probe
+    covers success/cycle/missing/limit cases. Actual view integration and the
+    all-mailbox/whole-graph coordinator remain separate work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

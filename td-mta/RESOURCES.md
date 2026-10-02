@@ -108,6 +108,14 @@ still account for those costs and concurrent owners within the ledger.
   The allocation executable checks unchanged/replaced/deleted rows, remaining
   output, input/sink failures, and draining the full-operation overlay after
   cold preparation. Callback allocations remain the caller's responsibility.
+  ParentWalk copies three mailbox IDs, the view identity and scalar progress;
+  tests cap compiled state at 256 bytes, charged to its owning worker stack.
+  Each advance borrows the existing result buffer for one ReadView get and
+  releases row strings before the next lookup. The caller's explicit lookup
+  budget bounds total operations; each get retains the view's own work limits.
+  No visited-ID collection, pool or additional result arena is created. The
+  allocation probe covers a rooted chain, a cycle, a missing target and read
+  exhaustion using a fixed view and caller buffer after cold preparation.
 - Writer: one journal arena and descriptor array, one 1 MiB frame, and
   256 KiB table/manifest/value scratch, a separate 1 MiB input key/value
   arena and 4096 operation slots of 32 bytes. The latter bounds the actual

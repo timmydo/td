@@ -10,6 +10,7 @@ pub mod gateway_policy;
 pub mod generations;
 pub mod ids;
 pub mod limits;
+pub mod mailbox_parents;
 pub mod merge;
 pub mod observability;
 pub mod overlay;
