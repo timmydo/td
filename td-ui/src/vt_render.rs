@@ -76,6 +76,7 @@ const BLANK: Cell = Cell {
         background: Color::Default,
         underline_color: Color::Default,
         link: 0,
+        prompt: false,
     },
 };
 

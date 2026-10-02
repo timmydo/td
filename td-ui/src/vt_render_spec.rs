@@ -403,6 +403,7 @@ fn the_rendition_matrix_covers_exactly_the_models_attribute_flags() {
         background: _,
         underline_color: _,
         link: _,
+        prompt: _,
     } = attributes();
     let flags = [
         ("bold", bold),

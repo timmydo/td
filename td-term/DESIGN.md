@@ -93,9 +93,10 @@ for td's shell and userland. It implements:
   reset;
 - pointer reporting: tracking modes 9, 1000, 1002 and 1003 and SGR's
   encoding, mode 1006, each initially off and cleared by terminal reset,
-  reported as §3 says; and
+  reported as §3 says;
 - OSC 8 hyperlinks, which name the cells written in them, followed as
-  §3 says.
+  §3 says; and
+- OSC 133;A shell-prompt marks, which §3's prompt chords jump between.
 
 UTF-8 scalars are initially single-cell glyphs. Wide cells, combining
 sequences, grapheme clustering, bidi, shaping, and emoji presentation require
@@ -134,11 +135,11 @@ terminal implements it.
 Unsupported CSI operations are ignored as complete sequences. DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
 execute commands or open paths. An OSC's payload is kept, to 4 KiB, and an
-OSC 8 is acted on when BEL or ESC, the start of ST, ends it; one that
-outgrows the bound is dropped whole, and every other OSC is ignored. CAN and
-SUB cancel a string. ESC either begins ST or recovers through the normal
-escape state. Unsupported input must not leak printable fragments or
-desynchronize subsequent supported input.
+OSC 8 or OSC 133;A is acted on when BEL or ESC, the start of ST, ends it;
+one that outgrows the bound is dropped whole, and every other OSC is
+ignored. CAN and SUB cancel a string. ESC either begins ST or recovers
+through the normal escape state. Unsupported input must not leak
+printable fragments or desynchronize subsequent supported input.
 
 `OSC 8 ; params ; URI` makes the cells written after it the link's, until
 an OSC 8 with an empty URI ends it, as does one whose URI is longer than
@@ -851,6 +852,22 @@ gone (`Terminal::still_matches`), is dropped; a clear that renumbers
 history or a switch of screen drops it and the last place too, since
 both name a line of text that went.
 
+A shell that marks where its prompt starts with OSC 133;A, with or
+without parameters (foot's shell integration), marks the next cell
+written (`Attributes::prompt`); no other OSC 133 mark is kept. Writing
+over the cell keeps the mark, since a line editor redraws its prompt
+without a new one, as foot's row mark survives; an erase drops it with
+its cell, and a reset or a screen switch drops one pending. foot's
+prompt chords scroll the view between them: `C-S-z` puts the nearest
+marked row above the view's first on top, and `C-S-x` the nearest below
+it, or returns the view to the live screen when that row is on it
+(`Terminal::prompt`, in the search's numbering). Neither reaches the
+child, `C-z` and `C-x` remain the child's, and the selection goes as
+with any key. A chord rings when there is no prompt that way, on the
+alternate screen, whose programs are not the shell, or when the view is
+already where it would go; one that moves the view repeats while held,
+each repeat a jump, never sent to the child, until one rings.
+
 The system image's input proof drives td-term's clipboard end to end, and
 td-term's half of it exists only when the exact `td.firefox-input=1` kernel
 token is on `/proc/cmdline`, read once at startup and bounded at 4 KiB. Under
@@ -1541,6 +1558,8 @@ terminal, and td-term's prove the program:
   where the view is, puts the view and selection back on `Escape`, `C-g`
   or `C-c`, and on `Return` or keypad Enter selects its match and makes
   it the primary selection, or keeps the selection with no match;
+  jumps the view between OSC 133;A prompts on `C-S-z` and `C-S-x`,
+  ringing with none further or nowhere to move;
   rings the visual bell in the next frame and in every frame until its
   flash, which a later bell puts forward, is over;
   waits for the proof's sync on the live source; rings for a paste with

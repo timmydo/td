@@ -73,6 +73,10 @@ pub struct Attributes {
     /// The OSC 8 link the cell was written in (`Terminal::link`), 0 for
     /// none. SGR does not touch it; an erase does.
     pub link: u32,
+    /// The cell is the first written after an OSC 133;A, where a shell
+    /// prompt starts (`Terminal::prompt`). Writing over it keeps it, as a
+    /// line editor redraws its prompt; an erase drops it.
+    pub prompt: bool,
 }
 
 impl Default for Attributes {
@@ -88,6 +92,7 @@ impl Default for Attributes {
             background: Color::Default,
             underline_color: Color::Default,
             link: 0,
+            prompt: false,
         }
     }
 }
@@ -1255,6 +1260,8 @@ pub struct Terminal {
     /// cells can never name a later one.
     links: VecDeque<Link>,
     next_link: u32,
+    /// An OSC 133;A came: the next cell written starts a prompt.
+    prompt_pending: bool,
 }
 
 /// An OSC 8 link: its id, the `id=` parameter that lets separately
@@ -1295,6 +1302,7 @@ impl Terminal {
             osc_overflow: false,
             links: VecDeque::new(),
             next_link: 1,
+            prompt_pending: false,
         })
     }
 
@@ -1608,6 +1616,40 @@ impl Terminal {
         None
     }
 
+    /// The line, in `search`'s numbering, of the nearest row older or
+    /// newer than the line `from` that holds a prompt's start (OSC 133;A),
+    /// for a jump between a shell's prompts. None on the alternate screen,
+    /// whose programs are not the shell's.
+    pub fn prompt(&self, from: u64, toward: Toward) -> Option<u64> {
+        if self.alternate_active {
+            return None;
+        }
+        let text = Searched::of(self);
+        let marked = |row: &usize| {
+            (0..text.columns).any(|column| {
+                text.cell(*row, column)
+                    .is_some_and(|cell| cell.attributes.prompt)
+            })
+        };
+        let row = text.row(from);
+        let before = from < text.first;
+        let found = match toward {
+            Toward::Older => {
+                let bound = row.unwrap_or(if before { 0 } else { text.rows });
+                (0..bound).rev().find(marked)
+            }
+            Toward::Newer => {
+                let start = match row {
+                    Some(row) => row.saturating_add(1),
+                    None if before => 0,
+                    None => text.rows,
+                };
+                (start..text.rows).find(marked)
+            }
+        };
+        found.map(|row| text.place(row))
+    }
+
     /// Whether `found` still spells `query` where it is: output since it
     /// was found can have rewritten those cells, or ended the wrap a match
     /// ran across.
@@ -1816,7 +1858,10 @@ impl Terminal {
     }
 
     fn put_char(&mut self, scalar: char) {
-        let attributes = self.attributes;
+        let attributes = Attributes {
+            prompt: std::mem::take(&mut self.prompt_pending),
+            ..self.attributes
+        };
         let history = self.records_history();
         let auto_wrap = self.auto_wrap;
         let screen = self.screen_mut();
@@ -1828,6 +1873,14 @@ impl Terminal {
                 screen.pending_wrap = false;
             }
         }
+        // A prompt redrawn over its mark keeps it; only an erase drops it.
+        let marked = screen
+            .cell(screen.cursor_row, screen.cursor_column)
+            .is_some_and(|cell| cell.attributes.prompt);
+        let attributes = Attributes {
+            prompt: attributes.prompt || marked,
+            ..attributes
+        };
         screen.set_cell(
             screen.cursor_row,
             screen.cursor_column,
@@ -1936,11 +1989,14 @@ impl Terminal {
         self.parser = ParserState::String(kind);
     }
 
-    /// An OSC this profile acts on: 8, a hyperlink. Any other is ignored.
+    /// An OSC this profile acts on: 8, a hyperlink, or 133;A, a shell
+    /// prompt's start, whatever parameters follow. Any other is ignored.
     fn dispatch_osc(&mut self) {
         let mut payload = std::mem::take(&mut self.osc);
         if let Some(rest) = payload.strip_prefix(b"8;") {
             self.osc_link(rest);
+        } else if payload == b"133;A" || payload.starts_with(b"133;A;") {
+            self.prompt_pending = true;
         }
         payload.clear();
         self.osc = payload;
@@ -2455,6 +2511,8 @@ impl Terminal {
             self.restore_dec_state();
         }
         self.last_printed = None;
+        // A prompt mark is the screen's it came on.
+        self.prompt_pending = false;
     }
 
     fn report_status(&mut self, status: u16) {
@@ -2509,6 +2567,7 @@ impl Terminal {
     fn reset_model(&mut self) {
         self.attributes = Attributes::default();
         self.links.clear();
+        self.prompt_pending = false;
         self.primary.reset(self.attributes);
         self.alternate.reset(self.attributes);
         self.alternate_active = false;

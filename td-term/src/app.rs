@@ -121,6 +121,11 @@ const SEARCH_ERASE_CHORD: &str = "Backspace";
 const ZOOM_IN_CHORDS: [&str; 2] = ["C-+", "C-="];
 const ZOOM_OUT_CHORD: &str = "C--";
 const ZOOM_RESET_CHORD: &str = "C-0";
+/// foot's prompt chords, which scroll the view to the shell's previous
+/// or next prompt (OSC 133;A). Control-z and Control-x still reach the
+/// child; only their Shift forms are taken.
+const PROMPT_OLDER_CHORD: &str = "C-S-z";
+const PROMPT_NEWER_CHORD: &str = "C-S-x";
 /// Pixels per em in a point, at the 96 dots per inch foot sizes its font
 /// by at scale one, so `--font-size 9` is foot's `size=9`.
 const PIXELS_PER_POINT: f32 = 4.0 / 3.0;
@@ -225,6 +230,15 @@ fn zoom_to(chord: &str) -> Option<render::ZoomTo> {
         ZOOM_OUT_CHORD => Some(render::ZoomTo::Out),
         ZOOM_RESET_CHORD => Some(render::ZoomTo::Start),
         _ if ZOOM_IN_CHORDS.contains(&chord) => Some(render::ZoomTo::In),
+        _ => None,
+    }
+}
+
+/// Which way a prompt chord jumps, if `chord` is one.
+fn prompt_toward(chord: &str) -> Option<td_ui::vt::Toward> {
+    match chord {
+        PROMPT_OLDER_CHORD => Some(td_ui::vt::Toward::Older),
+        PROMPT_NEWER_CHORD => Some(td_ui::vt::Toward::Newer),
         _ => None,
     }
 }
@@ -754,10 +768,45 @@ impl Window {
             return Ok(());
         }
         self.clear_selection();
-        if self.route(chord, stroke.text)? && stroke.repeat && !self.proof.enabled {
+        let moved = match prompt_toward(chord) {
+            Some(toward) => self.jump_to_prompt(toward),
+            None => self.route(chord, stroke.text)?,
+        };
+        if moved && stroke.repeat && !self.proof.enabled {
             self.client.arm(key, self.clock);
         }
         Ok(())
+    }
+
+    /// Scrolls the view so the nearest prompt (OSC 133;A) above or below
+    /// its first row is that row, as foot's prompt jumps do; one on the
+    /// live screen returns the view there. Rings, and returns false, when
+    /// there is no prompt that way or the view cannot move to it.
+    fn jump_to_prompt(&mut self, toward: td_ui::vt::Toward) -> bool {
+        let line = self.view_top().and_then(|top| {
+            let terminal = self.model.as_ref()?;
+            terminal.prompt(top, toward)
+        });
+        let Some(terminal) = self.model.as_ref() else {
+            return false;
+        };
+        let history = terminal.scrollback();
+        let current = self.viewport.offset(history);
+        let target = line
+            .map(|line| usize::try_from(history.pushed.saturating_sub(line)).unwrap_or(usize::MAX));
+        let Some(target) = target.filter(|target| *target != current) else {
+            self.ring();
+            return false;
+        };
+        let back =
+            i64::try_from(target).unwrap_or(i64::MAX) - i64::try_from(current).unwrap_or(i64::MAX);
+        let Ok(back) = i32::try_from(back) else {
+            self.ring();
+            return false;
+        };
+        self.viewport.by_lines(back, history);
+        self.stale = true;
+        true
     }
 
     fn alternate(&self) -> bool {
@@ -2293,11 +2342,14 @@ impl App for Window {
             if let Some(stroke) = self.client.repeat(now)? {
                 // Rerouted per repetition: the mode and the view it asks
                 // about may have changed since the press. A search takes
-                // a repeat as it takes the press.
+                // a repeat as it takes the press, and so does a prompt
+                // chord, which the child's table would send as C0.
                 let repeated = if self.search.is_some() {
                     self.check_search();
                     self.stale = true;
                     self.search_stroke(&stroke)
+                } else if let Some(toward) = prompt_toward(&stroke.chord) {
+                    self.jump_to_prompt(toward)
                 } else {
                     self.route(&stroke.chord, stroke.text)?
                 };
@@ -4431,6 +4483,80 @@ mod tests {
 
     fn bell(window: &mut Window) -> bool {
         window.model.as_mut().unwrap().take_bell()
+    }
+
+    /// C-S-z scrolls the view to put the prompt above its first row on
+    /// top, and C-S-x the one below, or the live screen for one on it;
+    /// nothing that way, or nowhere to move, rings. Neither reaches the
+    /// child, and the selection goes as with any key.
+    #[test]
+    fn the_prompt_chords_jump_between_prompts() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        let lines: Vec<u8> = (0..60)
+            .flat_map(|n| {
+                let mark = if n % 10 == 0 { "\x1b]133;A\x07$ " } else { "" };
+                format!("{mark}{n}\r\n").into_bytes()
+            })
+            .collect();
+        window.output(&lines).unwrap();
+        // Lines 0 to 60, the screen 41 to 60; prompts every tenth line.
+        assert_eq!(window.history().pushed, 41);
+        let offset = |window: &Window| window.viewport.offset(window.history());
+        window.selection = selection((0, 0), (0, 1));
+        chord(&mut window, CONTROL | SHIFT, 44);
+        assert_eq!(offset(&window), 1, "line 40 on top");
+        assert_eq!(window.selection, None);
+        assert!(window.input.take_for_test().is_empty());
+        chord(&mut window, CONTROL | SHIFT, 44);
+        assert_eq!(offset(&window), 11);
+        chord(&mut window, CONTROL | SHIFT, 45);
+        assert_eq!(offset(&window), 1);
+        assert!(!bell(&mut window));
+        chord(&mut window, CONTROL | SHIFT, 45);
+        assert_eq!(offset(&window), 0, "line 50 is on the live screen");
+        chord(&mut window, CONTROL | SHIFT, 45);
+        assert!(bell(&mut window), "already there");
+        for _ in 0..5 {
+            chord(&mut window, CONTROL | SHIFT, 44);
+        }
+        assert_eq!(offset(&window), 41, "line 0 on top");
+        assert!(!bell(&mut window));
+        chord(&mut window, CONTROL | SHIFT, 44);
+        assert!(bell(&mut window), "none older");
+        assert_eq!(offset(&window), 41);
+    }
+
+    /// A held prompt chord repeats as jumps, never to the child, until
+    /// one rings at the oldest prompt.
+    #[test]
+    fn a_held_prompt_chord_repeats_as_jumps() {
+        let (mut window, _peer) = presented();
+        focus(&mut window, 5);
+        window.client.input_mut().timing(25, 600, 0).unwrap();
+        let lines: Vec<u8> = (0..60)
+            .flat_map(|n| {
+                let mark = if n % 10 == 0 { "\x1b]133;A\x07$ " } else { "" };
+                format!("{mark}{n}\r\n").into_bytes()
+            })
+            .collect();
+        window.output(&lines).unwrap();
+        let offset = |window: &Window| window.viewport.offset(window.history());
+        modifiers(&mut window, CONTROL | SHIFT);
+        window.event(message(KEYBOARD, 3, &[9, 0, 44, 1])).unwrap();
+        assert_eq!(offset(&window), 1);
+        let now = window.clock;
+        window.end_turn(now + 700, true).unwrap();
+        assert_eq!(offset(&window), 11, "the repeat jumped");
+        assert!(window.input.take_for_test().is_empty());
+        for step in 1..8 {
+            window.end_turn(now + 700 + step * 40, true).unwrap();
+        }
+        assert_eq!(offset(&window), 41, "line 0 on top");
+        assert!(bell(&mut window), "none older");
+        assert!(window.input.take_for_test().is_empty());
+        window.event(message(KEYBOARD, 3, &[10, 0, 44, 0])).unwrap();
+        modifiers(&mut window, 0);
     }
 
     /// A URI too long for the status line loses its path first, then the

@@ -2369,3 +2369,72 @@ fn osc8_links_name_the_cells_written_in_them() {
     terminal.feed(b"\x1b]8;;https://e.example/g\x07R");
     assert_eq!(link(&terminal, 0, 0), Some(0));
 }
+
+/// OSC 133;A, with or without parameters, marks the next cell written,
+/// and that one only, as a prompt's start; other OSC 133 marks, an erase
+/// and a reset leave none. `prompt` finds the nearest marked row either
+/// way from a line, in history and on the screen, and none on the
+/// alternate screen.
+#[test]
+fn osc133_marks_prompts_and_prompt_finds_them() {
+    let prompt = |terminal: &Terminal, row: usize, column: usize| {
+        terminal
+            .cell(row, column)
+            .map(|cell| cell.attributes.prompt)
+    };
+    let mut terminal = Terminal::new(3, 10).unwrap();
+    terminal.feed(b"\x1b]133;A\x07$ ls\r\n\x1b]133;A;cl=m\x1b\\% \x1b]133;B\x07x");
+    assert_eq!(prompt(&terminal, 0, 0), Some(true));
+    assert_eq!(prompt(&terminal, 0, 1), Some(false), "the first cell only");
+    assert_eq!(prompt(&terminal, 1, 0), Some(true), "with parameters");
+    assert_eq!(prompt(&terminal, 1, 2), Some(false), "133;B marks none");
+    terminal.feed(b"\r\n\x1b]133;AB\x07y");
+    assert_eq!(prompt(&terminal, 2, 0), Some(false), "133;AB is not A");
+    terminal.feed(b"\x1b]133;A\x07\x1bcz");
+    assert_eq!(
+        prompt(&terminal, 0, 0),
+        Some(false),
+        "a reset drops one pending"
+    );
+    // A line editor's redraw writes over the prompt without a new mark:
+    // the mark stays until an erase.
+    terminal.feed(b"\x1b[2;1H\x1b]133;A\x07$ ls\r$ ls");
+    assert_eq!(prompt(&terminal, 1, 0), Some(true), "redrawn");
+    terminal.feed(b"\r\x1b[K");
+    assert_eq!(prompt(&terminal, 1, 0), Some(false), "an erase drops it");
+    // A screen switch drops one pending, either way.
+    terminal.feed(b"\x1b]133;A\x07\x1b[?1049h\x1b[Hq");
+    assert_eq!(prompt(&terminal, 0, 0), Some(false), "switched to");
+    terminal.feed(b"\x1b]133;A\x07\x1b[?1049l\x1b[3;1Hr");
+    assert_eq!(prompt(&terminal, 2, 0), Some(false), "switched back");
+    // Lines 0 to 6, prompts on 0, 3 and 6; the screen holds 4 to 6.
+    let mut terminal = Terminal::new(3, 10).unwrap();
+    terminal.feed(b"\x1b]133;A\x07p0\r\na\r\nb\r\n\x1b]133;A\x07p1\r\nc\r\nd\r\n\x1b]133;A\x07p2");
+    assert_eq!(terminal.scrollback().pushed, 4);
+    assert_eq!(terminal.prompt(4, Toward::Older), Some(3));
+    assert_eq!(terminal.prompt(3, Toward::Older), Some(0));
+    assert_eq!(terminal.prompt(0, Toward::Older), None);
+    assert_eq!(terminal.prompt(0, Toward::Newer), Some(3));
+    assert_eq!(terminal.prompt(3, Toward::Newer), Some(6));
+    assert_eq!(terminal.prompt(6, Toward::Newer), None);
+    assert_eq!(terminal.prompt(9, Toward::Older), Some(6), "past the end");
+    // A line older than history's first, once eviction has moved it:
+    // nothing is older, and the newest prompt is newer.
+    let mut evicted = Terminal::new(2, 4).unwrap();
+    evicted.feed(b"\x1b]133;A\x07p\r\n");
+    evicted.feed(&b"x\r\n".repeat(MAX_HISTORY_LINES + 8));
+    evicted.feed(b"\x1b]133;A\x07q");
+    let first = evicted.scrollback().pushed - evicted.scrollback().lines as u64;
+    assert!(first > 0);
+    assert_eq!(evicted.prompt(0, Toward::Older), None);
+    assert_eq!(
+        evicted.prompt(0, Toward::Newer),
+        Some(evicted.scrollback().pushed + 1)
+    );
+    terminal.feed(b"\x1b[?1049h\x1b]133;A\x07q");
+    assert_eq!(
+        terminal.prompt(9, Toward::Older),
+        None,
+        "the alternate screen"
+    );
+}
