@@ -4,6 +4,7 @@
 //! token's output or a PIN; the PIN prompt is the caller's `Prompt`, and
 //! every token operation ends when its `Cancel` is cancelled.
 
+use super::events;
 use super::host::{self, Entropy, Protected};
 use super::lifecycle::{
     self, AssertRequest, Asserted, Directory, EnrollRequest, Enrolled, Error, Hardware, KeyInfo,
@@ -16,6 +17,7 @@ use crate::fido_pin::Pin;
 use crate::fido_transaction::{Error as Transaction, PinPurpose, Status};
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read};
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// The notebook's bounds, for an editor to refuse early what a save would.
 pub const MAX_TITLE: usize = super::MAX_TITLE;
@@ -711,6 +713,85 @@ pub fn worker(args: &[String]) -> Option<Result<(), String>> {
     }
 }
 
+/// What the host did that a notebook locks for, without waiting on a
+/// dirty-document question.
+#[derive(Debug)]
+pub enum HostEvent {
+    /// The session was locked through logind.
+    Lock,
+    /// The system is about to sleep: lock, then drop the delay.
+    Suspend(SleepDelay),
+    /// The host's lock and sleep can no longer be watched, and why.
+    Lost(String),
+}
+
+/// Holds the system's sleep, where logind granted a delay, until dropped;
+/// logind's own maximum delay bounds it.
+#[derive(Debug)]
+pub struct SleepDelay(Option<std::fs::File>);
+
+impl SleepDelay {
+    /// Whether this holds the system's sleep.
+    pub fn held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// The host's lock and sleep events for this process's login session,
+/// watched through logind on the system bus.
+/// Dropping it stops the watch and releases a delay its thread holds.
+pub struct HostEvents {
+    events: Receiver<events::Event>,
+    delays: bool,
+    ended: bool,
+    _stop: events::Stop,
+}
+
+impl HostEvents {
+    /// Starts watching; the error says why the host's lock and sleep
+    /// cannot be watched. Connecting and setting up can take twenty
+    /// seconds, so a window starts it on a thread of its own.
+    pub fn watch() -> Result<Self, String> {
+        let (events, delays, stop) = events::watch()?;
+        Ok(Self {
+            events,
+            delays,
+            ended: false,
+            _stop: stop,
+        })
+    }
+
+    /// Whether logind granted a delay when watching began, so that sleep
+    /// waits for the lock. A delay refused after a later wake shows only
+    /// in that suspend's `SleepDelay::held`.
+    pub fn delays_sleep(&self) -> bool {
+        self.delays
+    }
+
+    /// The next event already received, without waiting. After the
+    /// source is lost there are no more.
+    pub fn try_next(&mut self) -> Option<HostEvent> {
+        if self.ended {
+            return None;
+        }
+        let event = match self.events.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                events::Event::Lost("the host's events stopped".to_owned())
+            }
+        };
+        Some(match event {
+            events::Event::Lock => HostEvent::Lock,
+            events::Event::Suspend(delay) => HostEvent::Suspend(SleepDelay(delay)),
+            events::Event::Lost(reason) => {
+                self.ended = true;
+                HostEvent::Lost(reason)
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::lifecycle::Purpose;
@@ -907,5 +988,43 @@ mod tests {
             }),
             notebook::Change::Create { .. }
         ));
+    }
+
+    #[test]
+    fn host_events_end_with_the_source_lost() {
+        let (send, events) = std::sync::mpsc::channel();
+        let mut host = HostEvents {
+            events,
+            delays: true,
+            ended: false,
+            _stop: events::Stop(std::os::unix::net::UnixStream::pair().unwrap().0),
+        };
+        assert!(host.delays_sleep());
+        assert!(host.try_next().is_none());
+        send.send(events::Event::Lock).unwrap();
+        send.send(events::Event::Suspend(None)).unwrap();
+        assert!(matches!(host.try_next(), Some(HostEvent::Lock)));
+        let Some(HostEvent::Suspend(delay)) = host.try_next() else {
+            panic!("no suspend");
+        };
+        assert!(!delay.held());
+        drop(send);
+        let Some(HostEvent::Lost(reason)) = host.try_next() else {
+            panic!("a watcher that ended was not lost");
+        };
+        assert_eq!(reason, "the host's events stopped");
+        assert!(host.try_next().is_none());
+
+        let (send, events) = std::sync::mpsc::channel();
+        let mut host = HostEvents {
+            events,
+            delays: false,
+            ended: false,
+            _stop: events::Stop(std::os::unix::net::UnixStream::pair().unwrap().0),
+        };
+        send.send(events::Event::Lost("gone".to_owned())).unwrap();
+        send.send(events::Event::Lock).unwrap();
+        assert!(matches!(host.try_next(), Some(HostEvent::Lost(reason)) if reason == "gone"));
+        assert!(host.try_next().is_none());
     }
 }

@@ -285,6 +285,7 @@ mod confinement {
             ("write_operation.rs", include_str!("write_operation.rs")),
             ("crypto.rs", include_str!("crypto.rs")),
             ("portable.rs", include_str!("portable.rs")),
+            ("portable_events.rs", include_str!("portable_events.rs")),
             (
                 "portable_lifecycle.rs",
                 include_str!("portable_lifecycle.rs"),
@@ -325,6 +326,15 @@ mod confinement {
                         "unexpected PIN syscall caller {name}"
                     );
                 }
+            }
+            // UNSAFE.md §15: the two descriptor receivers.
+            if name != "sys.rs"
+                && (production.contains("recv_with_fds") || production.contains("take_received"))
+            {
+                assert!(
+                    matches!(name, "client.rs" | "portable_events.rs"),
+                    "unexpected descriptor receiver {name}"
+                );
             }
             let keyword = format!("un{}", "safe");
             let lint = format!("{keyword}_code");
@@ -427,6 +437,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "pin_sys.rs",
                 "pin_terminal.rs",
                 "portable.rs",
+                "portable_events.rs",
                 "portable_host.rs",
                 "portable_lifecycle.rs",
                 "portable_notebook.rs",

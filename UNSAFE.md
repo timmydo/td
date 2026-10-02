@@ -113,7 +113,7 @@ own entry.
 | 12 | `td-portal` | `recvmsg(2)`, `sendmsg(2)`, `close(2)` for the shared credential-descriptor module (also compiled by td-secret, §15); one scoped received-descriptor adoption. The Wayland dialog's descriptor passing moved to td-ui (§19) |
 | 13 | `td-audio` | `ioctl(2)` with eleven value-pinned PCM requests, `poll(2)`, `getsockopt(2)` pinned to `SOL_SOCKET`/`SO_PEERCRED` |
 | 14 | `td-editor` | `flistxattr(2)` pinned to a size-only query, `renameat2(2)` pinned to two borrowed parents and `RENAME_NOREPLACE`; no descriptor adoption. The clipboard destination's `fcntl(2)` status commands moved to td-ui (§19) |
-| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
+| 15 | `td-secret` | shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` transport and scoped adoption for bounded credential replies and the portable vault's logind sleep-delay inhibitor; the named credential intake module of §16; plus the manual PIN terminal's two-request `ioctl(2)`, single-descriptor `poll(2)`, and fixed dumpability `prctl(2)` below |
 | 16 | `td-authd` | `recvmsg(2)`, `setsockopt(2)` with fixed `SO_PASSCRED`/`SO_PASSPIDFD`, `getsockopt(2)` with fixed `SO_PEERCRED`, and `poll(2)` on the peer pidfd; one scoped descriptor adoption; a separate mount instruction/adoption for `unshare(2)`, `open_tree(2)`, `mount_setattr(2)`, and `move_mount(2)` with the fixed portal file-grant values below; plus the separate named credential intake and six-request terminal ioctl/poll modules below |
 | 17 | `td-mail` | retired: `term_sys.rs`, td-sh's terminal half, went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§17](#17-td-mail--retired) |
 | 18 | `td-news` | retired: the copy of `term_sys.rs` went with the terminal; the crate forbids `unsafe` and draws through td-ui (§19) — see [§18](#18-td-news--retired) |
@@ -2377,28 +2377,42 @@ td-secret binary.
 
 td-secret is a library with a binary that only calls its `run`. The
 library's one other public module, `pass`, the notebook API td-pass
-links (`td-secret/PORTABLE.md`), reaches these surfaces only through
-the portable host adapter's process protection and token worker;
-linking it adds no syscall, request or allowance. td-pass itself
-forbids unsafe code, and its confinement test confines td-secret to
-its backend thread and its worker dispatch.
+links (`td-secret/PORTABLE.md`), reaches these surfaces only through the
+portable host adapter's process protection and token worker, and the
+host-event watcher's descriptor receive below; linking it adds no
+syscall, request or allowance. td-pass itself forbids unsafe code, and
+its confinement test confines td-secret to its backend file, which holds
+the vault thread and the host-event watch, and its worker dispatch.
 
-The client compiles surface 12's `td-secret/src/sys.rs` directly: the same
-three-syscall instruction and exact descriptor-adoption allowance.
-Only `client.rs` receives descriptors. Each D-Bus frame retains at most one
-SCM_RIGHTS descriptor; an owning guard closes it on every refusal and drop.
-An authenticated `td.Secret1.Retrieve` reply transfers that one descriptor
-through the shared exact adoption function. The file must be regular,
-unlinked, and at most 4096 bytes. The client reads it positionally from zero,
-checks for growth beyond its advertised extent, and writes
-the credential to its stdout pipe, which td-mail captures directly without a
-shell. Applications import no cryptographic implementation.
+The client compiles surface 12's `td-secret/src/sys.rs` directly: the
+same three-syscall instruction and exact descriptor-adoption allowance.
+`client.rs` and the host-event watcher below are its only descriptor
+receivers. Each D-Bus frame retains at most one SCM_RIGHTS descriptor;
+an owning guard closes it on every refusal and drop. An authenticated
+`td.Secret1.Retrieve` reply transfers that one descriptor through the
+shared exact adoption function. The file must be regular, unlinked, and
+at most 4096 bytes. The client reads it positionally from zero, checks
+for growth beyond its advertised extent, and writes the credential to
+its stdout pipe, which td-mail captures directly without a shell.
+Applications import no cryptographic implementation.
 
 The receive loop reads exactly the current D-Bus frame, negotiates descriptor
 transfer, checks the declared descriptor count, and never assigns a descriptor
 from another frame to a reply. One deadline bounds the whole exchange and a
 32-frame limit bounds unrelated traffic. Confinement tests pin the shared
 module, sole receive/adoption sites and disposal guard.
+
+The portable vault's host-event watcher, `portable_events.rs`
+(`td-secret/PORTABLE.md`), reads the system bus through the same receive
+wrapper after negotiating descriptor transfer. A frame keeps at most one
+descriptor under an owning guard that closes it on every refusal and
+drop; any more are closed as they arrive and the frame is passed over.
+Only an `Inhibit` reply whose one `h` argument names it gives up its
+descriptor, through the same exact adoption function: logind's
+sleep-delay inhibitor, held until its owner drops it. It adds no
+syscall, request or allowance; confinement tests pin its sole receive,
+adoption and disposal sites and these two files as the crate's only
+receivers.
 
 Surface 12 also has one additional send caller in `td-portal/src/secret.rs`.
 It sends only a read-only descriptor for an already-unlinked regular file,

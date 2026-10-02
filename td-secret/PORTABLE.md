@@ -1162,6 +1162,93 @@ creation publishes. The operations themselves are the lifecycle's,
 tested above with synthetic tokens. Their production adapter path, from
 `present` to a real token, remains hardware evidence.
 
+### Implemented host lock and sleep events
+
+`src/portable_events.rs` watches the host's screen lock and sleep for
+standalone mode through logind on the system bus (elogind on Guix
+System); `pass::HostEvents` hands them to the notebook, which locks
+without asking about unsaved changes.
+
+- **Connection.** The system bus is `DBUS_SYSTEM_BUS_ADDRESS` when it
+  names one absolute `unix:path=` address, else
+  `/run/dbus/system_bus_socket`; any other address is refused. The
+  connect waits at most ten seconds, on a thread of its own. The watcher
+  authenticates with SASL EXTERNAL as the process's uid and negotiates
+  descriptor passing. Setup and every later method call have a
+  ten-second deadline, so `HostEvents::watch` can take twenty seconds;
+  waiting for a signal has none. Dropping `HostEvents` shuts the
+  connection down, which ends the watching thread and releases a delay
+  it holds.
+- **Subscription.** It first subscribes to the bus's `NameOwnerChanged`
+  for logind, then learns logind's unique name with `GetNameOwner`, so a
+  restart in between is seen. It asks `GetSessionByPID` with pid 0,
+  which logind answers from the caller's bus credentials, so neither a
+  PID namespace nor a reused pid misleads it, and subscribes to the
+  manager's `PrepareForSleep` and that session's `Lock`. The session is
+  the one the process belongs to, whoever's it is. A signal counts only
+  when its sender is the unique name learned (the bus itself for
+  `NameOwnerChanged`) and its path, interface and member are the watched
+  ones; the match rules are not trusted alone. A reply counts only from
+  the bus for the bus's calls and from logind's unique name for
+  logind's, or as an error from either.
+- - **Other accounts.** Any account may send this connection a signal. A
+  frame's length is read from its header without the codec's ceilings: a
+  frame past 16 KiB is read through and passed over, one carrying more
+  than one descriptor has them closed at once and is passed over, and an
+  undecodable one is passed over; none of them ends the watch. Only a
+  length past the protocol's own 128 MiB maximum, or a byte order it
+  does not name, which the bus never sends, does. Every frame but a
+  watched signal or the awaited reply is dropped as it is read, also
+  while a call waits for its reply, so none holds memory; that wait is
+  bounded by its deadline.
+- **Sleep delay.** It asks logind for a `delay` inhibitor of `sleep`.
+  When `PrepareForSleep(true)` arrives the held inhibitor goes to the
+  caller inside `Suspend`; the caller drops it once it has locked, and
+  logind's own maximum delay bounds the wait either way. After
+  `PrepareForSleep(false)` the watcher takes a new one. A refusal, by
+  logind (polkit decides) or by the bus, is not an error: sleep is then
+  not delayed. `delays_sleep` says whether logind granted one when
+  watching began; a refusal after a later wake shows only in that
+  suspend's `SleepDelay::held`, and the notebook may then lock only once
+  the machine wakes. Watched signals read while a call waits for its
+  reply are kept, in order.
+- **Loss.** logind's name changing owner, the bus closing, or a read
+  failing ends the watch with `Lost` and its reason, and nothing is
+  reported after it. The caller locks then and goes on with its own Lock
+  only.
+- **Scope.** Only logind's signals are seen. A screen locker the
+  compositor runs directly, as Sway's `swaylock` alone, sends none; the
+  supported Sway setup locks through `loginctl lock-session`, for
+  example from swayidle's `lock` event, and the Guix acceptance records
+  that setup. Hibernation is sleep to logind and is reported the same
+  way; its image is the swap policy's question, which the host adapter
+  answers by refusing active swap.
+- **Descriptors.** The watcher is td-secret's second descriptor receiver
+  (`UNSAFE.md` §15). It calls the shared receive, adoption and disposal
+  functions once each. An owning guard closes every descriptor a frame
+  carries; only the one an `Inhibit` reply names, as its one `h`
+  argument, is taken. A test pins `client.rs` and this file as the
+  crate's only receivers.
+
+Scripted-bus tests over a socket pair cover the authentication and call
+sequence with its exact match rules; a granted delay held until dropped,
+also when the watcher drops or is stopped; another sender's or another
+session's lock and another sender's sleep ignored, each before an event
+of another kind; owner changes of another name or from another sender
+ignored; a lock that arrives while a new delay is asked for kept among
+many unwatched signals; a stray descriptor, a frame with two descriptors
+and an oversized frame passed over with their descriptors closed; an
+inhibitor reply that does not name its descriptor refused and the
+descriptor closed; a refused inhibitor; logind's restart, also during
+setup, and the bus closing as loss; refused authentication, descriptor
+negotiation and session lookup; a reply from another than logind; a
+reply of the wrong type; a call passing over many other frames, and
+frames past the codec's header and body ceilings, to its reply; the
+length rule's bound and byte orders; the address rules; and the sole
+descriptor sites. `HostEvents` is tested to end after loss. Deadline
+expiry is not tested: it would take ten seconds. A real logind and
+elogind, on the supported host, remain acceptance evidence.
+
 ## Independently landable increments
 
 1. This contract, td-pass notebook/host scope, bounded authenticated portable
