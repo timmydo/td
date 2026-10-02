@@ -984,6 +984,13 @@ service activation. Each part lands independently:
     returns scratch only after both sweeps succeed. Tests cover phase ordering,
     buffer identity, foreign owners, early admission, late faults and retirement.
     Current selection loading, final row/blob rules and activation remain separate.
+  - **M05d24 — offline validation ReadView:** implemented get/next through complete
+    table replay and a retained fixed-kind change scan over CheckedFiles. Admit
+    all selected source sizes and per-call work, check monotonic deadlines and
+    retire all errors. Shared scratch supports interleaved row/change calls.
+    Tests cover present/deleted rows, ordered EOF, history/active continuations,
+    short capacity, budgets, clock/cursor errors and late refusal. Full logical
+    validation, runtime leases and service activation remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

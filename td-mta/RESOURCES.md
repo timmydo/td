@@ -181,6 +181,12 @@ still account for those costs and concurrent owners within the ledger.
   sweep, can create additional stack temporaries; whole-worker stack
   qualification remains pending. It transfers the existing record buffer from
   table to history work and returns the existing change slots, adding no arena.
+  ValidationView retains the checked snapshot borrow, one ChangeScan, a clock
+  guard and scalar limits. Its Provider state fits 4 KiB, excluding the temporary
+  TableLookup/TableNext constructed during a row call and their existing merge
+  temporaries. Whole-worker stack qualification remains pending. Existing record
+  scratch is shared across row reads and change steps; retained change slots
+  remain separate. No arena, per-operation collection or thread is added.
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
   that input to a temporary; complete worker-stack qualification remains pending.

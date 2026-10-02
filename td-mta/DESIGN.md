@@ -95,7 +95,9 @@ A stopped-store owner now retains the cooperative lock behind read-only
 validation operations; consuming it restores mutation access after borrows end.
 A file-validation coordinator now couples that owner to the captured overlay,
 all selected table replays and retained history before returning borrowed
-physical-file evidence. Final row/reference/blob invariants and mail publication
+physical-file evidence. An offline ReadView now connects this evidence to row
+lookup, ordered iteration and retained change history with work/deadline limits.
+Final row/reference/blob invariants and mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory

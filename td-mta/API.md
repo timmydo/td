@@ -789,6 +789,25 @@ after both succeed. CheckedFiles retains the stopped owner and overlay; it
 proves supplied selected physical inputs, not final reference/blob invariants
 or current selection loading. Every error retires the coordinator.
 
+`CheckedFiles::read_view` constructs an offline ValidationView implementing
+ReadView over these physically checked files. It retains the stopped snapshot,
+borrows record/change scratch and binds one forward change scan to the requested
+kind and starting cursor. Get/next may interleave with that scan. Construction
+admits every selected table/source byte ceiling and a nonzero per-call work
+allowance; calls check a fixed monotonic deadline before work units and before
+returning results. Each get/next replays its entire selected table before exposing
+a copied row; next_change retains its cursor instead of restarting scans.
+
+Changing kind, using an unexpected continuation, short output/scratch,
+work exhaustion, clock regression, deadline or I/O failure retires the view.
+Subsequent calls return that first final error without more clock/I/O work.
+A late deadline/clock error takes precedence over the operation result; buffers
+may already be changed and must be discarded on failure. Dropping the view
+releases its scratch borrows; retained CheckedFiles can construct another scan.
+This supplies offline validation reads, without service authorization, runtime
+pool leases, complete logical invariants or activation. The existing blocking
+std I/O duration limitation remains; a deadline check cannot interrupt a syscall.
+
 `store_fs::HistorySweep` verifies every retained selected history segment,
 admitting total descriptor bytes and frames before I/O. Advances open, read one
 bounded frame, or complete one selected file; only digest/EOF completion releases

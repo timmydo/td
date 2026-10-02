@@ -11,6 +11,10 @@ use crate::{
     ports::{Crypto, Error as PolicyError, ViewIdentity},
 };
 
+#[path = "view.rs"]
+mod view;
+pub use view::{ReadLimits, ValidationReadRequest, ValidationView};
+
 #[derive(Debug)]
 pub enum ValidationError {
     Owner,
@@ -167,7 +171,7 @@ impl<'r, 'm, 't, 'h, 'o, 'b, 's, C: Crypto> FileValidation<'r, '_, 'm, 't, 'h, '
         }
         Ok((
             CheckedFiles {
-                _store: self.store,
+                store: self.store,
                 selection: self.selection,
                 active: self.active,
                 tables: self.complete_tables.ok_or(ValidationError::Incomplete)?,
@@ -180,7 +184,7 @@ impl<'r, 'm, 't, 'h, 'o, 'b, 's, C: Crypto> FileValidation<'r, '_, 'm, 't, 'h, '
 }
 /// Holds the stopped owner and active overlay. Final cross-row/blob checks remain.
 pub struct CheckedFiles<'r, 'm, 'o, 'b, 's> {
-    _store: &'r StoppedStore,
+    store: &'r StoppedStore,
     selection: Selection<'m>,
     active: &'o LoadedOverlay<'r, 'b, 's>,
     tables: CompleteTables,
@@ -213,11 +217,11 @@ mod tests {
         store_paths::{AccountEntry, Name, Number},
     };
     use td_crypto::Provider;
-    fn prepare() -> (Fixture, StoppedStore, active::ProbeBytes) {
+    pub(super) fn prepare() -> (Fixture, StoppedStore, active::ProbeBytes) {
         super::super::tests::prepare()
     }
 
-    fn limits() -> ValidationLimits {
+    pub(super) fn limits() -> ValidationLimits {
         ValidationLimits {
             tables: TableSweepLimits {
                 bytes: 1345,

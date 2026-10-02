@@ -454,6 +454,41 @@ validation. Cross-row/aggregate/blob invariants, tail repair, orphan accounting
 and service activation remain separate. Later validation must keep this owner
 and overlay alive; detached scalar summaries alone are not ownership evidence.
 
+`CheckedFiles::read_view` connects checked stopped-store files to ReadView for
+offline logical validation. Bind one fixed object kind, starting change cursor,
+clock and absolute deadline at construction; retain the CheckedFiles borrow.
+Admit a per-table byte ceiling against all selected tables, a per-source byte
+ceiling against all selected retained segments and the captured active prefix,
+and a positive work-unit count per trait call. Metadata admission is bounded by
+11 tables and at most 64 history descriptors. These byte limits are per input,
+not cumulative allowances across calls.
+
+Get and next perform the existing full selected-table lookup/ordered scan,
+copying into caller key/value buffers only provisionally until complete digest,
+extent and EOF checks succeed. Short result capacity reports Capacity. A call
+charges one unit for opening, each replay advance and completion. Each replay
+step keeps its existing bounded overlay work. Repeated ordered lookups may
+rescan a table; callers admit that cost and the absolute deadline limits the
+whole view lifetime. No index, whole-table buffer or new arena is introduced.
+
+Change calls advance the retained ChangeScan until its next record, frame
+boundary or completion, charging one unit per underlying advance. They require
+the exact last returned continuation and the fixed kind. Locating a starting
+cursor may read earlier bounded frames; continuing never restarts the scan.
+Get/next can reuse record scratch between change calls because retained compact
+changes live in their separate slots. Every selected source was already fully
+validated under the same stopped owner before this view existed.
+
+Sample the monotonic clock before each work unit and after the final operation.
+Expiry, regression or sampling failure prevents a result from escaping, even
+when caller output was already written. Clock/deadline failure takes precedence
+over the underlying result at that final check. Any returned error retires all
+view operations, and retired calls do no additional I/O or clock sampling.
+Caller buffers may be changed on error; discard them. A new view can borrow the
+same scratch after the failed view is dropped. An absolute deadline cannot
+interrupt a blocking std filesystem operation. Runtime view leases, service
+activation and complete logical validation remain separate.
+
 ### Loading the selected metadata
 
 `LockedRoot::load_selection` is the first recovery input step. Its caller must

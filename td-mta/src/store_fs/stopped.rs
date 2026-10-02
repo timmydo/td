@@ -1,11 +1,11 @@
 //! Read-only ownership of a cooperatively locked store during offline validation.
 use super::{
-    HistorySweep, HistorySweepError, HistorySweepLimits, LoadedOverlay, LockedRoot,
-    OverlayInputError, SelectionError, SelectionScratch, TableSweep, TableSweepError,
-    TableSweepLimits,
+    ChangeInputError, ChangeScan, ChangeScanRequest, HistorySweep, HistorySweepError,
+    HistorySweepLimits, LoadedOverlay, LockedRoot, OverlayInputError, SelectionError,
+    SelectionScratch, TableInput, TableInputError, TableSweep, TableSweepError, TableSweepLimits,
 };
 use crate::{
-    format::{bindings::Selection, table::MAX_RECORD_BYTES},
+    format::{bindings::Selection, table::MAX_RECORD_BYTES, Table},
     frame_changes,
     ids::AccountId,
     overlay,
@@ -15,7 +15,8 @@ use crate::{
 #[path = "stopped/validation.rs"]
 mod validation;
 pub use validation::{
-    CheckedFiles, FileValidation, ValidationError, ValidationLimits, ValidationStep,
+    CheckedFiles, FileValidation, ReadLimits, ValidationError, ValidationLimits,
+    ValidationReadRequest, ValidationStep, ValidationView,
 };
 
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.
@@ -74,6 +75,27 @@ impl StoppedStore {
     ) -> Result<LoadedOverlay<'r, 'b, 's>, OverlayInputError> {
         self.root
             .load_active_overlay(crypto, selection, view, max_bytes, frames, cells)
+    }
+    // Keep the validation child on the read-only owner's surface.
+    fn open_table<'r, 'c, 'm, 'b, C: Crypto>(
+        &'r self,
+        crypto: &'c C,
+        selection: Selection<'m>,
+        table: Table,
+        max_bytes: u64,
+        scratch: &'b mut [u8; MAX_RECORD_BYTES],
+    ) -> Result<TableInput<'r, 'c, 'm, 'b, C>, TableInputError> {
+        self.root
+            .open_table(crypto, selection, table, max_bytes, scratch)
+    }
+    fn change_scan<'r, 'c, 'm, 'b, C: Crypto>(
+        &'r self,
+        crypto: &'c C,
+        selection: Selection<'m>,
+        request: ChangeScanRequest,
+        cells: &'b mut [frame_changes::Cell],
+    ) -> Result<ChangeScan<'r, 'c, 'm, 'b, C>, ChangeInputError> {
+        self.root.change_scan(crypto, selection, request, cells)
     }
     /// Admit each replay step and retain any independently supplied overlay owner.
     pub fn tables<'r, 'c, 'm, 't, 'o, 'b, 's, C: Crypto>(
