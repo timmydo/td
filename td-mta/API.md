@@ -808,6 +808,16 @@ This supplies offline validation reads, without service authorization, runtime
 pool leases, complete logical invariants or activation. The existing blocking
 std I/O duration limitation remains; a deadline check cannot interrupt a syscall.
 
+`StoppedStore::verify_owned_account` consumes the store and applies the same
+VerifyLimits/VerifyScratch validation as verify_account. Verification failures
+return OwnedVerifyError::Verification with the original source; an incomplete
+tail returns IncompleteTail without repair. Errors drop the store and release
+its lock. VerifiedStore retains the checked CURRENT/identity/journal summary
+and the store itself, without scratch or read descriptors. Summary getters are
+copies, not read leases. Its only ownership exit, into_stopped, consumes the
+proof before restoring offline access. No writable handle or activation
+authority is exposed.
+
 `ScannedJournal::append_frame` is a mutation-capable low-level operation outside
 the stopped read-only facade. Keep actual stopped-store exclusion (no live readers
 or writers) from scan through completion. It consumes a scan without a partial tail,

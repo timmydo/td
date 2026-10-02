@@ -1066,6 +1066,14 @@ service activation. Each part lands independently:
     retains stopped admission and busy charges. Tests cover repeated successors,
     replay/accounting, changed selection/extent/inode and partial second writes.
     Live views and publication remain separate.
+  - **M05e3a — owned verified store:** implemented a consuming verification
+    transition that retains the locked store and copied CURRENT, view
+    identity and journal summary without caller scratch or a writable root
+    accessor. Refuse an incomplete tail without repair; errors release
+    ownership, requiring a fresh lock and verification on retry. Consuming
+    return discards this proof before restoring offline operations. This
+    prepares the owner for publication; reader leases, serialized live
+    append and atomic visibility remain separate.
   - **M05e3 — committed visibility:** planned; publish sequence and byte offset
     together only after durable append and reservation reconciliation, retaining
     selected-generation ownership for readers. Add crash/fault ordering oracles

@@ -261,6 +261,13 @@ still account for those costs and concurrent owners within the ledger.
   buffers are cold; no whole-service RSS or native allocation claim follows.
   One fixed atomic watermark lets outer and nested clock samples share
   regression/deadline checks without an allocated registry.
+
+  VerifiedStore fits 2 KiB including the consumed stopped root and its selected
+  CURRENT/identity/journal summary. Its verification borrows the same cold
+  VerifyScratch partitions; no read descriptor or scratch borrow survives.
+  This replaces the stopped owner at completion and adds no pool or arena.
+  Its whole-worker stack and allocation qualification remain pending.
+
   HistorySweep retains one HistoryChangesInput and selected metadata/scalars;
   its shipped-Provider state fits 2 KiB on the worker stack. Completion moves
   that input to a temporary; complete worker-stack qualification remains pending.

@@ -110,6 +110,11 @@ and replays the prefix, and drives selected-file and data checks under one
 monotonic deadline. It returns owner-bound summaries with reusable scratch;
 incomplete tails are reported without repair. The inspection CLI is still
 unimplemented.
+A consuming verification transition now retains the locked store with copied
+CURRENT, view identity and journal summary, without scratch or mutation
+access. It refuses incomplete tails, and failed verification releases the
+lock for a later reacquisition. This prepares ownership for committed
+visibility; it does not activate a service or grant live reader leases.
 Complete mutation-policy validation and mail publication remain unimplemented.
 A one-frame append primitive now validates a successor against a complete scan,
 rechecks CURRENT/inode/extent, and writes bounded chunks before sync and EOF

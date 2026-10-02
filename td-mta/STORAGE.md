@@ -562,6 +562,23 @@ policy, recovery accounting/orphan handling, authorized tail repair, runtime
 leases and service activation remain separate. The planned store verify command
 and JSON interface are not implemented by this library entry point.
 
+### Owning a verified store
+
+`StoppedStore::verify_owned_account` consumes the stopped owner, runs the same
+bounded account verification, and refuses any incomplete active tail without
+repair. Success returns VerifiedStore, which owns the store lock and checked
+CURRENT, view identity and journal summary. All verification scratch and read
+file descriptors are released before return. It exposes inspection copies of
+those summaries and no root, file handle or mutation operation.
+
+The owner retains the selected namespace under the same cooperative lock and
+stable private-path contract. `into_stopped` consumes the owner and discards its
+proof before restoring offline operations. A verification or incomplete-tail
+error drops the consumed owner and releases its lock; a retry reacquires the
+store and verifies again. No failed attempt changes mail data or repairs files.
+This is the ownership transition for one configured account, without runtime
+reader leases, writer admission, recovery accounting or service activation.
+
 ### Validating final references and blob data
 
 `CheckedFiles::validate_data` borrows one ValidationView and the same stopped

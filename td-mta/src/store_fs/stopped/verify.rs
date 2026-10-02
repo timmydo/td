@@ -127,6 +127,96 @@ impl VerifiedAccount<'_> {
         self.blobs
     }
 }
+/// Owns the stopped store and its verified single-account selection without scratch.
+/// No writable root accessor, live read lease or service-readiness authority is exposed.
+/// Consuming return discards the verification before restoring offline operations.
+pub struct VerifiedStore {
+    store: StoppedStore,
+    current: Current,
+    identity: ViewIdentity,
+    journal: Summary,
+}
+impl VerifiedStore {
+    pub const fn current(&self) -> Current {
+        self.current
+    }
+    pub const fn identity(&self) -> ViewIdentity {
+        self.identity
+    }
+    pub const fn journal(&self) -> Summary {
+        self.journal
+    }
+    pub fn into_stopped(self) -> StoppedStore {
+        self.store
+    }
+}
+#[derive(Debug)]
+pub enum OwnedVerifyError {
+    Verification(VerifyError),
+    IncompleteTail,
+}
+impl std::fmt::Display for OwnedVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Verification(_) => f.write_str("owned store verification failed"),
+            Self::IncompleteTail => {
+                f.write_str("verified store requires a complete active journal")
+            }
+        }
+    }
+}
+impl std::error::Error for OwnedVerifyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Verification(e) => Some(e),
+            Self::IncompleteTail => None,
+        }
+    }
+}
+impl StoppedStore {
+    /// Consume exclusive store ownership and verify its one configured account.
+    /// An incomplete tail refuses without repair. Any error drops this owner and
+    /// releases its cooperative lock; a retry must reacquire and verify again.
+    /// Full recovery accounting, mutation policy and activation remain separate.
+    ///
+    /// ```compile_fail,E0382
+    /// use td_mta::{ids::AccountId, ports::Clock,
+    ///     store_fs::{StoppedStore, VerifyLimits, VerifyScratch}};
+    /// fn transfer(store: StoppedStore, clock: &dyn Clock, account: AccountId,
+    ///     limits: VerifyLimits, scratch: VerifyScratch<'_>) {
+    ///     let verified = store.verify_owned_account(&td_crypto::Provider, clock, account, limits, scratch).unwrap();
+    ///     let root = store.into_locked();
+    ///     drop((verified, root));
+    /// }
+    /// ```
+    pub fn verify_owned_account<C: Crypto>(
+        self,
+        crypto: &C,
+        clock: &dyn Clock,
+        account: AccountId,
+        limits: VerifyLimits,
+        scratch: VerifyScratch<'_>,
+    ) -> Result<VerifiedStore, OwnedVerifyError>
+    where
+        C::Sha256: Sync,
+    {
+        let report = self
+            .verify_account(crypto, clock, account, limits, scratch)
+            .map_err(OwnedVerifyError::Verification)?;
+        if report.has_incomplete_tail() {
+            return Err(OwnedVerifyError::IncompleteTail);
+        }
+        let current = report.current();
+        let identity = report.identity();
+        let journal = report.journal();
+        Ok(VerifiedStore {
+            store: self,
+            current,
+            identity,
+            journal,
+        })
+    }
+}
 // All nested samplers share one monotonic watermark across phase boundaries.
 struct VerifyClock<'a> {
     source: &'a dyn Clock,
@@ -588,6 +678,93 @@ mod tests {
             Err(VerifyError::Policy(PolicyError::Deadline))
         ));
         assert_eq!(clock.calls.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn owned_verification_keeps_exclusion_releases_scratch_and_consumes_its_proof() {
+        use super::super::super::{acquire_lock, Directory, LockError};
+        use std::os::unix::fs::MetadataExt;
+        let (dir, store, _) = prepare();
+        blob(&store);
+        let mut scratch = Scratch::new();
+        let clock = TestClock::new(u64::MAX, 0);
+        let report = store
+            .verify_account(&Provider, &clock, ACCOUNT, limits(), scratch.borrowed())
+            .unwrap();
+        let expected = (report.current(), report.identity(), report.journal());
+        let directory = Directory::from_path(dir.path.to_str().unwrap()).unwrap();
+        let owner = directory.metadata().unwrap().uid();
+        let verified = store
+            .verify_owned_account(&Provider, &clock, ACCOUNT, limits(), scratch.borrowed())
+            .unwrap();
+        scratch.overwrite();
+        assert_eq!(
+            (verified.current(), verified.identity(), verified.journal()),
+            expected
+        );
+        assert!(matches!(
+            acquire_lock(&directory, owner),
+            Err(LockError::Busy)
+        ));
+        assert!(std::mem::size_of::<VerifiedStore>() <= 2048);
+        let store = verified.into_stopped();
+        assert!(matches!(
+            acquire_lock(&directory, owner),
+            Err(LockError::Busy)
+        ));
+        let report = store
+            .verify_account(&Provider, &clock, ACCOUNT, limits(), scratch.borrowed())
+            .unwrap();
+        assert_eq!(
+            (report.current(), report.identity(), report.journal()),
+            expected
+        );
+        drop(store);
+        drop(dir.reacquire());
+    }
+    #[test]
+    fn owned_verification_refuses_tail_or_failed_validation_without_changing_files() {
+        for mode in 0..3 {
+            let (dir, store, _) = prepare();
+            if mode != 0 {
+                blob(&store);
+            }
+            let entry = if mode == 2 {
+                AccountEntry::Current
+            } else {
+                AccountEntry::Journal(Number::new(2).unwrap())
+            };
+            let path = dir
+                .path
+                .join(Name::account(ACCOUNT, entry).unwrap().as_path().unwrap());
+            if mode == 2 {
+                std::fs::write(&path, [0; format::CURRENT_BYTES]).unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let mut scratch = Scratch::new();
+            let clock = TestClock::new(if mode == 1 { 0 } else { u64::MAX }, 0);
+            let result = store.verify_owned_account(
+                &Provider,
+                &clock,
+                ACCOUNT,
+                limits(),
+                scratch.borrowed(),
+            );
+            match mode {
+                0 => assert!(matches!(result, Err(OwnedVerifyError::IncompleteTail))),
+                1 => assert!(matches!(
+                    result,
+                    Err(OwnedVerifyError::Verification(VerifyError::Policy(
+                        PolicyError::Deadline
+                    )))
+                )),
+                _ => assert!(matches!(
+                    result,
+                    Err(OwnedVerifyError::Verification(VerifyError::Selection(_)))
+                )),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            drop(dir.reacquire());
+        }
     }
     /// Only calls the observer around verification; fixture I/O and allocation are cold.
     pub fn probe(mut snapshot: impl FnMut()) {

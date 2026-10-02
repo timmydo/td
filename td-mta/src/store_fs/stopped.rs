@@ -28,7 +28,9 @@ pub use validation::{
 mod verify;
 #[cfg(test)]
 pub use verify::probe_verify_account;
-pub use verify::{VerifiedAccount, VerifyError, VerifyLimits, VerifyScratch};
+pub use verify::{
+    OwnedVerifyError, VerifiedAccount, VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
+};
 
 /// Consumes the mutation-capable owner; no root/file-handle accessor is exposed.
 /// Stable operator-controlled paths and cooperating external writers are still required.
