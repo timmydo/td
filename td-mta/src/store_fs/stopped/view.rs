@@ -144,7 +144,7 @@ impl<C: Crypto> ValidationView<'_, C> {
     pub(super) const fn utc_ms(&self) -> i64 {
         self.utc_ms
     }
-    pub(super) fn check_deadline(&mut self) -> Result<(), Error> {
+    pub(in super::super) fn check_deadline(&mut self) -> Result<(), Error> {
         self.begin()?;
         self.finish(Ok(()))
     }

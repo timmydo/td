@@ -61,7 +61,8 @@ impl ReconciledAppend<'_> {
 }
 impl<'r> ScannedJournal<'r> {
     /// Caller supplies the ledger recovered for this selected account and holds
-    /// stopped-store exclusion (no live readers or writers) through completion.
+    /// stopped-store exclusion through completion, except for JournalSession
+    /// queries confined to its retained committed prefixes.
     /// Constructor refusal writes nothing and leaves
     /// all preexisting reservation state unchanged. No final graph policy
     /// or protocol acknowledgment is established.
@@ -87,7 +88,7 @@ impl<'r> ScannedJournal<'r> {
 }
 impl<'r> ReconciledAppend<'r> {
     /// Consume the retained durable boundary to append its successor without a
-    /// full journal rescan. Keep the same stopped-store/account exclusion and
+    /// full journal rescan. Keep the same account and append exclusion contract and
     /// ledger. Constructor refusal writes nothing; this consumed owner is then
     /// closed, so rescan before a later attempt. Publication remains external.
     pub fn append_reserved<'b, 'l, 'a>(

@@ -1088,8 +1088,18 @@ service activation. Each part lands independently:
     Require unchanged Rust allocator counters; setup, session startup and
     teardown remain cold. Small frames qualify these paths; maximum data,
     native allocation, worker stacks and whole-service RSS remain separate.
-  - **M05e3 — committed visibility:** serving integration remains pending.
-    Connect identity pins to read scratch and immutable prefix queries; retain
+  - **M05e3d — pinned query scopes:** implemented exclusive pin borrowing
+    with caller selection/replay/record/change scratch. Reload the unchanged
+    selection, validate its captured prefix and physical tables/history,
+    then lend the bounded ReadView implementation under one deadline. Later
+    appended bytes stay invisible to old pins, ignored reader errors still
+    fail the scope, and failed preparation releases scratch for reuse. Only
+    the owned session permits prefix queries alongside its serialized
+    writer; standalone append retains stopped-store exclusion. Runtime pool
+    leases and performance, allocation and whole-worker stack qualification
+    remain pending.
+  - **M05e3 — committed visibility:** runtime integration remains pending.
+    Connect scoped queries to admitted scratch-pool leases; retain
     generation/history ownership across live checkpoint and retention changes.
     Keep the durable append/publication ordering and fault oracles before
     exposing any SMTP/JMAP acknowledgment path.

@@ -26,6 +26,7 @@ mod publication;
 pub use publication::probe_journal_publication;
 pub use publication::{
     CommitError, CommittedView, JournalError, JournalSession, JournalStart, JournalStartScratch,
+    PinnedReadError, PinnedReadRequest, PinnedReadScratch,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,7 +390,7 @@ mod tests {
         value: [u8; 1024],
     }
     impl Scratch {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 metadata: SelectionScratch::new(),
                 frame: vec![0; MAX_FRAME_BYTES]
@@ -423,6 +424,15 @@ mod tests {
             JournalStartScratch {
                 selection: &mut self.metadata,
                 frame: &mut self.frame,
+            }
+        }
+        pub(super) fn read(&mut self) -> PinnedReadScratch<'_> {
+            PinnedReadScratch {
+                selection: &mut self.metadata,
+                frames: &mut self.frames,
+                cells: &mut self.cells,
+                record: &mut self.record,
+                changes: &mut self.changes,
             }
         }
         fn overwrite(&mut self) {
@@ -474,7 +484,7 @@ mod tests {
             })
         }
     }
-    fn limits() -> VerifyLimits {
+    pub(super) fn limits() -> VerifyLimits {
         VerifyLimits {
             capture_bytes: 4096,
             files: ValidationLimits {

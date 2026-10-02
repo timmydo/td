@@ -597,7 +597,31 @@ ViewIdentity and bounded reader count. Capture copies the entire identity
 and lends a CommittedView that borrows the session; it cannot escape the
 consuming scope. The whole selected namespace remains retained: there is no
 checkpoint, retention or writable-root operation in this session. These pins
-currently expose identity, not query I/O.
+can lend bounded query scopes over their captured prefixes.
+
+CommittedView::with_read_view borrows one pin exclusively and caller scratch
+for selection, replay bytes/cells, a record and retained change slots. Reload
+actual selected metadata and compare CURRENT with the session's retained copy.
+Load and validate only the captured active prefix, then run complete physical
+table/history validation before lending ReadView for one callback. This uses
+the existing get/next/change implementation and its per-call work limits.
+Preparation also has explicit byte/row/frame bounds. One monotonic watermark
+and absolute query deadline cover every preparation step, query and callback
+completion. A post-work deadline failure overrides an earlier result; ignoring
+a retired query error cannot produce success. Failure may overwrite scratch
+but releases all temporary descriptors and borrows; the pin may be reused.
+A query failure alone does not retire the serialized writer.
+
+The exclusive pin borrow allows one reader scope per admitted captured slot;
+no reader or scratch borrow escapes the callback. No I/O or callback holds the
+publication mutex or writer mutex. Existing namespace ownership keeps selected
+tables/history immutable and prevents reclamation. Active-prefix readers stop
+at their captured offset even if a later append is complete, partial or failed.
+Only this owned session path permits queries concurrently with physical
+append; standalone append still requires stopped-store exclusion. This
+increment adds no namespace mutation, blob reader or runtime scratch-pool
+lease. Revalidating files per scope and rescanning tables per row is a bounded
+fallback; full-service performance and allocation qualification remain open.
 
 A commit reserves one frame, performs bounded write/sync/confirmation and
 exact ledger reconciliation, releases the empty reservation, then replaces
@@ -621,9 +645,8 @@ them. Drop never repairs files or proves an unwritten frame.
 
 Each commit requires admitted frame work, the actual recovered account
 ledger, and final transaction/blob policy supplied by its future
-coordinator. This does not enable SMTP/JMAP mutations, implement serving
-ReadView, or reconcile recovery orphans/quotas. Those remaining obligations
-still gate service activation.
+coordinator. This does not enable SMTP/JMAP mutations or reconcile recovery
+orphans/quotas. Those remaining obligations still gate service activation.
 
 ### Validating final references and blob data
 
@@ -1489,17 +1512,19 @@ file policy; exact length and inode identity must match the scanned descriptor.
 Constructor refusal appends no bytes and returns Rejected. A repaired tail must
 be rescanned before using this entry point.
 
-JournalAppend holds the writer-lock borrow, append descriptor, selected CURRENT,
-frame borrow and fixed counters. The caller keeps actual stopped-store exclusion
-from scan through append completion, with no live readers or writers. LOCK alone
-is not that barrier. The stable private namespace remains required: reopen checks
-do not protect against same-size external writes. The caller also owns logical
-reservation and full final-view/blob validation. This
-primitive grants none of those authorities. Each advance performs one write of
-at most 64 KiB, a file sync, or final length/EOF confirmation. At most 64 write
-calls are admitted for the complete frame; excessive short writes refuse with
-WouldBlock. Zero writes, impossible counts, Interrupted and other I/O errors
-retire the append. Retried advances on a failed state do no I/O.
+JournalAppend holds the writer-lock borrow, append descriptor, selected
+CURRENT, frame borrow and fixed counters. The caller keeps actual stopped-store
+exclusion from scan through append completion. Only the owned
+JournalSession path may combine its serialized writer with queries of
+retained committed prefixes. LOCK alone is not that barrier. The stable
+private namespace remains required: reopen checks do not protect against
+same-size external writes. The caller also owns logical reservation and full
+final-view/blob validation. This primitive grants none of those authorities.
+Each advance performs one write of at most 64 KiB, a file sync, or final
+length/EOF confirmation. At most 64 write calls are admitted for the
+complete frame; excessive short writes refuse with WouldBlock. Zero writes,
+impossible counts, Interrupted and other I/O errors retire the append.
+Retried advances on a failed state do no I/O.
 
 Every advance error reports Indeterminate; even an apparently early write error
 must not authorize retry, rollback or release of the reservation. Written byte
@@ -1530,8 +1555,8 @@ not implemented here.
 any writes, then binds its exact frame size and operation count to the
 supplied WriterLedger frame reservation. Its selected-journal byte/operation
 totals must match the retained prior boundary. The caller supplies the ledger
-recovered for this account and keeps stopped-store exclusion (no live readers
-or writers) from scan through completion. Matching scalar counts do not
+recovered for this account and keeps the same append exclusion contract
+from scan through completion. Matching scalar counts do not
 establish account or generation identity. Constructor refusal starts no new
 effect and leaves preexisting reservations unchanged.
 
@@ -1560,8 +1585,8 @@ validated sequence and cumulative operation count, derives cumulative frame
 bytes from the retained exact endpoint, and rechecks CURRENT plus reopened
 inode/extent before any write. The old descriptor stays alive through that
 comparison and is then closed. This skips full journal reread/replay; it does
-not skip filesystem identity checks or permit overlapping writers/readers.
-Keep stopped-store exclusion and the same account ledger throughout the chain.
+not skip filesystem identity checks or permit overlapping writers. Keep the
+same append exclusion contract and account ledger throughout the chain.
 
 Constructor refusal consumes/closes the old evidence owner without appending
 bytes or changing existing reservations. A later attempt therefore needs a

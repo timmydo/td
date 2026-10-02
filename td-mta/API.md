@@ -831,9 +831,29 @@ eight) and copies the entire ViewIdentity under a short publication mutex.
 Its borrowed CommittedView retains the session and selected namespace; only
 append beyond an already published prefix can change journal bytes. Drop
 returns the slot. Capacity or mutex contention refuses without waiting;
-poisoning retires new captures. These pins expose only identity and perform
-no filesystem reads. They do not relax low-level append exclusion against
-live query I/O. Serving ReadView remains separate.
+poisoning retires new captures. Capture itself performs no filesystem I/O.
+
+CommittedView::with_read_view exclusively borrows one pin and caller-owned
+selection, overlay, record and change scratch for a callback over ReadView.
+PinnedReadRequest bounds overlay loading, selected table/history validation
+and each query. Reload CURRENT and require the session's unchanged selection;
+load only this pin's prefix, complete the existing physical table/history
+checks, then lend the existing bounded query implementation. One shared
+monotonic clock brackets preparation, callback and completion using the query
+deadline. A callback that ignores a retired reader's error still fails. The
+post-work clock check wins over earlier errors; all failure paths release
+scratch and temporary readers. PinnedReadError retains policy, selection,
+overlay or physical-validation errors. The pin remains usable for another
+scope, and query failure alone does not retire the writer.
+
+The callback cannot retain the reader or its borrowed scratch. Its exclusive
+pin borrow allows only one read scope per captured slot at a time. Existing
+pins can query their old prefix while the session appends beyond it; no
+writer/publication lock is held during reads or callbacks. Tables and retained
+history stay immutable throughout the session. This deliberately rechecks
+physical files per scope and scans tables per row query; it is a bounded
+fallback, not a performance qualification. Runtime scratch-pool leasing,
+blob-body reads and checkpoint/retention transitions remain separate.
 
 JournalSession::commit serializes one immutable frame under a separate
 writer mutex. It installs a frame-only reservation, advances bounded
@@ -857,36 +877,41 @@ leases, checkpoint/retention changes and protocol acknowledgment remain
 external. No selected namespace change is available during this
 fixed-generation session.
 
-`ScannedJournal::append_frame` is a mutation-capable low-level operation outside
-the stopped read-only facade. Keep actual stopped-store exclusion (no live readers
-or writers) from scan through completion. It consumes a scan without a partial tail,
-validates a borrowed successor frame and cumulative journal ceilings, rechecks
-CURRENT and opens the same private inode at the exact scanned length. Constructor
-errors are Rejected before writes. JournalAppend advances through bounded writes,
-sync and final length/EOF confirmation. Any step error permanently retires it and
-reports Indeterminate; Failed/Incomplete finish errors and unfinished drop also
-leave uncertain bytes and charges for recovery.
-Only consuming complete finish yields SyncedAppend endpoint/count evidence.
-Caller reservations, writer serialization, graph policy, deadline/work checks,
-atomic visibility and acknowledgment remain external. No writable handle escapes.
+`ScannedJournal::append_frame` is a mutation-capable low-level operation
+outside the stopped read-only facade. Keep actual stopped-store exclusion
+from scan through completion. The sole exception is JournalSession: its
+serialized writer may coexist with borrowed queries confined to retained
+committed prefixes. It consumes a scan without a partial tail, validates a
+borrowed successor frame and cumulative journal ceilings, rechecks CURRENT
+and opens the same private inode at the exact scanned length. Constructor
+errors are Rejected before writes. JournalAppend advances through bounded
+writes, sync and final length/EOF confirmation. Any step error permanently
+retires it and reports Indeterminate; Failed/Incomplete finish errors and
+unfinished drop also leave uncertain bytes and charges for recovery. Only
+consuming complete finish yields SyncedAppend endpoint/count evidence.
+Caller reservations, writer serialization, graph policy, deadline/work
+checks, atomic visibility and acknowledgment remain external. No writable
+handle escapes.
 
 `ScannedJournal::append_reserved` binds that physical append to the existing
-WriterLedger's exact frame ticket after checking prior journal counts. The caller
-supplies the correct account ledger and stopped-store exclusion (no live readers
-or writers) through completion. ReservedAppend holds an exclusive ledger borrow;
-step errors and unfinished drop stop admission
-and preserve busy charges. Successful finish first obtains durable evidence, then
-reconciles actual frame bytes/operations before returning ReconciledAppend, whose
+WriterLedger's exact frame ticket after checking prior journal counts. The
+caller supplies the correct account ledger and the same append exclusion
+contract through completion. ReservedAppend holds an exclusive ledger
+borrow; step errors and unfinished drop stop admission and preserve busy
+charges. Successful finish first obtains durable evidence, then reconciles
+actual frame bytes/operations before returning ReconciledAppend, whose
 durable evidence is accessible by shared reference only. Constructor refusal
 starts no new effect; bookkeeping refusal after durable I/O is uncertain and
-stops admission. Runtime publication and client acknowledgment remain external.
+stops admission. Runtime publication and client acknowledgment remain
+external.
 
-`ReconciledAppend::append_reserved` consumes a reconciled boundary for the next
-successor without a full rescan. Shared construction retains cumulative sequence,
-byte and operation checks and rechecks CURRENT/inode/extent before writes. Keep
-the same stopped-store/account exclusion and ledger. Refusal consumes the old
-owner but writes nothing; rescan before a later attempt. Successful finish gives
-the next reconciled owner. This grants no live view or publication authority.
+`ReconciledAppend::append_reserved` consumes a reconciled boundary for the
+next successor without a full rescan. Shared construction retains cumulative
+sequence, byte and operation checks and rechecks CURRENT/inode/extent before
+writes. Keep the same append exclusion contract and account ledger. Refusal
+consumes the old owner but writes nothing; rescan before a later attempt.
+Successful finish gives the next reconciled owner. This grants no live view
+or publication authority.
 
 `StoppedStore::capture_journal` wraps a bounded stopped scan using caller frame
 scratch and a physical byte ceiling. Advances yield scalar frame progress or

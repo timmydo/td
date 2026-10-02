@@ -120,8 +120,11 @@ rechecks the selected journal, and serializes append before paired
 sequence/offset publication. Bounded borrowed identity pins retain the
 selected namespace and old prefixes. Any failure after reservation retires
 its writer; a deadline failure following publication can leave visible
-durable state without acknowledgment. Serving ReadView, checkpoint/retention
-transitions and protocol mutations remain unimplemented.
+durable state without acknowledgment. Each pin can lend a bounded ReadView
+scope over its captured prefix, with caller scratch, full physical-file checks
+and one monotonic deadline. Later appended bytes stay invisible to old readers,
+which do not hold the writer lock. Runtime scratch-pool leases,
+checkpoint/retention transitions and protocol mutations remain unimplemented.
 
 Complete mutation-policy validation and mail publication remain unimplemented.
 A one-frame append primitive now validates a successor against a complete
@@ -131,7 +134,7 @@ for recovery; the reservation-bound adapter stops admission on uncertainty
 or abandonment and reconciles exact frame charges only after durable
 completion. The scoped session now couples it to atomic identity visibility.
 A reconciled boundary can start its successor without a full journal rescan,
-while retaining the CURRENT/inode/extent checks and stopped-store exclusion.
+while retaining the CURRENT/inode/extent checks and append exclusion contract.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can

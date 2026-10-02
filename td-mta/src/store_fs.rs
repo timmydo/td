@@ -21,9 +21,10 @@ mod stopped;
 pub use stopped::{
     CaptureError, CaptureStep, CapturedJournal, CheckedData, CheckedFiles, CommitError,
     CommittedView, DataError, DataLimits, DataStep, DataValidation, FileValidation, JournalCapture,
-    JournalError, JournalSession, JournalStart, JournalStartScratch, OwnedVerifyError, ReadLimits,
-    StoppedStore, ValidationError, ValidationLimits, ValidationReadRequest, ValidationStep,
-    ValidationView, VerifiedAccount, VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
+    JournalError, JournalSession, JournalStart, JournalStartScratch, OwnedVerifyError,
+    PinnedReadError, PinnedReadRequest, PinnedReadScratch, ReadLimits, StoppedStore,
+    ValidationError, ValidationLimits, ValidationReadRequest, ValidationStep, ValidationView,
+    VerifiedAccount, VerifiedStore, VerifyError, VerifyLimits, VerifyScratch,
 };
 #[path = "store_fs/selection.rs"]
 mod selection;

@@ -14,6 +14,10 @@ use crate::{
 };
 use std::sync::{atomic::AtomicU64, Mutex, TryLockError};
 
+#[path = "publication/read.rs"]
+mod read;
+pub use read::{PinnedReadError, PinnedReadRequest, PinnedReadScratch};
+
 #[derive(Clone, Copy, Debug)]
 pub struct JournalStart {
     pub max_bytes: u64,
@@ -585,6 +589,501 @@ mod tests {
                 });
             }
         }
+    }
+    fn read_request() -> PinnedReadRequest {
+        let limits = super::super::tests::limits();
+        PinnedReadRequest {
+            overlay_bytes: limits.capture_bytes,
+            files: limits.files,
+            query: super::super::super::ValidationReadRequest {
+                after: crate::ports::ChangeCursor {
+                    sequence: Sequence::from_u64(0),
+                    operation: u32::MAX,
+                },
+                kind: format::ObjectType::Email,
+                deadline: limits.deadline,
+                limits: limits.read,
+            },
+        }
+    }
+    fn inspect_reader(view: &mut dyn crate::ports::ReadView) -> Result<u64, PolicyError> {
+        use crate::{
+            format::{key::Key, Table},
+            ids::BlobId,
+            ports::ChangeStep,
+        };
+        let mut key = [0; 128];
+        let mut value = [0; 128];
+        assert!(view
+            .get(Key::Blob(BlobId::from_bytes([0x44; 16])), &mut value)?
+            .is_none());
+        assert!(view
+            .next(Table::Blobs, None, &mut key, &mut value)?
+            .is_none());
+        let mut cursor = read_request().query.after;
+        let mut last = 0;
+        loop {
+            match view.next_change(cursor, format::ObjectType::Email)? {
+                ChangeStep::Record(record) => {
+                    cursor = record.cursor;
+                    last = last.max(cursor.sequence.number());
+                }
+                ChangeStep::Advanced { through } => {
+                    cursor = crate::ports::ChangeCursor {
+                        sequence: through,
+                        operation: u32::MAX,
+                    };
+                    last = last.max(through.number());
+                }
+                ChangeStep::Complete => return Ok(last),
+            }
+        }
+    }
+    #[test]
+    fn pinned_queries_keep_the_old_prefix_across_append_and_reuse_scratch() {
+        assert!(std::mem::size_of::<SelectionScratch>() <= 5 * 1024);
+        with_ledger(|ledger| {
+            let (_dir, verified, mut startup) = owned_fixture();
+            let mut scratch = super::super::tests::Scratch::new();
+            let clock = TestClock::new(u64::MAX);
+            verified
+                .with_journal(
+                    &Provider,
+                    &clock,
+                    ledger,
+                    start(),
+                    startup.journal(),
+                    |session, _| {
+                        let mut old = session.capture().unwrap();
+                        old.with_read_view(
+                            &Provider,
+                            &clock,
+                            read_request(),
+                            scratch.read(),
+                            |view| {
+                                assert_eq!(view.identity().committed_sequence.number(), 2);
+                                session
+                                    .commit_fixture(
+                                        &Provider,
+                                        &TestClock::new(u64::MAX),
+                                        deadline(),
+                                        &frame(3),
+                                        budget(),
+                                    )
+                                    .unwrap();
+                                assert_eq!(inspect_reader(view)?, 2);
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            old.with_read_view(
+                                &Provider,
+                                &clock,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            2
+                        );
+                        let mut new = session.capture().unwrap();
+                        assert_eq!(
+                            new.with_read_view(
+                                &Provider,
+                                &clock,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            3
+                        );
+                        assert!(matches!(
+                            session.capture(),
+                            Err(JournalError::Policy(PolicyError::Capacity))
+                        ));
+                        drop(new);
+                        drop(old);
+                        drop(session.capture().unwrap());
+                    },
+                )
+                .unwrap();
+        });
+    }
+    #[test]
+    fn pinned_read_deadlines_and_ignored_query_errors_never_return_success() {
+        with_ledger(|ledger| {
+            let (_dir, verified, mut startup) = owned_fixture();
+            let mut scratch = super::super::tests::Scratch::new();
+            let good = TestClock::new(u64::MAX);
+            verified
+                .with_journal(
+                    &Provider,
+                    &good,
+                    ledger,
+                    start(),
+                    startup.journal(),
+                    |session, _| {
+                        let mut pin = session.capture().unwrap();
+                        let baseline = TestClock::new(u64::MAX);
+                        assert_eq!(
+                            pin.with_read_view(
+                                &Provider,
+                                &baseline,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            2
+                        );
+                        let samples = baseline.calls.load(Ordering::Relaxed);
+                        assert!(samples > 20);
+                        for fault in 0..samples {
+                            let clock = TestClock::new(fault);
+                            assert!(
+                                matches!(
+                                    pin.with_read_view(
+                                        &Provider,
+                                        &clock,
+                                        read_request(),
+                                        scratch.read(),
+                                        inspect_reader
+                                    ),
+                                    Err(PinnedReadError::Policy(PolicyError::Deadline))
+                                ),
+                                "fault {fault}"
+                            );
+                        }
+                        assert!(matches!(
+                            pin.with_read_view(
+                                &Provider,
+                                &good,
+                                read_request(),
+                                scratch.read(),
+                                |view| {
+                                    assert_eq!(
+                                        view.next_change(
+                                            read_request().query.after,
+                                            format::ObjectType::Mailbox
+                                        ),
+                                        Err(PolicyError::Invalid)
+                                    );
+                                    Ok(())
+                                }
+                            ),
+                            Err(PinnedReadError::Policy(PolicyError::Invalid))
+                        ));
+                        assert_eq!(
+                            pin.with_read_view(
+                                &Provider,
+                                &good,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            2
+                        );
+                        session
+                            .commit_fixture(
+                                &Provider,
+                                &TestClock::new(u64::MAX),
+                                deadline(),
+                                &frame(3),
+                                budget(),
+                            )
+                            .unwrap();
+                    },
+                )
+                .unwrap();
+        });
+    }
+    #[test]
+    fn pinned_queries_survive_failed_suffixes_and_late_publication() {
+        for (fault, partial) in [(5, false), (5, true), (12, false)] {
+            with_ledger(|ledger| {
+                let (dir, verified, mut startup) = owned_fixture();
+                let mut scratch = super::super::tests::Scratch::new();
+                let good = TestClock::new(u64::MAX);
+                verified
+                    .with_journal(
+                        &Provider,
+                        &good,
+                        ledger,
+                        start(),
+                        startup.journal(),
+                        |session, _| {
+                            let mut old = session.capture().unwrap();
+                            assert!(matches!(
+                                session.commit_fixture(
+                                    &Provider,
+                                    &TestClock::new(fault),
+                                    deadline(),
+                                    &frame(3),
+                                    budget()
+                                ),
+                                Err(CommitError::Stopped(JournalError::Policy(
+                                    PolicyError::Deadline
+                                )))
+                            ));
+                            if partial {
+                                // Simulate a torn suffix after retirement; keep the committed prefix.
+                                let path = dir.path.join(
+                                    Name::account(
+                                        old.identity().account,
+                                        AccountEntry::Journal(
+                                            Number::new(old.identity().segment).unwrap(),
+                                        ),
+                                    )
+                                    .unwrap()
+                                    .as_path()
+                                    .unwrap(),
+                                );
+                                std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(path)
+                                    .unwrap()
+                                    .set_len(old.identity().committed_offset + 7)
+                                    .unwrap();
+                            }
+                            assert_eq!(
+                                old.with_read_view(
+                                    &Provider,
+                                    &good,
+                                    read_request(),
+                                    scratch.read(),
+                                    inspect_reader
+                                )
+                                .unwrap(),
+                                2
+                            );
+                            let mut new = session.capture().unwrap();
+                            assert_eq!(
+                                new.with_read_view(
+                                    &Provider,
+                                    &good,
+                                    read_request(),
+                                    scratch.read(),
+                                    inspect_reader
+                                )
+                                .unwrap(),
+                                if fault == 12 { 3 } else { 2 }
+                            );
+                        },
+                    )
+                    .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn pinned_read_preparation_refuses_insufficient_scratch_and_work() {
+        with_ledger(|ledger| {
+            let (_dir, verified, mut startup) = owned_fixture();
+            let mut scratch = super::super::tests::Scratch::new();
+            let good = TestClock::new(u64::MAX);
+            verified
+                .with_journal(
+                    &Provider,
+                    &good,
+                    ledger,
+                    start(),
+                    startup.journal(),
+                    |session, _| {
+                        let mut pin = session.capture().unwrap();
+                        for mode in 0..6 {
+                            let mut request = read_request();
+                            let mut buffers = scratch.read();
+                            match mode {
+                                0 => request.overlay_bytes = 255,
+                                1 => buffers.frames = &mut [],
+                                2 => buffers.cells = &mut [],
+                                3 => request.files.tables.bytes = 0,
+                                4 => request.files.history.bytes = 0,
+                                5 => request.query.limits.steps = 0,
+                                _ => panic!("unknown read refusal fixture"),
+                            }
+                            let result = pin.with_read_view(
+                                &Provider,
+                                &good,
+                                request,
+                                buffers,
+                                |_| -> Result<(), PolicyError> {
+                                    panic!("invalid preparation reached callback")
+                                },
+                            );
+                            match mode {
+                                0..=2 => {
+                                    assert!(matches!(result, Err(PinnedReadError::Overlay(_))))
+                                }
+                                3 | 4 => assert!(matches!(result, Err(PinnedReadError::Files(_)))),
+                                5 => assert!(matches!(
+                                    result,
+                                    Err(PinnedReadError::Policy(PolicyError::Capacity))
+                                )),
+                                _ => panic!("unknown read refusal fixture"),
+                            }
+                        }
+                        assert_eq!(
+                            pin.with_read_view(
+                                &Provider,
+                                &good,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            2
+                        );
+                    },
+                )
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn pinned_reads_refuse_changed_current_even_with_the_same_manifest_identity() {
+        use crate::ports::Digest;
+        fn hash(bytes: &[u8]) -> [u8; 32] {
+            let mut digest = Provider.sha256().unwrap();
+            digest.update(bytes).unwrap();
+            digest.finish().unwrap()
+        }
+        with_ledger(|ledger| {
+            let (dir, verified, mut startup) = owned_fixture();
+            let mut scratch = super::super::tests::Scratch::new();
+            let good = TestClock::new(u64::MAX);
+            verified
+                .with_journal(
+                    &Provider,
+                    &good,
+                    ledger,
+                    start(),
+                    startup.journal(),
+                    |session, _| {
+                        let mut pin = session.capture().unwrap();
+                        let current = session.store.current;
+                        let current_path = dir.path.join(
+                            Name::account(current.account, AccountEntry::Current)
+                                .unwrap()
+                                .as_path()
+                                .unwrap(),
+                        );
+                        let manifest_path = dir.path.join(
+                            Name::account(
+                                current.account,
+                                AccountEntry::Manifest(Number::new(current.generation).unwrap()),
+                            )
+                            .unwrap()
+                            .as_path()
+                            .unwrap(),
+                        );
+                        let original_current = std::fs::read(&current_path).unwrap();
+                        let original_manifest = std::fs::read(&manifest_path).unwrap();
+                        let mut changed = original_manifest.clone();
+                        changed[format::MANIFEST_PREFIX_BYTES + 24] ^= 1;
+                        let end = changed.len() - 32;
+                        let digest = hash(&changed[..end]);
+                        changed[end..].copy_from_slice(&digest);
+                        assert_eq!(
+                            format::manifest::Manifest::decode(&Provider, &changed)
+                                .unwrap()
+                                .header(),
+                            format::manifest::Manifest::decode(&Provider, &original_manifest)
+                                .unwrap()
+                                .header()
+                        );
+                        let replacement = format::container::Current {
+                            manifest_digest: hash(&changed),
+                            ..current
+                        };
+                        assert_ne!(replacement, current);
+                        let mut encoded = [0; format::CURRENT_BYTES];
+                        replacement.encode(&Provider, &mut encoded).unwrap();
+                        // External corruption fixture; the session exposes no namespace mutation.
+                        std::fs::write(&manifest_path, &changed).unwrap();
+                        std::fs::write(&current_path, encoded).unwrap();
+                        let mut metadata = SelectionScratch::new();
+                        assert_eq!(
+                            session
+                                .store
+                                .store
+                                .load_selection(&Provider, current.account, &mut metadata)
+                                .unwrap()
+                                .current(),
+                            replacement
+                        );
+                        assert!(matches!(
+                            pin.with_read_view(
+                                &Provider,
+                                &good,
+                                read_request(),
+                                scratch.read(),
+                                |_| -> Result<(), PolicyError> {
+                                    panic!("changed CURRENT reached callback")
+                                }
+                            ),
+                            Err(PinnedReadError::Policy(PolicyError::Corrupt))
+                        ));
+                        std::fs::write(manifest_path, original_manifest).unwrap();
+                        std::fs::write(current_path, original_current).unwrap();
+                        assert_eq!(
+                            pin.with_read_view(
+                                &Provider,
+                                &good,
+                                read_request(),
+                                scratch.read(),
+                                inspect_reader
+                            )
+                            .unwrap(),
+                            2
+                        );
+                    },
+                )
+                .unwrap();
+        });
+    }
+    #[test]
+    fn pinned_reads_share_clock_regression_and_source_error_checks_across_phases() {
+        struct FaultClock {
+            calls: AtomicU64,
+            fault: u64,
+            source_error: bool,
+        }
+        impl Clock for FaultClock {
+            fn sample(&self) -> Result<Time, PolicyError> {
+                let fault = self.calls.fetch_add(1, Ordering::Relaxed) == self.fault;
+                if fault && self.source_error {
+                    return Err(PolicyError::Busy);
+                }
+                Ok(Time {
+                    utc_ms: 0,
+                    monotonic: Tick(if fault { 1 } else { 2 }),
+                })
+            }
+        }
+        with_ledger(|ledger| {
+            let (_dir, verified, mut startup) = owned_fixture();
+            let mut scratch = super::super::tests::Scratch::new();
+            let good = TestClock::new(u64::MAX);
+            verified.with_journal(&Provider, &good, ledger, start(), startup.journal(), |session, _| {
+                let mut pin = session.capture().unwrap();
+                let baseline = FaultClock { calls: AtomicU64::new(0), fault: u64::MAX, source_error: false };
+                assert_eq!(pin.with_read_view(&Provider, &baseline, read_request(), scratch.read(), inspect_reader).unwrap(), 2);
+                let samples = baseline.calls.load(Ordering::Relaxed);
+                for source_error in [false, true] {
+                    for fault in u64::from(!source_error)..samples {
+                        let clock = FaultClock { calls: AtomicU64::new(0), fault, source_error };
+                        let result = pin.with_read_view(&Provider, &clock, read_request(), scratch.read(), inspect_reader);
+                        let expected = if source_error { PolicyError::Busy } else { PolicyError::Invalid };
+                        assert!(matches!(result, Err(PinnedReadError::Policy(error)) if error == expected), "fault {fault}, source_error {source_error}");
+                    }
+                }
+                assert_eq!(pin.with_read_view(&Provider, &good, read_request(), scratch.read(), inspect_reader).unwrap(), 2);
+            }).unwrap();
+        });
     }
 
     struct TestClock {

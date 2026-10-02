@@ -81,7 +81,8 @@ pub struct JournalAppend<'r, 'b> {
 }
 impl<'r> ScannedJournal<'r> {
     /// Caller admits full frame validation, owns its reservation, and keeps actual
-    /// stopped-store exclusion through completion (no live readers or writers).
+    /// stopped-store exclusion through completion. Only JournalSession may pair
+    /// its serialized append with borrowed queries of retained committed prefixes.
     /// The stable private namespace remains required; no final-row/blob policy is granted.
     ///
     /// ```compile_fail,E0502
