@@ -1218,7 +1218,14 @@ Initial independently landable increments:
   Cover unread input, partial decoding, completion, rebinding, bad slots,
   clock/work failure and allocation counters. Nested chains and QP remain open.
 
-Implement bounded header unfolding, encoded words, address/date parsing,
+- **M06f — bounded header unfolding:** implemented byte-preserving removal of
+  CRLF/bare-LF folds before SP/HTAB, retaining bare CR and nonfold bytes.
+  Fixed copied state, 256-transition turns and source/output charges support
+  fragments and backpressure without line buffers. Cover every fixture split,
+  short output, replay charges, sticky refusal and allocation counters.
+  Charset/form composition, encoded words, NFC and protocol output remain open.
+
+Implement header-form composition, encoded words, address/date parsing,
 multipart scanning, transfer decoding and part offsets. Implement documented
 charset coverage and error/opaque-body representation. Add deterministic MIME
 serialization for structured outgoing email, including attachment streaming,

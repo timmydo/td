@@ -763,6 +763,13 @@ fragments, malformed UTF-8, replacement diagnostics, completion and sticky
 work refusal. No complete header normalization pipeline or worker-stack
 bound is claimed.
 
+Header unfolding uses at most 16 bytes of copied state, fitting the same
+2 KiB decoder/HTML/snippet state and a future decoding cursor checkpoint. At
+most two output octets await caller capacity; no line or field buffer grows.
+The isolated allocation interval covers single-byte source/output fragments,
+fold/nonfold endings, stable completion and fresh-meter refusal retries with
+unchanged Rust counters. Full header-form composition remains unqualified.
+
 The 32 KiB conversion region has this fixed simultaneous partition: 2 KiB NFC
 segment cells (256 cells), 1 KiB class counts, 1 KiB NFC source checkpoints,
 16 KiB Unicode token scalars, 8 KiB u16 KMP prefix entries, 2 KiB for 64 token

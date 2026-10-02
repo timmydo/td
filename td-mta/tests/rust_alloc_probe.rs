@@ -867,6 +867,76 @@ fn store_read_pool() {
     }
 }
 
+fn mime_unfold() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_unfold::{Decoder, Status},
+        ports::{Deadline, Tick},
+    };
+    fn budget(io: u64) -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: io,
+                output_bytes: 100,
+                ..Charge::default()
+            },
+        )
+    }
+    let before = COUNTERS.snapshot();
+    let mut decoder = Decoder::default();
+    let mut meter = budget(100);
+    let input = b" a\r\n\tb\rx\r\ny";
+    let expected = b" a\tb\rx\r\ny";
+    let mut source = 0;
+    let mut written = 0;
+    let mut done = false;
+    for _ in 0..100 {
+        let end = (source + 1).min(input.len());
+        let mut output = [0; 1];
+        let step = decoder
+            .poll(
+                input.get(source..end).unwrap(),
+                &mut output,
+                end == input.len(),
+                Tick(1),
+                &mut meter,
+            )
+            .unwrap();
+        source += step.consumed;
+        if step.written == 1 {
+            assert_eq!(output.first(), expected.get(written));
+        }
+        written += step.written;
+        if step.status == Status::Complete {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert_eq!(written, expected.len());
+    assert_eq!(
+        decoder
+            .poll(b"ignored", &mut [], true, Tick(100), &mut meter)
+            .unwrap()
+            .status,
+        Status::Complete
+    );
+    let mut decoder = Decoder::default();
+    assert_eq!(
+        decoder.poll(b"a", &mut [0; 1], true, Tick(1), &mut budget(0)),
+        Err(Stop::IoBytes)
+    );
+    let mut fresh = budget(100);
+    let remaining = fresh.remaining();
+    assert_eq!(
+        decoder.poll(b"a", &mut [0; 1], true, Tick(1), &mut fresh),
+        Err(Stop::IoBytes)
+    );
+    assert_eq!(fresh.remaining(), remaining);
+    assert_eq!(COUNTERS.snapshot(), before, "header unfolding allocated");
+}
+
 fn mime_checkpoints() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -1540,6 +1610,7 @@ fn main() {
         mime_headers();
         mime_charset();
         mime_checkpoints();
+        mime_unfold();
         println!("std-temporary-allocation-v1: passed");
         return;
     }
@@ -1626,6 +1697,7 @@ fn main() {
     mime_headers();
     mime_charset();
     mime_checkpoints();
+    mime_unfold();
     journal_overlay();
     journal_merge();
     mailbox_parent_walks();

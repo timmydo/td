@@ -822,6 +822,30 @@ join an owner-bound source checkpoint; restoring it never refunds the shared
 work meter. Unknown-label policy, absent-charset UTF-8 prescan, encoded words,
 NFC, source ownership and protocol projection remain separate.
 
+### 1.16 Byte-preserving header unfolding
+
+mime_unfold::Decoder removes CRLF or bare LF only when followed by SP/HTAB,
+retaining that following whitespace. Bare CR, other line endings, leading
+whitespace, NUL and all other octets pass through unchanged. This is one pass
+over the original bytes: removal never reclassifies an earlier emitted ending
+as a new fold. Field extents come from the header scanner; this primitive does
+not parse fields or apply SMTP line framing, charset replacement, initial-SP
+removal, encoded-word rules or NFC.
+
+Progress uses consumed/written counts with NeedInput, NeedOutput, Yield or
+Complete. Caller buffers may be empty and byte fragments may split either
+ending. Retain the unconsumed suffix and last flag until completion. The fixed
+state retains only a possible ending and at most two pending output bytes.
+Every turn has at most 256 transitions. Charge all source lookahead, including
+bytes revisited after flushing a nonfold ending, and each emitted byte. The
+owning header traversal charges its records. The caller brackets deterministic
+turns with fresh clock/cancellation checks; work refusal is sticky even with a
+fresh meter, and completed state remains stable without work. A refusal may
+leave partial caller output and unreported source progress; discard it and
+never return a partial unfolded value as success. Copied state may later join
+an owner-bound source checkpoint; restoration must retain the live meter and
+owner retirement status, never revive a failed operation with fresh work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -738,6 +738,11 @@ fixed state across source fragments. It preserves valid scalars and reports
 replacement diagnostics; unknown-label heuristics, header filtering, NFC and
 JSON projection remain separate.
 
+A fixed-state unfolding primitive removes accepted line endings only before
+space or tab, retaining the whitespace and every nonfold octet. It supports
+fragmentation and output backpressure within the 32 KiB conversion region;
+form-specific text processing and protocol integration remain separate.
+
 ## 10. HTTP and JMAP
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,
