@@ -516,11 +516,18 @@ after=td-firstboot
 requires=td-firstboot
 timeout=30
 
+[firefox-handoff]
+type=oneshot
+exec=/bin/td-authd prepare-portal-handoff
+after=td-firstboot
+requires=td-firstboot
+timeout=30
+
 [portal]
 type=daemon
 exec=/bin/td-portal supervise --bus /run/td-bus/1000/bus \
      --settings /etc/td-portal-settings
-after=busd,portal-files
+after=busd,portal-files,firefox-handoff
 requires=busd
 ready=/bin/td-login exec-primary -- /bin/td-portal probe \
       --bus /run/td-bus/1000/bus --settings /etc/td-portal-settings
@@ -8169,7 +8176,13 @@ mounts preserve mode-0600 files and map new writes back to human ownership.
 They are nosuid,nodev,noexec; they grant no other human directory. Jail
 resolution verifies their exact source mount identity and rejects nested
 mounts outside that declared source or aliases to protected state. The
-portal retains its separate read-only mapped Downloads view. Grant preparation
+portal retains its separate read-only mapped Downloads view. It also has
+one writable view, `/var/td-portal-files/1000/Opened`, of Firefox's private
+mode-0700 `Opened` directory under Firefox's application home, mapping
+Firefox's UID/GID to the portal's: what the portal writes there is
+Firefox's on disk, which Firefox reads through its read-only `~/Opened`
+grant at `/home/td/Opened`, and no human or other application identity can
+read it (td-authd/DESIGN.md, "Portal handoff"). Grant preparation
 and jail admission resolve the primary UID 1000 through the same bounded,
 root-owned account database reader, deriving `/var/home/NAME` from its
 validated name and canonical home. This lookup changes no application

@@ -138,6 +138,9 @@ pub fn recipe() -> Recipe {
         "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/sbin",
         "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/etc",
         "/home/td-jail-host/Downloads",
+        // Firefox's read-only `~/Opened` grant has no create: its source
+        // must exist before the spec launches.
+        "/home/td-jail-host/Opened",
         "/home/td-jail-host/etc",
         "/home/td-jail-host",
         "/home/td-jail-host/runtime",
@@ -328,6 +331,17 @@ mod tests {
         host_fixture, HOST_DEGRADATION_CGROUP, HOST_DEGRADATION_WAYLAND, HOST_FIREFOX_MARKER,
         HOST_FIREFOX_RUNTIME,
     };
+
+    #[test]
+    fn host_home_holds_every_firefox_source_the_jail_will_not_create() {
+        let host = host_fixture().expect("host fixture");
+        assert!(host.firefox_spec.contains("~/Opened=ro\n"));
+        let steps = super::recipe().steps.expect("steps");
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            crate::types::Step::MkDir { path } if path == "/home/td-jail-host/Opened"
+        )));
+    }
 
     #[test]
     fn host_fixture_exercises_declared_shared_network() {

@@ -32,6 +32,9 @@ pub fn recipe() -> Recipe {
         .and_then(|value| value.with_socket(PermissionSocket::Wayland))
         .and_then(|value| value.with_socket(PermissionSocket::PulseAudio))
         .and_then(|value| value.with_filesystem("xdg-download", FilesystemAccess::ReadWrite, true))
+        // The files the portal's OpenURI.OpenFile copies for Firefox to open,
+        // prepared by td-authd's portal handoff (APPLICATIONS.md §E).
+        .and_then(|value| value.with_filesystem("~/Opened", FilesystemAccess::ReadOnly, false))
         .and_then(|value| value.with_session_bus("org.mozilla.firefox", BusAccess::Own))
         // The remote-control name appends an encoding of the profile; the
         // portal's OpenURI hands links to it (APPLICATIONS.md §E).
@@ -119,14 +122,14 @@ mod tests {
     }
 
     #[test]
-    fn first_policy_is_wayland_pulse_network_download_and_the_firefox_bus_names() {
+    fn first_policy_is_wayland_pulse_network_download_handoff_and_the_firefox_bus_names() {
         let policy = recipe()
             .application_permissions
             .expect("permission policy")
             .to_keyfile();
         assert_eq!(
             policy,
-            "format=1\n\n[Context]\nshared=network\nsockets=wayland;pulseaudio\n\n[Filesystem]\nxdg-download=rw:create\n\n[Session Bus Policy]\norg.mozilla.firefox=own\norg.mozilla.firefox.*=own\n"
+            "format=1\n\n[Context]\nshared=network\nsockets=wayland;pulseaudio\n\n[Filesystem]\nxdg-download=rw:create\n~/Opened=ro\n\n[Session Bus Policy]\norg.mozilla.firefox=own\norg.mozilla.firefox.*=own\n"
         );
     }
 }

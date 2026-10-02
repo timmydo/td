@@ -375,21 +375,30 @@ fn the_production_source_and_raw_boundary_are_closed() {
     let files = include_str!("../src/portal_files.rs");
     assert_eq!(
         fingerprint(files),
-        0xd7a8ac583c441185,
+        0xfe21b1ca9dfaac8a,
         "root portal grant controller changed"
     );
     assert_eq!(files.matches("Command::new(\"/bin/td-authd\")").count(), 1);
-    assert_eq!(files.matches("Command::new(\"/bin/umount\")").count(), 1);
+    // The Downloads view and the Firefox handoff view, each its own fixed path.
+    assert_eq!(files.matches("Command::new(\"/bin/umount\")").count(), 2);
     assert!(files.contains(".arg(VIEW)"));
+    assert!(files.contains(".arg(HANDOFF_VIEW)"));
     assert_eq!(files.matches(".spawn(").count(), 1);
     assert_eq!(
         files.matches("launch::require_launch_startup()?").count(),
-        3
+        5
     );
     assert_eq!(files.matches("mount_sys::new_user_namespace(").count(), 1);
-    assert_eq!(files.matches("mount_sys::clone_directory(").count(), 1);
+    assert_eq!(files.matches("mount_sys::clone_directory(").count(), 2);
     assert_eq!(files.matches("mount_sys::portal_attributes(").count(), 1);
-    assert_eq!(files.matches("mount_sys::publish(").count(), 1);
+    // Only the handoff view is writable, and only Firefox's UID maps to it.
+    assert_eq!(
+        files.matches("mount_sys::application_attributes(").count(),
+        1
+    );
+    assert_eq!(files.matches("namespace_mapping(uid, PORTAL)").count(), 1);
+    assert_eq!(files.matches("admitted_uid(\"firefox\")").count(), 1);
+    assert_eq!(files.matches("mount_sys::publish(").count(), 2);
     let application_files = include_str!("../src/application_files.rs");
     assert_eq!(fingerprint(application_files), 0x7e525df007db68ab);
     assert_eq!(
@@ -481,7 +490,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     // Pin startup as well as raw code: aliases can evade API-name scans.
     assert_eq!(
         fingerprint(main),
-        0xe16cbaffe68dd300,
+        0x948bc212a33ae744,
         "main.rs: production startup changed"
     );
     assert_eq!(

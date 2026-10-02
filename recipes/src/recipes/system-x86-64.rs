@@ -1292,6 +1292,7 @@ const TD_SVC_UNITS: &[&str] = &[
     "claude-launch",
     "fetch-evidence",
     "portal-files",
+    "firefox-handoff",
     "portal",
     "portal-evidence",
     "wayland",
@@ -1638,11 +1639,21 @@ fn build_td_svc_conf() -> String {
          requires=td-firstboot\n\
          timeout=30\n\
          \n\
+         # Root maps Firefox's private handoff directory writable for the\n\
+         # portal, which copies OpenURI.OpenFile's files there for Firefox to\n\
+         # read through its read-only ~/Opened grant.\n\
+         [firefox-handoff]\n\
+         type=oneshot\n\
+         exec=/bin/td-authd prepare-portal-handoff\n\
+         after=td-firstboot\n\
+         requires=td-firstboot\n\
+         timeout=30\n\
+         \n\
          # Root supervises the dedicated service child and retains activation.\n\
          [portal]\n\
          type=daemon\n\
          exec=/bin/td-portal supervise --bus {bus_socket} --settings {portal_settings}\n\
-         after=busd,portal-files\n\
+         after=busd,portal-files,firefox-handoff\n\
          requires=busd\n\
          ready=/bin/td-login exec-primary -- /bin/td-portal probe --bus {bus_socket} --settings {portal_settings}\n\
          ready-timeout=30\n\
@@ -1886,7 +1897,7 @@ fn build_td_svc_conf() -> String {
          type=daemon\n\
          cgroup=session\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
-         after=audio,busd,portal,wayland,firefox-files,firefox-autotest,firefox-tls-origin,placement-evidence\n\
+         after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{firefox_app_id} title=\" || exit 1;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
@@ -2374,6 +2385,7 @@ fn build_shutdown() -> String {
          /bin/td-authd release-application-files mail || {{ echo 'td-shutdown: Mail file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-application-files claude || {{ echo 'td-shutdown: Claude file release failed' >&2; ok=0; }}\n\
          /bin/td-authd release-portal-files || {{ echo 'td-shutdown: portal file release failed' >&2; ok=0; }}\n\
+         /bin/td-authd release-portal-handoff || {{ echo 'td-shutdown: portal handoff release failed' >&2; ok=0; }}\n\
          if /bin/td-util test -e {FIREFOX_XDG_MOUNT_MARKER}; then\n\
            downloads=$(/bin/td-util cat {FIREFOX_XDG_MOUNT_MARKER}) && /bin/umount \"$downloads\" || {{ echo 'td-shutdown: umount Firefox Downloads failed' >&2; ok=0; }}\n\
          fi\n\
@@ -7259,6 +7271,18 @@ mod tests {
             unit_key("portal-files", "requires").as_deref(),
             Some("td-firstboot")
         );
+        // Firefox's handoff view: the portal writes, Firefox reads ~/Opened.
+        assert!(
+            grants.contains(r#"const HANDOFF_VIEW: &str = "/var/td-portal-files/1000/Opened";"#)
+        );
+        assert_eq!(
+            unit_key("firefox-handoff", "exec").as_deref(),
+            Some("/bin/td-authd prepare-portal-handoff")
+        );
+        assert_eq!(
+            unit_key("firefox-handoff", "requires").as_deref(),
+            Some("td-firstboot")
+        );
         let seat = include_str!("../../../td-seatd/src/main.rs");
         assert!(seat.contains(r#"const COMPOSITOR_RUNTIME_NAME: &str = "td-compositor";"#));
         assert!(seat.contains("shared_runtime(human_runtime, COMPOSITOR_RUNTIME_NAME)"));
@@ -7884,7 +7908,8 @@ mod tests {
             ("claude-launch", vec!["claude-files", "busd"]),
             ("fetch-evidence", vec!["fetchd", "firefox-tls-setup"]),
             ("portal-files", vec!["td-firstboot"]),
-            ("portal", vec!["busd", "portal-files"]),
+            ("firefox-handoff", vec!["td-firstboot"]),
+            ("portal", vec!["busd", "portal-files", "firefox-handoff"]),
             ("portal-evidence", vec!["portal", "firefox-tls-setup"]),
             ("wayland", vec!["seat"]),
             ("terminal", vec!["wayland"]),
@@ -7919,6 +7944,7 @@ mod tests {
                     "portal",
                     "wayland",
                     "firefox-files",
+                    "firefox-handoff",
                     "firefox-autotest",
                     "firefox-tls-origin",
                     "placement-evidence",
@@ -8243,7 +8269,7 @@ mod tests {
         assert_eq!(unit_key("portal", "ready"), Some(probe.clone()));
         assert_eq!(
             unit_key("portal", "after").as_deref(),
-            Some("busd,portal-files")
+            Some("busd,portal-files,firefox-handoff")
         );
         assert_eq!(unit_key("portal", "requires").as_deref(), Some("busd"));
         assert_eq!(unit_key("portal", "restart").as_deref(), Some("always"));
@@ -11014,6 +11040,9 @@ mod tests {
         let portal_release = "/bin/td-authd release-portal-files || {";
         assert_eq!(shutdown.matches(portal_release).count(), 1);
         assert!(shutdown.find(portal_release) < shutdown.find(&download_unmount));
+        let handoff_release = "/bin/td-authd release-portal-handoff || {";
+        assert_eq!(shutdown.matches(handoff_release).count(), 1);
+        assert!(shutdown.find(handoff_release) < shutdown.find("/bin/umount /var || {"));
         assert_eq!(shutdown.matches(&xdg_guard).count(), 1);
         assert!(
             shutdown.find(&xdg_guard) < shutdown.find(&download_unmount)

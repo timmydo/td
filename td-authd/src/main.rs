@@ -47,7 +47,8 @@ const USAGE: &str = "usage: td-authd channel-check --peer-uid UID | \
     td-authd terminal-serve --primary --peer-uid UID | \
     td-authd terminal-serve --user USER --uid UID --peer-uid UID | \
     td-authd terminal-exec UID GENERATION HANDLE [task] | td-authd prepare-portal-files | \
-    td-authd release-portal-files | td-authd prepare-application-files APP | \
+    td-authd release-portal-files | td-authd prepare-portal-handoff | \
+    td-authd release-portal-handoff | td-authd prepare-application-files APP | \
     td-authd release-application-files APP | \
     td-authd application-start OWNER APP direct|terminal|shell -- ARG... | \
      td-authd application-exec UID OWNER APP direct|terminal|shell -- ARG... | \
@@ -65,6 +66,12 @@ fn run(arguments: &[String]) -> Result<(), String> {
     }
     if arguments == ["release-portal-files"] {
         return portal_files::release();
+    }
+    if arguments == ["prepare-portal-handoff"] {
+        return portal_files::prepare_handoff();
+    }
+    if arguments == ["release-portal-handoff"] {
+        return portal_files::release_handoff();
     }
     if arguments == ["portal-file-namespace"] {
         return portal_files::namespace_helper();

@@ -86,6 +86,40 @@ from `/`, with a cleared environment and null standard descriptors, then
 requires the mount to be absent. It reports unmount failure; it does not use
 lazy detach or fall back to another path. This uses no new raw syscall surface.
 
+## Portal handoff
+
+The root-only `prepare-portal-handoff` startup operation gives the portal
+one writable directory that Firefox, and only Firefox, reads: the files
+OpenURI.OpenFile copies for Firefox to open (APPLICATIONS.md §E). The
+directory is `Opened` in Firefox's private application home
+`/var/lib/td/applications/UID`, with UID the active, ledger-admitted
+Firefox assignment. Preparation creates it at mode 0700 owned by that UID
+when absent, and otherwise requires exactly that ownership and mode. A
+detached, nonrecursive idmapped clone maps filesystem Firefox UID/GID to
+portal UID/GID 991 with nosuid, nodev and noexec, and is published at the
+root-owned `/var/td-portal-files/1000/Opened`. The portal therefore sees its
+own private directory and every file it creates is Firefox's on disk;
+Firefox's read-only `~/Opened` grant resolves to the same directory at
+`/home/td/Opened`. The human UID and the other applications have no
+mapping and no grant, and the application home's mode 0700 keeps them out
+of the source.
+
+Every component is opened through a retained parent without following
+links, as above. Repeated preparation accepts only the same directory at
+the fixed view with rw, nosuid, nodev and noexec. It uses the existing
+namespace helper with the one-entry map Firefox UID to 991, the existing
+application mount attributes and the existing publication; no syscall,
+flag value or caller-selected path is added. Firefox and the portal order
+after this unit without requiring it: an unavailable view refuses OpenFile
+alone, and the browser still starts. Only a missing or Firefox-unreadable
+directory stops it, since the jail refuses a read-only grant without create
+whose source it cannot use. An interrupted creation leaves a root-owned
+directory, which the next preparation completes when it is still empty and
+private, as application filesystem grants do; a non-empty or wider
+root-owned remnant is refused and needs removing by hand. The
+fixed root-only `release-portal-handoff` operation runs at shutdown beside
+`release-portal-files`, with the same fixed-path unmount and checks.
+
 ## Private channel
 
 Root td-svc creates the socketpair through `pair-exec`; each peer receives
@@ -849,7 +883,9 @@ durable-ledger admission select the UID; no caller supplies a path or map.
 The existing root namespace helper maps filesystem human UID/GID 1000 to
 that application identity. Mount attributes require nosuid, nodev and noexec;
 a cloned read-only source remains read-only and refuses writable admission.
-The portal's separate read-only Downloads view is unchanged.
+The portal's separate read-only Downloads view is unchanged; its writable
+handoff view maps the other way, Firefox's identity to the portal's
+("Portal handoff").
 
 Every directory is opened through a retained parent without following links.
 The human source must be directly owned by UID/GID 1000, and the private

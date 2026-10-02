@@ -1,6 +1,7 @@
-//! Root preparation of the portal's fixed read-only Downloads view.
+//! Root preparation of the portal's fixed read-only Downloads view and
+//! its writable view of Firefox's handoff directory.
 
-use crate::{launch, mount_sys};
+use crate::{application, launch, mount_sys};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -13,6 +14,10 @@ use std::time::Duration;
 const HUMAN: u32 = 1000;
 const PORTAL: u32 = 991;
 const VIEW: &str = "/var/td-portal-files/1000/Downloads";
+/// Where the portal writes the files OpenURI.OpenFile hands Firefox; the
+/// same directory is Firefox's read-only `~/Opened` grant.
+const HANDOFF: &str = "Opened";
+const HANDOFF_VIEW: &str = "/var/td-portal-files/1000/Opened";
 const DEADLINE: Duration = Duration::from_secs(5);
 const MAX_MOUNTINFO: u64 = 1024 * 1024;
 const DIRECTORY_FLAGS: i32 = 0x10000 | 0x20000;
@@ -141,7 +146,14 @@ fn namespace() -> Result<File, String> {
     namespace_for(PORTAL)
 }
 
+/// A user namespace mapping filesystem human UID/GID 1000 to `uid`.
 pub(crate) fn namespace_for(uid: u32) -> Result<File, String> {
+    namespace_mapping(HUMAN, uid)
+}
+
+/// A user namespace mapping filesystem UID/GID `stored` to `seen`, the one
+/// entry an idmapped view applies.
+fn namespace_mapping(stored: u32, seen: u32) -> Result<File, String> {
     let (mut parent, child) = UnixStream::pair().map_err(|e| e.to_string())?;
     parent
         .set_read_timeout(Some(DEADLINE))
@@ -170,7 +182,7 @@ pub(crate) fn namespace_for(uid: u32) -> Result<File, String> {
     // The unreaped direct child cannot have its PID reassigned. It waits on
     // this private endpoint and never delegates it or executes another image.
     let process = PathBuf::from(format!("/proc/{}", child.0.id()));
-    let mapping = format!("{HUMAN} {uid} 1\n");
+    let mapping = format!("{stored} {seen} 1\n");
     fs::write(process.join("uid_map"), &mapping).map_err(|e| e.to_string())?;
     fs::write(process.join("setgroups"), "deny\n").map_err(|e| e.to_string())?;
     fs::write(process.join("gid_map"), &mapping).map_err(|e| e.to_string())?;
@@ -250,6 +262,108 @@ pub(crate) fn release() -> Result<(), String> {
     }
     if mount_options()?.is_some() {
         return Err("file-grant mount remains after unmount".into());
+    }
+    Ok(())
+}
+
+fn require_handoff_view(source: &File, parent: &File, options: &str) -> Result<(), String> {
+    for required in ["rw", "nosuid", "nodev", "noexec"] {
+        if !options.split(',').any(|option| option == required) {
+            return Err(format!("handoff mount lacks {required}"));
+        }
+    }
+    let source = source.metadata().map_err(|e| e.to_string())?;
+    let view = child(parent, HANDOFF, PORTAL, false)?;
+    let view = view.metadata().map_err(|e| e.to_string())?;
+    if source.dev() != view.dev() || source.ino() != view.ino() {
+        return Err("handoff view no longer names Firefox's handoff directory".into());
+    }
+    Ok(())
+}
+
+/// Exposes Firefox's private `Opened` directory, created here at mode 0700
+/// under its application home, as the portal's writable view: filesystem
+/// Firefox UID/GID maps to portal 991, so what the portal writes is
+/// Firefox's on disk and no other identity can read it.
+pub(crate) fn prepare_handoff() -> Result<(), String> {
+    launch::require_launch_startup()?;
+    let uid = application::admitted_uid("firefox")?;
+    let root = directory(Path::new("/"), 0, true)?;
+    let var = child(&root, "var", 0, true)?;
+    let lib = child(&var, "lib", 0, true)?;
+    let td = child(&lib, "td", 0, true)?;
+    let applications = child(&td, "applications", 0, true)?;
+    let home = child(&applications, &uid.to_string(), uid, true)?;
+    if home.metadata().map_err(|e| e.to_string())?.mode() & 0o7777 != 0o700 {
+        return Err("Firefox's application home must have mode 0700".into());
+    }
+    match fs::DirBuilder::new()
+        .mode(0o700)
+        .create(pinned(&home, HANDOFF))
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("create handoff directory: {e}")),
+    }
+    // A root-owned directory is this operation's own creation, possibly
+    // interrupted before its ownership changed: only an empty private one
+    // is completed.
+    let created = fs::symlink_metadata(pinned(&home, HANDOFF)).map_err(|e| e.to_string())?;
+    if created.uid() == 0 {
+        let created = child(&home, HANDOFF, 0, true)?;
+        let mode = created.metadata().map_err(|e| e.to_string())?.mode() & 0o7777;
+        if mode & !0o700 != 0
+            || fs::read_dir(pinned(&created, ""))
+                .map_err(|e| e.to_string())?
+                .next()
+                .is_some()
+        {
+            return Err("an interrupted handoff directory must be empty and private".into());
+        }
+        created
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        std::os::unix::fs::fchown(&created, Some(uid), Some(uid)).map_err(|e| e.to_string())?;
+    }
+    let source = child(&home, HANDOFF, uid, true)?;
+    if source.metadata().map_err(|e| e.to_string())?.mode() & 0o7777 != 0o700 {
+        return Err("Firefox's handoff directory must have mode 0700".into());
+    }
+    let grants = ensure_root_child(&var, "td-portal-files")?;
+    let session = ensure_root_child(&grants, "1000")?;
+    if let Some(options) = mount_options_at(HANDOFF_VIEW)? {
+        return require_handoff_view(&source, &session, &options);
+    }
+    let target = ensure_root_child(&session, HANDOFF)?;
+    let namespace = namespace_mapping(uid, PORTAL)?;
+    let mount = mount_sys::clone_directory(source.as_fd()).map_err(|e| e.to_string())?;
+    mount_sys::application_attributes(mount.as_fd(), namespace.as_fd())
+        .map_err(|e| e.to_string())?;
+    mount_sys::publish(mount.as_fd(), target.as_fd()).map_err(|e| e.to_string())?;
+    let options = mount_options_at(HANDOFF_VIEW)?.ok_or("published handoff mount is missing")?;
+    require_handoff_view(&source, &session, &options)
+}
+
+/// The supervisor calls this after all services stop and before unmounting /var.
+pub(crate) fn release_handoff() -> Result<(), String> {
+    launch::require_launch_startup()?;
+    if mount_options_at(HANDOFF_VIEW)?.is_none() {
+        return Ok(());
+    }
+    let status = Command::new("/bin/umount")
+        .arg(HANDOFF_VIEW)
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("start fixed handoff unmount: {e}"))?;
+    if !status.success() {
+        return Err(format!("fixed handoff unmount failed: {status}"));
+    }
+    if mount_options_at(HANDOFF_VIEW)?.is_some() {
+        return Err("handoff mount remains after unmount".into());
     }
     Ok(())
 }
