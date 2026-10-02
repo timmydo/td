@@ -378,6 +378,32 @@ CompleteBlob retains the read-only file, account/ID/kind and observed digest.
 This verifies supplied blob bytes only. Full selected-graph, replay and final
 owning-reference validation remain required before mutation or serving.
 
+`store_fs::BlobSweep` connects final blob-row enumeration to that verifier.
+Each advance performs one ReadView next, one private blob open, one bounded
+read/hash chunk, or one blob completion. It never reads a whole message into
+memory. Copy the typed ID/BlobRow before returning from enumeration, then
+reuse the caller's value partition as the chunk buffer. A nonempty unread
+blob requires nonempty scratch; zero-length input still opens and completes
+through physical EOF and the empty digest. Drop the completed read-only handle
+before proceeding to another blob.
+
+Require strict blob-key order, locally valid rows and sequence ceilings under
+one captured view. Check identity before/after every phase, with movement taking
+precedence over its result. Admit finite row and cumulative declared-byte
+allowances before each open, counting only verified blobs and lengths. An
+excess row or byte requirement refuses before file I/O for that blob. Exact
+budgets still permit enumeration EOF. All errors retire the coordinator;
+incomplete/failed state cannot finish and repeated completion still checks
+identity without more I/O. Completion requires every enumerated file verified
+and blob-table EOF; report captured identity, blob count and byte count.
+
+This verifies the files named by supplied final blob rows, including uploads.
+It does not establish completeness of the ReadView, which blobs own live
+references, actual pins or authorization. The caller must retain a real
+immutable view or stopped-store exclusion and admit each next's full work plus
+bounded chunk work and deadline checks. The cooperative LOCK alone does not
+provide thread exclusion. Historical journal rows are not enumerated here.
+
 ### Loading the selected metadata
 
 `LockedRoot::load_selection` is the first recovery input step. Its caller must

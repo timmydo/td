@@ -95,6 +95,7 @@ pub fn run(mut snapshot: impl FnMut()) {
     drop(super::super::active::prepare_probe(&long.root));
     for fixture in [&short, &long] {
         super::super::blob::prepare_probe(&fixture.root);
+        super::super::blob_sweep::prepare_probe(&fixture.root);
     }
     let repair_update = super::super::input::prepare_repair_probe();
     let recovery_probe = super::super::input::prepare_recovery_probe();
@@ -104,6 +105,7 @@ pub fn run(mut snapshot: impl FnMut()) {
     snapshot();
     for fixture in [&short, &long] {
         super::super::blob::probe(&fixture.root);
+        super::super::blob_sweep::probe(&fixture.root);
         super::super::selection::probe(&fixture.root, &mut selection_scratch);
         super::super::table::probe(&fixture.root, &table_probe, &mut table_scratch);
         super::super::history::probe(

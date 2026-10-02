@@ -774,6 +774,14 @@ key bytes before reusing value scratch, and reports row/table progress separatel
 from completion. Completion carries row counts and the same UTC sample; full
 physical graph/aggregate validity, parent chains, blobs and pins stay external.
 
+`store_fs::BlobSweep` walks supplied final blob rows and verifies each named
+private file. Enumeration, opening, one bounded chunk and digest/EOF completion
+are separate advances. Row/total-byte limits precede file opening and full view
+identity is checked around each phase. Source value scratch is reused for
+chunks after scalar row detachment. Completion requires all enumerated files
+verified and table EOF; it records identity/counts and grants no pin, reference
+ownership or physical-enumeration completeness authority.
+
 `mailbox_sweep::Sweep` enumerates mailboxes and checks each complete parent
 chain, at most one next or get per advance. Separate row and total-get budgets
 bound admitted work without a growing visited set. Completion requires mailbox

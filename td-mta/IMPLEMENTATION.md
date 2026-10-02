@@ -948,6 +948,13 @@ service activation. Each part lands independently:
     exhausted work, corrupt/moved lookups and duplicate/descending enumeration.
     Allocation probes cover populated/empty fixtures. Physical completeness,
     configured depth policy and runtime pins remain separate.
+  - **M05d19 — final blob file sweep:** implemented ordered final blob rows
+    connected to private-file opening, bounded chunk hashing and digest/EOF completion.
+    Separate row/total-byte admission and full identity checks precede success;
+    reuse value scratch after detaching scalar source data. Tests cover empty
+    files/views, cumulative limits, late corruption, missing files, source/order
+    faults and view movement through every phase. Existing allocation probes
+    cover fixed prepared files. Physical view completeness and actual pins remain.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

@@ -154,6 +154,14 @@ still account for those costs and concurrent owners within the ledger.
   gets; the admission budget must account for that cost
   and each lookup's full physical work. Allocation probes cover rooted shared
   chains and an empty forest using fixed slices and result scratch.
+  BlobSweep retains one private BlobInput/digest, a copied pending BlobRow,
+  prior ID and scalar progress. With the shipped Provider its compiled state
+  fits 1 KiB on the worker stack; there is no new arena. Enumeration value
+  scratch becomes the at-most-64-KiB chunk buffer after row detachment. Finite
+  row and cumulative-byte allowances precede opens; only one file is retained.
+  Each step admits one next/open/read/completion operation and its deadline.
+  Allocation probes cover empty/populated views and row/byte refusal over
+  prepared files at both supported root lengths.
   Frame-change collection has its own 4096 slots of at most 24 bytes each,
   a separate 96 KiB reservation per view. Retained changes may coexist with
   get/next result storage; their memory never aliases those partitions. This

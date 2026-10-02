@@ -21,6 +21,9 @@ pub use selection::{SelectionError, SelectionScratch, SelectionStage};
 #[path = "store_fs/blob.rs"]
 mod blob;
 pub use blob::{BlobInput, BlobInputError, CompleteBlob};
+#[path = "store_fs/blob_sweep.rs"]
+mod blob_sweep;
+pub use blob_sweep::{BlobSweep, BlobSweepError, BlobSweepStep, CompleteBlobSweep};
 #[path = "store_fs/table.rs"]
 mod table;
 pub use table::{

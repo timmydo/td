@@ -81,11 +81,13 @@ source transitions with the same arena. Actual view-pin integration remains
 separate.
 Direct owning references now have a bounded supplied-row checker with at most
 two lookups. A supplied-view sweep now enumerates direct checks in bounded
-steps with fixed counts; physical graph completeness, blob verification and
-aggregate invariants remain. An ordered recipient sweep now verifies exact
+steps with fixed counts; physical graph completeness and remaining aggregate
+invariants still need coordination. An ordered recipient sweep now verifies exact
 submission recipient-count/ordinal coverage separately from queue state policy.
 A mailbox sweep now enumerates and roots every supplied parent chain with
-separate row/get budgets and no growing visited set.
+separate row/get budgets and no growing visited set. A blob sweep connects
+final rows to private-file, chunked digest and EOF verification under finite
+row/byte budgets.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
