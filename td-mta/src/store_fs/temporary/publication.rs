@@ -1,6 +1,26 @@
-//! Non-replacing blob publication; no metadata commit or admission authority.
+//! Non-replacing file publication; no metadata commit or admission authority.
 use super::*;
-use crate::{format::row::BlobKind, ids::BlobId};
+use crate::{
+    format::{row::BlobKind, Table},
+    ids::BlobId,
+};
+
+/// Fresh unselected metadata only. CURRENT cannot be named by this type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetadataDestination {
+    Table(Number, Table),
+    Manifest(Number),
+    Journal(Number),
+}
+impl MetadataDestination {
+    fn entry(self) -> AccountEntry {
+        match self {
+            Self::Table(generation, table) => AccountEntry::Table(generation, table),
+            Self::Manifest(generation) => AccountEntry::Manifest(generation),
+            Self::Journal(segment) => AccountEntry::Journal(segment),
+        }
+    }
+}
 
 /// Last established boundary, not proof of absence after a failed mutation.
 /// Every failure retains logical charges until explicit cleanup or recovery.
@@ -15,11 +35,11 @@ pub enum PublishError {
 impl std::fmt::Display for PublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Rejected(_) => "blob publication refused before linking",
-            Self::LinkAttempted(_) => "blob link has uncertain effects",
-            Self::Linked(_) => "blob linked but destination sync failed",
-            Self::DestinationSynced(_) => "blob destination synced but temporary unlink failed",
-            Self::TemporaryUnlinked(_) => "blob temporary removed but parent sync failed",
+            Self::Rejected(_) => "file publication refused before linking",
+            Self::LinkAttempted(_) => "file link has uncertain effects",
+            Self::Linked(_) => "file linked but destination sync failed",
+            Self::DestinationSynced(_) => "file destination synced but temporary unlink failed",
+            Self::TemporaryUnlinked(_) => "file temporary removed but parent sync failed",
         })
     }
 }
@@ -69,15 +89,31 @@ impl<'a> SyncedTemporary<'a> {
     ) -> Result<PublishedFile<'a>, PublishError> {
         self.publish_using(kind, id, Real)
     }
+    /// Publish a fresh table, manifest or initial journal into pre-existing
+    /// durable parents. The caller checks format/digest and selected reachability;
+    /// publication neither selects a generation nor grants journal append access.
+    pub fn publish_metadata(
+        self,
+        destination: MetadataDestination,
+    ) -> Result<PublishedFile<'a>, PublishError> {
+        self.publish_entry_using(destination.entry(), Real)
+    }
     fn publish_using(
         self,
         kind: BlobKind,
         id: BlobId,
+        ops: impl Operations,
+    ) -> Result<PublishedFile<'a>, PublishError> {
+        self.publish_entry_using(AccountEntry::Blob(kind, id), ops)
+    }
+    fn publish_entry_using(
+        self,
+        entry: AccountEntry,
         mut ops: impl Operations,
     ) -> Result<PublishedFile<'a>, PublishError> {
         let output = self.file;
         let root = &output._owner.root.directory;
-        let name = Name::account(output.account, AccountEntry::Blob(kind, id))
+        let name = Name::account(output.account, entry)
             .map_err(|_| PublishError::Rejected(io::ErrorKind::InvalidInput.into()))?;
         let mut source_buffer = [0; MAX_PATH_BYTES];
         let source = root
@@ -152,6 +188,37 @@ impl Operations for Real {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(super) fn probe(root: &LockedRoot, account: AccountId) {
+    let generation = Number::new(u64::MAX).unwrap();
+    for (index, destination) in [
+        MetadataDestination::Table(generation, Table::ThreadAnchors),
+        MetadataDestination::Manifest(generation),
+        MetadataDestination::Journal(generation),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for collision in [false, true] {
+            let mut file = root
+                .create_temporary(account, Number::new(200 + index as u64).unwrap(), 5)
+                .unwrap();
+            file.write(b"hello").unwrap();
+            let result = file.sync().unwrap().publish_metadata(destination);
+            if collision {
+                assert!(
+                    matches!(result, Err(PublishError::Rejected(e)) if e.kind() == io::ErrorKind::AlreadyExists)
+                );
+            } else {
+                let file = result.unwrap();
+                assert_eq!(
+                    file.name(),
+                    &Name::account(account, destination.entry()).unwrap()
+                );
+                let mut output = [0; 5];
+                assert_eq!(file.read_at(0, &mut output).unwrap(), 5);
+                assert_eq!(&output, b"hello");
+            }
+        }
+    }
     let mut bytes = [0xff; 16];
     for point in 0..10 {
         *bytes.last_mut().unwrap() = point.min(8) as u8;
@@ -283,6 +350,87 @@ mod tests {
             assert_eq!(fs::read(&target).unwrap(), b"prior");
             assert_eq!(fs::read(&source).unwrap(), b"hello");
         }
+    }
+
+    #[test]
+    fn metadata_names_are_exclusive_and_do_not_select_current() {
+        let fixture = Fixture::new();
+        let root = fixture.locked();
+        setup(&root);
+        let generation = Number::new(u64::MAX).unwrap();
+        for entry in [
+            AccountEntry::Metadata,
+            AccountEntry::Checkpoints,
+            AccountEntry::Checkpoint(generation),
+            AccountEntry::Journals,
+        ] {
+            root.create_account_directory(ACCOUNT, entry).unwrap();
+        }
+        let checkpoint =
+            "accounts/03030303030303030303030303030303/metadata/checkpoints/18446744073709551615";
+        let tables = [
+            (Table::Blobs, "blobs.tbl"),
+            (Table::Mailboxes, "mailboxes.tbl"),
+            (Table::Emails, "emails.tbl"),
+            (Table::Memberships, "memberships.tbl"),
+            (Table::Keywords, "keywords.tbl"),
+            (Table::Threads, "threads.tbl"),
+            (Table::ThreadAnchors, "thread-anchors.tbl"),
+            (Table::Submissions, "submissions.tbl"),
+            (Table::Recipients, "recipients.tbl"),
+            (Table::Leases, "leases.tbl"),
+            (Table::Imports, "imports.tbl"),
+        ];
+        let mut destinations: Vec<_> = tables
+            .into_iter()
+            .map(|(table, name)| {
+                (
+                    MetadataDestination::Table(generation, table),
+                    format!("{checkpoint}/{name}"),
+                )
+            })
+            .collect();
+        destinations.extend([
+            (MetadataDestination::Manifest(generation), format!("{checkpoint}/manifest")),
+            (MetadataDestination::Journal(generation), "accounts/03030303030303030303030303030303/metadata/journal/18446744073709551615.log".to_owned()),
+        ]);
+        for (index, (destination, expected)) in destinations.into_iter().enumerate() {
+            let number = index as u64 + 1;
+            let source = path(
+                &fixture,
+                AccountEntry::TemporaryFile(Number::new(number).unwrap()),
+            );
+            let target = fixture.path.join(&expected);
+            let file = temporary(&root, number)
+                .publish_metadata(destination)
+                .unwrap();
+            assert_eq!(file.name().as_str().unwrap(), expected);
+            assert!(!source.exists());
+            assert_eq!(fs::read(&target).unwrap(), b"hello");
+            assert_eq!(fs::metadata(&target).unwrap().nlink(), 1);
+            drop(file);
+            fs::write(&target, b"prior").unwrap();
+            assert!(
+                matches!(temporary(&root, number).publish_metadata(destination), Err(PublishError::Rejected(e)) if e.kind() == io::ErrorKind::AlreadyExists)
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"prior");
+            assert_eq!(fs::read(&source).unwrap(), b"hello");
+        }
+        assert!(!path(&fixture, AccountEntry::Current).exists());
+        // Missing generations cannot be silently created or selected.
+        assert!(
+            matches!(temporary(&root, 20).publish_metadata(MetadataDestination::Manifest(Number::new(1).unwrap())), Err(PublishError::Rejected(e)) if e.kind() == io::ErrorKind::NotFound)
+        );
+        assert!(!path(&fixture, AccountEntry::Checkpoint(Number::new(1).unwrap())).exists());
+        assert!(!path(&fixture, AccountEntry::Manifest(Number::new(1).unwrap())).exists());
+        assert_eq!(
+            fs::read(path(
+                &fixture,
+                AccountEntry::TemporaryFile(Number::new(20).unwrap())
+            ))
+            .unwrap(),
+            b"hello"
+        );
     }
 
     #[test]

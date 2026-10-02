@@ -29,6 +29,10 @@ impl Fixture {
             create_directory(&parent);
         }
         for entry in [
+            AccountEntry::Metadata,
+            AccountEntry::Checkpoints,
+            AccountEntry::Checkpoint(Number::new(u64::MAX).unwrap()),
+            AccountEntry::Journals,
             AccountEntry::Messages,
             AccountEntry::Shard(crate::format::row::BlobKind::Message, 0xff),
         ] {

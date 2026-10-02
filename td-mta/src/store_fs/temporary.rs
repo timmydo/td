@@ -1,7 +1,7 @@
 //! Private output and consuming immutable publication under the writer lock.
 #[path = "temporary/publication.rs"]
 mod publication;
-pub use publication::{PublishError, PublishedFile};
+pub use publication::{MetadataDestination, PublishError, PublishedFile};
 #[cfg(test)]
 #[path = "temporary/probe.rs"]
 pub mod probe;

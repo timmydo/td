@@ -159,8 +159,8 @@ never synthesize a passing sample. No external command or host probe is needed.
 Operators provision disk headroom and may monitor it with their ordinary tools.
 
 Create private files with `OpenOptions::create_new` and mode 0600, directories
-with `DirBuilder` and mode 0700. Blob publication uses `hard_link` to publish
-immutable completed files without replacing an existing destination, then syncs
+with `DirBuilder` and mode 0700. Blob/metadata publication uses `hard_link` to publish
+completed files without replacing or modifying an existing destination, then syncs
 the destination directory before removing/syncing the temporary link. Source
 and destination must share a filesystem. CURRENT uses same-directory temporary
 creation, file sync, atomic `rename` replacement and parent-directory sync.
@@ -289,6 +289,16 @@ a bounded caller-buffer read API and the LOCK borrow; it exposes no writable
 handle. The temporary parent is released. This primitive establishes neither
 hash validation nor quota authority, and does not produce `ports::PublishedBlob`
 or commit a transaction. No success acknowledgement follows from it alone.
+
+`SyncedTemporary::publish_metadata` uses the same operation sequence and error
+stages. Its MetadataDestination admits only a generation's table/manifest or a
+fresh journal segment, always in the originating account. No directory, CURRENT,
+LOCK or FORMAT name is expressible. Checkpoint/journal parents must already be
+private and durable; missing generations refuse rather than being created.
+The caller proves the name fresh/unselected and validates the table, manifest
+or initial journal before publishing. Opaque temporary bytes can be published
+by this low-level adapter; it does not certify their format. Journal append
+access, graph validation and CURRENT selection remain separate operations.
 
 `PublishError` records the last established boundary:
 

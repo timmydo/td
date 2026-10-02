@@ -33,8 +33,9 @@ exclusion. Physical EOF, selected-graph validation,
 complete final-view semantics and committed mail publication remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
-and parent. Completed private blobs can be published without replacement using
-std hard-link and directory-sync operations. These low-level primitives grant
+and parent. Completed private blobs and fresh table/manifest/journal files can
+be published without replacement using std hard-link and directory-sync
+operations. These low-level primitives grant
 no transaction, hash or admission authority.
 [WIRE.md](WIRE.md) pins implemented wire-ID and
 MIME-part locator codecs separately from the future protocol handlers.

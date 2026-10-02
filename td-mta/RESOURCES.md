@@ -573,7 +573,9 @@ exclusive create/prepare, 4 KiB write/read/sync/drop, existing-name collision,
 byte-limit and read-offset refusal, missing ancestors, injected open/preparation
 and sync failures, Interrupted attempt exhaustion, retired output refusal and
 unexpected early EOF. Blob publication adds link/sync/unlink/sync success,
-collision and errors before/after every effect boundary, plus bounded reads.
+collision and errors before/after every effect boundary, plus bounded reads. Fresh metadata publication additionally
+covers table, manifest and journal destinations with maximum numeric components,
+including success and collision refusal at both root bounds.
 PublishedFile retains one File, one Name, completed length and the LOCK borrow;
 publication uses fixed source/destination paths and transient directory handles.
 It requires unchanged Rust allocation/deallocation

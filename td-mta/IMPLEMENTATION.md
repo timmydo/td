@@ -664,6 +664,14 @@ service activation. Each part lands independently:
         Host/musl allocation probes cover success, collisions and errors at
         every mutation/sync boundary. Transaction/admission coupling remains
         M05c; CURRENT replacement and recovery remain separate work.
+      - **M05b2c4 — fresh metadata publication:** implemented a closed typed
+        destination for tables, manifests and initial journal segments through
+        the same non-replacing publication sequence. Names remain bound to the
+        temporary file's account; CURRENT is not expressible. Missing parents
+        refuse. Tests cover all table tags and unchanged collisions; allocation
+        probes cover each metadata role at maximum generation/root lengths.
+        Format validation, selected reachability and append authority remain
+        caller/recovery responsibilities. CURRENT replacement follows.
     - **M05b2d — input files:** std type/link/owner/mode checks under SCHEMA.md,
       bounded reading through EOF and opened-file identity checks. Deployment
       uses the data-root owner as its trusted expected service identity.
