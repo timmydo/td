@@ -24,6 +24,29 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         });
     }
 }
+/// The disclosure mark in a slot whose top left is `(x, y)`: a box nine
+/// logical pixels square with a minus, and a plus while collapsed, drawn
+/// as fills so it is one crisp mark at every scale in either face. The
+/// offsets place it in the `INDENT`-wide slot of a `ROW`-tall row (16 by
+/// 24), centred on the row's text; no two fills cover the same pixel.
+fn disclosure_box(x: i64, y: i64, scale: u32, expanded: bool) -> [Option<Rect>; 7] {
+    let s = i64::from(scale);
+    let rect = |left: i64, top: i64, width: u32, height: u32| Rect {
+        x: x + left * s,
+        y: y + top * s,
+        width: width * scale,
+        height: height * scale,
+    };
+    [
+        Some(rect(3, 8, 9, 1)),
+        Some(rect(3, 16, 9, 1)),
+        Some(rect(3, 9, 1, 7)),
+        Some(rect(11, 9, 1, 7)),
+        Some(rect(5, 12, 5, 1)),
+        (!expanded).then(|| rect(7, 10, 1, 2)),
+        (!expanded).then(|| rect(7, 13, 1, 2)),
+    ]
+}
 impl<I: Copy + Ord> Controller<I> {
     fn text(
         &self,
@@ -200,23 +223,17 @@ impl<I: Copy + Ord> Controller<I> {
                 };
                 self.text(text, cell, origin, style, damage, sink);
                 if column == 0 && row.children {
-                    if let Some(disclosure) = g.disclosure(index, row.depth) {
-                        let full = Rect {
-                            x: cell.rect.x + i64::from(u32::from(row.depth) * INDENT * scale),
-                            width: INDENT * scale,
-                            ..cell.rect
-                        };
-                        self.text(
-                            if row.expanded { "v" } else { ">" },
-                            CellRect {
-                                rect: full,
-                                clip: disclosure,
-                            },
-                            full.x + 4 * i64::from(scale),
-                            style,
-                            damage,
-                            sink,
-                        );
+                    if let Some(clip) = g
+                        .disclosure(index, row.depth)
+                        .and_then(|disclosure| disclosure.intersection(damage))
+                    {
+                        let x = cell.rect.x + i64::from(u32::from(row.depth) * INDENT * scale);
+                        for rect in disclosure_box(x, cell.rect.y, scale, row.expanded)
+                            .into_iter()
+                            .flatten()
+                        {
+                            fill(rect, ink, clip, sink);
+                        }
                     }
                 }
             }

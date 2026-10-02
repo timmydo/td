@@ -676,3 +676,125 @@ fn roster_ceiling_leaves_room_for_one_synthetic_root() {
     )
     .is_err());
 }
+/// The fills drawn wholly inside a disclosure slot, with their clips and
+/// colours, and how many glyphs land in it.
+fn slot_marks(c: &Controller<u32>, slot: Rect, damage: Rect) -> (Vec<(Rect, Rect, u32)>, usize) {
+    use td_ui::raster::Primitive;
+    use td_ui::tree_table::Cell;
+    let mut fills = Vec::new();
+    let mut glyphs = 0;
+    c.emit(
+        None,
+        damage,
+        &mut |_, _| Cell::new("worker").unwrap(),
+        &mut |draw| match draw.primitive {
+            Primitive::Fill { rect, color } if slot.intersection(rect) == Some(rect) => {
+                fills.push((draw.clip, rect, color))
+            }
+            Primitive::Glyph { x, y, .. } if slot.contains(x, y) => glyphs += 1,
+            _ => {}
+        },
+    );
+    (fills, glyphs)
+}
+#[test]
+fn disclosure_is_a_drawn_box_with_a_plus_or_minus_at_every_scale() {
+    use td_ui::raster::{INK, PAPER};
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let surface = Surface::new(
+            700 * scale as usize,
+            400 * scale as usize,
+            Scale::new(scale).unwrap(),
+        )
+        .unwrap();
+        let rect = Rect {
+            x: 20 * s,
+            y: 20 * s,
+            width: 640 * scale as u32,
+            height: 320 * scale as u32,
+        };
+        let open = Row {
+            children: true,
+            expanded: true,
+            ..row(1)
+        };
+        let child = Row {
+            parent: Some(1),
+            depth: 1,
+            children: true,
+            ..row(2)
+        };
+        let leaf = Row {
+            parent: Some(1),
+            depth: 1,
+            ..row(3)
+        };
+        let mut c = Controller::new(model(&[open, child, leaf]), surface, rect).unwrap();
+        let g = c.geometry().unwrap();
+        // The box's four sides and a minus; a plus adds the upright, in
+        // two halves so no pixel is filled twice.
+        let expected = |slot: Rect, expanded: bool| {
+            let at = |x: i64, y: i64, w: i64, h: i64| Rect {
+                x: slot.x + x * s,
+                y: slot.y + y * s,
+                width: (w * s) as u32,
+                height: (h * s) as u32,
+            };
+            let mut marks = vec![
+                at(3, 8, 9, 1),
+                at(3, 16, 9, 1),
+                at(3, 9, 1, 7),
+                at(11, 9, 1, 7),
+                at(5, 12, 5, 1),
+            ];
+            if !expanded {
+                marks.push(at(7, 10, 1, 2));
+                marks.push(at(7, 13, 1, 2));
+            }
+            marks.sort_by_key(|r| (r.x, r.y, r.width, r.height));
+            marks
+        };
+        for (index, depth, expanded) in [(0usize, 0u16, true), (1, 1, false)] {
+            let slot = g.disclosure(index, depth).unwrap();
+            let (fills, glyphs) = slot_marks(&c, slot, slot);
+            let mut shape: Vec<Rect> = fills.iter().map(|(_, rect, _)| *rect).collect();
+            shape.sort_by_key(|r| (r.x, r.y, r.width, r.height));
+            assert_eq!(shape, expected(slot, expanded), "scale {scale} row {index}");
+            assert!(fills.iter().all(|(_, _, color)| *color == INK));
+            assert_eq!(glyphs, 0, "no text mark in the slot");
+            // A repaint cutting through the box draws only inside both.
+            let damage = Rect {
+                x: slot.x + 6 * s,
+                width: 3 * scale as u32,
+                ..slot
+            };
+            let (cut, _) = slot_marks(&c, slot, damage);
+            assert!(!cut.is_empty());
+            for (clip, _, _) in cut {
+                assert_eq!(clip.intersection(damage), Some(clip));
+                assert_eq!(clip.intersection(slot), Some(clip));
+            }
+        }
+        for (i, a) in expected(rect, false).iter().enumerate() {
+            for b in expected(rect, false).iter().skip(i + 1) {
+                assert_eq!(a.intersection(*b), None, "{a:?} overlaps {b:?}");
+            }
+        }
+        // A row without children has no mark.
+        let leaf_slot = g.disclosure(2, 1).unwrap();
+        let (fills, glyphs) = slot_marks(&c, leaf_slot, leaf_slot);
+        assert!(fills.is_empty() && glyphs == 0);
+        // A focused selection draws the box in paper, as its text; an
+        // unfocused one keeps the ink.
+        let slot = g.disclosure(0, 0).unwrap();
+        c.select(Some(1), false);
+        c.set_focus(Focus::Rows).unwrap();
+        let (fills, _) = slot_marks(&c, slot, slot);
+        assert_eq!(fills.len(), 5);
+        assert!(fills.iter().all(|(_, _, color)| *color == PAPER));
+        c.set_focus(Focus::None).unwrap();
+        let (fills, _) = slot_marks(&c, slot, slot);
+        assert!(fills.iter().all(|(_, _, color)| *color == INK));
+    }
+}

@@ -2391,7 +2391,11 @@ or I/O. Returned text must outlive the complete emit call; a callback cannot
 return a borrow into its mutable formatting scratch. Consumers prepare
 numeric strings in a bounded visible cache before painting.
 Numeric columns align right; the first column reserves 16 logical pixels
-per hierarchy level and a disclosure slot, clipped to that column.
+per hierarchy level and a disclosure slot, clipped to that column. A row
+with children shows its disclosure as a box nine logical pixels square in
+the row's ink, holding a minus, and a plus while collapsed; it is drawn
+as fills rather than a glyph, none overlapping another, so it is the same
+crisp mark at every scale in either face.
 
 `Controller` owns the model and stable selection. A model replacement
 preserves selection and the first visible anchor by ID when present
@@ -2440,7 +2444,10 @@ The consumer owns physical key bindings and focus traversal.
 Tests cover bounded hierarchy and text validation, stable ID/anchor
 replacement, stale and interrupted gestures, disclosure and navigation,
 scrollbar capture, horizontal header/cell/hit alignment, visible-only
-formatting, fallback and scale 1-4 clipping/partial-repaint pixel oracles.
+formatting, fallback and scale 1-4 clipping/partial-repaint pixel oracles,
+and the disclosure box's exact plus and minus, its colour on a focused
+selection, its clipping to partial damage and its absence on a leaf, at
+scales 1-4.
 
 ## Task-manager widgets
 
