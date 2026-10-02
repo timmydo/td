@@ -94,6 +94,7 @@ for td's shell and userland. It implements:
 - pointer reporting: tracking modes 9, 1000, 1002 and 1003 and SGR's
   encoding, mode 1006, each initially off and cleared by terminal reset,
   reported as §3 says;
+- OSC 0 and OSC 2 window titles, which §4's toplevel shows;
 - OSC 8 hyperlinks, which name the cells written in them, followed as
   §3 says; and
 - OSC 133;A shell-prompt marks, which §3's prompt chords jump between.
@@ -136,11 +137,20 @@ terminal implements it.
 Unsupported CSI operations are ignored as complete sequences. DCS, SOS,
 APC, and PM strings enter allocation-free streaming ignore states and cannot
 execute commands or open paths. An OSC's payload is kept, to 4 KiB, and an
-OSC 8 or OSC 133;A is acted on when BEL or ESC, the start of ST, ends it;
-one that outgrows the bound is dropped whole, and every other OSC is
-ignored. CAN and SUB cancel a string. ESC either begins ST or recovers
-through the normal escape state. Unsupported input must not leak
-printable fragments or desynchronize subsequent supported input.
+OSC 0, 2, 8 or 133;A is acted on when BEL or ESC, the start of ST, ends it;
+one that outgrows the bound is dropped whole, and every other OSC,
+OSC 1's icon name among them, is ignored. CAN and SUB cancel a string.
+ESC either begins ST or recovers through the normal escape state.
+Unsupported input must not leak printable fragments or desynchronize
+subsequent supported input.
+
+`OSC 0 ; text` and `OSC 2 ; text` set the window title (`Terminal::title`):
+the text is decoded with malformed UTF-8 replaced by U+FFFD, cut to 256
+characters, td's compositor's own bound, and each character the shared
+report-text predicate (`td_ui::reportable`) would not print in a title is
+a space, so text of nothing else is a title of spaces. Empty text clears
+it. The number is read exactly: `OSC 02` is not OSC 2. A reset keeps the
+title, as xterm's does: it is the window's, not the screen's.
 
 `OSC 8 ; params ; URI` makes the cells written after it the link's, until
 an OSC 8 with an empty URI ends it, as does one whose URI is longer than
@@ -162,8 +172,9 @@ Resource ceilings are part of the model contract:
   storage;
 - at most 1 MiB of queued PTY output, 64 KiB of queued keyboard input, and
   64 KiB of queued terminal replies;
-- an OSC payload of at most 4 KiB, and at most 1024 OSC 8 links, each
-  with a URI of at most 2 KiB and an `id=` of at most 256 bytes; and
+- an OSC payload of at most 4 KiB, a title of at most 256 characters,
+  and at most 1024 OSC 8 links, each with a URI of at most 2 KiB and an
+  `id=` of at most 256 bytes; and
 - a grid of at most `vt::MAX_DIMENSION` (16,384) rows or columns and 1,048,576
   cells in 16 MiB, on a surface within td-ui's raster ceilings (8192 pixels an
   axis, 32 MiB a frame), each checked before anything is allocated for it.
@@ -1215,6 +1226,17 @@ The PTY is opened before the first frame, so a machine whose devpts is
 missing fails without drawing a window. Once td-ui's client has bound its
 globals, td-term sets the title `td terminal` and app id `td-term` and
 commits the empty toplevel, the required initial commit before any buffer.
+A draw then sends the child's title, or `td terminal` again once the
+child clears its own, when it is not the title last sent, ahead of the
+frame when one follows. Titles are at least 100 milliseconds apart: td's
+compositor repaints for every changed title, so a child retitling as
+fast as it writes would otherwise set the screen's rate. A title that
+comes sooner waits, the loop woken when it is due, and goes as the
+latest by then. The pace is a clock and not the frame callback, which a
+compositor may withhold from a hidden window whose title a task list
+still shows. The
+compositor's terminal-authority probe therefore recognises td-term by its
+app id, which the child cannot change, not by its title.
 Every
 configure is bounded before anything is allocated for it -- a surface with no
 area, an axis past 8192 pixels, or a frame over 32 MiB closes the terminal --
@@ -1499,8 +1521,9 @@ terminal, and td-term's prove the program:
   no-regression expectations overlay (`vt_spec.rs`);
 - parser and model results are invariant under every required input chunking
   and remain bounded for malformed streams; replies are bounded, drainable
-  and admitted whole, the bell coalesces, and history evicts whole lines
-  within its byte ceiling (`vt_spec.rs`);
+  and admitted whole, the bell coalesces, an OSC 0 or 2 title is cut,
+  spaced and cleared as §2 says, and history evicts whole lines within
+  its byte ceiling (`vt_spec.rs`);
 - exact model-renderer PPM goldens pass, beside the structural rendition,
   underline-style and underline-color, palette, cursor, selection,
   bell-ring, and viewport assertions, through the bitmap face and the
@@ -1564,6 +1587,10 @@ terminal, and td-term's prove the program:
   it the primary selection, or keeps the selection with no match;
   jumps the view between OSC 133;A prompts on `C-S-z` and `C-S-x`,
   ringing with none further or nowhere to move;
+  sends the child's title when it changes, one sooner than 100
+  milliseconds after the last when it is due and then only the latest,
+  with a frame in flight or not, nothing for one it already shows, and
+  `td terminal` again once it is cleared;
   rings the visual bell in the next frame and in every frame until its
   flash, which a later bell puts forward, is over;
   waits for the proof's sync on the live source; rings for a paste with
@@ -1593,8 +1620,9 @@ terminal, and td-term's prove the program:
 - td-term's confinement tests pin its closed source inventory, that it
   forbids `unsafe` and reaches no raw layer, that its manifest declares td-ui
   alone and joins the gate, and, by value, the words td's units and boot
-  oracle read: the title, the app id, the proof token, every marker, the
-  last-screen prefix and the exit report;
+  oracle read: the fallback title, the app id the authority probe reads,
+  the proof token, every marker, the last-screen prefix and the exit
+  report;
 - the shipped artifact is static, and its target selftest runs without host
   paths or libraries: `td-term selftest` exercises the model, encoder,
   renderer, terminfo compiler, PTY grid arithmetic, session policy,

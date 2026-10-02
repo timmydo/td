@@ -73,7 +73,8 @@ pub struct Options {
     pub font_size: Option<f32>,
 }
 
-/// What an operator sees in a title bar; td's compositor keeps it.
+/// What an operator sees in a title bar until the child sets its own
+/// (OSC 0 or 2), and again once it clears it; td's compositor keeps it.
 pub const TITLE: &str = "td terminal";
 const APP_ID: &str = "td-term";
 
@@ -84,6 +85,12 @@ const HANDSHAKE_MS: u64 = 20_000;
 
 /// How long a bell's ring stays on screen after the frame that took it.
 const BELL_FLASH_MS: u64 = 100;
+
+/// The least time between two titles sent: td's compositor repaints for
+/// every changed title, so a child retitling as fast as it writes would
+/// otherwise set its rate. A clock rather than the frame callback, which a
+/// compositor may withhold from a hidden window.
+const TITLE_MS: u64 = 100;
 
 /// Where the session's own identity is read from: the uid from the first,
 /// everything else from the second.
@@ -550,6 +557,10 @@ pub struct Window {
     /// Until when frames ring the visual bell: set when a frame that took
     /// the model's bell is submitted, and put forward by every later one.
     flash: Option<u64>,
+    /// The title last sent: `TITLE` at bind, then the child's (OSC 0 or 2).
+    shown_title: String,
+    /// When the child's title was last sent, on the loop's clock.
+    retitled: Option<u64>,
     /// The grid the PTY was last set to and verified at.
     cells: Option<(u16, u16)>,
     /// The surface size the PTY and the model were last adopted for, which a
@@ -619,6 +630,8 @@ impl Window {
             drawn: None,
             frame: None,
             flash: None,
+            shown_title: TITLE.to_owned(),
+            retitled: None,
             cells: None,
             adopted: None,
             backlog: false,
@@ -1829,6 +1842,9 @@ impl Window {
         if let Some(until) = self.flash {
             wait = wait.min(until.saturating_sub(now));
         }
+        if let Some(due) = self.title_due() {
+            wait = wait.min(due.saturating_sub(now));
+        }
         wait.max(1)
     }
 
@@ -1924,6 +1940,27 @@ impl Window {
             && self.drawn == self.wanted()
             && self.adopted == self.current
             && self.frame_complete()
+    }
+
+    /// When a title that is not the one last sent may go: at once after a
+    /// quiet `TITLE_MS`, else that long after the last.
+    fn title_due(&self) -> Option<u64> {
+        (title(self.model.as_ref()) != self.shown_title)
+            .then(|| self.retitled.map_or(0, |at| at.saturating_add(TITLE_MS)))
+    }
+
+    /// Sends the title once it is due, ahead of any frame this draw
+    /// commits; one changed again meanwhile goes as its latest.
+    fn retitle(&mut self) -> Result<()> {
+        if !self.title_due().is_some_and(|due| self.clock >= due) {
+            return Ok(());
+        }
+        let title = title(self.model.as_ref());
+        self.client.set_title(title)?;
+        self.shown_title.clear();
+        self.shown_title.push_str(title);
+        self.retitled = Some(self.clock);
+        Ok(())
     }
 
     /// Readiness, and a keyboard whose keymap compiled: a shell nobody can
@@ -2379,6 +2416,7 @@ impl App for Window {
     }
 
     fn draw(&mut self) -> Result<()> {
+        self.retitle()?;
         let Some(mut wanted) = self.wanted() else {
             return Ok(());
         };
@@ -2460,6 +2498,11 @@ impl App for Window {
         }
         Ok(())
     }
+}
+
+/// The window's title: the child's, or `TITLE` while it has none.
+fn title(model: Option<&Terminal>) -> &str {
+    model.and_then(Terminal::title).unwrap_or(TITLE)
 }
 
 fn clipboard_target(terminal: &Terminal) -> Option<(usize, usize)> {
@@ -2887,6 +2930,58 @@ mod tests {
             .flat_map(|n| format!("{n}\r\n").into_bytes())
             .collect();
         window.output(&lines).unwrap();
+    }
+
+    /// The child's title (OSC 0 or 2) is sent when it changes, ahead of
+    /// the frame; a change within TITLE_MS of the last waits, the loop
+    /// woken for it, and goes as its latest, frame callback or none;
+    /// nothing goes for the title already shown, and `TITLE` again once
+    /// the child clears its own.
+    #[test]
+    fn the_childs_title_is_sent_when_it_changes() {
+        let (mut window, peer) = presented();
+        let titles = |peer: &UnixStream| -> Vec<Message> {
+            let (requests, _) = peer::drain(peer).unwrap();
+            requests
+                .into_iter()
+                .filter(|m| m.object == TOPLEVEL && m.opcode == 2)
+                .collect()
+        };
+        assert!(titles(&peer).is_empty());
+        window.output(b"\x1b]2;td terminal\x07").unwrap();
+        window.draw().unwrap();
+        assert!(titles(&peer).is_empty(), "already shown");
+        complete(&mut window);
+        window.tick(1_000).unwrap();
+        window.output(b"\x1b]0;~/src\x07$ ").unwrap();
+        window.draw().unwrap();
+        let (requests, _) = peer::drain(&peer).unwrap();
+        let sent = requests
+            .iter()
+            .position(|m| *m == text(TOPLEVEL, 2, "~/src"));
+        let commit = requests
+            .iter()
+            .position(|m| m.object == SURFACE && m.opcode == 6);
+        assert!(sent.is_some() && sent < commit, "ahead of the frame");
+        window.output(b"\x1b]2;~/src\x07").unwrap();
+        window.draw().unwrap();
+        assert!(titles(&peer).is_empty(), "unchanged");
+        window.tick(1_050).unwrap();
+        window.output(b"\x1b]2;make\x07").unwrap();
+        window.draw().unwrap();
+        window.output(b"\x1b]2;vim\x07").unwrap();
+        window.draw().unwrap();
+        assert!(titles(&peer).is_empty(), "paced");
+        assert_eq!(window.next_wait(1_050), 50, "woken when it is due");
+        window.tick(1_100).unwrap();
+        assert!(!window.client.can_present(), "a frame is in flight");
+        window.draw().unwrap();
+        assert_eq!(titles(&peer), [text(TOPLEVEL, 2, "vim")], "the latest");
+        assert!(window.next_wait(1_100) > 50, "nothing waits");
+        window.tick(1_200).unwrap();
+        window.output(b"\x1b]0;\x07").unwrap();
+        window.draw().unwrap();
+        assert_eq!(titles(&peer), [text(TOPLEVEL, 2, TITLE)]);
     }
 
     #[test]

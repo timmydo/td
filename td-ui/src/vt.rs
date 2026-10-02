@@ -24,6 +24,10 @@ const MAX_LINKS: usize = 1024;
 const MAX_URI: usize = 2048;
 /// The longest OSC 8 `id=` that joins links; a longer one is no id.
 const MAX_LINK_ID: usize = 256;
+/// The longest OSC 0 or 2 title kept, in characters: td's compositor keeps
+/// no more, and at four bytes each its request stays far inside a Wayland
+/// message, which a whole OSC payload would not.
+const MAX_TITLE: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Color {
@@ -1262,6 +1266,9 @@ pub struct Terminal {
     next_link: u32,
     /// An OSC 133;A came: the next cell written starts a prompt.
     prompt_pending: bool,
+    /// The title the last OSC 0 or 2 set, `None` before one or after an
+    /// empty one.
+    title: Option<String>,
 }
 
 /// An OSC 8 link: its id, the `id=` parameter that lets separately
@@ -1303,7 +1310,13 @@ impl Terminal {
             links: VecDeque::new(),
             next_link: 1,
             prompt_pending: false,
+            title: None,
         })
+    }
+
+    /// The window title the child set with OSC 0 or 2, while it has one.
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// The URI of the OSC 8 link `id` names, while the model remembers it.
@@ -1989,17 +2002,41 @@ impl Terminal {
         self.parser = ParserState::String(kind);
     }
 
-    /// An OSC this profile acts on: 8, a hyperlink, or 133;A, a shell
-    /// prompt's start, whatever parameters follow. Any other is ignored.
+    /// An OSC this profile acts on: 0 or 2, the window title, 8, a
+    /// hyperlink, or 133;A, a shell prompt's start, whatever parameters
+    /// follow. Any other is ignored.
     fn dispatch_osc(&mut self) {
         let mut payload = std::mem::take(&mut self.osc);
-        if let Some(rest) = payload.strip_prefix(b"8;") {
+        if let Some(text) = payload
+            .strip_prefix(b"0;")
+            .or_else(|| payload.strip_prefix(b"2;"))
+        {
+            self.osc_title(text);
+        } else if let Some(rest) = payload.strip_prefix(b"8;") {
             self.osc_link(rest);
         } else if payload == b"133;A" || payload.starts_with(b"133;A;") {
             self.prompt_pending = true;
         }
         payload.clear();
         self.osc = payload;
+    }
+
+    /// `OSC 0 ; text` or `OSC 2 ; text`: the window's title, malformed
+    /// UTF-8 replaced by U+FFFD, cut to `MAX_TITLE` characters, each one a
+    /// title would not show (`reportable`) a space. Empty text is no title.
+    fn osc_title(&mut self, text: &[u8]) {
+        let title: String = String::from_utf8_lossy(text)
+            .chars()
+            .take(MAX_TITLE)
+            .map(|character| {
+                if crate::reportable::reportable(character) {
+                    character
+                } else {
+                    ' '
+                }
+            })
+            .collect();
+        self.title = (!title.is_empty()).then_some(title);
     }
 
     /// `OSC 8 ; params ; URI`: the cells written after it are the link's,

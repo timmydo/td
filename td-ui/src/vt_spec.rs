@@ -2438,3 +2438,43 @@ fn osc133_marks_prompts_and_prompt_finds_them() {
         "the alternate screen"
     );
 }
+
+/// OSC 0 and OSC 2 set the window title, ended by BEL or ST; OSC 1, the
+/// icon's name, does not, nor does a zero-padded number. The title is
+/// cut to MAX_TITLE characters, a character a title would not show is a
+/// space, malformed UTF-8 is U+FFFD, and empty text clears it. Nothing
+/// is printed, and a reset keeps it, as xterm's does.
+#[test]
+fn osc0_and_osc2_set_the_title() {
+    let mut terminal = Terminal::new(1, 8).unwrap();
+    assert_eq!(terminal.title(), None);
+    terminal.feed(b"A\x1b]0;user@host: ~\x07B");
+    assert_eq!(terminal.title(), Some("user@host: ~"));
+    assert_eq!(terminal.row_text(0).unwrap(), "AB      ", "nothing printed");
+    terminal.feed(b"\x1b]2;vim notes.txt\x1b\\");
+    assert_eq!(terminal.title(), Some("vim notes.txt"), "ST ends it too");
+    terminal.feed(b"\x1b]1;icon\x07\x1b]20;x\x07\x1b]2\x07\x1b]02;x\x07\x1b]00;x\x07");
+    assert_eq!(terminal.title(), Some("vim notes.txt"), "not titles");
+    terminal.feed(b"\x1b]2;a\tb\x01c\xe2\x80\xaed\xc2\x85e\0f\x07");
+    assert_eq!(terminal.title(), Some("a b c d e f"), "unshowable, spaces");
+    terminal.feed(b"\x1b]2;\x01\x07");
+    assert_eq!(terminal.title(), Some(" "), "only spaces is a title");
+    terminal.feed(b"\x1b]0;caf\xc3\xa9 \xff\x07");
+    assert_eq!(terminal.title(), Some("caf\u{e9} \u{fffd}"));
+    let long = format!("\x1b]2;{}\x07", "\u{e9}".repeat(MAX_TITLE + 1));
+    terminal.feed(long.as_bytes());
+    assert_eq!(
+        terminal.title().map(|title| title.chars().count()),
+        Some(MAX_TITLE)
+    );
+    // CAN cancels, and one past MAX_OSC is dropped whole.
+    terminal.feed(b"\x1b]2;shell\x07\x1b]2;cancelled\x18");
+    assert_eq!(terminal.title(), Some("shell"));
+    let over = format!("\x1b]2;{}\x07", "z".repeat(MAX_OSC));
+    terminal.feed(over.as_bytes());
+    assert_eq!(terminal.title(), Some("shell"), "the overlong OSC");
+    terminal.feed(b"\x1bc");
+    assert_eq!(terminal.title(), Some("shell"), "a reset keeps it");
+    terminal.feed(b"\x1b]0;\x07");
+    assert_eq!(terminal.title(), None, "empty clears it");
+}

@@ -605,7 +605,8 @@ of its own files may name each module.
   `take_bell` for the coalesced bell, the history reads and `scrollback`,
   `wrapped`, `primary_wrapped` and `history_wrapped`, which rows an
   autowrap ended, `search`, the nearest match of a query older or newer
-  than a `Place` as a `Found`, `link`, the URI of an OSC 8 link a cell
+  than a `Place` as a `Found`, `title`, the window title OSC 0 or 2
+  set, `link`, the URI of an OSC 8 link a cell
   names (`Attributes::link`), `prompt`, the nearest line older or newer
   than one whose row holds a prompt's start (OSC 133;A,
   `Attributes::prompt`), `still_matches`, whether a found match's

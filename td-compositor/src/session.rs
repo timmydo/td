@@ -83,9 +83,10 @@ const HUMAN_RUNTIME: &str = "/run/user/1000";
 /// The terminal the stock session launches. It is its own program, so its
 /// readiness is asked of it rather than parsed by a second copy here.
 const TERMINAL_PROGRAM: &str = "/bin/td-term";
-/// The window title td-term gives itself; `terminal_is_focused` recognises the
-/// terminal by it. A confinement test pins it against td-term's source.
-pub(crate) const TERMINAL_TITLE: &str = "td terminal";
+/// The app id td-term gives its window; `terminal_is_focused` recognises the
+/// terminal by it rather than by its title, which the child sets (OSC 0 and
+/// 2). A confinement test pins it against td-term's source.
+pub(crate) const TERMINAL_APP_ID: &str = "td-term";
 
 /// Composed boot diagnostic: the host supplies the two physical key chords.
 /// This observes the stock launch path; it is not a consent or identity proof.
@@ -259,14 +260,14 @@ fn terminal_is_focused(report: &str, handle: u64) -> bool {
         let Some(line) = line.strip_prefix(&prefix) else {
             return false;
         };
-        let Some((fields, title)) = line.split_once(" title=") else {
+        let Some((fields, _title)) = line.split_once(" title=") else {
             return false;
         };
-        let Some((fields, _app_id)) = fields.split_once(" app_id=") else {
+        let Some((fields, app_id)) = fields.split_once(" app_id=") else {
             return false;
         };
         let fields: Vec<_> = fields.split_ascii_whitespace().collect();
-        title == TERMINAL_TITLE
+        app_id == TERMINAL_APP_ID
             && fields.contains(&"visible=true")
             && fields.contains(&"focused=true")
             && fields.iter().any(|field| {
@@ -441,25 +442,33 @@ mod tests {
 
     #[test]
     fn terminal_layout_requires_a_new_focused_visible_positive_window() {
-        assert_eq!(TERMINAL_TITLE, "td terminal");
-        let row = "window id=@7 object=1:4 workspace=1 x=0 y=24 width=800 height=600 visible=true focused=true fullscreen=false floating=false parent= app_id= title=td terminal\n";
+        assert_eq!(TERMINAL_APP_ID, "td-term");
+        let row = "window id=@7 object=1:4 workspace=1 x=0 y=24 width=800 height=600 visible=true focused=true fullscreen=false floating=false parent= app_id=td-term title=td terminal\n";
         assert_eq!(window_ids(row).unwrap(), BTreeSet::from([7]));
         assert!(terminal_is_focused(row, 7));
         assert!(!terminal_is_focused(row, 8));
+        // The title is the child's to change.
+        assert!(terminal_is_focused(
+            &row.replace("title=td terminal", "title=user@host: ~"),
+            7
+        ));
         for (from, to) in [
             ("visible=true", "visible=false"),
             ("focused=true", "focused=false"),
             ("width=800", "width=0"),
             ("height=600", "height=0"),
-            ("title=td terminal", "title=other focused=true"),
+            ("app_id=td-term", "app_id=other"),
+            ("app_id=td-term", "app_id=td-term focused=true"),
         ] {
             assert!(!terminal_is_focused(&row.replace(from, to), 7));
         }
-        let forged = row.replace("focused=true", "focused=false").replace(
-            "app_id=",
-            "app_id=focused=true visible=true width=1 height=1",
-        );
-        assert!(!terminal_is_focused(&forged, 7));
+        let unfocused = row.replace("focused=true", "focused=false");
+        for forged in [
+            unfocused.replace("app_id=td-term", "app_id=td-term visible=true focused=true"),
+            unfocused.replace("title=td terminal", "title=x focused=true app_id=td-term"),
+        ] {
+            assert!(!terminal_is_focused(&forged, 7), "{forged}");
+        }
         assert!(window_ids(&format!("{row}{row}")).is_err());
         assert!(window_ids(&row.replace("id=@7", "id=@0")).is_err());
     }

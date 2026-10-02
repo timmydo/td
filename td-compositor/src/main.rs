@@ -1157,16 +1157,16 @@ mod confinement {
             .collect()
     }
 
-    /// td-term names its own window; the authority probe recognises the
-    /// terminal by that name, so the compositor's copy is pinned to it.
+    /// td-term names its own window's app id; the authority probe recognises
+    /// the terminal by it, so the compositor's copy is pinned to it.
     #[test]
-    fn the_authority_probe_names_the_title_td_term_sets() {
+    fn the_authority_probe_names_the_app_id_td_term_sets() {
         let app = include_str!("../../td-term/src/app.rs");
-        let title = format!(
-            "const TITLE: &str = \"{}\";",
-            crate::session::TERMINAL_TITLE
+        let app_id = format!(
+            "const APP_ID: &str = \"{}\";",
+            crate::session::TERMINAL_APP_ID
         );
-        assert!(app.contains(&title), "td-term no longer spells {title}");
+        assert!(app.contains(&app_id), "td-term no longer spells {app_id}");
     }
 
     #[test]
