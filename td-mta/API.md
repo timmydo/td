@@ -774,6 +774,13 @@ key bytes before reusing value scratch, and reports row/table progress separatel
 from completion. Completion carries row counts and the same UTC sample; full
 physical graph/aggregate validity, parent chains, blobs and pins stay external.
 
+`recipient_sweep::Sweep` checks exact recipient ordinals for every submission
+through one next per advance, preserving ordered progress in both tables. It
+requires both streams exhausted before completion and refuses missing/extra/
+orphan rows, malformed sources, changed identity and total-row exhaustion.
+Completion records coverage counts only; queue state policy, selected physical
+completeness and actual pins remain separate.
+
 `store_fs::ChangeRoute` selects the source for a NeedFrame sequence using
 selected manifest metadata and captured ViewIdentity. It validates retained
 coverage through the checkpoint, then returns a history descriptor index or

@@ -968,6 +968,34 @@ these are logical lookup bounds, not a physical I/O or time bound. Identity
 movement during either next or a target get reports the same top-level
 ChangedView error; other reference failures retain their nested classification.
 
+`recipient_sweep::Sweep` verifies FORMAT's exact recipient coverage over the
+supplied view. Walk ordered submissions and recipients with one next per
+advance. For each locally valid submission, copy its ID/count and require
+recipient ordinals exactly 0 through count-1 for that ID. Read the next
+submission only after the current group is complete. Never skip forward to a
+matching recipient: a later group/ordinal or early EOF reports the missing
+expected ordinal; an earlier group or rows after all submissions reports an
+unexpected recipient. Require strict order in both streams independently.
+
+Check full identity before/after each next, with movement preceding all results.
+Validate source table/key/value and sequence ceiling, copy only scalar IDs/counts
+and release all row strings before returning. A finite total-row allowance covers
+both streams. Local corruption and coverage errors precede row-budget refusal;
+a valid row beyond admission refuses before advancing progress. EOF remains
+checkable at the exact allowance, including an empty view at zero rows.
+Complete requires EOF on both streams after every exact group. It retains the
+captured identity and submission/recipient counts. Errors retire the checker;
+failed/unfinished state cannot finish, and repeated completion still checks view
+identity without another read.
+
+This checks ordinal coverage and local row encoding only. CompleteCoverage does
+not establish physical view completeness, direct owning references, queue state
+transitions, completedAt/notification policy or actual pins. The caller composes
+those validations under the same immutable view. Each step needs admission and
+deadline checks for the supplied view's full next operation; one logical lookup
+is not a physical I/O/time limit. Fixed progress and 20-byte cursor scratch use
+the worker stack; caller key/value result partitions are reused.
+
 Thread assignment does not depend on disposable indexes or rescanning every
 body. Store at most one anchor per email: its first syntactically valid
 Message-ID within a 1004-byte ceiling (four-byte length plus ID plus 16-byte

@@ -82,7 +82,8 @@ separate.
 Direct owning references now have a bounded supplied-row checker with at most
 two lookups. A supplied-view sweep now enumerates direct checks in bounded
 steps with fixed counts; physical graph completeness, blob verification and
-aggregate invariants remain.
+aggregate invariants remain. An ordered recipient sweep now verifies exact
+submission recipient-count/ordinal coverage separately from queue state policy.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

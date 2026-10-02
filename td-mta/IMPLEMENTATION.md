@@ -934,6 +934,13 @@ service activation. Each part lands independently:
     budgets, order/type/sequence faults, lookup failures and changed-view
     precedence. Allocation probes reuse fixed fixtures. Full physical graph,
     blob bytes, parent cycles, aggregate invariants and runtime pins remain.
+  - **M05d17 — exact recipient coverage:** implemented ordered submission and
+    recipient validation with one next per advance, exact 0..count ordinals,
+    independent stream order, identity/sequence/local checks and a finite total
+    row budget. Tests cover an empty view, multiple/maximum groups, missing/extra/orphan
+    rows, duplicate keys, lookup/identity faults, malformed sources and terminal
+    states. Allocation probes cover fixed populated/empty fixtures. Queue state
+    policy, physical view completeness and actual pins remain separate.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

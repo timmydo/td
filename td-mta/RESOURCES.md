@@ -139,6 +139,12 @@ still account for those costs and concurrent owners within the ledger.
   key/value output partitions are reused without a new arena. A finite row
   limit bounds successful enumeration; each step admits one next plus at most
   two gets. Allocation probes cover populated and empty all-table sweeps.
+  Recipient Sweep retains typed previous IDs/ordinal, one current group and
+  scalar counters/phase. Compiled state fits 512 bytes; each advance encodes at
+  most a 20-byte cursor on the worker stack and performs one next using existing
+  key/value result partitions. A finite combined row allowance covers both
+  streams. Allocation instrumentation covers exact multiple-group and empty
+  coverage with fixed input slices; no recipient collection is constructed.
   Frame-change collection has its own 4096 slots of at most 24 bytes each,
   a separate 96 KiB reservation per view. Retained changes may coexist with
   get/next result storage; their memory never aliases those partitions. This
