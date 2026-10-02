@@ -14,7 +14,11 @@ use std::{
 mod recovery;
 #[cfg(test)]
 pub(super) use recovery::{prepare_probe as prepare_recovery_probe, probe as probe_recovery};
-pub use recovery::{RecoveryInput, RecoveryInputError, ScannedJournal};
+#[cfg(test)]
+pub(super) use recovery::{prepare_repair_probe, probe_repair};
+pub use recovery::{
+    RecoveryInput, RecoveryInputError, RepairError, RepairedJournal, ScannedJournal,
+};
 
 #[path = "input/prefix.rs"]
 mod prefix;
@@ -151,7 +155,7 @@ impl<'a> StoreReader<'a> {
             return Err(io::ErrorKind::InvalidData.into());
         }
         Ok(CompleteFile {
-            _owner: self.owner,
+            owner: self.owner,
             file: self.file,
             name: self.name,
             length: self.length,
@@ -163,7 +167,7 @@ impl<'a> StoreReader<'a> {
 /// digest, current pathname binding, read-view pin or authorization.
 #[derive(Debug)]
 pub struct CompleteFile<'a> {
-    _owner: &'a LockedRoot,
+    owner: &'a LockedRoot,
     file: File,
     name: Name,
     length: u64,

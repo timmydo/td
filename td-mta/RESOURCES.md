@@ -673,14 +673,27 @@ invalid-view/admission refusal. Literal active files and metadata are prepared
 before the snapshots. No extra per-view buffer or runtime pin pool is added.
 
 RecoveryInput retains one whole-file StoreReader, fixed journal verifier and
-valid sequence/operation counters, borrowing the same admitted 1 MiB frame
-arena. It performs at most 64 explicit reads per frame/tail, and no suffix
-allocation or directory inventory. ScannedJournal retains the CompleteFile,
-verified Summary and valid byte boundary. The allocation interval reuses the
-active fixture with its incomplete suffix and the existing frame arena, checks
-physical EOF completion, whole-file byte refusal, premature completion and
-sticky read failure at both root bounds. Fixture metadata preparation is cold;
-no repair, worker slot or extra frame reservation is introduced.
+valid sequence/operation counters and a fixed Current value, borrowing the
+same admitted 1 MiB frame arena. It performs at most 64 explicit reads per
+frame/tail, and no suffix allocation or directory inventory. ScannedJournal
+retains the CompleteFile, verified Summary, selected Current and valid byte
+boundary. The allocation interval reuses the active fixture with its
+incomplete suffix and the existing frame arena, checks physical EOF
+completion, whole-file byte refusal, premature completion and sticky read
+failure at both root bounds. Fixture metadata preparation is cold; no worker
+slot or extra frame reservation is introduced.
+
+Explicit repair encodes and reads CURRENT using two fixed 120-byte buffers,
+64 explicit extent reads and one EOF probe. After that input closes, it
+retains the scanner's read-only File plus one private writable journal File;
+opening uses shared fixed path scratch and transient parent handles. It calls
+set_len and sync_all once, closes the writable File, then confirms the original
+File's length and EOF. RepairedJournal retains one CompleteFile and Summary.
+The allocation interval advances the fixture CURRENT to its supplied generation
+using an already prepared CurrentUpdate, scans/repairs the active suffix,
+checks bounded reads, rescans the repaired journal and refuses a second repair.
+All metadata/intent preparation is cold; the 1 MiB frame arena is reused.
+This fixture composes I/O primitives, not a validated complete store graph.
 
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.

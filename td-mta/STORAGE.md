@@ -568,6 +568,43 @@ state, validates final row references or grants serving authority. Explicit
 repair must use this observed file identity and boundary under exclusive
 recovery before complete graph/replay validation and activation.
 
+### Explicit incomplete-tail repair
+
+`ScannedJournal::repair` consumes a completed stopped-journal scan with an
+incomplete physical suffix. The caller keeps actual stopped-store exclusion
+through scanning and repair, with no live readers or writers. LOCK alone is
+not this thread barrier. The scanner retains the selected CURRENT value;
+repair re-encodes it and compares all 120 bytes against a fresh, private,
+fully consumed CURRENT with observed EOF. A missing, changed or invalid
+selector refuses before truncation. This recheck is not complete selected
+graph, replay or final-reference validation.
+
+Reopen the generated journal path read/write without creation or automatic
+truncation. Apply the same ancestor/private-file policy as input; compare its
+device/inode and exact physical length with the retained scanned descriptor.
+Reject changed lengths, replacement files or nonprivate links. The trusted
+stable-namespace contract is still required: these checks are not an atomic
+confinement mechanism or protection against same-size external writes.
+
+Call std File::set_len only with the scanner's verified prefix boundary, then
+File::sync_all. No arbitrary offset, writable descriptor or implicit Drop
+repair is exposed. This changes an existing inode, so no namespace publication
+or parent-directory sync is performed. Require the original retained file to
+have exactly the repaired length and return EOF at that boundary before
+returning RepairedJournal, which retains its read-only CompleteFile and the
+unchanged verified prefix summary.
+
+RepairError identifies the last effect boundary: Rejected means no truncation
+was attempted; TruncateAttempted means truncation returned an error and its
+effects are uncertain; Truncated means set_len succeeded but sync failed;
+Synced means sync succeeded but final extent/EOF confirmation failed. Every
+error consumes the scan. Never retry or roll back automatically, and never
+resume writer admission after an attempted mutation error until recovery
+establishes the file state. Success proves this tail repair only. Complete
+selected-graph, replay and live-reference validation still precede pins,
+mutation admission and serving. Ordinary fault-injection tests do not qualify
+power-loss persistence on any deployment filesystem.
+
 ### Expected CURRENT replacement
 
 `CurrentUpdate::prepare` encodes a next CURRENT and either expected absence or

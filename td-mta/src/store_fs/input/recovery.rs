@@ -5,7 +5,7 @@ use super::{fill_exact, fill_exact_using, CompleteFile, StoreReader};
 use crate::{
     format::{
         bindings::Selection,
-        container::JournalHeader,
+        container::{Current, JournalHeader},
         frame::Frame,
         frame_header::Header as FrameHeader,
         journal_stream::{Error as StreamError, Summary, Verifier},
@@ -17,12 +17,19 @@ use crate::{
 };
 use std::io;
 
+#[path = "recovery/repair.rs"]
+mod repair;
+#[cfg(test)]
+pub(crate) use repair::{prepare_probe as prepare_repair_probe, probe as probe_repair};
+pub use repair::{RepairError, RepairedJournal};
+
 pub struct RecoveryInput<'r, 'c, 'b, C: Crypto> {
     file: StoreReader<'r>,
     verifier: Verifier<'c, C>,
     crypto: &'c C,
     through: Sequence,
     operations: usize,
+    current: Current,
     scratch: &'b mut [u8; MAX_FRAME_BYTES],
     failed: bool,
 }
@@ -68,6 +75,7 @@ impl LockedRoot {
             crypto,
             through: selected.through,
             operations: 0,
+            current: selection.current(),
             scratch,
             failed: false,
         })
@@ -178,6 +186,7 @@ impl<'r, C: Crypto> RecoveryInput<'r, '_, '_, C> {
             file,
             summary,
             prefix,
+            current: self.current,
         })
     }
 }
@@ -187,6 +196,7 @@ pub struct ScannedJournal<'r> {
     file: CompleteFile<'r>,
     summary: Summary,
     prefix: u64,
+    current: Current,
 }
 impl ScannedJournal<'_> {
     pub fn file(&self) -> &CompleteFile<'_> {

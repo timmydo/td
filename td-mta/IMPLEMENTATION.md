@@ -763,10 +763,14 @@ service activation. Each part lands independently:
     sequence/byte/operation budgets, the physical format cap, read-budget
     failure and changed extents. Allocation probes reuse the existing arena at
     both roots. Live journal readers retain strict short-frame refusal.
-  - **M05d5b — explicit tail repair:** recheck scanner-retained identity/extent,
-    truncate only its observed incomplete tail, then sync under exclusive
-    recovery. Preserve uncertainty on syscall errors. Finish graph/replay and
-    reference validation before opening pins or mutation admission.
+  - **M05d5b — explicit tail repair:** implemented consuming repair of a scanned
+    incomplete suffix. Recheck exact CURRENT and retained journal identity/
+    extent, truncate with std set_len, sync_all, then confirm retained-file EOF.
+    Errors retain attempted/truncated/synced effect stages; no automatic retry
+    or rollback. Tests cover stale selectors, changed/replaced/nonprivate-file
+    refusal and errors before/after effects. Allocation probes share the
+    existing arena at both root bounds. Finish graph/replay and reference
+    validation before opening pins or mutation admission.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

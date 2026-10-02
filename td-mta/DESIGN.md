@@ -43,9 +43,10 @@ input validates supplied view identity/ranges, streams checked frames and binds
 completion to the captured sequence/offset. It still requires actual caller
 pin ownership. Read-only stopped-journal recovery scanning now distinguishes
 physically incomplete final bytes from complete corruption and retains a
-verified prefix boundary through physical EOF. Explicit tail repair, complete
-selected-graph/final-view validation and committed mail publication remain
-unimplemented.
+verified prefix boundary through physical EOF. Explicit tail repair rechecks
+CURRENT and the scanned file identity/extent, truncates only that suffix and
+syncs before confirming the repaired extent. Complete selected-graph/final-view
+validation and committed mail publication remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can

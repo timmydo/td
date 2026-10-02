@@ -12,8 +12,8 @@ mod create_directory;
 #[path = "store_fs/input.rs"]
 mod input;
 pub use input::{
-    CompleteFile, CompletePrefix, PrefixReader, RecoveryInput, RecoveryInputError, ScannedJournal,
-    StoreReader,
+    CompleteFile, CompletePrefix, PrefixReader, RecoveryInput, RecoveryInputError, RepairError,
+    RepairedJournal, ScannedJournal, StoreReader,
 };
 #[path = "store_fs/selection.rs"]
 mod selection;

@@ -92,6 +92,7 @@ pub fn run(mut snapshot: impl FnMut()) {
     drop(super::super::history::prepare_probe(&long.root));
     let active_probe = super::super::active::prepare_probe(&short.root);
     drop(super::super::active::prepare_probe(&long.root));
+    let repair_update = super::super::input::prepare_repair_probe();
     let recovery_probe = super::super::input::prepare_recovery_probe();
     let mut history_scratch = vec![0; crate::format::MAX_FRAME_BYTES];
     let mut selection_scratch = super::super::SelectionScratch::new();
@@ -112,6 +113,12 @@ pub fn run(mut snapshot: impl FnMut()) {
         super::super::input::probe_recovery(
             &fixture.root,
             &recovery_probe,
+            history_scratch.as_mut_slice().try_into().unwrap(),
+        );
+        super::super::input::probe_repair(
+            &fixture.root,
+            &recovery_probe,
+            &repair_update,
             history_scratch.as_mut_slice().try_into().unwrap(),
         );
         super::super::input::probe_prefix(&fixture.root);
