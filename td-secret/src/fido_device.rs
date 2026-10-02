@@ -2996,10 +2996,10 @@ mod vm_tests {
                         .unwrap();
                     assert!(!result.status.success() && result.stdout.is_empty());
                     let error = String::from_utf8(result.stderr).unwrap();
-                    if error == "td-secret: credential portal refused the request: org.freedesktop.DBus.Error.NameHasNoOwner\n" {
+                    if error.starts_with("td-secret: credential portal refused the request: org.freedesktop.DBus.Error.NameHasNoOwner") {
                                     return false;
                                 }
-                    assert_eq!(error, "td-secret: credential portal refused the request: org.freedesktop.portal.Error.NotAllowed\n");
+                    assert_eq!(error, "td-secret: credential portal refused the request: org.freedesktop.portal.Error.NotAllowed: credential caller is not an authenticated application\n");
                     true
                 });
                 portal
@@ -3121,7 +3121,7 @@ mod vm_tests {
                     let success = if parts[2] == "unavailable" {
                         !result.status.success() && result.stdout.is_empty()
                                         && std::str::from_utf8(&result.stderr).is_ok_and(|error|
-                                            error == "td-secret: credential portal refused the request: org.freedesktop.portal.Error.Failed\n")
+                                            error == "td-secret: credential portal refused the request: org.freedesktop.portal.Error.Failed: credential is unavailable; enroll or unlock through secure attention\n")
                     } else {
                         result.status.success() && result.stdout == parts[2].as_bytes()
                     };

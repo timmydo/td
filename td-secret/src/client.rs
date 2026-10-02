@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 const BUS: &str = "org.freedesktop.DBus";
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
 const MAX_FRAME: usize = 16 * 1024;
+const MAX_REASON: usize = 256;
 
 #[derive(Default)]
 struct Descriptors(Vec<RawFd>);
@@ -133,13 +134,7 @@ impl Client {
                 return Err("credential reply has wrong sender".into());
             }
             if reply.kind == message::MessageType::Error {
-                return Err(format!(
-                    "credential portal refused the request: {}",
-                    reply
-                        .fields
-                        .error_name
-                        .unwrap_or("unspecified remote error")
-                ));
+                return Err(refusal(&reply));
             }
             if reply.kind != message::MessageType::MethodReturn {
                 return Err("invalid credential reply type".into());
@@ -148,6 +143,35 @@ impl Client {
         }
         Err("too much unrelated credential bus traffic".into())
     }
+}
+
+/// A refusal names the error and, when the sender gave one, its reason:
+/// the portal's says what would answer it, which the bare name does not.
+/// The reason is shown to a person, so it is bounded printable ASCII; the
+/// name is one the decoder checked. Read only from a reply whose sender
+/// `call` verified.
+fn refusal(reply: &message::Message<'_>) -> String {
+    let name = reply
+        .fields
+        .error_name
+        .unwrap_or("unspecified remote error");
+    let mut reason = String::new();
+    if let [wire::Value::Str(text)] = reply.args() {
+        if reply.fields.signature == Some("s") && !text.trim().is_empty() {
+            reason.push_str(": ");
+            reason.extend(text.trim().chars().take(MAX_REASON).map(|c| {
+                if c == ' ' || c.is_ascii_graphic() {
+                    c
+                } else {
+                    '?'
+                }
+            }));
+            if text.trim().chars().nth(MAX_REASON).is_some() {
+                reason.push_str("...");
+            }
+        }
+    }
+    format!("credential portal refused the request: {name}{reason}")
 }
 
 fn one_string(frame: &Frame) -> Result<String, String> {
@@ -391,6 +415,56 @@ mod tests {
             server.join().unwrap();
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn a_refusal_carries_its_bounded_printable_reason() {
+        let text = |name: &str, body: Option<&str>| {
+            let mut builder = message::Builder::error(wire::Endian::Little, name, 7).serial(8);
+            if let Some(body) = body {
+                builder = builder.body("s", |w| w.string(body)).unwrap();
+            }
+            let bytes = builder.encode().unwrap();
+            refusal(&message::decode(&bytes, 0).unwrap().0)
+        };
+        assert_eq!(
+            text(
+                "org.freedesktop.portal.Error.Failed",
+                Some("credential is unavailable; enroll or unlock through secure attention")
+            ),
+            "credential portal refused the request: org.freedesktop.portal.Error.Failed: credential is unavailable; enroll or unlock through secure attention"
+        );
+        assert_eq!(
+            text("org.freedesktop.portal.Error.Failed", None),
+            "credential portal refused the request: org.freedesktop.portal.Error.Failed"
+        );
+        assert_eq!(
+            text("org.freedesktop.portal.Error.Failed", Some("")),
+            "credential portal refused the request: org.freedesktop.portal.Error.Failed"
+        );
+        assert_eq!(
+            text("a.B", Some("one\nline\u{1b}[2J \u{202e}x")),
+            "credential portal refused the request: a.B: one?line?[2J ?x"
+        );
+        assert_eq!(
+            text("a.B", Some(" \t ")),
+            "credential portal refused the request: a.B"
+        );
+        let long = "x".repeat(MAX_REASON + 9);
+        assert_eq!(
+            text("a.B", Some(&long)),
+            format!(
+                "credential portal refused the request: a.B: {}...",
+                "x".repeat(MAX_REASON)
+            )
+        );
+        assert_eq!(
+            text("a.B", Some(&long[..MAX_REASON])),
+            format!(
+                "credential portal refused the request: a.B: {}",
+                "x".repeat(MAX_REASON)
+            )
+        );
     }
 
     #[test]
