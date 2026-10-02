@@ -81,6 +81,18 @@ still account for those costs and concurrent owners within the ledger.
   allocation probe builds and sorts 8192 operations with repeated/permuted keys,
   performs successful/absent point and next lookups, and refuses a short slot
   buffer and corrupt frame without Rust allocations after cold preparation.
+  The provisional table Merge borrows the same overlay, retaining a pending
+  borrowed entry, scalar progress and a fixed 1024-byte previous checkpoint key.
+  Each push/finish initializes one 1024-byte overlay-key stack buffer and reuses
+  it while emitting borrowed rows. Merge's previous key is inline state, not a
+  borrow from the per-view cursor/value arena. Tests cap the compiled Merge at
+  4 KiB; this state and its temporary key buffer are charged to the owning worker
+  stack. Runtime integration still must qualify the complete worker stack.
+  No new arena/pool or whole-table map is allocated. Admit one input
+  record plus up to 8192 overlay keys per push, and up to 8192 keys for finish.
+  The allocation executable checks unchanged/replaced/deleted rows, remaining
+  output, input/sink failures, and draining the full-operation overlay after
+  cold preparation. Callback allocations remain the caller's responsibility.
 - Writer: one journal arena and descriptor array, one 1 MiB frame, and
   256 KiB table/manifest/value scratch, a separate 1 MiB input key/value
   arena and 4096 operation slots of 32 bytes. The latter bounds the actual

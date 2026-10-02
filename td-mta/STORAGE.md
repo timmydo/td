@@ -997,8 +997,35 @@ interruptible by that deadline. Full selected-graph and final-row/reference
 validation remain separate prerequisites to serving.
 
 Read an object from that bounded overlay or its sorted checkpoint table.
-Listings merge a sequential table cursor with sorted overlay entries. Sparse
-key/offset indexes and folder/date/search indexes are disposable disk files
+Listings merge a sequential table cursor with sorted overlay entries.
+`merge::Merge` implements a provisional supplied-record merge for one table.
+Its constructor validates table-header structure and binds account/epoch and
+checkpoint sequence to the overlay's journal base. Push accepts one locally
+validated checkpoint Record, checks ascending unique keys, table identity,
+last-change ceiling and declared count/payload bounds, then emits intervening
+latest overlay PUTs to a synchronous borrowed-row callback. DELETE emits no row;
+a matching overlay key replaces or suppresses its checkpoint row. Unchanged
+records retain their last-change sequence; replacements use the frame sequence.
+No whole-table collection or per-row allocation is constructed. Its input
+checks intentionally repeat the file verifier's count/extent/order/sequence
+checks because a locally valid Record can be constructed without that verifier.
+Both classify count/payload overflow as TrailingBytes. This duplication does
+not replace file hashing or selected-table completion.
+
+Finish requires exactly the declared checkpoint count/payload, drains remaining
+overlay keys and returns the live row count. This does not prove table checksum,
+physical EOF, selected generation or final references. The caller feeds every
+checkpoint record in order, completes and binds that table input, and keeps all
+callback effects provisional until complete final-view validation succeeds.
+A callback can have produced earlier rows before a later error; no rollback is
+promised. Input and callback errors permanently retire push; finish consumes the
+merge. Any staging output is abandoned through the coordinator's normal orphan
+handling. Admit one checkpoint record plus at most 8192 intervening overlay keys
+per push, or at most 8192 remaining keys for finish; callbacks retain their own
+bounded I/O and deadline accounting. Check deadlines around that entire work
+unit. This is not yet a serving ReadView or checkpoint publication mechanism.
+
+Sparse key/offset indexes and folder/date/search indexes are disposable disk files
 with bounded caches; their sizes are not RAM reservations. An absent index
 permits a bounded-work sequential scan or explicit temporary resource error.
 It must never produce an empty successful result merely because rebuilding

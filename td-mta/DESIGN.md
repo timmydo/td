@@ -51,6 +51,8 @@ against a supplied row. The supplied-byte replay overlay now validates complete
 frames, sorts bounded descriptors and resolves latest operations/tombstones.
 The active-overlay loader reads a captured private prefix into caller arenas,
 binds its selected header/endpoint and retains the consumed prefix descriptor.
+A provisional streaming merge now combines sorted checkpoint records with
+overlay replacements and deletions using fixed key state and borrowed rows.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

@@ -794,8 +794,16 @@ service activation. Each part lands independently:
     alongside the borrowed overlay. Tests cover suffix growth, identity and
     admission refusal, corruption/cut frames, endpoint mismatch and exact read
     budget/error boundaries; allocation probes cover short/maximum roots.
-    Checkpoint merge, final reference validation and live pins remain integration
-    work.
+  - **M05d9 — provisional table replay:** implemented a streaming sorted merge
+    of supplied checkpoint records and latest overlay entries. Bind table header
+    account/epoch/base, validate input order/count/extent, retain unchanged row
+    sequences and replace/drop rows according to PUT/DELETE. Callback output
+    remains provisional; input or sink failure retires the merge. Tests compare
+    an independent last-write map, check independent pre-output count/payload
+    ceilings, wrong inputs/identities and sink errors;
+    allocation probes include full-capacity overlay draining. File/digest
+    bindings, checkpoint publication, final reference validation and live pins
+    remain integration work.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

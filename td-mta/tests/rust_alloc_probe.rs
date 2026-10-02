@@ -830,6 +830,22 @@ fn journal_overlay() {
             .get(Key::Thread(ThreadId::from_bytes([255; 16])))
             .unwrap()
             .is_none());
+        let table = td_mta::format::table::TableHeader {
+            table: Table::Threads,
+            account: AccountId::from_bytes([3; 16]),
+            epoch: StoreEpoch::from_bytes([4; 16]),
+            generation: 1,
+            through: Sequence::from_u64(0),
+            record_count: 0,
+            payload_bytes: 0,
+        };
+        assert_eq!(
+            td_mta::merge::Merge::new(table, &overlay)
+                .unwrap()
+                .finish(|_| Ok::<_, ()>(()))
+                .unwrap(),
+            0
+        );
     }
     assert!(Overlay::decode(
         &td_crypto::Provider,
@@ -842,6 +858,107 @@ fn journal_overlay() {
     assert!(Overlay::decode(&td_crypto::Provider, &header, &bytes, &mut cells).is_err());
     assert!(!before.invalid);
     assert_eq!(COUNTERS.snapshot(), before, "journal overlay allocated");
+}
+
+fn journal_merge() {
+    use td_mta::{
+        format::{
+            container::JournalHeader,
+            frame,
+            key::Key,
+            operation::Operation,
+            table::{Record, TableHeader},
+            Sequence, Table, FRAME_FOOTER_BYTES, FRAME_HEADER_BYTES, JOURNAL_HEADER_BYTES,
+        },
+        ids::{AccountId, StoreEpoch},
+        merge::{Error, Merge},
+        overlay::{Cell, Overlay},
+    };
+    let account = AccountId::from_bytes([3; 16]);
+    let epoch = StoreEpoch::from_bytes([4; 16]);
+    let mut header = [0; JOURNAL_HEADER_BYTES];
+    JournalHeader {
+        account,
+        epoch,
+        segment: 2,
+        base: Sequence::from_u64(5),
+    }
+    .encode(&td_crypto::Provider, &mut header)
+    .unwrap();
+    let operations = [
+        Operation::put(Table::Threads, &[1; 16], &[]).unwrap(),
+        Operation::delete(Table::Threads, &[2; 16]).unwrap(),
+        Operation::put(Table::Threads, &[4; 16], &[]).unwrap(),
+    ];
+    let mut bytes = vec![
+        0;
+        FRAME_HEADER_BYTES
+            + FRAME_FOOTER_BYTES
+            + operations
+                .iter()
+                .map(|v| v.encoded_len().unwrap())
+                .sum::<usize>()
+    ];
+    let mut offset = FRAME_HEADER_BYTES;
+    for operation in operations {
+        offset += operation.encode(bytes.get_mut(offset..).unwrap()).unwrap();
+    }
+    frame::seal(&td_crypto::Provider, Sequence::from_u64(6), 3, &mut bytes).unwrap();
+    let mut cells = [Cell::EMPTY; 3];
+    let overlay = Overlay::decode(&td_crypto::Provider, &header, &bytes, &mut cells).unwrap();
+    let table = TableHeader {
+        table: Table::Threads,
+        account,
+        epoch,
+        generation: 1,
+        through: Sequence::from_u64(5),
+        record_count: 2,
+        payload_bytes: 128,
+    };
+    let first = Record::new(Table::Threads, Sequence::from_u64(3), &[2; 16], &[]).unwrap();
+    let second = Record::new(Table::Threads, Sequence::from_u64(3), &[3; 16], &[]).unwrap();
+    let expected = [(1, 6), (3, 3), (4, 6)];
+    let before = COUNTERS.snapshot();
+    let mut outputs = 0;
+    let mut sink = |row: td_mta::ports::Record<'_>| {
+        let id = match row.key {
+            Key::Thread(id) => *id.as_bytes().first().unwrap(),
+            _ => panic!("wrong table"),
+        };
+        assert_eq!(Some(&(id, row.last_change.number())), expected.get(outputs));
+        outputs += 1;
+        Ok::<_, ()>(())
+    };
+    let mut merge = Merge::new(table, &overlay).unwrap();
+    merge.push(first, &mut sink).unwrap();
+    merge.push(second, &mut sink).unwrap();
+    assert_eq!(merge.finish(&mut sink).unwrap(), 3);
+    assert_eq!(outputs, 3);
+    assert!(Merge::new(
+        TableHeader {
+            account: AccountId::from_bytes([9; 16]),
+            ..table
+        },
+        &overlay
+    )
+    .is_err());
+    let mut merge = Merge::new(table, &overlay).unwrap();
+    assert_eq!(merge.push(first, |_| Err(7)), Err(Error::Sink(7)));
+    assert_eq!(merge.finish(|_| Ok::<_, i32>(())), Err(Error::Failed));
+    let mut merge = Merge::new(table, &overlay).unwrap();
+    merge.push(first, |_| Ok::<_, ()>(())).unwrap();
+    assert!(matches!(
+        merge.push(first, |_| Ok::<_, ()>(())),
+        Err(Error::Format(_))
+    ));
+    assert!(merge.is_failed());
+    assert!(matches!(
+        Merge::new(table, &overlay)
+            .unwrap()
+            .finish(|_| Ok::<_, ()>(())),
+        Err(Error::Format(_))
+    ));
+    assert_eq!(COUNTERS.snapshot(), before, "journal merge allocated");
 }
 
 fn main() {
@@ -928,6 +1045,7 @@ fn main() {
     store_directories();
     store_temporary_files();
     journal_overlay();
+    journal_merge();
     hot_paths();
     println!("rust-allocation-probe-v1: counter-model forwarding hot-paths passed");
 }
