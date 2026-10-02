@@ -1,7 +1,8 @@
 //! org.freedesktop.portal.OpenURI: an `http` or `https` link goes to the
 //! running Firefox through its remote-control `OpenURL`; `file` and every
-//! other scheme, and the descriptor-taking `OpenFile`, are refused
-//! (APPLICATIONS.md §E row 4).
+//! other scheme are refused. `OpenFile`'s descriptor is copied into
+//! Firefox's handoff directory (`handoff.rs`) and Firefox is handed the
+//! copy the same way (APPLICATIONS.md §E row 4).
 //!
 //! The handler is found on the bus, not started: the portal lists the names
 //! under Firefox's `org.mozilla.firefox.*` grant, resolves each one's owner
@@ -14,7 +15,7 @@ use super::*;
 pub(super) const INTERFACE: &str = "org.freedesktop.portal.OpenURI";
 pub(super) const VERSION: u32 = 1;
 pub(super) const UNSUPPORTED_FILE: &str =
-    "td OpenURI does not open files: the handler runs in another sandbox";
+    "td OpenURI does not open file URIs: pass the file's descriptor to OpenFile";
 
 const LIMIT: usize = 16;
 const PER_OWNER: usize = 4;
@@ -50,7 +51,9 @@ pub(super) struct Pending {
     path: String,
     endian: Endian,
     uri: String,
-    https: bool,
+    /// `http`, `https`, or `file` for an OpenFile copy: the record's only
+    /// trace of what was opened.
+    scheme: &'static str,
     app: Option<String>,
     stage: Stage,
     /// Names still to try, the next last.
@@ -67,7 +70,7 @@ pub(super) fn is_call(call: &Message<'_>) -> bool {
         && call.fields.member == Some("OpenURI")
 }
 
-/// Whether `call` is the descriptor-taking member td does not serve.
+/// Whether `call` is the descriptor-taking member.
 pub(super) fn is_open_file(call: &Message<'_>) -> bool {
     call.kind == MessageType::MethodCall
         && call.fields.path == Some(PORTAL_PATH)
@@ -130,41 +133,7 @@ fn parse<'a>(call: &'a Message<'a>) -> Result<Parsed<'a>, Refusal> {
         return Err(refusal("the parent window handle is too long"));
     }
     let https = link(uri)?;
-    let entries = options
-        .values(MAX_PORTAL_OPTIONS)
-        .map_err(|_| refusal("OpenURI has too many options"))?;
-    let mut token = None;
-    for entry in &entries {
-        let pair = entry
-            .as_seq()
-            .and_then(|pair| pair.values(2).ok())
-            .ok_or_else(|| refusal("an OpenURI option is malformed"))?;
-        let [Value::Str(key), Value::Variant(value)] = pair.as_slice() else {
-            return Err(refusal("an OpenURI option has the wrong shape"));
-        };
-        let expected = match *key {
-            "handle_token" | "activation_token" => "s",
-            "writable" | "ask" => "b",
-            // Unknown options are ignored, as the portal specification asks.
-            _ => continue,
-        };
-        if value.signature() != expected {
-            return Err(refusal("an OpenURI option has the wrong type"));
-        }
-        if *key != "handle_token" {
-            continue;
-        }
-        let values = value
-            .values(1)
-            .map_err(|_| refusal("handle_token has a malformed variant"))?;
-        let (Some(Value::Str(text)), None) = (values.first(), token) else {
-            return Err(refusal("handle_token must appear once as a string"));
-        };
-        if !handles::valid_token(text) {
-            return Err(refusal("handle_token is not a valid object-path element"));
-        }
-        token = Some(*text);
-    }
+    let token = token(options, false)?;
     Ok(Parsed { uri, https, token })
 }
 
@@ -256,7 +225,7 @@ fn refuse(
     )?)
 }
 
-/// `OpenFile` hands the portal a descriptor its handler could not reach.
+/// An `OpenFile` that arrived without the descriptor it names.
 pub(super) fn refuse_open_file(connection: &mut Connection, call: &Message<'_>) -> io::Result<()> {
     let owner = call
         .fields
@@ -266,8 +235,132 @@ pub(super) fn refuse_open_file(connection: &mut Connection, call: &Message<'_>) 
         connection,
         call,
         owner,
-        (UNSUPPORTED_OPEN, UNSUPPORTED_FILE),
+        refusal("OpenFile takes a parent, one file descriptor and options"),
     )
+}
+
+/// The `handle_token` of `options`, checking the types of the options this
+/// interface defines and ignoring the rest, as the specification asks.
+/// For a file `writable` must be false: Firefox is handed a read-only copy.
+/// A link ignores it, as the specification does.
+fn token<'a>(options: &'a wire::Seq<'a>, file: bool) -> Result<Option<&'a str>, Refusal> {
+    let entries = options
+        .values(MAX_PORTAL_OPTIONS)
+        .map_err(|_| refusal("the request has too many options"))?;
+    let mut token = None;
+    for entry in &entries {
+        let pair = entry
+            .as_seq()
+            .and_then(|pair| pair.values(2).ok())
+            .ok_or_else(|| refusal("a request option is malformed"))?;
+        let [Value::Str(key), Value::Variant(value)] = pair.as_slice() else {
+            return Err(refusal("a request option has the wrong shape"));
+        };
+        let expected = match *key {
+            "handle_token" | "activation_token" => "s",
+            "writable" | "ask" => "b",
+            _ => continue,
+        };
+        if value.signature() != expected {
+            return Err(refusal("a request option has the wrong type"));
+        }
+        if *key == "writable" {
+            if file && value.values(1).ok().as_deref() == Some(&[Value::Bool(true)][..]) {
+                return Err((
+                    UNSUPPORTED_OPEN,
+                    "td hands the handler a read-only copy; writable is not supported",
+                ));
+            }
+            continue;
+        }
+        if *key != "handle_token" {
+            continue;
+        }
+        let values = value
+            .values(1)
+            .map_err(|_| refusal("handle_token has a malformed variant"))?;
+        let (Some(Value::Str(text)), None) = (values.first(), token) else {
+            return Err(refusal("handle_token must appear once as a string"));
+        };
+        if !handles::valid_token(text) {
+            return Err(refusal("handle_token is not a valid object-path element"));
+        }
+        token = Some(*text);
+    }
+    Ok(token)
+}
+
+/// OpenFile: copies the one descriptor into Firefox's handoff directory,
+/// then opens the copy as OpenURI opens a link.
+pub(super) fn begin_file(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    call: &Message<'_>,
+    files: Vec<fs::File>,
+) -> io::Result<()> {
+    let owner = call
+        .fields
+        .sender
+        .ok_or_else(|| io::Error::other("OpenFile has no broker sender"))?;
+    let token = match parse_file(call) {
+        Ok(token) => token,
+        Err(why) => return refuse(connection, call, owner, why),
+    };
+    let [file] = files.as_slice() else {
+        return refuse_open_file(connection, call);
+    };
+    if let Some(why) = full(state, owner) {
+        return refuse(connection, call, owner, why);
+    }
+    // The handle is held before any bytes are copied, so a refused token
+    // costs no copy and evicts none.
+    let Some(path) = reserve(connection, state, call, owner, token)? else {
+        return Ok(());
+    };
+    let name = handoff::descriptor_name(file);
+    let copied = match state.handoff.copy(file, &name) {
+        Ok(copied) => copied,
+        Err(text) => {
+            state.handles.retire(&path);
+            eprintln!("TD-PORTAL-OPEN-URI app=- scheme=file response=- outcome=not-copied");
+            return refuse(connection, call, owner, (UNSUPPORTED_OPEN, text));
+        }
+    };
+    start(connection, state, call, owner, path, copied.url, "file")
+}
+
+/// OpenFile's arguments: an empty or bounded parent, exactly one received
+/// descriptor at index 0, and options.
+fn parse_file<'a>(call: &'a Message<'a>) -> Result<Option<&'a str>, Refusal> {
+    if !exact_signature(call, "sha{sv}") {
+        return Err(refusal(
+            "OpenFile takes a parent, one file descriptor and options",
+        ));
+    }
+    let [Value::Str(parent), Value::UnixFd(0), Value::Array(options)] = call.args() else {
+        return Err(refusal(
+            "OpenFile takes a parent, one file descriptor and options",
+        ));
+    };
+    if parent.len() > MAX_PARENT_BYTES {
+        return Err(refusal("the parent window handle is too long"));
+    }
+    token(options, true)
+}
+
+/// Why a new request from `owner` is refused for the request bound, if it is.
+fn full(state: &ServiceState, owner: &str) -> Option<Refusal> {
+    (state.open_uris.len() >= LIMIT
+        || state
+            .open_uris
+            .values()
+            .filter(|pending| pending.owner == owner)
+            .count()
+            >= PER_OWNER)
+        .then_some((
+            "org.freedesktop.DBus.Error.LimitsExceeded",
+            "too many OpenURI requests are pending",
+        ))
 }
 
 pub(super) fn begin(
@@ -283,65 +376,66 @@ pub(super) fn begin(
         Ok(parsed) => parsed,
         Err(why) => return refuse(connection, call, owner, why),
     };
-    if state.open_uris.len() >= LIMIT
-        || state
-            .open_uris
-            .values()
-            .filter(|pending| pending.owner == owner)
-            .count()
-            >= PER_OWNER
-    {
-        return refuse(
-            connection,
-            call,
-            owner,
-            (
-                "org.freedesktop.DBus.Error.LimitsExceeded",
-                "too many OpenURI requests are pending",
-            ),
-        );
+    if let Some(why) = full(state, owner) {
+        return refuse(connection, call, owner, why);
     }
-    let token = parsed
-        .token
-        .map_or_else(|| format!("td_{}", call.serial), str::to_string);
-    let path = match state.handles.reserve(HandleKind::Request, owner, &token) {
-        Ok(path) => path,
+    let scheme = if parsed.https { "https" } else { "http" };
+    let Some(path) = reserve(connection, state, call, owner, parsed.token)? else {
+        return Ok(());
+    };
+    start(
+        connection,
+        state,
+        call,
+        owner,
+        path,
+        parsed.uri.to_string(),
+        scheme,
+    )
+}
+
+/// Reserves the caller's Request, or refuses the call and returns None.
+fn reserve(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    call: &Message<'_>,
+    owner: &str,
+    token: Option<&str>,
+) -> io::Result<Option<String>> {
+    let token = token.map_or_else(|| format!("td_{}", call.serial), str::to_string);
+    let refused = match state.handles.reserve(HandleKind::Request, owner, &token) {
+        Ok(path) => return Ok(Some(path)),
         Err(ReserveError::InvalidOwner) => {
             return Err(io::Error::other(
                 "the broker assigned a sender outside td-busd's unique-name shape",
             ))
         }
         Err(ReserveError::InvalidToken) => {
-            return refuse(
-                connection,
-                call,
-                owner,
-                refusal("handle_token is not a valid object-path element"),
-            )
+            refusal("handle_token is not a valid object-path element")
         }
-        Err(ReserveError::Duplicate) => {
-            return refuse(
-                connection,
-                call,
-                owner,
-                (
-                    "org.freedesktop.portal.Error.Exists",
-                    "that request handle is already active",
-                ),
-            )
-        }
-        Err(ReserveError::OwnerFull | ReserveError::Full) => {
-            return refuse(
-                connection,
-                call,
-                owner,
-                (
-                    "org.freedesktop.DBus.Error.LimitsExceeded",
-                    "this portal has too many active handles",
-                ),
-            )
-        }
+        Err(ReserveError::Duplicate) => (
+            "org.freedesktop.portal.Error.Exists",
+            "that request handle is already active",
+        ),
+        Err(ReserveError::OwnerFull | ReserveError::Full) => (
+            "org.freedesktop.DBus.Error.LimitsExceeded",
+            "this portal has too many active handles",
+        ),
     };
+    refuse(connection, call, owner, refused).map(|()| None)
+}
+
+/// Answers the call with its reserved Request `path` and asks who the
+/// caller is: the first stage of handing `uri` to the browser.
+fn start(
+    connection: &mut Connection,
+    state: &mut ServiceState,
+    call: &Message<'_>,
+    owner: &str,
+    path: String,
+    uri: String,
+    scheme: &'static str,
+) -> io::Result<()> {
     if call.flags & message::FLAG_NO_REPLY_EXPECTED == 0 {
         let serial = connection.next_serial()?;
         connection.write_frame(&method_return(
@@ -361,8 +455,8 @@ pub(super) fn begin(
             owner: owner.to_string(),
             path,
             endian: call.endian,
-            uri: parsed.uri.to_string(),
-            https: parsed.https,
+            uri,
+            scheme,
             app: None,
             stage: Stage::Caller,
             candidates: Vec::new(),
@@ -600,7 +694,7 @@ fn record(pending: &Pending, response: u32, outcome: &str) -> String {
     format!(
         "TD-PORTAL-OPEN-URI app={} scheme={} response={response} outcome={outcome}",
         pending.app.as_deref().unwrap_or("-"),
-        if pending.https { "https" } else { "http" },
+        pending.scheme,
     )
 }
 
@@ -1294,55 +1388,221 @@ mod tests {
         assert!(broker.state.open_uris.is_empty());
     }
 
-    #[test]
-    fn open_file_is_not_supported_with_or_without_a_descriptor() {
-        for descriptors in [0u32, 1] {
-            let mut broker = Broker::new();
-            let mut builder = message::Builder::method_call(
-                Endian::Little,
-                PORTAL_PATH,
-                Some(INTERFACE),
-                "OpenFile",
-            )
+    /// An OpenFile call carrying one descriptor and `options`.
+    fn open_file(writable: Option<bool>) -> Vec<u8> {
+        message::Builder::method_call(Endian::Little, PORTAL_PATH, Some(INTERFACE), "OpenFile")
             .destination(PORTAL_NAME)
             .sender(":1.7")
-            .serial(32);
-            if descriptors == 1 {
-                builder = builder.unix_fds(1);
-            }
-            let bytes = if descriptors == 1 {
-                builder.body("sha{sv}", |writer| {
-                    writer.string("")?;
-                    writer.unix_fd(0);
-                    writer.array("{sv}", |_| Ok(()))
+            .serial(32)
+            .unix_fds(1)
+            .body("sha{sv}", |writer| {
+                writer.string("")?;
+                writer.unix_fd(0);
+                writer.array("{sv}", |writer| {
+                    writer.dict_entry(|writer| {
+                        writer.string("handle_token")?;
+                        writer.variant("s", |writer| writer.string("t1"))
+                    })?;
+                    if let Some(writable) = writable {
+                        writer.dict_entry(|writer| {
+                            writer.string("writable")?;
+                            writer.variant("b", |writer| {
+                                writer.bool(writable);
+                                Ok(())
+                            })
+                        })?;
+                    }
+                    Ok(())
                 })
-            } else {
-                builder.body("sa{sv}", |writer| {
-                    writer.string("")?;
-                    writer.array("{sv}", |_| Ok(()))
-                })
-            }
+            })
             .unwrap()
             .encode()
+            .unwrap()
+    }
+
+    /// A private directory standing in for the portal's handoff view.
+    fn handoff_view(name: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let root =
+            std::env::temp_dir().join(format!("td-portal-openfile-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        root
+    }
+
+    fn error_name(broker: &mut Broker) -> Option<String> {
+        let error = broker.next();
+        let (error, _) = message::decode(&error, 0).unwrap();
+        error.fields.error_name.map(str::to_string)
+    }
+
+    #[test]
+    fn open_file_without_its_descriptor_is_invalid() {
+        let mut broker = Broker::new();
+        let bytes =
+            message::Builder::method_call(Endian::Little, PORTAL_PATH, Some(INTERFACE), "OpenFile")
+                .destination(PORTAL_NAME)
+                .sender(":1.7")
+                .serial(32)
+                .body("sa{sv}", |writer| {
+                    writer.string("")?;
+                    writer.array("{sv}", |_| Ok(()))
+                })
+                .unwrap()
+                .encode()
+                .unwrap();
+        service_frame(&mut broker, IncomingFrame::Message(bytes));
+        assert_eq!(
+            error_name(&mut broker).as_deref(),
+            Some("org.freedesktop.DBus.Error.InvalidArgs")
+        );
+        assert!(broker.state.open_uris.is_empty());
+    }
+
+    #[test]
+    fn a_file_is_copied_and_its_copy_handed_to_the_browser() {
+        let view = handoff_view("open");
+        let source = view.join("..").join(format!(
+            "td-portal-openfile-{}-report.pdf",
+            std::process::id()
+        ));
+        fs::write(&source, b"%PDF-1.7 attachment").unwrap();
+        let mut broker = Broker::new();
+        broker.state.handoff = handoff::Handoff::at(view.clone());
+        service_frame(
+            &mut broker,
+            IncomingFrame::Descriptors {
+                bytes: open_file(Some(false)),
+                count: 1,
+                files: vec![fs::File::open(&source).unwrap()],
+            },
+        );
+        let handle = broker.next();
+        let (handle, _) = message::decode(&handle, 0).unwrap();
+        assert_eq!(
+            handle.args(),
+            vec![Value::ObjectPath(
+                "/org/freedesktop/portal/desktop/request/1_7/t1"
+            )]
+        );
+        let copies = fs::read_dir(&view).unwrap().collect::<Vec<_>>();
+        assert_eq!(copies.len(), 1);
+        let directory = copies[0].as_ref().unwrap().file_name();
+        let directory = directory.to_str().unwrap();
+        let name = format!("td-portal-openfile-{}-report.pdf", std::process::id());
+        assert_eq!(
+            fs::read(view.join(directory).join(&name)).unwrap(),
+            b"%PDF-1.7 attachment"
+        );
+        let query = broker.next();
+        assert_eq!(member(&query).0, "GetConnectionCredentials");
+        let pending = broker.state.open_uris.values().next().unwrap();
+        assert_eq!(
+            pending.uri,
+            format!("file:///home/td/Opened/{directory}/{name}")
+        );
+        assert_eq!(pending.scheme, "file");
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&view);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_copied_or_written_is_refused() {
+        let view = handoff_view("refuse");
+        let mut broker = Broker::new();
+        broker.state.handoff = handoff::Handoff::at(view.join("absent"));
+        let source = view.join("source");
+        fs::write(&source, b"x").unwrap();
+        service_frame(
+            &mut broker,
+            IncomingFrame::Descriptors {
+                bytes: open_file(None),
+                count: 1,
+                files: vec![fs::File::open(&source).unwrap()],
+            },
+        );
+        assert_eq!(error_name(&mut broker).as_deref(), Some(UNSUPPORTED_OPEN));
+        broker.state.handoff = handoff::Handoff::at(view.clone());
+        service_frame(
+            &mut broker,
+            IncomingFrame::Descriptors {
+                bytes: open_file(Some(true)),
+                count: 1,
+                files: vec![fs::File::open(&source).unwrap()],
+            },
+        );
+        assert_eq!(error_name(&mut broker).as_deref(), Some(UNSUPPORTED_OPEN));
+        // A directory is not a file to open.
+        service_frame(
+            &mut broker,
+            IncomingFrame::Descriptors {
+                bytes: open_file(None),
+                count: 1,
+                files: vec![fs::File::open(&view).unwrap()],
+            },
+        );
+        assert_eq!(error_name(&mut broker).as_deref(), Some(UNSUPPORTED_OPEN));
+        assert!(broker.state.open_uris.is_empty());
+        assert!(broker
+            .state
+            .handles
+            .lookup("/org/freedesktop/portal/desktop/request/1_7/t1", ":1.7")
+            .is_err());
+        let _ = fs::remove_dir_all(&view);
+    }
+
+    #[test]
+    fn a_refused_handle_copies_nothing() {
+        let view = handoff_view("held");
+        let source = view.join("..").join(format!(
+            "td-portal-openfile-{}-held.pdf",
+            std::process::id()
+        ));
+        fs::write(&source, b"x").unwrap();
+        let mut broker = Broker::new();
+        broker.state.handoff = handoff::Handoff::at(view.clone());
+        broker
+            .state
+            .handles
+            .reserve(HandleKind::Request, ":1.7", "t1")
             .unwrap();
-            let frame = if descriptors == 1 {
-                IncomingFrame::Descriptors {
-                    bytes,
-                    count: descriptors,
-                }
-            } else {
-                IncomingFrame::Message(bytes)
-            };
-            service_frame(&mut broker, frame);
-            let error = broker.next();
-            let (error, _) = message::decode(&error, 0).unwrap();
-            assert_eq!(
-                error.fields.error_name,
-                Some(UNSUPPORTED_OPEN),
-                "{descriptors}"
-            );
-            assert!(broker.state.open_uris.is_empty());
-        }
+        service_frame(
+            &mut broker,
+            IncomingFrame::Descriptors {
+                bytes: open_file(None),
+                count: 1,
+                files: vec![fs::File::open(&source).unwrap()],
+            },
+        );
+        assert_eq!(
+            error_name(&mut broker).as_deref(),
+            Some("org.freedesktop.portal.Error.Exists")
+        );
+        assert_eq!(fs::read_dir(&view).unwrap().count(), 0);
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_dir_all(&view);
+    }
+
+    #[test]
+    fn a_descriptor_count_other_than_one_is_invalid() {
+        let view = handoff_view("count");
+        let mut broker = Broker::new();
+        broker.state.handoff = handoff::Handoff::at(view.clone());
+        service_frame(
+            &mut broker,
+            IncomingFrame::Descriptors {
+                bytes: open_file(None),
+                count: 1,
+                files: Vec::new(),
+            },
+        );
+        assert_eq!(
+            error_name(&mut broker).as_deref(),
+            Some("org.freedesktop.DBus.Error.InvalidArgs")
+        );
+        assert_eq!(fs::read_dir(&view).unwrap().count(), 0);
+        assert_eq!(broker.state.handles.len(), 0);
+        let _ = fs::remove_dir_all(&view);
     }
 
     #[test]
@@ -1368,7 +1628,7 @@ mod tests {
             path: "/org/freedesktop/portal/desktop/request/1_7/t".into(),
             endian: Endian::Little,
             uri: "https://secret.example/token".into(),
-            https: true,
+            scheme: "https",
             app: Some("news".into()),
             stage: Stage::Open {
                 unique: ":1.9".into(),

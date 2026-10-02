@@ -298,17 +298,32 @@ pub(super) fn acknowledge(
 pub(super) struct DescriptorReader {
     stream: UnixStream,
     count: u32,
+    /// The descriptors received with the frame being read, adopted at
+    /// receipt so each has one owner until the frame's consumer drops it.
+    files: Vec<File>,
 }
 impl DescriptorReader {
     pub fn new(stream: UnixStream) -> Self {
-        Self { stream, count: 0 }
+        Self {
+            stream,
+            count: 0,
+            files: Vec::new(),
+        }
     }
     pub fn finish(&mut self, frame: IncomingFrame) -> io::Result<IncomingFrame> {
         let count = std::mem::take(&mut self.count);
+        let mut files = std::mem::take(&mut self.files);
+        // Only OpenFile's one descriptor is ever used; any other freight is
+        // closed here, so queued frames cannot hold the portal's descriptors.
+        if count != 1 {
+            files.clear();
+        }
         match frame {
-            IncomingFrame::Message(bytes) if count != 0 => {
-                Ok(IncomingFrame::Descriptors { bytes, count })
-            }
+            IncomingFrame::Message(bytes) if count != 0 => Ok(IncomingFrame::Descriptors {
+                bytes,
+                count,
+                files,
+            }),
             frame => Ok(frame),
         }
     }
@@ -321,7 +336,17 @@ impl Read for DescriptorReader {
         let received =
             sys::recv_with_fds(&self.stream, bytes).map_err(|e| io::Error::other(e.to_string()))?;
         let count = received.fds.len() as u32;
-        sys::discard_received(&received.fds);
+        let mut fds = received.fds.into_iter();
+        while let Some(fd) = fds.next() {
+            // Each number leaves the received list before its adoption.
+            match sys::take_received(fd) {
+                Ok(file) => self.files.push(file),
+                Err(why) => {
+                    sys::discard_received(&fds.collect::<Vec<_>>());
+                    return Err(io::Error::other(why));
+                }
+            }
+        }
         self.count = self.count.saturating_add(count);
         if self.count > message::MAX_FDS_PER_MESSAGE {
             return Err(io::Error::other("too many incoming portal descriptors"));
@@ -333,6 +358,37 @@ impl Read for DescriptorReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame keeps the files that arrived with its first bytes only when
+    /// there is exactly one, OpenFile's shape; other freight closes at once.
+    #[test]
+    fn the_reader_keeps_one_received_file_and_closes_other_freight() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut reader = DescriptorReader::new(receiver);
+        let file = File::open("/proc/self/exe").unwrap();
+        sys::send_with_fd(&sender, b"one", std::os::fd::AsRawFd::as_raw_fd(&file)).unwrap();
+        let mut bytes = [0u8; 3];
+        reader.read_exact(&mut bytes).unwrap();
+        let IncomingFrame::Descriptors { count, files, .. } = reader
+            .finish(IncomingFrame::Message(bytes.to_vec()))
+            .unwrap()
+        else {
+            panic!("a descriptor frame");
+        };
+        assert_eq!((count, files.len()), (1, 1));
+        for _ in 0..2 {
+            sys::send_with_fd(&sender, b"x", std::os::fd::AsRawFd::as_raw_fd(&file)).unwrap();
+        }
+        let mut bytes = [0u8; 2];
+        reader.read_exact(&mut bytes).unwrap();
+        let IncomingFrame::Descriptors { count, files, .. } = reader
+            .finish(IncomingFrame::Message(bytes.to_vec()))
+            .unwrap()
+        else {
+            panic!("a descriptor frame");
+        };
+        assert_eq!((count, files.len()), (2, 0));
+    }
 
     fn connection() -> (Connection, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();
@@ -490,12 +546,24 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .unwrap();
+        // The bus reader adopts what it receives, so OpenFile's descriptor
+        // has one owner; a failed adoption disposes of the numbers left.
         for site in [
             "sys::send_with_fd(",
             "sys::recv_with_fds(",
+            "sys::take_received(",
             "sys::discard_received(",
         ] {
             assert_eq!(source.matches(site).count(), 1);
+        }
+        for (name, other) in [
+            ("main.rs", include_str!("main.rs")),
+            ("open_uri.rs", include_str!("open_uri.rs")),
+            ("handoff.rs", include_str!("handoff.rs")),
+        ] {
+            let other = other.split("#[cfg(test)]").next().unwrap();
+            assert!(!other.contains("sys::take_received("), "{name}");
+            assert!(!other.contains("from_raw_fd"), "{name}");
         }
     }
     #[test]

@@ -53,6 +53,7 @@ mod fido_hid;
 )]
 mod fido_metadata;
 mod handles;
+mod handoff;
 #[path = "../../td-busd/src/message.rs"]
 #[allow(
     dead_code,
@@ -391,7 +392,7 @@ struct Connection {
     serial: u32,
     unique: Option<String>,
     until: Option<Instant>,
-    setup_events: Vec<Vec<u8>>,
+    setup_events: Vec<IncomingFrame>,
 }
 
 #[derive(Debug)]
@@ -426,6 +427,7 @@ enum IncomingFrame {
     Descriptors {
         bytes: Vec<u8>,
         count: u32,
+        files: Vec<fs::File>,
     },
     Message(Vec<u8>),
     Oversized {
@@ -725,7 +727,26 @@ impl Connection {
                     )))
                 }
             };
-            let (reply, consumed) = message::decode(&bytes, 0).map_err(message_error)?;
+            let (reply, consumed) = match message::decode(&bytes, 0) {
+                // Setup reads plainly, which closes a call's descriptors: it
+                // is answered once setup ends as one that arrived without
+                // them, rather than ending the service.
+                Err(message::MessageError::FdCountMismatch) => {
+                    let count = declared_descriptors(&bytes).ok_or_else(|| {
+                        io::Error::other("a D-Bus frame declares descriptors it cannot carry")
+                    })?;
+                    if self.setup_events.len() == MAX_QUEUED_SERVICE_EVENTS {
+                        return Err(io::Error::other("too many portal events during setup"));
+                    }
+                    self.setup_events.push(IncomingFrame::Descriptors {
+                        bytes,
+                        count,
+                        files: Vec::new(),
+                    });
+                    continue;
+                }
+                decoded => decoded.map_err(message_error)?,
+            };
             if consumed != bytes.len() {
                 return Err(io::Error::other("a D-Bus frame carried trailing bytes"));
             }
@@ -740,7 +761,7 @@ impl Connection {
                 if self.setup_events.len() == MAX_QUEUED_SERVICE_EVENTS {
                     return Err(io::Error::other("too many portal events during setup"));
                 }
-                self.setup_events.push(bytes);
+                self.setup_events.push(IncomingFrame::Message(bytes));
                 continue;
             }
             if reply.fields.reply_serial != Some(serial) {
@@ -891,6 +912,16 @@ fn auth_line(uid: u32) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     format!("\0AUTH EXTERNAL {identity}\r\n")
+}
+
+/// The descriptor count a frame read without its descriptors declares.
+fn declared_descriptors(bytes: &[u8]) -> Option<u32> {
+    (1..=message::MAX_FDS_PER_MESSAGE).find(|&count| {
+        !matches!(
+            message::decode(bytes, count),
+            Err(message::MessageError::FdCountMismatch)
+        )
+    })
 }
 
 fn read_frame(reader: &mut impl Read) -> io::Result<IncomingFrame> {
@@ -1209,15 +1240,12 @@ fn serve(
         ),
         ..ServiceState::default()
     };
+    if let Err(why) = state.handoff.clear() {
+        eprintln!("td-portal: OpenFile is unavailable: {why}");
+    }
     // Calls can precede the reply that grants our public name.
-    for bytes in std::mem::take(&mut connection.setup_events) {
-        consume_bus_frame(
-            connection,
-            settings,
-            &mut state,
-            &sender,
-            IncomingFrame::Message(bytes),
-        )?;
+    for frame in std::mem::take(&mut connection.setup_events) {
+        consume_bus_frame(connection, settings, &mut state, &sender, frame)?;
     }
     loop {
         let event = receiver
@@ -1283,6 +1311,8 @@ struct ServiceState {
     open_uris: BTreeMap<u32, open_uri::Pending>,
     /// Expired browser calls by serial, with the browser's unique name.
     open_uri_stale: BTreeMap<u32, String>,
+    /// OpenFile's copies for Firefox.
+    handoff: handoff::Handoff,
     handles: Handles,
     pending: BTreeMap<u32, PendingOpen>,
     pending_audits: BTreeMap<u32, String>,
@@ -1301,11 +1331,16 @@ fn consume_bus_frame(
     frame: IncomingFrame,
 ) -> io::Result<()> {
     let frame = match frame {
-        IncomingFrame::Descriptors { bytes, count } => {
+        IncomingFrame::Descriptors {
+            bytes,
+            count,
+            files,
+        } => {
             let (call, _) = message::decode(&bytes, count).map_err(message_error)?;
             if open_uri::is_open_file(&call) {
-                return open_uri::refuse_open_file(connection, &call);
+                return open_uri::begin_file(connection, state, &call, files);
             }
+            drop(files);
             if call.kind == MessageType::MethodCall
                 && call.flags & message::FLAG_NO_REPLY_EXPECTED == 0
             {
@@ -3688,6 +3723,7 @@ mod confinement {
         ("lib.rs", include_str!("lib.rs")),
         ("settings.rs", include_str!("settings.rs")),
         ("secret.rs", include_str!("secret.rs")),
+        ("handoff.rs", include_str!("handoff.rs")),
         ("open_uri.rs", include_str!("open_uri.rs")),
         ("sys.rs", include_str!("../../td-secret/src/sys.rs")),
         (
@@ -5507,6 +5543,59 @@ mod tests {
         let error = subscribe_to_owner_departures(&mut connection).unwrap_err();
         assert_eq!(error.to_string(), "too many portal events during setup");
         assert_eq!(connection.setup_events.len(), MAX_QUEUED_SERVICE_EVENTS);
+    }
+
+    /// A call whose descriptors a setup read closed is queued with its
+    /// declared count and no files, to be refused once setup ends.
+    #[test]
+    fn a_descriptor_call_during_setup_is_queued_without_its_files() {
+        let (stream, mut broker) = UnixStream::pair().unwrap();
+        let mut connection = Connection {
+            stream,
+            serial: 0,
+            unique: Some(":1.10".into()),
+            until: Some(Instant::now() + Duration::from_secs(2)),
+            setup_events: Vec::new(),
+        };
+        let open_file = message::Builder::method_call(
+            Endian::Little,
+            PORTAL_PATH,
+            Some("org.freedesktop.portal.OpenURI"),
+            "OpenFile",
+        )
+        .destination(PORTAL_NAME)
+        .sender(":1.7")
+        .serial(4)
+        .unix_fds(1)
+        .body("sha{sv}", |writer| {
+            writer.string("")?;
+            writer.unix_fd(0);
+            writer.array("{sv}", |_| Ok(()))
+        })
+        .unwrap()
+        .encode()
+        .unwrap();
+        broker.write_all(&open_file).unwrap();
+        let reply = message::Builder::method_return(Endian::Little, 1)
+            .sender(BUS_NAME)
+            .destination(":1.10")
+            .serial(20)
+            .body("", |_| Ok(()))
+            .unwrap()
+            .encode()
+            .unwrap();
+        broker.write_all(&reply).unwrap();
+        subscribe_to_owner_departures(&mut connection).unwrap();
+        let [IncomingFrame::Descriptors {
+            bytes,
+            count,
+            files,
+        }] = connection.setup_events.as_slice()
+        else {
+            panic!("the descriptor call was not queued");
+        };
+        assert_eq!((bytes, *count, files.len()), (&open_file, 1, 0));
+        assert_eq!(declared_descriptors(&reply), None);
     }
 
     #[test]

@@ -2035,11 +2035,12 @@ enters the surface.
 The private Wayland dialog that was this module's original consumer no longer
 uses it. The FileChooser dialog runs over the shared `td_ui::client`, whose own
 transport module owns the keymap fd and the SHM pool descriptor passing (§19).
-So td-portal passes no Wayland descriptor and adopts none in its own code; the
-adoption function stays in the shared source for td-secret's client (§15),
-behind a dead-code allow in td-portal. td-portal's remaining use of the module
-is the secret store in `td-portal/src/secret.rs` — one send caller and one
-receive-and-discard pair — whose exact provenance §15 details.
+So td-portal passes no Wayland descriptor. Its use of the module is in
+`td-portal/src/secret.rs`: the secret store's one send caller, whose exact
+provenance §15 details, and the bus reader's one receive with its one
+adoption call and one disposal call. The bus reader adopts each received
+descriptor at receipt, so OpenURI.OpenFile's descriptor has a single
+`File` owner until the frame's consumer drops it.
 
 Every receive requests `MSG_CMSG_CLOEXEC`, parses at most 128 ancillary bytes,
 accepts only `SOL_SOCKET`/`SCM_RIGHTS`, and records a content or policy refusal
@@ -2425,10 +2426,18 @@ reading that application's named credential. Secret bytes are written only
 after unlinking. The credential method accepts no incoming descriptor.
 
 After fd negotiation, the portal's bus reader also uses the shared receive
-wrapper. It discards every received fd immediately, counts them only for
-bounded D-Bus decoding, and answers calls with InvalidArgs rather than
-terminating the service. Oversized frames retain the existing bounded drain.
-This receive-and-discard pair is confined to secret.rs and pinned in tests.
+wrapper. It adopts every received fd at receipt through the one adoption
+function, each number leaving the received list before its adoption; if an
+adoption is refused, the numbers not yet adopted are disposed of through the
+crate-visible helper and the reader stops. The frame carries the adopted
+`File`s with its count for bounded D-Bus decoding. Only OpenURI.OpenFile
+keeps one, which it reads with positional reads and drops after copying it
+for Firefox (APPLICATIONS.md §E row 4); every other descriptor-carrying call
+drops them and is answered with InvalidArgs rather than terminating the
+service. Oversized frames retain the existing bounded drain. This adds a
+production caller of the existing adoption function and no syscall,
+ancillary kind or allowance.
+This receive, adopt and dispose set is confined to secret.rs and pinned in tests.
 
 ## 16. `td-authd` — the secure-attention authority channel
 

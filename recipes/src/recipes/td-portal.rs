@@ -116,6 +116,24 @@ mod tests {
         }
     }
 
+    /// OpenFile's copies land where td-authd publishes the portal's view of
+    /// Firefox's `~/Opened`, and the URL names the path Firefox's read-only
+    /// grant shows it.
+    #[test]
+    fn portal_authd_and_firefox_share_the_exact_handoff_pair() {
+        let handoff = include_str!("../../../td-portal/src/handoff.rs");
+        assert!(handoff.contains("const HOST: &str = \"/var/td-portal-files/1000/Opened\";"));
+        assert!(handoff.contains("const GUEST: &str = \"/home/td/Opened\";"));
+        assert_eq!(TD_JAIL_FIXTURE_DOWNLOAD_TARGET, "/home/td/Downloads");
+        let authd = include_str!("../../../td-authd/src/portal_files.rs");
+        assert!(authd.contains("const HANDOFF: &str = \"Opened\";"));
+        assert!(authd.contains("const HANDOFF_VIEW: &str = \"/var/td-portal-files/1000/Opened\";"));
+        let firefox = include_str!("firefox.rs");
+        assert!(
+            firefox.contains("with_filesystem(\"~/Opened\", FilesystemAccess::ReadOnly, false)")
+        );
+    }
+
     #[test]
     fn portal_and_firefox_share_the_exact_download_grant_pair() {
         assert_eq!(TD_JAIL_FIXTURE_DOWNLOAD_TARGET, "/home/td/Downloads");
