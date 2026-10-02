@@ -70,8 +70,10 @@ bounded sequence progress; an abandoned frame retires its parent. Retained-
 history input can now read selected files with one operation buffer and compact
 change slots, requiring EOF/digest binding at completion. Active change input
 shares that operation reader while stopping at a captured prefix, allowing
-append growth and binding completion to its sequence/offset. Live change
-cursors still need their pin and cursor-policy integration.
+append growth and binding completion to its sequence/offset. A supplied-frame
+cursor now checks captured identity, retained floors and endpoint
+boundaries while draining supplied checked frames. File location and actual
+view-pin integration remain separate.
 Complete selected-graph/final-view validation and committed mail publication
 remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit

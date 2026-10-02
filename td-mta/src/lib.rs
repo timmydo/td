@@ -3,6 +3,7 @@
 
 pub mod admission;
 pub mod bounded;
+pub mod change_cursor;
 pub mod clock;
 pub mod config;
 pub mod format;

@@ -886,6 +886,14 @@ service activation. Each part lands independently:
     later appends, empty prefixes, short slots, I/O faults, mismatched views and
     endpoint mismatch. Existing allocation instrumentation covers both root
     bounds. Live cursor, history-floor and pin integration remain future.
+  - **M05d14f — supplied change cursor:** implemented fixed-kind, captured-view
+    policy over checked compact frames. Validate floor/endpoint/caller cursor,
+    request the exact next sequence, retain frame identity and slot position,
+    and return ordered matching records or explicit frame boundaries. All
+    errors are terminal; completion requires the endpoint boundary. Tests cover
+    maximum frames, partial cursors, filtering/actions/duplicates, empty ranges,
+    view changes and frame substitution. Allocation instrumentation covers
+    draining and refusal. File location, real pins and serving remain future.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

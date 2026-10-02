@@ -726,10 +726,35 @@ slot borrow; retained unused slots never appear in records. Records have the
 frame sequence and original ordinals; duplicates/actions are not coalesced or
 filtered. Row-only frames can complete with zero slots. Results do not borrow
 the operation input and retain no file or view pin. RESOURCES.md reserves
-distinct change slots because
-get/next may use their result buffers while a completed frame is being drained.
+distinct change slots because get/next may use their result buffers while a
+completed frame is being drained.
 This helper performs no I/O, cursor/floor/endpoint check, selected-journal
 binding, JMAP coalescing or next_change activation.
+
+`change_cursor::Cursor` implements the supplied-frame policy for one fixed
+object kind and captured ViewIdentity. Construct it with an initial after
+cursor; Identity, a future sequence or an inverted floor/end range is Invalid.
+A cursor below the floor, or partway through the floor's unretained frame, is
+HistoryLost. The floor boundary `(floor, u32::MAX)` remains valid. The caller
+owns actual pins and verifies deadlines, selected files and final-view validity
+before using any returned step as serving data.
+
+`poll` requires the identical captured identity and the exact last returned
+cursor. View changes are Conflict; caller cursor jumps or reuse of an older
+cursor after progress are Invalid. With no supplied frame, NeedFrame names
+the next exact sequence;
+locating/reading it has an external work budget. Supply a CompleteChanges from
+a checked frame. The initial finite ordinal must name an operation in that
+frame; it need not be a CHANGE. Frames out of order or replacement of the
+currently drained frame's Summary are Corrupt. All poll errors are terminal.
+
+Drain matching records in original ordinal order, including duplicates/actions.
+A saved slot index never revisits examined changes. One call returns the next
+record or Advanced at that same frame's end; no matching records still produces
+Advanced. Resume at `(through, u32::MAX)` after Advanced; the next call can
+request the next frame. Complete occurs only after the pinned endpoint boundary,
+including an empty range. This helper reads no files, coalesces no JMAP events
+and supplies no live pin, selected-history validation or protocol activation.
 
 BlobReader is an already authorized, opened, immutable file with a live owner
 pin held until it closes. Store::open_blob requires Access and borrows the

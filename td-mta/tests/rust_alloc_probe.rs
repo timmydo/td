@@ -1457,6 +1457,52 @@ fn collected_frame_changes() {
         if mode == 0 {
             let complete = result.unwrap();
             assert_eq!(complete.len(), MAX_FRAME_OPERATIONS);
+            let view = td_mta::ports::ViewIdentity {
+                account: td_mta::ids::AccountId::from_bytes([1; 16]),
+                epoch: td_mta::ids::StoreEpoch::from_bytes([2; 16]),
+                generation: 1,
+                checkpoint: Sequence::default(),
+                segment: 1,
+                committed_offset: bytes.len() as u64 + 96,
+                committed_sequence: Sequence::from_u64(1),
+                history_floor: Sequence::default(),
+            };
+            let start = td_mta::ports::ChangeCursor {
+                sequence: Sequence::default(),
+                operation: u32::MAX,
+            };
+            let mut cursor =
+                td_mta::change_cursor::Cursor::new(view, start, ObjectType::Email).unwrap();
+            for ordinal in 0..MAX_FRAME_OPERATIONS {
+                assert!(
+                    matches!(cursor.poll(view, cursor.after(), Some(&complete)).unwrap(),
+                    td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Record(record)) if record.cursor.operation as usize == ordinal)
+                );
+            }
+            assert!(
+                matches!(cursor.poll(view, cursor.after(), Some(&complete)).unwrap(),
+                td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Advanced { through }) if through.number() == 1)
+            );
+            assert_eq!(
+                cursor.poll(view, cursor.after(), None).unwrap(),
+                td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Complete)
+            );
+            let mut empty =
+                td_mta::change_cursor::Cursor::new(view, start, ObjectType::Thread).unwrap();
+            assert!(matches!(
+                empty.poll(view, start, Some(&complete)).unwrap(),
+                td_mta::change_cursor::Step::Change(td_mta::ports::ChangeStep::Advanced { .. })
+            ));
+            let mut changed = view;
+            changed.generation += 1;
+            assert_eq!(
+                empty.poll(changed, empty.after(), None),
+                Err(td_mta::ports::Error::Conflict)
+            );
+            assert_eq!(
+                empty.poll(view, empty.after(), None),
+                Err(td_mta::ports::Error::Conflict)
+            );
             for _ in 0..2 {
                 for (index, record) in complete.records().enumerate() {
                     assert_eq!(black_box(record).cursor.operation as usize, index);

@@ -111,6 +111,19 @@ impl<'s> CompleteChanges<'s> {
     pub fn into_cells(self) -> &'s mut [Cell] {
         self.cells
     }
+    pub(crate) fn record(&self, index: usize) -> Option<ChangeRecord> {
+        if index >= self.count {
+            return None;
+        }
+        let cell = self.cells.get(index)?;
+        Some(ChangeRecord {
+            cursor: ChangeCursor {
+                sequence: self.summary.header().sequence,
+                operation: cell.ordinal,
+            },
+            change: cell.change,
+        })
+    }
     pub fn records(&self) -> impl ExactSizeIterator<Item = ChangeRecord> + '_ {
         let sequence = self.summary.header().sequence;
         self.cells

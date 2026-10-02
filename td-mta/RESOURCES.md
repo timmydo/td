@@ -770,6 +770,15 @@ and populated prefixes, checksum completion and admission/premature-finish
 refusals using the cold fixture record-buffer prefix. This is component evidence,
 not complete-worker memory qualification or live-view activation.
 
+The supplied-frame change Cursor fits 512 bytes on the worker stack. It owns
+only ViewIdentity, kind/cursor, current Summary/index and terminal error state;
+it borrows no operation buffer or CHANGE arena between calls. Each poll scans
+at most the remaining 4096 compact slots in one frame and retains its next
+index, so draining never rescans examined entries. NeedFrame performs no I/O;
+the driver separately bounds initial location and each frame read. Existing
+allocation instrumentation drains maximum changes, filters an empty result and
+checks changed-view refusal without new hooks. No resource allowance changes.
+
 HistoryInput borrows one preallocated 1 MiB frame buffer and the selected
 manifest, retains one StoreReader and the fixed journal verifier (header,
 sequence/count/extent counters and provider digest state). Opening uses a
