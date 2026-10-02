@@ -6,25 +6,55 @@
 //! td-mail's `tests/mock_fetch.rs` is the precedent; this one answers from
 //! fixtures rather than forwarding to a loopback server, since nothing in
 //! a model exchange needs one. No test reaches the network.
+//!
+//! A request that asks for a stream gets the service's stream mode: the
+//! head ending in `stream`, the body as `chunk N` frames, and an `end` or
+//! `error` line, or, for a client that must close it, comment frames as
+//! OpenRouter sends while a model is silent until the client does.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const PROTOCOL: &str = "td-fetch 1";
+/// The service's bound on one frame.
+const MAX_FRAME: usize = 64 * 1024;
+/// What a stream left open sends while the client reads on.
+const KEEPALIVE: &[u8] = b": OPENROUTER PROCESSING\n\n";
+
+/// How a streamed reply ends after its body.
+#[derive(Clone, Debug)]
+pub enum Tail {
+    /// `end`: the body is whole.
+    End,
+    /// `error kind: reason`: the origin broke off.
+    Error(String),
+    /// Comment frames every 20 ms until the client closes the connection,
+    /// which the mock counts (`closed`).
+    Open,
+}
 
 /// One scripted answer.
 #[derive(Clone, Debug)]
 pub enum Reply {
-    /// A counted reply: status, headers and body.
+    /// A counted reply: status, headers and body. A request for a stream
+    /// gets it as the service would, framed, and ended.
     Http {
         status: u16,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+    },
+    /// A streamed reply: its body in frames of `frame` bytes, then `tail`.
+    Stream {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        frame: usize,
+        tail: Tail,
     },
     /// The service's `error kind: reason` head.
     Error(String),
@@ -34,6 +64,84 @@ pub enum Reply {
 }
 
 impl Reply {
+    /// A 200 event stream from fixture `name`, in frames of 61 bytes so
+    /// that its events straddle them.
+    pub fn sse(name: &str) -> Self {
+        Self::Stream {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: fixture(name),
+            frame: 61,
+            tail: Tail::End,
+        }
+    }
+
+    /// The same, its lines ending in CRLF.
+    pub fn sse_crlf(name: &str) -> Self {
+        let text = String::from_utf8(fixture(name)).expect("a UTF-8 fixture");
+        Self::sse(name).body(text.replace('\n', "\r\n").into_bytes())
+    }
+
+    fn body(self, new: Vec<u8>) -> Self {
+        match self {
+            Self::Stream {
+                status,
+                headers,
+                frame,
+                tail,
+                ..
+            } => Self::Stream {
+                status,
+                headers,
+                body: new,
+                frame,
+                tail,
+            },
+            other => other,
+        }
+    }
+
+    /// A stream cut off after the event that carries `marker`.
+    pub fn cut_after(self, marker: &str) -> Self {
+        let Self::Stream { ref body, .. } = self else {
+            return self;
+        };
+        let text = String::from_utf8(body.clone()).expect("a UTF-8 fixture");
+        let at = text.find(marker).expect("the marker");
+        let end = text[at..].find("\n\n").expect("the event's end") + at + 2;
+        self.body(text.as_bytes()[..end].to_vec())
+    }
+
+    /// The same stream with `data: [DONE]` after what it has.
+    pub fn done(self) -> Self {
+        let Self::Stream { ref body, .. } = self else {
+            return self;
+        };
+        let mut body = body.clone();
+        body.extend_from_slice(b"data: [DONE]\n\n");
+        self.body(body)
+    }
+
+    /// A stream ending `tail`.
+    pub fn tail(self, new: Tail) -> Self {
+        match self {
+            Self::Stream {
+                status,
+                headers,
+                body,
+                frame,
+                ..
+            } => Self::Stream {
+                status,
+                headers,
+                body,
+                frame,
+                tail: new,
+            },
+            other => other,
+        }
+    }
+
     /// A 200 with a fixture's body.
     pub fn ok(fixture: &str) -> Self {
         Self::status(200, fixture)
@@ -106,6 +214,8 @@ pub struct MockFetch {
     recorded: Arc<Mutex<Vec<Recorded>>>,
     script: Arc<Mutex<Vec<Reply>>>,
     stop: Arc<AtomicBool>,
+    /// Open streams their client closed.
+    closed: Arc<AtomicUsize>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -124,14 +234,21 @@ impl MockFetch {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(script.into_iter().rev().collect::<Vec<_>>()));
         let stop = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicUsize::new(0));
         let handle = {
-            let (recorded, script, stop) = (recorded.clone(), script.clone(), stop.clone());
+            let (recorded, script, stop, closed) = (
+                recorded.clone(),
+                script.clone(),
+                stop.clone(),
+                closed.clone(),
+            );
             thread::spawn(move || {
                 let mut held = Vec::new();
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            if let Some(stream) = serve(stream, &recorded, &script) {
+                            if let Some(stream) = serve(stream, &recorded, &script, &stop, &closed)
+                            {
                                 held.push(stream);
                             }
                         }
@@ -148,7 +265,21 @@ impl MockFetch {
             recorded,
             script,
             stop,
+            closed,
             handle: Some(handle),
+        }
+    }
+
+    /// Waits until the client has closed `count` open streams.
+    pub fn wait_closed(&self, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.closed.load(Ordering::SeqCst) < count {
+            assert!(
+                Instant::now() < deadline,
+                "{} of {count} open streams were closed",
+                self.closed.load(Ordering::SeqCst)
+            );
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -196,12 +327,48 @@ impl Drop for MockFetch {
     }
 }
 
+/// The head of a streamed reply.
+fn stream_head(status: u16, headers: &[(String, String)]) -> Vec<u8> {
+    let mut head = format!("{PROTOCOL}\nstatus {status}\n");
+    for (name, value) in headers {
+        head.push_str(&format!("header {name}: {value}\n"));
+    }
+    head.push_str("stream\n\n");
+    head.into_bytes()
+}
+
+/// `body` as frames of at most `frame` bytes.
+fn frames(body: &[u8], frame: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for piece in body.chunks(frame.clamp(1, MAX_FRAME)) {
+        out.extend(format!("chunk {}\n", piece.len()).into_bytes());
+        out.extend(piece);
+    }
+    out
+}
+
+/// Comment frames until the client closes the connection, counted then.
+fn keep_open(stream: UnixStream, stop: Arc<AtomicBool>, closed: Arc<AtomicUsize>) {
+    let mut frame = format!("chunk {}\n", KEEPALIVE.len()).into_bytes();
+    frame.extend(KEEPALIVE);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        if (&stream).write_all(&frame).is_err() {
+            closed.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Reads one request, records it and answers it; a held connection is
 /// handed back to be kept open.
 fn serve(
     stream: UnixStream,
     recorded: &Mutex<Vec<Recorded>>,
     script: &Mutex<Vec<Reply>>,
+    stop: &Arc<AtomicBool>,
+    closed: &Arc<AtomicUsize>,
 ) -> Option<UnixStream> {
     stream.set_nonblocking(false).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -213,9 +380,46 @@ fn serve(
             return None;
         }
     };
+    let streamed = request.stream;
     recorded.lock().ok()?.push(request);
     let reply = script.lock().ok()?.pop();
     let bytes = match reply {
+        // As the service frames any reply to a request for a stream.
+        Some(Reply::Http {
+            status,
+            headers,
+            body,
+        }) if streamed => {
+            let mut bytes = stream_head(status, &headers);
+            bytes.extend(frames(&body, MAX_FRAME));
+            bytes.extend(b"end\n");
+            bytes
+        }
+        Some(Reply::Stream {
+            status,
+            headers,
+            body,
+            frame,
+            tail,
+        }) if streamed => {
+            let mut bytes = stream_head(status, &headers);
+            bytes.extend(frames(&body, frame));
+            match tail {
+                Tail::End => bytes.extend(b"end\n"),
+                Tail::Error(line) => bytes.extend(format!("error {line}\n").into_bytes()),
+                Tail::Open => {
+                    (&stream).write_all(&bytes).ok()?;
+                    let (stop, closed) = (stop.clone(), closed.clone());
+                    thread::spawn(move || keep_open(stream, stop, closed));
+                    return None;
+                }
+            }
+            bytes
+        }
+        Some(Reply::Stream { .. }) => {
+            format!("{PROTOCOL}\nerror malformed: a stream scripted for a counted request\n\n")
+                .into_bytes()
+        }
         Some(Reply::Http {
             status,
             headers,

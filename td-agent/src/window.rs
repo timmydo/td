@@ -167,6 +167,11 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::Interrupt => {
+                    if let Err(e) = self.supervisor.interrupt() {
+                        self.app.note(e);
+                    }
+                }
                 Request::SaveShare(first, total) => {
                     if let Err(e) = self.state.save_share(first, total) {
                         self.app.note(e);

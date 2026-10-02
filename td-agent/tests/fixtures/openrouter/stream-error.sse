@@ -1,0 +1,8 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1759400500-sTrEaMeRrOr00001","provider":"Google AI Studio","model":"google/gemini-3-pro-preview","object":"chat.completion.chunk","created":1759400500,"choices":[{"index":0,"delta":{"role":"assistant","content":"Rebase onto"},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400500-sTrEaMeRrOr00001","provider":"Google AI Studio","model":"google/gemini-3-pro-preview","object":"chat.completion.chunk","created":1759400500,"error":{"code":502,"message":"Upstream error from Google: the stream was reset","metadata":{"provider_name":"Google AI Studio"}},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error","native_finish_reason":null,"logprobs":null}],"usage":{"prompt_tokens":2350,"completion_tokens":4,"total_tokens":2354,"cost":0.0048,"is_byok":false}}
+
+data: [DONE]
+

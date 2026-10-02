@@ -9926,7 +9926,8 @@ webpki-roots, and no decoder. So:
    frame at a time and holds each frame to 64 KiB, a bound a recipe test
    holds to the service's, and their sum to the limit; neither
    application calls them, and td-agent's model client
-   (`td-agent/DESIGN.md` §5) is the first that will.
+   (`td-agent/DESIGN.md` §5) is the first that does, streaming each
+   turn through `post_stream`.
 4. Evidence. The boot VM has no route out, so the evidence is the socket
    and the policy: `[fetch-evidence]` connects as the UI user, asks for
    a loopback URL and expects the exact refusal; inside the jail, the

@@ -11,7 +11,8 @@
 //! conversation process per open or running conversation
 //! (`conversation`), which speak `protocol` in `frame`s over a socketpair.
 //! Only a conversation process writes its conversation's directory of the
-//! `store`. The model client (DESIGN.md §5) is `client`, its money `cost`
+//! `store`. The model client (DESIGN.md §5) is `client`, a streamed reply
+//! read by `sse` and put back together by `assemble`, its money `cost`
 //! and `accounts`, what it knows of the provider's models `models`; the
 //! window reads the API key (`key`) and hands it down.
 //!
@@ -20,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod accounts;
+pub mod assemble;
 pub mod client;
 pub mod config;
 pub mod control;
@@ -33,9 +35,11 @@ pub mod models;
 pub mod prompt;
 pub mod protocol;
 pub mod span;
+pub mod sse;
 pub mod store;
 pub mod supervisor;
-// The fetch service's client: td-agent posts, and does not stream yet.
+// The fetch service's client: td-agent posts titles and streams turns,
+// and gets nothing streamed.
 #[allow(dead_code)]
 #[cfg_attr(
     test,

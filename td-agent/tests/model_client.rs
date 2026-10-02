@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use mock_fetch::{fixture, MockFetch, Reply};
+use mock_fetch::{fixture, MockFetch, Reply, Tail};
 use td_agent::config::Client;
 use td_agent::cost::{Limits, ONE};
 use td_agent::frame;
@@ -62,6 +62,10 @@ struct Harness {
     /// Every reservation asked for and every cost reported.
     reserved: Vec<(u64, u64)>,
     spent: Vec<(u64, u64)>,
+    /// Every streamed delta: its request, reasoning and text.
+    deltas: Vec<(u64, String, String)>,
+    /// Events `until_text` heard, which the next `turn` begins with.
+    heard: Vec<Event>,
     stderr: PathBuf,
 }
 
@@ -96,6 +100,8 @@ impl Harness {
             day: Day::Grant,
             reserved: Vec::new(),
             spent: Vec::new(),
+            deltas: Vec::new(),
+            heard: Vec::new(),
             stderr,
         };
         assert!(matches!(harness.next(), Up::Hello { .. }));
@@ -130,40 +136,101 @@ impl Harness {
         });
     }
 
+    /// Answers a reservation as the day says, or keeps a delta: whether
+    /// `up` was either.
+    fn hear(&mut self, up: &Up) -> bool {
+        match up {
+            Up::Reserve { id, amount } => {
+                self.reserved.push((*id, *amount));
+                let refusal = match &self.day {
+                    Day::Grant => None,
+                    Day::Refuse(why) => Some(why.clone()),
+                };
+                self.down(&Down::Reservation { id: *id, refusal });
+            }
+            Up::Spent { id, amount } => self.spent.push((*id, *amount)),
+            Up::Delta {
+                request,
+                reasoning,
+                content,
+            } => self
+                .deltas
+                .push((*request, reasoning.clone(), content.clone())),
+            _ => return false,
+        }
+        true
+    }
+
+    /// What the process said until a delta brought text, reservations
+    /// answered on the way; the events, for `turn` to go on from.
+    fn until_text(&mut self) {
+        loop {
+            let up = self.next();
+            if self.hear(&up) {
+                if matches!(up, Up::Delta { ref content, .. } if !content.is_empty()) {
+                    return;
+                }
+            } else if let Up::Event(event) = up {
+                self.heard.push(event);
+            }
+        }
+    }
+
+    /// What the process said until `count` reservations were spent; the
+    /// events, for `turn` to go on from.
+    fn until_spent(&mut self, count: usize) {
+        while self.spent.len() < count {
+            let up = self.next();
+            if !self.hear(&up) {
+                if let Up::Event(event) = up {
+                    self.heard.push(event);
+                }
+            }
+        }
+    }
+
+    /// The text every delta of request `request` brought.
+    fn streamed(&self, request: u64) -> (String, String) {
+        let mut out = (String::new(), String::new());
+        for (of, reasoning, content) in &self.deltas {
+            if *of == request {
+                out.0.push_str(reasoning);
+                out.1.push_str(content);
+            }
+        }
+        out
+    }
+
     /// What the process said up to its turn's end, reservations answered
     /// on the way: the events, and the turn's outcome and retry flag.
     fn turn(&mut self) -> (Vec<Event>, String, bool) {
-        let mut events = Vec::new();
-        let mut turns = Vec::new();
+        let mut events = std::mem::take(&mut self.heard);
+        let mut turns: Vec<u64> = events
+            .iter()
+            .filter(|e| matches!(e.kind, Kind::Started { .. }))
+            .map(|e| e.seq)
+            .collect();
         loop {
-            match self.next() {
-                Up::Reserve { id, amount } => {
-                    self.reserved.push((id, amount));
-                    let refusal = match &self.day {
-                        Day::Grant => None,
-                        Day::Refuse(why) => Some(why.clone()),
-                    };
-                    self.down(&Down::Reservation { id, refusal });
+            let up = self.next();
+            if self.hear(&up) {
+                continue;
+            }
+            if let Up::Event(event) = up {
+                if let Kind::Started { .. } = event.kind {
+                    turns.push(event.seq);
                 }
-                Up::Spent { id, amount } => self.spent.push((id, amount)),
-                Up::Event(event) => {
-                    if let Kind::Started { .. } = event.kind {
-                        turns.push(event.seq);
-                    }
-                    let end = match &event.kind {
-                        Kind::Finished {
-                            started,
-                            outcome,
-                            retry,
-                        } if turns.contains(started) => Some((outcome.clone(), *retry)),
-                        _ => None,
-                    };
-                    events.push(event);
-                    if let Some((outcome, retry)) = end {
-                        return (events, outcome, retry);
-                    }
+                let end = match &event.kind {
+                    Kind::Finished {
+                        started,
+                        outcome,
+                        retry,
+                    } if turns.contains(started) => Some((outcome.clone(), *retry)),
+                    _ => None,
+                };
+                events.push(event);
+                if let Some((outcome, retry)) = end {
+                    return (events, outcome, retry);
                 }
-                _ => {}
             }
         }
     }
@@ -294,13 +361,30 @@ fn usage(events: &[Event]) -> Vec<(u64, Basis)> {
         .collect()
 }
 
-/// The sonnet reply's reasoning details, as the fixture's bytes carry
-/// them.
-fn sonnet_details() -> String {
-    let text = String::from_utf8(fixture("completion-sonnet.json")).unwrap();
-    let start = text.find("\"reasoning_details\": ").unwrap() + "\"reasoning_details\": ".len();
-    let end = text[start..].find("\n        ]").unwrap() + start + "\n        ]".len();
-    text[start..end].to_string()
+/// The streamed sonnet reply's reasoning details as assembled from its
+/// three fragments of index 0 and serialized once.
+const SONNET_DETAILS: &str = "[{\"type\":\"reasoning.text\",\
+    \"text\":\"The person asks what a sparse checkout is. Answer plainly.\",\
+    \"format\":\"anthropic-claude-v1\",\"index\":0,\
+    \"signature\":\"EqQBCkgIBxABGAIiQL/x+Jq0dXN0IHNpZ25hdHVyZQ==\\n\"}]";
+const SONNET_TEXT: &str = "A sparse checkout keeps only the paths you name in the working tree; the rest stay in the repository\u{2019}s objects.";
+
+/// The reply events of `events`: request, text, reasoning details and
+/// whether it is incomplete.
+fn replies(events: &[Event]) -> Vec<(u64, Option<String>, Option<String>, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Assistant {
+                request,
+                content,
+                details,
+                incomplete,
+                ..
+            } => Some((*request, content.clone(), details.clone(), *incomplete)),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -308,7 +392,7 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     let mut h = Harness::new(
         "roundtrip",
         Role::Conversation,
-        vec![Reply::ok("completion-sonnet.json"), Reply::ok("title.json")],
+        vec![Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")],
     );
     h.setup(Client::default());
     h.say("What is a sparse checkout?");
@@ -347,11 +431,34 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
             ("x-openrouter-title".to_string(), "td-agent".to_string()),
         ]
     );
-    assert!(!turn.stream);
-    assert_eq!(turn.limit, Some(512 * 1024));
+    // The turn streams, the frames' sum bounded; the title is counted.
+    assert!(turn.stream);
+    assert_eq!(turn.limit, Some(32 * 1024 * 1024));
+    assert!(!requests[1].stream);
+    assert_eq!(requests[1].limit, Some(512 * 1024));
     let body = flat(&turn.text());
     assert_eq!(body["model"], "anthropic/claude-sonnet-5.5");
     assert_eq!(body["max_tokens"], "16384");
+    assert_eq!(body["stream"], "true");
+    // Drawn as it came, a delta per frame that brought anything, and
+    // logged whole once it ended, its reasoning details as assembled.
+    let reply = replies(&events);
+    assert_eq!(
+        reply,
+        [(
+            reply[0].0,
+            Some(SONNET_TEXT.to_string()),
+            Some(SONNET_DETAILS.to_string()),
+            false
+        )]
+    );
+    let (reasoning, text) = h.streamed(reply[0].0);
+    assert_eq!(text, SONNET_TEXT);
+    assert_eq!(
+        reasoning,
+        "The person asks what a sparse checkout is. Answer plainly."
+    );
+    assert!(h.deltas.len() > 2, "{:?}", h.deltas);
     assert_eq!(body["reasoning.effort"], "medium");
     assert_eq!(body["provider.require_parameters"], "true");
     assert_eq!(body["provider.data_collection"], "deny");
@@ -421,14 +528,14 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
 }
 
 /// Two turns, the second from a new process: its body begins with every
-/// byte the first sent, reasoning details spliced back exactly as the
-/// response carried them.
+/// byte the first sent, reasoning details spliced back exactly as they
+/// were stored. The second reply streams with CRLF line endings.
 #[test]
 fn the_next_request_replays_the_log_and_the_reasoning_byte_for_byte() {
     let mut h = Harness::new(
         "replay",
         Role::Orchestrator,
-        vec![Reply::ok("completion-sonnet.json")],
+        vec![Reply::sse("stream-sonnet.sse")],
     );
     h.setup(Client::default());
     h.say("What is a sparse checkout?");
@@ -443,10 +550,10 @@ fn the_next_request_replays_the_log_and_the_reasoning_byte_for_byte() {
     for _ in 0..7 {
         assert!(matches!(h.next(), Up::Event(_)));
     }
-    h.mock.then(vec![Reply::ok("completion-gemini.json")]);
+    h.mock.then(vec![Reply::sse_crlf("stream-gemini.sse")]);
     h.setup(Client::default());
     h.say("And after a base advances?");
-    let (_, outcome, _) = h.turn();
+    let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     let requests = h.mock.requests();
     let (first, second) = (requests[0].text(), requests[1].text());
@@ -455,12 +562,25 @@ fn the_next_request_replays_the_log_and_the_reasoning_byte_for_byte() {
         second.starts_with(kept),
         "the second body does not begin with the first:\n{first}\n{second}"
     );
-    let details = sonnet_details();
     assert!(
-        second.contains(&format!(",\"reasoning_details\":{details}}}")),
+        second.contains(&format!(",\"reasoning_details\":{SONNET_DETAILS}}}")),
         "{second}"
     );
     flat(&second);
+    // CRLF framing reads as LF does: a text entry and an encrypted one.
+    let reply = replies(&events);
+    assert_eq!(
+        reply[0].1.as_deref(),
+        Some("Rebase onto the new base, then run the tests again.")
+    );
+    assert_eq!(
+        reply[0].2.as_deref(),
+        Some(
+            "[{\"type\":\"reasoning.text\",\"text\":\"**Planning the answer**\\n\\nThe person wants the order of steps.\",\"format\":\"google-gemini-v1\",\"index\":0},\
+             {\"type\":\"reasoning.encrypted\",\"data\":\"CiQBjz1rX3J5dGhtLXNpZ25hdHVyZS1ieXRlcw==\",\"id\":\"tool_0\",\"format\":\"google-gemini-v1\",\"index\":1}]"
+        )
+    );
+    assert_eq!(usage(&events), [(2_150_000_000, Basis::Reported)]);
 }
 
 #[test]
@@ -484,7 +604,7 @@ fn a_rate_limited_request_is_retried_at_most_three_times() {
     assert!(h.spent.iter().all(|(_, amount)| *amount == 0));
     // Once more: rate-limited, then answered.
     h.mock
-        .then(vec![limited(), Reply::ok("completion-sonnet.json")]);
+        .then(vec![limited(), Reply::sse("stream-sonnet.sse")]);
     let mut h = h;
     h.say("again");
     let (_, outcome, _) = h.turn();
@@ -514,7 +634,7 @@ fn a_502_is_shown_with_a_retry_and_asked_again_only_when_told() {
     assert_eq!(h.spent, [(h.reserved[0].0, reserved)]);
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(h.mock.requests().len(), 1, "never retried by itself");
-    h.mock.then(vec![Reply::ok("completion-sonnet.json")]);
+    h.mock.then(vec![Reply::sse("stream-sonnet.sse")]);
     h.down(&Down::Retry);
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
@@ -554,6 +674,8 @@ fn a_401_or_a_402_stops_the_turn() {
     }
 }
 
+/// A 200 that answers a stream with one JSON body, as some providers do
+/// for an error, is read as a counted reply would be.
 #[test]
 fn an_error_inside_a_200_is_caught_and_charged_as_reported() {
     let mut h = Harness::new(
@@ -571,6 +693,172 @@ fn an_error_inside_a_200_is_caught_and_charged_as_reported() {
     assert!(retry);
     assert_eq!(usage(&events), [(4_700_000_000, Basis::Reported)]);
     assert!(!kinds(&events).contains(&"assistant"));
+}
+
+/// An error object inside a 200 stream ends the turn as one inside a
+/// counted 200 does, charged as reported and offered again; the text
+/// before it is logged, marked incomplete, and never sent back.
+#[test]
+fn an_error_mid_stream_ends_the_turn_charged_with_its_text_kept() {
+    let mut h = Harness::new(
+        "midstream",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-error.sse")],
+    );
+    h.setup(Client::default());
+    h.say("And after a base advances?");
+    let (events, outcome, retry) = h.turn();
+    assert_eq!(
+        outcome,
+        "error 502: Upstream error from Google: the stream was reset"
+    );
+    assert!(retry);
+    assert_eq!(usage(&events), [(4_800_000_000, Basis::Reported)]);
+    let reply = replies(&events);
+    assert_eq!(reply.len(), 1);
+    assert_eq!(reply[0].1.as_deref(), Some("Rebase onto"));
+    assert!(reply[0].3, "marked incomplete");
+    assert_eq!(h.streamed(reply[0].0).1, "Rebase onto");
+    // Asked again: the same request, the incomplete reply not in it.
+    h.mock.then(vec![Reply::sse("stream-sonnet.sse")]);
+    h.down(&Down::Retry);
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let requests = h.mock.requests();
+    assert_eq!(requests[0].body, requests[1].body);
+}
+
+/// A stream that breaks off, by a transport error or by ending before its
+/// reply finished, ends the turn with what it brought logged as
+/// incomplete, its whole reservation charged, and `C-r` offered.
+#[test]
+fn a_stream_broken_mid_reply_keeps_its_text_and_charges_the_reservation() {
+    for (tail, said) in [
+        (
+            Tail::Error("transport: connection reset by peer".into()),
+            "error: connection reset by peer",
+        ),
+        (
+            Tail::End,
+            "error: the stream ended before the reply finished",
+        ),
+    ] {
+        let mut h = Harness::new(
+            "broken",
+            Role::Orchestrator,
+            vec![Reply::sse("stream-sonnet.sse")
+                .cut_after("paths you name")
+                .tail(tail)],
+        );
+        h.setup(Client::default());
+        h.say("What is a sparse checkout?");
+        let (events, outcome, retry) = h.turn();
+        assert_eq!(outcome, said);
+        assert!(retry);
+        let reserved = h.reserved[0].1;
+        assert_eq!(usage(&events), [(reserved, Basis::Reserved)]);
+        assert_eq!(h.spent, [(h.reserved[0].0, reserved)]);
+        let reply = replies(&events);
+        assert_eq!(
+            reply[0].1.as_deref(),
+            Some("A sparse checkout keeps only the paths you name")
+        );
+        assert!(reply[0].3, "marked incomplete");
+        // Its reasoning details are kept as far as they came.
+        assert!(reply[0].2.as_deref().unwrap().contains("Answer plainly."));
+    }
+}
+
+/// A stream's end decides with its finish: one ended after its finish
+/// without `[DONE]` is whole, and `[DONE]` before any finish is a stream
+/// cut short, kept incomplete and offered again.
+#[test]
+fn a_reply_is_whole_by_its_finish_not_by_done() {
+    let mut h = Harness::new(
+        "finish",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse").cut_after("0.00435")],
+    );
+    h.setup(Client::default());
+    h.say("What is a sparse checkout?");
+    let (events, outcome, retry) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert!(!retry);
+    assert_eq!(usage(&events), [(4_350_000_000, Basis::Reported)]);
+    assert!(!replies(&events)[0].3, "whole");
+    h.mock.then(vec![Reply::sse("stream-sonnet.sse")
+        .cut_after("paths you name")
+        .done()]);
+    h.say("And a shallow clone?");
+    let (events, outcome, retry) = h.turn();
+    assert_eq!(outcome, "error: the stream ended before the reply finished");
+    assert!(retry);
+    let reserved = h.reserved[1].1;
+    assert_eq!(usage(&events), [(reserved, Basis::Reserved)]);
+    assert!(replies(&events)[0].3, "marked incomplete");
+}
+
+/// An interrupt during a rate limit's wait ends the wait and the turn,
+/// with the request not asked again until told.
+#[test]
+fn an_interrupt_ends_a_rate_limits_wait() {
+    let limited = Reply::status(429, "error-429.json").with_header("retry-after", "30");
+    let mut h = Harness::new("429-interrupt", Role::Orchestrator, vec![limited]);
+    h.setup(Client::default());
+    h.say("hello");
+    // Its reservation is released just before the wait.
+    h.until_spent(1);
+    let began = std::time::Instant::now();
+    h.down(&Down::Interrupt);
+    let (events, outcome, retry) = h.turn();
+    assert!(began.elapsed() < std::time::Duration::from_secs(10));
+    assert!(
+        outcome.ends_with("; interrupted before asking again"),
+        "{outcome}"
+    );
+    assert!(retry);
+    assert_eq!(usage(&events), [(0, Basis::Nothing)]);
+    assert_eq!(h.mock.requests().len(), 1);
+}
+
+/// Escape closes the stream's connection and ends the turn, saying that
+/// a provider may go on generating and billing; what came is kept, the
+/// reservation charged, and the turn may be asked again.
+#[test]
+fn an_interrupt_closes_the_stream_and_ends_the_turn() {
+    let mut h = Harness::new(
+        "interrupt",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")
+            .cut_after("paths you name")
+            .tail(Tail::Open)],
+    );
+    h.setup(Client::default());
+    h.say("What is a sparse checkout?");
+    h.until_text();
+    h.down(&Down::Interrupt);
+    let (events, outcome, retry) = h.turn();
+    assert_eq!(outcome, td_agent::client::INTERRUPTED);
+    assert!(outcome.contains("not every provider stops generating, or billing"));
+    assert!(retry);
+    h.mock.wait_closed(1);
+    let reserved = h.reserved[0].1;
+    assert_eq!(usage(&events), [(reserved, Basis::Reserved)]);
+    let reply = replies(&events);
+    assert!(reply[0].3, "marked incomplete");
+    assert_eq!(
+        reply[0].1.as_deref(),
+        Some("A sparse checkout keeps only the paths you name")
+    );
+    // An interrupt between turns is nothing; a retry asks again whole.
+    h.down(&Down::Interrupt);
+    h.mock.then(vec![Reply::sse("stream-sonnet.sse")]);
+    h.down(&Down::Retry);
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
 }
 
 #[test]
@@ -621,7 +909,7 @@ fn spending_limits_refuse_a_request_before_it_is_sent() {
     let mut h = Harness::new(
         "unlimited",
         Role::Orchestrator,
-        vec![Reply::ok("completion-sonnet.json")],
+        vec![Reply::sse("stream-sonnet.sse")],
     );
     h.setup(Client {
         orchestrator_model: "openrouter/auto".into(),
@@ -661,7 +949,7 @@ fn a_model_without_reasoning_is_not_asked_for_it() {
     let mut h = Harness::new(
         "plain",
         Role::Orchestrator,
-        vec![Reply::ok("completion-sonnet.json")],
+        vec![Reply::sse("stream-sonnet.sse")],
     );
     h.setup(Client {
         orchestrator_model: "meta-llama/llama-4-small".into(),

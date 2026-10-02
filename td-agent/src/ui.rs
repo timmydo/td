@@ -118,6 +118,16 @@ fn tokens(count: u64) -> String {
     }
 }
 
+/// A reply the transcript draws as it streams in: its request, its
+/// message's index, and whether that message has a reasoning section
+/// (the first) before its text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Streaming {
+    request: u64,
+    index: usize,
+    reasoning: bool,
+}
+
 /// One conversation in the list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Row {
@@ -142,6 +152,8 @@ pub enum Request {
     Send(String),
     /// Ask the open conversation's failed turn again.
     Retry,
+    /// Interrupt the open conversation's turn.
+    Interrupt,
     /// Save the split's preferred share.
     SaveShare(u32, u32),
 }
@@ -358,6 +370,11 @@ pub struct App {
     /// shown once.
     last_seq: u64,
     meter: Meter,
+    /// The reply streaming in, until its request ends.
+    streaming: Option<Streaming>,
+    /// A request whose reply the transcript could not draw as it came:
+    /// its deltas are dropped, and its reply shown once logged.
+    undrawn: Option<u64>,
     /// The models a conversation and the orchestrator use.
     models: (String, String),
     /// Each model's context length, as the models list gives it.
@@ -413,6 +430,8 @@ impl App {
             last_seq: 0,
             background_turns: Vec::new(),
             meter: Meter::default(),
+            streaming: None,
+            undrawn: None,
             models: (String::new(), String::new()),
             contexts: Vec::new(),
             credit: None,
@@ -629,6 +648,8 @@ impl App {
         self.turns.clear();
         self.last_seq = 0;
         self.meter = Meter::default();
+        self.streaming = None;
+        self.undrawn = None;
         self.touch();
     }
 
@@ -755,7 +776,13 @@ impl App {
             }
             // The window's ledger answers these; nothing shows.
             Update::Up(Up::Reserve { .. } | Up::Spent { .. }) => {}
+            Update::Up(Up::Delta {
+                request,
+                reasoning,
+                content,
+            }) => self.delta(request, &reasoning, &content),
             Update::Restarting { reason } => {
+                self.stream_died();
                 if let Some(row) = self.active_row() {
                     row.state = RowState::Restarting;
                 }
@@ -765,6 +792,7 @@ impl App {
                 self.refresh_list();
             }
             Update::Failed { reason } => {
+                self.stream_died();
                 if let Some(row) = self.active_row() {
                     row.state = RowState::Failed;
                 }
@@ -822,7 +850,14 @@ impl App {
                 retry,
             } => {
                 if !self.turns.iter().any(|(turn, _)| *turn == started) {
-                    // A request's finish: its turn's says how it went.
+                    // A request's finish: its turn's says how it went. A
+                    // reply it was streaming that never reached the log
+                    // stays as drawn, marked.
+                    if let Some(streaming) = self.streaming.take_if(|s| s.request == started) {
+                        let _ = self
+                            .transcript
+                            .set_status(streaming.index, Some(("not logged", Tone::Bad)));
+                    }
                     return self.touch();
                 }
                 self.meter.retry = retry;
@@ -887,26 +922,44 @@ impl App {
                 content,
                 reasoning,
                 finish,
+                incomplete,
                 ..
             } => {
-                let mut message = Message::new("assistant");
-                if let Some(reasoning) = reasoning.filter(|r| !r.trim().is_empty()) {
-                    message = message.and_then(|m| m.section("reasoning", &reasoning, true));
-                }
+                let reasoning = reasoning.filter(|r| !r.trim().is_empty());
                 let text = content.unwrap_or_default();
                 let text = if text.is_empty() { "(no text)" } else { &text };
-                let pushed = message
+                let verdict = if incomplete {
+                    Some(("incomplete", Tone::Bad))
+                } else if finish == "stop" {
+                    None
+                } else {
+                    Some((finish.as_str(), Tone::Neutral))
+                };
+                let mut message = Message::new("assistant");
+                if let Some(reasoning) = &reasoning {
+                    message = message.and_then(|m| m.section("reasoning", reasoning, true));
+                }
+                let message = message
                     .and_then(|m| m.text(text))
-                    .and_then(|m| {
-                        if finish == "stop" {
-                            Ok(m)
-                        } else {
-                            m.verdict(&finish, Tone::Neutral)
+                    .and_then(|m| match verdict {
+                        Some((verdict, tone)) => m.verdict(verdict, tone),
+                        None => Ok(m),
+                    });
+                if self.undrawn == Some(request) {
+                    self.undrawn = None;
+                }
+                let shown = match message.map_err(|e| e.to_string()) {
+                    Err(e) => Err(e),
+                    Ok(message) => match self.streaming.filter(|s| s.request == request) {
+                        Some(_) => {
+                            let sections: Vec<&str> =
+                                reasoning.as_deref().into_iter().chain([text]).collect();
+                            self.settle_stream(&sections, verdict, message)
                         }
-                    })
-                    .map_err(|e| e.to_string())
-                    .and_then(|m| self.push_message(m));
-                match pushed {
+                        None => self.push_message(message),
+                    },
+                };
+                match shown {
                     Ok(index) => self.meter.replies.push((request, index)),
                     Err(e) => self.note(format!("the transcript refused a reply: {e}")),
                 }
@@ -977,15 +1030,188 @@ impl App {
     }
 
     /// Drops the transcript's oldest eighth, keeping the indices its
-    /// turns find their messages by.
+    /// turns, replies and a streaming reply find their messages by.
     fn evict(&mut self) {
         let count = (self.transcript.len() / 8).max(1);
         self.transcript.remove_first(count);
-        self.messages.retain(|(_, index)| *index >= count);
-        for (_, index) in &mut self.messages {
-            *index = index.saturating_sub(count);
+        for list in [&mut self.messages, &mut self.meter.replies] {
+            list.retain(|(_, index)| *index >= count);
+            for (_, index) in list.iter_mut() {
+                *index = index.saturating_sub(count);
+            }
         }
+        self.streaming = self
+            .streaming
+            .filter(|s| s.index >= count)
+            .map(|s| Streaming {
+                index: s.index - count,
+                ..s
+            });
         self.note("the transcript shows the most recent messages; the log keeps every one");
+    }
+
+    /// What a streaming reply brought since the last, drawn into its
+    /// message, which the request's first delta starts (DESIGN.md §4).
+    /// Once the transcript cannot draw it, the rest waits for the log.
+    fn delta(&mut self, request: u64, reasoning: &str, content: &str) {
+        if (reasoning.is_empty() && content.is_empty()) || self.undrawn == Some(request) {
+            return;
+        }
+        let drawn = match self.streaming.filter(|s| s.request == request) {
+            None => self.start_stream(request, reasoning, content),
+            Some(streaming) => self.extend_stream(streaming, reasoning, content),
+        };
+        if let Err(e) = drawn {
+            self.undrawn = Some(request);
+            if let Some(streaming) = self.streaming.filter(|s| s.request == request) {
+                let _ = self
+                    .transcript
+                    .set_status(streaming.index, Some(("cut short", Tone::Bad)));
+            }
+            self.note(format!(
+                "the transcript cannot draw the reply as it comes ({e}); it shows it once whole"
+            ));
+        }
+        self.touch();
+    }
+
+    /// The process died mid-stream: what was drawn stays, marked. The log
+    /// never holds it; a restart shows the request interrupted.
+    fn stream_died(&mut self) {
+        if let Some(streaming) = self.streaming.take() {
+            let _ = self
+                .transcript
+                .set_status(streaming.index, Some(("interrupted", Tone::Bad)));
+        }
+        self.undrawn = None;
+    }
+
+    /// `edit` on the streaming message, room made as `push_message` makes
+    /// it when the transcript is at its limit; the message's index after.
+    fn edit_stream(
+        &mut self,
+        mut edit: impl FnMut(&mut messages::Controller, usize) -> Result<(), MessagesError>,
+    ) -> Result<usize, String> {
+        loop {
+            let Some(index) = self.streaming.map(|s| s.index) else {
+                return Err("its message was dropped from the transcript".into());
+            };
+            match edit(&mut self.transcript, index) {
+                Ok(()) => return Ok(index),
+                Err(e) if self.transcript.len() <= 1 || e != MessagesError::Limit => {
+                    return Err(e.to_string())
+                }
+                Err(_) => self.evict(),
+            }
+        }
+    }
+
+    /// A streaming message: its reasoning section, when there is
+    /// reasoning, then its text.
+    fn streaming_message(reasoning: Option<&str>, text: &str) -> Result<Message, String> {
+        let mut message =
+            Message::new("assistant").and_then(|m| m.status("streaming", Tone::Neutral));
+        if let Some(reasoning) = reasoning {
+            message = message.and_then(|m| m.section("reasoning", reasoning, true));
+        }
+        message
+            .and_then(|m| m.text(text))
+            .map_err(|e| e.to_string())
+    }
+
+    fn start_stream(&mut self, request: u64, reasoning: &str, content: &str) -> Result<(), String> {
+        let has = !reasoning.is_empty();
+        let message = Self::streaming_message(has.then_some(reasoning), content)?;
+        let index = self.push_message(message)?;
+        self.streaming = Some(Streaming {
+            request,
+            index,
+            reasoning: has,
+        });
+        Ok(())
+    }
+
+    fn extend_stream(
+        &mut self,
+        mut streaming: Streaming,
+        reasoning: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        if !reasoning.is_empty() {
+            if streaming.reasoning {
+                self.edit_stream(|list, index| list.append(index, 0, reasoning))?;
+            } else {
+                // Reasoning after text: drawn again with its section first.
+                let text = self
+                    .transcript
+                    .message(streaming.index)
+                    .and_then(|m| m.section_text(0))
+                    .unwrap_or_default()
+                    .to_string();
+                let message = Self::streaming_message(Some(reasoning), &text)?;
+                self.edit_stream(|list, index| list.replace(index, message.clone()))?;
+                if let Some(drawn) = self.streaming.as_mut() {
+                    drawn.reasoning = true;
+                }
+                streaming.reasoning = true;
+            }
+        }
+        if !content.is_empty() {
+            let section = usize::from(streaming.reasoning);
+            self.edit_stream(|list, index| list.append(index, section, content))?;
+        }
+        Ok(())
+    }
+
+    /// A streamed reply's message once the reply is logged: kept as drawn,
+    /// its reasoning left open or closed as the human left it, when its
+    /// sections are the logged reply's; else the logged reply replaces it,
+    /// as when the window opened the conversation mid-stream or could not
+    /// draw it all. A reply the transcript cannot hold stays as drawn,
+    /// marked cut short.
+    fn settle_stream(
+        &mut self,
+        sections: &[&str],
+        verdict: Option<(&str, Tone)>,
+        logged: Message,
+    ) -> Result<usize, String> {
+        let same = self.streaming.is_some_and(|streaming| {
+            self.transcript
+                .message(streaming.index)
+                .is_some_and(|drawn| {
+                    drawn.sections() == sections.len()
+                        && sections
+                            .iter()
+                            .enumerate()
+                            .all(|(at, text)| drawn.section_text(at) == Some(*text))
+                })
+        });
+        let settled = if same {
+            self.edit_stream(|list, index| {
+                list.set_status(index, None)
+                    .and_then(|()| list.set_verdict(index, verdict))
+            })
+        } else {
+            self.edit_stream(|list, index| list.replace(index, logged.clone()))
+        };
+        let Some(streaming) = self.streaming.take() else {
+            // Its message was evicted to make room: the reply is pushed.
+            return self.push_message(logged);
+        };
+        if let Err(e) = settled {
+            // The verdict, which the usage that follows leaves alone.
+            let _ = self
+                .transcript
+                .set_status(streaming.index, None)
+                .and_then(|()| {
+                    self.transcript
+                        .set_verdict(streaming.index, Some(("cut short", Tone::Bad)))
+                });
+            self.note(format!(
+                "the transcript could not show the whole reply: {e}"
+            ));
+        }
+        Ok(streaming.index)
     }
 
     /// Orders the rows, the orchestrator first and then the most recently
@@ -1144,6 +1370,15 @@ impl App {
         }
     }
 
+    /// Whether the open conversation is running a turn.
+    fn running(&self) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            self.rows
+                .iter()
+                .any(|row| &row.id == active && row.state == RowState::Running)
+        })
+    }
+
     fn active_failed(&self) -> bool {
         self.active.as_ref().is_some_and(|active| {
             self.rows
@@ -1287,6 +1522,13 @@ impl App {
                     self.requests.push(Request::Retry);
                     self.touch();
                 }
+                return;
+            }
+            // While a turn runs, Escape is the window's; else the
+            // focused widget's.
+            "Escape" if !repeat && self.running() => {
+                self.requests.push(Request::Interrupt);
+                self.note("interrupting the turn");
                 return;
             }
 
@@ -2015,6 +2257,7 @@ pub mod tests {
                     reasoning: Some("the person greets".into()),
                     details: Some("[]".into()),
                     finish: "stop".into(),
+                    incomplete: false,
                 },
             ),
             0,
@@ -2075,6 +2318,153 @@ pub mod tests {
         // send what the log already gave: shown once.
         app.update(at(7, Kind::Notice { text: "dup".into() }), 0);
         assert_eq!(app.transcript().len(), 2);
+    }
+
+    fn delta(request: u64, reasoning: &str, content: &str) -> Update {
+        Update::Up(Up::Delta {
+            request,
+            reasoning: reasoning.into(),
+            content: content.into(),
+        })
+    }
+
+    fn reply(request: u64, reasoning: &str, content: &str, incomplete: bool) -> Kind {
+        Kind::Assistant {
+            request,
+            content: Some(content.into()),
+            reasoning: Some(reasoning.into()),
+            details: None,
+            finish: if incomplete { "unknown" } else { "stop" }.into(),
+            incomplete,
+        }
+    }
+
+    /// Deltas draw the reply into one message as they come; the logged
+    /// reply then settles it, kept as drawn (its reasoning left as the
+    /// human opened it) when it matches, replaced when it does not.
+    #[test]
+    fn a_streamed_reply_is_drawn_as_it_comes_and_settled_once_logged() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, 900)), 0);
+        app.update(delta(3, "the person ", ""), 0);
+        app.update(delta(3, "greets", "hi "), 0);
+        app.update(delta(3, "", "there"), 0);
+        assert_eq!(app.transcript().len(), 2, "the message and one reply");
+        let drawn = app.transcript().message(1).unwrap();
+        assert_eq!(drawn.section_text(0), Some("the person greets"));
+        assert_eq!(drawn.section_text(1), Some("hi there"));
+        assert!(text(&app).contains("streaming"), "{}", text(&app));
+        app.transcript.set_section_collapsed(1, 0, false).unwrap();
+        app.update(at(4, reply(3, "the person greets", "hi there", false)), 0);
+        assert_eq!(app.transcript().len(), 2);
+        let shown = text(&app);
+        assert!(!shown.contains("streaming"), "{shown}");
+        assert!(shown.contains("the person greets"), "still open: {shown}");
+        // Text before reasoning: drawn again with its reasoning first; a
+        // reply cut short keeps what was drawn, marked incomplete.
+        turn(&mut app, 5, "again");
+        app.update(at(7, request(6, 900)), 0);
+        app.update(delta(7, "", "par"), 0);
+        app.update(delta(7, "late thought", "tial"), 0);
+        let drawn = app.transcript().message(3).unwrap();
+        assert_eq!(drawn.section_text(0), Some("late thought"));
+        assert_eq!(drawn.section_text(1), Some("partial"));
+        app.update(at(8, reply(7, "late thought", "partial", true)), 0);
+        assert!(text(&app).contains("incomplete"), "{}", text(&app));
+        assert_eq!(app.transcript().len(), 4);
+        // Opened mid-stream, the window drew only the end: the logged
+        // reply replaces it whole.
+        turn(&mut app, 9, "once more");
+        app.update(at(11, request(10, 900)), 0);
+        app.update(delta(11, "", "the end"), 0);
+        app.update(
+            at(
+                12,
+                reply(11, "all of it", "from the start to the end", false),
+            ),
+            0,
+        );
+        let settled = app.transcript().message(5).unwrap();
+        assert_eq!(settled.section_text(1), Some("from the start to the end"));
+        // A process that fails mid-stream, not restarted, leaves what was
+        // drawn, marked; a later delta of its request starts nothing.
+        turn(&mut app, 13, "last");
+        app.update(at(15, request(14, 900)), 0);
+        app.update(delta(15, "", "half"), 0);
+        assert!(text(&app).contains("streaming"), "{}", text(&app));
+        app.update(Update::Failed { reason: "x".into() }, 0);
+        let shown = text(&app);
+        assert!(!shown.contains("streaming"), "{shown}");
+        assert!(shown.contains("interrupted"), "{shown}");
+        assert_eq!(app.transcript().len(), 8);
+    }
+
+    /// A transcript at its limit mid-stream makes room as a pushed message
+    /// does, and a reply it still cannot hold is marked, not left streaming.
+    #[test]
+    fn a_stream_at_the_transcripts_limit_makes_room() {
+        let mut app = app();
+        // Sixteen messages of just under a mebibyte: the transcript's 16
+        // MiB all but full.
+        let big = "x".repeat(messages::MAX_TEXT_BYTES - 1024);
+        let full = (messages::MAX_TOTAL_BYTES / big.len()) as u64;
+        for seq in 1..=full {
+            app.update(user(seq, &big), 0);
+        }
+        assert_eq!(app.transcript().len() as u64, full);
+        turn(&mut app, full + 1, "hello");
+        let request = full + 3;
+        app.update(at(request, self::request(full + 2, 900)), 0);
+        let piece = "y".repeat(64 * 1024);
+        for _ in 0..8 {
+            app.update(delta(request, "", &piece), 0);
+        }
+        assert!(app.transcript().len() as u64 <= full, "evicted");
+        let last = app.transcript().len() - 1;
+        let whole = piece.repeat(8);
+        assert_eq!(
+            app.transcript().message(last).unwrap().section_text(0),
+            Some(whole.as_str()),
+            "drawn whole"
+        );
+        app.update(at(request + 1, reply(request, "", &whole, false)), 0);
+        assert_eq!(app.transcript().len() - 1, last, "kept as drawn");
+        let shown = text(&app);
+        assert!(!shown.contains("streaming"), "settled");
+        assert!(!shown.contains("cut short"), "settled");
+    }
+
+    /// Escape is the window's while a turn runs, asking to interrupt it,
+    /// and the focused widget's otherwise.
+    #[test]
+    fn escape_interrupts_a_running_turn_and_only_then() {
+        let mut app = app();
+        key(&mut app, "Escape");
+        assert!(app.take_requests().is_empty());
+        turn(&mut app, 1, "hello");
+        key(&mut app, "Escape");
+        assert_eq!(app.take_requests(), [Request::Interrupt]);
+        assert_eq!(app.notice(), Some("interrupting the turn"));
+        app.update(
+            at(
+                3,
+                Kind::Finished {
+                    started: 2,
+                    outcome: crate::client::INTERRUPTED.into(),
+                    retry: true,
+                },
+            ),
+            0,
+        );
+        key(&mut app, "Escape");
+        assert!(app.take_requests().is_empty());
+        let shown = text(&app);
+        assert!(
+            shown.contains("not every provider stops generating"),
+            "{shown}"
+        );
+        assert!(app.status_line().contains("C-r asks again"));
     }
 
     #[test]

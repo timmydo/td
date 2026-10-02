@@ -296,6 +296,18 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Asks the open conversation to interrupt its turn.
+    pub fn interrupt(&mut self) -> Result<(), String> {
+        let running = self.opened().ok_or("no conversation is open")?;
+        if running.failed {
+            return Err("the conversation's process failed".into());
+        }
+        if frame::write(&mut running.writer, &Down::Interrupt.encode()).is_err() {
+            let _ = running.writer.shutdown(std::net::Shutdown::Both);
+        }
+        Ok(())
+    }
+
     /// Sends `down` to conversation `id`'s process: a reservation's
     /// answer, whether or not it is open.
     pub fn answer(&mut self, id: &Id, down: &Down) {

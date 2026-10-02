@@ -15,11 +15,12 @@ submission.
 
 ## Status
 
-Increments 3, 4 and 5 of §18 are built: td-ui's message list; the
+Increments 3 to 7 of §18 are built: td-ui's message list; the
 crate with its gate, the window and conversation processes, the store
-and `./agent`; and the model client over `td-fetch 1`, non-streaming
-and with no tools, with the key file, the models list, cost limits,
-credit and titles. Where building them
+and `./agent`; the model client over `td-fetch 1`, with no tools, with
+the key file, the models list, cost limits, credit and titles; td-net's
+streamed fetch; and streamed replies over it, drawn as they arrive and
+interrupted by `Escape`. Where building them
 settled a point the design left open, the section says so under "As
 built". No recipe names td-agent yet. The decisions below that were the
 user's to make were made on 2026-10-01 and 2026-10-02:
@@ -284,6 +285,16 @@ settings first, before any message: the API key, or why there is none,
 and the model client's configuration (§5, §15). The key crosses the
 socketpair in that one frame and in no argument, environment variable
 or file.
+
+**As built (increment 7).** Two frames join the socketpair's. Down,
+`interrupt` asks the open conversation's process to interrupt its turn;
+between turns it means nothing. Up, `delta` carries what a streamed
+reply brought since the last, its reasoning and its text, with its
+request's sequence number, for the window to draw (§4). A delta is not
+an event and is not logged: the reply is logged whole when its stream
+ends (§5), and a window that adopts a conversation mid-stream draws
+only the deltas after it opened, until the logged reply replaces them.
+A background conversation's deltas are dropped.
 
 ## 3. The orchestrator and conversations
 
@@ -550,6 +561,31 @@ conversations, each against its limit where one is set, the key's
 credit, the mode, `no limits` (the resource limits of §8) and `0
 background` (the background processes of §12).
 
+**As built (increment 7).** A streamed reply is drawn as it arrives:
+its first delta adds an `assistant` message with the status
+`streaming`, its reasoning a collapsed section before its text, and
+each later delta is appended to its section through the list's
+`append`, so the window does no more per delta than the bytes it
+brought; reasoning that comes after text draws the message again with
+its section first. When the reply is logged the message is settled: kept
+as drawn, its reasoning left open or closed as the human left it, when
+its sections are the logged reply's, and replaced by the logged reply
+otherwise. A transcript at its limit mid-stream makes room as for a new
+message, dropping its oldest; a reply it still cannot draw is marked
+`cut short`, its later deltas dropped, and the logged reply replaces
+it; one the transcript cannot hold even so stays as drawn with the
+verdict `cut short`. A reply logged incomplete (§5) carries the
+verdict `incomplete`; one whose process fails mid-stream keeps what was
+drawn, marked `interrupted`, until a restart draws the transcript again
+from the log. While the open conversation's turn runs, `Escape` asks
+it to interrupt and the status row says so; otherwise `Escape` is the
+focused widget's. `interrupt` is the driven action. The turn's
+`td-agent` message then says that the stream was closed but that not
+every provider stops generating, or billing, when a stream closes, and
+that `C-r` asks again. A turn whose reply is logged and whose title is
+being asked for (§13) does not hear an interrupt: the title request is
+short and counted.
+
 ## 5. Model client
 
 **Dialect.** OpenAI Chat Completions as OpenRouter serves it at
@@ -730,6 +766,91 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   `limit_remaining` (a negative remainder as zero), or what the key has
   used when it has no limit.
 
+**As built (increment 7).** A turn's request streams. Its head gains
+`"stream":true` after `max_tokens`, so the logged head still rebuilds
+the exact body; it is sent with `td_fetch::post_stream`, the frames'
+sum bounded at 32 MiB, since every delta is a JSON object of its own,
+many times the text it carries. A title request stays counted, with
+`td_fetch::post` and its 512 KiB cap: it is short, drawn nowhere and
+never interrupted. `td_fetch.rs` is td-news's copy, unedited.
+
+- **The stream** is read on a thread of the conversation process's own,
+  which hands its head and each frame to the turn through the channel
+  the window's frames come by, so the turn hears an interrupt between
+  any two frames. The thread reads on only while the turn still wants
+  its request; when the turn ends, however it ends, the thread stops
+  at its next frame and drops the stream, which closes the connection.
+- **The SSE reader** (`sse.rs`) reads `text/event-stream` as the HTML
+  standard defines it: lines ending in LF, CRLF or a lone CR, a CRLF
+  split across frames included; `:` comment lines skipped; `data` lines
+  joined by line feeds into one event, dispatched by a blank line; the
+  `event`, `id` and `retry` fields and a leading byte order mark
+  ignored; an event the stream's end cuts off not dispatched. `data:
+  [DONE]` ends the reply and nothing after it is read. Each line and
+  each event's text is held to 256 KiB, and the whole stream to the
+  32 MiB of the request's limit; its buffers are reused from event to
+  event.
+- **Assembly** (`assemble.rs`) reads each event as a chunk:
+  `delta.content` and `delta.reasoning` are appended;
+  `reasoning_details` fragments are joined as OpenRouter's own client
+  (ai-sdk-provider) joins them, by the type's transitions and not by
+  `index`, which providers reuse for distinct blocks: a
+  `reasoning.text` or `reasoning.summary` fragment joins the entry just
+  before it when that entry has its type, appending its `text` or
+  `summary`; where upstream fills only a missing `signature` and
+  `format`, any member the entry lacks or holds as null or empty is
+  filled, the entry's first value of every other member standing; every
+  other fragment, an encrypted block always, is an entry of its own.
+  Tool-call fragments are assembled by `index`, `id`,
+  `type` and the function's `name` from the first fragment that carries
+  each and `arguments` appended, kept for the first tools (increment 8);
+  `finish_reason` and `usage` are the last given. Text, reasoning and
+  reasoning details are held to 512 KiB as the log line carries them,
+  JSON escaping counted (twice for the details, stored as a string),
+  so the reply fits a log line; the tool calls count the bytes they
+  keep; at most 256 details entries and 256 calls. The details array
+  is serialized once, when the reply ends, stored as that text, and
+  spliced back as before.
+- **Errors.** Every chunk is checked for an `error` object, at the top
+  or in its choice, and for `finish_reason: "error"`; each ends the turn
+  as an error inside a counted 200 does, charged its reported cost or
+  else its reservation, with `C-r` offered. A chunk that is not JSON,
+  and a stream past a bound, end it the same way. A head whose status is
+  not 200, or a 200 whose `content-type` is `application/json`, is read
+  whole under the 512 KiB cap and classified as a counted reply, so 429,
+  401, 402 and 502 behave as before. Whether a reply is whole is its
+  `finish_reason`'s to say: a stream that ends after one without
+  `[DONE]` is whole, and one that ends before any, with `[DONE]` or
+  without, or breaks off with a transport error, ends the turn with
+  `C-r` offered and its reservation charged unless a `usage` with a
+  cost had come, as a counted reply with no choice is. A stream broken
+  or interrupted while its head's error body is read is charged so too:
+  the reservation is the bound when nothing reported a cost.
+- **What a stream brought** before it broke, failed or was interrupted
+  is logged as an `assistant` event marked `incomplete` (§6), when it
+  brought any text, reasoning or details, before its `usage` and
+  finish. An incomplete reply is never sent back to the model: its
+  reasoning details may lack the signature that closes them, and a
+  retry asks the same request again, byte for byte.
+- **Interrupting.** `Escape` (§4) sends `interrupt` (§2). During a
+  stream the turn ends at once: its request is charged as a broken
+  stream's, its turn finishes with `C-r` offered and an outcome saying
+  the stream was closed but not every provider stops generating, or
+  billing, when a stream closes. The connection itself closes when the
+  stream's thread wakes for its next frame: `td_fetch`'s `Stream` can be
+  closed only by the thread reading it, and the shared module is not
+  edited here. OpenRouter's `: OPENROUTER PROCESSING` comments make
+  that prompt, and the service's two-minute idle deadline bounds it
+  against a silent origin; a request interrupted before its head came
+  is still sent, and closed once its head comes. An interrupt while the
+  window reserves the request ends the turn before it is sent, the
+  reservation released; one during a rate limit's wait ends the wait
+  and the turn, as the window closing does.
+- **Recovery** is unchanged: a request is logged and synced as started
+  before it is sent, and one a restart finds unfinished is interrupted,
+  never resent. Nothing of a stream is logged before it ends, so a
+  process killed mid-stream leaves only that interruption.
+
 ## 6. Credentials and the conversation store
 
 **The API key** is held only by the agent processes (§2).
@@ -866,6 +987,14 @@ still held when the window closes is written whole to standard error.
 - **Recovery** applies to requests as to turns: one started and not
   finished is interrupted, never resent, and its reservation counts as
   spent in the conversation's total.
+
+**As built (increment 7).** An `assistant` event may carry
+`incomplete: true`, absent when false, for what a stream that broke,
+failed or was interrupted had brought (§5). It is shown and kept in the
+log, and left out of every later request, so requests remain a pure
+function of `prefix` and `log`. Only whole replies count toward the
+conversation's first reply, after which a title is asked for, and only
+a whole reply is quoted in the title request.
 
 ## 7. Workspaces
 
@@ -1854,6 +1983,10 @@ The model's context is the prefix (§13) plus a view of the log; the log
 itself keeps everything (§6). The budget is the model's `context_length`
 from §5. The prompt is estimated as the last response's reported prompt
 tokens plus a bytes-over-four estimate of what has been appended since.
+As built (increment 7), the last response is the last one answered
+whole, its report counting its prompt and completion: a failed or
+incomplete reply's report is left out, since its completion is never
+sent back, and a retry then rebuilds the failed request's head exactly.
 
 **Auto-compaction.** Before a request whose estimated prompt plus
 `max_tokens` exceeds `compact_at` (default 80%) of the budget, the
@@ -2199,6 +2332,43 @@ standard error. `tests/processes.rs` adds a message sent just before
 switching away, whose turn still runs in the background. The shared
 `td_fetch.rs` joins `json.rs` and `toml.rs` in
 `tests/shared_modules.rs`.
+
+**As built (increment 7).** Pure units cover the SSE reader in
+`src/sse.rs`: comment lines, `[DONE]` and nothing read after it, an
+OpenRouter-shaped stream, one with CRLF endings and one with
+multibyte text each split at every byte boundary and fed a byte at a
+time, LF, CRLF and lone-CR endings, multi-line `data`, the other fields
+and a byte order mark, the per-line, per-event and total bounds, and a
+sink's error stopping the reading. `src/assemble.rs` covers text and
+reasoning deltas and what is handed to the window once, reasoning
+details joined and serialized once, distinct blocks that share an index
+kept apart, a block whose members vary by delta kept whole and an empty
+signature giving way, fragmented tool calls assembled by index, an
+error mid-stream with its usage, a string error code, a choice's error,
+a bare error finish and a chunk that is not JSON, and the reply's
+bounds, counted as logged. `client.rs` keeps a failed request's report
+out of the prompt estimate. The window's units draw a reply as its
+deltas come, settle it kept or replaced, mark one incomplete or
+interrupted by its process failing, make room at the transcript's limit
+mid-stream, and give `Escape` to a running turn alone.
+`tests/support/mock_fetch.rs` serves the stream mode: a request with
+`stream` gets its reply as `chunk N` frames of a chosen size, ending
+`end`, `error`, or kept open with comment frames until the client
+closes it, which the mock counts; a counted reply scripted for a
+stream is framed as the service would. The fixtures
+`stream-sonnet.sse`, `stream-gemini.sse` (served with CRLF endings) and
+`stream-error.sse` are written by hand in OpenRouter's streamed shape,
+in 61-byte frames so events straddle them. `tests/model_client.rs`
+streams every turn: the exact head with `stream` and the 32 MiB limit,
+the deltas and the reply logged whole with its details as assembled, a
+restarted process sending them back byte for byte, an error mid-stream
+charged as reported with its text kept incomplete and a retry sending
+the same body, a stream broken by a transport error and one ended
+before its finish, each charged its reservation, a finish without
+`[DONE]` whole and `[DONE]` without a finish cut short, an interrupt
+that ends the turn, closes the connection and is asked again whole, and
+one that ends a rate limit's wait. A 200
+answering a stream with one JSON body keeps increment 5's error case.
 
 The live check is by hand. Write the key as one line to
 `$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode 0600, and run `./agent`

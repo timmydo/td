@@ -1,7 +1,9 @@
 //! The model client's wire format (DESIGN.md §5): OpenAI Chat Completions
-//! as OpenRouter serves it, non-streaming and with no tools in this
-//! increment. What a request carries and how a reply reads are pure
-//! functions here; `conversation` sends them through the fetch service.
+//! as OpenRouter serves it, with no tools yet. A turn's request streams
+//! (`stream: true`), its reply put back together by `sse` and `assemble`;
+//! a title's is counted. What a request carries and how a reply reads are
+//! pure functions here; `conversation` sends them through the fetch
+//! service.
 //!
 //! A request's body is `{HEAD,"messages":[PREFIX...,MESSAGES...]}`: `HEAD`
 //! the exact text of its other members, logged with the request; the
@@ -25,8 +27,14 @@ use crate::td_fetch;
 /// The attribution pair's values (DESIGN.md §5).
 pub const REFERER: &str = "https://github.com/timmydo/td";
 pub const TITLE: &str = "td-agent";
-/// The most a model reply may run to, which a log line holds.
+/// The most a model reply may run to, which a log line holds: a counted
+/// reply's body, and a streamed reply's text, reasoning, reasoning details
+/// and tool calls as assembled.
 pub const MAX_REPLY: u64 = 512 * 1024;
+/// The most a streamed reply's events may run to, the fetch service's
+/// limit on the sum of its frames: every delta is a JSON object of its
+/// own, many times the text it carries.
+pub const MAX_STREAM: u64 = 32 * 1024 * 1024;
 /// The completion bound a turn asks for, under the model's own.
 pub const MAX_TOKENS: u64 = 16_384;
 /// A title request's completion bound, and the most of the first
@@ -93,6 +101,7 @@ pub fn head(params: &Params<'_>) -> String {
     let mut pairs = vec![
         ("model".into(), Json::Str(params.model.into())),
         ("max_tokens".into(), Json::from(params.max_tokens)),
+        ("stream".into(), Json::Bool(true)),
     ];
     if let Some(effort) = params.effort {
         pairs.push((
@@ -147,8 +156,10 @@ pub fn title_head(client: &Client, user: &str, reply: &str) -> String {
 }
 
 /// The messages of the log before a request, as the request carries
-/// them: each user message, and each turn reply that has text or
-/// reasoning to give back.
+/// them: each user message, and each whole turn reply that has text or
+/// reasoning to give back. A reply a broken or interrupted stream left
+/// incomplete is the log's and the window's, never the model's: its
+/// reasoning details may lack the signature that closes them.
 pub fn messages(events: &[Event]) -> Vec<String> {
     let mut purposes: Vec<(u64, Purpose)> = Vec::new();
     let mut out = Vec::new();
@@ -160,6 +171,7 @@ pub fn messages(events: &[Event]) -> Vec<String> {
                 request,
                 content,
                 details,
+                incomplete,
                 ..
             } => {
                 let turn = purposes
@@ -168,7 +180,7 @@ pub fn messages(events: &[Event]) -> Vec<String> {
                     .find(|(seq, _)| seq == request)
                     .is_some_and(|(_, p)| *p == Purpose::Turn);
                 let content = content.as_deref().unwrap_or_default();
-                if !turn || (content.is_empty() && details.is_none()) {
+                if !turn || *incomplete || (content.is_empty() && details.is_none()) {
                     continue;
                 }
                 let mut message = format!(
@@ -263,14 +275,16 @@ pub fn body(events: &[Event], index: usize, prefix_file: &str) -> Result<String,
 }
 
 /// The prompt's tokens as DESIGN.md §14 estimates them: what the last
-/// turn request's response reported for its prompt and completion, plus
-/// a quarter of a token a byte for what the body has grown by since; and
-/// never less than a quarter of the whole body, which is the estimate
-/// before any report.
+/// turn request answered whole reported for its prompt and completion,
+/// plus a quarter of a token a byte for what the body has grown by since;
+/// and never less than a quarter of the whole body, which is the estimate
+/// before any report. A request that failed leaves the estimate as it
+/// was, so asking it again sends the same head.
 pub fn estimate(events: &[Event], bytes: u64) -> u64 {
     let whole = bytes.div_ceil(4);
     let mut last: Option<(u64, u64)> = None;
     let mut sizes: Vec<(u64, u64)> = Vec::new();
+    let mut answered: Option<u64> = None;
     for event in events {
         match &event.kind {
             Kind::Request {
@@ -278,9 +292,14 @@ pub fn estimate(events: &[Event], bytes: u64) -> u64 {
                 bytes,
                 ..
             } => sizes.push((event.seq, *bytes)),
+            Kind::Assistant {
+                request,
+                incomplete: false,
+                ..
+            } => answered = Some(*request),
             Kind::Usage {
                 request, tokens, ..
-            } if tokens.prompt > 0 => {
+            } if tokens.prompt > 0 && answered == Some(*request) => {
                 if let Some((_, sent)) = sizes.iter().rev().find(|(seq, _)| seq == request) {
                     last = Some((tokens.prompt.saturating_add(tokens.completion), *sent));
                 }
@@ -329,15 +348,22 @@ pub enum Failure {
         message: String,
         wait: Option<Duration>,
     },
-    /// 502, 503, a transport failure or an error inside a 200: the
-    /// provider may have generated, and billed, before failing. Shown with
-    /// a retry action, never retried by itself.
+    /// 502, 503, a transport failure, an error inside a 200 or a stream
+    /// that broke off: the provider may have generated, and billed, before
+    /// failing. Shown with a retry action, never retried by itself.
     Retryable {
         status: Option<u16>,
         message: String,
         usage: Option<Usage>,
     },
+    /// The human interrupted the stream, which closes its connection; the
+    /// provider may go on generating, and billing, regardless. Charged and
+    /// offered again as `Retryable` is.
+    Interrupted { usage: Option<Usage> },
 }
+
+/// What an interrupted turn says (DESIGN.md §5).
+pub const INTERRUPTED: &str = "interrupted; its stream is closed, but not every provider stops generating, or billing, when a stream closes";
 
 impl Failure {
     /// The turn's outcome for it.
@@ -352,6 +378,7 @@ impl Failure {
             Self::Retryable {
                 status, message, ..
             } => said(status, message),
+            Self::Interrupted { .. } => INTERRUPTED.to_string(),
         }
     }
 }
@@ -375,7 +402,7 @@ fn tidy(message: &str) -> String {
 }
 
 /// An error object's code and message: `{"code":402,"message":"..."}`.
-fn error_object(error: &Json) -> (Option<u16>, String) {
+pub(crate) fn error_object(error: &Json) -> (Option<u16>, String) {
     let code = error
         .get("code")
         .and_then(Json::as_u64)
@@ -398,7 +425,7 @@ fn error_object(error: &Json) -> (Option<u16>, String) {
 /// at least its prompt and completion counts to compute one from. One
 /// that says neither is no usage, so the request is charged its whole
 /// reservation rather than nothing.
-fn usage(value: &Json) -> Option<Usage> {
+pub(crate) fn usage(value: &Json) -> Option<Usage> {
     let usage = value.get("usage").filter(|u| !u.is_null())?;
     let count = |path: &[&str]| usage.get_path(path).and_then(Json::as_u64).unwrap_or(0);
     let cost = match usage.get("cost") {
@@ -656,7 +683,7 @@ mod tests {
         };
         assert_eq!(
             head(&params),
-            "\"model\":\"anthropic/claude-sonnet-5.5\",\"max_tokens\":16384,\
+            "\"model\":\"anthropic/claude-sonnet-5.5\",\"max_tokens\":16384,\"stream\":true,\
              \"reasoning\":{\"effort\":\"medium\"},\
              \"provider\":{\"require_parameters\":true,\"data_collection\":\"deny\"},\
              \"cache_control\":{\"type\":\"ephemeral\"}"
@@ -673,7 +700,7 @@ mod tests {
         };
         assert_eq!(
             head(&params),
-            "\"model\":\"google/gemini-3-pro\",\"max_tokens\":100,\
+            "\"model\":\"google/gemini-3-pro\",\"max_tokens\":100,\"stream\":true,\
              \"provider\":{\"require_parameters\":true,\"data_collection\":\"allow\"}"
         );
         let names: Vec<&str> = headers("sk-x").iter().map(|(n, _)| *n).collect();
@@ -728,6 +755,7 @@ mod tests {
                     reasoning: Some("thought".into()),
                     details: Some(details.into()),
                     finish: "stop".into(),
+                    incomplete: false,
                 },
             ),
             // A title request's reply is not part of the conversation.
@@ -815,6 +843,19 @@ mod tests {
                     reasoning: None,
                     details: None,
                     finish: "length".into(),
+                    incomplete: false,
+                },
+            ),
+            // What a broken stream brought is never sent back.
+            event(
+                5,
+                Kind::Assistant {
+                    request: 1,
+                    content: Some("half a rep".into()),
+                    reasoning: Some("thought".into()),
+                    details: Some("[{\"type\":\"reasoning.text\",\"text\":\"thought\"}]".into()),
+                    finish: "unknown".into(),
+                    incomplete: true,
                 },
             ),
             event(
@@ -836,6 +877,7 @@ mod tests {
                     reasoning: None,
                     details: Some("[]".into()),
                     finish: "stop".into(),
+                    incomplete: false,
                 },
             ),
         ];
@@ -866,6 +908,7 @@ mod tests {
                 reasoning: completion.reasoning.clone(),
                 details: completion.details.clone(),
                 finish: completion.finish.clone(),
+                incomplete: false,
             },
         };
         let line = logged.to_json().to_string();
@@ -1098,6 +1141,17 @@ mod tests {
             ),
             event(
                 2,
+                Kind::Assistant {
+                    request: 1,
+                    content: Some("Hi.".into()),
+                    reasoning: None,
+                    details: None,
+                    finish: "stop".into(),
+                    incomplete: false,
+                },
+            ),
+            event(
+                3,
                 Kind::Usage {
                     request: 1,
                     tokens: Tokens {
@@ -1114,9 +1168,52 @@ mod tests {
         // 2,100 reported, and 1,000 bytes more since: 250 tokens.
         assert_eq!(estimate(&events, 5000), 2350);
         assert_eq!(estimate(&events, 40_000), 2100 + 9000);
+        // A failed request's report, its reply incomplete or absent,
+        // leaves the estimate as it was: a retry sends the same head.
+        for incomplete in [true, false] {
+            let mut failed = events.clone();
+            failed.push(event(
+                4,
+                Kind::Request {
+                    turn: 0,
+                    purpose: Purpose::Turn,
+                    prefix: 0,
+                    head: String::new(),
+                    bytes: 5000,
+                    reserved: 0,
+                },
+            ));
+            if incomplete {
+                failed.push(event(
+                    5,
+                    Kind::Assistant {
+                        request: 4,
+                        content: Some("Hal".into()),
+                        reasoning: None,
+                        details: None,
+                        finish: "unknown".into(),
+                        incomplete: true,
+                    },
+                ));
+            }
+            failed.push(event(
+                6,
+                Kind::Usage {
+                    request: 4,
+                    tokens: Tokens {
+                        prompt: 2600,
+                        completion: 900,
+                        ..Tokens::default()
+                    },
+                    cost: 0,
+                    basis: Basis::Reported,
+                },
+            ));
+            assert_eq!(estimate(&failed, 5000), 2350);
+        }
         // Never under a quarter of the body.
         let mut sparse = events.clone();
-        if let Kind::Usage { tokens, .. } = &mut sparse[1].kind {
+        if let Kind::Usage { tokens, .. } = &mut sparse[2].kind {
             tokens.prompt = 500;
             tokens.completion = 0;
         }

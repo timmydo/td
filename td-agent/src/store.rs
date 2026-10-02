@@ -484,13 +484,17 @@ pub enum Kind {
     },
     /// The assistant message a request received: its text, its reasoning
     /// as text where the provider gave it, its `reasoning_details` as the
-    /// exact bytes of the response that carried them, and why it ended.
+    /// exact bytes of the response that carried them (from a stream, the
+    /// array as assembled, serialized once), and why it ended.
+    /// `incomplete` marks what a stream that broke off, failed or was
+    /// interrupted had brought: kept and shown, never sent back.
     Assistant {
         request: u64,
         content: Option<String>,
         reasoning: Option<String>,
         details: Option<String>,
         finish: String,
+        incomplete: bool,
     },
     /// A request's token counts and what it cost, in pico-credits.
     Usage {
@@ -575,6 +579,7 @@ impl Event {
                 reasoning,
                 details,
                 finish,
+                incomplete,
             } => {
                 let text = |v: &Option<String>| v.clone().map_or(Json::Null, Json::Str);
                 put("kind", Json::Str("assistant".into()));
@@ -583,6 +588,9 @@ impl Event {
                 put("reasoning", text(reasoning));
                 put("reasoning_details", text(details));
                 put("finish", Json::Str(finish.clone()));
+                if *incomplete {
+                    put("incomplete", Json::Bool(true));
+                }
             }
             Kind::Usage {
                 request,
@@ -679,6 +687,10 @@ impl Event {
                     reasoning: text("reasoning")?,
                     details: text("reasoning_details")?,
                     finish: string("finish")?,
+                    incomplete: match value.get("incomplete") {
+                        None => false,
+                        Some(flag) => flag.as_bool().ok_or("incomplete is not a boolean")?,
+                    },
                 }
             }
             Some("usage") => Kind::Usage {

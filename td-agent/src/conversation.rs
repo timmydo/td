@@ -5,29 +5,37 @@
 //! and then serves the window's messages until the socketpair closes,
 //! when it exits.
 //!
-//! A turn is one exchange with the model (DESIGN.md §5), non-streaming and
-//! with no tools: the human's message is logged, the request is reserved
-//! against the turn's, the conversation's and, through the window, the
-//! day's limits, logged as started and synced, and only then sent through
-//! the fetch service; its reply and usage are logged when it comes. A
-//! rate-limited request is asked again after a bounded wait; any other
-//! failure ends the turn and says why, with a retry action where asking
-//! again may succeed. After a conversation's first exchange its title
-//! comes from `title_model`, reserved like any request.
+//! A turn is one exchange with the model (DESIGN.md §5), with no tools:
+//! the human's message is logged, the request is reserved against the
+//! turn's, the conversation's and, through the window, the day's limits,
+//! logged as started and synced, and only then sent through the fetch
+//! service as a stream. Its reply is drawn in the window as it arrives
+//! and logged whole when it ends, with its usage; a stream that breaks
+//! off, fails or is interrupted logs what it had brought, marked
+//! incomplete. A rate-limited request is asked again after a bounded
+//! wait; any other failure ends the turn and says why, with a retry
+//! action where asking again may succeed. After a conversation's first
+//! exchange its title comes from `title_model`, reserved like any request
+//! and asked for whole, not streamed.
 //!
 //! The window's frames are read on a thread of their own into a channel,
 //! so that the window's writes never wait on a request in flight; what
-//! arrives during a turn waits its turn.
+//! arrives during a turn waits its turn. A stream is read on a thread of
+//! its own into the same channel, so an interrupt from the window is heard
+//! between any two of its frames.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::accounts;
+use crate::assemble::Assembly;
 use crate::client::{self, Completion, Failure, Params};
 use crate::config::Client;
 use crate::cost;
@@ -35,6 +43,7 @@ use crate::frame;
 use crate::key::Secret;
 use crate::models::{Model, Models};
 use crate::protocol::{Down, Up, MAX_TEXT};
+use crate::sse::{self, Fault};
 use crate::store::{
     Basis, Conversation, Effect, Event, Id, Kind, Purpose, Role, StateDir, LOCK_WAIT,
 };
@@ -59,11 +68,71 @@ pub fn run(state: &StateDir, id: &Id, create: Option<Role>) -> Result<(), String
     serve(UnixStream::from(socket), state, id, create)
 }
 
-/// What the reader thread hands on.
+/// What the reader thread, and a stream's thread, hand on.
 enum Inbound {
     Down(Down),
     Closed,
     Broken(String),
+    /// What the stream of request `request` (its sequence number) brought.
+    Fetch {
+        request: u64,
+        item: Fetched,
+    },
+}
+
+/// One step of a streamed request, as its thread read it.
+#[derive(Debug)]
+enum Fetched {
+    /// The reply's head.
+    Head {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
+    /// A frame of its body.
+    Chunk(Vec<u8>),
+    /// The service said the body is whole.
+    End,
+    /// The request, or the stream, failed.
+    Failed(td_fetch::Error),
+}
+
+/// What a streamed request came to.
+enum Streamed {
+    Replied(Completion),
+    /// It failed, or was interrupted; `partial` is what it had brought.
+    Failed {
+        failure: Failure,
+        partial: Option<Completion>,
+    },
+}
+
+/// A streamed reply being read.
+struct Reading {
+    head: Option<(u16, Vec<(String, String)>)>,
+    /// A reply that is no event stream, read whole: an error status's
+    /// body, or a 200 that came as one JSON object.
+    plain: Option<Vec<u8>>,
+    reader: sse::Reader,
+    reply: Assembly,
+}
+
+impl Reading {
+    /// What the reply had brought, when anything worth keeping.
+    fn partial(&self) -> Option<Completion> {
+        (!self.reply.is_empty()).then(|| self.reply.completion())
+    }
+
+    /// The stream broke off: charged and offered again.
+    fn broken(&self, message: String) -> Streamed {
+        Streamed::Failed {
+            failure: Failure::Retryable {
+                status: None,
+                message,
+                usage: self.reply.usage(),
+            },
+            partial: self.partial(),
+        }
+    }
 }
 
 /// The conversation over `stream`: opened, replayed, then served.
@@ -80,10 +149,14 @@ pub fn serve(
     let reader = stream
         .try_clone()
         .map_err(|e| format!("the socketpair: {e}"))?;
+    let (sender, inbox) = listen(reader)?;
     let mut session = Session {
         conversation,
         writer: stream,
-        inbox: listen(reader)?,
+        inbox,
+        sender,
+        live: Arc::new(AtomicU64::new(0)),
+        interrupt: false,
         queue: VecDeque::new(),
         setup: None,
         state: state.root().to_path_buf(),
@@ -105,9 +178,11 @@ pub fn serve(
     session.serve()
 }
 
-/// Reads the window's frames into a channel until the socketpair ends.
-fn listen(mut reader: UnixStream) -> Result<Receiver<Inbound>, String> {
+/// Reads the window's frames into a channel until the socketpair ends;
+/// the channel's sender is kept for the streams to hand on through.
+fn listen(mut reader: UnixStream) -> Result<(Sender<Inbound>, Receiver<Inbound>), String> {
     let (send, inbox) = mpsc::channel();
+    let sender = send.clone();
     std::thread::Builder::new()
         .name("td-agent-window".into())
         .spawn(move || loop {
@@ -130,7 +205,49 @@ fn listen(mut reader: UnixStream) -> Result<Receiver<Inbound>, String> {
             }
         })
         .map_err(|e| format!("the reader thread: {e}"))?;
-    Ok(inbox)
+    Ok((sender, inbox))
+}
+
+/// A stream's thread: sends `body` as a streamed request and hands on its
+/// head and each frame as they come, for as long as `live` names it.
+/// Returning drops the stream, which closes its connection, and with it
+/// the service's to the origin: an interrupt takes effect at the frame
+/// after it, which the service's idle deadline bounds (DESIGN.md §5).
+fn fetch(
+    url: &str,
+    headers: &[(&'static str, String)],
+    body: &[u8],
+    request: u64,
+    live: &AtomicU64,
+    send: &Sender<Inbound>,
+) {
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+    let hand = |item: Fetched| send.send(Inbound::Fetch { request, item }).is_ok();
+    let mut stream = match td_fetch::post_stream(url, &headers, body, Some(client::MAX_STREAM)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            hand(Fetched::Failed(e));
+            return;
+        }
+    };
+    let head = Fetched::Head {
+        status: stream.status,
+        headers: stream.headers.clone(),
+    };
+    if !hand(head) {
+        return;
+    }
+    while live.load(Ordering::SeqCst) == request {
+        let item = match stream.next_chunk() {
+            Ok(Some(bytes)) => Fetched::Chunk(bytes.to_vec()),
+            Ok(None) => Fetched::End,
+            Err(e) => Fetched::Failed(e),
+        };
+        let last = !matches!(item, Fetched::Chunk(_));
+        if !hand(item) || last {
+            return;
+        }
+    }
 }
 
 /// How a turn ended: what the window shows, whether the human may ask
@@ -173,6 +290,13 @@ struct Session {
     conversation: Conversation,
     writer: UnixStream,
     inbox: Receiver<Inbound>,
+    /// The inbox's sender, which each stream's thread hands on through.
+    sender: Sender<Inbound>,
+    /// The request whose stream is still wanted, 0 for none: a stream's
+    /// thread reads on only while this names its request.
+    live: Arc<AtomicU64>,
+    /// The window asked to interrupt the turn under way.
+    interrupt: bool,
     /// Messages that came while a turn waited on the window.
     queue: VecDeque<Down>,
     setup: Option<(Result<Secret, String>, Client)>,
@@ -217,10 +341,14 @@ impl Session {
         if let Some(down) = self.queue.pop_front() {
             return Ok(Some(down));
         }
-        match self.inbox.recv() {
-            Ok(Inbound::Down(down)) => Ok(Some(down)),
-            Ok(Inbound::Closed) | Err(_) => Ok(None),
-            Ok(Inbound::Broken(e)) => Err(format!("the window: {e}")),
+        loop {
+            match self.inbox.recv() {
+                Ok(Inbound::Down(down)) => return Ok(Some(down)),
+                Ok(Inbound::Closed) | Err(_) => return Ok(None),
+                Ok(Inbound::Broken(e)) => return Err(format!("the window: {e}")),
+                // A stream given up on, still reading to its next frame.
+                Ok(Inbound::Fetch { .. }) => {}
+            }
         }
     }
 
@@ -236,7 +364,8 @@ impl Session {
                 // A reservation granted after its request gave up waiting:
                 // nothing was sent, so the window's hold is released.
                 Down::Reservation { id, refusal: None } => self.spent(id, 0),
-                Down::Reservation { .. } => {}
+                // Between turns there is nothing to interrupt.
+                Down::Reservation { .. } | Down::Interrupt => {}
             }
             if !self.gone {
                 let _ = self.writer.flush();
@@ -328,6 +457,7 @@ impl Session {
 
     /// Runs turn `turn` to its end in the log.
     fn turn(&mut self, turn: u64) -> Result<(), String> {
+        self.interrupt = false;
         let outcome = self.exchange(turn)?;
         if outcome.replied && self.first_reply() {
             self.title(turn)?;
@@ -341,8 +471,8 @@ impl Session {
         self.sync()
     }
 
-    /// Whether the conversation has had exactly one reply, and no title
-    /// from a model yet.
+    /// Whether the conversation has had exactly one whole reply, and no
+    /// title from a model yet.
     fn first_reply(&self) -> bool {
         if self.conversation.meta().role != Role::Conversation {
             return false;
@@ -357,7 +487,11 @@ impl Session {
                     purpose: Purpose::Turn,
                     ..
                 } => turns.push(event.seq),
-                Kind::Assistant { request, .. } if turns.contains(request) => replies += 1,
+                Kind::Assistant {
+                    request,
+                    incomplete: false,
+                    ..
+                } if turns.contains(request) => replies += 1,
                 _ => {}
             }
         }
@@ -409,7 +543,10 @@ impl Session {
                     id: late,
                     refusal: None,
                 })) => self.spent(late, 0),
+                // Said while waiting: the request is not sent.
+                Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(RecvTimeoutError::Disconnected) => {
                     self.gone = true;
                     return Err("the window has closed".into());
@@ -554,6 +691,15 @@ impl Session {
                     })
                 }
             };
+            if self.interrupt {
+                // Interrupted while the window reserved it: never sent.
+                self.spent(id, 0);
+                return Ok(Outcome {
+                    text: "interrupted before its request was sent".into(),
+                    retry: true,
+                    replied: false,
+                });
+            }
             let request = self.log(Kind::Request {
                 turn,
                 purpose: Purpose::Turn,
@@ -565,8 +711,8 @@ impl Session {
             // Logged as started and synced before it is sent: a restart
             // that finds it unfinished never sends it again.
             self.sync()?;
-            let failure = match client::classify(post(&client, &key, &body)) {
-                Ok(completion) => {
+            let failure = match self.stream(request.seq, &client, &key, body) {
+                Streamed::Replied(completion) => {
                     let cost = charge(completion.usage, pricing, reserved);
                     let text = self.reply(request.seq, &completion, cost)?;
                     self.spent(id, cost.0);
@@ -576,7 +722,12 @@ impl Session {
                         replied: true,
                     });
                 }
-                Err(failure) => failure,
+                Streamed::Failed { failure, partial } => {
+                    if let Some(partial) = partial {
+                        self.partial(request.seq, partial)?;
+                    }
+                    failure
+                }
             };
             let outcome = failure.outcome();
             match failure {
@@ -596,7 +747,18 @@ impl Session {
                             client::MAX_WAIT.as_secs()
                         )));
                     };
-                    std::thread::sleep(wait);
+                    if self.pause(wait) {
+                        let why = if self.gone {
+                            "the window closed"
+                        } else {
+                            "interrupted"
+                        };
+                        return Ok(Outcome {
+                            text: format!("error 429: {message}; {why} before asking again"),
+                            retry: true,
+                            replied: false,
+                        });
+                    }
                     attempt += 1;
                 }
                 Failure::Stop { .. } => {
@@ -604,7 +766,7 @@ impl Session {
                     self.spent(id, 0);
                     return Ok(Outcome::stop(outcome));
                 }
-                Failure::Retryable { usage, .. } => {
+                Failure::Retryable { usage, .. } | Failure::Interrupted { usage } => {
                     let cost = match usage {
                         Some(client::Usage {
                             cost: Some(cost), ..
@@ -637,6 +799,7 @@ impl Session {
             reasoning: completion.reasoning.clone(),
             details: completion.details.clone(),
             finish: completion.finish.clone(),
+            incomplete: false,
         };
         if let Err(e) = self.log(assistant) {
             // A reply past what a log line holds: its cost still counts.
@@ -655,6 +818,197 @@ impl Session {
         Ok(outcome)
     }
 
+    /// Logs what a stream that did not finish had brought, marked
+    /// incomplete; one past what a log line holds is noted instead.
+    fn partial(&mut self, request: u64, partial: Completion) -> Result<(), String> {
+        let logged = self.log(Kind::Assistant {
+            request,
+            content: partial.content,
+            reasoning: partial.reasoning,
+            details: partial.details,
+            finish: partial.finish,
+            incomplete: true,
+        });
+        if let Err(e) = logged {
+            self.log(Kind::Notice {
+                text: format!("the incomplete reply could not be logged: {e}"),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Waits out a rate limit, still hearing the window: whether the
+    /// human interrupted the turn meanwhile, or the window closed, when
+    /// the next request could not be reserved.
+    fn pause(&mut self, wait: Duration) -> bool {
+        if self.gone {
+            return true;
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.inbox.recv_timeout(left) {
+                Ok(Inbound::Down(Down::Interrupt)) => return true,
+                Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
+                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Closed | Inbound::Broken(_)) => {
+                    self.gone = true;
+                    return true;
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// Sends turn request `request` as a stream and reads its reply as it
+    /// comes, drawing what each frame brings in the window, until the
+    /// reply ends or fails or the window interrupts it. A window that
+    /// closes meanwhile leaves the reply to be read and logged whole.
+    fn stream(&mut self, request: u64, client: &Client, key: &Secret, body: String) -> Streamed {
+        self.live.store(request, Ordering::SeqCst);
+        let url = format!("{}/chat/completions", client.base_url);
+        let headers = client::headers(key.expose());
+        let (send, live) = (self.sender.clone(), self.live.clone());
+        let spawned = std::thread::Builder::new()
+            .name("td-agent-stream".into())
+            .spawn(move || fetch(&url, &headers, body.as_bytes(), request, &live, &send));
+        if let Err(e) = spawned {
+            return Streamed::Failed {
+                failure: Failure::Stop {
+                    status: None,
+                    message: format!("the stream's thread: {e}"),
+                },
+                partial: None,
+            };
+        }
+        let mut reading = Reading {
+            head: None,
+            plain: None,
+            reader: sse::Reader::new(sse::MAX_EVENT, client::MAX_STREAM),
+            reply: Assembly::default(),
+        };
+        let end = loop {
+            let inbound = match self.inbox.recv() {
+                Ok(inbound) => inbound,
+                // The session holds a sender, so this does not happen.
+                Err(_) => break reading.broken("the conversation's channel closed".into()),
+            };
+            match inbound {
+                Inbound::Fetch { request: of, item } if of == request => {
+                    if let Some(end) = self.fetched(request, item, &mut reading) {
+                        break end;
+                    }
+                }
+                Inbound::Fetch { .. } => {}
+                Inbound::Down(Down::Interrupt) => {
+                    break Streamed::Failed {
+                        failure: Failure::Interrupted {
+                            usage: reading.reply.usage(),
+                        },
+                        partial: reading.partial(),
+                    }
+                }
+                Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
+                Inbound::Down(down) => self.queue.push_back(down),
+                Inbound::Closed | Inbound::Broken(_) => self.gone = true,
+            }
+        };
+        // Its thread reads no further than the frame it is waiting for.
+        self.live.store(0, Ordering::SeqCst);
+        end
+    }
+
+    /// One step of request `request`'s stream: what it ended in, when it
+    /// has ended.
+    fn fetched(&mut self, request: u64, item: Fetched, reading: &mut Reading) -> Option<Streamed> {
+        match item {
+            Fetched::Head { status, headers } => {
+                let json = headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-type")
+                        && value
+                            .trim_start()
+                            .get(..16)
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("application/json"))
+                });
+                if status != 200 || json {
+                    reading.plain = Some(Vec::new());
+                }
+                reading.head = Some((status, headers));
+                None
+            }
+            Fetched::Chunk(bytes) => {
+                if let Some(plain) = reading.plain.as_mut() {
+                    if plain.len().saturating_add(bytes.len()) > client::MAX_REPLY as usize {
+                        return Some(
+                            reading.broken(format!("a reply past {} bytes", client::MAX_REPLY)),
+                        );
+                    }
+                    plain.extend_from_slice(&bytes);
+                    return None;
+                }
+                let reply = &mut reading.reply;
+                let fed = reading.reader.feed(&bytes, &mut |event| match event {
+                    sse::Event::Data(text) => reply.event(text),
+                    sse::Event::Done => Ok(()),
+                });
+                let (reasoning, content) = reading.reply.fresh();
+                // A frame's events may complete one begun frames before,
+                // so what they bring is sent in pieces a frame holds
+                // however JSON escapes it.
+                let reasoning = pieces(reasoning, DELTA_PIECE).into_iter().map(|r| (r, ""));
+                let content = pieces(content, DELTA_PIECE).into_iter().map(|c| ("", c));
+                for (reasoning, content) in reasoning.chain(content) {
+                    self.send(&Up::Delta {
+                        request,
+                        reasoning: reasoning.to_string(),
+                        content: content.to_string(),
+                    });
+                }
+                match fed {
+                    Err(Fault::Sink(failure)) => Some(Streamed::Failed {
+                        failure,
+                        partial: reading.partial(),
+                    }),
+                    Err(Fault::Reader(e)) => Some(reading.broken(e.to_string())),
+                    // `[DONE]` with no finish is a stream cut short, as a
+                    // counted reply with no choice is.
+                    Ok(()) if reading.reader.done() && reading.reply.finished() => {
+                        Some(Streamed::Replied(reading.reply.completion()))
+                    }
+                    Ok(()) if reading.reader.done() => {
+                        Some(reading.broken("the stream ended before the reply finished".into()))
+                    }
+                    Ok(()) => None,
+                }
+            }
+            Fetched::End => match (reading.plain.take(), reading.head.take()) {
+                (Some(body), Some((status, headers))) => Some(whole(status, headers, body)),
+                // Whole without `[DONE]` only once a finish has come.
+                _ if reading.reply.finished() => {
+                    Some(Streamed::Replied(reading.reply.completion()))
+                }
+                _ => Some(reading.broken("the stream ended before the reply finished".into())),
+            },
+            Fetched::Failed(e) => match (reading.plain.take(), reading.head.take()) {
+                // Before the head: refused or unsent as a counted request
+                // would have been.
+                (_, None) => Some(match client::classify(Err(e)) {
+                    Ok(completion) => Streamed::Replied(completion),
+                    Err(failure) => Streamed::Failed {
+                        failure,
+                        partial: None,
+                    },
+                }),
+                // An error status's body cut short: the status decides.
+                (Some(body), Some((status, headers))) if status != 200 => {
+                    Some(whole(status, headers, body))
+                }
+                _ => Some(reading.broken(e.to_string())),
+            },
+        }
+    }
+
     /// The conversation's title from `title_model`, after its first
     /// exchange (DESIGN.md §13). Reserved like any request; whatever goes
     /// wrong leaves the first message's line as the title and says why.
@@ -668,7 +1022,11 @@ impl Session {
             _ => None,
         });
         let reply = events.iter().rev().find_map(|e| match &e.kind {
-            Kind::Assistant { content, .. } => Some(content.clone().unwrap_or_default()),
+            Kind::Assistant {
+                content,
+                incomplete: false,
+                ..
+            } => Some(content.clone().unwrap_or_default()),
             _ => None,
         });
         let (Some(first), Some(reply)) = (first, reply) else {
@@ -758,7 +1116,46 @@ impl Session {
     }
 }
 
-/// A model request through the fetch service.
+/// The most text one `delta` frame carries in a field: six times it,
+/// escaped at its longest, is well within `frame::MAX_FRAME`.
+const DELTA_PIECE: usize = 64 * 1024;
+
+/// `text` in pieces of at most `most` bytes, cut at character boundaries.
+fn pieces(text: &str, most: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut cut = rest.len().min(most.max(4));
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (Some(piece), Some(tail)) = (rest.get(..cut), rest.get(cut..)) else {
+            break;
+        };
+        out.push(piece);
+        rest = tail;
+    }
+    out
+}
+
+/// A streamed request's reply that came as one body: as a counted reply
+/// is read.
+fn whole(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Streamed {
+    let response = td_fetch::Response {
+        status,
+        headers,
+        body,
+    };
+    match client::classify(Ok(response)) {
+        Ok(completion) => Streamed::Replied(completion),
+        Err(failure) => Streamed::Failed {
+            failure,
+            partial: None,
+        },
+    }
+}
+
+/// A title request through the fetch service, counted.
 fn post(client: &Client, key: &Secret, body: &str) -> Result<td_fetch::Response, td_fetch::Error> {
     let headers = client::headers(key.expose());
     let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
@@ -864,6 +1261,28 @@ mod tests {
         served.join().unwrap().unwrap();
         let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
         assert_eq!(conversation.events().len(), 3);
+    }
+
+    #[test]
+    fn a_delta_is_cut_into_pieces_a_frame_holds() {
+        assert!(pieces("", 4).is_empty());
+        assert_eq!(pieces("abcdef", 4), ["abcd", "ef"]);
+        assert_eq!(
+            pieces(&"\u{e9}".repeat(5), 5),
+            ["\u{e9}\u{e9}", "\u{e9}\u{e9}", "\u{e9}"]
+        );
+        // The longest piece, escaped at its longest, fits a frame.
+        let worst = "\u{1}".repeat(DELTA_PIECE * 2 + 1);
+        let cut = pieces(&worst, DELTA_PIECE);
+        assert_eq!(cut.len(), 3);
+        for piece in cut {
+            let delta = Up::Delta {
+                request: 1,
+                reasoning: piece.into(),
+                content: piece.into(),
+            };
+            assert!(delta.encode().len() <= frame::MAX_FRAME);
+        }
     }
 
     #[test]

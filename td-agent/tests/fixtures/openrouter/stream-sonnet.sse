@@ -1,0 +1,18 @@
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1759400300-sTrEaMsOnNeT0001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400300,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"The person asks what a sparse checkout is.","reasoning_details":[{"type":"reasoning.text","text":"The person asks what a sparse checkout is.","format":"anthropic-claude-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400300-sTrEaMsOnNeT0001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400300,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":" Answer plainly.","reasoning_details":[{"type":"reasoning.text","text":" Answer plainly.","format":"anthropic-claude-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400300-sTrEaMsOnNeT0001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400300,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":null,"reasoning_details":[{"type":"reasoning.text","signature":"EqQBCkgIBxABGAIiQL\/x+Jq0dXN0IHNpZ25hdHVyZQ==\n","format":"anthropic-claude-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400300-sTrEaMsOnNeT0001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400300,"choices":[{"index":0,"delta":{"role":"assistant","content":"A sparse checkout keeps only the paths you name"},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400300-sTrEaMsOnNeT0001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400300,"choices":[{"index":0,"delta":{"role":"assistant","content":" in the working tree; the rest stay in the repository’s objects."},"finish_reason":"stop","native_finish_reason":"end_turn","logprobs":null}]}
+
+data: {"id":"gen-1759400300-sTrEaMsOnNeT0001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400300,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"native_finish_reason":null,"logprobs":null}],"usage":{"prompt_tokens":1210,"completion_tokens":48,"total_tokens":1258,"cost":0.00435,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":12,"image_tokens":0}}}
+
+data: [DONE]
+

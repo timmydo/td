@@ -30,6 +30,9 @@ pub enum Down {
     Reservation { id: u64, refusal: Option<String> },
     /// Ask again for the last turn, which failed in a way that may pass.
     Retry,
+    /// Interrupt the turn under way: its stream's connection is closed
+    /// (DESIGN.md §5). Between turns it means nothing.
+    Interrupt,
 }
 
 /// From a conversation to the window.
@@ -67,6 +70,14 @@ pub enum Up {
     Spent {
         id: u64,
         amount: u64,
+    },
+    /// What a streamed reply to request `request` (its sequence number)
+    /// has brought since the last: reasoning, then text, for the window to
+    /// draw as it arrives. Not logged: the reply is, whole, once it ends.
+    Delta {
+        request: u64,
+        reasoning: String,
+        content: String,
     },
 }
 
@@ -126,6 +137,7 @@ impl Down {
                 ],
             ),
             Self::Retry => typed("retry", Vec::new()),
+            Self::Interrupt => typed("interrupt", Vec::new()),
         }
     }
 
@@ -154,6 +166,7 @@ impl Down {
                 },
             }),
             Some("retry") => Ok(Self::Retry),
+            Some("interrupt") => Ok(Self::Interrupt),
             Some("user") => {
                 let delivery = string(&value, "delivery")?;
                 if !delivery_ok(&delivery) {
@@ -218,6 +231,18 @@ impl Up {
                     ("amount".into(), Json::from(*amount)),
                 ],
             ),
+            Self::Delta {
+                request,
+                reasoning,
+                content,
+            } => typed(
+                "delta",
+                vec![
+                    ("request".into(), Json::from(*request)),
+                    ("reasoning".into(), Json::Str(reasoning.clone())),
+                    ("content".into(), Json::Str(content.clone())),
+                ],
+            ),
         }
     }
 
@@ -260,6 +285,11 @@ impl Up {
             Some("spent") => Self::Spent {
                 id: number(&value, "id")?,
                 amount: number(&value, "amount")?,
+            },
+            Some("delta") => Self::Delta {
+                request: number(&value, "request")?,
+                reasoning: string(&value, "reasoning")?,
+                content: string(&value, "content")?,
             },
             other => return Err(format!("unknown message {other:?}")),
         })
@@ -316,6 +346,24 @@ mod tests {
                 id: 1,
                 amount: u64::MAX,
             },
+            Up::Delta {
+                request: 9,
+                reasoning: "thinking \u{1}".into(),
+                content: String::new(),
+            },
+            // An incomplete reply's flag survives the log's encoding.
+            Up::Event(Event {
+                seq: 4,
+                time: 5,
+                kind: Kind::Assistant {
+                    request: 3,
+                    content: Some("half".into()),
+                    reasoning: None,
+                    details: None,
+                    finish: "unknown".into(),
+                    incomplete: true,
+                },
+            }),
         ] {
             assert_eq!(Up::decode(&up.encode()).unwrap(), up);
         }
@@ -338,6 +386,7 @@ mod tests {
                 refusal: Some("max_cost_per_day".into()),
             },
             Down::Retry,
+            Down::Interrupt,
         ] {
             assert_eq!(Down::decode(&down.encode()).unwrap(), down);
         }

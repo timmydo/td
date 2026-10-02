@@ -1,0 +1,14 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1759400400-sTrEaMgEmInI0001","provider":"Google AI Studio","model":"google/gemini-3-pro-preview","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"**Planning the answer**\n\n","reasoning_details":[{"type":"reasoning.text","text":"**Planning the answer**\n\n","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-sTrEaMgEmInI0001","provider":"Google AI Studio","model":"google/gemini-3-pro-preview","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"The person wants the order of steps.","reasoning_details":[{"type":"reasoning.text","text":"The person wants the order of steps.","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-sTrEaMgEmInI0001","provider":"Google AI Studio","model":"google/gemini-3-pro-preview","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":"Rebase onto the new base,","reasoning_details":[{"type":"reasoning.encrypted","data":"CiQBjz1rX3J5dGhtLXNpZ25hdHVyZS1ieXRlcw==","id":"tool_0","format":"google-gemini-v1","index":1}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+
+data: {"id":"gen-1759400400-sTrEaMgEmInI0001","provider":"Google AI Studio","model":"google/gemini-3-pro-preview","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":" then run the tests again."},"finish_reason":"stop","native_finish_reason":"STOP","logprobs":null}]}
+
+data: {"id":"gen-1759400400-sTrEaMgEmInI0001","provider":"Google AI Studio","model":"google/gemini-3-pro-preview","object":"chat.completion.chunk","created":1759400400,"choices":[],"usage":{"prompt_tokens":2350,"completion_tokens":140,"total_tokens":2490,"cost":2.15e-3,"is_byok":false,"prompt_tokens_details":{"cached_tokens":1024,"audio_tokens":0},"cost_details":{"upstream_inference_cost":null},"completion_tokens_details":{"reasoning_tokens":96,"image_tokens":0}}}
+
+data: [DONE]
+
