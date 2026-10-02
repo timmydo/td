@@ -330,6 +330,14 @@ const FIREFOX_SOAK_BRACKET_MARGIN_SECS: u16 = 30;
 // exponential restart backoff. Autotest allows two cold starts plus margin.
 const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
     FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS + FIREFOX_RETRY_MARGIN_SECS;
+/// Under the setup-input token the live wizard waits this long, by the
+/// clock, for the autotest Firefox's window, no longer than Firefox's
+/// evidence polls for it: its readiness can time out under TCG before it
+/// maps, and a window mapped later takes the keyboard.
+const SETUP_FIREFOX_WAIT_SECS: u16 = FIREFOX_EVIDENCE_WAIT_ITERATIONS;
+/// The wizard's readiness outlasts that wait by its last layout query and
+/// its own window's 30 seconds.
+const SETUP_READY_TIMEOUT_SECS: u16 = SETUP_FIREFOX_WAIT_SECS + 60;
 // `after=` releases this daemon when firefox-evidence starts, not when its
 // atomic completion appears. Cover the evidence poll loop plus every support
 // session that can legally extend one of those iterations.
@@ -1823,7 +1831,10 @@ fn build_td_svc_conf() -> String {
          timeout={application_place}\n\
          \n\
          # The installer wizard, on a live boot only (td-install/INSTALLER.md):\n\
-         # once the session's own windows are placed and Firefox's has mapped,\n\
+         # once the session's own windows are placed and Firefox's has mapped\n\
+         # (Firefox is ready on a live boot only then, unless its readiness\n\
+         # times out; under the setup-input token the wizard waits for the\n\
+         # window itself),\n\
          # the view moves to an empty workspace and the wizard maps there\n\
          # alone, whole-output and holding the keyboard. It runs as the human\n\
          # user, unjailed and without disk authority, and reaches root's\n\
@@ -1834,11 +1845,11 @@ fn build_td_svc_conf() -> String {
          [setup]\n\
          type=daemon\n\
          cgroup=session\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) /bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {setup_workspace} || exit 1; exec /bin/td-login exec-primary -- /bin/env WAYLAND_DISPLAY={wayland_socket} /bin/td-setup;; *) exit 0;; esac'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) case \" $(/bin/cat /proc/cmdline) \" in *\" {setup_input_cmdline_token} \"*) start=$(/bin/date +%s) || exit 1; while :; do layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{firefox_app_id} title=\" && break; now=$(/bin/date +%s) || exit 1; if [ $((now - start)) -ge {setup_firefox_wait} ]; then /bin/echo \"td-setup: the autotest Firefox window did not map in {setup_firefox_wait}s; not starting the wizard it would take the keyboard from\"; exit 1; fi; /bin/td-util sleep 1; done;; esac; /bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {setup_workspace} || exit 1; exec /bin/td-login exec-primary -- /bin/env WAYLAND_DISPLAY={wayland_socket} /bin/td-setup;; *) exit 0;; esac'\n\
          after=wayland,placement-evidence,firefox\n\
          requires=wayland\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{setup_app_id} title=\"'\n\
-         ready-timeout=30\n\
+         ready-timeout={setup_ready_timeout}\n\
          restart=never\n\
          \n\
          # Boot evidence on a live boot under the autotest token only: the\n\
@@ -2094,6 +2105,8 @@ fn build_td_svc_conf() -> String {
         setup_min_height = SETUP_MIN_HEIGHT,
         setup_min_width = SETUP_MIN_WIDTH,
         setup_workspace = SETUP_WORKSPACE,
+        setup_firefox_wait = SETUP_FIREFOX_WAIT_SECS,
+        setup_ready_timeout = SETUP_READY_TIMEOUT_SECS,
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
         fetch_marker = TD_FETCH_BOOT_MARKER,
@@ -7730,15 +7743,36 @@ mod tests {
         let gate =
             |token: &str| format!("case \" $(/bin/cat /proc/cmdline) \" in *\" {token} \"*)");
         let live = gate(td_boot_protocol::LIVE_CMDLINE_TOKEN);
+        // Firefox's readiness can time out before its window maps under
+        // TCG; while the oracle types, the wizard waits for that window by
+        // the clock, since the compositor focuses what it maps, and does not
+        // start without it.
+        let input = gate(SETUP_INPUT_CMDLINE_TOKEN);
+        let wait = SETUP_FIREFOX_WAIT_SECS;
         assert_eq!(
             unit_key("setup", "exec").unwrap(),
             format!(
-                "/bin/sh -c '{live} /bin/td-login exec-primary -- /bin/td-ctl --socket \
-                 {CONTROL_SOCKET} workspace {SETUP_WORKSPACE} || exit 1; \
+                "/bin/sh -c '{live} {input} start=$(/bin/date +%s) || exit 1; while :; \
+                 do layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket \
+                 {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | /bin/grep -q \
+                 \"{WINDOW_RECORD}{FIREFOX_APP_ID} title=\" && break; \
+                 now=$(/bin/date +%s) || exit 1; if [ $((now - start)) -ge {wait} ]; then \
+                 /bin/echo \"td-setup: the autotest Firefox window did not map in {wait}s; \
+                 not starting the wizard it would take the keyboard from\"; exit 1; fi; \
+                 /bin/td-util sleep 1; done;; esac; /bin/td-login exec-primary -- \
+                 /bin/td-ctl --socket {CONTROL_SOCKET} workspace {SETUP_WORKSPACE} || exit 1; \
                  exec /bin/td-login exec-primary -- /bin/env \
                  WAYLAND_DISPLAY={WAYLAND_SOCKET} /bin/td-setup;; *) exit 0;; esac'"
             )
         );
+        assert_eq!(
+            unit_key("setup", "ready-timeout").as_deref(),
+            Some(SETUP_READY_TIMEOUT_SECS.to_string().as_str())
+        );
+        // As long as Firefox's own evidence waits for it, and readiness
+        // outlasts the wait by the last query and the wizard's own window.
+        assert_eq!(wait, FIREFOX_EVIDENCE_WAIT_ITERATIONS);
+        assert_eq!(SETUP_READY_TIMEOUT_SECS, wait + 60);
         // An empty workspace: neither the shell's nor the applications'.
         assert!((2..=9).contains(&SETUP_WORKSPACE));
         assert_ne!(SETUP_WORKSPACE, TERMINAL_APPLICATION_WORKSPACE);

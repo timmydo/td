@@ -95,8 +95,13 @@ The system image carries td-setup, and on a live boot (`td.live=1`, which
 only the live selector's handoff sets; td-install/MEDIA.md "Live boot") the
 session's `[setup]` td-svc unit starts it once the compositor runs, the
 session's own windows are placed and Firefox's window has mapped (on a live
-boot Firefox is ready only then): as the human user, unjailed and without
-disk authority, on the compositor's socket by `WAYLAND_DISPLAY`. The unit
+boot Firefox is ready only then, unless its readiness times out first): as
+the human user, unjailed and without disk authority, on the compositor's
+socket by `WAYLAND_DISPLAY`. A Firefox slow enough to time out its
+readiness can still map after the wizard, as can a restarted Firefox,
+terminal or application, on the wizard's workspace and with the keyboard,
+since the compositor focuses what it maps; keeping a late window from
+taking the wizard's place and keys is a follow-up. The unit
 first makes the empty third workspace active, so the wizard maps there
 alone, with the whole output and the keyboard; a third tile beside the
 shell and Firefox would be smaller than its smallest page. A window that
@@ -152,9 +157,11 @@ state that does not follow its act within five minutes, or an installed
 notice that does not follow consent within half an hour, fails it then; so
 does td-setup saying the installation failed. Under that token the session
 keeps the drive's keyboard: the autotest Claude terminal evidence, whose
-window would map on the wizard's workspace and take the keys, does not run,
-and the greeter parks rather than reboot the live boot when its health
-transaction settles. With the medium detached, the installed disk then
+window would map on the wizard's workspace and take the keys, does not run;
+the wizard waits for the autotest Firefox's window, by the clock and no
+longer than Firefox's own evidence polls for it, and does not start if it
+never maps, saying so on the console; and the greeter parks rather than
+reboot the live boot when its health transaction settles. With the medium detached, the installed disk then
 cold-boots through firmware twice, alone and then renamed behind a decoy
 disk: each boot must bind the volume UUID read from the image's own
 superblock and the medium's deployment, activate the wizard's account and
