@@ -12,6 +12,9 @@ mod create_directory;
 #[path = "store_fs/input.rs"]
 mod input;
 pub use input::{CompleteFile, StoreReader};
+#[path = "store_fs/selection.rs"]
+mod selection;
+pub use selection::{SelectionError, SelectionScratch, SelectionStage};
 #[path = "store_fs/temporary.rs"]
 mod temporary;
 pub use temporary::{

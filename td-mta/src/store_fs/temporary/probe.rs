@@ -82,8 +82,13 @@ pub fn run(mut snapshot: impl FnMut()) {
                 .unwrap();
         }
     }
+    for fixture in [&short, &long] {
+        super::super::selection::prepare_probe(&fixture.root);
+    }
+    let mut selection_scratch = super::super::SelectionScratch::new();
     snapshot();
     for fixture in [&short, &long] {
+        super::super::selection::probe(&fixture.root, &mut selection_scratch);
         super::current::probe(&fixture.root, fixture.account);
         super::super::input::probe(&fixture.root, fixture.account);
         super::publication::probe(&fixture.root, fixture.account);

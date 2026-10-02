@@ -606,6 +606,18 @@ complete reads, random reads, ceiling/role refusal, injected read errors, early
 EOF and completion-probe failure at both root bounds. No per-file heap buffer,
 new allocator hook or runtime pool is introduced.
 
+Selection loading uses caller-owned scratch totaling 5032 bytes: FORMAT (80),
+CURRENT (120) and maximum manifest (4832). It retains at most one input File
+at a time in addition to the root and LOCK; opening uses the same transient
+parent handles and fixed path scratch as StoreReader. Container decoders use
+bounded stack state and the existing allocation-free SHA-256 provider. Each
+file permits at most 64 explicit extent reads plus one EOF probe. Selection
+borrows the scratch manifest, preventing its reuse until that borrow ends.
+The allocation interval loads literal metadata and exercises missing-account
+refusal at short/maximum roots; fixture bytes/directories and scratch are
+prepared before measurement. This does not instantiate recovery workers or
+prove full-service RSS.
+
 Pending/failed files retain their logical charges until explicit
 cleanup, including when syncing consumed and closed their handles.
 

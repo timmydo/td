@@ -706,6 +706,14 @@ service activation. Each part lands independently:
 - **M05d — selected-store recovery:** validate CURRENT's complete selected graph,
   replay contiguous frames, fence corruption and repair only incomplete EOF
   tails under the lock. Do not scan for a newer unselected generation or magic.
+  - **M05d1 — selection loading:** implemented private FORMAT/CURRENT and named
+    manifest reads through complete-extent/EOF evidence, then container and
+    account/epoch/generation/digest binding. Fixed caller scratch and per-file
+    read-attempt limits; errors identify the failed stage. Literal-file tests
+    cover identity/checksum/size failures and missing selection without scans;
+    the allocation probe covers success and missing-account refusal at both
+    root bounds. Whole table/journal validation, replay, orphan accounting and
+    final-view invariants remain required before activating the store.
 - **M05e — serialized commit publication:** connect reservations, complete frame
   append/sync and atomic sequence/offset visibility. Failed sync stops writes;
   all crash boundaries preserve acknowledged state. M08 supplies the complete

@@ -30,9 +30,11 @@ existing directory types, links and private-root permissions under an explicit
 operator-controlled stable-path contract. It performs no direct syscalls or
 free-space probes. A retained std file lock provides cooperative writer
 exclusion. Typed private-file readers now require complete extent consumption
-and physical EOF before returning a retained completion handle. Selected-graph
-validation, complete final-view semantics and committed mail publication remain
-unimplemented.
+and physical EOF before returning a retained completion handle. Selection
+loading reads FORMAT, CURRENT and only its named manifest, then binds their
+account, epoch, generation and digests in caller-owned scratch. Complete
+selected-graph validation, final-view semantics and committed mail publication
+remain unimplemented.
 Private temporary output now has exclusive creation, bounded I/O and explicit
 file/parent sync. Typed private-directory creation also syncs the new directory
 and parent. Completed private blobs and fresh table/manifest/journal files can

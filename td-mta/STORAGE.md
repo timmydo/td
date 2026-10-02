@@ -357,6 +357,31 @@ a separate prefix-bound adapter; full physical EOF is not that prefix. Secret
 and operator-config files also retain their separate SCHEMA.md policy and loader
 work. No public config-check/service readiness is granted by this store reader.
 
+### Loading the selected metadata
+
+`LockedRoot::load_selection` is the first recovery input step. Its caller must
+hold quiescent store access or the actual writer/selection barrier throughout
+loading; the cooperative LOCK alone does not serialize threads. Read FORMAT
+and CURRENT through the private reader, consume their entire extents and
+observe physical EOF. Validate their encodings/checksums, expected account and
+shared store epoch before deriving a manifest path. Read only the generation
+named by CURRENT, with the fixed maximum manifest size. Bind that complete
+manifest's account, epoch, generation and whole-file digest using the existing
+Selection codec. Missing or invalid selected files fail; no directory scan,
+newer-generation fallback or repair runs.
+
+The caller supplies reusable SelectionScratch (80 + 120 + 4832 bytes). Load at
+most 64 explicit extent reads per file plus its completion probe; short reads
+consume the attempt allowance, and I/O errors return immediately. Attempt
+exhaustion returns WouldBlock without a selection. This bounds explicit work,
+not the duration of a blocking std call. Only one input descriptor is live at
+a time, and loading returns a Selection borrowing the manifest scratch. Error
+values identify FORMAT, CURRENT, manifest validation or final binding and retain the
+underlying I/O/container error. Returned metadata proves only this selection's
+container/identity/digest binding and the consumed file extents; every table,
+journal, row invariant, replay boundary and read-view pin still requires its
+own validation. It grants no serving, repair or transaction authority.
+
 ### Expected CURRENT replacement
 
 `CurrentUpdate::prepare` encodes a next CURRENT and either expected absence or
