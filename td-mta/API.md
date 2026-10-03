@@ -1818,6 +1818,56 @@ Allocation intervals cover success and malformed/nesting/work failures.
 Mailbox/group assembly, display decoding/NFC, JSON output and composed
 worker resource qualification remain open.
 
+### 1.40 Resident single mailbox grammar
+
+M06ah supplies `header_mailbox::Cursor` over one complete admitted item,
+excluding its enclosing list/group separator. Complete returns one Mailbox
+with a raw address extent and optional Name::Phrase or Name::Comment extent,
+all relative to the original slice. There are no provisional public events:
+syntax, prefix, route, address and trailing CFWS must all finish first.
+Malformed permits the outer best-effort owner's raw fallback; work/nesting
+errors retain resource meaning. No result authorizes an SMTP recipient.
+
+A bounded structural scan uses shared CFWS and delimited-token cursors to
+protect punctuation inside comments, quoted words and domain literals.
+Accept bare addr-spec or one optional phrase plus angle-enclosed addr-spec;
+reject multiple/nested/unmatched angles, list/group separators and extra
+tail text. Validate a CFWS-only prefix separately from a nonempty phrase.
+The phrase extent retains all prefix CFWS, including the raw boundary at
+`<` needed by later encoded-word placement. The enclosing list/group owner
+must also preserve context before this slice.
+
+Inside angles, accept RFC 5322 obsolete routes only after validating the
+complete obs-domain-list: leading CFWS/empty comma slots, at least one
+@domain, then comma-separated optional CFWS/@domain slots, and a colon.
+A private shared domain entry stops at an unconsumed comma or the admitted
+route boundary; it does not loosen public MessageIds or addr-spec parsing.
+Only the validated route is omitted from the returned address extent.
+Domains remain lexical data without DNS/IP validation or network lookup.
+
+A phrase name takes precedence, including an empty quoted word. Otherwise,
+replay CFWS after the last actual addr-spec part and select its first
+comment, retaining surrounding parentheses and any nested comments. This
+fallback applies to a bare address or a comment before the closing angle;
+a comment after `>` is outside addr-spec and is not selected. Leading,
+interior-domain and route comments are never substituted as names. The
+address extent retains grammatical CFWS; the later projector must replay
+addr-spec parts to omit it, rather than emitting the entire raw slice.
+No unquoting, unfolding, encoded-word interpretation, NFC or JSON emission
+occurs in this grammar layer.
+
+Child state is held in one enum, with no address/name copy or arena. The
+non-Copy cursor fits 512 bytes. One poll prepays one parent record and
+performs at most one bounded child turn, for ceilings of 161 source-byte
+visits and 34 records, with no output charge. A bare a@b costs twelve
+visits and twenty-eight records including its structural scan and trailing
+comment replay. All failures latch across replacement meters; cached
+Complete is inert. Tests cover literal name/address extents, protected
+delimiters, route grammar, fallback precedence, invalid tails, long Unicode,
+exact work and sticky failures. Allocation intervals include success and
+malformed/nesting/work refusal. List/group recovery, text/NFC projection,
+response admission and complete worker qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

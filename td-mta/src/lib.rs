@@ -19,6 +19,7 @@ pub mod header_address_items;
 pub mod header_cfws;
 pub mod header_date;
 pub mod header_delimited;
+pub mod header_mailbox;
 pub mod header_message_ids;
 pub mod header_phrase;
 pub mod header_property;

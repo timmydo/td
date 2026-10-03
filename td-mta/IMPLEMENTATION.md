@@ -1430,6 +1430,14 @@ Initial independently landable increments:
   refusal. Complete mailbox/group assembly, display decoding/NFC and
   publication remain follow-on work.
 
+- **M06ah — resident single mailbox:** compose shared structural tokens,
+  phrase and addr-spec grammar with exact obsolete route validation.
+  Return only final raw name/address extents after complete-item success;
+  choose the first immediately trailing comment when no phrase exists.
+  Cover protected delimiters, route slots, name precedence, malformed tails,
+  long Unicode, precise work and allocation-free refusal. List/group
+  recovery, display/address projection, NFC and publication remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

@@ -2064,6 +2064,70 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_single_mailbox() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_mailbox::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    fn drive(cursor: &mut Cursor<'_>, work: &mut Meter) -> Result<(), Error> {
+        for _ in 0..100_000 {
+            if let Status::Complete(mailbox) = cursor.poll(Tick(1), work)? {
+                black_box(mailbox);
+                return Ok(());
+            }
+        }
+        panic!("mailbox allocation probe did not finish");
+    }
+    let source = format!(
+        "{} <(c),@route,,:{}@b(Name)>",
+        "🐈".repeat(1000),
+        "é".repeat(1000)
+    );
+    let nested = "(".repeat(33);
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, expected) in [
+        (source.as_bytes(), Ok(())),
+        (b"a@b (name)".as_slice(), Ok(())),
+        (b"\"a\r\n b\" <\"x\r\n y\"@[x,;]>", Ok(())),
+        (b"Name <@a,b:c@d>", Err(Error::Malformed)),
+        (b"Name <a@b> junk", Err(Error::Malformed)),
+        (b"a@b\r\n", Err(Error::Malformed)),
+        (nested.as_bytes(), Err(Error::NestingLimit)),
+    ] {
+        let mut cursor = Cursor::new(black_box(source));
+        assert_eq!(drive(&mut cursor, &mut work), expected);
+    }
+    let mut cursor = Cursor::new(b"Name <@route:a@b>");
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 20,
+            records: 1000,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut limited),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut work),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "mailbox parsing allocated");
+}
+
 fn header_phrase_tokens() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3499,6 +3563,7 @@ fn main() {
         header_message_id_text();
         header_url_text();
         header_address_boundaries();
+        header_single_mailbox();
         header_phrase_tokens();
         header_single_addr_spec();
         header_date_projection();
@@ -3610,6 +3675,7 @@ fn main() {
     header_message_id_text();
     header_url_text();
     header_address_boundaries();
+    header_single_mailbox();
     header_phrase_tokens();
     header_single_addr_spec();
     header_date_projection();

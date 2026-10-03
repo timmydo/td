@@ -158,8 +158,11 @@ All seven header forms are supported only in their RFC 8621 sections
 4.1.2.1-7 allowed combinations. Forbidden combinations are invalidArguments
 on reads and invalidProperties on structured creation. Addresses and
 GroupedAddresses support quoted pairs, comments, groups, UTF-8 display names
-and RFC 2047 placement; use an immediately trailing comment as a missing
-display name. Recovery splits only at commas/semicolons outside quotes,
+and RFC 2047 placement; use the first comment immediately trailing the
+addr-spec as a missing display name, including before a closing angle. A
+comment after the closing angle is outside addr-spec and is not selected.
+An explicit phrase, including an empty quoted word, takes precedence.
+Recovery splits only at commas/semicolons outside quotes,
 comments, angle brackets and domain literals; an otherwise unparseable
 nonempty item becomes {name:null,email:unfolded trimmed item}. An unmatched
 construct consumes the remaining item, not an unbounded search for a closing

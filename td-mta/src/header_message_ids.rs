@@ -71,6 +71,7 @@ enum Purpose {
     MessageIds,
     AddrSpec,
     Phrase,
+    RouteDomain,
 }
 /// Every Begin/Part/End is provisional until Complete validates the full input.
 /// Public list input ends at field value_end; private inputs are single candidates.
@@ -115,6 +116,17 @@ impl<'a> Cursor<'a> {
         let mut cursor = Self::new(source, Mode::ObsoletePhrases);
         cursor.purpose = Purpose::Phrase;
         cursor
+    }
+    // A route domain ends at its own comma or the route slice's colon boundary.
+    pub(crate) const fn route_domain(source: &'a [u8]) -> Self {
+        let mut cursor = Self::new(source, Mode::Strict);
+        cursor.purpose = Purpose::RouteDomain;
+        cursor.grammar = Grammar::RightStart;
+        cursor
+    }
+    pub(crate) fn route_domain_end(&self) -> Option<usize> {
+        (self.purpose == Purpose::RouteDomain && matches!(self.phase, Phase::Complete))
+            .then_some(self.position)
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         if let Some(error) = self.failure {
@@ -281,7 +293,13 @@ impl<'a> Cursor<'a> {
             }
             (Grammar::RightTail, Some(b'.')) => self.punctuation(Grammar::RightAtom),
             (Grammar::RightTail | Grammar::LiteralTail, None)
-                if self.purpose == Purpose::AddrSpec =>
+                if matches!(self.purpose, Purpose::AddrSpec | Purpose::RouteDomain) =>
+            {
+                self.phase = Phase::Complete;
+                Ok(Status::Complete)
+            }
+            (Grammar::RightTail | Grammar::LiteralTail, Some(b','))
+                if self.purpose == Purpose::RouteDomain =>
             {
                 self.phase = Phase::Complete;
                 Ok(Status::Complete)

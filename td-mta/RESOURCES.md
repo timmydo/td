@@ -878,6 +878,16 @@ Allocation intervals cover long Unicode atoms, quoted folds, obsolete dots,
 malformed tails and nesting/work refusal. Complete mailbox/group and
 text/NFC composition remain to be qualified.
 
+The single-mailbox cursor fits 512 bytes in the body parser reservation.
+Its enum retains only one active CFWS/delimited/phrase/domain/addr-spec
+child, with scalar scan/route state and result extents. Names, routes and
+addresses are never copied. Each poll charges one parent record plus at
+most one child turn, at most 161 byte visits/34 records and no output.
+Structural scanning and comment replay share the live meter. Allocation
+intervals cover long names/addresses, routes, quoted folds, fallback names,
+malformed tails and nesting/work refusal. List/group recovery, text/NFC
+composition and complete worker stack qualification remain open.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no
