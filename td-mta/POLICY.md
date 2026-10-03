@@ -305,8 +305,34 @@ Root Content-Type defaults to text/plain; a missing child type in
 multipart/digest defaults to message/rfc822. Use the first syntactically valid
 Content-Type/Content-Disposition/Content-Transfer-Encoding field, ignoring
 later duplicates; the full raw header list remains visible. Types, disposition
-tokens and recognized encodings compare ASCII case insensitively. Emit type
-and disposition tokens lowercase; parameter charset value retains its
+tokens and recognized encodings compare ASCII case insensitively.
+
+Metadata field syntax is strict: empty parameters and trailing semicolons are
+malformed, and each value must be a complete ASCII MIME token or admitted
+quoted string. Quoted strings and comments must contain well-formed UTF-8;
+any invalid byte makes that occurrence malformed, including legacy unlabelled
+8-bit values. Unquoted non-ASCII or embedded spaces are also malformed.
+Validate the complete field before retaining its head or any parameter. Skip
+a malformed occurrence rather than repairing its tail into a different type,
+boundary or charset. Nesting, job-work and aggregate interpretation limits
+retire the whole metadata selection; neither a later duplicate nor a default
+may turn a resource refusal into success.
+
+For example, `text/html; charset=UTF-8;` is malformed and cannot override the
+root default; a later valid occurrence may be selected. Preserve this
+first-valid rule even when another parser retains its first occurrence:
+malformed `multipart/mixed; boundary="a";` followed by valid `text/html`
+selects text/html here, while a tolerant client may see multipart. With no
+valid type, the default can likewise collapse malformed multipart into one
+text leaf. The complete raw list remains available; syntax acceptance does
+not promise that another MIME parser chooses the same structure.
+
+Quoted syntax retains the existing obsolete ASCII control and quoted-pair
+admission (API.md section 1.32). Derived metadata separately checks boundary
+characters, charset labels and display-text control filtering; lexical
+success alone does not validate any of those values.
+
+Emit type and disposition tokens lowercase; parameter charset value retains its
 spelling. Part IDs are decimal preorder ordinals starting at 1, counting
 containers even though multipart partId/blobId are null. Ordinals are Strings
 without leading zeros and stable for unchanged bytes under this parser

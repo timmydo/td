@@ -1674,6 +1674,16 @@ Initial independently landable increments:
   injection from decoded words, aggregate refusal and allocation-free output.
   Derived parameter metadata, MIME part traversal and retention remain open.
 
+- **M06bo — bounded MIME field syntax:** compose existing CFWS and
+  quoted-string validators for Content-Type, Content-Disposition and
+  Content-Transfer-Encoding. Return raw type/token/parameter extents in wire
+  order with fixed state; retain duplicate and extended spelling for later
+  metadata selection. Require complete suffix validation before accepting
+  provisional events. Carry original job/email budgets, charged source
+  revisits and sticky syntax/depth/resource failures. Cover long input,
+  escaped/folded values, every partial admission and allocation-free turns.
+  RFC 2231 assembly, derived metadata and part traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

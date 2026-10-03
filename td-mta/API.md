@@ -3241,6 +3241,65 @@ include construction and one-byte drains for each form, NFC overflow, scratch
 reuse and refusal. Structured Text grammars, MIME part traversal and the
 unpublished response-spool implementation remain follow-on work.
 
+### 1.69 Resident MIME field syntax
+
+M06bo adds `mime_fields::Cursor` for one complete authorized resident
+field value, excluding its final line ending. Kind selects ContentType,
+ContentDisposition or TransferEncoding; the caller binds that choice to
+the selected header. The cursor validates ASCII MIME tokens,
+type/subtype, semicolon-separated name=value parameters, quoted values
+and optional CFWS. It reuses the existing bounded comment and
+quoted-string validators, including their UTF-8, fold, quoted-pair and
+obsolete-control policy. CFWS is permitted before and after the head and
+between grammatical tokens. TransferEncoding admits one token with
+optional CFWS and refuses parameters. Missing tokens, trailing
+semicolons, incomplete quotes and extra unprotected text are Malformed.
+Comment depth above 32 is NestingLimit, an interpretation refusal.
+
+Head carries original first/optional second token extents. Parameter
+carries original name/value extents and a quoted flag; quoted value
+extents include the delimiters. Events preserve case, wire order,
+duplicate names and RFC 2231 suffix spelling. They neither unquote
+values nor decode percent escapes, encoded words or charsets. Unknown
+tokens and syntactically valid extended parameter spellings remain
+syntax, not a supported media-type or filename claim. Invalid RFC 2231
+candidates are a later metadata decision.
+
+Poll emits Yield, Head, Parameter or Complete. Every event is
+provisional until whole-field Complete: a malformed suffix or resource
+refusal retires all earlier extents. This helper does not discover field
+boundaries or choose among duplicate fields. The enclosing selector must
+validate the complete candidate before applying POLICY.md's
+first-valid-field rule. No field list, parameter list, source copy,
+recursion or allocation is retained.
+
+Each active poll charges before inspection and calls at most one lexical
+child, or scans up to 32 token octets. The plain cursor charges at most
+160 source visits and 32 records per turn. Cached Complete is inert;
+failure latches even with a replacement meter. Callers supply current
+Tick and cancellation checks around active turns.
+
+Budgeted borrows the original job Meter and email HeaderBudget
+throughout validation, using the existing private parsing seam. Source
+revisits charge both budgets; EOF attempts and transitions charge
+aggregate steps. One job record prepays at most sixteen steps with
+private per-field credit. Bounds are 160 visits, 193 aggregate steps and
+thirteen job records per turn; no output capacity is charged. First
+Complete remains an active charged turn, including a live deadline check
+after the final extent event. Thereafter, check_deadline provides live
+final admission without new byte or step cost and can retire cached
+completion. Its failure also latches. The owner and plain cursor each
+fit 512 bytes in the existing 16 KiB parser reservation and own no
+scratch arena.
+
+Tests pin raw extents, ordering, quote/fold/UTF-8 validation,
+complete-suffix failure, nesting, long inputs, original-budget
+accounting, every partial aggregate admission and final deadline
+retirement. Allocation intervals cover construction, long
+comments/tokens/quotes and late refusal. Derived metadata selection, RFC
+2231 assembly, part traversal, response retention and combined
+worker/native memory qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -867,6 +867,82 @@ fn store_read_pool() {
     }
 }
 
+fn mime_fields() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_fields::{Budgeted, Error, Kind, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        "({0})text/plain; name=\"{0}\"; x={1}",
+        "🐈".repeat(8192),
+        "a".repeat(65_536)
+    );
+    let nested = format!("text/plain {}x{}", "(".repeat(33), ")".repeat(33));
+    let before = COUNTERS.snapshot();
+    for (source, kind, parameters, error) in [
+        (long.as_bytes(), Kind::ContentType, 2, None),
+        (
+            b"attachment; filename*1*=b; filename*0*=utf-8''a",
+            Kind::ContentDisposition,
+            2,
+            None,
+        ),
+        (b"(note) BASE64", Kind::TransferEncoding, 0, None),
+        (
+            b"text/plain; ok=y; bad=",
+            Kind::ContentType,
+            1,
+            Some(Error::Malformed),
+        ),
+        (
+            nested.as_bytes(),
+            Kind::ContentType,
+            0,
+            Some(Error::NestingLimit),
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 16 * 1024 * 1024,
+                records: 2_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Budgeted::new(black_box(source), kind, &mut work, &mut budget);
+        let mut count = 0;
+        let result = loop {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield | Status::Head(_)) => {}
+                Ok(Status::Parameter(value)) => {
+                    black_box(value);
+                    count += 1;
+                }
+                Ok(Status::Complete) => break None,
+                Err(error) => break Some(error),
+            }
+        };
+        assert_eq!(result, error);
+        assert_eq!(count, parameters);
+        if let Some(error) = result {
+            assert_eq!(cursor.poll(Tick(1)), Err(error));
+        } else {
+            cursor.check_deadline(Tick(1)).unwrap();
+            assert_eq!(
+                cursor.check_deadline(Tick(100)),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME field syntax allocated");
+}
+
 fn header_raw() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -5869,6 +5945,7 @@ fn main() {
         header_text();
         mime_input();
         mime_headers();
+        mime_fields();
         body_value();
         mime_text();
         body_charset();
@@ -6008,6 +6085,7 @@ fn main() {
     header_text();
     mime_input();
     mime_headers();
+    mime_fields();
     body_value();
     mime_text();
     body_charset();

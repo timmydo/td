@@ -1010,6 +1010,17 @@ and three records before any JSON. Existing source/turn bounds hold, and
 allocation intervals include all admitted grammars. Combined worker
 qualification remains open.
 
+The resident MIME field syntax owner (M06bo) fits 512 bytes in the existing
+16 KiB parser reservation, including optional inline CFWS/quoted-string
+children and original-budget borrows. It retains no parameter vector, source
+copy or output arena. A turn invokes at most one bounded child or scans at
+most 32 token octets: 160 visits, 193 aggregate steps and thirteen job records
+are the budgeted ceilings. Plain parsing uses at most 32 records per turn.
+No output bytes are charged. Allocation intervals cover long comments,
+quotes/tokens, construction, malformed suffixes, nesting and final deadline
+refusal. Metadata assembly, part traversal and combined worker/native/RSS
+qualification remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

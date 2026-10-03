@@ -298,7 +298,10 @@ and bounded charged replay. Keywords and List-Id Text now retain source
 punctuation while decoding original phrase/comment words with fixed lexical
 placement state and shared normalization. POLICY.md owns malformed display
 recovery. Content-Type and Content-Disposition Text decode original comment
-words while retaining parameter spelling. Derived parameter metadata, MIME
+words while retaining parameter spelling. A bounded resident MIME syntax
+cursor now reuses the CFWS and quoted-string validators, returning raw token
+and parameter extents under original job/email admission. Events remain
+provisional until whole-field validation. Derived parameter metadata, MIME
 part traversal and protocol integration remain open.
 
 The core also contains 27 positive leap insertion dates generated from the
