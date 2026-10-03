@@ -3328,6 +3328,66 @@ fn phrase_nfc() {
     assert_eq!(before, after, "phrase NFC allocated");
 }
 
+fn comment_nfc() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_comment,
+        nfc::{Cursor, HeaderBudget, Scratch, Status},
+        ports::{Deadline, Tick},
+    };
+    let long = format!("(=?utf-8?q?a?={})", " =?utf-8?q?=CC=95=CC=80?=".repeat(150));
+    let mut scratch = Scratch::new();
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 16 * 1024 * 1024,
+            records: 2_000_000,
+            output_bytes: 1024 * 1024,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for (input, count) in [
+        (b"( e\xcc\x81 )".as_slice(), 1),
+        (b"(=?utf-8?q?e?= =?utf-8?q?=CC=81?=)", 1),
+        (b"(=?utf-8?q?e=00=CC=81?=)", 1),
+        (b"(=?utf-8?q?x?=(y))", 4),
+        (b"(\\ =?utf-8?q?x?=)", 2),
+        (long.as_bytes(), 300),
+    ] {
+        let mut parser = header_comment::Cursor::new(black_box(input));
+        while !matches!(
+            parser.poll(Tick(1), &mut work).unwrap(),
+            header_comment::Status::Complete
+        ) {}
+        let proof = parser.into_validated().unwrap();
+        let mut cursor = Cursor::from_comment(proof, &mut scratch, &mut work, &mut budget);
+        let mut scalars = 0;
+        loop {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Yield => {}
+                Status::Scalar(value) => {
+                    cursor
+                        .charge_output(Tick(1), value.len_utf8() as u64)
+                        .unwrap();
+                    black_box(value);
+                    scalars += 1;
+                }
+                Status::Complete => break,
+            }
+        }
+        assert_eq!(scalars, count);
+        let mut limited = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+        let mut refused = Cursor::from_comment(proof, &mut scratch, &mut limited, &mut budget);
+        assert!(refused.poll(Tick(100)).is_err());
+        assert!(refused.poll(Tick(1)).is_err());
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "comment NFC allocated");
+}
+
 fn header_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -3928,6 +3988,7 @@ fn main() {
         header_properties();
         header_nfc();
         phrase_nfc();
+        comment_nfc();
         encoded_word_candidates();
         encoded_word_decoding();
         header_text();
@@ -4045,6 +4106,7 @@ fn main() {
     header_properties();
     header_nfc();
     phrase_nfc();
+    comment_nfc();
     encoded_word_candidates();
     encoded_word_decoding();
     header_text();

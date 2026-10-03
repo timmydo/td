@@ -931,6 +931,18 @@ finished prefix. Allocation intervals cover full decoding/normalization fast
 and overflow paths. Caller-owned grammar/whole-field aggregate admission,
 response storage and complete worker stack/RSS remain unqualified.
 
+M06an's exact comment validator fits 96 bytes and its proof 16 bytes. It
+retains one CFWS child and charges at most 160 visits/33 records per poll.
+The Copy comment scalar decoder fits 192 bytes; its enum retains only one
+encoded-word decoder, with fixed UTF-8 scratch and one held scalar. Each poll
+fits 225 visits/227 records, with owner output charging. No name length or
+nesting count grows memory. NFC retains its 256-byte Source, 3072-byte Scratch
+and 1024-byte cursor-plus-budget ceilings, within 231 aggregate steps/15 job
+records per poll. Copies contain no live meter or credit. Allocation intervals
+compose validation, scalar conversion, normalization fast/replay paths and
+refusal. Whole-worker memory, native allocations and service RSS remain
+unqualified.
+
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
 including the fixed one-byte handoff; public MessageIds state remains

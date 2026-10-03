@@ -1479,6 +1479,14 @@ Initial independently landable increments:
   composition. Comment fallback, whole-field publication and worker resource
   qualification remain open.
 
+- **M06an — normalized fallback comment names:** validate the separately
+  selected exact comment into an opaque proof; decode original placement,
+  nested/escaped text and explicit whitespace/filtering policy. Compose its
+  Copy scalar source with NFC under the existing live budgets and fixed
+  source/cursor/scratch ceilings. Cover copied suffixes, hostile normalization
+  replay, terminal refusal and allocation-free composition. Whole-field
+  admission/publication and worker resource qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

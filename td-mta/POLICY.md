@@ -209,6 +209,20 @@ noncharacters. The word decoder drops encoded controls and repairs encoding
 faults; spaces produced by encoded words are preserved. Apply NFC only
 after this name projection, with JSON control escaping at serialization.
 
+Fallback comment names remove only the selected comment's outer parentheses;
+nested parentheses remain display data. Unquote and unfold literal content. As
+an explicit best-effort display policy, trim outer grammatical LWS and
+collapse interior grammatical LWS to one SP; preserve escaped and decoded
+spaces. Delay a collapsed separator until another scalar survives filtering.
+Decode only original contiguous unescaped RFC 2047 Comment words, separated
+from adjacent ctext/encoded words by actual LWS. Nested comments and whole
+quoted-pair tokens may directly bound a word on either side (RFC 2047 section
+5(2)); their original grammar establishes placement. An escaped byte itself
+cannot start a word, and unquoting/decoding cannot manufacture syntax.
+Suppress pure LWS only between recognized words. Use the same literal/encoded
+scalar filtering as phrase names, followed by NFC. This projection neither
+chooses a fallback comment nor overrides an explicit phrase.
+
 MessageIds parses complete RFC 5322 msg-id lists, removes grammatical CFWS
 and outer angle brackets, and returns null for an invalid list. For
 References and In-Reply-To also accept their RFC 5322 section 4 obsolete

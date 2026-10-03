@@ -154,6 +154,7 @@ enum Input<'a> {
     Utf8 { text: &'a str, position: usize },
     Header(crate::header_text::Cursor<'a>),
     Phrase(crate::header_phrase::decode::Cursor<'a>),
+    Comment(crate::header_comment::decode::Cursor<'a>),
 }
 #[derive(Clone, Copy)]
 struct Source<'a> {
@@ -188,6 +189,13 @@ impl<'a> Source<'a> {
             next: 0,
         }
     }
+    fn comment(proof: crate::header_comment::Validated<'a>) -> Self {
+        Self {
+            input: Input::Comment(proof.decode()),
+            pending: None,
+            next: 0,
+        }
+    }
     fn at(&self, other: &Self) -> bool {
         let same = match (self.input, other.input) {
             (
@@ -199,17 +207,22 @@ impl<'a> Source<'a> {
             ) => std::ptr::eq(text, right) && position == at,
             (Input::Header(left), Input::Header(right)) => left.at(&right),
             (Input::Phrase(left), Input::Phrase(right)) => left.at(&right),
+            (Input::Comment(left), Input::Comment(right)) => left.at(&right),
             _ => false,
         };
         same && self.pending == other.pending && self.next == other.next
     }
     fn is_header(&self) -> bool {
-        matches!(self.input, Input::Header(_) | Input::Phrase(_))
+        matches!(
+            self.input,
+            Input::Header(_) | Input::Phrase(_) | Input::Comment(_)
+        )
     }
     fn is_encoding_problem(&self) -> bool {
         match self.input {
             Input::Header(cursor) => cursor.is_encoding_problem(),
             Input::Phrase(cursor) => cursor.is_encoding_problem(),
+            Input::Comment(cursor) => cursor.is_encoding_problem(),
             Input::Utf8 { .. } => false,
         }
     }
@@ -270,6 +283,22 @@ impl<'a> Source<'a> {
                         }
                         crate::header_phrase::decode::Status::Yield => return Ok(Read::Yield),
                         crate::header_phrase::decode::Status::Complete => return Ok(Read::End),
+                    }
+                }
+                Input::Comment(cursor) => {
+                    budget.charge(work, now, 0, 1, credit)?;
+                    let mut charged = DecodeWork {
+                        work,
+                        budget,
+                        credit,
+                    };
+                    match cursor.poll_with_work(now, &mut charged)? {
+                        crate::header_comment::decode::Status::Scalar(value) => {
+                            budget.charge(work, now, 0, 1, credit)?;
+                            value
+                        }
+                        crate::header_comment::decode::Status::Yield => return Ok(Read::Yield),
+                        crate::header_comment::decode::Status::Complete => return Ok(Read::End),
                     }
                 }
             };
@@ -375,6 +404,16 @@ impl<'a, 'w> Cursor<'a, 'w> {
             work,
             budget,
         ))
+    }
+    /// Supply the separately selected, complete fallback comment proof.
+    /// The caller authorizes field/form selection before this call.
+    pub fn from_comment(
+        proof: crate::header_comment::Validated<'a>,
+        scratch: &'w mut Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Self {
+        Self::from_source(Source::comment(proof), scratch, work, budget)
     }
     fn from_source(
         source: Source<'a>,
@@ -997,6 +1036,130 @@ mod tests {
         let mut cursor = Cursor::new("e\u{301}", &mut scratch, &mut work, &mut budget);
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Scalar('é')));
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Complete));
+    }
+    fn comment_proof(input: &[u8]) -> crate::header_comment::Validated<'_> {
+        let mut parser = crate::header_comment::Cursor::new(input);
+        let mut meter = work();
+        while parser.poll(Tick(1), &mut meter).unwrap() != crate::header_comment::Status::Complete {
+        }
+        parser.into_validated().unwrap()
+    }
+    fn comment(input: &[u8]) -> (String, bool, u64) {
+        let proof = comment_proof(input);
+        let mut scratch = Scratch::new();
+        let mut meter = work();
+        let before = meter.remaining();
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::from_comment(proof, &mut scratch, &mut meter, &mut budget);
+        assert!(std::mem::size_of::<Source<'_>>() <= 256);
+        assert!(std::mem::size_of_val(&cursor) + std::mem::size_of::<HeaderBudget>() <= 1024);
+        let mut text = String::new();
+        for _ in 0..20_000_000 {
+            let steps = cursor.budget.steps_remaining();
+            let records = cursor.work.remaining().records;
+            let status = cursor.poll(Tick(1)).unwrap();
+            assert!(steps - cursor.budget.steps_remaining() <= 231);
+            assert!(records - cursor.work.remaining().records <= 15);
+            match status {
+                Status::Yield => {}
+                Status::Scalar(value) => text.push(value),
+                Status::Complete => {
+                    let problem = cursor.is_encoding_problem();
+                    let visits = before.io_bytes - meter.remaining().io_bytes;
+                    assert_eq!(visits, 16 * 1024 * 1024 - budget.source_bytes_remaining());
+                    return (text, problem, visits);
+                }
+            }
+        }
+        panic!("comment NFC did not finish");
+    }
+    #[test]
+    fn comment_names_normalize_after_unquoting_placement_and_filtering() {
+        for (source, expected, problem) in [
+            ("()", "", false),
+            ("( e\u{301} )", "é", false),
+            ("(=?utf-8?q?e?= =?utf-8?q?=CC=81?=)", "é", false),
+            ("(=?utf-8?q?e=00=CC=81?=)", "é", false),
+            ("(e\\\0\u{301})", "é", false),
+            ("((=?utf-8?q?e=CC=81?=))", "(é)", false),
+            ("(=?utf-8?q?=E1=84=80?= =?utf-8?q?=E1=85=A1?=)", "가", false),
+            ("(e\u{301}\u{fdd0})", "é�", true),
+            ("(=?utf-8?q?=FF?=)", "�", true),
+        ] {
+            let (text, diagnostic, _) = comment(source.as_bytes());
+            assert_eq!(
+                (text.as_str(), diagnostic),
+                (expected, problem),
+                "{source:?}"
+            );
+        }
+        // A maximum-width original token stresses the recognition quantum.
+        let token = format!("=?utf-8?q?{}?=", "a".repeat(63));
+        assert_eq!(token.len(), 75);
+        let source = format!("(x {token} e\u{301})");
+        assert_eq!(
+            comment(source.as_bytes()).0,
+            format!("x {} é", "a".repeat(63))
+        );
+    }
+    #[test]
+    fn comment_overflow_replays_checkpoints_without_rescanning_prefix() {
+        let tail = format!(
+            "=?utf-8?q?=C3=A9?={} =?utf-8?q?z?=",
+            " =?utf-8?q?=CC=95=CD=84?=".repeat(257)
+        );
+        let source = format!("({tail})");
+        let (text, problem, visits) = comment(source.as_bytes());
+        assert!(!problem);
+        assert_eq!(
+            text,
+            format!(
+                "é{}{}z",
+                "\u{308}\u{301}".repeat(257),
+                "\u{315}".repeat(257)
+            )
+        );
+        let prefixed = format!("({} {tail})", "x".repeat(10_000));
+        let (long, _, long_visits) = comment(prefixed.as_bytes());
+        assert_eq!(long, format!("{} {text}", "x".repeat(10_000)));
+        assert!(long_visits - visits < 50_100);
+    }
+    #[test]
+    fn comment_aggregate_and_progressed_refusals_latch() {
+        let proof = comment_proof(b"(a =?utf-8?q?b?=)");
+        for (bytes, steps) in [(0, 16_000_000), (16 * 1024 * 1024, 0)] {
+            let mut scratch = Scratch::new();
+            let mut meter = work();
+            let mut budget = HeaderBudget {
+                bytes,
+                steps,
+                exhausted: false,
+            };
+            let mut cursor = Cursor::from_comment(proof, &mut scratch, &mut meter, &mut budget);
+            for _ in 0..100 {
+                if cursor.poll(Tick(1)) == Err(Error::InterpretationLimit) {
+                    break;
+                }
+            }
+            assert_eq!(cursor.poll(Tick(1)), Err(Error::InterpretationLimit));
+        }
+        let mut scratch = Scratch::new();
+        let mut meter = work();
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::from_comment(proof, &mut scratch, &mut meter, &mut budget);
+        for _ in 0..10 {
+            cursor.poll(Tick(1)).unwrap();
+        }
+        assert_eq!(cursor.poll(Tick(1000)), Err(Error::Work(Stop::Deadline)));
+        assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+        let mut meter = work();
+        let mut cursor = Cursor::from_comment(proof, &mut scratch, &mut meter, &mut budget);
+        while cursor.poll(Tick(1)).unwrap() != Status::Complete {}
+        assert_eq!(
+            cursor.charge_output(Tick(1), 1),
+            Err(Error::Work(Stop::OutputBytes))
+        );
+        assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::OutputBytes)));
     }
     fn phrase_proof(input: &[u8]) -> crate::header_phrase::Validated<'_> {
         let mut parser = crate::header_phrase::Cursor::new(input);

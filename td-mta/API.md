@@ -2085,6 +2085,59 @@ remain terminal. Allocation intervals cover the complete phrase/NFC fast and
 replay paths. Comment fallback names, field assembly, JSON serialization and
 complete worker memory/RSS qualification remain open.
 
+### 1.46 Fallback comment display names
+
+M06an adds `header_comment::Cursor`, an exact one-comment grammar validator.
+The selected range includes its outer parentheses and no outer CFWS. It reuses
+the bounded CFWS parser, requires a single comment spanning the entire slice
+followed by successful completion, and consumes that success into a
+private-field Copy `Validated` proof. A malformed or unfinished cursor cannot
+produce a proof. Nesting/work refusals stay terminal. Mailbox selection and
+field/form authorization remain the caller's responsibility; a raw
+`header_mailbox::Name::Comment` range alone is not proof.
+
+`Validated::decode()` produces a Copy scalar cursor. It drops the outer
+parentheses, retains nested parentheses as display text, removes quoted-pair
+backslashes, and unfolds after unquoting. POLICY.md specifies grammatical
+whitespace trimming/collapse and RFC 2047 Comment placement. Recognition
+examines original unescaped bytes only. Both edges of nested comments and
+whole quoted-pair tokens are grammatical boundaries; a word may directly
+precede or follow them. A quoted pair's escaped byte cannot start a word.
+Unquoting or decoding never manufactures syntax. Adjacent plain ctext or
+another encoded word requires LWS. Only a pure LWS gap between recognized
+words is suppressed. A pending separator emits only when another scalar
+survives filtering, so dropped NUL/encoded controls cannot leave a trailing
+separator. Escaped or encoded spaces remain data.
+
+Literal NUL is removed, other literal controls are retained, noncharacters
+become U+FFFD and set the encoding diagnostic. The shared word decoder removes
+encoded controls, repairs encoding faults and preserves decoded spaces. Owner
+serialization charges output and escapes JSON controls.
+
+`nfc::Cursor::from_comment(proof, scratch, meter, header_budget)` composes
+this source with the existing resident normalizer. Each Copy checkpoint
+compares immutable source pointer/length and a checked successful-turn
+ordinal, plus pending canonical decomposition. Copies contain no meter or
+scratch credit; all validation is caller-charged and subsequent
+lookahead/conversion/replay spends the live aggregate budget. Diagnostics
+accumulate through replay.
+
+The validator fits 96 bytes, the proof 16 and the scalar cursor 192. Validator
+polls use at most 160 visits/33 records; scalar polls at most 225 visits/227
+records, without output charges. Empty `()` decoding costs zero visits/two
+records; `(a)` costs four/three, excluding validation. Errors latch across
+copies/fresh meters and cached completion is inert. NFC retains the 256-byte
+Source, 3072-byte Scratch and 1024-byte cursor-plus-budget ceilings. Its
+comment polls fit 231 aggregate steps and 15 job records. These are upper
+bounds, not a claim that every poll attains them.
+
+Tests cover exact proof rejection, nested/escaped text, actual encoded-word
+placement, whitespace/filtering order, every copied suffix, terminal refusal,
+canonical/Hangul NFC, hostile multi-class replay and prefix accounting.
+Allocation intervals cover validation plus decoding/NFC and refusal. Complete
+header-form aggregate admission, field assembly, JMAP publication and worker
+stack/RSS qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

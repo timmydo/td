@@ -260,6 +260,23 @@ remain terminal. The allocation probe composes validation, decoding and NFC
 without allocating after admission. Comment fallback and whole-field/JMAP
 publication remain open, as do worker-stack and service RSS qualification.
 
+M06an adds selected fallback comments through an exact whole-comment proof.
+Quoted-pair decoding, unfolding, explicit grammatical whitespace policy and
+scalar filtering precede NFC. Original comment, quoted-pair and LWS boundaries
+govern encoded-word placement; decoded characters never become new syntax.
+Source pointer/length plus checked turn identity and pending decomposition
+make Copy checkpoints exact without scanning prefixes. Nested comment
+parentheses are ordinary normalized display text after outer-parenthesis
+removal.
+
+The existing source/cursor/scratch ceilings hold. Comment polls fit 231
+aggregate steps and 15 job records, with all conversion and replay charged.
+Tests cover canonical/Hangul composition, NUL removal between base and accent,
+encoding diagnostics, multi-class overflow and bounded prefix cost. Allocation
+intervals compose proof validation and normalization, including refusal.
+Initial grammar and complete field admission remain caller-owned; whole-field
+response publication and worker/RSS qualification remain open.
+
 ## Acceptance evidence owned by M06
 
 Run the complete pinned NormalizationTest file's NFC equations, normalization
