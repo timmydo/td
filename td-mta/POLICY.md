@@ -194,6 +194,27 @@ literal controls and encoded-word-looking text without NFC or RFC 2047
 interpretation. Later JSON escapes controls; SMTP validation remains the
 separate authority boundary. Display-name decoding and NFC are distinct.
 
+Keywords and List-Id Text retain the unfolded source spelling, including
+quotes, quoted pairs, comments, separators and angle brackets. Only
+initial SPs are trimmed. Decode whole phrase atom words with the
+stricter RFC 2047 Phrase alphabet and actual LWS/field boundaries on
+both sides. Comment words use Comment syntax; nested parentheses and
+whole quoted pairs may bound them. Finish the entire escaped UTF-8
+character, or its maximal-subpart replacement, before admitting a
+following word. Quoted strings and escaped bytes cannot begin encoded
+words. Decode from the original octets before NFC; decoded punctuation
+never changes placement. Suppress pure LWS only between recognized
+adjacent words in the same source context. Unknown encodings and
+malformed/incorrectly placed candidates remain literal. Unclosed
+quotes/comments retain their lexical context to EOF rather than
+inventing a close; nesting above 32 refuses the field with an
+interpretation-limit error. This is a display recovery policy, not
+structured creation validation. List-Id stops admitting words at the
+first unquoted, uncommented opening angle bracket, including all
+identifier bytes and any malformed suffix. It does not validate,
+canonicalize or authorize a list ID. Both grammars use the existing
+literal/encoded scalar filtering and NFC.
+
 Phrase display names omit comments and leading/trailing grammatical CFWS;
 nonempty CFWS between words becomes one SP. Adjacent raw tokens with no
 CFWS concatenate. Decode only whole atom words with RFC 2047 Phrase syntax

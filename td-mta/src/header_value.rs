@@ -159,7 +159,13 @@ impl<'a, 'w> Text<'a, 'w> {
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
     ) -> Result<Self, Error> {
-        Core::new(input, work, budget, scratch).map(Self)
+        Core::new(
+            input,
+            work,
+            budget,
+            (scratch, crate::header_text::Grammar::Text),
+        )
+        .map(Self)
     }
     pub const fn is_encoding_problem(&self) -> bool {
         self.0.is_encoding_problem()

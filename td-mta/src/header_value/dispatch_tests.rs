@@ -138,6 +138,20 @@ fn selected_forms_share_scratch_and_preserve_values_occurrences_and_absence() {
 fn diagnostics_and_unsupported_grammar_remain_selected_value_policy() {
     for (key, source, expected, encoding, leap) in [
         (
+            "header:Keywords:asText",
+            b"Keywords:(=?utf-8?Q?=FF?=)\n\n".as_slice(),
+            "\"(�)\"",
+            true,
+            false,
+        ),
+        (
+            "header:List-Id:asText",
+            b"List-Id:=?utf-8?Q?=FF?= <list.example>\n\n".as_slice(),
+            "\"� <list.example>\"",
+            true,
+            false,
+        ),
+        (
             "header:X-Custom:asText",
             b"X-Custom:\xff\n\n".as_slice(),
             "\"�\"",
@@ -186,7 +200,7 @@ fn diagnostics_and_unsupported_grammar_remain_selected_value_policy() {
     let mut budget = HeaderBudget::new();
     let mut scratch = nfc::Scratch::new();
     let mut cursor = Cursor::new(
-        input(b"Keywords:secret\n\n", "header:Keywords:asText"),
+        input(b"Content-Type:secret\n\n", "header:Content-Type:asText"),
         &mut scratch,
         &mut work,
         &mut budget,

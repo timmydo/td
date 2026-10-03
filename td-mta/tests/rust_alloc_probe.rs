@@ -4796,6 +4796,8 @@ fn text_header_values() {
     };
     for field in [
         "Subject",
+        "Keywords",
+        "List-Id",
         "Content-Description",
         "X-Long-Header",
         "X-Custom",
@@ -4803,8 +4805,24 @@ fn text_header_values() {
         let refused_source = format!("{field}: a\nOther: long\n\n");
         let refused_limit = field.len() as u64 + 5;
         let property_name = format!("header:{field}:asText:all");
+        let structured = matches!(field, "Keywords" | "List-Id");
+        let extra = if structured {
+            format!("{field}: \" =?utf-8?Q?literal?= \" (=?utf-8?Q?cafe=CC=81?=) < =?utf-8?Q?literal?= >\r\n")
+        } else {
+            String::new()
+        };
+        let extra_size = if structured {
+            let expected = if field == "List-Id" {
+                "\" =?utf-8?Q?literal?= \" (café) < =?utf-8?Q?literal?= >"
+            } else {
+                "\" =?utf-8?Q?literal?= \" (café) < literal >"
+            };
+            td_json::Json::from(expected).to_string().len() + 1
+        } else {
+            0
+        };
         let source = format!(
-            "{field}: a{}\u{323}\r\n{field}: =?utf-8?Q?cafe=CC=81?=\r\n\r\n",
+            "{field}: a{}\u{323}\r\n{field}: =?utf-8?Q?cafe=CC=81?=\r\n{extra}\r\n",
             "\u{301}".repeat(300)
         );
         let mut work = Meter::new(
@@ -4855,7 +4873,7 @@ fn text_header_values() {
         }
         assert!(complete);
         // U+1EA1 plus 300 acute marks, café, quotes and array punctuation.
-        assert_eq!(written, 3 + 600 + 5 + 7);
+        assert_eq!(written, 3 + 600 + 5 + 7 + extra_size);
         cursor.check_deadline(Tick(1)).unwrap();
         let mut cursor = Text::new(
             Input {

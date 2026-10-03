@@ -1,4 +1,4 @@
-//! Unstructured header Text scalars before NFC; field/form authorization is external.
+//! Header Text scalars before NFC; field/form authorization is external.
 pub use crate::encoded_word::decode::Status;
 use crate::{
     admission::work::{Charge, Meter, Stop},
@@ -50,6 +50,90 @@ impl From<crate::encoded_word::decode::Error> for Error {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Grammar {
+    Text,
+    Keywords,
+    ListId,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Placement {
+    grammar: Grammar,
+    depth: u8,
+    quoted: bool,
+    escaped: bool,
+    identifier: bool,
+}
+impl Placement {
+    const fn new(grammar: Grammar) -> Self {
+        Self {
+            grammar,
+            depth: 0,
+            quoted: false,
+            escaped: false,
+            identifier: false,
+        }
+    }
+    fn context(self) -> Option<Context> {
+        if self.grammar == Grammar::Text {
+            Some(Context::Text)
+        } else if self.quoted || self.escaped || self.identifier {
+            None
+        } else if self.depth != 0 {
+            Some(Context::Comment)
+        } else {
+            Some(Context::Phrase)
+        }
+    }
+    fn delimiter(self, byte: u8) -> bool {
+        match self.context() {
+            Some(Context::Comment) => matches!(byte, b'(' | b')' | b'\\'),
+            Some(Context::Phrase) => b"()<>[]:;@\\,\".".contains(&byte),
+            _ => false,
+        }
+    }
+    fn consume(&mut self, byte: u8, scalar_complete: bool) -> Result<bool, Error> {
+        if self.grammar == Grammar::Text || self.identifier {
+            return Ok(false);
+        }
+        if self.escaped {
+            if scalar_complete {
+                self.escaped = false;
+                return Ok(self.depth != 0);
+            }
+            return Ok(false);
+        }
+        if byte == b'\\' && (self.quoted || self.depth != 0) {
+            self.escaped = true;
+            return Ok(false);
+        }
+        if self.depth != 0 {
+            match byte {
+                b'(' => {
+                    if self.depth == 32 {
+                        return Err(Error::InterpretationLimit);
+                    }
+                    self.depth += 1;
+                }
+                b')' => self.depth -= 1,
+                _ => {}
+            }
+            // Leaving a comment still requires actual LWS for phrase words.
+            return Ok(matches!(byte, b'(' | b')'));
+        }
+        if byte == b'"' {
+            self.quoted = !self.quoted;
+        } else if !self.quoted && byte == b'(' {
+            self.depth = 1;
+            return Ok(true);
+        } else if !self.quoted && byte == b'<' && self.grammar == Grammar::ListId {
+            // No phrase follows the list identifier, including malformed tails.
+            self.identifier = true;
+        }
+        Ok(false)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Phase {
     Leading,
@@ -67,6 +151,7 @@ enum Phase {
 #[derive(Clone, Copy)]
 pub struct Cursor<'a> {
     source: &'a [u8],
+    placement: Placement,
     turn: u64,
     position: usize,
     scan: usize,
@@ -81,8 +166,12 @@ pub struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     /// Supply one authorized unstructured field value, without its final ending.
     pub const fn new(source: &'a [u8]) -> Self {
+        Self::with_grammar(source, Grammar::Text)
+    }
+    pub(crate) const fn with_grammar(source: &'a [u8], grammar: Grammar) -> Self {
         Self {
             source,
+            placement: Placement::new(grammar),
             turn: 0,
             position: 0,
             scan: 0,
@@ -106,7 +195,9 @@ impl<'a> Cursor<'a> {
     // Immutable deterministic input makes the turn ordinal an O(1) exact
     // checkpoint identity. Failed cursors are retired before comparison.
     pub(crate) fn at(&self, other: &Self) -> bool {
-        std::ptr::eq(self.source, other.source) && self.turn == other.turn
+        std::ptr::eq(self.source, other.source)
+            && self.turn == other.turn
+            && self.placement.grammar == other.placement.grammar
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         self.poll_with_work(now, work)
@@ -196,9 +287,21 @@ impl<'a> Cursor<'a> {
     ) -> Result<Status, Error> {
         let decoded = self.literal.poll_with_work(&[byte], false, now, work)?;
         if decoded.consumed == 1 {
+            if self.placement.grammar != Grammar::Text {
+                work.charge(
+                    now,
+                    Charge {
+                        records: 1,
+                        ..Charge::default()
+                    },
+                )?;
+            }
+            let boundary = self
+                .placement
+                .consume(byte, matches!(decoded.status, Decoded::Scalar(_)))?;
             self.position = next;
             if !matches!(self.phase, Phase::EmitGap) {
-                self.phase = if matches!(byte, b' ' | b'\t') {
+                self.phase = if boundary || matches!(byte, b' ' | b'\t') {
                     Phase::Boundary
                 } else {
                     Phase::Literal
@@ -206,6 +309,20 @@ impl<'a> Cursor<'a> {
             }
         } else if decoded.consumed != 0 {
             return Err(Error::InvalidState);
+        } else if self.placement.escaped && matches!(decoded.status, Decoded::Scalar(_)) {
+            // A malformed escaped prefix emits replacement before revisiting
+            // its unconsumed lookahead, which may begin an encoded word.
+            work.charge(
+                now,
+                Charge {
+                    records: 1,
+                    ..Charge::default()
+                },
+            )?;
+            self.placement.escaped = false;
+            if self.placement.depth != 0 {
+                self.phase = Phase::Boundary;
+            }
         }
         self.literal_status(decoded.status)
     }
@@ -242,7 +359,9 @@ impl<'a> Cursor<'a> {
             }
             Phase::Boundary => {
                 match self.atom(self.position, now, work)? {
-                    Some((b'=', _)) => self.begin_candidate(self.position),
+                    Some((b'=', _)) if self.placement.context().is_some() => {
+                        self.begin_candidate(self.position)
+                    }
                     Some((byte, next)) => return self.literal_byte(byte, next, now, work),
                     None => self.phase = Phase::Finish,
                 }
@@ -264,7 +383,9 @@ impl<'a> Cursor<'a> {
             Phase::Gap => {
                 match self.atom(self.scan, now, work)? {
                     Some((b' ' | b'\t', next)) => self.scan = next,
-                    Some((b'=', _)) => self.begin_candidate(self.scan),
+                    Some((b'=', _)) if self.placement.context().is_some() => {
+                        self.begin_candidate(self.scan)
+                    }
                     _ => {
                         self.token_start = self.scan;
                         self.reject_candidate();
@@ -275,6 +396,9 @@ impl<'a> Cursor<'a> {
             Phase::Candidate => {
                 match self.atom(self.scan, now, work)? {
                     Some((b' ' | b'\t', _)) | None => self.phase = Phase::Recognize,
+                    Some((byte, _)) if self.placement.delimiter(byte) => {
+                        self.phase = Phase::Recognize
+                    }
                     Some((_, next)) => {
                         self.scan = next;
                         if self
@@ -294,9 +418,29 @@ impl<'a> Cursor<'a> {
                     .source
                     .get(self.token_start..self.scan)
                     .ok_or(Error::InvalidState)?;
-                match Word::recognize_with_work(token, Context::Text, now, work)
-                    .map_err(Error::from)?
+                let context = self.placement.context().ok_or(Error::InvalidState)?;
+                if context == Context::Phrase {
+                    if let Some(previous) = self.token_start.checked_sub(1) {
+                        if !matches!(self.byte(previous, now, work)?, Some(b' ' | b'\t')) {
+                            self.reject_candidate();
+                            return Ok(Status::Yield);
+                        }
+                    }
+                }
+                // Phrase encoded words need actual LWS on their right; a comma
+                // or quote is a token boundary but cannot supply that spacing.
+                let right = if context == Context::Phrase {
+                    self.atom(self.scan, now, work)?
+                } else {
+                    None
+                };
+                if context == Context::Phrase
+                    && right.is_some_and(|(byte, _)| !matches!(byte, b' ' | b'\t'))
                 {
+                    self.reject_candidate();
+                    return Ok(Status::Yield);
+                }
+                match Word::recognize_with_work(token, context, now, work).map_err(Error::from)? {
                     Some(word) => {
                         self.word = Some(encoded_word::decode::Cursor::new(word));
                         self.position = self.scan;
@@ -527,6 +671,98 @@ mod tests {
                 }
             }
             assert!(failed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    use crate::ports::Deadline;
+    #[test]
+    fn lexical_charge_refusal_retires_even_with_a_fresh_job_meter() {
+        for grammar in [Grammar::Keywords, Grammar::ListId] {
+            let mut cursor = Cursor::with_grammar(b"x", grammar);
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 1000,
+                    records: 1,
+                    ..Charge::default()
+                },
+            );
+            let mut refused = false;
+            for _ in 0..10 {
+                match cursor.poll(Tick(1), &mut work) {
+                    Ok(status) => assert_eq!(status, Status::Yield),
+                    Err(error) => {
+                        assert_eq!(error, Error::Work(Stop::Records));
+                        let mut fresh = Meter::new(
+                            Deadline::after(Tick(0), 100).unwrap(),
+                            Charge {
+                                io_bytes: 1000,
+                                records: 1000,
+                                ..Charge::default()
+                            },
+                        );
+                        let before = fresh.remaining();
+                        assert_eq!(cursor.poll(Tick(1), &mut fresh), Err(error));
+                        assert_eq!(fresh.remaining(), before);
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            assert!(refused);
+        }
+    }
+    #[test]
+    fn structured_checkpoints_replay_lexical_state_without_refunding_work() {
+        for grammar in [Grammar::Keywords, Grammar::ListId] {
+            for bytes in [
+                b" \"a\\\" =?utf-8?Q?no?=\" (=?utf-8?Q?e=CC=81?= \t=?utf-8?Q?two?=) <x>".as_slice(),
+                b" (\\x=?utf-8?Q?yes?=) =?utf-8?Q?=FF?= ",
+                b" =?utf-8?B?@@?= =?utf-8?Q?no?=, a\xff",
+            ] {
+                let mut cursor = Cursor::with_grammar(bytes, grammar);
+                assert!(std::mem::size_of_val(&cursor) <= 208);
+                assert!(!cursor.at(&Cursor::new(bytes)));
+                let mut work = Meter::new(
+                    Deadline::after(Tick(0), 100).unwrap(),
+                    Charge {
+                        io_bytes: 1_000_000,
+                        records: 1_000_000,
+                        ..Charge::default()
+                    },
+                );
+                let mut complete = false;
+                for _ in 0..10000 {
+                    let saved = cursor;
+                    let before = work.remaining();
+                    let first = cursor.poll(Tick(1), &mut work).unwrap();
+                    let after = work.remaining();
+                    assert!(before.io_bytes - after.io_bytes <= 229);
+                    assert!(before.records - after.records <= 226);
+                    let advanced = cursor;
+                    cursor = saved;
+                    assert_eq!(cursor.poll(Tick(1), &mut work).unwrap(), first);
+                    assert!(cursor.at(&advanced));
+                    assert_eq!(
+                        before.io_bytes - after.io_bytes,
+                        after.io_bytes - work.remaining().io_bytes
+                    );
+                    assert_eq!(
+                        before.records - after.records,
+                        after.records - work.remaining().records
+                    );
+                    if first == Status::Complete {
+                        complete = true;
+                        break;
+                    }
+                }
+                assert!(complete);
+            }
         }
     }
 }

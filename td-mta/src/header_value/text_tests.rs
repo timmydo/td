@@ -371,8 +371,6 @@ fn text_grammar_is_checked_before_output_and_cannot_authorize_structured_words()
     for key in [
         "header:Content-Type:asText",
         "header:Content-Disposition:asText:all",
-        "header:Keywords:asText",
-        "header:List-Id:asText",
         "header:Unknown:asText",
     ] {
         let mut work = work();
@@ -509,24 +507,34 @@ fn description_and_user_fields_use_text_rules_in_email_and_body_parts() {
 fn text_grammar_admission_preserves_known_costs_and_bounds_prefix_work() {
     for (name, visits, steps, accepted) in [
         ("Subject", 7, 1, true),
+        ("List-Id", 14, 2, true),
+        ("Keywords", 16, 2, true),
         ("cOmMeNtS", 8, 1, true),
         ("cOnTeNt-DeScRiPtIoN", 19, 1, true),
         ("X-", 2, 1, true),
         ("x-long-header", 2, 1, true),
-        ("X-Cats!", 9, 2, true),
-        ("X-Custom", 10, 2, true),
+        ("X-Cats!", 16, 3, true),
+        ("X-Custom", 18, 3, true),
         ("X-12345678901234567", 21, 2, true),
         ("X", 0, 1, false),
-        ("X_Header", 10, 2, false),
+        ("X_Header", 18, 3, false),
         ("Content-Type", 2, 1, false),
         ("Content-DispositioN", 21, 2, false),
-        ("Unknown", 9, 2, false),
+        ("Unknown", 16, 3, false),
     ] {
         let mut work = work();
         let initial = work.remaining();
         let mut budget = HeaderBudget::new();
         let mut scratch = nfc::Scratch::new();
-        let result = TextMode::validate(name, Tick(1), &mut work, &mut budget, &mut &mut scratch);
+        let mut workspace = (&mut scratch, crate::header_text::Grammar::Text);
+        let result = TextMode::validate(name, Tick(1), &mut work, &mut budget, &mut workspace);
+        if name == "Keywords" {
+            assert!(workspace.1 == crate::header_text::Grammar::Keywords);
+        } else if name == "List-Id" {
+            assert!(workspace.1 == crate::header_text::Grammar::ListId);
+        } else {
+            assert!(workspace.1 == crate::header_text::Grammar::Text);
+        }
         assert_eq!(
             result,
             if accepted {
@@ -634,5 +642,257 @@ fn prefix_admission_preserves_paid_comparison_when_job_budget_refuses() {
         assert_eq!(work.remaining().output_bytes, 100);
         assert_eq!(budget.source_bytes_remaining(), 16 * 1024 * 1024 - paid);
         assert_eq!(budget.steps_remaining(), 16_000_000 - u64::from(paid != 0));
+    }
+}
+
+#[test]
+fn structured_text_preserves_syntax_and_decodes_only_source_grammar_positions() {
+    let cases: &[(&str, &[u8], &str, bool)] = &[
+        (
+            "List-Id",
+            b" \"<\" =?utf-8?Q?yes?= <x>",
+            "\"<\" yes <x>",
+            false,
+        ),
+        ("List-Id", b" (<) =?utf-8?Q?yes?= <x>", "(<) yes <x>", false),
+        ("Keywords", b" (\\\xe1=?utf-8?Q?yes?=)", "(\\�yes)", true),
+        (
+            "Keywords",
+            b" (\\\xc3\xa9=?utf-8?Q?yes?=)",
+            "(\\éyes)",
+            false,
+        ),
+        (
+            "List-Id",
+            b" (\\\xe1=?utf-8?Q?yes?=) <x>",
+            "(\\�yes) <x>",
+            true,
+        ),
+        (
+            "List-Id",
+            b" (\\\xc3\xa9=?utf-8?Q?yes?=) <x>",
+            "(\\éyes) <x>",
+            false,
+        ),
+        (
+            "Keywords",
+            b" =?utf-8?Q?cafe=CC=81?= , plain",
+            "café , plain",
+            false,
+        ),
+        (
+            "Keywords",
+            b" =?utf-8?Q?one?= \r\n\t=?utf-8?B?dHdv?=",
+            "onetwo",
+            false,
+        ),
+        (
+            "Keywords",
+            b"\" =?utf-8?Q?quoted?= \" , =?utf-8?Q?yes?= ",
+            "\" =?utf-8?Q?quoted?= \" , yes ",
+            false,
+        ),
+        (
+            "Keywords",
+            b" =?utf-8?Q?no?=, =?utf-8?Q?yes?= ",
+            "=?utf-8?Q?no?=, yes ",
+            false,
+        ),
+        ("Keywords", b",=?utf-8?Q?no?= ", ",=?utf-8?Q?no?= ", false),
+        (
+            "Keywords",
+            b" (=?utf-8?Q?one?= \t=?utf-8?Q?two?=)",
+            "(onetwo)",
+            false,
+        ),
+        (
+            "Keywords",
+            b" (=?utf-8?Q?one?=(=?utf-8?Q?two?=))",
+            "(one(two))",
+            false,
+        ),
+        (
+            "Keywords",
+            b" (\\=?utf-8?Q?no?=)",
+            "(\\=?utf-8?Q?no?=)",
+            false,
+        ),
+        ("Keywords", b" (\\x=?utf-8?Q?yes?=)", "(\\xyes)", false),
+        (
+            "Keywords",
+            b" (x)=?utf-8?Q?no?= ",
+            "(x)=?utf-8?Q?no?= ",
+            false,
+        ),
+        ("Keywords", b" =?utf-8?Q?a,b?= ", "=?utf-8?Q?a,b?= ", false),
+        ("Keywords", b" (=?utf-8?Q?a,b?=)", "(a,b)", false),
+        (
+            "Keywords",
+            b" (=?utf-8?Q?a(b?=)",
+            "(=?utf-8?Q?a(b?=)",
+            false,
+        ),
+        (
+            "Keywords",
+            b" =?unknown?Q?one?= \t=?utf-8?Q?two?=",
+            "=?unknown?Q?one?= \ttwo",
+            false,
+        ),
+        ("Keywords", b" =?utf-8?Q?=FF=00=01?=", "�", true),
+        ("Keywords", b" a\0\xff\xef\xb7\x90", "a��", true),
+        (
+            "Keywords",
+            b" \"unterminated =?utf-8?Q?no?=",
+            "\"unterminated =?utf-8?Q?no?=",
+            false,
+        ),
+        (
+            "List-Id",
+            b" =?utf-8?Q?cafe=CC=81?= <list.example.org>",
+            "café <list.example.org>",
+            false,
+        ),
+        (
+            "List-Id",
+            b" \" =?utf-8?Q?no?= \" <list.example.org>",
+            "\" =?utf-8?Q?no?= \" <list.example.org>",
+            false,
+        ),
+        (
+            "List-Id",
+            b" (=?utf-8?Q?yes?=) <list.example.org>",
+            "(yes) <list.example.org>",
+            false,
+        ),
+        (
+            "List-Id",
+            b" < =?utf-8?Q?no?= > =?utf-8?Q?tail?=",
+            "< =?utf-8?Q?no?= > =?utf-8?Q?tail?=",
+            false,
+        ),
+        (
+            "List-Id",
+            b" =?utf-8?Q?no?=<list.example.org>",
+            "=?utf-8?Q?no?=<list.example.org>",
+            false,
+        ),
+        (
+            "List-Id",
+            b" \"a\\\" =?utf-8?Q?no?=\" =?utf-8?Q?yes?= <x>",
+            "\"a\\\" =?utf-8?Q?no?=\" yes <x>",
+            false,
+        ),
+    ];
+    for &(field, value, expected, problem) in cases {
+        let mut scratch = nfc::Scratch::new();
+        for width in 1..=8 {
+            let source = [field.as_bytes(), b":", value, b"\r\n\r\nbody"].concat();
+            for all in [false, true] {
+                let key = format!("header:{field}:asText{}", if all { ":all" } else { "" });
+                let mut work = work();
+                let mut budget = HeaderBudget::new();
+                let mut cursor =
+                    Text::new(input(&source, &key), &mut scratch, &mut work, &mut budget).unwrap();
+                let encoded = td_json::Json::from(expected).to_string();
+                let expected = if all { format!("[{encoded}]") } else { encoded };
+                assert_eq!(
+                    drain(&mut cursor, width),
+                    expected.as_bytes(),
+                    "{field} {value:?}"
+                );
+                assert_eq!(cursor.is_encoding_problem(), problem);
+            }
+        }
+    }
+}
+
+#[test]
+fn structured_text_selection_scratch_replay_and_refusal_keep_original_budgets() {
+    for field in ["Keywords", "List-Id"] {
+        let long = format!(" a{}\u{323}", "\u{301}".repeat(300));
+        let source = format!("{field}:{long}\r\n{field}: =?utf-8?Q?cafe=CC=81?=\r\n\r\n");
+        let expected = format!("[\"ạ{}\",\"café\"]", "\u{301}".repeat(300));
+        let key = format!("header:{field}:asText:all");
+        let mut scratch = nfc::Scratch::new();
+        for width in 1..=8 {
+            let mut work = work();
+            let mut budget = HeaderBudget::new();
+            let mut cursor = Text::new(
+                input(source.as_bytes(), &key),
+                &mut scratch,
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            assert_eq!(drain(&mut cursor, width), expected.as_bytes());
+            assert!(!cursor.is_encoding_problem());
+        }
+        for (source, expected) in [(b"".as_slice(), b"[]".as_slice()), (b"Other:a\n\n", b"[]")] {
+            let mut work = work();
+            let mut budget = HeaderBudget::new();
+            let mut cursor =
+                Text::new(input(source, &key), &mut scratch, &mut work, &mut budget).unwrap();
+            assert_eq!(drain(&mut cursor, 1), expected);
+        }
+        let depth32 = format!(
+            "{field}: {}=?utf-8?Q?yes?={}\r\n\r\n",
+            "(".repeat(32),
+            ")".repeat(32)
+        );
+        let expected32 = format!("[\"{}yes{}\"]", "(".repeat(32), ")".repeat(32));
+        let mut admitted_work = work();
+        let mut admitted_budget = HeaderBudget::new();
+        let mut admitted = Text::new(
+            input(depth32.as_bytes(), &key),
+            &mut scratch,
+            &mut admitted_work,
+            &mut admitted_budget,
+        )
+        .unwrap();
+        assert_eq!(drain(&mut admitted, 1), expected32.as_bytes());
+        for first in ["\"open", "(open"] {
+            let source = format!("{field}:{first}\r\n{field}: =?utf-8?Q?yes?=\r\n\r\n");
+            let expected = td_json::Json::from(vec![first, "yes"]).to_string();
+            let mut work = work();
+            let mut budget = HeaderBudget::new();
+            let mut cursor = Text::new(
+                input(source.as_bytes(), &key),
+                &mut scratch,
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            assert_eq!(drain(&mut cursor, 1), expected.as_bytes());
+        }
+        let source = format!("{field}: {}x{}\r\n\r\n", "(".repeat(33), ")".repeat(33));
+        let mut work = work();
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Text::new(
+            input(source.as_bytes(), &key),
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut output = [0; 1];
+        let mut refused = false;
+        for _ in 0..10000 {
+            match cursor.poll(Tick(1), &mut output) {
+                Ok(progress) => assert!(!matches!(progress.status, Status::Complete(_))),
+                Err(error) => {
+                    assert_eq!(
+                        error,
+                        Error::Json(json_string::Error::Source(nfc::Error::InterpretationLimit))
+                    );
+                    output[0] = 0xa5;
+                    assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                    assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                    assert_eq!(output, [0xa5]);
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused);
     }
 }

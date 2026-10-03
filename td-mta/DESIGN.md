@@ -294,8 +294,10 @@ verified by the ordinary offline test suite and a cold tooling example. M06
 now has reproducible offline table generation, fixed runtime lookups and
 bounded NFC over resident valid UTF-8, verified against the complete official
 NFC equations. M06t composes resident unstructured-header decoding with NFC
-and bounded charged replay. Structured headers and protocol integration
-remain open.
+and bounded charged replay. Keywords and List-Id Text now retain source
+punctuation while decoding original phrase/comment words with fixed lexical
+placement state and shared normalization. POLICY.md owns malformed display
+recovery. MIME parameter Text and protocol integration remain open.
 
 The core also contains 27 positive leap insertion dates generated from the
 approved, checksummed IANA input in leap-seconds/README.md. Offline tooling

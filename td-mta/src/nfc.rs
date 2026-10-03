@@ -171,9 +171,9 @@ impl<'a> Source<'a> {
             next: 0,
         }
     }
-    fn header(bytes: &'a [u8]) -> Self {
+    fn header(bytes: &'a [u8], grammar: crate::header_text::Grammar) -> Self {
         Self {
-            input: Input::Header(crate::header_text::Cursor::new(bytes)),
+            input: Input::Header(crate::header_text::Cursor::with_grammar(bytes, grammar)),
             pending: None,
             next: 0,
         }
@@ -386,7 +386,22 @@ impl<'a, 'w> Cursor<'a, 'w> {
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
     ) -> Self {
-        Self::from_source(Source::header(bytes), scratch, work, budget)
+        Self::from_header(
+            bytes,
+            crate::header_text::Grammar::Text,
+            scratch,
+            work,
+            budget,
+        )
+    }
+    pub(crate) fn from_header(
+        bytes: &'a [u8],
+        grammar: crate::header_text::Grammar,
+        scratch: &'w mut Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Self {
+        Self::from_source(Source::header(bytes, grammar), scratch, work, budget)
     }
     /// Supply a complete validated phrase and its exact range in the admitted
     /// field value. The caller authorizes field/form selection before this call.
@@ -1543,10 +1558,10 @@ mod tests {
     fn header_replay_restores_word_and_decomposition_positions_without_prefix_scans() {
         let left = vec![b'a'];
         let right = vec![b'a'];
-        let original = Source::header(&left);
+        let original = Source::header(&left, crate::header_text::Grammar::Text);
         let mut advanced = original;
         assert!(original.at(&advanced));
-        assert!(!original.at(&Source::header(&right)));
+        assert!(!original.at(&Source::header(&right, crate::header_text::Grammar::Text)));
         assert!(matches!(
             advanced
                 .read(&mut work(), &mut HeaderBudget::new(), &mut 0, Tick(1))
@@ -1775,6 +1790,61 @@ mod tests {
                 assert_ne!(cursor.poll(Tick(1)).unwrap(), Status::Complete);
             }
             assert!(reached);
+        }
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    use crate::{header_text::Grammar, ports::Deadline};
+    #[test]
+    fn structured_normalization_replay_obeys_the_child_turn_contract() {
+        let word = format!("=?utf-8?Q?{}?=", "a".repeat(63));
+        let sources = [
+            format!(" {word}\r\n\t{word} (\\é{word}) <x>"),
+            format!(" (\\é{word}) a{}\u{323}", "\u{301}".repeat(300)),
+        ];
+        for grammar in [Grammar::Keywords, Grammar::ListId] {
+            let mut scratch = Scratch::new();
+            for source in &sources {
+                let mut work = Meter::new(
+                    Deadline::after(Tick(0), 100).unwrap(),
+                    Charge {
+                        io_bytes: 100_000_000,
+                        records: 2_000_000,
+                        ..Charge::default()
+                    },
+                );
+                let mut budget = HeaderBudget::new();
+                let mut cursor = Cursor::from_header(
+                    source.as_bytes(),
+                    grammar,
+                    &mut scratch,
+                    &mut work,
+                    &mut budget,
+                );
+                assert!(
+                    std::mem::size_of_val(&cursor) + std::mem::size_of::<HeaderBudget>() <= 1024
+                );
+                assert!(std::mem::size_of::<Source<'_>>() <= 256);
+                let mut complete = false;
+                for _ in 0..100_000 {
+                    let visits = cursor.budget.source_bytes_remaining();
+                    let steps = cursor.budget.steps_remaining();
+                    let records = cursor.work.remaining().records;
+                    let status = cursor.poll(Tick(1)).unwrap();
+                    assert!(visits - cursor.budget.source_bytes_remaining() <= 229);
+                    assert!(steps - cursor.budget.steps_remaining() <= 228);
+                    assert!(records - cursor.work.remaining().records <= 15);
+                    if status == Status::Complete {
+                        complete = true;
+                        break;
+                    }
+                }
+                assert!(complete);
+            }
         }
     }
 }

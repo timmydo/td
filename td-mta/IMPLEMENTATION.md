@@ -1655,6 +1655,16 @@ Initial independently landable increments:
   retirement, including allocation-free construction and short drains.
   Structured Text grammars and response-spool publication remain open.
 
+- **M06bm — structured Text placement:** admit Keywords and List-Id with
+  fixed lexical quote/comment/identifier state in the resident scalar decoder.
+  Preserve Text punctuation while recognizing only original phrase/comment
+  encoded words, charging comparisons and lexical transitions. Reuse NFC,
+  overflow replay, JSON framing and the original email/job meters. Cover
+  one-byte drains, grammar-specific alphabets, malformed/escaped placement,
+  diagnostics, scratch reuse, fixed-state replay and allocation-free output.
+  MIME parameter Text grammars, part traversal and response retention remain
+  open; this decoder is no structured-creation or list-identity authority.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

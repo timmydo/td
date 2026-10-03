@@ -87,25 +87,32 @@ impl<'a, 'w> Projection<'a, 'w> for RawMode {
 }
 pub(super) struct TextMode;
 impl<'a, 'w> Projection<'a, 'w> for TextMode {
-    type Source = nfc::Cursor<'a, 'w>;
-    type Workspace = &'w mut nfc::Scratch;
+    type Source = (nfc::Cursor<'a, 'w>, crate::header_text::Grammar);
+    type Workspace = (&'w mut nfc::Scratch, crate::header_text::Grammar);
     const FORM: Form = Form::Text;
     fn validate(
         name: &str,
         now: Tick,
         work: &mut Meter,
         budget: &mut HeaderBudget,
-        _: &mut Self::Workspace,
+        workspace: &mut Self::Workspace,
     ) -> Result<(), Error> {
-        let field = match name.len() {
-            7 => Some("Subject"),
-            8 => Some("Comments"),
-            19 => Some("Content-Description"),
-            _ => None,
+        let fields: &[(&str, crate::header_text::Grammar)] = match name.len() {
+            7 => &[
+                ("Subject", crate::header_text::Grammar::Text),
+                ("List-Id", crate::header_text::Grammar::ListId),
+            ],
+            8 => &[
+                ("Comments", crate::header_text::Grammar::Text),
+                ("Keywords", crate::header_text::Grammar::Keywords),
+            ],
+            19 => &[("Content-Description", crate::header_text::Grammar::Text)],
+            _ => &[],
         };
-        if let Some(field) = field {
+        for &(field, grammar) in fields {
             budget.charge(work, now, field.len() as u64, 1, &mut 0)?;
             if name.eq_ignore_ascii_case(field) {
+                workspace.1 = grammar;
                 return Ok(());
             }
         }
@@ -122,17 +129,24 @@ impl<'a, 'w> Projection<'a, 'w> for TextMode {
         bytes: &'a [u8],
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
-        scratch: Self::Workspace,
+        (scratch, grammar): Self::Workspace,
     ) -> Self::Source {
-        nfc::Cursor::from_unstructured_header(bytes, scratch, work, budget)
+        (
+            nfc::Cursor::from_header(bytes, grammar, scratch, work, budget),
+            grammar,
+        )
     }
     fn finish(
         source: Self::Source,
     ) -> Result<(&'w mut Meter, &'w mut HeaderBudget, Self::Workspace), Error> {
-        source.finish().map_err(Error::Text)
+        let (source, grammar) = source;
+        source
+            .finish()
+            .map(|(work, budget, scratch)| (work, budget, (scratch, grammar)))
+            .map_err(Error::Text)
     }
     fn charge_output(source: &mut Self::Source, now: Tick, bytes: u64) -> Result<(), Error> {
-        source.charge_output(now, bytes).map_err(Error::Text)
+        source.0.charge_output(now, bytes).map_err(Error::Text)
     }
     fn poll(
         source: &mut Self::Source,
@@ -141,10 +155,10 @@ impl<'a, 'w> Projection<'a, 'w> for TextMode {
         output: &mut [u8],
     ) -> Result<Progress, Error> {
         frame
-            .poll(&mut Source::Normalized(source), now, output)
+            .poll(&mut Source::Normalized(&mut source.0), now, output)
             .map_err(Error::Json)
     }
     fn is_encoding_problem(source: &Self::Source) -> bool {
-        source.is_encoding_problem()
+        source.0.is_encoding_problem()
     }
 }

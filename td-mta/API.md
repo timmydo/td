@@ -1178,23 +1178,32 @@ a caller cannot treat candidate recognition as placement authorization or
 join charset bytes from separate words. Section 1.27 composes the resident
 unstructured-header source with NFC.
 
-### 1.26 Resident unstructured header decoding
+### 1.26 Resident header Text decoding
 
-M06s supplies `header_text::Cursor` over one immutable unstructured field
-value, excluding its final line ending. The caller must authorize the field
-and form first. This cursor is not an address/comment/parameter parser and
-must not be applied to structured fields to authorize encoded words there.
-It produces Text-form scalars before NFC; it does not yet provide the complete
-JMAP Text projection or serializer.
+M06s supplies the public `header_text::Cursor::new` entry point over one
+immutable unstructured field value, excluding its final line ending. The
+caller must authorize the field and form first. This entry point is not an
+address/comment/parameter parser and cannot authorize structured encoded
+words. M06bm adds a private grammar-selected constructor for Keywords and
+List-Id Text, selected only by the header-value coordinator (section 1.53).
+Both produce Text-form scalars before NFC; they provide no field selection,
+whole JMAP property publication or serializer.
 
 Each poll returns at most one Scalar, Yield or Complete. Unfold CRLF or LF
 followed by SP/HTAB, preserving that whitespace; preserve other endings and
 bare CR. Remove only initial SP from the unfolded stream. Decode literal
 UTF-8 with maximal-subpart replacement, then remove NUL and replace I-JSON
 noncharacters. Other literal controls remain scalars for later JSON escaping.
-Candidate words begin at field start or after SP/HTAB and must end at the
-next such boundary or EOF. A bad suffix, an overlong token or a syntactic
-nonword stays literal, without accepting a convenient encoded prefix.
+In the unstructured mode, candidate words begin at field start or after
+SP/HTAB and must end at the next such boundary or EOF. A bad suffix, an
+overlong token or a syntactic nonword stays literal, without accepting a
+convenient encoded prefix. Structured modes enforce original phrase-word
+spacing and alphabet; comment candidates may also be bounded by parentheses
+or a whole quoted pair. Escaped UTF-8 characters and maximal-subpart repairs
+finish before the following candidate begins. Source quotes, quoted pairs
+and comment punctuation stay literal. List-Id stops word admission at its
+first unquoted/uncommented opening angle. POLICY.md owns malformed display
+recovery and the per-field nesting limit.
 
 Recognized words use section 1.25's independent per-word decoder. Retain
 whitespace after a word as raw offsets while scanning for the next token.
@@ -1209,8 +1218,12 @@ word decoder, within the 256-byte decoding checkpoint. It owns no
 header string, candidate buffer or whitespace buffer. Candidate scans stop
 after at most 76 raw bytes; an oversized token streams literally thereafter.
 Whitespace scanning/replay advances one unfolded byte per poll. Recognition
-is a separate bounded turn, charging at most 226 records/225 byte visits;
-other turns charge source/lookahead, charset and word work as performed.
+is a separate bounded turn, charging at most 226 records/225 byte visits in
+unstructured mode and 226 records/229 visits in structured phrase mode,
+including the left byte and right fold/whitespace checks. Other turns charge
+source/lookahead, charset and word work as performed. Structured literal
+transitions also charge one step per consumed byte or repaired escaped
+prefix.
 Replay repeats those charges. Tests retain a one-MiB ASCII literal header
 within the default two-million-record job allowance.
 
@@ -1222,7 +1235,7 @@ Section 1.27 connects this cursor to NFC with aggregate header source/step
 accounting and exact restart points. This standalone entry point uses only
 the job meter. Worker stack and service activation remain unqualified.
 
-### 1.27 Normalized unstructured headers
+### 1.27 Normalized header Text
 
 M06t supplies `nfc::Cursor::from_unstructured_header(bytes, scratch, meter,
 header_budget)`. It uses section 1.26's resident decoding before canonical
@@ -1231,14 +1244,18 @@ caller must first authorize one unstructured field/form and exclude its final
 line ending. Structured header parsing, header-form selection, provisional
 property publication, JSON escaping and worker scheduling remain external.
 The valid-UTF8 constructor retains section 1.23's original scalar semantics.
+M06bm's private `from_header(bytes, grammar, scratch, meter, header_budget)`
+adds the grammar-selected resident source behind section 1.53's property
+owner; it supplies no independent field/form authority.
 
-Both constructors borrow the same exclusive Scratch, live job Meter and
+These constructors borrow the same exclusive Scratch, live job Meter and
 aggregate HeaderBudget. Source checkpoints now hold either a valid UTF-8
-position or the complete unstructured-header decoding state, plus pending
+position or the complete selected header decoding state, plus pending
 canonical expansion. Each fits 256 bytes; the complete cursor plus aggregate
 budget remains within 1024 bytes alongside the 3072-byte scratch. A checked
 successful-turn ordinal identifies exact deterministic header state together
-with source pointer/length, without scanning any prefix. Failed cursors are
+with source pointer/length and the selected grammar, without scanning any
+prefix. Failed cursors are
 retired before comparisons. Restore includes states inside a word, charset
 sequence, candidate scan, whitespace replay or decomposition. EOF replay ends
 at the before-turn checkpoint; resumption retains the consumed EOF state.
@@ -2437,8 +2454,11 @@ Subject, Comments and Content-Description, plus user-defined X- fields,
 case-insensitively, before staging any JSON. M06bj extends the unstructured
 path using RFC 2045 section 8 and RFC 2047 section 5's field rules.
 Parentheses and quotes in these fields are text, not structured comments or
-quoted strings. Keywords, List-Id, other MIME fields and unknown non-X- fields
-return UnsupportedGrammar until grammar-aware Text conversion is implemented.
+quoted strings. M06bm also admits Keywords and List-Id with original
+phrase/comment placement as specified in POLICY.md. Quotes, quoted pairs,
+comments and punctuation remain Text data, while List-Id identifier bytes
+never admit words. Other MIME fields and unknown non-X- fields still return
+UnsupportedGrammar.
 This is an implementation limit, not an invalid-property or invalidArguments
 claim; Text-form authorization alone cannot authorize encoded words in
 structured syntax. Last/all, absence, provisional output, backpressure and
@@ -2448,15 +2468,23 @@ unchanged.
 A private generic core owns the shared selector, punctuation, JSON Frame and
 failure state. Its two private projections provide Raw or normalized Text
 sources; there is no trait object, heap allocation or duplicated framing state
-machine. The Text source is the existing unstructured-header NFC cursor: it
-removes initial SP, unfolds while retaining following whitespace, decodes
-originally permitted encoded words and normalizes the filtered scalars.
+machine. The Text source uses the existing NFC cursor with the selected
+resident scalar grammar. It removes initial SP, unfolds while retaining
+following whitespace, decodes originally permitted encoded words and
+normalizes the filtered scalars. Keywords/List-Id add fixed lexical state;
+whole escaped UTF-8 characters (including repaired malformed prefixes) must
+finish before a subsequent word can begin. Quotes/comments remain unfolded
+source bytes rather than display-name projection. Comment nesting above 32
+refuses with an interpretation-limit error.
 Grammar admission dispatches by name length and prepays each comparison.
 Subject/Comments keep their seven/eight visits and one step. Content-
-Description costs nineteen visits/one step. If a same-length known-name
-comparison fails, check the two-byte X- prefix in a separate admission; other
-lengths check only that prefix. Maximum dispatch cost is twenty-one visits,
-two steps and two job records, with no scan of the remaining extension name. A
+Description costs nineteen visits/one step. Seven-byte names try Subject,
+then List-Id (fourteen visits/two steps); eight-byte names try Comments,
+then Keywords (sixteen visits/two steps). Failed known-name comparisons
+precede a separately charged two-byte X- prefix check; other lengths check
+only that prefix. Dispatch has dimensional maxima of twenty-one visits
+(for nineteen-byte names), three steps and three job records (for seven- or
+eight-byte names), with no scan of the remaining extension name. A
 name shorter than two bytes has no byte comparison but still costs one step
 and one job record. Use the original job/email budgets and discard unused
 prepaid credit; empty output performs only the live deadline check until
@@ -2484,8 +2512,9 @@ Tests distinguish Raw identity from Text decoding/NFC, cover last/all and
 absence, repair diagnostics, encoded-word and fold handling, overflow segments
 followed by a second field, exact charges against separate selector/converter
 runs, Content-Description/X- admission, exact classification costs, partial
-job/email admission refusals, structured-field refusal, comma/output
-exhaustion, partial handoff, late scan refusal and final deadline retirement.
+job/email admission refusals, unsupported MIME-field refusal, Keywords/List-Id
+placement and escaped-character repair, comma/output exhaustion, partial
+handoff, late scan refusal and final deadline retirement.
 The allocation probe covers overflow plus subsequent scratch reuse and late
 failure in both registered modes. Other parsed forms and ADMISSION.md's
 unpublished response-spool implementation remain separate.
