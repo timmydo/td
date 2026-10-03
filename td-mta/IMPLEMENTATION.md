@@ -1494,6 +1494,13 @@ Initial independently landable increments:
   scalars, one-byte sinks, exact charges, replay and allocation-free operation.
   Field admission, retained response ownership and publication remain open.
 
+- **M06ap — Raw/address JSON strings:** extend the bounded serializer with
+  borrowed Raw and parsed/fallback address sources and the live job meter.
+  Preserve identity without NFC; retain decoder work and charge escaped JSON
+  separately. Cover tiny output slices, repairs, exact layered charges and
+  allocation-free refusal. Whole-field/list assembly and publication remain
+  open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

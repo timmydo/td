@@ -2190,6 +2190,59 @@ response ownership and complete worker qualification remain open.
 
 Source: [RFC 8259 sections 7 and 8.1](https://www.rfc-editor.org/rfc/rfc8259.html#section-7).
 
+### 1.48 JSON output preserving Raw and address text
+
+M06ap adds `json_string::Cursor::from_raw(&mut raw_cursor, &mut meter)` and
+`from_address(&mut address_cursor, &mut meter)`. These select the existing Raw
+and parsed/fallback address projections directly, with no normalization or
+encoded-word interpretation added by the serializer. Supply an unpolled source
+and its job's live meter. Partial abandonment invalidates the whole property
+and any staged/output bytes; retry with a fresh source from the original input
+without refunding spent work. Authorization, source binding and whole-field
+admission remain with the enclosing owner.
+
+The private source enum holds exclusive borrowed references, with exactly one
+active source and no owned parser or copied meter. The normalized constructor
+keeps its existing API. Raw/address constructors share the same six-byte
+staging, bounded drains, live deadline checks, output precharging and sticky
+retirement. The complete JSON wrapper still fits 64 bytes. The Raw cursor
+remains in the 2 KiB decoder/HTML/snippet state of the 32 KiB conversion
+region; the address facade remains in the 16 KiB parser reservation. Neither
+path borrows NFC scratch.
+
+Raw keeps source folds, case, decomposed characters and literal encoded words,
+while applying its existing NUL/UTF-8/noncharacter policy. Address projection
+keeps address identity, removes grammatical CFWS or trims/unfolds fallback
+according to its selected mode, and applies its existing repair policy. JSON
+only escapes the resulting scalars. Raw and address decoders already replace
+noncharacters; encoding diagnostics remain source-owned. No JSON completion
+proves that a recovered address can be used for SMTP.
+
+Address conversion already charges intermediate unfolding and scalar bytes.
+The serializer additionally charges escaped JSON bytes and quotes once; it
+neither refunds earlier conversion nor double-charges fragmented JSON drains.
+Raw charges its original decode work plus exact serialized output. Raw/Address
+variants identify source errors; direct serializer charges use Work only for
+those borrowed-meter modes. The normalized mode retains Source for both NFC
+and serializer refusals, so it does not distinguish those origins. Every
+variant retires the whole provisional string, including an opening quote
+emitted before malformed address validation finishes.
+
+Tests cover output widths one through eight, preserved combining sequences,
+folds, quoting, controls, case and encoded-looking addresses; repair
+diagnostics; and exact conversion-plus-JSON charges. Source, output and
+final-deadline refusals remain terminal. The allocation probe covers Raw,
+parsed/fallback addresses and malformed refusal in both registered modes. This
+supplies string components; list/group assembly, complete aggregate admission,
+retained response publication and worker resource qualification remain open.
+
+A direct serializer refusal stops the wrapper and its borrowed meter. It need
+not latch into a Raw/address source that was not polled by that refusal. The
+owner must retire that progressed source with the property and must not attach
+a fresh meter or rewrap a copy. This differs from normalized output charging,
+which also retires the NFC source. Source-reported failures retain each
+source's existing latch.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

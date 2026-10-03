@@ -952,6 +952,16 @@ once even with one-byte slices. Allocation intervals compose normalization,
 fragmented serialization and refusal; retained response storage and combined
 worker stack/RSS are not qualified by this helper.
 
+The JSON adapter also borrows Raw or parsed/fallback address sources through
+one fixed enum. Its complete wrapper still fits 64 bytes, with no owned source
+parser and no meter copy. These modes borrow no NFC scratch. Raw state remains
+in the 2 KiB decoder/HTML/snippet state of the 32 KiB conversion region; the
+address facade remains in the 16 KiB parser reservation. Original source
+conversion charges and escaped JSON output charges both apply, while
+fragmenting a staged JSON scalar adds no charge. Allocation intervals cover
+Raw, both address modes and malformed-source refusal. No complete
+response/worker claim follows.
+
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
 including the fixed one-byte handoff; public MessageIds state remains

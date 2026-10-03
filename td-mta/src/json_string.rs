@@ -1,14 +1,24 @@
-//! Bounded JSON string serialization of an already authorized NFC source.
-use crate::{nfc, ports::Tick};
+//! Bounded JSON strings from already selected header scalar sources.
+use crate::{
+    admission::work::{Charge, Meter, Stop},
+    header_address_text, header_raw, nfc,
+    ports::Tick,
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Source(nfc::Error),
+    Raw(header_raw::Error),
+    Address(header_address_text::Error),
+    Work(Stop),
     InvalidState,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(error) => write!(f, "JSON string source: {error}"),
+            Self::Raw(error) => write!(f, "JSON Raw source: {error}"),
+            Self::Address(error) => write!(f, "JSON address source: {error}"),
+            Self::Work(error) => write!(f, "JSON string output: {error}"),
             Self::InvalidState => f.write_str("invalid JSON string state"),
         }
     }
@@ -38,9 +48,54 @@ enum Phase {
     DrainClose,
     Complete,
 }
+enum Source<'c, 'a, 'w> {
+    Normalized(&'c mut nfc::Cursor<'a, 'w>),
+    Raw(&'c mut header_raw::Cursor<'a>, &'c mut Meter),
+    Address(&'c mut header_address_text::Cursor<'a>, &'c mut Meter),
+}
+impl Source<'_, '_, '_> {
+    fn charge_output(&mut self, now: Tick, output_bytes: u64) -> Result<(), Error> {
+        match self {
+            Self::Normalized(cursor) => cursor
+                .charge_output(now, output_bytes)
+                .map_err(Error::Source),
+            Self::Raw(_, work) | Self::Address(_, work) => work
+                .charge(
+                    now,
+                    Charge {
+                        output_bytes,
+                        ..Charge::default()
+                    },
+                )
+                .map_err(Error::Work),
+        }
+    }
+    const fn is_encoding_problem(&self) -> bool {
+        match self {
+            Self::Normalized(cursor) => cursor.is_encoding_problem(),
+            Self::Raw(cursor, _) => cursor.is_encoding_problem(),
+            Self::Address(cursor, _) => cursor.is_encoding_problem(),
+        }
+    }
+    fn poll(&mut self, now: Tick) -> Result<nfc::Status, Error> {
+        match self {
+            Self::Normalized(cursor) => cursor.poll(now).map_err(Error::Source),
+            Self::Raw(cursor, work) => match cursor.poll(now, work).map_err(Error::Raw)? {
+                header_raw::Status::Yield => Ok(nfc::Status::Yield),
+                header_raw::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
+                header_raw::Status::Complete => Ok(nfc::Status::Complete),
+            },
+            Self::Address(cursor, work) => match cursor.poll(now, work).map_err(Error::Address)? {
+                header_address_text::Status::Yield => Ok(nfc::Status::Yield),
+                header_address_text::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
+                header_address_text::Status::Complete => Ok(nfc::Status::Complete),
+            },
+        }
+    }
+}
 /// Every emitted byte is provisional until the containing property succeeds.
 pub struct Cursor<'c, 'a, 'w> {
-    source: &'c mut nfc::Cursor<'a, 'w>,
+    source: Source<'c, 'a, 'w>,
     pending: [u8; 6],
     used: usize,
     position: usize,
@@ -52,6 +107,20 @@ impl<'c, 'a, 'w> Cursor<'c, 'a, 'w> {
     /// Dropping before Complete abandons the whole property; do not rewrap the
     /// advanced source. Charged output is never refunded.
     pub fn new(source: &'c mut nfc::Cursor<'a, 'w>) -> Self {
+        Self::from_source(Source::Normalized(source))
+    }
+    /// Supply an unpolled Raw cursor and its job's live meter.
+    pub fn from_raw(source: &'c mut header_raw::Cursor<'a>, work: &'c mut Meter) -> Self {
+        Self::from_source(Source::Raw(source, work))
+    }
+    /// Supply an unpolled address cursor and its job's live meter.
+    pub fn from_address(
+        source: &'c mut header_address_text::Cursor<'a>,
+        work: &'c mut Meter,
+    ) -> Self {
+        Self::from_source(Source::Address(source, work))
+    }
+    fn from_source(source: Source<'c, 'a, 'w>) -> Self {
         Self {
             source,
             pending: [0; 6],
@@ -69,7 +138,7 @@ impl<'c, 'a, 'w> Cursor<'c, 'a, 'w> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let result = self.source.charge_output(now, 0).map_err(Error::Source);
+        let result = self.source.charge_output(now, 0);
         if let Err(error) = result {
             self.failure = Some(error);
         }
@@ -340,6 +409,138 @@ mod tests {
             assert_eq!(text, expected.as_bytes());
             assert_eq!(cursor.is_encoding_problem(), problem);
         }
+    }
+    fn drain(cursor: &mut Cursor<'_, '_, '_>, width: usize) -> String {
+        assert!(std::mem::size_of_val(cursor) <= 64);
+        let mut output = [0; 8];
+        let mut text = Vec::new();
+        for _ in 0..100_000 {
+            let progress = cursor
+                .poll(Tick(1), output.get_mut(..width).unwrap())
+                .unwrap();
+            text.extend_from_slice(output.get(..progress.written).unwrap());
+            if progress.status == Status::Complete {
+                return String::from_utf8(text).unwrap();
+            }
+        }
+        panic!("identity JSON string did not finish");
+    }
+    #[test]
+    fn raw_headers_keep_folds_and_decomposition_without_normalization() {
+        for width in 1..=8 {
+            for (input, expected, problem) in [
+                (b"e\xcc\x81".as_slice(), "\"e\u{301}\"", false),
+                (b"a\r\n\tb\0", r#""a\r\n\tb""#, false),
+                (b"\"\\\xff", "\"\\\"\\\\�\"", true),
+                (b"=?utf-8?q?e=CC=81?=", "\"=?utf-8?q?e=CC=81?=\"", false),
+            ] {
+                let mut source = header_raw::Cursor::new(input);
+                let mut meter = work(1000);
+                let mut cursor = Cursor::from_raw(&mut source, &mut meter);
+                assert_eq!(drain(&mut cursor, width), expected);
+                assert_eq!(cursor.is_encoding_problem(), problem);
+                assert_eq!(1000 - meter.remaining().output_bytes, expected.len() as u64);
+            }
+        }
+    }
+    #[test]
+    fn parsed_and_fallback_addresses_preserve_identity_and_charge_each_layer() {
+        use header_address_text::Mode::{Fallback, Parsed};
+        for width in 1..=8 {
+            for (input, mode, expected, problem) in [
+                (
+                    b"e\xcc\x81@EXAMPLE.org".as_slice(),
+                    Parsed,
+                    "\"e\u{301}@EXAMPLE.org\"",
+                    false,
+                ),
+                (b"(left)a@(right)b", Parsed, "\"a@b\"", false),
+                (b"\"a\\b\"@b", Parsed, r#""\"a\\b\"@b""#, false),
+                (b"=?utf-8?q?x?=@b", Parsed, "\"=?utf-8?q?x?=@b\"", false),
+                (
+                    b"  e\xcc\x81 broken\r\n value \t",
+                    Fallback,
+                    "\"e\u{301} broken value\"",
+                    false,
+                ),
+                (b" \xff\0 ", Fallback, "\"�\\u0000\"", true),
+            ] {
+                let mut original = header_address_text::Cursor::new(input, mode);
+                let mut original_meter = work(10000);
+                while original.poll(Tick(1), &mut original_meter).unwrap()
+                    != header_address_text::Status::Complete
+                {}
+                let conversion = 10000 - original_meter.remaining().output_bytes;
+                let mut source = header_address_text::Cursor::new(input, mode);
+                let mut meter = work(10000);
+                let mut cursor = Cursor::from_address(&mut source, &mut meter);
+                assert_eq!(drain(&mut cursor, width), expected);
+                assert_eq!(cursor.is_encoding_problem(), problem);
+                assert_eq!(
+                    10000 - meter.remaining().output_bytes,
+                    conversion + expected.len() as u64
+                );
+            }
+        }
+    }
+    fn refusal(cursor: &mut Cursor<'_, '_, '_>, output: &mut [u8]) -> (Error, usize) {
+        let mut written = 0;
+        for _ in 0..10_000 {
+            match cursor.poll(Tick(1), output) {
+                Ok(Progress {
+                    status: Status::Complete,
+                    ..
+                }) => panic!("refused JSON completed"),
+                Ok(progress) => written += progress.written,
+                Err(error) => return (error, written),
+            }
+        }
+        panic!("JSON refusal did not finish");
+    }
+    #[test]
+    fn raw_and_address_source_refusals_retire_provisional_json() {
+        let mut raw = header_raw::Cursor::new(b"a");
+        let mut meter = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                output_bytes: 100,
+                ..Charge::default()
+            },
+        );
+        let mut cursor = Cursor::from_raw(&mut raw, &mut meter);
+        let mut output = [0; 8];
+        let (error, written) = refusal(&mut cursor, &mut output);
+        assert_eq!(written, 1);
+        assert_eq!(error, Error::Raw(header_raw::Error::Work(Stop::IoBytes)));
+        assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+        let mut address =
+            header_address_text::Cursor::new(b"a@", header_address_text::Mode::Parsed);
+        let mut meter = work(100);
+        let mut cursor = Cursor::from_address(&mut address, &mut meter);
+        let (error, written) = refusal(&mut cursor, &mut output);
+        assert_eq!(written, 1);
+        assert_eq!(error, Error::Address(header_address_text::Error::Malformed));
+        assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+        let mut raw = header_raw::Cursor::new(b"name");
+        let mut meter = work(1);
+        let mut cursor = Cursor::from_raw(&mut raw, &mut meter);
+        let (error, written) = refusal(&mut cursor, &mut output);
+        assert_eq!(written, 1);
+        assert_eq!(error, Error::Work(Stop::OutputBytes));
+        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+        let mut address =
+            header_address_text::Cursor::new(b"a@b", header_address_text::Mode::Parsed);
+        let mut meter = work(100);
+        let mut cursor = Cursor::from_address(&mut address, &mut meter);
+        assert_eq!(drain(&mut cursor, 1), "\"a@b\"");
+        assert_eq!(
+            cursor.check_deadline(Tick(100)),
+            Err(Error::Work(Stop::Deadline))
+        );
+        assert_eq!(
+            cursor.poll(Tick(1), &mut output),
+            Err(Error::Work(Stop::Deadline))
+        );
     }
     #[test]
     fn empty_output_neither_advances_nor_charges_but_checks_the_deadline() {

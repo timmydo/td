@@ -3248,6 +3248,79 @@ fn header_properties() {
     assert_eq!(before, after, "header property selection allocated");
 }
 
+fn json_identity_output() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_address_text::{self, Mode},
+        header_raw,
+        json_string::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    fn meter() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 1024 * 1024,
+                records: 100_000,
+                output_bytes: 1024 * 1024,
+                ..Charge::default()
+            },
+        )
+    }
+    fn drain(cursor: &mut Cursor<'_, '_, '_>) -> usize {
+        let mut output = [0; 1];
+        let mut written = 0;
+        for _ in 0..10_000 {
+            let progress = cursor.poll(Tick(1), &mut output).unwrap();
+            written += progress.written;
+            black_box(output);
+            if progress.status == Status::Complete {
+                return written;
+            }
+        }
+        panic!("identity JSON allocation fixture did not finish");
+    }
+    let before = COUNTERS.snapshot();
+    let mut work = meter();
+    let mut raw = header_raw::Cursor::new(black_box(b"e\xcc\x81\r\n"));
+    let mut cursor = Cursor::from_raw(&mut raw, &mut work);
+    assert_eq!(drain(&mut cursor), 9);
+    let mut work = meter();
+    let mut address = header_address_text::Cursor::new(black_box(b"e\xcc\x81@b"), Mode::Parsed);
+    let mut cursor = Cursor::from_address(&mut address, &mut work);
+    assert_eq!(drain(&mut cursor), 7);
+    let mut work = meter();
+    let mut address = header_address_text::Cursor::new(black_box(b" \xff\0 "), Mode::Fallback);
+    let mut cursor = Cursor::from_address(&mut address, &mut work);
+    assert_eq!(drain(&mut cursor), 11);
+    assert!(cursor.is_encoding_problem());
+    let mut work = meter();
+    let mut invalid = header_address_text::Cursor::new(b"a@", Mode::Parsed);
+    let mut cursor = Cursor::from_address(&mut invalid, &mut work);
+    let mut output = [0; 1];
+    let mut failed = false;
+    let mut written = 0;
+    for _ in 0..10_000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                assert_ne!(progress.status, Status::Complete);
+                written += progress.written;
+            }
+            Err(error) => {
+                assert_eq!(error, Error::Address(header_address_text::Error::Malformed));
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert_eq!(written, 1);
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Raw/address JSON serialization allocated");
+}
+
 fn json_string_output() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4033,6 +4106,7 @@ fn main() {
         phrase_nfc();
         comment_nfc();
         json_string_output();
+        json_identity_output();
         encoded_word_candidates();
         encoded_word_decoding();
         header_text();
@@ -4152,6 +4226,7 @@ fn main() {
     phrase_nfc();
     comment_nfc();
     json_string_output();
+    json_identity_output();
     encoded_word_candidates();
     encoded_word_decoding();
     header_text();
