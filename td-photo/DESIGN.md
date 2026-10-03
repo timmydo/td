@@ -62,9 +62,9 @@ with its edge and corner handles and the look palette; the `export` verb and
 the window's `export` action are in, `delete-rejected` with them, and the
 export view with its settings and the picks' export close the export
 increment, AVIF included. The crate is packaged: the `td-photo`
-target recipe builds it static over the staged td-ui and td-compositor
-trees, the image copies its output and links `/bin/td-photo`, and
-`td-photo-test` runs the built binary's verbs over a synthetic frame
+target recipe builds it static over the staged td-civil, td-ui and
+td-compositor trees, the image copies its output and links
+`/bin/td-photo`, and `td-photo-test` runs the built binary's verbs over a synthetic frame
 (Packaging below).
 
 The rules below define version 1; the increments identify the order of
@@ -91,7 +91,8 @@ unbounded read.
 
 Production code has no `unwrap`, `expect`, panics or panicking indexing;
 the crate root forbids `unsafe`, and its confinement tests pin that td-ui
-is its one dependency and which files name which of its modules.
+and td-civil (the calendar the EXIF date is checked against) are its only
+dependencies and which files name which of td-ui's modules.
 
 ## Workflow
 
@@ -2002,13 +2003,14 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
 - The decoded sample of the 14-bit lossless tree is what dcraw decodes;
   the pinned real-frame fixture is the oracle and a change that moves it
   is a codec change.
-- No `unsafe`, no dependency other than td-ui, no `include!`, no build
-  script.
+- No `unsafe`, no dependency other than td-ui and td-civil, no
+  `include!`, no build script.
 
 ## Test contract
 
 `tests/confinement.rs` pins the source inventory, that the crate root
-forbids `unsafe`, that the manifest declares td-ui as its one dependency,
+forbids `unsafe`, that the manifest declares td-ui and td-civil as its
+only dependencies (and a pure module names only td-civil's month length),
 the native case and the trusted test root (the window binds its control
 socket under the harness's directory in `/tmp`, and td-ui's socket refuses
 an ancestor the gate's rootless namespace shows as owned by no one, so the
@@ -2535,19 +2537,21 @@ all-target Clippy.
 ## Packaging
 
 The target recipe `td-photo` (`recipes/src/recipes/td-photo.rs`) builds the
-crate with cargo on the source-built toolchain, staging the `td-ui` and
-`td-compositor` trees beside it so the toolkit's `#[path]` mounts and
-embedded notices resolve as the sources name them, links the binary fully
-static and splits its debug companion: the td-editor and td-taskmgr shape,
-with a lock that lists only td-photo and td-ui. The system image
+crate with cargo on the source-built toolchain, staging the `td-civil`,
+`td-ui` and `td-compositor` trees beside it so the calendar resolves and
+the toolkit's `#[path]` mounts and embedded notices resolve as the
+sources name them, links the binary fully static and splits its debug
+companion: the td-editor and td-taskmgr shape, with a lock that lists
+only td-photo, td-civil and td-ui. The system image
 (`recipes/src/recipes/system-x86-64.rs`) copies the complete recipe output,
 companion included, into the immutable root and links `/bin/td-photo` to
 it; the tool is run from the terminal or from the launcher's Photos card,
 which the authority-mode compositor starts through fixed request 09 as the
 human, in the account home (td-authd/DESIGN.md). Either way it receives no
-authority, socket or credential of its own. Every retained file of the
-three trees moves the `td-photo-source` row of `seed/seed-digests.txt`;
-DESIGN.md is excluded from staging and from the hash.
+authority, socket or credential of its own. The four trees are a local
+source: their bytes are the checkout, re-derived on every run from the
+paths `seed/local-source-roster.txt` declares, so no committed digest
+moves when one of their files does; DESIGN.md is excluded from staging.
 
 The realized-output check `td-photo-test` requires and asserts the static
 binary, runs `--help` and an empty `--replay` on the target, then compiles

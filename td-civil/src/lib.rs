@@ -121,6 +121,14 @@ fn civil_from_days(days: i64) -> (i64, u8, u8) {
     )
 }
 
+/// [`unix_to_civil_utc`], or `None` outside roughly +/- 1,000,000 years
+/// instead of clamping, for a caller that must not show a wrong date.
+pub fn unix_to_civil_utc_checked(unix: i64) -> Option<Civil> {
+    (MIN_UNIX..=MAX_UNIX)
+        .contains(&unix)
+        .then(|| unix_to_civil_utc(unix))
+}
+
 /// Split a Unix timestamp into UTC civil fields. Inputs outside roughly
 /// +/- 1,000,000 years are clamped.
 pub fn unix_to_civil_utc(unix: i64) -> Civil {
@@ -1053,6 +1061,22 @@ mod tests {
         assert_eq!(format_rfc3339_utc(-1), "1969-12-31T23:59:59Z");
         assert_eq!(format_rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(format_rfc3339_utc(4_107_542_399), "2100-02-28T23:59:59Z");
+    }
+
+    #[test]
+    fn the_checked_split_refuses_what_the_plain_one_clamps() {
+        assert_eq!(unix_to_civil_utc_checked(0), Some(unix_to_civil_utc(0)));
+        assert_eq!(
+            unix_to_civil_utc_checked(MAX_UNIX),
+            Some(unix_to_civil_utc(MAX_UNIX))
+        );
+        assert_eq!(
+            unix_to_civil_utc_checked(MIN_UNIX),
+            Some(unix_to_civil_utc(MIN_UNIX))
+        );
+        assert_eq!(unix_to_civil_utc_checked(MAX_UNIX + 1), None);
+        assert_eq!(unix_to_civil_utc_checked(MIN_UNIX - 1), None);
+        assert_eq!(unix_to_civil_utc_checked(i64::MIN), None);
     }
 
     fn civil(y: i32, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> Civil {

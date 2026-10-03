@@ -6,12 +6,13 @@ description = "td's disk usage analyzer: a directory tree sorted by size over a 
 license = "GPL-3.0-or-later"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
-# a worktree nested under it (see the root Cargo.toml). The toolkit is the one
-# dependency, a sibling path in the one spelling the lock guard admits
-# (AGENTS.md 'Rust code').
+# a worktree nested under it (see the root Cargo.toml). Its dependencies are
+# td's civil calendar and the toolkit, sibling paths in the one spelling the
+# lock guard admits (AGENTS.md 'Rust code').
 [workspace]
 
 [dependencies]
+td-civil = { path = "../td-civil" }
 td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]

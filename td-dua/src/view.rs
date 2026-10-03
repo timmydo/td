@@ -197,20 +197,11 @@ pub fn percent(part: u64, whole: u64) -> String {
     format!("{:.1}%", part as f64 * 100.0 / whole as f64)
 }
 
-/// Seconds since the epoch as a UTC date, `YYYY-MM-DD`.
+/// Seconds since the epoch as a UTC date, `YYYY-MM-DD`, or question marks
+/// for an instant past the calendar's range of about a million years.
 pub fn date(seconds: i64) -> String {
-    // Howard Hinnant's days-to-civil.
-    let days = seconds.div_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
+    td_civil::unix_to_civil_utc_checked(seconds)
+        .map_or_else(|| "????-??-??".into(), |c| td_civil::format_ymd(&c))
 }
 
 /// A name as the list shows it: lossy UTF-8, each control character a
@@ -303,6 +294,9 @@ mod tests {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(951_782_400), "2000-02-29");
         assert_eq!(date(-86_400), "1969-12-31");
+        // Past the calendar's range, a placeholder of a date's width.
+        assert_eq!(date(i64::MAX), "????-??-??");
+        assert_eq!(date(i64::MIN), "????-??-??");
         assert_eq!(display_name(std::ffi::OsStr::new("a\nb")), "a?b");
     }
 

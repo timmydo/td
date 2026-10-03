@@ -202,27 +202,20 @@ fn permissions(kind: char, mode: u32) -> String {
     text
 }
 
-// Gregorian civil conversion, also used in td-news/civil.rs. Dividing seconds
-// first bounds every intermediate even for the full signed timestamp range.
+/// A modification time to the minute in UTC, or question marks for a year
+/// a four-digit field cannot show.
 fn timestamp(seconds: i64) -> String {
-    let z = seconds.div_euclid(86_400) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    if !(0..=9999).contains(&year) {
-        return "????-??-?? ??:??Z".into();
+    match td_civil::unix_to_civil_utc_checked(seconds) {
+        Some(c) if (0..=9999).contains(&c.year) => {
+            format!(
+                "{} {:02}:{:02}Z",
+                td_civil::format_ymd(&c),
+                c.hour,
+                c.minute
+            )
+        }
+        _ => "????-??-?? ??:??Z".into(),
     }
-    let time = seconds.rem_euclid(86_400);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}Z",
-        time / 3600,
-        time / 60 % 60
-    )
 }
 
 /// None delegates to the existing regular/missing-file adapter. Final symlinks

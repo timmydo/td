@@ -50,9 +50,10 @@ unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
 # td's own crates, by the one sibling-dependency spelling the lock guard
-# admits (AGENTS.md 'Rust code'): the fetch service's client, JSON, TOML
-# and the shared UI toolkit.
+# admits (AGENTS.md 'Rust code'): the civil calendar, the fetch service's
+# client, JSON, TOML and the shared UI toolkit.
 [dependencies]
+td-civil = { path = "../td-civil" }
 td-fetch-client = { path = "../td-fetch-client" }
 td-json = { path = "../td-json" }
 td-toml = { path = "../td-toml" }

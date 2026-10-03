@@ -4763,14 +4763,16 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// `workspace_exemption_requires_no_distribution_recipe` holds, and a crate
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
-/// whole list without the list changing. td-mta reads
-/// td-crypto and td-json, its direct dependencies. td-agent reads td-fetch-client,
-/// td-json, td-toml and td-ui, its dependencies, and td-compositor, the test tool its
-/// `native-compositor-tests` opt-in builds (td-agent/DESIGN.md §17).
+/// whole list without the list changing. td-mta reads td-crypto and td-json,
+/// its direct dependencies. td-agent reads td-civil, td-fetch-client,
+/// td-json, td-toml and td-ui, its dependencies, and td-compositor, the test
+/// tool its `native-compositor-tests` opt-in builds (td-agent/DESIGN.md
+/// §17).
 const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
     (
         "td-agent",
         &[
+            "td-civil",
             "td-compositor",
             "td-fetch-client",
             "td-json",
@@ -9075,9 +9077,10 @@ mod tests {
             }
             manifest
         };
-        let all_deps = ["td-fetch-client", "td-json", "td-toml", "td-ui"];
+        let all_deps = ["td-civil", "td-fetch-client", "td-json", "td-toml", "td-ui"];
         for name in [
             "td-agent",
+            "td-civil",
             "td-compositor",
             "td-fetch-client",
             "td-json",
@@ -9112,7 +9115,7 @@ mod tests {
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
         // An edge lost is a changed set too.
         std::fs::write(root.join("td-agent/src/lib.rs"), "").unwrap();
-        std::fs::write(root.join("td-agent/Cargo.toml"), deps(&all_deps[..3])).unwrap();
+        std::fs::write(root.join("td-agent/Cargo.toml"), deps(&all_deps[..4])).unwrap();
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
     }
 

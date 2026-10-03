@@ -858,7 +858,7 @@ pub fn roll_folder(taken: Option<&str>) -> String {
     match (shaped, date, time) {
         (true, (Some(year), Some(month), Some(day)), (Some(hour), Some(minute), Some(second)))
             if (1900..=2999).contains(&year)
-                && (1..=days_in(year, month)).contains(&day)
+                && days_in(year, month).is_some_and(|days| (1..=days).contains(&day))
                 && hour < 24
                 && minute < 60
                 && second < 60 =>
@@ -871,15 +871,9 @@ pub fn roll_folder(taken: Option<&str>) -> String {
 
 /// Days in a month of the Gregorian calendar, none for a month there is
 /// not.
-fn days_in(year: u32, month: u32) -> u32 {
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    }
+fn days_in(year: u32, month: u32) -> Option<u32> {
+    let days = td_civil::days_in_month(i32::try_from(year).ok()?, u8::try_from(month).ok()?)?;
+    Some(u32::from(days))
 }
 
 /// `DateTimeOriginal` from a TIFF-shaped file's Exif IFD, when it has one.

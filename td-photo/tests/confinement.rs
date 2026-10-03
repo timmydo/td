@@ -2,10 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 //! Source-level contracts the compiler cannot express: the crate's file
-//! inventory, that it forbids `unsafe` and declares the toolkit as its one
-//! dependency, that its pure modules reach no file, environment, clock,
-//! network or process and the window opens no file, which files name which
-//! toolkit modules, that photo pixels reach a frame through one blitter,
+//! inventory, that it forbids `unsafe` and declares the calendar and the
+//! toolkit as its only dependencies, that its pure modules reach no file,
+//! environment, clock, network or process and the window opens no file,
+//! which files name which toolkit modules, that photo pixels reach a frame through one blitter,
 //! and the budgets DESIGN.md names, by value.
 
 use std::collections::BTreeSet;
@@ -111,15 +111,17 @@ fn the_crate_forbids_unsafe_and_includes_nothing() {
 }
 
 #[test]
-fn the_manifest_declares_the_toolkit_alone_and_joins_the_gate() {
+fn the_manifest_declares_the_calendar_and_the_toolkit_and_joins_the_gate() {
     let manifest = read("Cargo.toml");
     assert!(manifest.contains("[workspace]\n"), "own workspace root");
-    // The one sibling, in the one spelling the lock guard admits.
+    // The two siblings, in the one spelling the lock guard admits.
     assert!(
-        manifest.contains("\n[dependencies]\ntd-ui = { path = \"../td-ui\" }\n"),
-        "the toolkit by path"
+        manifest.contains(
+            "\n[dependencies]\ntd-civil = { path = \"../td-civil\" }\ntd-ui = { path = \"../td-ui\" }\n"
+        ),
+        "the civil calendar and the toolkit by path"
     );
-    assert_eq!(manifest.matches("path =").count(), 1, "one dependency");
+    assert_eq!(manifest.matches("path =").count(), 2, "two dependencies");
     assert_eq!(manifest.matches("[dependencies]").count(), 1);
     assert!(!manifest.contains("[dev-dependencies]"));
     assert!(!manifest.contains("[build-dependencies]"));
@@ -144,7 +146,8 @@ fn the_manifest_declares_the_toolkit_alone_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 2);
+    assert_eq!(lock.matches("[[package]]").count(), 3);
+    assert!(lock.contains("name = \"td-civil\""));
     assert!(lock.contains("name = \"td-photo\""));
     assert!(lock.contains("name = \"td-ui\""));
     assert!(!lock.contains("source ="), "no registry or git source");
@@ -172,6 +175,18 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
             "SystemTime",
         ] {
             assert!(!text.contains(forbidden), "{name} names {forbidden}");
+        }
+        // td-civil also reads the clock and the zone file: a pure module
+        // names only its pure month length, by full path.
+        for hidden in ["use td_civil", "td_civil::{", "td_civil as"] {
+            assert!(!text.contains(hidden), "{name}: {hidden}");
+        }
+        for (at, _) in text.match_indices("td_civil::") {
+            let used: String = text[at + "td_civil::".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert_eq!(used, "days_in_month", "{name} names td_civil::{used}");
         }
     }
     // `main` is the one module that opens files and reads the clock, and it

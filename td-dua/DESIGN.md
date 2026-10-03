@@ -221,8 +221,8 @@ in both crate roots, that `app.rs`, `tree.rs`, `treemap.rs` and `view.rs`
 reach no system interface (and use no grouped `std::{` import that would
 hide one from the scan), that only `delete.rs` removes and nothing
 writes, renames or changes permissions, that deletion reads the mount
-table and never calls `remove_dir_all`, and that the manifest's one
-dependency is td-ui.
+table and never calls `remove_dir_all`, and that the manifest's
+dependencies are td-civil (the modified date) and td-ui.
 
 ## Tests
 

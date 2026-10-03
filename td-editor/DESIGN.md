@@ -1082,10 +1082,11 @@ td-compositor/assets/unifont-OFL-1.1.txt
 ```
 
 The target recipe `td-editor` (`recipes/src/recipes/td-editor.rs`) builds
-the crate with cargo on the source-built toolchain, staging the `td-ui` and
-`td-compositor` trees beside it so those five files arrive as the sources
-above name them, links the binary fully static and splits its debug
-companion. The system image (`recipes/src/recipes/system-x86-64.rs`)
+the crate with cargo on the source-built toolchain, staging the
+`td-civil`, `td-ui` and `td-compositor` trees beside it so the calendar
+resolves and those five files arrive as the sources above name them,
+links the binary fully static and splits its debug companion. The system
+image (`recipes/src/recipes/system-x86-64.rs`)
 copies the complete recipe output, companion included, into the immutable
 root and links `/bin/td-editor` to it, as it does td-photo's; the editor
 is run from the terminal or from the launcher's Text Editor card, which
@@ -1283,7 +1284,8 @@ moved out of it, named from the repository root:
 Version 1 shared `font.rs`, `font_data.rs` and `wire.rs` through explicit
 source-module paths, as td-portal still does. Those mounts now live in
 `td-ui`, the shared UI toolkit (`td-ui/DESIGN.md`), which td-editor names as
-the sibling path dependency `td-ui = { path = "../td-ui" }`; the crate root
+the sibling path dependency `td-ui = { path = "../td-ui" }` (its other
+one, td-civil, dates the directory listing); the crate root
 re-exports `td_ui::font` and `td_ui::wire`, so the editor neither copies
 those modules nor depends on the compositor binary, and mounts no source of
 its own. The keymap compiler, the held-key repeat policy and the pointer
@@ -1313,9 +1315,10 @@ the control socket, replay, spelling, the prompts and `preview`, the fixed
 reference-renderer frame over the shared scene. The source bundle is the td
 git checkout; `cargo build --manifest-path td-editor/Cargo.toml` builds the
 standalone binary without an installed td system, resolving td-ui offline
-from the checkout. The target recipe must stage the td-ui tree beside this
-one (the cargo `local_source_trees` shape td-net uses; a flat direct-rustc
-staging cannot link a second crate) with the shared sources and licenses
+from the checkout. The target recipe must stage the td-ui and td-civil
+trees beside this one (the cargo `local_source_trees` shape td-net uses;
+a flat direct-rustc staging cannot link a second crate) with the shared
+sources and licenses
 td-ui mounts, and td-ui and shared-source changes must select editor tests in
 affected-checks, which they do through the reader graph. A future move of a
 shared file updates staging, check mappings and all consumers atomically.

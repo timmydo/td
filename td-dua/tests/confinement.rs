@@ -20,7 +20,7 @@ fn production(name: &str) -> String {
     text.split("#[cfg(test)]").next().unwrap().to_owned()
 }
 
-const FILES: [&str; 10] = [
+const FILES: &[&str] = &[
     "app.rs",
     "delete.rs",
     "lib.rs",
@@ -35,7 +35,7 @@ const FILES: [&str; 10] = [
 
 /// Files that hold the tree, the list, the treemap and the window's state
 /// and reach nothing but memory.
-const PURE: [&str; 4] = ["app.rs", "tree.rs", "treemap.rs", "view.rs"];
+const PURE: &[&str] = &["app.rs", "tree.rs", "treemap.rs", "view.rs"];
 
 #[test]
 fn the_source_inventory_is_closed() {
@@ -45,7 +45,7 @@ fn the_source_inventory_is_closed() {
         .collect();
     assert_eq!(
         found.iter().map(String::as_str).collect::<BTreeSet<_>>(),
-        FILES.into_iter().collect()
+        FILES.iter().copied().collect()
     );
     assert!(!root().join("build.rs").exists());
     for name in ["lib.rs", "main.rs"] {
@@ -55,7 +55,7 @@ fn the_source_inventory_is_closed() {
 
 #[test]
 fn pure_files_reach_no_system() {
-    for name in PURE {
+    for &name in PURE {
         let text = production(name);
         for denied in [
             // A grouped import would hide the paths below from this scan.
@@ -88,7 +88,7 @@ fn pure_files_reach_no_system() {
 
 #[test]
 fn only_the_deletion_module_removes() {
-    for name in FILES {
+    for &name in FILES {
         let text = production(name);
         for removal in [
             "remove_file",
@@ -108,8 +108,30 @@ fn only_the_deletion_module_removes() {
     assert!(production("delete.rs").contains("/proc/self/mountinfo"));
 }
 
+/// td-civil also reads the clock and the zone file, so a pure file may name
+/// only the calendar's pure functions it uses, each by full path.
 #[test]
-fn the_manifest_names_only_the_toolkit() {
+fn pure_files_take_only_the_calendar_from_td_civil() {
+    for &name in PURE {
+        let text = production(name);
+        for hidden in ["use td_civil", "td_civil::{", "td_civil as"] {
+            assert!(!text.contains(hidden), "{name}: {hidden}");
+        }
+        for (at, _) in text.match_indices("td_civil::") {
+            let used: String = text[at + "td_civil::".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                ["format_ymd", "unix_to_civil_utc_checked"].contains(&used.as_str()),
+                "{name} names td_civil::{used}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_manifest_names_the_calendar_and_the_toolkit() {
     let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap();
     let deps: Vec<&str> = manifest
         .split("[dependencies]")
@@ -119,5 +141,19 @@ fn the_manifest_names_only_the_toolkit() {
         .take_while(|line| !line.starts_with('['))
         .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
         .collect();
-    assert_eq!(deps, ["td-ui = { path = \"../td-ui\" }"]);
+    assert_eq!(
+        deps,
+        [
+            "td-civil = { path = \"../td-civil\" }",
+            "td-ui = { path = \"../td-ui\" }"
+        ]
+    );
+    let lock = std::fs::read_to_string(root().join("Cargo.lock")).unwrap();
+    let names: Vec<&str> = lock
+        .lines()
+        .filter_map(|line| line.strip_prefix("name = \""))
+        .filter_map(|rest| rest.strip_suffix('"'))
+        .collect();
+    assert_eq!(names, ["td-civil", "td-dua", "td-ui"]);
+    assert!(!lock.contains("source ="), "no registry or git source");
 }

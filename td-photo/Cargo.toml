@@ -6,12 +6,14 @@ description = "td's photo tool: imports a card of Nikon raw files into dated rol
 license = "GPL-3.0-or-later"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
-# a worktree nested under it (see the root Cargo.toml). The toolkit is the one
-# dependency, a sibling path in the one spelling the lock guard admits
-# (AGENTS.md 'Rust code'); the confinement tests pin that it is the only one.
+# a worktree nested under it (see the root Cargo.toml). Its dependencies are
+# td's civil calendar and the toolkit, sibling paths in the one spelling the
+# lock guard admits (AGENTS.md 'Rust code'); the confinement tests pin that
+# they are the only ones.
 [workspace]
 
 [dependencies]
+td-civil = { path = "../td-civil" }
 td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]

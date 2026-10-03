@@ -6,11 +6,16 @@ version = 4
 name = "td-agent"
 version = "0.1.0"
 dependencies = [
+ "td-civil",
  "td-fetch-client",
  "td-json",
  "td-toml",
  "td-ui",
 ]
+
+[[package]]
+name = "td-civil"
+version = "0.1.0"
 
 [[package]]
 name = "td-fetch-client"
