@@ -61,6 +61,13 @@ domains; they do not measure allocator overhead or every realloc transient.
 Increasing these entries does not qualify service admission or RSS. M07e must
 still account for those costs and concurrent owners within the ledger.
 
+M06n's generated Unicode arrays have a checked 58720-byte compiled payload.
+They are presently linked only by tests. Their eventual runtime static data
+belongs to the existing process/allocator allowance. Slice metadata,
+accessor code and mapped-page rounding are excluded from this payload count
+and also belong within that allowance. No new arena or RSS qualification
+follows from this payload count.
+
 ## Slot composition and ownership
 
 - SMTP: bounded headers, 320 bytes per envelope recipient, 64 KiB I/O and

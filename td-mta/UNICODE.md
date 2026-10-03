@@ -2,8 +2,8 @@
 
 This is td-mta's approved upstream data dependency. It adds no Cargo crate,
 runtime file dependency, network fetch during a build, or Unicode library.
-M06m supplies committed inputs and cold verification tooling. The std-only
-generator, generated Rust tables and normalizer remain separate M06 work.
+M06m supplies committed inputs and cold verification tooling; M06n generates
+compact tables reproducibly. Runtime lookup and normalization remain open.
 
 ## Inputs
 
@@ -48,10 +48,45 @@ success it reports each filename, byte count and digest; output errors also
 fail the command and may leave partial output. It writes no source files.
 These source copies and tool are outside the service executable and its
 memory plan.
-Regeneration commands, generated tables, official NFC equations and the
-normalizer are still unimplemented; input verification is not conformance.
+Input verification and table generation do not establish NFC conformance.
 
 ## Generated tables
+
+The cold examples/unicode_generate.rs tool first verifies the complete corpus,
+then emits deterministic Rust source on stdout. It does not write a source
+file itself. Capture a candidate from the repository root:
+
+```text
+.td-build-cache/crypto-target/x86_64-unknown-linux-gnu/debug/examples/unicode_generate td-mta/unicode/17.0.0 > td-mta/unicode/tables.rs.candidate
+```
+
+Check the command succeeds and review the candidate before replacing
+unicode/tables.rs. Shell redirection creates or truncates the candidate
+before verification; any failure can leave it empty or partly written.
+
+The generator runs offline and does not invoke a formatter. The emitted
+source already matches the repository's default formatting. The ordinary
+test suite compares fresh output byte for byte with the committed file,
+compiles the tables, and checks ordering, scalar values, offsets, class
+count and payload size. The full license notice is retained as comments in
+the generated source.
+
+The current tables contain 2081 decomposition entries (u32 scalar, u16 offset,
+u8 length), 3450 u32 decomposed scalars, 403 combining-class ranges (u32 start,
+u32 end, u8 class), 961 composition triples (three u32 scalars) and 1488 simple
+lowercase pairs (two u32 scalars). Their compiled array payload totals 58720
+bytes on the initial target layout. Slice descriptors, code and mapped-page
+rounding are separate. These tables are compiled by tests only in M06n;
+runtime lookup and algorithmic Hangul remain separate work. Their eventual
+static payload fits within the existing process allowance in RESOURCES.md.
+
+Decomposition entries are fully recursively expanded, without canonical
+reordering. The normalizer must still order combining classes and compose.
+Expansion uses an explicit cold work stack with cycle detection and rejects
+more than four output scalars. Composition pairs come from the original
+two-scalar mappings before expansion, with Full_Composition_Exclusion applied.
+The source interpretation follows Unicode 17's UAX #15 revision 57 and UAX #44
+revision 36. No ambient Rust or host Unicode tables are consulted.
 
 Generate sorted compact arrays for canonical decomposition, nonzero canonical
 combining class, canonical composition, and simple lowercase mapping.
@@ -73,8 +108,8 @@ source has 55 distinct nonzero combining classes; verify that count during
 generation as an additional bound on the replay policy below. No build script
 downloads or regenerates tables on an ordinary cargo build. Commit generated
 tables and compare fresh offline generator output byte for byte in the owning
-gate. Their static bytes fit the existing process allowance in RESOURCES.md;
-M06 records actual size before enabling an implementation.
+gate. Runtime integration must retain the static payload accounting above
+within the existing process allowance in RESOURCES.md.
 
 Use simple lowercase from this pin for POLICY.md's default comparison/search.
 Do not substitute Rust's evolving Unicode tables or claim full case folding,

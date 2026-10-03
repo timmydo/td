@@ -1273,17 +1273,23 @@ Initial independently landable increments:
   a built example provides explicit verification. No runtime data or new
   Cargo dependency is added. Generation and normalization remain open.
 
+- **M06n — reproducible Unicode tables:** implement offline source parsing,
+  checked First/Last ranges, iterative canonical expansion, composition
+  exclusions, class ranges and simple lowercase mappings. Emit licensed Rust
+  tables with stable formatting and verify exact regeneration, malformed
+  inputs, scalar/offset bounds and the 58720-byte compiled array payload.
+  Runtime lookup, Hangul and complete NFC equations remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
 deterministic MIME serialization for structured outgoing email, including
 attachment streaming, boundary generation through Entropy, reply headers and
-Bcc separation. Add the std-only generator, committed compact tables,
-reproducibility gate and every official NFC vector from UNICODE.md's
-verified offline corpus. Implement the fixed-memory fast/resident-replay
+Bcc separation. Use the committed tables in bounded runtime lookups and run
+every official NFC vector. Implement the fixed-memory fast/resident-replay
 algorithm with charged work. Search case mappings come from the same pin. No
 allocating library or ambient Unicode version may replace these contracts.
-Record static table size within process headroom.
+Retain static table accounting within the process allowance.
 
 **Acceptance:** fragmented input, nested multiparts, malformed encodings, huge
 headers, cyclic-looking boundary data and unsupported charsets do not panic or
