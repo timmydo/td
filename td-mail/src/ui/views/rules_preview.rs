@@ -64,11 +64,35 @@ impl View for RulesPreviewView {
             // The terminal's n and p, a line each; no unread to go to here.
             Key::Char('n') => ViewAction::Scroll(Scroll::Lines(1)),
             Key::Char('p') => ViewAction::Scroll(Scroll::Lines(-1)),
+            Key::Char('?') => ViewAction::ShowKeys,
             _ => ViewAction::Continue,
         }
     }
 
     fn on_response(&mut self, _response: &BackendResponse) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `?` asks the window for its key list.
+    #[test]
+    fn question_mark_shows_the_keys() {
+        let mut view = RulesPreviewView::new(
+            "INBOX".to_string(),
+            RulesDryRunResult {
+                scanned: 0,
+                matched_rules: 0,
+                actions: 0,
+                entries: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            view.handle_key(Key::Char('?'), 10),
+            ViewAction::ShowKeys
+        ));
     }
 }

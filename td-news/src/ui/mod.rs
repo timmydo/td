@@ -1,12 +1,12 @@
 //! The reader's views over the widget window: the toolkit's lists for
 //! the feeds, the articles and an article's links, td-ui's read-only editor
-//! document pane for an article, a log window and the help, a search
-//! field, an action bar and a status row, laid out over the surface each
-//! frame. The window owns the Wayland connection; the app owns every view
-//! and the pane's controller. A press in the pane is handed on at the
-//! pointer's pixel as both the caret and the cell coordinate, as the
-//! toolkit's replay does, so the caret lands before the glyph under the
-//! pointer rather than at its nearer edge.
+//! document pane for an article and a log window, a search field, an
+//! action bar and a status row, laid out over the surface each frame.
+//! The window owns the Wayland connection and the key list `?` asks it
+//! to show; the app owns every view and the pane's controller. A press
+//! in the pane is handed on at the pointer's pixel as both the caret and
+//! the cell coordinate, as the toolkit's replay does, so the caret lands
+//! before the glyph under the pointer rather than at its nearer edge.
 
 mod input;
 pub mod views;
@@ -23,6 +23,7 @@ use td_ui::chrome::{Bar, Field, Item, List, Status, Strip, TabHit, TextEntry, RO
 use td_ui::editor::{Controller, Event, Outcome, PointerPhase as PanePhase};
 use td_ui::editor_clipboard::Snapshot;
 use td_ui::editor_model::TabId;
+use td_ui::keys::Section;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::window::{Clipboard, Input, PointerPhase};
 
@@ -55,7 +56,6 @@ enum View {
     ArticleList,
     Article,
     Log,
-    Help,
 }
 
 #[derive(Clone)]
@@ -118,7 +118,6 @@ enum PaneText {
         columns: usize,
         total: Option<usize>,
     },
-    Help,
 }
 
 /// The action bar's labels for a view, and the key each stands for; a
@@ -184,8 +183,6 @@ const LOG_KEYS: &[Key] = &[
     Key::Char('d'),
     Key::Char('?'),
 ];
-const HELP_LABELS: &[&str] = &["Back"];
-const HELP_KEYS: &[Key] = &[Key::Char('q')];
 
 /// The frame's regions, laid out over the surface for the view: the
 /// action bar, then the view's body between it and the status row.
@@ -200,8 +197,8 @@ struct Layout {
 
 struct App {
     view: View,
-    /// The view the help returns to.
-    help_from: View,
+    /// Whether `?` asked the window to show its key list.
+    show_keys: bool,
     feeds: Vec<FeedRow>,
     selected_feed: usize,
     feed_first: usize,
@@ -242,7 +239,7 @@ struct App {
     url_first: usize,
     pending_user_fetches: usize,
     pending_read_mutations: HashMap<String, bool>,
-    /// The document pane, read-only: an article, a log window or the help.
+    /// The document pane, read-only: an article or a log window.
     pane: Controller,
     pane_tab: Option<TabId>,
     pane_text: PaneText,
@@ -293,7 +290,7 @@ impl App {
         let pane = Controller::pane().map_err(|e| format!("document pane: {e}"))?;
         Ok(Self {
             view: View::FeedList,
-            help_from: View::FeedList,
+            show_keys: false,
             feeds,
             selected_feed: 0,
             feed_first: 0,
@@ -597,8 +594,7 @@ impl App {
     }
 
     fn pane_shown(&self) -> bool {
-        matches!(self.view, View::Help | View::Log)
-            || (self.view == View::Article && !self.url_picking)
+        self.view == View::Log || (self.view == View::Article && !self.url_picking)
     }
 
     /// A chord: one of the reader's keys, or the pane's when one is shown.
@@ -618,10 +614,9 @@ impl App {
         cache: &Cache,
         cmd_tx: &mpsc::Sender<BackendCommand>,
     ) {
-        if key == Key::Char('?') && self.view != View::Help && !self.search_mode {
-            self.help_from = self.view;
-            self.view = View::Help;
-            self.pending_redraw = true;
+        // The window shows the key list over whatever view is up.
+        if key == Key::Char('?') && !self.search_mode {
+            self.show_keys = true;
             return;
         }
         if self.search_mode {
@@ -650,14 +645,6 @@ impl App {
             View::ArticleList => self.handle_article_list_keys(key, cache, cmd_tx),
             View::Article => self.handle_article_view_keys(key, chord, cache, cmd_tx),
             View::Log => self.handle_log_keys(key),
-            View::Help => {
-                if key == Key::Char('q') {
-                    self.view = self.help_from;
-                    self.pending_redraw = true;
-                } else {
-                    self.pane_key(key, chord);
-                }
-            }
         }
     }
 
@@ -1077,7 +1064,7 @@ impl App {
                     self.open_url(index);
                 }
             }
-            View::Log | View::Help => {}
+            View::Log => {}
         }
     }
 
@@ -1088,7 +1075,7 @@ impl App {
             View::FeedList => self.move_feed(rows),
             View::ArticleList => self.move_article(rows),
             View::Article if self.url_picking => self.move_url(rows),
-            View::Article | View::Help => self.pane_scroll(rows),
+            View::Article => self.pane_scroll(rows),
             View::Log => self.scroll_log(rows),
         }
     }
@@ -1109,9 +1096,9 @@ impl App {
 
     /// Points the pane's underline at the link under the hover point,
     /// where a Control-press would follow it (`follow_link`): with the
-    /// mouse on, in an article's or the help's text in the pane.
+    /// mouse on, in an article's text in the pane.
     fn underline_link(&mut self) {
-        let open = self.mouse_config && matches!(self.view, View::Article | View::Help);
+        let open = self.mouse_config && self.view == View::Article;
         let mut at = self.hover.filter(|_| open);
         if let Some((x, y)) = at {
             let layout = self.layout();
@@ -1131,8 +1118,8 @@ impl App {
     /// the selection and a drag are untouched: whether it was over one.
     fn follow_link(&mut self, x: i64, y: i64) -> bool {
         // The log's lines are cut at the pane's width, which can cut a link
-        // short: only an article's and the help's text is whole.
-        if !matches!(self.view, View::Article | View::Help) {
+        // short: only an article's text is whole.
+        if self.view != View::Article {
             return false;
         }
         let layout = self.layout();
@@ -1283,6 +1270,16 @@ impl App {
 
     // ---- the frame -------------------------------------------------------
 
+    /// The key list the window shows, the view the reader is in first.
+    fn key_sections(&self) -> Vec<Section> {
+        keybindings::sections(match self.view {
+            View::FeedList => keybindings::FEEDS,
+            View::ArticleList => keybindings::ARTICLES,
+            View::Article => keybindings::ARTICLE,
+            View::Log => keybindings::LOG,
+        })
+    }
+
     fn labels(&self) -> &'static [&'static str] {
         match self.view {
             View::FeedList => FEED_LABELS,
@@ -1290,7 +1287,6 @@ impl App {
             View::Article if self.url_picking => LINKS_LABELS,
             View::Article => ARTICLE_LABELS,
             View::Log => LOG_LABELS,
-            View::Help => HELP_LABELS,
         }
     }
 
@@ -1301,7 +1297,6 @@ impl App {
             View::Article if self.url_picking => LINKS_KEYS,
             View::Article => ARTICLE_KEYS,
             View::Log => LOG_KEYS,
-            View::Help => HELP_KEYS,
         }
     }
 
@@ -1348,7 +1343,7 @@ impl App {
                 layout.list = List::new(surface, rest);
             }
             View::Article if self.url_picking => layout.list = List::new(surface, body),
-            View::Article | View::Help => layout.pane = pane_rect(body),
+            View::Article => layout.pane = pane_rect(body),
             View::Log => {
                 let (tabs, rest) = band(body);
                 if tabs.height == row {
@@ -1401,7 +1396,7 @@ impl App {
                         margin,
                     );
                 }
-                View::Log | View::Help => {}
+                View::Log => {}
             }
         }
         if let Some(field) = layout.search {
@@ -1445,11 +1440,6 @@ impl App {
                     let text = text
                         .unwrap_or_else(|| format!("Could not read {}", self.log_path().display()));
                     self.set_pane_text(key, &text);
-                }
-            }
-            View::Help => {
-                if self.pane_text != PaneText::Help {
-                    self.set_pane_text(PaneText::Help, &help_text());
                 }
             }
             View::FeedList | View::ArticleList => {}
@@ -1535,7 +1525,7 @@ impl App {
                     format!("{scope}: {shown} matching · {}", self.status)
                 }
             }
-            View::FeedList | View::Help => self.status.clone(),
+            View::FeedList => self.status.clone(),
         }
     }
 
@@ -1603,7 +1593,7 @@ impl App {
                     shown.push((url.clone(), format!("[{}]", index + 1), false));
                 }
             }
-            View::Log | View::Help => {}
+            View::Log => {}
         }
         shown
     }
@@ -1665,7 +1655,7 @@ impl App {
                 self.filtered_article_indices().len(),
             ),
             View::Article => (self.url_first, self.url_cursor, self.article_urls.len()),
-            View::Log | View::Help => (0, 0, 0),
+            View::Log => (0, 0, 0),
         }
     }
 
@@ -2356,34 +2346,6 @@ fn article_text(article: &Article, urls: &[String], columns: usize) -> String {
     text
 }
 
-/// The help as the pane shows it.
-fn help_text() -> String {
-    let mut text = String::from("Keys\n\n");
-    for (label, items) in [
-        ("Everywhere", keybindings::GLOBAL),
-        ("Feeds", keybindings::FEED_LIST),
-        ("Articles", keybindings::ARTICLE_LIST),
-        ("Article", keybindings::ARTICLE_VIEW),
-        ("Log", keybindings::LOG_VIEW),
-    ] {
-        text.push_str(label);
-        text.push('\n');
-        for item in items {
-            text.push_str("  ");
-            text.push_str(item);
-            text.push('\n');
-        }
-        text.push('\n');
-    }
-    text.push_str("Mouse\n");
-    for item in keybindings::MOUSE {
-        text.push_str("  ");
-        text.push_str(item);
-        text.push('\n');
-    }
-    text
-}
-
 /// Detect markdown reference link definitions like `[1]: https://example.com`
 /// the renderer emits, so we can strip them from rendered output.
 fn is_reference_link_def(line: &str) -> bool {
@@ -2930,12 +2892,10 @@ pub(super) mod tests {
         assert_eq!(app.selected_feed, last);
         press(&mut app, 10, row(last + 1).y + 3);
         assert_eq!(app.selected_feed, last, "below the last row");
-        // The bar's "Help" is the `?` key, and the help's "Back" its `q`.
+        // The bar's "Help" is the `?` key, which asks for the key list.
         let help = layout.bar.header(4).expect("help label");
         press(&mut app, help.x + 2, help.y + 2);
-        assert_eq!(app.view, View::Help);
-        let back = app.layout().bar.header(0).expect("back label");
-        press(&mut app, back.x + 2, back.y + 2);
+        assert!(std::mem::take(&mut app.show_keys));
         assert_eq!(app.view, View::FeedList);
         app.mouse_config = false;
         press(&mut app, 10, row(0).y + 3);
@@ -3285,7 +3245,7 @@ pub(super) mod tests {
         let config = test_config();
         let (cmd_tx, _cmd_rx) = mpsc::channel();
         let mut app = App::new(&config, &cache, true).expect("app");
-        app.set_pane_text(PaneText::Help, "x\u{7f}y");
+        app.set_pane_text(PaneText::NoArticle, "x\u{7f}y");
         let tab = app.pane_tab.expect("loaded");
         let document = app.pane.editor().document(tab).expect("document");
         assert_eq!(document.text(), "x\u{fffd}y");
@@ -3426,10 +3386,10 @@ pub(super) mod tests {
         let text = shown(&mut app);
         assert!(text.contains(&format!("{FEED_NAME}: 1 articles")), "{text}");
         // A selection past the clipboard's ceiling is refused before the
-        // clipboard is asked, with the reason: the help's pane, holding
-        // a text that long for the chord.
-        key(&mut app, "?");
-        assert_eq!(app.view, View::Help);
+        // clipboard is asked, with the reason: the article's pane, holding
+        // a text that long until the next frame.
+        key(&mut app, "Return");
+        assert_eq!(app.view, View::Article);
         app.set_pane_text(
             PaneText::NoArticle,
             &"x".repeat(td_ui::editor_clipboard::MAX_BYTES + 1),
@@ -3443,10 +3403,9 @@ pub(super) mod tests {
             "{text}"
         );
         // A repeat of the chord, a held key, asks the clipboard nothing:
-        // the clipboard takes a selection at a press only.
-        key(&mut app, "q");
-        key(&mut app, "Return");
-        assert_eq!(app.view, View::Article);
+        // the clipboard takes a selection at a press only. The frame
+        // above put the article back in the pane.
+        assert!(matches!(app.pane_text, PaneText::Article { .. }));
         key(&mut app, "C-a");
         app.input(
             Input::Key {

@@ -93,6 +93,10 @@ impl Handler for Session {
     fn notice(&mut self, message: &str) {
         eprintln!("td-dua: window: {message}");
     }
+
+    fn keys(&self) -> Vec<td_ui::keys::Section> {
+        self.app.key_list()
+    }
 }
 
 /// Runs the analyzer over `root` on the compositor the environment names

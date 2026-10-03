@@ -4,8 +4,199 @@
 //! asked for them, as the window requires.
 
 use super::*;
+use td_ui::keys::Section;
+
+/// A section's rows, `(keys, what)`.
+type Rows = &'static [(&'static str, &'static str)];
+
+/// The key list's sections, as the handlers below bind the keys: each
+/// mode's and focus's, titled, in the order the list shows them when none
+/// is current.
+const SECTIONS: &[(&str, Rows)] = &[
+    (
+        "Key prompt",
+        &[
+            ("Return", "go on, with the PIN when one is asked"),
+            ("Escape", "decline"),
+            ("C-v", "paste the PIN"),
+        ],
+    ),
+    ("Question", confirmations::KEYS),
+    (
+        "Swap on storage",
+        &[
+            ("Return", "ask again whether to open over swap on storage"),
+            ("C-q", "quit"),
+        ],
+    ),
+    // Opening, locking, or refused with td mode's reason.
+    ("Not open", &[("C-q", "quit")]),
+    (
+        "Finder",
+        &[
+            ("Up/Down", "select the entry above or below"),
+            ("PageUp/PageDown", "select a page away"),
+            ("Home/End", "select the first or last entry"),
+            ("Return", "open the selected folder, or choose the file"),
+            ("C-Return", "choose the listed folder, or the selected file"),
+            ("Backspace", "delete a filter character, or go up"),
+            ("M-Up", "go to the parent folder"),
+            ("Escape", "close the finder"),
+            ("C-l", "close the finder and lock"),
+            ("C-q", "close the finder and quit"),
+            ("characters", "filter the listing"),
+        ],
+    ),
+    (
+        "Locked",
+        &[
+            ("Up/Down", "select a key"),
+            ("PageUp/PageDown", "select a page away"),
+            ("Home/End", "select the first or last key"),
+            (
+                "Return",
+                "unlock with the selected key, or create a notebook",
+            ),
+            ("C-o", "import an encrypted copy, with no notebook"),
+            ("C-q", "quit"),
+        ],
+    ),
+    (
+        "Importing a copy",
+        &[
+            ("Up/Down", "select the key to import with"),
+            ("Return", "import the copy with the selected key"),
+            ("Escape/C-l", "give the copy up"),
+            ("C-q", "quit"),
+        ],
+    ),
+    (
+        "Keys view",
+        &[
+            ("Up/Down", "select a key"),
+            ("Space", "mark or unmark the key for replacing"),
+            ("Return", "use the selected key for saves"),
+            ("Insert", "add a backup key"),
+            ("Delete", "replace the marked keys, or the selected one"),
+            ("C-e", "export an encrypted copy"),
+            ("Escape/C-k", "close the keys view"),
+            ("C-l", "lock"),
+            ("C-q", "quit"),
+        ],
+    ),
+    (
+        "Notebook",
+        &[
+            ("C-s", "save the entry"),
+            ("C-n", "new entry"),
+            ("F2", "rename the entry"),
+            ("C-f", "find in the entry"),
+            ("C-k", "show the keys view"),
+            ("F6/S-F6", "move the focus forward or back"),
+            ("C-l", "lock"),
+            ("C-q", "quit"),
+        ],
+    ),
+    (
+        "Search",
+        &[
+            ("Return/Down/Tab", "go to the titles"),
+            ("Escape", "clear the search"),
+            ("C-c/C-x/C-v", "copy, cut or paste"),
+        ],
+    ),
+    (
+        "Titles",
+        &[
+            ("Up/Down", "open the entry above or below"),
+            ("PageUp/PageDown", "open an entry a page away"),
+            ("Home/End", "open the first or last entry"),
+            ("Return", "edit the entry's text"),
+            ("Tab", "edit the entry's title"),
+            ("S-Tab/Escape", "go back to the search"),
+            ("Delete", "delete the entry, after asking"),
+        ],
+    ),
+    (
+        "Title",
+        &[
+            ("Return/Tab", "go to the text"),
+            ("S-Tab", "go back to the titles"),
+            ("Escape", "put the saved title back"),
+            ("C-c/C-x/C-v", "copy, cut or paste"),
+        ],
+    ),
+    (
+        "Text",
+        &[
+            ("C-c/C-x/C-v", "copy, cut or paste the selection"),
+            ("F3/S-F3", "find the next or previous match"),
+        ],
+    ),
+    (
+        "Find",
+        &[
+            ("Return", "find the next match"),
+            ("S-Return", "find the previous match"),
+            ("Escape", "close find"),
+            ("C-c/C-x/C-v", "copy, cut or paste"),
+        ],
+    ),
+];
 
 impl App {
+    /// The key list's sections, those for what has the keyboard now
+    /// first, in the order `key` asks them; under the keys view, which
+    /// takes every key, the notebook's and its focuses' last.
+    pub fn key_list(&self) -> Vec<Section> {
+        let mut current = Vec::new();
+        let mut idle: &[&str] = &[];
+        if self.prompt.is_some() {
+            current.push("Key prompt");
+        }
+        if self.chooser.is_some() {
+            current.push("Finder");
+        }
+        if self.dialog.is_some() {
+            current.push("Question");
+        }
+        match &self.phase {
+            Phase::Opening | Phase::Locking | Phase::Refused(_) => current.push("Not open"),
+            Phase::Swap(_) => current.push("Swap on storage"),
+            Phase::Locked { .. } => current.push("Locked"),
+            Phase::Importing { .. } => current.push("Importing a copy"),
+            Phase::Unlocked(notebook) if notebook.keys.showing => {
+                current.push("Keys view");
+                idle = &["Notebook", "Search", "Titles", "Title", "Text", "Find"];
+            }
+            Phase::Unlocked(_) => {
+                current.push(match self.focus {
+                    Focus::Keys => "Keys view",
+                    Focus::Search => "Search",
+                    Focus::List => "Titles",
+                    Focus::Title => "Title",
+                    Focus::Editor => "Text",
+                    Focus::Find => "Find",
+                });
+                current.push("Notebook");
+            }
+        }
+        let mut sections: Vec<Section> = SECTIONS
+            .iter()
+            .map(|&(title, rows)| Section::new(title, rows))
+            .collect();
+        // Stable: the current ones in order, the rest as listed, the idle
+        // ones after them.
+        sections.sort_by_key(|section| {
+            match current.iter().position(|title| *title == section.title) {
+                Some(at) => at,
+                None if idle.contains(&section.title) => current.len() + 1,
+                None => current.len(),
+            }
+        });
+        sections
+    }
+
     /// One input; whether the window should close is `quitting`.
     pub fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
         match input {

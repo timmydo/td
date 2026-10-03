@@ -321,6 +321,10 @@ impl ComposeView {
 }
 
 impl View for ComposeView {
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        Some(&crate::keybindings::COMPOSE)
+    }
+
     fn scene(&self) -> Scene<'_> {
         let (title, labels, keys) = if self.asking {
             (format!("Save {}?", self.file_name()), ASK_LABELS, ASK_KEYS)

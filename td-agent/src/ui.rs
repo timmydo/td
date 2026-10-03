@@ -29,6 +29,7 @@ use td_ui::chrome::ROW;
 use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
 use td_ui::editor_clipboard::{Paste, Snapshot};
 use td_ui::editor_model::TabId;
+use td_ui::keys::{self, Section};
 use td_ui::messages::{self, Error as MessagesError, Message, Tone};
 use td_ui::raster::{
     self, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, Weight, BORDER, CHROME, INK,
@@ -383,6 +384,35 @@ impl Composer {
         }
     }
 }
+
+/// The focused widgets' keys for the key list, as `key` binds them; the
+/// window's own chords are `control::BINDINGS`.
+const LIST_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "Select a conversation."),
+    ("PageUp/PageDown", "Select a page away."),
+    ("Home/End", "Select the first or last conversation."),
+    ("Return", "Open the selected conversation."),
+];
+const TRANSCRIPT_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "Scroll a row."),
+    ("PageUp/PageDown", "Scroll a page."),
+    ("Home/End", "Scroll to the top or the end."),
+    ("M-Up/M-Down", "Focus the previous or next message."),
+    ("Return", "Collapse or expand the focused message."),
+    ("C-a", "Select the whole transcript."),
+    ("C-c", "Copy the selection."),
+    ("C-S-c", "Copy the focused message whole."),
+];
+const COMPOSER_KEYS: &[(&str, &str)] = &[
+    ("Return", "Start a new line."),
+    (
+        "C-Return",
+        "Send the text to the open conversation and empty the composer; blank text is not sent.",
+    ),
+    ("C-c/C-Insert", "Copy the selection."),
+    ("C-x", "Cut the selection."),
+    ("C-v/S-Insert", "Paste."),
+];
 
 /// The window's state.
 pub struct App {
@@ -2063,6 +2093,36 @@ impl App {
         }
     }
 
+    /// The key list's sections: the window's chords, from the driven
+    /// table, then the focused widget's keys and the other widgets'.
+    pub fn key_list(&self) -> Vec<Section> {
+        let window = Section {
+            title: "td-agent",
+            rows: crate::control::BINDINGS
+                .iter()
+                .filter_map(|binding| {
+                    Some(keys::Row {
+                        keys: binding.chord?,
+                        what: binding.help,
+                    })
+                })
+                .collect(),
+        };
+        let mut widgets = vec![
+            (Focus::List, Section::new("Conversation list", LIST_KEYS)),
+            (
+                Focus::Transcript,
+                Section::new("Transcript", TRANSCRIPT_KEYS),
+            ),
+            (Focus::Composer, Section::new("Composer", COMPOSER_KEYS)),
+        ];
+        // Stable: the focused widget's first, the others in order.
+        widgets.sort_by_key(|(focus, _)| *focus != self.focus);
+        std::iter::once(window)
+            .chain(widgets.into_iter().map(|(_, section)| section))
+            .collect()
+    }
+
     /// A key, by its chord: the window's own first, then the focused
     /// widget's.
     pub fn key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
@@ -2534,6 +2594,38 @@ pub mod tests {
                 text: text.into(),
             },
         }))
+    }
+
+    #[test]
+    fn the_key_list_is_the_driven_table_then_the_focused_widget_first() {
+        let mut app = app();
+        let sections = app.key_list();
+        let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
+        assert_eq!(
+            titles,
+            ["td-agent", "Composer", "Conversation list", "Transcript"]
+        );
+        // Every chord the driven table binds, in its order and words; the
+        // chordless menu item is no key.
+        let chorded: Vec<keys::Row> = crate::control::BINDINGS
+            .iter()
+            .filter_map(|b| {
+                Some(keys::Row {
+                    keys: b.chord?,
+                    what: b.help,
+                })
+            })
+            .collect();
+        assert_eq!(sections[0].rows, chorded);
+        assert_eq!(sections[0].rows.len(), crate::control::BINDINGS.len() - 1);
+        assert!(sections[0].rows.iter().any(|r| r.keys == "C-n"));
+        assert!(sections[1].rows.iter().any(|r| r.keys == "C-v/S-Insert"));
+        key(&mut app, "F6");
+        let titles: Vec<&str> = app.key_list().iter().map(|s| s.title).collect();
+        assert_eq!(
+            titles,
+            ["td-agent", "Conversation list", "Transcript", "Composer"]
+        );
     }
 
     #[test]

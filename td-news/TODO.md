@@ -12,7 +12,7 @@
 - [x] Feed list view with unread counts
 - [x] Article list view with search
 - [x] Article view with plain text rendering (td's `html` renderer)
-- [x] Help view with keybinding reference
+- [x] Key reference in td-ui's key list (`?` or `F1`)
 - [x] Mouse support (click, wheel scrolling)
 
 ## Features

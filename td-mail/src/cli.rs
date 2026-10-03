@@ -1852,9 +1852,9 @@ send_draft: Send a retained draft through the account's server (JMAP EmailSubmis
 
 Keybindings
 -----------
-keybindings: Export the window's keybinding dictionary.
+keybindings: Export the window's keybinding dictionary, the rows its key list (F1 or ?) shows.
    > {{"command": "keybindings"}}
-   < {{"ok": true, "keybindings": [{{"view": "global", "key": "?", "action": "help", "description": "Show help"}}, ...]}}
+   < {{"ok": true, "keybindings": [{{"view": "global", "key": "?", "action": "show_keys", "description": "Show this list of keys (F1 too)"}}, ...]}}
 "#
     );
 }

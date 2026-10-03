@@ -3,7 +3,6 @@ use crate::compose;
 use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
 use crate::ui::input::Key;
-use crate::ui::views::help::HelpView;
 use crate::ui::views::{
     strip_newlines, text_scroll, wrap_text, Body, Row, Scene, Scroll, View, ViewAction,
 };
@@ -722,6 +721,10 @@ impl EmailView {
 }
 
 impl View for EmailView {
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        Some(&crate::keybindings::EMAIL_VIEW)
+    }
+
     fn scene(&self) -> Scene<'_> {
         let (labels, keys) = if self.url_picking {
             (URL_LABELS, URL_KEYS)
@@ -1016,7 +1019,7 @@ impl View for EmailView {
                 }
                 ViewAction::Continue
             }
-            Key::Char('?') => ViewAction::Push(Box::new(HelpView::new())),
+            Key::Char('?') => ViewAction::ShowKeys,
             _ => ViewAction::Continue,
         }
     }
@@ -1334,5 +1337,15 @@ mod tests {
         assert!(text.contains("Bold"), "{text}");
         assert!(text.contains("go [http://e/x]"), "{text}");
         assert!(text.contains("Pic [img: p.png]"), "{text}");
+    }
+
+    /// `?` asks the window for its key list.
+    #[test]
+    fn question_mark_shows_the_keys() {
+        let (mut view, _rx) = loaded_view("plain body");
+        assert!(matches!(
+            view.handle_key(Key::Char('?'), 10),
+            ViewAction::ShowKeys
+        ));
     }
 }

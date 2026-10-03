@@ -293,6 +293,10 @@ const LABELS: &[&str] = &["Open", "Refresh", "Back"];
 const KEYS: &[Key] = &[Key::Enter, Key::Char('g'), Key::Escape];
 
 impl View for DraftsView {
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        Some(&crate::keybindings::DRAFTS)
+    }
+
     fn scene(&self) -> Scene<'_> {
         let body = if self.entries.is_empty() {
             Body::message(format!(
@@ -371,6 +375,7 @@ impl View for DraftsView {
                 self.relist();
                 ViewAction::Continue
             }
+            Key::Char('?') => ViewAction::ShowKeys,
             // The press selects; opening is the pending action, so the
             // selection is shown first.
             Key::Click(index) => {
@@ -436,6 +441,10 @@ const SENT_LABELS: &[&str] = &["Back"];
 const SENT_KEYS: &[Key] = &[Key::Escape];
 
 impl View for SentView {
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        Some(&crate::keybindings::SENT)
+    }
+
     fn scene(&self) -> Scene<'_> {
         Scene {
             title: self.title.clone(),
@@ -458,6 +467,7 @@ impl View for SentView {
             Key::Char('q') | Key::Escape => ViewAction::Pop,
             Key::Char('n') => ViewAction::Scroll(Scroll::Lines(1)),
             Key::Char('p') => ViewAction::Scroll(Scroll::Lines(-1)),
+            Key::Char('?') => ViewAction::ShowKeys,
             _ => ViewAction::Continue,
         }
     }
@@ -593,5 +603,25 @@ mod tests {
             assert_eq!(listing.unread.len(), 1, "{:?}", listing.unread);
             assert!(listing.unread[0].starts_with(&sent.display().to_string()));
         }
+    }
+
+    /// `?` asks the window for its key list, over the list and over a
+    /// sent draft.
+    #[test]
+    fn question_mark_shows_the_keys() {
+        let root = crate::testing::tempdir().unwrap();
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+        let mut drafts = DraftsView::new(root.path().join("drafts"), cmd_tx);
+        assert!(matches!(
+            drafts.handle_key(Key::Char('?'), 10),
+            ViewAction::ShowKeys
+        ));
+        let path = root.path().join("td-mail-draft-1.eml");
+        std::fs::write(&path, "Subject: went\n").unwrap();
+        let mut sent = SentView::open(&path).unwrap();
+        assert!(matches!(
+            sent.handle_key(Key::Char('?'), 10),
+            ViewAction::ShowKeys
+        ));
     }
 }

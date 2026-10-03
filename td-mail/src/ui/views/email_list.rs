@@ -4,7 +4,6 @@ use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
 use crate::ui::input::Key;
 use crate::ui::views::email_view::{EmailNavEntry, EmailView};
-use crate::ui::views::help::HelpView;
 use crate::ui::views::rules_preview::RulesPreviewView;
 use crate::ui::views::thread_view::ThreadView;
 use crate::ui::views::{
@@ -684,6 +683,10 @@ impl EmailListView {
 }
 
 impl View for EmailListView {
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        Some(&crate::keybindings::EMAIL_LIST)
+    }
+
     fn scene(&self) -> Scene<'_> {
         let (labels, keys) = if self.search_mode {
             (SEARCH_LABELS, SEARCH_KEYS)
@@ -1070,7 +1073,7 @@ impl View for EmailListView {
                 let draft = compose::build_compose_draft(&self.reply_from_address);
                 ViewAction::Compose(draft.into())
             }
-            Key::Char('?') => ViewAction::Push(Box::new(HelpView::new())),
+            Key::Char('?') => ViewAction::ShowKeys,
             Key::ScrollUp => {
                 if self.cursor > 0 {
                     self.cursor -= 1;

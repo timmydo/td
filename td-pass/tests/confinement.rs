@@ -132,6 +132,7 @@ fn pure_files_reach_no_system_vault_or_compositor() {
                     "editor_search",
                     "entry_model",
                     "finder",
+                    "keys",
                     "list_model",
                     "raster",
                     "window",

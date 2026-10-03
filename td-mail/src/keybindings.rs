@@ -1,3 +1,307 @@
+//! The window's keys, one table per view: the key list the window shows
+//! on F1 or `?` and the CLI's `keybindings` export read the same rows.
+
+use td_ui::keys::{Row, Section};
+
+/// A view's keys: the CLI's name for the view, the list's title for its
+/// section, and its bindings as (keys, action, description).
+pub struct Table {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub bindings: &'static [(&'static str, &'static str, &'static str)],
+}
+
+pub const GLOBAL: Table = Table {
+    id: "global",
+    title: "Global",
+    bindings: &[
+        ("?", "show_keys", "Show this list of keys (F1 too)"),
+        ("c", "compose", "Compose new email"),
+    ],
+};
+
+pub const MAILBOX_LIST: Table = Table {
+    id: "mailbox_list",
+    title: "Mailbox List",
+    bindings: &[
+        ("q", "quit", "Quit"),
+        ("n/j/Down", "next", "Next mailbox"),
+        ("p/k/Up", "prev", "Previous mailbox"),
+        ("Enter", "open", "Open mailbox"),
+        ("g", "refresh", "Refresh"),
+        (
+            "a",
+            "next_account",
+            "Next account; with one, reopen it (reconnect)",
+        ),
+        (
+            "s",
+            "set_up",
+            "Set up an account with no server, or one not reached",
+        ),
+        ("D", "drafts", "Drafts: retained and sent; Enter opens one"),
+        ("+", "create_folder", "Create folder"),
+        ("d", "delete_folder", "Delete selected folder"),
+        (
+            "u",
+            "mark_all_read",
+            "Mark all mail in selected folder read",
+        ),
+        ("x", "preview_retention", "Preview retention expiry list"),
+        ("X", "expire_retention", "Expire retained mail now"),
+        ("PgDn", "page_down", "Page down"),
+        ("PgUp", "page_up", "Page up"),
+        ("Home", "jump_top", "Jump to top"),
+        ("End", "jump_bottom", "Jump to bottom"),
+    ],
+};
+
+pub const EMAIL_LIST: Table = Table {
+    id: "email_list",
+    title: "Email List",
+    bindings: &[
+        ("q", "back", "Back to mailbox list"),
+        ("n/j/Down", "next", "Next email"),
+        ("p/k/Up", "prev", "Previous email"),
+        ("Enter", "open", "Open email"),
+        ("t", "open_thread", "Open thread list view (same folder)"),
+        (
+            "T",
+            "open_thread_cross_folder",
+            "Open thread list view (all folders)",
+        ),
+        ("g", "refresh", "Refresh"),
+        ("r", "reply", "Reply to selected email"),
+        ("R", "reply_all", "Reply all to selected email"),
+        ("e", "dry_run_rules", "Dry-run rules on loaded messages"),
+        ("E", "run_rules", "Run rules on loaded messages"),
+        ("a", "archive", "Archive selected email"),
+        ("d", "delete", "Move selected email to deleted folder"),
+        (
+            "D",
+            "destroy",
+            "Expire selected email now (deleted folder only)",
+        ),
+        (
+            "J",
+            "mark_spam",
+            "Mark spam: train classifier and move to Junk",
+        ),
+        (
+            "H",
+            "mark_ham",
+            "Mark not-spam (ham): train classifier and move to Inbox",
+        ),
+        (
+            "S",
+            "show_spam_score",
+            "Score selected message and tag it (S=spam, ?=unsure)",
+        ),
+        ("f", "toggle_flagged", "Toggle flagged"),
+        ("u", "toggle_read", "Toggle read/unread"),
+        ("m", "move", "Move to folder"),
+        ("s", "search", "Search in mailbox"),
+        ("l", "load_more", "Load more messages"),
+        ("Escape", "clear_search", "Clear search"),
+        ("PgDn", "page_down", "Page down"),
+        ("PgUp", "page_up", "Page up"),
+        ("Home", "jump_top", "Jump to top"),
+        ("End", "jump_bottom", "Jump to bottom"),
+    ],
+};
+
+pub const THREAD_VIEW: Table = Table {
+    id: "thread_view",
+    title: "Thread View",
+    bindings: &[
+        ("q", "back", "Back to email list"),
+        ("n/j/Down", "next", "Next email"),
+        ("p/k/Up", "prev", "Previous email"),
+        ("Enter", "open", "Open email"),
+        ("g", "refresh", "Refresh"),
+        ("a", "archive", "Archive selected email"),
+        ("d", "delete", "Move selected email to deleted folder"),
+        (
+            "D",
+            "destroy",
+            "Expire selected email now (deleted folder only)",
+        ),
+        ("f", "toggle_flagged", "Toggle flagged"),
+        ("u", "toggle_read", "Toggle read/unread"),
+        ("PgDn", "page_down", "Page down"),
+        ("PgUp", "page_up", "Page up"),
+        ("Home", "jump_top", "Jump to top"),
+        ("End", "jump_bottom", "Jump to bottom"),
+    ],
+};
+
+pub const EMAIL_VIEW: Table = Table {
+    id: "email_view",
+    title: "Email View",
+    bindings: &[
+        ("q", "back", "Back to email list"),
+        ("n", "next_unread", "Open next unread email"),
+        ("p", "prev_unread", "Open previous unread email"),
+        ("j/Down", "scroll_down", "Scroll down"),
+        ("k/Up", "scroll_up", "Scroll up"),
+        ("Space/PgDn", "page_down", "Page down"),
+        ("PgUp", "page_up", "Page up"),
+        ("Home", "jump_top", "Jump to top"),
+        ("End", "jump_bottom", "Jump to bottom"),
+        ("r", "reply", "Reply"),
+        ("R", "reply_all", "Reply all"),
+        (
+            "F",
+            "forward_attachment",
+            "Forward as attachment (preserves HTML)",
+        ),
+        ("f", "forward", "Forward as inline quoted text"),
+        ("a", "archive", "Archive message"),
+        ("d", "delete", "Delete message (move to trash)"),
+        ("m", "move", "Move to mailbox (interactive picker)"),
+        ("A", "attachment", "Download/open attachment"),
+        ("b", "browse_urls", "Browse URLs found in message body"),
+        (
+            "1-9",
+            "open_url",
+            "Open URL by number in configured browser",
+        ),
+        (
+            "Ctrl-click",
+            "follow_link",
+            "Open the link under the pointer in the browser",
+        ),
+        ("h", "toggle_html", "Toggle HTML vs plain text body"),
+        (
+            "v",
+            "raw_headers",
+            "Toggle raw headers (DKIM, Received, etc)",
+        ),
+        ("*", "toggle_flagged", "Toggle flagged"),
+        ("u", "toggle_read", "Toggle read/unread"),
+        (
+            "J",
+            "mark_spam",
+            "Mark spam: train classifier and move to Junk",
+        ),
+        (
+            "H",
+            "mark_ham",
+            "Mark not-spam (ham): train classifier and move to Inbox",
+        ),
+        (
+            "S",
+            "show_spam_score",
+            "Show this message's spam score and verdict",
+        ),
+        ("D", "destroy", "Expire now (deleted folder only)"),
+    ],
+};
+
+pub const DRAFTS: Table = Table {
+    id: "drafts",
+    title: "Drafts",
+    bindings: &[
+        (
+            "Enter",
+            "open",
+            "Reopen the draft to edit, or show the sent one read-only",
+        ),
+        ("g", "refresh", "Read the drafts and sent directories again"),
+        ("q", "back", "Back to the mailbox list"),
+    ],
+};
+
+/// A sent draft shown read-only, as it was retired.
+pub const SENT: Table = Table {
+    id: "sent",
+    title: "Sent Draft",
+    bindings: &[
+        ("q/Escape", "back", "Back to the drafts"),
+        ("n/j", "scroll_down", "Scroll down a line"),
+        ("p/k", "scroll_up", "Scroll up a line"),
+        ("Space/PgDn", "page_down", "Page down"),
+        ("PgUp", "page_up", "Page up"),
+        (
+            "Up/Down",
+            "caret_line",
+            "Caret up or down a line; the view follows",
+        ),
+        (
+            "Home/End",
+            "caret_line_ends",
+            "Caret to its line's start or end; the view follows",
+        ),
+    ],
+};
+
+/// The draft in the editable pane, whose keys are the editor core's
+/// default profile; the rest of the keyboard types.
+pub const COMPOSE: Table = Table {
+    id: "compose",
+    title: "Compose",
+    bindings: &[
+        (
+            "Ctrl-Enter",
+            "send",
+            "Send the draft through the account's server (saves it first)",
+        ),
+        (
+            "Ctrl-Shift-A",
+            "attach",
+            "Attach a file: its tag at the caret's line, or at the end \
+             (the finder: Return opens or attaches, Backspace on an empty \
+             filter goes up, letters filter, Escape closes it)",
+        ),
+        ("Ctrl-S", "save", "Save the draft over its retained file"),
+        (
+            "Ctrl-W",
+            "close",
+            "Close (asks when unsaved: y saves, n keeps the file as saved)",
+        ),
+        (
+            "Ctrl-X/C/V",
+            "cut_copy_paste",
+            "Cut, copy, paste within td-mail (a message's selection too)",
+        ),
+        ("Ctrl-Z/Y", "undo_redo", "Undo, redo"),
+        ("Ctrl-A", "select_all", "Select all"),
+    ],
+};
+
+const TABLES: &[&Table] = &[
+    &GLOBAL,
+    &MAILBOX_LIST,
+    &EMAIL_LIST,
+    &THREAD_VIEW,
+    &EMAIL_VIEW,
+    &DRAFTS,
+    &SENT,
+    &COMPOSE,
+];
+
+/// The key list's sections: `first`'s, the view shown, then the rest in
+/// the tables' order.
+pub fn sections(first: Option<&Table>) -> Vec<Section> {
+    let first = first.map(|table| table.id);
+    let (front, rest): (Vec<&Table>, Vec<&Table>) = TABLES
+        .iter()
+        .copied()
+        .partition(|table| Some(table.id) == first);
+    front
+        .into_iter()
+        .chain(rest)
+        .map(|table| Section {
+            title: table.title,
+            rows: table
+                .bindings
+                .iter()
+                .map(|&(keys, _, what)| Row { keys, what })
+                .collect(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyBinding {
     pub view: &'static str,
@@ -6,586 +310,90 @@ pub struct KeyBinding {
     pub description: &'static str,
 }
 
+/// Every binding, for the CLI's export.
 pub fn all_keybindings() -> Vec<KeyBinding> {
-    vec![
-        // Global
-        KeyBinding {
-            view: "global",
-            key: "?",
-            action: "help",
-            description: "Show help",
-        },
-        KeyBinding {
-            view: "global",
-            key: "c",
-            action: "compose",
-            description: "Compose new email",
-        },
-        // Mailbox List
-        KeyBinding {
-            view: "mailbox_list",
-            key: "q",
-            action: "quit",
-            description: "Quit",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "n/j/Down",
-            action: "next",
-            description: "Next mailbox",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "p/k/Up",
-            action: "prev",
-            description: "Previous mailbox",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "Enter",
-            action: "open",
-            description: "Open mailbox",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "g",
-            action: "refresh",
-            description: "Refresh",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "D",
-            action: "drafts",
-            description: "List retained and sent drafts",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "+",
-            action: "create_folder",
-            description: "Create folder",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "d",
-            action: "delete_folder",
-            description: "Delete selected folder",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "u",
-            action: "mark_all_read",
-            description: "Mark all mail in selected folder read",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "x",
-            action: "preview_retention",
-            description: "Preview retention expiry list",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "X",
-            action: "expire_retention",
-            description: "Expire retained mail now",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "PgDn",
-            action: "page_down",
-            description: "Page down",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "PgUp",
-            action: "page_up",
-            description: "Page up",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "Home",
-            action: "jump_top",
-            description: "Jump to top",
-        },
-        KeyBinding {
-            view: "mailbox_list",
-            key: "End",
-            action: "jump_bottom",
-            description: "Jump to bottom",
-        },
-        // Email List
-        KeyBinding {
-            view: "email_list",
-            key: "q",
-            action: "back",
-            description: "Back to mailbox list",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "n/j/Down",
-            action: "next",
-            description: "Next email",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "p/k/Up",
-            action: "prev",
-            description: "Previous email",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "Enter",
-            action: "open",
-            description: "Open email",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "t",
-            action: "open_thread",
-            description: "Open thread list view (same folder)",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "T",
-            action: "open_thread_cross_folder",
-            description: "Open thread list view (all folders)",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "g",
-            action: "refresh",
-            description: "Refresh",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "r",
-            action: "reply",
-            description: "Reply to selected email",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "R",
-            action: "reply_all",
-            description: "Reply all to selected email",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "e",
-            action: "dry_run_rules",
-            description: "Dry-run rules on loaded messages",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "E",
-            action: "run_rules",
-            description: "Run rules on loaded messages",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "a",
-            action: "archive",
-            description: "Archive selected email",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "d",
-            action: "delete",
-            description: "Move selected email to deleted folder",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "D",
-            action: "destroy",
-            description: "Expire selected email now (deleted folder only)",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "J",
-            action: "mark_spam",
-            description: "Mark as spam: train classifier and move to Junk",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "H",
-            action: "mark_ham",
-            description: "Mark as not-spam (ham): train classifier and move to Inbox",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "S",
-            action: "show_spam_score",
-            description: "Score selected message and tag it (S=spam, ?=unsure)",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "f",
-            action: "toggle_flagged",
-            description: "Toggle flagged",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "u",
-            action: "toggle_read",
-            description: "Toggle read/unread",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "m",
-            action: "move",
-            description: "Move to folder",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "s",
-            action: "search",
-            description: "Search in mailbox",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "l",
-            action: "load_more",
-            description: "Load more messages",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "Escape",
-            action: "clear_search",
-            description: "Clear search",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "PgDn",
-            action: "page_down",
-            description: "Page down",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "PgUp",
-            action: "page_up",
-            description: "Page up",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "Home",
-            action: "jump_top",
-            description: "Jump to top",
-        },
-        KeyBinding {
-            view: "email_list",
-            key: "End",
-            action: "jump_bottom",
-            description: "Jump to bottom",
-        },
-        // Thread View
-        KeyBinding {
-            view: "thread_view",
-            key: "q",
-            action: "back",
-            description: "Back to email list",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "n/j/Down",
-            action: "next",
-            description: "Next email",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "p/k/Up",
-            action: "prev",
-            description: "Previous email",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "Enter",
-            action: "open",
-            description: "Open email",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "g",
-            action: "refresh",
-            description: "Refresh",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "a",
-            action: "archive",
-            description: "Archive selected email",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "d",
-            action: "delete",
-            description: "Move selected email to deleted folder",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "D",
-            action: "destroy",
-            description: "Expire selected email now (deleted folder only)",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "f",
-            action: "toggle_flagged",
-            description: "Toggle flagged",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "u",
-            action: "toggle_read",
-            description: "Toggle read/unread",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "PgDn",
-            action: "page_down",
-            description: "Page down",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "PgUp",
-            action: "page_up",
-            description: "Page up",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "Home",
-            action: "jump_top",
-            description: "Jump to top",
-        },
-        KeyBinding {
-            view: "thread_view",
-            key: "End",
-            action: "jump_bottom",
-            description: "Jump to bottom",
-        },
-        // Email View
-        KeyBinding {
-            view: "email_view",
-            key: "q",
-            action: "back",
-            description: "Back to email list",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "n",
-            action: "next_unread",
-            description: "Open next unread email",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "p",
-            action: "prev_unread",
-            description: "Open previous unread email",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "j/Down",
-            action: "scroll_down",
-            description: "Scroll down",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "k/Up",
-            action: "scroll_up",
-            description: "Scroll up",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "Space/PgDn",
-            action: "page_down",
-            description: "Page down",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "PgUp",
-            action: "page_up",
-            description: "Page up",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "Home",
-            action: "jump_top",
-            description: "Jump to top",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "End",
-            action: "jump_bottom",
-            description: "Jump to bottom",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "r",
-            action: "reply",
-            description: "Reply",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "R",
-            action: "reply_all",
-            description: "Reply all",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "F",
-            action: "forward_attachment",
-            description: "Forward as attachment (preserves HTML)",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "f",
-            action: "forward",
-            description: "Forward as inline quoted text",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "A",
-            action: "attachment",
-            description: "Download/open attachment",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "h",
-            action: "toggle_html",
-            description: "Toggle HTML vs plain text body",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "v",
-            action: "raw_headers",
-            description: "Toggle raw headers (DKIM, Received, etc)",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "*",
-            action: "toggle_flagged",
-            description: "Toggle flagged",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "u",
-            action: "toggle_read",
-            description: "Toggle read/unread",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "D",
-            action: "destroy",
-            description: "Expire now (deleted folder only)",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "a",
-            action: "archive",
-            description: "Archive message",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "d",
-            action: "delete",
-            description: "Delete message (move to trash)",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "m",
-            action: "move",
-            description: "Move to mailbox (interactive picker)",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "J",
-            action: "mark_spam",
-            description: "Mark as spam: train classifier and move to Junk",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "H",
-            action: "mark_ham",
-            description: "Mark as not-spam (ham): train classifier and move to Inbox",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "S",
-            action: "show_spam_score",
-            description: "Show this message's spam score and verdict",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "b",
-            action: "browse_urls",
-            description: "Browse URLs found in message body",
-        },
-        KeyBinding {
-            view: "email_view",
-            key: "1-9",
-            action: "open_url",
-            description: "Open URL by number in configured browser",
-        },
-        KeyBinding {
-            view: "drafts",
-            key: "Enter",
-            action: "open",
-            description: "Reopen the draft to edit, or show the sent one read-only",
-        },
-        KeyBinding {
-            view: "drafts",
-            key: "g",
-            action: "refresh",
-            description: "Read the drafts and sent directories again",
-        },
-        KeyBinding {
-            view: "drafts",
-            key: "q",
-            action: "back",
-            description: "Back to the mailbox list",
-        },
-        // Compose: the draft in the editable pane, whose keys are
-        // the editor core's default profile; the rest of the keyboard types.
-        KeyBinding {
-            view: "compose",
-            key: "Ctrl-Enter",
-            action: "send",
-            description: "Send the draft through the account's server, saving it first",
-        },
-        KeyBinding {
-            view: "compose",
-            key: "Ctrl-Shift-A",
-            action: "attach",
-            description:
-                "Attach a file chosen in the finder: copied beside the draft, tagged at the caret's line in the body, else at its end",
-        },
-        KeyBinding {
-            view: "compose",
-            key: "Ctrl-S",
-            action: "save",
-            description: "Save the draft over its retained file",
-        },
-        KeyBinding {
-            view: "compose",
-            key: "Ctrl-W",
-            action: "close",
-            description:
-                "Close the draft (asks when unsaved: y saves, n keeps the file as last saved)",
-        },
-        KeyBinding {
-            view: "compose",
-            key: "Ctrl-X/Ctrl-C/Ctrl-V",
-            action: "cut_copy_paste",
-            description: "Cut, copy and paste within td-mail (a message's selection too)",
-        },
-        KeyBinding {
-            view: "compose",
-            key: "Ctrl-Z/Ctrl-Y",
-            action: "undo_redo",
-            description: "Undo and redo",
-        },
-        KeyBinding {
-            view: "compose",
-            key: "Ctrl-A",
-            action: "select_all",
-            description: "Select all",
-        },
-    ]
+    TABLES
+        .iter()
+        .flat_map(|table| {
+            table
+                .bindings
+                .iter()
+                .map(|&(key, action, description)| KeyBinding {
+                    view: table.id,
+                    key,
+                    action,
+                    description,
+                })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    /// One section per view, titled by its table, the shown view's
+    /// first; a row reads as the table wrote it.
+    #[test]
+    fn the_sections_are_the_tables_with_the_shown_view_first() {
+        let titles = |sections: &[Section]| -> Vec<&str> {
+            sections.iter().map(|section| section.title).collect()
+        };
+        let all = sections(None);
+        assert_eq!(
+            titles(&all),
+            [
+                "Global",
+                "Mailbox List",
+                "Email List",
+                "Thread View",
+                "Email View",
+                "Drafts",
+                "Sent Draft",
+                "Compose"
+            ]
+        );
+        assert_eq!(
+            all[0].rows[0],
+            Row {
+                keys: "?",
+                what: "Show this list of keys (F1 too)"
+            }
+        );
+        let viewing = sections(Some(&EMAIL_VIEW));
+        assert_eq!(
+            titles(&viewing),
+            [
+                "Email View",
+                "Global",
+                "Mailbox List",
+                "Email List",
+                "Thread View",
+                "Drafts",
+                "Sent Draft",
+                "Compose"
+            ]
+        );
+        assert!(viewing[0].rows.contains(&Row {
+            keys: "b",
+            what: "Browse URLs found in message body"
+        }));
+        let compose = &viewing[7].rows;
+        assert_eq!(compose[1].keys, "Ctrl-Shift-A");
+    }
+
+    /// The CLI's export is every row, each with its view, keys and
+    /// action.
+    #[test]
+    fn the_cli_export_is_every_binding_with_its_keys() {
+        let all = all_keybindings();
+        assert_eq!(all[0].view, "global");
+        assert_eq!(all[0].action, "show_keys");
+        assert!(all
+            .iter()
+            .all(|binding| !binding.key.is_empty() && !binding.action.is_empty()));
+        let rows: usize = TABLES.iter().map(|table| table.bindings.len()).sum();
+        assert_eq!(all.len(), rows);
+    }
 }

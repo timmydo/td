@@ -127,6 +127,7 @@ mod tests {
             ("Delete", None),
             ("Left", None),
             ("Insert", None),
+            // The window's own: it opens the key list before the client.
             ("F1", None),
             ("", None),
         ] {

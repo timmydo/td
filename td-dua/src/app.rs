@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use td_ui::chrome::Status;
 use td_ui::confirmations::{self, Choice};
+use td_ui::keys::Section;
 use td_ui::pointer::DoubleClick;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::split;
@@ -29,8 +30,39 @@ pub enum Act {
 
 type Dialog = confirmations::Controller<Act, u64, ()>;
 
-/// The keys, for `--help` and the status row before the first scan ends.
-pub const KEYS: &str = "d: add to delete list  D: delete now  x: delete the list  u: undo add  r: refresh  a: allocated/apparent  C-q: quit";
+/// The window's own keys, as `key` binds them: the key list's first
+/// section, and `hint` for `--help` and the status row.
+pub const KEYS: &[(&str, &str)] = &[
+    ("d", "add to delete list"),
+    ("D", "delete now"),
+    ("x", "delete the list"),
+    ("u", "undo add"),
+    ("r", "refresh"),
+    ("a", "allocated/apparent"),
+    ("C-q", "quit"),
+];
+/// The list's keys, `tree_table::Key::from_chord`'s.
+const LIST_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "select the entry above or below"),
+    ("PageUp/PageDown", "select a page away"),
+    ("Home/End", "select the first or last row"),
+    ("Left", "collapse, or go to the parent"),
+    ("Right", "expand, or go to the first child"),
+    // `view::SHOWN` more, which a test holds the number to.
+    (
+        "Return/Space",
+        "open or close a directory, or show 500 more",
+    ),
+    ("S-Left/S-Right", "scroll sideways"),
+];
+
+/// `KEYS` as one line, `key: what` two spaces apart.
+pub fn hint() -> String {
+    KEYS.iter()
+        .map(|(keys, what)| format!("{keys}: {what}"))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Capture {
@@ -123,7 +155,7 @@ impl App {
             pending: 0,
             deleting: false,
             progress: (0, 0),
-            message: KEYS.to_owned(),
+            message: hint(),
             title,
             capture: None,
             clicks: DoubleClick::default(),
@@ -173,6 +205,18 @@ impl App {
     }
     pub fn dialog_open(&self) -> bool {
         self.dialog.is_some()
+    }
+    /// The key list's sections: the delete question's first while it is
+    /// open, then the window's keys and the list's.
+    pub fn key_list(&self) -> Vec<Section> {
+        let question = Section::new("Delete question", confirmations::KEYS);
+        let window = Section::new("td-dua", KEYS);
+        let list = Section::new("List", LIST_KEYS);
+        if self.dialog_open() {
+            vec![question, window, list]
+        } else {
+            vec![window, list, question]
+        }
     }
     pub fn expanded(&self, id: NodeId) -> bool {
         self.expanded.contains(&id)
@@ -1108,7 +1152,7 @@ impl App {
             message.push_str(" (some entries could not be read)");
         }
         message.push_str(".  ");
-        message.push_str(KEYS);
+        message.push_str(&hint());
         self.say(message);
     }
 

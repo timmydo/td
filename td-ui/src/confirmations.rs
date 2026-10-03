@@ -193,6 +193,20 @@ impl Key {
         }
     }
 }
+
+/// The open dialog's keys as a key list shows them, `Key::from_chord`'s
+/// as `(keys, what)` rows for a consumer's `keys::Section`.
+pub const KEYS: &[(&str, &str)] = &[
+    ("Tab/S-Tab", "move between the details and the buttons"),
+    ("Up/Down", "scroll the details"),
+    ("PageUp/PageDown", "scroll the details a page"),
+    ("Home/End", "go to the details' start or end"),
+    (
+        "Return/Space",
+        "choose the focused button; Cancel starts focused",
+    ),
+    ("Escape", "cancel"),
+];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
     Key { key: Key, repeated: bool },

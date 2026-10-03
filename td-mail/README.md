@@ -47,7 +47,7 @@ copy and paste are Ctrl-X, Ctrl-C and Ctrl-V (Ctrl-A selects all): a
 selection made in any text, a message's view or an error's, is copied to
 the system clipboard and kept in td-mail's own kill ring, a cut one too.
 With no selection in a draft, Copy or Cut takes the caret's whole line;
-read-only message and help views still require a selection. A paste into a
+read-only message and preview views still require a selection. A paste into a
 draft takes the system clipboard's text when it has any, and the kill ring's
 otherwise. The clipboard's text arrives a moment later, into the draft it
 was asked for while that draft is still the one
@@ -383,6 +383,12 @@ after `cargo build --release --manifest-path net/Cargo.toml`), and
 ```bash
 cargo run
 ```
+
+In the window, F1, or `?` (the Help label) in a view, shows the window's
+key list over the frame: the shown view's keys first, then every other
+view's and the window's own. Its rows are `src/keybindings.rs`'s tables,
+which the CLI's `keybindings` command exports too, so the two cannot
+drift apart.
 
 For all command-line options, run:
 

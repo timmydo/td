@@ -30,6 +30,11 @@
 //! the pane scrolls it, selects in it by drag, word and line, and the window
 //! copies the selection to the clipboard on `C-c`. Those inputs stay on the
 //! window thread; they decide nothing, so no stamp guards them.
+//!
+//! So does `?`, which opens the window's key list (`keys.rs`) as `F1` does,
+//! whatever pane or prompt is up: the worker never sees it. A branch name
+//! cannot hold `?`, so the filter loses nothing it could match, and a
+//! confirmation is left up rather than answered.
 
 use std::collections::VecDeque;
 use std::io;
@@ -56,6 +61,7 @@ use td_ui::window::{Clipboard, Flow, Handler, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::app::{self, App};
+use crate::keys;
 use crate::view::{self, Document, Frame, Key, Pane, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW};
 
 /// A row's height at scale one: a cell with a pixel of leading above and
@@ -513,6 +519,8 @@ struct Session {
     /// What a copy came to, over the status row until the next input or
     /// the next frame, so it never covers a prompt bar a frame raised.
     note: Option<String>,
+    /// `?` was pressed: the window's key list opens after this input.
+    show_keys: bool,
 }
 
 impl Session {
@@ -544,6 +552,7 @@ impl Session {
             surface: None,
             clock: 0,
             note: None,
+            show_keys: false,
         })
     }
 
@@ -853,6 +862,10 @@ impl Session {
         }
         match input {
             Input::Key { chord, repeat } => {
+                if chord == "?" {
+                    self.show_keys |= !repeat;
+                    return Flow::Continue;
+                }
                 if self.pane_key(chord, repeat, clipboard) {
                     return Flow::Continue;
                 }
@@ -1031,6 +1044,14 @@ impl Handler for Session {
 
     fn notice(&mut self, message: &str) {
         eprintln!("td-review: window: {}", view::scrub(message));
+    }
+
+    fn keys(&self) -> Vec<td_ui::keys::Section> {
+        keys::sections(self.region().is_some())
+    }
+
+    fn take_show_keys(&mut self) -> bool {
+        std::mem::take(&mut self.show_keys)
     }
 }
 
@@ -1454,6 +1475,101 @@ mod tests {
             })
             .collect();
         assert_eq!(keys, [Key::Char('j'), Key::Char('D')]);
+    }
+
+    /// `?` asks for the window's key list, once a press, on the list's frame
+    /// and the review's alike; the worker never hears it. `F1` is the
+    /// window's own before it reaches the handler, which sends nothing for it
+    /// either. Under a prompt and the filter: the test after this one.
+    #[test]
+    fn a_question_mark_opens_the_key_list_and_reaches_no_worker() {
+        let (mut session, events, _messages) = session();
+        let board = &mut td_ui::window::NoClipboard;
+        assert!(!session.take_show_keys());
+        session.input(press("?", false), board);
+        assert!(session.take_show_keys());
+        assert!(!session.take_show_keys(), "an edge, taken once");
+        session.input(press("?", true), board);
+        assert!(!session.take_show_keys(), "a repeat asks for nothing");
+        let document = Arc::new(Document::new(1, &[Line::plain("hello")]));
+        showing(&mut session, 1, reviewing(&document, true));
+        session.input(press("?", false), board);
+        assert!(session.take_show_keys());
+        assert!(events.try_recv().is_err(), "the worker saw no `?`");
+    }
+
+    /// Polls `session` until the worker's frame shows `text`, puts each frame
+    /// on screen as it comes, and returns when inputs read after it are
+    /// stamped with it: a dwell after it was shown.
+    fn until(session: &mut Session, text: &str) -> Instant {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            session.poll(0);
+            if let Some((generation, frame)) = session.pending.take() {
+                let found = frame.text().contains(text);
+                let at = Instant::now();
+                session.shown_at(generation, frame.picks(), at);
+                showing(session, generation, frame);
+                if found {
+                    return ms(at, DWELL_MS);
+                }
+            }
+            assert!(Instant::now() < deadline, "no frame with {text:?}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// With the worker's own frames on screen, `?` under a squash
+    /// confirmation and while the branch filter is typed opens the key list
+    /// and sends the worker nothing: the confirmation is still up for the
+    /// `n` that answers it, and the filter holds only what was typed.
+    #[test]
+    fn a_question_mark_under_a_prompt_or_the_filter_reaches_no_worker() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (message_tx, message_rx) = mpsc::channel();
+        let grid = Arc::new(Grid::new((24, 80)));
+        let link = Link::new(event_rx, message_tx, Arc::clone(&grid));
+        let worker = thread::spawn(move || serve(crate::app::reviewing_fixture(), link));
+        let mut session = Session::new("td-review".into(), event_tx, message_rx, grid).unwrap();
+        let question = |session: &mut Session, at: Instant| {
+            let sent = session.sent;
+            session.input_at(press("?", false), at);
+            assert!(session.take_show_keys());
+            assert_eq!(session.sent, sent, "the worker was sent the `?`");
+        };
+
+        let at = until(&mut session, " review ");
+        session.input_at(press("s", false), at);
+        let at = until(&mut session, "squash into one commit");
+        question(&mut session, at);
+        session.input_at(press("n", false), at);
+        let at = until(&mut session, "cancelled");
+
+        session.input_at(press("q", false), at);
+        let at = until(&mut session, " enter review ");
+        session.input_at(press("/", false), at);
+        let at = until(&mut session, " filter: _");
+        question(&mut session, at);
+        session.input_at(press("x", false), at);
+        until(&mut session, " filter: x_");
+
+        session.input_at(Input::Close, Instant::now());
+        assert!(worker.join().unwrap().is_ok());
+    }
+
+    /// The list's sections are the review's first while a review is on
+    /// screen, and the branch list's otherwise.
+    #[test]
+    fn the_key_list_leads_with_the_pane_on_screen() {
+        let (mut session, _events, _messages) = session();
+        let first = |session: &Session| session.keys().first().map(|s| s.title);
+        assert_eq!(first(&session), Some("branch list"));
+        let document = Arc::new(Document::new(1, &[Line::plain("hello")]));
+        showing(&mut session, 1, reviewing(&document, true));
+        assert_eq!(first(&session), Some("review"));
+        assert_eq!(session.keys().len(), 5);
+        showing(&mut session, 2, listing(&["origin/a"]));
+        assert_eq!(first(&session), Some("branch list"));
     }
 
     fn listing(names: &[&str]) -> Frame {

@@ -15,7 +15,6 @@ pub mod compose;
 pub mod drafts;
 pub mod email_list;
 pub mod email_view;
-pub mod help;
 pub mod mailbox_list;
 pub mod retention_preview;
 pub mod rules_preview;
@@ -163,6 +162,8 @@ pub enum ViewAction {
     ChooseAttachment,
     /// List the retained drafts and the sent ones beside them.
     Drafts,
+    /// Open the window's key list, as `?` asks.
+    ShowKeys,
 }
 
 pub trait View {
@@ -171,6 +172,10 @@ pub trait View {
     /// A key, a press on a row or the wheel's travel; `page` is the rows
     /// the body shows, which the page keys move by.
     fn handle_key(&mut self, key: Key, page: usize) -> ViewAction;
+    /// The view's keys, which the key list shows first.
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        None
+    }
     /// A request the pane raised from a chord, or a bar label stood
     /// for, with the draft the pane shows: `save`, `close-tab`, `quit`,
     /// or one the view ignores.

@@ -161,6 +161,14 @@ mode.
   revoked. The window refuses to revoke every key. It names keys by
   their place in the list the vault thread last gave it; the thread
   holds their credentials.
+- **Keyboard.** `F1` shows td-ui's key list over the window
+  (td-ui/DESIGN.md, "Key list"): a section each for the prompt, a
+  question, the finder, the swap screen, the window while nothing is
+  open (opening, locking or refused), the locked view, a copy being
+  imported, the keys view, the notebook's shortcuts and each focus,
+  listed beside the input code in `src/app/input.rs`. The sections for
+  what has the keyboard now come first; under the keys view, which takes
+  every key, the notebook's and its focuses' come last.
 - **Copies.** In the keys view Export (Ctrl+E) opens td-ui's finder on
   folders, from `$HOME`; Ctrl+Return writes the notebook's encrypted
   copy, the authenticated ciphertext of the revision the session holds,
@@ -233,11 +241,12 @@ placement, the keys view's use, add and replace by key and by pointer,
 the refusal to revoke every key, marks that a held Space does not
 flicker, lock during a key operation, a failure's report kept past the
 view, the unsaved edits and focus kept under the view, the lists given
-their keys when the window grows, the pane's bezel on every side and
-its seams with the list and the search field with and without an entry
-and finding, a pane too short for a row keeping its lower bezel under
-the placeholder and an open entry, and painting the notebook, its keys
-view, its prompt and dialogs and each locked view, export into the
+their keys when the window grows, the key list's order, the pane's
+bezel on every side and its seams with the list and the search field
+with and without an entry and finding, a pane too short for a row
+keeping its lower bezel under the placeholder and an open entry, and
+painting the notebook, its keys view, its prompt and dialogs and each
+locked view, export into the
 folder the finder accepts, import of a chosen copy with one of its keys,
 a copy given up or unread, the finder painted, filtered and closed by
 Ctrl+L or the strip's Lock, a listing for a closed finder dropped, a

@@ -474,6 +474,10 @@ impl Handler for Session {
     fn notice(&mut self, message: &str) {
         eprintln!("td-agent: window: {message}");
     }
+
+    fn keys(&self) -> Vec<td_ui::keys::Section> {
+        self.app.key_list()
+    }
 }
 
 /// The conversations the store holds, as the list shows them, closed.

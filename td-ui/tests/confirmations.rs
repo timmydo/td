@@ -807,3 +807,23 @@ fn the_default_chords_name_the_keys() {
         assert_eq!(Key::from_chord(chord), None, "{chord}");
     }
 }
+
+/// Every key the key list names for the dialog is one it takes, and
+/// every chord it takes is named.
+#[test]
+fn the_listed_keys_are_the_dialogs() {
+    let listed: Vec<&str> = td_ui::confirmations::KEYS
+        .iter()
+        .flat_map(|(keys, _)| keys.split('/'))
+        .collect();
+    for chord in &listed {
+        let chord = if *chord == "Space" { " " } else { chord };
+        assert!(Key::from_chord(chord).is_some(), "{chord}");
+    }
+    for chord in [
+        "Tab", "S-Tab", "Up", "Down", "PageUp", "PageDown", "Home", "End", "Return", " ", "Escape",
+    ] {
+        let named = if chord == " " { "Space" } else { chord };
+        assert!(listed.contains(&named), "{chord} unlisted");
+    }
+}

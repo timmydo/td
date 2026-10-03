@@ -293,6 +293,9 @@ struct Session {
     /// Where the window last said Control is held over: the pane
     /// underlines the link a Control-press there would follow.
     hover: Option<(i64, i64)>,
+    /// A view's `?` asked for the window's key list, which the window
+    /// takes after the input.
+    show_keys: bool,
 }
 
 impl Session {
@@ -327,6 +330,7 @@ impl Session {
             attach_folder: None,
             attach_hidden: false,
             hover: None,
+            show_keys: false,
         };
         // The window reads the title at binding, before any poll.
         session.refresh_title();
@@ -417,6 +421,7 @@ impl Session {
             ViewAction::Request(name) => self.request(name),
             ViewAction::ChooseAttachment => self.open_chooser(),
             ViewAction::Drafts => self.drafts(),
+            ViewAction::ShowKeys => self.show_keys = true,
         }
     }
 
@@ -1504,6 +1509,14 @@ impl Handler for Session {
         "td-mail"
     }
 
+    fn keys(&self) -> Vec<td_ui::keys::Section> {
+        crate::keybindings::sections(self.stack.current().and_then(|view| view.keys()))
+    }
+
+    fn take_show_keys(&mut self) -> bool {
+        std::mem::take(&mut self.show_keys)
+    }
+
     fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> Flow {
         // The note is up until the next key or press.
         let presses = matches!(
@@ -1900,6 +1913,29 @@ mod frame_tests {
         key_with(session, chord, &mut NoClipboard);
     }
 
+    /// `count` messages the retention policies would expire, `old 0`
+    /// onward.
+    fn candidates(count: usize) -> Vec<crate::backend::RetentionCandidate> {
+        (0..count)
+            .map(|n| crate::backend::RetentionCandidate {
+                id: n.to_string(),
+                mailbox: "Trash".to_string(),
+                policy: "trash".to_string(),
+                received_at: "2026-01-01".to_string(),
+                from: "a@example.com".to_string(),
+                subject: format!("old {n}"),
+            })
+            .collect()
+    }
+
+    /// A read-only text pushed over the stack: the retention preview of
+    /// `count` messages.
+    fn preview(count: usize) -> ViewAction {
+        ViewAction::Push(Box::new(
+            views::retention_preview::RetentionPreviewView::new(candidates(count)),
+        ))
+    }
+
     fn key_with(session: &mut Session, chord: &str, clipboard: &mut dyn Clipboard) {
         let input = Input::Key {
             chord,
@@ -2284,11 +2320,12 @@ mod frame_tests {
 
     /// The frame reads back as text: the mailboxes with their counts,
     /// the title the header row was, then the folder opened by Return
-    /// with the backend asked for its messages, then the help in the
-    /// pane, read-only, where a chord the client does not claim edits
-    /// nothing, and back.
+    /// with the backend asked for its messages; `?` asks the window for
+    /// its key list, the shown view's keys first, and changes nothing;
+    /// then a text in the pane, read-only, where a chord the client does
+    /// not claim edits nothing, and back.
     #[test]
-    fn the_frame_shows_the_mailboxes_and_opens_one_and_the_help_in_the_pane() {
+    fn the_frame_shows_the_mailboxes_and_opens_one_and_a_text_in_the_pane() {
         let (mut session, cmd_rx, _resp_tx) = session(true);
         let text = session.shown();
         for expected in ["INBOX", "3/12", "Archive", "40", "Trash"] {
@@ -2319,12 +2356,30 @@ mod frame_tests {
         key(&mut session, "d");
         assert_eq!(session.title(), "Delete folder 'Trash'?");
         key(&mut session, "Escape");
-        key(&mut session, "?");
-        assert_eq!(session.stack.depth(), 2);
-        assert_eq!(session.title(), "Help");
+        assert!(!session.take_show_keys());
+        let title = session.title().to_string();
         let text = session.shown();
-        assert!(text.contains("Mailbox List"), "{text}");
-        let tab = session.pane.tab().expect("the pane holds the help");
+        key(&mut session, "?");
+        assert!(session.take_show_keys(), "`?` asks for the key list");
+        assert!(!session.take_show_keys(), "once");
+        assert_eq!(session.stack.depth(), 1);
+        assert_eq!(session.title(), title);
+        assert_eq!(session.shown(), text, "the view is as it was");
+        let first = |session: &Session| session.keys().first().map(|section| section.title);
+        assert_eq!(first(&session), Some("Mailbox List"));
+        assert_eq!(session.keys().len(), 8);
+        key(&mut session, "Return");
+        assert_eq!(first(&session), Some("Email List"));
+        key(&mut session, "?");
+        assert!(session.take_show_keys());
+        assert_eq!(session.stack.depth(), 2);
+        key(&mut session, "q");
+        session.act(preview(3));
+        assert_eq!(session.stack.depth(), 2);
+        assert_eq!(session.title(), "Retention expiry preview");
+        let text = session.shown();
+        assert!(text.contains("old 2"), "{text}");
+        let tab = session.pane.tab().expect("the pane holds the preview");
         let document = session.pane.editor().document(tab).unwrap();
         assert!(document.read_only());
         let revision = document.revision();
@@ -2480,7 +2535,7 @@ mod frame_tests {
     }
 
     /// A text entry: the folder name typed shows in the band, Escape
-    /// leaves it; over the help, the wheel and the reading keys scroll
+    /// leaves it; over a text, the wheel and the reading keys scroll
     /// the pane and Escape closes it.
     #[test]
     fn an_entry_shows_what_is_typed_and_a_text_scrolls_in_the_pane() {
@@ -2497,7 +2552,7 @@ mod frame_tests {
         assert_eq!(session.stack.depth(), 1);
         key(&mut session, "Escape");
         assert!(session.shape().unwrap().layout.entry.is_none());
-        key(&mut session, "?");
+        session.act(preview(200));
         session.shown();
         let page = session.page();
         assert!(page > 1, "{page}");
@@ -2525,22 +2580,15 @@ mod frame_tests {
         assert_eq!(session.pane.editor().tabs().count(), 1);
         key(&mut session, "Escape");
         assert_eq!(session.stack.depth(), 1);
-        // A text over a text: the preview's rows arrive, the help opens
-        // over it and closes, and a reading key right after, before any
-        // paint, moves the preview, whose document the pane holds again.
-        let candidates = (0..40)
-            .map(|n| crate::backend::RetentionCandidate {
-                id: n.to_string(),
-                mailbox: "Trash".to_string(),
-                policy: "trash".to_string(),
-                received_at: "2026-01-01".to_string(),
-                from: "a@example.com".to_string(),
-                subject: format!("old {n}"),
-            })
-            .collect();
+        // A text over a text: the preview's rows arrive, another text
+        // opens over it and closes, and a reading key right after, before
+        // any paint, moves the preview, whose document the pane holds
+        // again.
         resp_tx
             .send(BackendResponse::RetentionPreview {
-                result: Ok(crate::backend::RetentionPreviewResult { candidates }),
+                result: Ok(crate::backend::RetentionPreviewResult {
+                    candidates: candidates(40),
+                }),
             })
             .unwrap();
         session.poll(0);
@@ -2552,10 +2600,9 @@ mod frame_tests {
             Some(1),
             "pushed: the pane's at once"
         );
-        // The preview binds no help key; the push is the dispatcher's.
-        session.act(ViewAction::Push(Box::new(views::help::HelpView::new())));
+        session.act(preview(5));
         assert_eq!(session.pane.editor().tabs().count(), 2);
-        assert_eq!(session.title(), "Help");
+        assert_eq!(session.stack.depth(), 3);
         key(&mut session, "q");
         key(&mut session, "j");
         assert_eq!(
@@ -2973,7 +3020,7 @@ mod frame_tests {
         // A finder whose draft is no longer shown is closed with a note,
         // and the draft, shown again, says nothing was attached.
         key(&mut session, "C-S-a");
-        session.act(ViewAction::Push(Box::new(views::help::HelpView::new())));
+        session.act(preview(1));
         session.poll(0);
         assert!(session.chooser.is_none());
         session.act(ViewAction::Pop);
@@ -3328,8 +3375,8 @@ mod frame_tests {
             format!("z{template}"),
             "the fourth is unchanged"
         );
-        // A selection copied in the help's read-only pane is pasted into a draft.
-        key(&mut session, "?");
+        // A selection copied in a read-only pane is pasted into a draft.
+        session.act(preview(3));
         key(&mut session, "C-a");
         key(&mut session, "C-c");
         assert_eq!(session.pane.editor().tabs().count(), 1);
@@ -3338,7 +3385,7 @@ mod frame_tests {
         let fifth = path_of(&session);
         key(&mut session, "C-End");
         key(&mut session, "C-v");
-        assert!(text(&session).contains("Timmy's Mail Console"));
+        assert!(text(&session).contains("old 2"));
         // The question takes no edits: a chord the client does not
         // claim is dropped, and a letter is not an answer.
         key(&mut session, "C-w");
@@ -3373,13 +3420,11 @@ mod frame_tests {
             ),
             Flow::Quit
         );
-        assert!(std::fs::read_to_string(&fifth)
-            .unwrap()
-            .contains("Timmy's Mail Console"));
+        assert!(std::fs::read_to_string(&fifth).unwrap().contains("old 2"));
         // A window too small for the pane: the draft is still loaded,
         // the view's own, and a save writes it, not the text under it.
         let (mut small, _cmd_rx, _resp_tx) = self::session(true);
-        key(&mut small, "?");
+        small.act(preview(3));
         small.input(
             Input::Resize(Surface::new(800, 40, Default::default()).unwrap()),
             &mut NoClipboard,
@@ -3416,23 +3461,19 @@ mod frame_tests {
         let (mut session, _cmd_rx, _resp_tx) = session(true);
         let draft_dir = session.setup.draft_dir.clone().unwrap();
         let mut board = Board::new();
-        // The help, read-only: its whole text is copied out.
-        key(&mut session, "?");
-        assert_eq!(session.title(), "Help");
+        // A preview, read-only: its whole text is copied out.
+        session.act(preview(3));
+        assert_eq!(session.title(), "Retention expiry preview");
         key_with(&mut session, "C-c", &mut board);
         assert!(board.copies.is_empty(), "reader copy needs a selection");
         assert!(session.pane.killed().is_none());
         key_with(&mut session, "C-a", &mut board);
         key_with(&mut session, "C-c", &mut board);
         assert_eq!(board.copies.len(), 1);
-        assert!(
-            board.copies[0].contains("Mailbox List"),
-            "{}",
-            board.copies[0]
-        );
+        assert!(board.copies[0].contains("old 2"), "{}", board.copies[0]);
         assert_eq!(session.pane.killed(), Some(board.copies[0].clone()));
         assert!(!session.shown().contains("copy kept"), "no note");
-        // A paste into the help pastes nothing and asks nothing.
+        // A paste into the preview pastes nothing and asks nothing.
         board.text = true;
         key_with(&mut session, "C-v", &mut board);
         assert_eq!(board.pastes, 0);
@@ -3453,11 +3494,7 @@ mod frame_tests {
         key_with(&mut session, "C-v", &mut board);
         assert_eq!(board.pastes, 1);
         assert!(text(&session).starts_with("pasted"), "{}", text(&session));
-        assert!(
-            text(&session).contains("Mailbox List"),
-            "{}",
-            text(&session)
-        );
+        assert!(text(&session).contains("old 2"), "{}", text(&session));
         // A cut is the clipboard's too, so a paste after it brings the
         // cut text back whichever serves it; an empty text arriving
         // changes nothing and says nothing.
@@ -3778,9 +3815,9 @@ mod frame_tests {
         assert_eq!(session.stack.depth(), 1);
         // A view pushed with no poll between: the next key finds the
         // dropdown stale, closes it, and is the pushed view's (Escape
-        // pops the help).
+        // pops the preview).
         open(&mut session);
-        session.act(ViewAction::Push(Box::new(views::help::HelpView::new())));
+        session.act(preview(1));
         assert_eq!(session.stack.depth(), 2);
         key(&mut session, "Escape");
         assert!(session.menu.is_none());

@@ -2400,7 +2400,10 @@ The adapter must not position Confirm, nor an alternate such as Discard,
 beneath the pointer that opened the dialog: a second click in a
 double-click is otherwise a fresh gesture.
 
-`tests/confirmations.rs` pins the default chords, default cancellation,
+`confirmations::KEYS` is the dialog's keys as a key list shows them, so
+each program with a dialog lists the same rows for it.
+`tests/confirmations.rs` pins the default chords, the listed keys being
+exactly the ones `Key::from_chord` takes, default cancellation,
 focus confinement, press/release pairing, duplicate/repeated input,
 outside input, stale data, focus loss, resize refusal and focus
 restoration. It covers capture independence, lossless Unicode wrapping
@@ -2625,7 +2628,7 @@ time, coordinate extremes, explicit cancellation and consumed pairs.
 ## Following links
 
 A Control-press on a link opens it in the browser in td-editor's
-documents, in td-mail's messages and in td-news's articles and help,
+documents, in td-mail's messages and in td-news's articles,
 which each shows in the editor's pane (td-news's log cuts its lines at
 the pane's width, so it follows none), and in td-term's grid. The rule
 and the launch are the toolkit's so the programs agree.
@@ -2650,7 +2653,7 @@ will open before pressing. The widget window reports the pointer as
 hands the controller the point (`Controller::hover_link`) only where a
 press would reach the pane and follow (no menu, finder or prompt taking
 the press, the mouse on in td-mail's and td-news's configuration, and in
-td-news an article or the help), and none otherwise. The controller
+td-news an article), and none otherwise. The controller
 keeps the point, not the link, and its scene underlines the link
 `link_at` finds there in the text it draws, a one-pixel-per-scale rule
 along the cells' last row in the glyphs' ink, so text that changes or

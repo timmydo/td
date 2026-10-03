@@ -4,7 +4,6 @@ use crate::jmap::types::{Email, Mailbox};
 use crate::rules;
 use crate::ui::input::Key;
 use crate::ui::views::email_view::{EmailNavEntry, EmailView};
-use crate::ui::views::help::HelpView;
 use crate::ui::views::{strip_newlines, Body, Row, Scene, View, ViewAction};
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -365,6 +364,10 @@ impl ThreadView {
 }
 
 impl View for ThreadView {
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        Some(&crate::keybindings::THREAD_VIEW)
+    }
+
     fn scene(&self) -> Scene<'_> {
         let mode_label = if self.filter_mailbox_id.is_some() {
             "Thread"
@@ -521,7 +524,7 @@ impl View for ThreadView {
                 let draft = compose::build_compose_draft(&self.reply_from_address);
                 ViewAction::Compose(draft.into())
             }
-            Key::Char('?') => ViewAction::Push(Box::new(HelpView::new())),
+            Key::Char('?') => ViewAction::ShowKeys,
             Key::ScrollUp => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
@@ -798,5 +801,15 @@ mod tests {
         view.handle_key(Key::Click(5), 10);
         assert_eq!(view.cursor, 1);
         assert!(view.take_pending_action().is_none());
+    }
+
+    /// `?` asks the window for its key list.
+    #[test]
+    fn question_mark_shows_the_keys() {
+        let (mut view, _cmd_rx) = make_view(None);
+        assert!(matches!(
+            view.handle_key(Key::Char('?'), 10),
+            ViewAction::ShowKeys
+        ));
     }
 }

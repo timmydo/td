@@ -89,18 +89,19 @@ shows and draw in the toolkit's palette.
 
 ### Keybindings
 
-- Global: `?` help, `q` back/quit, `g` refresh
+- Global: `?` or `F1` shows the window's list of keys, the view's
+  first (`?`, `q`, `Escape` or `F1` closes it); `q` back/quit, `g` refresh
 - Feed list: `j/k/n/p` or arrows, `PgUp/PgDn`, `Home/End`, `Enter`, `u`
 - Article list: `j/k/n/p` or arrows, `PgUp/PgDn`, `Home/End`, `Enter`, `u`, `o`, `/`
 - Article view: `j/k`, `Space`, `PgUp/PgDn` scroll; arrows and `Home/End` move the caret; `n/p`, `u`, `o`, `b`
-- Any text (an article, the log, the help): `Ctrl-A` selects all, `Ctrl-C` copies the selection to the system clipboard; the status row says whether it was taken
+- Any text (an article, the log): `Ctrl-A` selects all, `Ctrl-C` copies the selection to the system clipboard; the status row says whether it was taken
 - Mouse:
 - A click selects a list row; a click on an article opens it
 - The action bar's labels are the view's keys
 - The wheel moves the selection, or scrolls the article
 - A drag in the article selects text, and `Ctrl-C` copies it
-- A Ctrl-click on a link in the article or the help opens it in the
-  browser; holding Ctrl over one underlines it
+- A Ctrl-click on a link in the article opens it in the browser;
+  holding Ctrl over one underlines it
 
 ## Cache
 

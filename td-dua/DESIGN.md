@@ -118,6 +118,11 @@ scroll sideways; the wheel scrolls three rows a notch.
   default) and apparent lengths.
 - Ctrl+Q or the compositor's close quits.
 
+`F1` shows these keys in td-ui's key list (td-ui/DESIGN.md, "Key
+list"): the window's own from `app::KEYS`, the table the status row's
+and `--help`'s hint is made from, then the list's and the delete
+question's, the question's first while it is open.
+
 While a scan or deletion is running, `x`, `D` and `r` are refused, so
 replies always apply to the tree they were asked about; `d` and `u` are
 list edits and always work. The status row shows the running scan's

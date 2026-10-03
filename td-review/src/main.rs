@@ -10,6 +10,7 @@
 mod app;
 mod chooser;
 mod git;
+mod keys;
 mod land;
 mod record;
 mod saved;
@@ -64,7 +65,7 @@ options:
 
 keys (window; it opens on $WAYLAND_DISPLAY):
   j/k move   enter review   r reload   / filter   D delete   w worktrees
-  ? help   q quit   a click selects a row, a double click reviews it
+  ?/F1 keys   q quit   a click selects a row, a double click reviews it
   f fetch the base's remote   F fetch every remote
   p push the base to its remote   P push the base to every remote that has
   not set remote.<name>.skipPushAll

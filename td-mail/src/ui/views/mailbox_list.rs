@@ -4,7 +4,6 @@ use crate::config::RetentionPolicyConfig;
 use crate::jmap::types::Mailbox;
 use crate::ui::input::{Key, Menu};
 use crate::ui::views::email_list::{CachedEmailListState, EmailListView};
-use crate::ui::views::help::HelpView;
 use crate::ui::views::retention_preview::RetentionPreviewView;
 use crate::ui::views::{
     format_system_time, strip_newlines, Body, Entry, Row, Scene, View, ViewAction,
@@ -595,6 +594,10 @@ impl MailboxListView {
 }
 
 impl View for MailboxListView {
+    fn keys(&self) -> Option<&'static crate::keybindings::Table> {
+        Some(&crate::keybindings::MAILBOX_LIST)
+    }
+
     fn scene(&self) -> Scene<'_> {
         // The list stays under the naming band and the delete question, so
         // the folder each is about is the one shown selected.
@@ -830,7 +833,7 @@ impl View for MailboxListView {
                     ViewAction::Continue
                 }
             }
-            Key::Char('?') => ViewAction::Push(Box::new(HelpView::new())),
+            Key::Char('?') => ViewAction::ShowKeys,
             Key::ScrollUp => {
                 if self.cursor > 0 {
                     self.cursor -= 1;

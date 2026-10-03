@@ -19,7 +19,6 @@ enum Screen {
     List,
     Review,
     Log,
-    Help,
 }
 
 /// A pending yes/no decision, shown as a bar across the bottom row.
@@ -118,7 +117,6 @@ pub struct App {
     log: Vec<Line>,
     log_title: String,
     log_scroll: usize,
-    help_scroll: usize,
     prompt: Option<Prompt>,
     /// Set when the screen changed under the operator — a confirmation went up,
     /// or an unconfirmed `r` landed and swapped the pane for the log. Either
@@ -156,7 +154,6 @@ impl App {
             log: Vec::new(),
             log_title: String::new(),
             log_scroll: 0,
-            help_scroll: 0,
             prompt: None,
             stale_typeahead: false,
             landed: VecDeque::new(),
@@ -186,8 +183,8 @@ impl App {
     /// was looking at. The batch boundary is the operator's typing speed, not
     /// anything this can reason about, so the reveal has to be the line.
     ///
-    /// Every return to the list drops, including from help and the review pane
-    /// where no row can have moved. Knowing which reveals are safe would mean
+    /// Every return to the list drops, including from the review pane, where
+    /// no row can have moved. Knowing which reveals are safe would mean
     /// tracking what the list looked like when it was last drawn, to save a
     /// `q j` somebody has to press twice.
     fn show_list(&mut self) {
@@ -273,7 +270,6 @@ impl App {
             Screen::List => self.render_list(&mut f),
             Screen::Review => self.render_review(&mut f),
             Screen::Log => self.render_log(&mut f),
-            Screen::Help => self.render_help(&mut f),
         }
         f
     }
@@ -478,7 +474,7 @@ impl App {
         }
         self.footer(
             f,
-            " enter review · f/F fetch · p/P push+clean up · / filter · D delete · w worktrees · ? help · q quit",
+            " enter review · f/F fetch · p/P push+clean up · / filter · D delete · w worktrees · ? keys · q quit",
         );
     }
 
@@ -516,18 +512,6 @@ impl App {
         self.footer(f, " j/k scroll · q back to branches");
     }
 
-    fn render_help(&self, f: &mut Frame) {
-        self.title(f, " td-review — keys");
-        let height = f.rows.saturating_sub(2);
-        let lines = help_lines();
-        let top = self.help_scroll.min(lines.len().saturating_sub(height));
-        f.scrollbar(height, lines.len(), top);
-        for line in lines.iter().skip(top).take(height) {
-            f.push(line);
-        }
-        self.footer(f, " j/k scroll · q back");
-    }
-
     // ----------------------------------------------------------------- input
 
     pub fn handle(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
@@ -552,15 +536,6 @@ impl App {
                         self.log_scroll =
                             scroll_by(self.log_scroll, key, self.log_rows(term), term.size().0);
                     }
-                }
-                Ok(Flow::Continue)
-            }
-            Screen::Help => {
-                if matches!(key, Key::Char('q') | Key::Esc | Key::Char('?')) {
-                    self.show_list();
-                } else {
-                    self.help_scroll =
-                        scroll_by(self.help_scroll, key, help_lines().len(), term.size().0);
                 }
                 Ok(Flow::Continue)
             }
@@ -597,7 +572,6 @@ impl App {
         let height = term.size().0.saturating_sub(self.list_chrome()).max(1);
         match key {
             Key::Char('q') | Key::Ctrl('c') => return Ok(Flow::Quit),
-            Key::Char('?') => self.screen = Screen::Help,
             Key::Char('j') | Key::Down => self.sel = step(self.sel, 1, self.view.len()),
             Key::Char('k') | Key::Up => self.sel = self.sel.saturating_sub(1),
             Key::Char('g') | Key::Home => self.sel = 0,
@@ -864,7 +838,6 @@ impl App {
             Key::Char('q') | Key::Esc | Key::Char('h') | Key::Left => {
                 self.show_list();
             }
-            Key::Char('?') => self.screen = Screen::Help,
             // No pager: the window is no terminal to hand one, and the pane
             // is the whole diff. `p` stays unbound here rather than taking
             // the list's push.
@@ -994,9 +967,6 @@ impl App {
             }
             // The window's pane scrolls under the wheel itself.
             (None, Screen::Review) => {}
-            (None, Screen::Help) => {
-                self.help_scroll = by(self.help_scroll, help_lines().len());
-            }
         }
     }
 
@@ -1760,132 +1730,6 @@ impl App {
             ));
         }
     }
-}
-
-fn help_lines() -> Vec<Line> {
-    let mut out = Vec::new();
-    let mut section = |title: &str, rows: &[(&str, &str)]| {
-        if !out.is_empty() {
-            out.push(Line::blank());
-        }
-        out.push(Line::new(title.to_string(), Style::fg(CYAN).with_bold()));
-        for (keys, what) in rows {
-            out.push(Line::plain(format!("  {keys:<18}{what}")));
-        }
-    };
-    section(
-        "branch list",
-        &[
-            ("j / k", "move"),
-            ("space / b", "page down / up"),
-            ("g / G", "first / last"),
-            ("enter", "review the selected branch against the base"),
-            ("f", "fetch + prune the base's remote (else origin)"),
-            ("F", "fetch + prune every remote, mirrors included"),
-            (
-                "p",
-                "push the base to its remote (else origin), then delete",
-            ),
-            ("", "the branches that push published — no confirmation"),
-            ("P", "the same, to every remote — bar the no_push ones and"),
-            ("", "any with `git config remote.<name>.skipPushAll true`,"),
-            ("", "which `p` and a hand-typed `git push` still reach"),
-            ("r", "re-read branches"),
-            ("/", "filter by branch name (esc clears)"),
-            (
-                "D",
-                "delete the selected branch from the remote its row names",
-            ),
-            ("", "— asked first, unless every check can prove the"),
-            ("", "delete takes nothing; the pane names the one that"),
-            ("", "could not, and then it asks"),
-            ("w", "sweep worktrees whose branch has fully landed (clean,"),
-            (
-                "",
-                "unpushed, not -rolling); every other one says why it stays",
-            ),
-            ("?", "this help"),
-            ("q", "quit"),
-        ],
-    );
-    // The column's whole vocabulary, because two of these cells are answers to
-    // a question the operator did not ask — what a LANDING would find, which no
-    // key spells out until one is pressed. Titled as CELLS because `?` is also
-    // a key above, and the two columns of this sheet look alike.
-    // Its two halves answer different questions now, which was self-evident
-    // while the whole cell was `%(ahead-behind:)` and is not any more.
-    section(
-        "A/B column (cells, not keys)",
-        &[
-            ("A", "commits a landing would take — none on a landed row,"),
-            ("", "however many of its own the branch still carries"),
-            ("B", "commits the base has that the branch does not, by"),
-            ("", "ancestry: how far behind it has fallen"),
-        ],
-    );
-    section(
-        "READY column (cells, not keys)",
-        &[
-            ("ok", "every commit carries the record AGENTS.md requires"),
-            ("n/m!", "n of its m commits do not"),
-            ("?", "the records could not be read"),
-            ("-", "no commits over the base"),
-            ("landed", "nothing left to land: the base carries this work"),
-            ("", "already, under its own oids after a landing replayed"),
-            ("", "them — rebase the branch and it empties"),
-            ("!merge", "does not merge onto the base, so neither s nor r"),
-            ("", "can take it as it stands; rebase it, unless it shares"),
-            ("", "no history with the base at all, which nothing lands"),
-        ],
-    );
-    section(
-        "review",
-        &[
-            ("j / k, space / b", "scroll"),
-            ("g / G", "top / end"),
-            ("drag", "select; double, triple click a word, a line"),
-            ("C-c", "copy the selection"),
-            ("s", "land it squashed: one commit on the base — asks first"),
-            ("r", "land it rebased: its own commits, replayed"),
-            ("", "lands on the keystroke — no confirmation"),
-            ("q", "back to the list"),
-        ],
-    );
-    section(
-        "landing",
-        &[
-            (
-                "s then y",
-                "squash + commit, message from the branch's commits",
-            ),
-            ("r", "replays each commit onto the base tip, message,"),
-            ("", "author and all — all of them or none, and with no"),
-            ("", "confirmation: it commits, it does not publish"),
-            ("q, then p", "publish it: push the base (P = every remote)"),
-            (
-                "after the push",
-                "the branches it published are deleted from the",
-            ),
-            ("", "remotes it reached — no further confirmation"),
-        ],
-    );
-    for prose in [
-        "The branch is pinned to the commit you reviewed: if the ref moves",
-        "before it runs, the landing refuses rather than committing work",
-        "you have not seen. Both modes hold what lands to the diff this pane",
-        "showed, and say so on the log when they could not. Landing only",
-        "commits — the push is a separate,",
-        "deliberate step, and it publishes every local commit on the base.",
-        "p and P push straight away: the keystroke is the decision, and the",
-        "branches this session landed onto what it published go with it. A",
-        "remote copy that has moved off the commit you reviewed is left, as",
-        "is one on a mirror the push did not reach — until a push does.",
-        "",
-        "Landing needs a clean work tree with the base branch checked out.",
-    ] {
-        out.push(Line::new(format!("  {prose}"), Style::dim()));
-    }
-    out
 }
 
 /// Width of the branch-name column: the longest name, measured in the same
@@ -3963,9 +3807,9 @@ mod tests {
             app.prompt.is_some(),
             "a row reading {cell} vanished unasked"
         );
-        // And the pane says WHY it is asking, which is what the help promises
-        // — this is the commonest refusal there is, so a silent one here would
-        // make that promise false for nearly every prompt.
+        // And the pane says WHY it is asking, which is what the key list
+        // promises — this is the commonest refusal there is, so a silent one
+        // here would make that promise false for nearly every prompt.
         assert!(
             app.log
                 .iter()
@@ -4811,10 +4655,10 @@ mod tests {
         assert_eq!(app.sel, 0);
         assert!(app.prompt.is_some());
         app.prompt = None;
-        app.screen = Screen::Help;
+        app.screen = Screen::Log;
         app.pick("origin/b03", true, 24).unwrap();
         assert_eq!(app.sel, 0);
-        assert!(matches!(app.screen, Screen::Help));
+        assert!(matches!(app.screen, Screen::Log));
         app.screen = Screen::List;
         app.editing_filter = true;
         app.pick("origin/b03", false, 24).unwrap();

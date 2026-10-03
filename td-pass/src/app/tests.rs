@@ -2678,3 +2678,56 @@ fn create_asks_which_keys_and_one_key_is_an_explicit_choice() {
         "Add a backup first (Insert): a kept key authorizes the replacement"
     );
 }
+
+fn titles(app: &App) -> Vec<&'static str> {
+    app.key_list().iter().map(|section| section.title).collect()
+}
+
+#[test]
+fn the_key_list_puts_what_has_the_keyboard_first() {
+    // Every section, always; the phase's first while it shows.
+    let mut board = Board::default();
+    let mut app = watched();
+    assert_eq!(titles(&app)[0], "Not open");
+    app.reply(Reply::Swap {
+        devices: vec!["/swapfile".to_owned()],
+    });
+    // The question comes unasked; under it, the screen's Return.
+    assert_eq!(&titles(&app)[..2], ["Question", "Swap on storage"]);
+    key(&mut app, &mut board, "Escape");
+    assert_eq!(titles(&app)[0], "Swap on storage");
+    let mut app = watched();
+    app.reply(Reply::Refused {
+        text: "refused".to_owned(),
+    });
+    assert_eq!(titles(&app)[0], "Not open");
+    let mut app = watched();
+    app.reply(Reply::Opened {
+        keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
+    });
+    let locked = titles(&app);
+    assert_eq!(locked.len(), 14);
+    assert_eq!(locked[0], "Locked");
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    assert_eq!(&titles(&app)[..2], ["Search", "Notebook"]);
+    let sections = app.key_list();
+    assert!(sections[1]
+        .rows
+        .iter()
+        .any(|row| (row.keys, row.what) == ("F2", "rename the entry")));
+    key(&mut app, &mut board, "Return");
+    assert_eq!(&titles(&app)[..2], ["Titles", "Notebook"]);
+    // The keys view takes every key: the notebook's shortcuts and its
+    // focuses' keys are dead under it, so they come last.
+    key(&mut app, &mut board, "C-k");
+    let shown = titles(&app);
+    assert_eq!(shown[0], "Keys view");
+    assert_eq!(
+        shown[shown.len() - 6..],
+        ["Notebook", "Search", "Titles", "Title", "Text", "Find"]
+    );
+    key(&mut app, &mut board, "Delete");
+    assert!(app.dialog.is_some());
+    assert_eq!(&titles(&app)[..2], ["Question", "Keys view"]);
+    assert_eq!(titles(&app).last(), Some(&"Find"));
+}

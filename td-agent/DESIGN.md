@@ -781,6 +781,16 @@ Without a key the status row says `no key: File → Set OpenRouter key…
 (F10)` after the state, until one is stored, when the notice says where
 it was stored and that every conversation uses it from now on.
 
+**As built (the key list).** `F1` shows td-ui's key list over the
+window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
+of the driven action table, `control::BINDINGS`, with its help line, so
+the list and the table an agent reads are one source; `set-key`, which
+has no chord, is the File menu's. Then come the focused widget's keys
+(the conversation list's, the transcript's or the composer's) and the
+other two's, listed beside `ui::App::key`. The control socket delivers
+its keys to the window's state, not through td-ui's window, so an `F1`
+sent there opens nothing.
+
 ## 5. Model client
 
 **Dialect.** OpenAI Chat Completions as OpenRouter serves it at

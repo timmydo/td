@@ -53,7 +53,7 @@ fn run() -> Result<(), String> {
             let _ = writeln!(
                 std::io::stdout().lock(),
                 "{USAGE}\n\nKeys: {}",
-                td_dua::app::KEYS
+                td_dua::app::hint()
             );
             Ok(())
         }

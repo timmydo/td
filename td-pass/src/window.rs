@@ -162,6 +162,10 @@ impl Handler for Session {
         self.app.take_scrub()
     }
 
+    fn keys(&self) -> Vec<td_ui::keys::Section> {
+        self.app.key_list()
+    }
+
     fn notice(&mut self, message: &str) {
         eprintln!("td-pass: window: {message}");
     }

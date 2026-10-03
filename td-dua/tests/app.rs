@@ -236,6 +236,40 @@ fn the_delete_list_adds_undoes_and_deletes_after_confirming() {
 }
 
 #[test]
+fn the_key_list_is_the_window_s_keys_then_the_list_s_and_the_question_s() {
+    let scratch = sample("keys");
+    let mut app = open(&scratch);
+    let titles = |app: &App| -> Vec<&str> { app.key_list().iter().map(|s| s.title).collect() };
+    assert_eq!(titles(&app), ["td-dua", "List", "Delete question"]);
+    let sections = app.key_list();
+    let window: Vec<(&str, &str)> = sections[0].rows.iter().map(|r| (r.keys, r.what)).collect();
+    assert_eq!(window, td_dua::app::KEYS);
+    assert!(sections[1].rows.iter().any(|r| r.keys == "S-Left/S-Right"));
+    // A "more" row shows `view::SHOWN` more, as the list says.
+    let more = format!("show {} more", td_dua::view::SHOWN);
+    assert!(sections[1]
+        .rows
+        .iter()
+        .any(|r| r.keys == "Return/Space" && r.what.ends_with(&more)));
+    // The status row's hint is the same table.
+    assert!(
+        app.message().ends_with(&td_dua::app::hint()),
+        "{}",
+        app.message()
+    );
+    assert_eq!(
+        td_dua::app::hint(),
+        "d: add to delete list  D: delete now  x: delete the list  u: undo add  r: refresh  a: allocated/apparent  C-q: quit"
+    );
+    // While the question is open its keys come first.
+    select(&mut app, "small.txt");
+    key(&mut app, "d");
+    key(&mut app, "x");
+    assert!(app.dialog_open());
+    assert_eq!(titles(&app), ["Delete question", "td-dua", "List"]);
+}
+
+#[test]
 fn a_changed_list_closes_the_question_unanswered() {
     let scratch = sample("stale");
     let mut app = open(&scratch);

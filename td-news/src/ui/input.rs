@@ -67,6 +67,7 @@ mod tests {
             ("Escape", None),
             ("Tab", None),
             ("Delete", None),
+            // The window's key list takes F1 before the reader sees it.
             ("F1", None),
             ("", None),
         ] {
