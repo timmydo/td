@@ -38,7 +38,7 @@ impl ErrorCode for Refusal {
 }
 
 /// The window's actions, each its default chord.
-pub const BINDINGS: [Binding; 8] = [
+pub const BINDINGS: [Binding; 11] = [
     Binding {
         name: "new",
         chord: Some("C-n"),
@@ -74,6 +74,24 @@ pub const BINDINGS: [Binding; 8] = [
         chord: Some("Escape"),
         arguments: "",
         help: "Interrupt the open conversation's running turn.",
+    },
+    Binding {
+        name: "pause",
+        chord: Some("C-S-p"),
+        arguments: "",
+        help: "Pause the open conversation, or resume it: paused, messages from other conversations wait.",
+    },
+    Binding {
+        name: "todo",
+        chord: Some("C-t"),
+        arguments: "",
+        help: "Show the open conversation's whole todo list, or collapse it to the item in progress.",
+    },
+    Binding {
+        name: "clear-todo",
+        chord: Some("C-S-t"),
+        arguments: "",
+        help: "Clear the open conversation's todo list.",
     },
     Binding {
         name: "focus-next",

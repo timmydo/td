@@ -14,7 +14,10 @@
 //! `store`. The model client (DESIGN.md §5) is `client`, a streamed reply
 //! read by `sse` and put back together by `assemble`, its money `cost`
 //! and `accounts`, what it knows of the provider's models `models`; the
-//! window reads the API key (`key`) and hands it down.
+//! window reads the API key (`key`) and hands it down. The conversation
+//! tools (DESIGN.md §3, §12) are `tools`, their reads of a log `history`
+//! and their wake budget `wake`; the window routes the messages they send
+//! between conversations through `post`.
 //!
 //! `unsafe` is forbidden for the whole crate (DESIGN.md §2).
 
@@ -28,10 +31,12 @@ pub mod control;
 pub mod conversation;
 pub mod cost;
 pub mod frame;
+pub mod history;
 #[allow(dead_code)]
 mod json;
 pub mod key;
 pub mod models;
+pub mod post;
 pub mod prompt;
 pub mod protocol;
 pub mod span;
@@ -57,5 +62,7 @@ mod testing;
     allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)
 )]
 mod toml;
+pub mod tools;
 pub mod ui;
+pub mod wake;
 pub mod window;

@@ -15,12 +15,15 @@ submission.
 
 ## Status
 
-Increments 3 to 7 of §18 are built: td-ui's message list; the
+Increments 3 to 8 of §18 are built: td-ui's message list; the
 crate with its gate, the window and conversation processes, the store
-and `./agent`; the model client over `td-fetch 1`, with no tools, with
-the key file, the models list, cost limits, credit and titles; td-net's
-streamed fetch; and streamed replies over it, drawn as they arrive and
-interrupted by `Escape`. Where building them
+and `./agent`; the model client over `td-fetch 1`, with the key file,
+the models list, cost limits, credit and titles; td-net's streamed
+fetch; streamed replies over it, drawn as they arrive and interrupted
+by `Escape`; and the conversation tools, the first a model is given:
+the todo list, `history_search` and `history_read`, `conversations`,
+`send_message` and `report`, with the wake budget and pausing. Where
+building them
 settled a point the design left open, the section says so under "As
 built". No recipe names td-agent yet. The decisions below that were the
 user's to make were made on 2026-10-01 and 2026-10-02:
@@ -296,6 +299,41 @@ ends (§5), and a window that adopts a conversation mid-stream draws
 only the deltas after it opened, until the logged reply replaces them.
 A background conversation's deltas are dropped.
 
+**As built (increment 8).** The window routes messages between
+conversations. Up, `send` carries a `send_message` or `report` (an id
+of the sender's, the receiver's id, the text, and a report's status),
+and `query` asks for the states the window knows; down, `sent` answers
+a send, queued or refused with why, and `states` answers a query.
+`message` hands a receiver a message from another conversation (its
+delivery id, sender, sender's role, text and status), which it
+acknowledges with `delivered` once logged, or refuses; `pause` pauses
+or resumes the open conversation, and `clear_todo` clears its todo
+list. `hello` says whether the conversation is paused. The window
+checks every send again, whatever the sender checked (the receiver
+exists, the crossing rules, the bounds), and writes it whole to the
+state directory's `outbox`, one file per message under its receiver's
+id, named by a rising order and its delivery id, before the sender hears
+it was queued. Each poll hands what is queued to its receiver's process,
+starting one in the background for a conversation that has none and has
+not failed, and a message's file is removed only when its receiver
+acknowledges or refuses it. So once queued, a restart of the receiver or
+the window neither loses nor repeats a message: a receiver restarted
+from its log is handed its unacknowledged messages again, and logs each
+delivery id once. A sender that hears no answer, the window closing or
+not answering in 30 s, tells its model that whether the message was
+queued is unknown, and not to send it again unless an answer that needs
+it does not come; a sender restarted mid-send finds the call
+interrupted with its effect unknown (§6). A message the receiver
+refuses (its log full, say) is noted in the window and not offered
+again. A receiver the store no longer lists, or whose process cannot
+be started, is said once and not tried again until the human opens it;
+one whose process failed waits the same way. The outbox directory is
+synced before each message is written, so a receiver's directory made
+for it is durable first. A process woken for a message is let go, as
+any background one is, when its turn ends, or at once when the message
+started none; one told to resume is kept until it logs the resumption,
+which comes after the start of any turn the resumption begins.
+
 ## 3. The orchestrator and conversations
 
 The orchestrator is a conversation like any other in its log and model
@@ -462,6 +500,59 @@ increments of §18:
   A firing to a conversation the human has paused is skipped and logged
   the same way.
 
+**As built (increment 8).** There are no workspaces yet, so every
+conversation is a workspace of its own and the orchestrator is the only
+other party it reaches. The orchestrator has `conversations`,
+`send_message`, `history_search`, `history_read` and `todo_write`; a
+conversation has `todo_write`, `history_search`, `history_read`,
+`conversations`, `send_message` and `report`. The crossing rules are
+`tools::crossing`, applied by the caller and again by the window: a
+conversation reads its own log, and the orchestrator reads and messages
+every conversation; any conversation messages the orchestrator; reading
+the orchestrator's log, and reading or messaging another conversation,
+are refused, saying that crossings are decided from a later increment
+and are not to be reached another way. No conversation messages
+itself. Archived and closed conversations do not exist until
+`close_workspace` (increment 11): a send to an id the store does not
+hold is refused by name, and the archived and closed checks join with
+them. A report's status is `in_progress`, `done` or `blocked`, and a
+report goes to the orchestrator alone. `conversations` lists at most
+200, the orchestrator first and then the most recently active, with
+how many more there are.
+
+- **A message** reaches its receiver's model as a user-role message whose
+  first line is its label: `[a message from the orchestrator, not from
+  the person]`, `[a message from conversation ID, not from the person]`
+  or `[a report from conversation ID, status S, not from the person]`.
+  The receiver logs it as a `message` event (§6) and decides there and
+  then, between turns, whether it starts one.
+- **The wake budget** is counted from the receiver's log: the first turn
+  of each message from another conversation, not a report, after the
+  human's last message in that log and after their last message to the
+  orchestrator, read from its log by time, a turn in the same second as
+  that message counting as before it. A turn the human asks again
+  (`C-r`) does not count. A report does not count: it is the
+  orchestrator's notification of a conversation's own turn, which that
+  conversation's budget bounds; nor does the orchestrator's own budget
+  stop it. Past twenty, a message is logged `held` without starting a
+  turn, and the first held since the budget was renewed adds a notice
+  saying so, which the window also shows when the conversation is in
+  the background. A held message is in the log, so the next turn's
+  request carries it; the human writing to the conversation or to the
+  orchestrator renews the budget.
+- **Pausing** is `C-S-p` on the open conversation (§4). It is logged as
+  a `pause` event and kept in `meta`, which an open puts right from the
+  log's last `pause` should a process have died between the two, so it
+  survives restarts. A paused conversation logs each message `held`
+  and starts no turn for it; resumed, it starts one turn for the
+  messages held since its last turn began, unless one of them would be
+  a wake past the budget, and that turn's request carries them all. A
+  pause sent while a turn runs takes effect when the turn ends, before
+  any message that came meanwhile, though not before the human's own
+  message or retry sent ahead of it. The human's own message or retry
+  resumes a paused conversation, logging the resumption, and is
+  answered as always.
+
 ## 4. Window and layout
 
 td-agent is a td-ui widget window (td-ui/DESIGN.md, "Widget window"). A
@@ -585,6 +676,24 @@ every provider stops generating, or billing, when a stream closes, and
 that `C-r` asks again. A turn whose reply is logged and whose title is
 being asked for (§13) does not hear an interrupt: the title request is
 short and counted.
+
+**As built (increment 8).** The open conversation's todo list is drawn
+above the composer, over the chrome, collapsed to one line: how many
+items are done of how many, then the item in progress, or the first
+pending, with its mark (`[ ]` pending, `[>]` in progress, `[x]` done,
+`[-]` cancelled). `C-t` shows the whole list, a line an item and at most
+twelve lines, the last saying how many more there are, and collapses it
+again; `C-S-t` clears it, which the conversation logs. `C-S-p` pauses or
+resumes the open conversation (§3); the list and the status row say
+`paused` while it is. `C-p` stays the composer's. The driven actions
+are `pause`, `todo` and `clear-todo`. The transcript shows a message
+from another conversation under its sender, a report with its status,
+and one held with the verdict `held: paused` or `held: wake budget`; it
+gets the status of the turn it starts as a human message does. A reply
+that calls tools carries a `tool calls` excerpt naming each call with
+its arguments, and each result is a `tool NAME` block, an excerpt of
+the result whose copy action copies the whole, marked `error` when it is
+one. A pause, a resumption and a cleared list are `td-agent` notices.
 
 ## 5. Model client
 
@@ -851,6 +960,55 @@ never interrupted. `td_fetch.rs` is td-news's copy, unedited.
   never resent. Nothing of a stream is logged before it ends, so a
   process killed mid-stream leaves only that interruption.
 
+**As built (increment 8).** Every request carries the conversation's
+tools. They live in the prefix (§6, §13), which is now a JSON object
+`{"tools":[…],"tool_choice":"auto","parallel_tool_calls":true,"messages":[{system}]}`,
+`messages` its last member, so a body is `{HEAD,` then the object's
+members with its `messages` array left open, the log's messages, and
+`]}`. A prefix written as increment 7 wrote it, an array of messages,
+still rebuilds its requests byte for byte, and such a conversation gets
+the object as a `prefix` event before its next request. A model whose
+cached `supported_parameters` lacks `tools` is refused before any
+request, naming the setting that chose it.
+
+- **A turn** is a loop of steps, each one request reserved against the
+  limits as any other. A whole reply's calls, whatever its
+  `finish_reason`, run one at a time in their order; each is logged as
+  `tool_call` and synced before it runs, and answered by exactly one
+  `tool_result`, which goes back as `{"role":"tool","tool_call_id":…,
+  "content":…}` after the reply, itself sent as
+  `{"role":"assistant","content":…,"tool_calls":[…]}` with `content`
+  null when it has no text. A reply with no calls ends the turn. A turn
+  stops after 40 steps, each a reply (a rate-limited request asked
+  again is the same step), saying so, every call answered; a message
+  goes on from there. A reply that finishes `tool_calls` with no calls
+  ends the turn as replied.
+- **Arguments** are parsed under a 256 KiB bound as a JSON object whose
+  members are all named by the tool; empty arguments are `{}`. Anything
+  else, an unknown tool or a bound passed is an error result saying
+  what was wrong, and the turn goes on. A result too long to log is
+  replaced by an error saying so. A call that came without an id or a
+  tool name, with an id past 256 bytes or one an earlier call of the
+  reply has, or with a name past 64 bytes, fails the reply as an error
+  inside a 200, charged and offered again: answered, it would make
+  every later request one the provider refuses. The tool calls' bytes
+  count against the reply's bound escaped, as the log carries them.
+- **Log room.** A request is sent only while the log has room for its
+  reply and for each of the 256 calls a reply may make to be answered
+  without running, and a call runs only while there is room for its
+  result at its longest (a log line) and for the later calls' answers;
+  past that it is answered as not run, the log full. So a reply's calls
+  can always be answered, by the process or by the repair at load.
+- **Interrupting** between calls answers each call not yet run as not
+  run, and the turn ends with `C-r` offered, which goes on from the log.
+  An incomplete reply's calls never run.
+- **The title** follows the first turn the human began (their message,
+  or a retry of it) that had a whole reply, however that turn ended,
+  quoting the human's first message and the last reply. A turn a
+  message from another conversation began does not count, so a
+  conversation first woken by one is titled after the human's first
+  turn.
+
 ## 6. Credentials and the conversation store
 
 **The API key** is held only by the agent processes (§2).
@@ -995,6 +1153,34 @@ log, and left out of every later request, so requests remain a pure
 function of `prefix` and `log`. Only whole replies count toward the
 conversation's first reply, after which a title is asked for, and only
 a whole reply is quoted in the title request.
+
+**As built (increment 8).** `meta` gains `paused`, absent in older
+ones and read as false. New events:
+
+- `message`: a message from another conversation, with its delivery id,
+  sender, sender's role, text, a report's status, and `held` (`paused`
+  or `budget`) when it started no turn; its delivery id is logged once,
+  as a user message's is.
+- `tool_call`: the reply it belongs to, the call's id and tool, logged
+  and synced before the call runs.
+- `tool_result`: the reply, the call's id and tool, the `tool_call` it
+  finishes (0 for a call never started), the content as returned to the
+  model, and whether it is an error.
+- `todo`: the whole list as written, marked `cleared` when the human
+  cleared it.
+- `pause`: the human paused or resumed the conversation.
+- `approval`: the decision on a call, by whom, and Jev's probabilities
+  and the reason; nothing writes one until increment 13, and the
+  history tools already show only its outcome and who decided.
+
+An `assistant` event carries its `tool_calls` (id, tool and the
+arguments as the model wrote them) when it made any. On load, every
+call of a whole reply that has no result gets one, before any later
+request could need it: a call found started is answered that a restart
+interrupted it and its effect is unknown, and is reported as
+interrupted; one never started is answered as not run. Neither runs
+again. A message logged without its turn's start, and not held, is
+given one, as a user message is.
 
 ## 7. Workspaces
 
@@ -1910,6 +2096,24 @@ made by the conversation process through the fetch service as a network
 crossing; a `task` tool for summarizing child conversations within a
 workspace; and an MCP stdio client.
 
+**As built (increment 8).** The conversation tools run in the
+conversation process; their definitions are JSON schemas with
+`additionalProperties: false`, in the prefix. An item's content is one
+line, since the window draws an item to a line. `todo_write` answers with
+the list as written. An event renders for the history tools as `#SEQ
+KIND TIME` (UTC, ISO 8601) and its text: a message under its sender, a
+reply's text and calls, a call's tool, a result's content whole, an
+approval only as its outcome and who decided. `history_search` folds
+case per character, so an excerpt of 120 bytes either side of the first
+match falls on character boundaries in the original, and gives each
+event at most once; a query is at most 1 KiB. `history_read`'s cursor
+is a sequence number and a byte offset into that event's rendering; an
+offset inside a character starts at that character, and a page always
+takes at least one character, so it moves. A page is held to `max_bytes`
+of text, and to 512 KiB as the tool result is logged, escaped. The todo
+item in progress is shown by `conversations` for the caller's own
+conversation, and to the orchestrator for every one, as the title is.
+
 ## 13. Prompting
 
 The prefix of §6 is ordered from stable to volatile, so it caches, and is
@@ -1976,6 +2180,18 @@ and never for the orchestrator. Its reply's first line, without
 quotation marks, becomes the title. A title request that is refused
 leaves the first line standing and says why in a notice, and one that
 fails records why in its request's finish; neither fails the turn.
+
+**As built (increment 8).** The prefix is the role's tool
+definitions and its static text (§5). Both static texts now name the
+tools the role has and what it still lacks; ask for a todo list on work
+of three or more steps; send the model to the history tools for what
+has left its context; say that a message from another conversation is
+labelled, not from the person, possibly wrong, and never permission;
+say that messages are delivered later and not to wait for a reply; and
+say that a refused crossing is not to be worked around. A
+conversation's text asks it to `report` to the orchestrator when the
+orchestrator gave it work; the orchestrator's asks it to weigh reports,
+and that each message it sends can start a turn that costs money.
 
 ## 14. Context
 
@@ -2370,10 +2586,54 @@ that ends the turn, closes the connection and is asked again whole, and
 one that ends a rate limit's wait. A 200
 answering a stream with one JSON body keeps increment 5's error case.
 
+**As built (increment 8).** `src/tools.rs` covers each tool's
+arguments and bounds: the todo list's 50 items, 500 bytes and one item
+in progress, unknown and mistyped members, malformed JSON and empty
+arguments, the search and read limits, a message's 32 KiB and a
+report's statuses; the crossing rules for each pair of roles; the
+listing's field filtering; and the definitions in the prefix.
+`src/history.rs` covers search (every term, case folded, newest first,
+kinds, the limit, excerpts on character boundaries), the cursor over a
+3,000-character tool result paged back whole, an offset inside a
+character, a page always taking one, and an approval's redaction in
+both tools. `src/wake.rs` covers the budget's count, reports and
+retries not counting, its renewal in the conversation and through the
+orchestrator, and its one notice; `src/post.rs` the outbox across a
+restart and the window's own check; `src/store.rs` the new events
+replayed exactly, `paused` in `meta`, and calls without results
+answered at load once; `src/assemble.rs` and `src/client.rs` a call
+without an id or name, a counted reply's calls, and the wire form of
+messages, calls and results; and the window's units the todo panel and
+its keys, pausing, messages, calls and results in the transcript, and
+a streamed reply's calls kept once it is logged. `client::check_calls`
+covers ids missing, shared or too long and names missing or too long.
+`tests/support/mock_fetch.rs` can route a request by a marker its body
+carries to a script of its own. The fixtures `stream-tool-todo.sse`,
+`stream-tool-parallel.sse`, `stream-tool-malformed.sse` and
+`stream-tool-send.sse` are hand-written tool-call streams in 17-byte
+argument fragments, and `models.json` gains a model without `tools`.
+`tests/model_client.rs` runs a tool call's round trip (the second body
+rebuilt from the log byte for byte), two parallel calls answered in
+their order, malformed arguments answered with an error, the step
+bound, a model without tools refused, the wake budget held past twenty
+and renewed by the human, a paused conversation holding a message and
+starting its turn when resumed, a pause sent mid-turn holding a message
+that came before it, a message handed on twice logged once, a crossing
+refused as the call's result, a conversation a message woke first
+titled after the human's first turn, and a restart that finds a call
+started and not finished; and, through a `Supervisor` and the window's
+`Post`, the orchestrator messaging a closed conversation, which is
+woken and answers; and an interrupt that comes while a call waits on
+the window, which lets that call finish, answers the next as not run
+and offers `C-r`, whose request carries both results.
+
 The live check is by hand. Write the key as one line to
 `$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode 0600, and run `./agent`
 from a checkout. A message to the orchestrator gets a reply, with its
-usage and cost on it. A new conversation's first reply is followed by a
+usage and cost on it. Asked to plan three steps, a model writes a todo
+list, drawn above the composer; asked to tell a conversation something,
+the orchestrator sends it a message, which that conversation answers in
+a turn of its own. A new conversation's first reply is followed by a
 title from `title_model`. The status row shows the model, the context
 used, the cost, today's total and the key's credit. The conversation's
 `log` under `$XDG_STATE_HOME/td-agent/` holds the request, the reply

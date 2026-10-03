@@ -6,9 +6,10 @@
 //!
 //! It also holds what crosses conversations: the API key, read once at
 //! startup and handed to each conversation process over its socketpair;
-//! the day's spending (`accounts::Ledger`); and the provider's models list
-//! and the key's credit, fetched on a thread of their own (`Fetcher`) so
-//! the window never waits on the network.
+//! the day's spending (`accounts::Ledger`); the messages between
+//! conversations, which it routes (`post`); and the provider's models
+//! list and the key's credit, fetched on a thread of their own
+//! (`Fetcher`) so the window never waits on the network.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -25,6 +26,7 @@ use crate::config::{Client, Config};
 use crate::control::Remote;
 use crate::key::Secret;
 use crate::models::{Credit, Models, MAX_LIST};
+use crate::post::{Outbox, Post};
 use crate::protocol::{Down, Up};
 use crate::store::{self, Event, Id, Kind, Role, StateDir};
 use crate::supervisor::{Opened, Supervisor, Update};
@@ -148,6 +150,7 @@ pub struct Session {
     ledger: Ledger,
     fetcher: Option<Fetcher>,
     client: Client,
+    post: Post,
 }
 
 impl Session {
@@ -172,6 +175,16 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::Pause(paused) => {
+                    if let Err(e) = self.supervisor.tell(&Down::Pause { paused }) {
+                        self.app.note(e);
+                    }
+                }
+                Request::ClearTodo => {
+                    if let Err(e) = self.supervisor.tell(&Down::ClearTodo) {
+                        self.app.note(e);
+                    }
+                }
                 Request::SaveShare(first, total) => {
                     if let Err(e) = self.state.save_share(first, total) {
                         self.app.note(e);
@@ -186,7 +199,7 @@ impl Session {
     fn open(&mut self, id: Id, create: Option<Role>) {
         match self.supervisor.open(id.clone(), create) {
             Ok(Opened::Started) => {}
-            Ok(Opened::Adopted) => match read_log(&self.state, &id) {
+            Ok(Opened::Adopted) => match store::read_log(&self.state, &id) {
                 Ok(events) => self.app.replay(events),
                 Err(e) => self.app.note(format!("the conversation's log: {e}")),
             },
@@ -209,16 +222,25 @@ impl Session {
             title: Role::Conversation.first_title().to_string(),
             activity: store::now(),
             state: RowState::Starting,
+            paused: false,
         });
         self.app.set_active(id.clone());
         self.open(id, Some(Role::Conversation));
     }
 
     /// What the conversation processes said: reservations answered from
-    /// the ledger, the rest to the app.
+    /// the ledger, messages between them routed, the rest to the app.
     fn hear(&mut self) {
         let now = store::now();
+        let directory = self.app.directory();
         for (id, update) in self.supervisor.poll() {
+            if let Some(note) = self
+                .post
+                .hear(&id, &update, &mut self.supervisor, &directory)
+            {
+                eprintln!("td-agent: {note}");
+                self.app.note(note);
+            }
             match &update {
                 Update::Up(Up::Reserve {
                     id: request,
@@ -272,6 +294,11 @@ impl Session {
             } else {
                 self.app.background(&id, &update, now);
             }
+        }
+        let directory = self.app.directory();
+        for note in self.post.deliver(&mut self.supervisor, &directory) {
+            eprintln!("td-agent: {note}");
+            self.app.note(note);
         }
         let today = self.ledger.today(now);
         self.app.set_today(today);
@@ -342,15 +369,6 @@ impl Session {
     }
 }
 
-/// A conversation's log as the store holds it now, its final line left
-/// out if its process is still writing it.
-fn read_log(state: &StateDir, id: &Id) -> Result<Vec<Event>, String> {
-    let path = state.conversation(id).join("log");
-    let bytes = store::read_bounded(&path, store::MAX_LOG)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    store::parse_log(&bytes).map(|(events, _)| events)
-}
-
 impl Handler for Session {
     fn app_id(&self) -> &str {
         "td-agent"
@@ -418,6 +436,7 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
                 title: meta.title,
                 activity,
                 state: RowState::Closed,
+                paused: meta.paused,
             }
         })
         .collect();
@@ -498,6 +517,13 @@ pub fn run(
         }
     };
     let ledger = Ledger::load(Some(state.root()), client.limits.day, store::now());
+    let (outbox, problems) = Outbox::load(&state);
+    for problem in &problems {
+        eprintln!("td-agent: the outbox: {problem}");
+    }
+    if let Some(problem) = problems.last() {
+        app.note(format!("the outbox: {problem}"));
+    }
     let mut session = Session {
         app,
         supervisor,
@@ -506,6 +532,7 @@ pub fn run(
         ledger,
         fetcher,
         client,
+        post: Post::new(outbox),
     };
     // A cached list serves until the provider's comes.
     match Models::load(session.state.root()) {
@@ -530,6 +557,7 @@ pub fn run(
                 title: Role::Orchestrator.first_title().to_string(),
                 activity: store::now(),
                 state: RowState::Starting,
+                paused: false,
             });
             session.app.set_active(id.clone());
             session.open(id, Some(Role::Orchestrator));

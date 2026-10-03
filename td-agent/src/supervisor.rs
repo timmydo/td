@@ -11,8 +11,10 @@
 //! in the background, answered as before, until the turn ends; then its
 //! socketpair is shut and it exits. Opening it again while
 //! it runs adopts that process rather than starting a second, which its
-//! directory's lock would refuse.
+//! directory's lock would refuse. A message from another conversation
+//! wakes one with no process: it is started in the background for it.
 
+use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -49,6 +51,9 @@ pub enum Update {
     /// The child failed and will not be restarted until the conversation
     /// is opened again.
     Failed { reason: String },
+    /// The child refused a message from another conversation, which is
+    /// not offered again.
+    Undeliverable { delivery: String, reason: String },
 }
 
 /// How a conversation was opened.
@@ -74,11 +79,17 @@ struct Running {
     incoming: Receiver<Incoming>,
     /// The human's messages sent and not yet acknowledged, in order.
     pending: Vec<(String, String)>,
+    /// Messages from other conversations handed to this child and not yet
+    /// acknowledged, in order: each a `Down::Message`, by delivery id.
+    deliveries: Vec<(String, Down)>,
     /// Restarts since the last acknowledgement.
     restarts: u32,
     failed: bool,
     /// The turn under way, by its start's sequence number.
     busy: Option<u64>,
+    /// Told to resume and not yet heard resuming: a turn for what it
+    /// held may be about to start, so it is kept.
+    resuming: bool,
 }
 
 impl Running {
@@ -87,7 +98,10 @@ impl Running {
     /// Such a child is kept when its conversation is left, so a message
     /// sent just before a switch is answered, not abandoned.
     fn working(&self) -> bool {
-        self.busy.is_some() || !self.pending.is_empty()
+        self.busy.is_some()
+            || self.resuming
+            || !self.pending.is_empty()
+            || !self.deliveries.is_empty()
     }
 }
 
@@ -104,6 +118,8 @@ pub struct Supervisor {
     /// Messages a closed conversation had not acknowledged, sent again
     /// when it is opened again; its process logs each delivery id once.
     parked: Vec<(Id, Vec<(String, String)>)>,
+    /// Variables set in each child's environment besides what it inherits.
+    env: Vec<(OsString, OsString)>,
 }
 
 impl Supervisor {
@@ -118,7 +134,101 @@ impl Supervisor {
             open: None,
             retiring: Vec::new(),
             parked: Vec::new(),
+            env: Vec::new(),
         }
+    }
+
+    /// Sets `name` to `value` in every child's environment: the tests'
+    /// fetch service, without changing their own process's.
+    pub fn env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// Whether conversation `id` has a process that has not failed.
+    pub fn running(&self, id: &Id) -> bool {
+        self.at(id)
+            .and_then(|at| self.children.get(at))
+            .is_some_and(|r| !r.failed)
+    }
+
+    /// Whether conversation `id`'s process holds delivery `delivery`,
+    /// handed to it and not yet acknowledged.
+    pub fn holds(&self, id: &Id, delivery: &str) -> bool {
+        self.at(id)
+            .and_then(|at| self.children.get(at))
+            .is_some_and(|r| r.deliveries.iter().any(|(d, _)| d == delivery))
+    }
+
+    /// Starts conversation `id`'s process in the background, for a
+    /// message to wake it; the open conversation stays open.
+    pub fn wake(&mut self, id: &Id) -> Result<(), String> {
+        if self.at(id).is_some() {
+            return Ok(());
+        }
+        let pending = match self.parked.iter().position(|(parked, _)| parked == id) {
+            Some(at) => self.parked.swap_remove(at).1,
+            None => Vec::new(),
+        };
+        let (child, mut writer, incoming) = match self.spawn(id, None) {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                if !pending.is_empty() {
+                    self.parked.push((id.clone(), pending));
+                }
+                return Err(e);
+            }
+        };
+        greet(&mut writer, &self.setup, &pending, &[]);
+        self.children.push(Running {
+            id: id.clone(),
+            child,
+            writer,
+            incoming,
+            pending,
+            deliveries: Vec::new(),
+            restarts: 0,
+            failed: false,
+            busy: None,
+            resuming: false,
+        });
+        Ok(())
+    }
+
+    /// Hands a message from another conversation, a `Down::Message`, to
+    /// conversation `id`'s running process, which acknowledges it once
+    /// logged; false when it has none.
+    pub fn deliver(&mut self, id: &Id, delivery: String, down: Down) -> bool {
+        let Some(running) = self.at(id).and_then(|at| self.children.get_mut(at)) else {
+            return false;
+        };
+        if running.failed {
+            return false;
+        }
+        let bytes = down.encode();
+        running.deliveries.push((delivery, down));
+        if frame::write(&mut running.writer, &bytes).is_err() {
+            let _ = running.writer.shutdown(std::net::Shutdown::Both);
+        }
+        true
+    }
+
+    /// Sends `down` to the open conversation's process: a pause, or the
+    /// todo list cleared.
+    pub fn tell(&mut self, down: &Down) -> Result<(), String> {
+        let running = self.opened().ok_or("no conversation is open")?;
+        if running.failed {
+            return Err("the conversation's process failed; open it again to restart it".into());
+        }
+        // A write that fails shuts the socketpair, and the child's going is
+        // heard and said as any failure of its is.
+        if frame::write(&mut running.writer, &down.encode()).is_err() {
+            let _ = running.writer.shutdown(std::net::Shutdown::Both);
+        }
+        if matches!(down, Down::Pause { paused: false }) {
+            running.resuming = true;
+        }
+        Ok(())
     }
 
     /// The open conversation, when there is one.
@@ -180,16 +290,18 @@ impl Supervisor {
                 return Err(e);
             }
         };
-        greet(&mut writer, &self.setup, &pending);
+        greet(&mut writer, &self.setup, &pending, &[]);
         self.children.push(Running {
             id: id.clone(),
             child,
             writer,
             incoming,
             pending,
+            deliveries: Vec::new(),
             restarts: 0,
             failed: false,
             busy: None,
+            resuming: false,
         });
         self.open = Some(id);
         Ok(Opened::Started)
@@ -213,8 +325,9 @@ impl Supervisor {
         }
     }
 
-    /// Shuts a child's socketpair, keeping what it had not acknowledged
-    /// for its next process, and reaps it as it exits.
+    /// Shuts a child's socketpair, keeping the human's messages it had not
+    /// acknowledged for its next process, and reaps it as it exits. The
+    /// window's outbox keeps the other conversations' messages.
     fn retire(&mut self, mut running: Running) {
         let _ = running.writer.shutdown(std::net::Shutdown::Both);
         if !running.pending.is_empty() {
@@ -235,6 +348,7 @@ impl Supervisor {
         let input = theirs.try_clone().map_err(|e| format!("socketpair: {e}"))?;
         let mut command = Command::new(&self.program);
         command
+            .envs(self.env.iter().map(|(name, value)| (name, value)))
             .arg("conversation")
             .arg(id.as_str())
             .arg("--state-dir")
@@ -409,7 +523,12 @@ impl Supervisor {
                 running.child = child;
                 running.writer = writer;
                 running.incoming = incoming;
-                greet(&mut running.writer, &self.setup, &running.pending);
+                greet(
+                    &mut running.writer,
+                    &self.setup,
+                    &running.pending,
+                    &running.deliveries,
+                );
                 Update::Restarting { reason }
             }
             Err(e) => {
@@ -436,9 +555,18 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
         match running.incoming.try_recv() {
             Ok(Incoming::Frame(bytes)) => match Up::decode(&bytes) {
                 Ok(Up::Refused { delivery, reason }) => {
+                    running.restarts = 0;
+                    // Another conversation's message: not offered again.
+                    if let Some(at) = running.deliveries.iter().position(|(d, _)| *d == delivery) {
+                        running.deliveries.remove(at);
+                        updates.push((
+                            running.id.clone(),
+                            Update::Undeliverable { delivery, reason },
+                        ));
+                        continue;
+                    }
                     // The message goes back to the window with why; a
                     // retry refused ends the busy it was marked with.
-                    running.restarts = 0;
                     if running.busy == Some(0) {
                         running.busy = None;
                     }
@@ -453,10 +581,17 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                     match &up {
                         Up::Delivered { delivery } => {
                             running.pending.retain(|(d, _)| d != delivery);
+                            running.deliveries.retain(|(d, _)| d != delivery);
                             running.restarts = 0;
                         }
-                        Up::Hello { .. } => running.busy = None,
+                        Up::Hello { .. } => {
+                            running.busy = None;
+                            running.resuming = false;
+                        }
                         Up::Event(event) => match event.kind {
+                            // Logged after any turn it starts, whose start
+                            // has marked the child busy.
+                            Kind::Pause { paused: false } => running.resuming = false,
                             Kind::Started {
                                 effect: Effect::Turn,
                                 ..
@@ -536,18 +671,26 @@ fn listen(ours: &UnixStream) -> Result<Receiver<Incoming>, String> {
     Ok(incoming)
 }
 
-/// Sends a new child its settings, then the unacknowledged messages, in
-/// order. A write that fails, a partial frame included, shuts the
-/// socketpair, so the reader sees the child go and the restart runs again
-/// rather than the child waiting on the rest of a frame.
-fn greet(writer: &mut UnixStream, setup: &Down, pending: &[(String, String)]) {
-    let downs = std::iter::once(setup.encode()).chain(pending.iter().map(|(delivery, text)| {
-        Down::User {
-            delivery: delivery.clone(),
-            text: text.clone(),
-        }
-        .encode()
-    }));
+/// Sends a new child its settings, then the unacknowledged messages, the
+/// human's and then other conversations', each in order. A write that
+/// fails, a partial frame included, shuts the socketpair, so the reader
+/// sees the child go and the restart runs again rather than the child
+/// waiting on the rest of a frame.
+fn greet(
+    writer: &mut UnixStream,
+    setup: &Down,
+    pending: &[(String, String)],
+    deliveries: &[(String, Down)],
+) {
+    let downs = std::iter::once(setup.encode())
+        .chain(pending.iter().map(|(delivery, text)| {
+            Down::User {
+                delivery: delivery.clone(),
+                text: text.clone(),
+            }
+            .encode()
+        }))
+        .chain(deliveries.iter().map(|(_, down)| down.encode()));
     for bytes in downs {
         if frame::write(writer, &bytes).is_err() {
             let _ = writer.shutdown(std::net::Shutdown::Both);

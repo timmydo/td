@@ -7,6 +7,10 @@
 //! fixtures rather than forwarding to a loopback server, since nothing in
 //! a model exchange needs one. No test reaches the network.
 //!
+//! A request whose body carries a routed marker (`route`) is answered
+//! from that marker's own script instead, so two conversations' requests,
+//! which may interleave, each get their own replies.
+//!
 //! A request that asks for a stream gets the service's stream mode: the
 //! head ending in `stream`, the body as `chunk N` frames, and an `end` or
 //! `error` line, or, for a client that must close it, comment frames as
@@ -209,10 +213,15 @@ impl Recorded {
     }
 }
 
+/// Scripts by the marker a request's body carries, each in reverse.
+type Routed = Mutex<Vec<(String, Vec<Reply>)>>;
+type Routes = Arc<Routed>;
+
 pub struct MockFetch {
     runtime: PathBuf,
     recorded: Arc<Mutex<Vec<Recorded>>>,
     script: Arc<Mutex<Vec<Reply>>>,
+    routes: Routes,
     stop: Arc<AtomicBool>,
     /// Open streams their client closed.
     closed: Arc<AtomicUsize>,
@@ -233,12 +242,14 @@ impl MockFetch {
             .expect("a nonblocking listener");
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(script.into_iter().rev().collect::<Vec<_>>()));
+        let routes: Routes = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicUsize::new(0));
         let handle = {
-            let (recorded, script, stop, closed) = (
+            let (recorded, script, routes, stop, closed) = (
                 recorded.clone(),
                 script.clone(),
+                routes.clone(),
                 stop.clone(),
                 closed.clone(),
             );
@@ -247,7 +258,8 @@ impl MockFetch {
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            if let Some(stream) = serve(stream, &recorded, &script, &stop, &closed)
+                            let scripts = (&*script, &*routes);
+                            if let Some(stream) = serve(stream, &recorded, scripts, &stop, &closed)
                             {
                                 held.push(stream);
                             }
@@ -264,6 +276,7 @@ impl MockFetch {
             runtime: runtime.to_path_buf(),
             recorded,
             script,
+            routes,
             stop,
             closed,
             handle: Some(handle),
@@ -298,6 +311,13 @@ impl MockFetch {
         for reply in replies {
             script.insert(0, reply);
         }
+    }
+
+    /// Answers each request whose body carries `marker` with the next of
+    /// `replies`, before the main script, until they run out.
+    pub fn route(&self, marker: &str, replies: Vec<Reply>) {
+        let mut routes = self.routes.lock().expect("the routes");
+        routes.push((marker.into(), replies.into_iter().rev().collect()));
     }
 
     /// Waits until `count` requests have come.
@@ -366,7 +386,7 @@ fn keep_open(stream: UnixStream, stop: Arc<AtomicBool>, closed: Arc<AtomicUsize>
 fn serve(
     stream: UnixStream,
     recorded: &Mutex<Vec<Recorded>>,
-    script: &Mutex<Vec<Reply>>,
+    (script, routes): (&Mutex<Vec<Reply>>, &Routed),
     stop: &Arc<AtomicBool>,
     closed: &Arc<AtomicUsize>,
 ) -> Option<UnixStream> {
@@ -381,8 +401,18 @@ fn serve(
         }
     };
     let streamed = request.stream;
+    let text = String::from_utf8_lossy(&request.body).into_owned();
     recorded.lock().ok()?.push(request);
-    let reply = script.lock().ok()?.pop();
+    let routed = routes
+        .lock()
+        .ok()?
+        .iter_mut()
+        .find(|(marker, replies)| !replies.is_empty() && text.contains(marker.as_str()))
+        .and_then(|(_, replies)| replies.pop());
+    let reply = match routed {
+        Some(reply) => Some(reply),
+        None => script.lock().ok()?.pop(),
+    };
     let bytes = match reply {
         // As the service frames any reply to a request for a stream.
         Some(Reply::Http {

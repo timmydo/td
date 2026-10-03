@@ -7,7 +7,7 @@
 use crate::config::Client;
 use crate::json::Json;
 use crate::key::Secret;
-use crate::store::{Event, Role};
+use crate::store::{Event, Id, Role};
 
 /// The longest message a human sends in one go. JSON escaping can make it
 /// six times longer on the wire, which `frame::MAX_FRAME` holds.
@@ -33,6 +33,24 @@ pub enum Down {
     /// Interrupt the turn under way: its stream's connection is closed
     /// (DESIGN.md §5). Between turns it means nothing.
     Interrupt,
+    /// A message from another conversation, which the receiver logs once
+    /// by its delivery id and takes between turns (DESIGN.md §3).
+    Message {
+        delivery: String,
+        from: Id,
+        role: Role,
+        text: String,
+        status: Option<String>,
+    },
+    /// The answer to a `Send` of the same id: queued, or why not.
+    Sent { id: u64, refusal: Option<String> },
+    /// The answer to a `Query` of the same id: each conversation's state
+    /// as the window knows it.
+    States { id: u64, states: Vec<(Id, String)> },
+    /// The human paused or resumed the conversation.
+    Pause { paused: bool },
+    /// The human cleared the todo list.
+    ClearTodo,
 }
 
 /// From a conversation to the window.
@@ -46,6 +64,7 @@ pub enum Up {
         title: String,
         torn: Option<u64>,
         interrupted: Vec<u64>,
+        paused: bool,
     },
     Event(Event),
     /// The message with this delivery id is logged and synced.
@@ -79,6 +98,19 @@ pub enum Up {
         reasoning: String,
         content: String,
     },
+    /// `send_message` or `report`: queue `text` for conversation `to`,
+    /// with a report's status. The window answers with `Sent`.
+    Send {
+        id: u64,
+        to: Id,
+        text: String,
+        status: Option<String>,
+    },
+    /// `conversations`: what state is each conversation in? The window
+    /// answers with `States`.
+    Query {
+        id: u64,
+    },
 }
 
 fn typed(kind: &str, mut pairs: Vec<(String, Json)>) -> Vec<u8> {
@@ -100,6 +132,20 @@ pub fn delivery_ok(delivery: &str) -> bool {
         && delivery
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// An optional text as a frame carries it: the text, or null.
+fn optional(text: &Option<String>) -> Json {
+    text.clone().map_or(Json::Null, Json::Str)
+}
+
+/// An optional text member, which a frame must carry, as null when none.
+fn maybe(value: &Json, name: &str) -> Result<Option<String>, String> {
+    match value.get(name) {
+        Some(Json::Null) => Ok(None),
+        Some(Json::Str(text)) => Ok(Some(text.clone())),
+        _ => Err(format!("no {name}")),
+    }
 }
 
 fn number(value: &Json, name: &str) -> Result<u64, String> {
@@ -138,6 +184,51 @@ impl Down {
             ),
             Self::Retry => typed("retry", Vec::new()),
             Self::Interrupt => typed("interrupt", Vec::new()),
+            Self::Message {
+                delivery,
+                from,
+                role,
+                text,
+                status,
+            } => typed(
+                "message",
+                vec![
+                    ("delivery".into(), Json::Str(delivery.clone())),
+                    ("from".into(), Json::Str(from.to_string())),
+                    ("role".into(), Json::Str(role.word().into())),
+                    ("text".into(), Json::Str(text.clone())),
+                    ("status".into(), optional(status)),
+                ],
+            ),
+            Self::Sent { id, refusal } => typed(
+                "sent",
+                vec![
+                    ("id".into(), Json::from(*id)),
+                    ("refusal".into(), optional(refusal)),
+                ],
+            ),
+            Self::States { id, states } => typed(
+                "states",
+                vec![
+                    ("id".into(), Json::from(*id)),
+                    (
+                        "states".into(),
+                        Json::Arr(
+                            states
+                                .iter()
+                                .map(|(id, state)| {
+                                    Json::Arr(vec![
+                                        Json::Str(id.to_string()),
+                                        Json::Str(state.clone()),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ],
+            ),
+            Self::Pause { paused } => typed("pause", vec![("paused".into(), Json::Bool(*paused))]),
+            Self::ClearTodo => typed("clear_todo", Vec::new()),
         }
     }
 
@@ -167,6 +258,47 @@ impl Down {
             }),
             Some("retry") => Ok(Self::Retry),
             Some("interrupt") => Ok(Self::Interrupt),
+            Some("message") => {
+                let delivery = string(&value, "delivery")?;
+                if !delivery_ok(&delivery) {
+                    return Err("a malformed delivery id".into());
+                }
+                Ok(Self::Message {
+                    delivery,
+                    from: Id::parse(&string(&value, "from")?).ok_or("a malformed sender")?,
+                    role: Role::parse(&string(&value, "role")?).ok_or("a malformed role")?,
+                    text: string(&value, "text")?,
+                    status: maybe(&value, "status")?,
+                })
+            }
+            Some("sent") => Ok(Self::Sent {
+                id: number(&value, "id")?,
+                refusal: maybe(&value, "refusal")?,
+            }),
+            Some("states") => Ok(Self::States {
+                id: number(&value, "id")?,
+                states: value
+                    .get("states")
+                    .and_then(Json::as_arr)
+                    .ok_or("no states")?
+                    .iter()
+                    .map(|pair| {
+                        let id = pair.index(0).and_then(Json::as_str).and_then(Id::parse);
+                        let state = pair.index(1).and_then(Json::as_str);
+                        match (id, state) {
+                            (Some(id), Some(state)) => Ok((id, state.to_string())),
+                            _ => Err("a malformed state"),
+                        }
+                    })
+                    .collect::<Result<_, _>>()?,
+            }),
+            Some("pause") => Ok(Self::Pause {
+                paused: value
+                    .get("paused")
+                    .and_then(Json::as_bool)
+                    .ok_or("no paused")?,
+            }),
+            Some("clear_todo") => Ok(Self::ClearTodo),
             Some("user") => {
                 let delivery = string(&value, "delivery")?;
                 if !delivery_ok(&delivery) {
@@ -190,6 +322,7 @@ impl Up {
                 title,
                 torn,
                 interrupted,
+                paused,
             } => typed(
                 "hello",
                 vec![
@@ -200,6 +333,7 @@ impl Up {
                         "interrupted".into(),
                         Json::Arr(interrupted.iter().map(|s| Json::from(*s)).collect()),
                     ),
+                    ("paused".into(), Json::Bool(*paused)),
                 ],
             ),
             Self::Event(event) => typed("event", vec![("event".into(), event.to_json())]),
@@ -243,6 +377,21 @@ impl Up {
                     ("content".into(), Json::Str(content.clone())),
                 ],
             ),
+            Self::Send {
+                id,
+                to,
+                text,
+                status,
+            } => typed(
+                "send",
+                vec![
+                    ("id".into(), Json::from(*id)),
+                    ("to".into(), Json::Str(to.to_string())),
+                    ("text".into(), Json::Str(text.clone())),
+                    ("status".into(), optional(status)),
+                ],
+            ),
+            Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
         }
     }
 
@@ -264,6 +413,10 @@ impl Up {
                     .iter()
                     .map(|v| v.as_u64().ok_or("a malformed interrupted id"))
                     .collect::<Result<_, _>>()?,
+                paused: value
+                    .get("paused")
+                    .and_then(Json::as_bool)
+                    .ok_or("no paused")?,
             },
             Some("event") => Self::Event(Event::from_json(
                 value.get("event").ok_or("an event message with no event")?,
@@ -291,6 +444,15 @@ impl Up {
                 reasoning: string(&value, "reasoning")?,
                 content: string(&value, "content")?,
             },
+            Some("send") => Self::Send {
+                id: number(&value, "id")?,
+                to: Id::parse(&string(&value, "to")?).ok_or("a malformed receiver")?,
+                text: string(&value, "text")?,
+                status: maybe(&value, "status")?,
+            },
+            Some("query") => Self::Query {
+                id: number(&value, "id")?,
+            },
             other => return Err(format!("unknown message {other:?}")),
         })
     }
@@ -301,6 +463,10 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::store::Kind;
+
+    fn delivery_text() -> String {
+        "0123456789abcdef0123456789abcdef".into()
+    }
 
     #[test]
     fn every_message_round_trips_within_the_frame_bound() {
@@ -318,13 +484,28 @@ mod tests {
                 title: "Orchestrator".into(),
                 torn: Some(3),
                 interrupted: vec![2, 5],
+                paused: false,
             },
             Up::Hello {
                 role: Role::Conversation,
                 title: "t".into(),
                 torn: None,
                 interrupted: vec![],
+                paused: true,
             },
+            Up::Send {
+                id: 4,
+                to: Id::parse(&"b".repeat(32)).unwrap(),
+                text: "\u{1}".repeat(crate::tools::MAX_MESSAGE),
+                status: Some("done".into()),
+            },
+            Up::Send {
+                id: 5,
+                to: Id::parse(&"b".repeat(32)).unwrap(),
+                text: "hi".into(),
+                status: None,
+            },
+            Up::Query { id: 6 },
             Up::Event(Event {
                 seq: 1,
                 time: 2,
@@ -362,10 +543,46 @@ mod tests {
                     details: None,
                     finish: "unknown".into(),
                     incomplete: true,
+                    calls: Vec::new(),
                 },
             }),
         ] {
+            assert!(up.encode().len() <= crate::frame::MAX_FRAME);
             assert_eq!(Up::decode(&up.encode()).unwrap(), up);
+        }
+        let other = Id::parse(&"c".repeat(32)).unwrap();
+        for down in [
+            Down::Message {
+                delivery: delivery_text(),
+                from: other.clone(),
+                role: Role::Conversation,
+                text: "\u{1}".repeat(crate::tools::MAX_MESSAGE),
+                status: Some("blocked".into()),
+            },
+            Down::Message {
+                delivery: delivery_text(),
+                from: other.clone(),
+                role: Role::Orchestrator,
+                text: "go".into(),
+                status: None,
+            },
+            Down::Sent {
+                id: 1,
+                refusal: None,
+            },
+            Down::Sent {
+                id: 2,
+                refusal: Some("full".into()),
+            },
+            Down::States {
+                id: 3,
+                states: vec![(other, "idle".into())],
+            },
+            Down::Pause { paused: true },
+            Down::ClearTodo,
+        ] {
+            assert!(down.encode().len() <= crate::frame::MAX_FRAME);
+            assert_eq!(Down::decode(&down.encode()).unwrap(), down);
         }
         let client = Client::default();
         for down in [

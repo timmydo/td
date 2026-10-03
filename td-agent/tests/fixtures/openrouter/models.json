@@ -19,9 +19,13 @@
   {"id":"meta-llama/llama-4-small","name":"Meta: Llama 4 Small","context_length":131072,
    "pricing":{"prompt":"0.0000001","completion":"0.0000003"},
    "top_provider":{"context_length":131072,"max_completion_tokens":null,"is_moderated":false},
-   "supported_parameters":["max_tokens","temperature","top_p"]},
+   "supported_parameters":["max_tokens","temperature","tool_choice","tools","top_p"]},
   {"id":"openrouter/auto","name":"Auto Router","context_length":2000000,
    "pricing":{"prompt":"-1","completion":"-1"},
    "top_provider":{"context_length":null,"max_completion_tokens":null,"is_moderated":false},
-   "supported_parameters":[]}
+   "supported_parameters":["tool_choice","tools"]},
+  {"id":"example/no-tools","name":"Example: No Tools","context_length":32768,
+   "pricing":{"prompt":"0.0000001","completion":"0.0000003"},
+   "top_provider":{"context_length":32768,"max_completion_tokens":null,"is_moderated":false},
+   "supported_parameters":["max_tokens","temperature"]}
 ]}

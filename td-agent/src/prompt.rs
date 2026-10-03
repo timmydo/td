@@ -2,10 +2,11 @@
 //! compiled in. They are program source, named `.txt` so that no
 //! documentation-only waiver covers them, and reviewed like code.
 //!
-//! A conversation's request prefix is its role's static text as the one
-//! system message every request begins with, written to the conversation's
-//! `prefix` file at creation. This increment has no tools, no environment
-//! block and no project instructions, which later increments add to it.
+//! A conversation's request prefix is its role's tool definitions and its
+//! static text as the one system message every request begins with
+//! (`tools::prefix`), written to the conversation's `prefix` file at
+//! creation. There is no environment block and no project instructions
+//! yet, which later increments add to it.
 
 use crate::json::Json;
 use crate::store::Role;
@@ -24,14 +25,14 @@ pub fn message(role: &str, content: &str) -> String {
     .to_string()
 }
 
-/// The prefix a conversation of `role` begins with: a JSON array of the
-/// messages every request starts with.
+/// The prefix a conversation of `role` begins with: a JSON object of its
+/// tools and the messages every request starts with.
 pub fn prefix(role: Role) -> String {
     let text = match role {
         Role::Orchestrator => ORCHESTRATOR,
         Role::Conversation => CONVERSATION,
     };
-    format!("[{}]", message("system", text.trim_end()))
+    crate::tools::prefix(role, text.trim_end())
 }
 
 #[cfg(test)]
@@ -40,11 +41,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_prefix_is_a_json_array_of_one_system_message() {
+    fn a_prefix_holds_the_tools_and_one_system_message() {
         for role in [Role::Orchestrator, Role::Conversation] {
             let prefix = prefix(role);
             let value = crate::json::parse(&prefix).unwrap();
-            let messages = value.as_arr().unwrap();
+            assert!(value.get("tools").is_some());
+            let messages = value.get("messages").unwrap().as_arr().unwrap();
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].get("role").unwrap().as_str(), Some("system"));
             let content = messages[0].get("content").unwrap().as_str().unwrap();

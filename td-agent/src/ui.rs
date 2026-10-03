@@ -15,6 +15,11 @@
 //! The status row says the open conversation's model, the context its
 //! last request used against the model's length, what the conversation
 //! has cost, what today has, and the key's credit (DESIGN.md §4, §5).
+//!
+//! The open conversation's todo list (DESIGN.md §12), when it has one, is
+//! drawn above the composer, collapsed to the item in progress; `C-t`
+//! shows the whole list and `C-S-t` clears it. `C-S-p` pauses or resumes
+//! the open conversation (§3).
 
 use td_ui::chrome::ROW;
 use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
@@ -32,12 +37,16 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::config::Mode;
 use crate::cost;
+use crate::post::Entry;
 use crate::protocol::{Up, MAX_TEXT};
-use crate::store::{Event, Id, Kind, Purpose, Role};
+use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TodoItem};
 use crate::supervisor::Update;
+use crate::tools;
 
 /// The composer's text rows when the window has room for them.
 const COMPOSER_ROWS: usize = 6;
+/// The most rows the todo list takes when shown whole.
+const TODO_ROWS: usize = 12;
 /// The split's child minima, in logical pixels.
 const LIST_MIN: u32 = 160;
 const CONVERSATION_MIN: u32 = 320;
@@ -138,6 +147,18 @@ pub struct Row {
     /// orders the conversations by.
     pub activity: u64,
     pub state: RowState,
+    /// The human paused it: messages from other conversations wait.
+    pub paused: bool,
+}
+
+impl Row {
+    /// Its state as the list names it.
+    pub fn word(&self) -> &'static str {
+        match self.state {
+            RowState::Closed | RowState::Idle if self.paused => "paused",
+            state => state.word(),
+        }
+    }
 }
 
 /// What the window asks of the session.
@@ -154,6 +175,10 @@ pub enum Request {
     Retry,
     /// Interrupt the open conversation's turn.
     Interrupt,
+    /// Pause, or resume, the open conversation.
+    Pause(bool),
+    /// Clear the open conversation's todo list.
+    ClearTodo,
     /// Save the split's preferred share.
     SaveShare(u32, u32),
 }
@@ -191,6 +216,8 @@ enum Capture {
 struct Regions {
     list: Rect,
     transcript: Rect,
+    /// The todo list, empty when there is none.
+    todo: Rect,
     /// The rule above the composer.
     rule: Rect,
     composer: Rect,
@@ -359,6 +386,9 @@ pub struct App {
     capture: Option<Capture>,
     mode: Mode,
     notice: Option<String>,
+    /// The open conversation's todo list, and whether it is shown whole.
+    todo: Vec<TodoItem>,
+    todo_open: bool,
     /// Each user message's sequence number and its index in the
     /// transcript, and each started turn's and its user message's.
     messages: Vec<(u64, usize)>,
@@ -425,6 +455,8 @@ impl App {
             capture: None,
             mode,
             notice: None,
+            todo: Vec::new(),
+            todo_open: false,
             messages: Vec::new(),
             turns: Vec::new(),
             last_seq: 0,
@@ -487,6 +519,28 @@ impl App {
         &self.rows
     }
 
+    /// The conversations as the post routes between them.
+    pub fn directory(&self) -> Vec<Entry> {
+        self.rows
+            .iter()
+            .map(|row| Entry {
+                id: row.id.clone(),
+                role: row.role,
+                state: match row.word() {
+                    "" => "idle",
+                    word => word,
+                }
+                .to_string(),
+                failed: row.state == RowState::Failed,
+            })
+            .collect()
+    }
+
+    /// The open conversation's todo list.
+    pub fn todo(&self) -> &[TodoItem] {
+        &self.todo
+    }
+
     pub fn focus(&self) -> Focus {
         self.focus
     }
@@ -509,7 +563,7 @@ impl App {
             .active
             .as_ref()
             .and_then(|id| self.rows.iter().find(|r| &r.id == id));
-        let state = row.map_or("no conversation", |r| r.state.word());
+        let state = row.map_or("no conversation", Row::word);
         // A notice goes next to the state, where a narrow row still
         // shows it.
         let notice = self
@@ -650,6 +704,10 @@ impl App {
         self.meter = Meter::default();
         self.streaming = None;
         self.undrawn = None;
+        if !self.todo.is_empty() {
+            self.todo.clear();
+            self.place();
+        }
         self.touch();
     }
 
@@ -711,6 +769,23 @@ impl App {
                 row.activity = now;
                 None
             }
+            Update::Up(Up::Event(Event {
+                kind: Kind::Pause { paused },
+                ..
+            })) => {
+                row.paused = *paused;
+                None
+            }
+            // What td-agent tells the human there, such as a wake budget
+            // spent, is said here too.
+            Update::Up(Up::Event(Event {
+                kind: Kind::Notice { text },
+                ..
+            })) => {
+                let note = format!("{}: {text}", row.title);
+                self.notice = Some(note);
+                None
+            }
             Update::Failed { .. } => Some(RowState::Failed),
             Update::Up(Up::Title { title }) => {
                 row.title = crate::store::title(title);
@@ -736,19 +811,21 @@ impl App {
                 title,
                 torn,
                 interrupted,
+                paused,
                 ..
             }) => {
                 self.clear_transcript();
                 if let Some(row) = self.active_row() {
                     row.title = crate::store::title(&title);
                     row.state = RowState::Idle;
+                    row.paused = paused;
                 }
                 if let Some(bytes) = torn {
                     self.note(format!("dropped a torn final log line of {bytes} bytes"));
                 }
                 if !interrupted.is_empty() {
                     self.note(format!(
-                        "a restart interrupted {} turn(s); none is repeated",
+                        "a restart interrupted {} turn(s), request(s) or tool call(s); none is repeated",
                         interrupted.len()
                     ));
                 }
@@ -774,8 +851,11 @@ impl App {
             Update::Refused { text: None, reason } | Update::Up(Up::Refused { reason, .. }) => {
                 self.note(format!("refused: {reason}"))
             }
-            // The window's ledger answers these; nothing shows.
-            Update::Up(Up::Reserve { .. } | Up::Spent { .. }) => {}
+            // The window's ledger and post answer these; nothing shows.
+            Update::Up(
+                Up::Reserve { .. } | Up::Spent { .. } | Up::Send { .. } | Up::Query { .. },
+            )
+            | Update::Undeliverable { .. } => {}
             Update::Up(Up::Delta {
                 request,
                 reasoning,
@@ -923,11 +1003,21 @@ impl App {
                 reasoning,
                 finish,
                 incomplete,
+                calls,
                 ..
             } => {
                 let reasoning = reasoning.filter(|r| !r.trim().is_empty());
                 let text = content.unwrap_or_default();
-                let text = if text.is_empty() { "(no text)" } else { &text };
+                let text = match (text.is_empty(), calls.is_empty()) {
+                    (true, true) => "(no text)",
+                    (true, false) => "(tool calls)",
+                    _ => &text,
+                };
+                let called = calls
+                    .iter()
+                    .map(|c| format!("{}({})", c.name, c.arguments))
+                    .collect::<Vec<String>>()
+                    .join("\n");
                 let verdict = if incomplete {
                     Some(("incomplete", Tone::Bad))
                 } else if finish == "stop" {
@@ -941,6 +1031,10 @@ impl App {
                 }
                 let message = message
                     .and_then(|m| m.text(text))
+                    .and_then(|m| match called.is_empty() {
+                        true => Ok(m),
+                        false => m.excerpt("tool calls", &called),
+                    })
                     .and_then(|m| match verdict {
                         Some((verdict, tone)) => m.verdict(verdict, tone),
                         None => Ok(m),
@@ -952,8 +1046,15 @@ impl App {
                     Err(e) => Err(e),
                     Ok(message) => match self.streaming.filter(|s| s.request == request) {
                         Some(_) => {
-                            let sections: Vec<&str> =
-                                reasoning.as_deref().into_iter().chain([text]).collect();
+                            // The calls are a section of their own, which a
+                            // stream never draws: a reply with calls is
+                            // always drawn again whole.
+                            let sections: Vec<&str> = reasoning
+                                .as_deref()
+                                .into_iter()
+                                .chain([text])
+                                .chain((!called.is_empty()).then_some(called.as_str()))
+                                .collect();
                             self.settle_stream(&sections, verdict, message)
                         }
                         None => self.push_message(message),
@@ -998,19 +1099,154 @@ impl App {
                         .set_status(index, Some((&status, Tone::Neutral)));
                 }
             }
-            Kind::Prefix { .. } | Kind::Title { .. } => {}
-            Kind::Notice { text } => {
-                let pushed = Message::new("td-agent")
-                    .and_then(|m| m.status("notice", Tone::Neutral))
+            Kind::Prefix { .. } | Kind::Title { .. } | Kind::ToolCall { .. } => {}
+            Kind::Notice { text } => self.notice_message(&text),
+            Kind::Message {
+                from,
+                role,
+                text,
+                status,
+                held,
+                ..
+            } => {
+                let header = match (role, &status) {
+                    (Role::Orchestrator, _) => "the orchestrator".to_string(),
+                    (Role::Conversation, None) => format!("conversation {}", self.named(&from)),
+                    (Role::Conversation, Some(status)) => {
+                        format!("report ({status}) from {}", self.named(&from))
+                    }
+                };
+                let held = held.map(|held| match held {
+                    Held::Paused => "held: paused",
+                    Held::Budget => "held: wake budget",
+                });
+                let pushed = Message::new(&header)
                     .and_then(|m| m.text(&text))
+                    .and_then(|m| match held {
+                        Some(held) => m.verdict(held, Tone::Neutral),
+                        None => Ok(m),
+                    })
+                    .map_err(|e| e.to_string())
+                    .and_then(|m| self.push_message(m));
+                match pushed {
+                    Ok(index) => self.messages.push((event.seq, index)),
+                    Err(e) => self.note(format!("the transcript refused a message: {e}")),
+                }
+            }
+            Kind::ToolResult {
+                name,
+                content,
+                error,
+                ..
+            } => {
+                let source: std::sync::Arc<str> = std::sync::Arc::from(content.as_str());
+                let mut message = Message::new(&format!("tool {name}"))
+                    .and_then(|m| m.excerpt("result", &content))
+                    .and_then(|m| m.source(source));
+                if error {
+                    message = message.and_then(|m| m.verdict("error", Tone::Bad));
+                }
+                let pushed = message
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));
                 if let Err(e) = pushed {
-                    self.note(format!("the transcript refused a notice: {e}"));
+                    self.note(format!("the transcript refused a tool result: {e}"));
                 }
+            }
+            Kind::Todo { items, cleared } => {
+                if cleared {
+                    self.notice_message("you cleared the todo list");
+                }
+                let rows = self.todo_rows();
+                self.todo = items;
+                if self.todo_rows() != rows {
+                    self.place();
+                }
+            }
+            Kind::Pause { paused } => {
+                if let Some(row) = self.active_row() {
+                    row.paused = paused;
+                }
+                self.refresh_list();
+                self.notice_message(if paused {
+                    "paused: messages from other conversations wait, held, until you resume it (C-S-p) or write here"
+                } else {
+                    "resumed"
+                });
+            }
+            Kind::Approval { outcome, by, .. } => {
+                self.notice_message(&format!("approval: {outcome}, decided by {by}"));
             }
         }
         self.touch();
+    }
+
+    /// A notice of td-agent's in the transcript.
+    fn notice_message(&mut self, text: &str) {
+        let pushed = Message::new("td-agent")
+            .and_then(|m| m.status("notice", Tone::Neutral))
+            .and_then(|m| m.text(text))
+            .map_err(|e| e.to_string())
+            .and_then(|m| self.push_message(m));
+        if let Err(e) = pushed {
+            self.note(format!("the transcript refused a notice: {e}"));
+        }
+    }
+
+    /// Conversation `id` as a message's header names it: its title, short,
+    /// and the start of its id.
+    fn named(&self, id: &Id) -> String {
+        let short: String = id.as_str().chars().take(8).collect();
+        match self.rows.iter().find(|r| &r.id == id) {
+            Some(row) => {
+                let title: String = row.title.chars().take(48).collect();
+                format!("{title} ({short})")
+            }
+            None => short,
+        }
+    }
+
+    /// The rows the todo list takes.
+    fn todo_rows(&self) -> usize {
+        match (self.todo.is_empty(), self.todo_open) {
+            (true, _) => 0,
+            (false, false) => 1,
+            (false, true) => self.todo.len().min(TODO_ROWS),
+        }
+    }
+
+    /// The todo list's lines as drawn: collapsed, the item in progress,
+    /// or the first not done; open, every item that fits.
+    pub fn todo_lines(&self) -> Vec<String> {
+        let line = |item: &TodoItem| format!("{} {}", tools::mark(item.status), item.content);
+        if self.todo.is_empty() {
+            return Vec::new();
+        }
+        if !self.todo_open {
+            let done = self
+                .todo
+                .iter()
+                .filter(|i| i.status == Status::Done)
+                .count();
+            let current = self
+                .todo
+                .iter()
+                .find(|i| i.status == Status::InProgress)
+                .or_else(|| self.todo.iter().find(|i| i.status == Status::Pending))
+                .map_or_else(|| "all done".to_string(), line);
+            return vec![format!(
+                "todo {done}/{}: {current} | C-t shows all, C-S-t clears",
+                self.todo.len()
+            )];
+        }
+        let shown = self.todo_rows();
+        let mut lines: Vec<String> = self.todo.iter().take(shown).map(line).collect();
+        if self.todo.len() > shown {
+            if let Some(last) = lines.last_mut() {
+                *last = format!("\u{2026} {} more", self.todo.len() - shown + 1);
+            }
+        }
+        lines
     }
 
     /// Appends a message to the transcript. The list's bounds are smaller
@@ -1277,6 +1513,7 @@ impl App {
     /// The panes where the split's layout puts them. A drag of the
     /// divider comes here alone: a resize of the split would end it.
     fn place(&mut self) {
+        let todo_rows = self.todo_rows();
         self.regions = self.split.layout().map(|layout| {
             let s = self.surface.scale.value();
             let right = layout.second;
@@ -1285,7 +1522,9 @@ impl App {
             let wanted = (COMPOSER_ROWS * CELL_HEIGHT * s + 2 * s) as u32;
             let composer_height = wanted.min(rest / 2);
             let rule_height = (s as u32).min(rest - composer_height);
-            let transcript_height = rest - composer_height - rule_height;
+            let above = rest - composer_height - rule_height;
+            let todo_height = ((todo_rows * ROW * s) as u32).min(above / 2);
+            let transcript_height = above - todo_height;
             let at = |y: u32, height: u32| Rect {
                 x: right.x,
                 y: right.y + i64::from(y),
@@ -1295,8 +1534,9 @@ impl App {
             Regions {
                 list: layout.first,
                 transcript: at(0, transcript_height),
-                rule: at(transcript_height, rule_height),
-                composer: at(transcript_height + rule_height, composer_height),
+                todo: at(transcript_height, todo_height),
+                rule: at(above, rule_height),
+                composer: at(above + rule_height, composer_height),
                 status: at(rest, status_height),
             }
         });
@@ -1511,6 +1751,33 @@ impl App {
         match chord {
             "C-n" if !repeat => {
                 self.requests.push(Request::New);
+                return;
+            }
+            "C-t" if !repeat => {
+                if self.todo.is_empty() {
+                    self.note("the conversation has no todo list");
+                } else {
+                    self.todo_open = !self.todo_open;
+                    self.place();
+                }
+                return;
+            }
+            "C-S-t" if !repeat => {
+                if !self.todo.is_empty() {
+                    self.requests.push(Request::ClearTodo);
+                }
+                return;
+            }
+            "C-S-p" if !repeat => {
+                let paused = self
+                    .active
+                    .as_ref()
+                    .and_then(|id| self.rows.iter().find(|r| &r.id == id))
+                    .map(|r| r.paused);
+                if let Some(paused) = paused {
+                    self.requests.push(Request::Pause(!paused));
+                    self.note(if paused { "resuming" } else { "pausing" });
+                }
                 return;
             }
             "C-PageUp" => return self.switch(-1),
@@ -1729,9 +1996,42 @@ impl App {
     fn cell(&self, index: usize, column: usize) -> Cell<'_> {
         let text = self.rows.get(index).map_or("", |row| match column {
             0 => row.title.as_str(),
-            _ => row.state.word(),
+            _ => row.word(),
         });
         Cell::new(text).unwrap_or_else(|_| Cell::empty())
+    }
+
+    /// The todo list, a line to an item, over the chrome.
+    fn emit_todo(&self, rect: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let Some(clip) = rect.intersection(damage) else {
+            return;
+        };
+        let s = self.surface.scale.value();
+        sink(Draw {
+            clip,
+            primitive: Primitive::Fill {
+                rect,
+                color: CHROME,
+            },
+        });
+        for (at, line) in self.todo_lines().iter().enumerate() {
+            raster::text_run(
+                self.surface.scale,
+                line.chars(),
+                (
+                    rect.x + (CELL_WIDTH * s) as i64,
+                    rect.y + ((at * ROW + 4) * s) as i64,
+                ),
+                rect,
+                GlyphStyle {
+                    ink: INK,
+                    background: CHROME,
+                    weight: Weight::Regular,
+                },
+                damage,
+                sink,
+            );
+        }
     }
 
     fn emit_status(&self, rect: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
@@ -1815,6 +2115,7 @@ impl Composition for App {
             sink,
         );
         self.transcript.emit(damage, sink);
+        self.emit_todo(regions.todo, damage, sink);
         if let Some(clip) = regions.rule.intersection(damage) {
             sink(Draw {
                 clip,
@@ -1849,6 +2150,7 @@ pub mod tests {
             title: format!("title {n}"),
             activity,
             state: RowState::Closed,
+            paused: false,
         }
     }
 
@@ -1908,6 +2210,7 @@ pub mod tests {
                 title: "Orchestrator".into(),
                 torn: Some(7),
                 interrupted: vec![],
+                paused: false,
             }),
             0,
         );
@@ -1994,6 +2297,7 @@ pub mod tests {
                 title: "Orchestrator".into(),
                 torn: None,
                 interrupted: vec![2],
+                paused: false,
             }),
             0,
         );
@@ -2258,6 +2562,7 @@ pub mod tests {
                     details: Some("[]".into()),
                     finish: "stop".into(),
                     incomplete: false,
+                    calls: Vec::new(),
                 },
             ),
             0,
@@ -2335,6 +2640,7 @@ pub mod tests {
             reasoning: Some(reasoning.into()),
             details: None,
             finish: if incomplete { "unknown" } else { "stop" }.into(),
+            calls: Vec::new(),
             incomplete,
         }
     }
@@ -2651,6 +2957,235 @@ pub mod tests {
             app.rows().iter().find(|r| r.id == id(3)).unwrap().state,
             RowState::Failed
         );
+    }
+
+    fn todo_item(content: &str, status: Status) -> TodoItem {
+        TodoItem {
+            content: content.into(),
+            status,
+        }
+    }
+
+    #[test]
+    fn the_todo_list_shows_above_the_composer_collapsed_to_its_item_in_progress() {
+        let mut app = app();
+        let before = app.regions.unwrap().transcript.height;
+        key(&mut app, "C-t");
+        assert!(app.notice().unwrap().contains("no todo list"));
+        app.update(
+            at(
+                1,
+                Kind::Todo {
+                    items: vec![
+                        todo_item("Read the design", Status::Done),
+                        todo_item("Write the tests", Status::InProgress),
+                        todo_item("Land it", Status::Pending),
+                    ],
+                    cleared: false,
+                },
+            ),
+            0,
+        );
+        let regions = app.regions.unwrap();
+        assert!(regions.todo.height > 0 && regions.transcript.height < before);
+        assert_eq!(
+            regions.todo.y + i64::from(regions.todo.height),
+            regions.rule.y
+        );
+        assert_eq!(
+            app.todo_lines(),
+            ["todo 1/3: [>] Write the tests | C-t shows all, C-S-t clears"]
+        );
+        assert!(text(&app).contains("[>] Write the tests"), "drawn");
+        key(&mut app, "C-t");
+        assert_eq!(
+            app.todo_lines(),
+            ["[x] Read the design", "[>] Write the tests", "[ ] Land it"]
+        );
+        assert!(app.regions.unwrap().todo.height > regions.todo.height);
+        key(&mut app, "C-S-t");
+        assert_eq!(app.take_requests(), [Request::ClearTodo]);
+        app.update(
+            at(
+                2,
+                Kind::Todo {
+                    items: Vec::new(),
+                    cleared: true,
+                },
+            ),
+            0,
+        );
+        assert!(app.todo().is_empty());
+        assert_eq!(app.regions.unwrap().todo.height, 0);
+        assert_eq!(app.regions.unwrap().transcript.height, before);
+        assert!(text(&app).contains("you cleared the todo list"));
+        // Nothing to clear asks nothing.
+        key(&mut app, "C-S-t");
+        assert!(app.take_requests().is_empty());
+    }
+
+    #[test]
+    fn c_s_p_pauses_and_resumes_and_the_list_says_paused() {
+        let mut app = app();
+        app.update(
+            Update::Up(Up::Hello {
+                role: Role::Orchestrator,
+                title: "t".into(),
+                torn: None,
+                interrupted: Vec::new(),
+                paused: false,
+            }),
+            0,
+        );
+        key(&mut app, "C-S-p");
+        assert_eq!(app.take_requests(), [Request::Pause(true)]);
+        app.update(at(1, Kind::Pause { paused: true }), 0);
+        assert!(
+            app.status_line().starts_with("paused"),
+            "{}",
+            app.status_line()
+        );
+        assert_eq!(app.directory()[0].state, "paused");
+        assert!(text(&app).contains("messages from other conversations wait"));
+        key(&mut app, "C-S-p");
+        assert_eq!(app.take_requests(), [Request::Pause(false)]);
+        app.update(at(2, Kind::Pause { paused: false }), 0);
+        assert!(
+            app.status_line().starts_with("idle"),
+            "{}",
+            app.status_line()
+        );
+        // A conversation in the background that pauses shows it in its row.
+        app.background(&id(2), &at(5, Kind::Pause { paused: true }), 0);
+        let row = app.rows().iter().find(|r| r.id == id(2)).unwrap();
+        assert_eq!(row.word(), "paused");
+        let entry = app.directory().into_iter().find(|e| e.id == id(3)).unwrap();
+        assert_eq!(
+            entry.state, "idle",
+            "a closed conversation is idle to the tools"
+        );
+    }
+
+    #[test]
+    fn messages_tool_calls_and_results_show_in_the_transcript() {
+        let mut app = app();
+        app.update(
+            at(
+                1,
+                Kind::Message {
+                    delivery: "d".into(),
+                    from: id(3),
+                    role: Role::Conversation,
+                    text: "the build is green".into(),
+                    status: Some("done".into()),
+                    held: Some(Held::Budget),
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                2,
+                Kind::Started {
+                    effect: crate::store::Effect::Turn,
+                    of: 1,
+                },
+            ),
+            0,
+        );
+        app.update(at(3, request(2, 0)), 0);
+        app.update(
+            at(
+                4,
+                Kind::Assistant {
+                    request: 3,
+                    content: None,
+                    reasoning: None,
+                    details: None,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                    calls: vec![crate::store::Call {
+                        id: "c1".into(),
+                        name: "history_search".into(),
+                        arguments: "{\"query\":\"green\"}".into(),
+                    }],
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                5,
+                Kind::ToolResult {
+                    reply: 4,
+                    id: "c1".into(),
+                    name: "history_search".into(),
+                    call: 0,
+                    content: "No event matches.".into(),
+                    error: true,
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        for said in [
+            "report (done) from title 3",
+            "the build is green",
+            "held: wake budget",
+            "running",
+            "(tool calls)",
+            "history_search({\"query\":\"green\"})",
+            "tool history_search",
+            "No event matches.",
+            "error",
+        ] {
+            assert!(shown.contains(said), "{said} in {shown}");
+        }
+        // A notice in the background is said in the status row.
+        app.background(
+            &id(2),
+            &at(
+                9,
+                Kind::Notice {
+                    text: crate::wake::notice(),
+                },
+            ),
+            0,
+        );
+        assert!(app
+            .notice()
+            .unwrap()
+            .starts_with("title 2: messages from other"));
+    }
+
+    #[test]
+    fn a_streamed_reply_that_calls_tools_shows_its_calls_once_logged() {
+        let mut app = app();
+        turn(&mut app, 1, "plan");
+        app.update(at(3, request(2, 0)), 0);
+        app.update(delta(3, "", "I will plan."), 0);
+        app.update(
+            at(
+                4,
+                Kind::Assistant {
+                    request: 3,
+                    content: Some("I will plan.".into()),
+                    reasoning: None,
+                    details: None,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                    calls: vec![crate::store::Call {
+                        id: "c1".into(),
+                        name: "todo_write".into(),
+                        arguments: "{\"items\":[]}".into(),
+                    }],
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        assert!(shown.contains("todo_write({\"items\":[]})"), "{shown}");
+        assert_eq!(shown.matches("I will plan.").count(), 1, "{shown}");
     }
 
     #[test]

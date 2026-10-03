@@ -1,14 +1,15 @@
 //! The model client's wire format (DESIGN.md §5): OpenAI Chat Completions
-//! as OpenRouter serves it, with no tools yet. A turn's request streams
-//! (`stream: true`), its reply put back together by `sse` and `assemble`;
-//! a title's is counted. What a request carries and how a reply reads are
-//! pure functions here; `conversation` sends them through the fetch
-//! service.
+//! as OpenRouter serves it, with the conversation tools. A turn's request
+//! streams (`stream: true`), its reply put back together by `sse` and
+//! `assemble`; a title's is counted. What a request carries and how a
+//! reply reads are pure functions here; `conversation` sends them through
+//! the fetch service.
 //!
-//! A request's body is `{HEAD,"messages":[PREFIX...,MESSAGES...]}`: `HEAD`
+//! A request's body is `{HEAD,PREFIX…,"messages":[…,MESSAGES…]}`: `HEAD`
 //! the exact text of its other members, logged with the request; the
-//! prefix's messages as the conversation's prefix holds them; and one
-//! message per user message and assistant reply logged before it. So
+//! prefix's tools and messages as the conversation's prefix holds them
+//! (`turn_body`); and one message per user message, message from another
+//! conversation, assistant reply and tool result logged before it. So
 //! every request is a pure function of the prefix and the log, and a
 //! restart sends the same bytes as before, which keeps a provider's
 //! prompt cache warm. An assistant reply's `reasoning_details` go back as
@@ -21,7 +22,7 @@ use crate::config::Client;
 use crate::cost::{self, Tokens};
 use crate::json::Json;
 use crate::span::{self, Step};
-use crate::store::{Event, Kind, Purpose};
+use crate::store::{Call, Event, Kind, Purpose, Role};
 use crate::td_fetch;
 
 /// The attribution pair's values (DESIGN.md §5).
@@ -155,11 +156,57 @@ pub fn title_head(client: &Client, user: &str, reply: &str) -> String {
     ]))
 }
 
+/// The longest tool call id and tool name a reply may give; every later
+/// request carries them back.
+pub const MAX_CALL_ID: usize = 256;
+pub const MAX_TOOL_NAME: usize = 64;
+
+/// Whether a whole reply's tool calls can each be answered: an id that is
+/// present, bounded and its own, and a bounded name. A call that cannot
+/// is a failure inside a 200: answered under a missing or shared id, it
+/// would make every later request one the provider refuses.
+pub fn check_calls(calls: &[Call]) -> Result<(), String> {
+    for (at, call) in calls.iter().enumerate() {
+        let wrong = if call.id.is_empty() {
+            "came without an id"
+        } else if call.id.len() > MAX_CALL_ID {
+            "came with an id past 256 bytes"
+        } else if call.name.is_empty() {
+            "came without a tool name"
+        } else if call.name.len() > MAX_TOOL_NAME {
+            "came with a tool name past 64 bytes"
+        } else if calls.iter().take(at).any(|c| c.id == call.id) {
+            "came with the id of an earlier call"
+        } else {
+            continue;
+        };
+        return Err(format!("tool call {at} {wrong}"));
+    }
+    Ok(())
+}
+
+/// The label a message from another conversation reaches the model under
+/// (DESIGN.md §3): its source, and that it is not the person's.
+pub fn label(from: &crate::store::Id, role: Role, status: Option<&str>) -> String {
+    match (role, status) {
+        (Role::Orchestrator, _) => "[a message from the orchestrator, not from the person]".into(),
+        (Role::Conversation, Some(status)) => {
+            format!("[a report from conversation {from}, status {status}, not from the person]")
+        }
+        (Role::Conversation, None) => {
+            format!("[a message from conversation {from}, not from the person]")
+        }
+    }
+}
+
 /// The messages of the log before a request, as the request carries
-/// them: each user message, and each whole turn reply that has text or
-/// reasoning to give back. A reply a broken or interrupted stream left
-/// incomplete is the log's and the window's, never the model's: its
-/// reasoning details may lack the signature that closes them.
+/// them: each user message, and each message from another conversation
+/// under its label; each whole turn reply that has text, reasoning or
+/// tool calls to give back; and each tool result, as a `tool` message
+/// after the reply that asked for it. A reply a broken or interrupted
+/// stream left incomplete is the log's and the window's, never the
+/// model's: its reasoning details may lack the signature that closes
+/// them, and its tool calls never ran.
 pub fn messages(events: &[Event]) -> Vec<String> {
     let mut purposes: Vec<(u64, Purpose)> = Vec::new();
     let mut out = Vec::new();
@@ -167,11 +214,22 @@ pub fn messages(events: &[Event]) -> Vec<String> {
         match &event.kind {
             Kind::Request { purpose, .. } => purposes.push((event.seq, *purpose)),
             Kind::User { text, .. } => out.push(crate::prompt::message("user", text)),
+            Kind::Message {
+                from,
+                role,
+                text,
+                status,
+                ..
+            } => out.push(crate::prompt::message(
+                "user",
+                &format!("{}\n{text}", label(from, *role, status.as_deref())),
+            )),
             Kind::Assistant {
                 request,
                 content,
                 details,
                 incomplete,
+                calls,
                 ..
             } => {
                 let turn = purposes
@@ -180,13 +238,39 @@ pub fn messages(events: &[Event]) -> Vec<String> {
                     .find(|(seq, _)| seq == request)
                     .is_some_and(|(_, p)| *p == Purpose::Turn);
                 let content = content.as_deref().unwrap_or_default();
-                if !turn || *incomplete || (content.is_empty() && details.is_none()) {
+                if !turn
+                    || *incomplete
+                    || (content.is_empty() && details.is_none() && calls.is_empty())
+                {
                     continue;
                 }
-                let mut message = format!(
-                    "{{\"role\":\"assistant\",\"content\":{}",
+                // A reply that only calls tools has no content to give.
+                let content = if content.is_empty() && !calls.is_empty() {
+                    Json::Null
+                } else {
                     Json::Str(content.into())
-                );
+                };
+                let mut message = format!("{{\"role\":\"assistant\",\"content\":{content}");
+                if !calls.is_empty() {
+                    let calls: Vec<Json> = calls
+                        .iter()
+                        .map(|call| {
+                            Json::Obj(vec![
+                                ("id".into(), Json::Str(call.id.clone())),
+                                ("type".into(), Json::Str("function".into())),
+                                (
+                                    "function".into(),
+                                    Json::Obj(vec![
+                                        ("name".into(), Json::Str(call.name.clone())),
+                                        ("arguments".into(), Json::Str(call.arguments.clone())),
+                                    ]),
+                                ),
+                            ])
+                        })
+                        .collect();
+                    message.push_str(",\"tool_calls\":");
+                    message.push_str(&Json::Arr(calls).to_string());
+                }
                 if let Some(details) = details {
                     message.push_str(",\"reasoning_details\":");
                     message.push_str(details);
@@ -194,6 +278,14 @@ pub fn messages(events: &[Event]) -> Vec<String> {
                 message.push('}');
                 out.push(message);
             }
+            Kind::ToolResult { id, content, .. } => out.push(
+                Json::Obj(vec![
+                    ("role".into(), Json::Str("tool".into())),
+                    ("tool_call_id".into(), Json::Str(id.clone())),
+                    ("content".into(), Json::Str(content.clone())),
+                ])
+                .to_string(),
+            ),
             _ => {}
         }
     }
@@ -226,24 +318,43 @@ pub fn current_prefix<'a>(events: &'a [Event], file: &'a str) -> (u64, &'a str) 
 }
 
 /// A turn body from its head, its prefix and the messages before it.
+///
+/// A prefix is one of two forms. Before the first tools it was a JSON
+/// array of the messages every request begins with, and the body is
+/// `{HEAD,"messages":[PREFIX…,MESSAGES…]}`. Since, it is a JSON object
+/// whose last member is `messages`, its tools and their settings before
+/// it (DESIGN.md §13), and the body is that object's members after
+/// `HEAD`, the log's messages appended to its `messages`. Either way the
+/// prefix's bytes are spliced, never re-encoded.
 pub fn turn_body(head: &str, prefix: &str, messages: &[String]) -> Result<String, String> {
-    let inner = prefix
-        .trim()
-        .strip_prefix('[')
-        .and_then(|p| p.strip_suffix(']'))
-        .ok_or("the prefix is not a JSON array")?
-        .trim();
+    let prefix = prefix.trim();
+    let (opening, inner) = if let Some(array) = prefix.strip_prefix('[') {
+        let inner = array
+            .strip_suffix(']')
+            .ok_or("the prefix is not a JSON array")?
+            .trim();
+        (",\"messages\":[", inner)
+    } else {
+        let inner = prefix
+            .strip_prefix('{')
+            .and_then(|p| p.strip_suffix("]}"))
+            .ok_or("the prefix is neither a JSON array nor an object ending in its messages")?;
+        (",", inner)
+    };
     let mut body = String::with_capacity(
         head.len() + inner.len() + messages.iter().map(|m| m.len() + 1).sum::<usize>() + 16,
     );
     body.push('{');
     body.push_str(head);
-    body.push_str(",\"messages\":[");
+    body.push_str(opening);
     body.push_str(inner);
-    for (n, message) in messages.iter().enumerate() {
-        if n > 0 || !inner.is_empty() {
+    // The prefix's own messages, if any, come first.
+    let mut first = inner.is_empty() || inner.ends_with('[');
+    for message in messages {
+        if !first {
             body.push(',');
         }
+        first = false;
         body.push_str(message);
     }
     body.push_str("]}");
@@ -324,6 +435,8 @@ pub struct Completion {
     pub details: Option<String>,
     pub finish: String,
     pub usage: Option<Usage>,
+    /// The tool calls it asked for, in their order.
+    pub calls: Vec<Call>,
 }
 
 /// A reply's `usage`: its token counts, and its cost where it gave one.
@@ -589,12 +702,34 @@ pub fn classify(
             })
         }
     };
+    let malformed = |message: &str| Failure::Retryable {
+        status: Some(200),
+        message: message.into(),
+        usage: usage(&value),
+    };
+    let calls = match message.get("tool_calls") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::Arr(calls)) => calls
+            .iter()
+            .map(|call| {
+                let text = |path: &[&str]| call.get_path(path).and_then(Json::as_str);
+                Call {
+                    id: text(&["id"]).unwrap_or_default().into(),
+                    name: text(&["function", "name"]).unwrap_or_default().into(),
+                    arguments: text(&["function", "arguments"]).unwrap_or_default().into(),
+                }
+            })
+            .collect(),
+        Some(_) => return Err(malformed("tool_calls is not a list")),
+    };
+    check_calls(&calls).map_err(|e| malformed(&e))?;
     Ok(Completion {
         content: text("content")?,
         reasoning: text("reasoning")?,
         details,
         finish,
         usage: usage(&value),
+        calls,
     })
 }
 
@@ -756,6 +891,7 @@ mod tests {
                     details: Some(details.into()),
                     finish: "stop".into(),
                     incomplete: false,
+                    calls: Vec::new(),
                 },
             ),
             // A title request's reply is not part of the conversation.
@@ -798,10 +934,14 @@ mod tests {
             ),
         ];
         let first = body(&events, 2, &prefix).unwrap();
-        let system = prefix.trim_start_matches('[').trim_end_matches(']');
+        // The prefix object's members, its messages left open.
+        let members = prefix
+            .strip_prefix('{')
+            .and_then(|p| p.strip_suffix("]}"))
+            .unwrap();
         assert_eq!(
             first,
-            format!("{{\"model\":\"m\",\"messages\":[{system},{{\"role\":\"user\",\"content\":\"hi \\\"you\\\"\"}}]}}")
+            format!("{{\"model\":\"m\",{members},{{\"role\":\"user\",\"content\":\"hi \\\"you\\\"\"}}]}}")
         );
         let second = body(&events, 8, &prefix).unwrap();
         assert_eq!(
@@ -844,6 +984,7 @@ mod tests {
                     details: None,
                     finish: "length".into(),
                     incomplete: false,
+                    calls: Vec::new(),
                 },
             ),
             // What a broken stream brought is never sent back.
@@ -856,6 +997,7 @@ mod tests {
                     details: Some("[{\"type\":\"reasoning.text\",\"text\":\"thought\"}]".into()),
                     finish: "unknown".into(),
                     incomplete: true,
+                    calls: Vec::new(),
                 },
             ),
             event(
@@ -878,6 +1020,7 @@ mod tests {
                     details: Some("[]".into()),
                     finish: "stop".into(),
                     incomplete: false,
+                    calls: Vec::new(),
                 },
             ),
         ];
@@ -909,6 +1052,7 @@ mod tests {
                 details: completion.details.clone(),
                 finish: completion.finish.clone(),
                 incomplete: false,
+                calls: Vec::new(),
             },
         };
         let line = logged.to_json().to_string();
@@ -1113,6 +1257,122 @@ mod tests {
     }
 
     #[test]
+    fn a_counted_completion_reads_its_tool_calls() {
+        let reply = r#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"todo_write","arguments":"{\"items\":[]}"}}]}}]}"#;
+        let completion = classify(Ok(response(200, reply, &[]))).unwrap();
+        assert_eq!(
+            completion.calls,
+            [Call {
+                id: "c1".into(),
+                name: "todo_write".into(),
+                arguments: "{\"items\":[]}".into(),
+            }]
+        );
+        let call = |id: &str, name: &str| Call {
+            id: id.into(),
+            name: name.into(),
+            arguments: String::new(),
+        };
+        for (calls, said) in [
+            (vec![call("", "a")], "tool call 0 came without an id"),
+            (vec![call("x", "")], "tool call 0 came without a tool name"),
+            (
+                vec![call("x", "a"), call("x", "b")],
+                "tool call 1 came with the id of an earlier call",
+            ),
+            (vec![call(&"x".repeat(257), "a")], "past 256 bytes"),
+            (vec![call("x", &"a".repeat(65))], "past 64 bytes"),
+        ] {
+            let e = check_calls(&calls).unwrap_err();
+            assert!(e.contains(said), "{e}");
+        }
+        assert!(check_calls(&[call("x", "a"), call("y", "a")]).is_ok());
+        let nameless = r#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant",
+            "tool_calls":[{"id":"c1","type":"function","function":{"arguments":"{}"}}]}}]}"#;
+        assert!(matches!(
+            classify(Ok(response(200, nameless, &[]))),
+            Err(Failure::Retryable { .. })
+        ));
+    }
+
+    #[test]
+    fn messages_calls_and_results_go_back_as_the_wire_has_them() {
+        let from = crate::store::Id::parse(&"f".repeat(32)).unwrap();
+        let events = vec![
+            event(
+                1,
+                Kind::Message {
+                    delivery: "d".into(),
+                    from: from.clone(),
+                    role: Role::Conversation,
+                    text: "it is done".into(),
+                    status: Some("done".into()),
+                    held: Some(crate::store::Held::Paused),
+                },
+            ),
+            event(
+                2,
+                Kind::Request {
+                    turn: 0,
+                    purpose: Purpose::Turn,
+                    prefix: 0,
+                    head: String::new(),
+                    bytes: 0,
+                    reserved: 0,
+                },
+            ),
+            event(
+                3,
+                Kind::Assistant {
+                    request: 2,
+                    content: None,
+                    reasoning: None,
+                    details: None,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                    calls: vec![Call {
+                        id: "c1".into(),
+                        name: "history_read".into(),
+                        arguments: "{\"from\":1}".into(),
+                    }],
+                },
+            ),
+            event(
+                4,
+                Kind::ToolCall {
+                    reply: 3,
+                    id: "c1".into(),
+                    name: "history_read".into(),
+                },
+            ),
+            event(
+                5,
+                Kind::ToolResult {
+                    reply: 3,
+                    id: "c1".into(),
+                    name: "history_read".into(),
+                    call: 4,
+                    content: "#1 report".into(),
+                    error: false,
+                },
+            ),
+        ];
+        assert_eq!(
+            messages(&events),
+            [
+                format!("{{\"role\":\"user\",\"content\":\"[a report from conversation {from}, status done, not from the person]\\nit is done\"}}"),
+                "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"history_read\",\"arguments\":\"{\\\"from\\\":1}\"}}]}".to_string(),
+                "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"#1 report\"}".to_string(),
+            ]
+        );
+        assert_eq!(
+            label(&from, Role::Orchestrator, None),
+            "[a message from the orchestrator, not from the person]"
+        );
+    }
+
+    #[test]
     fn rate_limited_retries_back_off_within_a_bound() {
         assert_eq!(backoff(0, None), Some(Duration::from_secs(1)));
         assert_eq!(backoff(1, None), Some(Duration::from_secs(2)));
@@ -1148,6 +1408,7 @@ mod tests {
                     details: None,
                     finish: "stop".into(),
                     incomplete: false,
+                    calls: Vec::new(),
                 },
             ),
             event(
@@ -1193,6 +1454,7 @@ mod tests {
                         details: None,
                         finish: "unknown".into(),
                         incomplete: true,
+                        calls: Vec::new(),
                     },
                 ));
             }

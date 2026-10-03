@@ -19,8 +19,8 @@
 //!   that text, which every later request sends back unchanged.
 //! - **Tool calls** are assembled by `index`: `id`, `type` and the
 //!   function's `name` from the first fragment that carries each, the
-//!   function's `arguments` appended. No tool is exposed yet; the calls
-//!   are kept for the increment that exposes the first.
+//!   function's `arguments` appended. A whole reply's every call must
+//!   have come with an id and a name.
 //! - **`finish_reason`** is the last one given and **`usage`** the last
 //!   one given, which OpenRouter sends on the final chunk.
 //!
@@ -28,11 +28,11 @@
 //! choice, and for `finish_reason: "error"`: either ends the reply as an
 //! error inside a 200 does (DESIGN.md §5), charged and offered again. What
 //! is assembled is held to `MAX_REPLY` bytes as its log line will carry
-//! it, escaped, so it fits one; the tool calls, not logged yet, count as
-//! the bytes they keep.
+//! it, escaped, so it fits one.
 
 use crate::client::{self, Completion, Failure, Usage, MAX_REPLY};
 use crate::json::Json;
+use crate::store::Call;
 
 /// The most reasoning-details entries, and tool calls, one reply holds.
 pub const MAX_ENTRIES: usize = 256;
@@ -271,15 +271,19 @@ impl Assembly {
         let Some(call) = self.calls.get(at) else {
             return Ok(());
         };
-        // Counted as kept: the first id, type and name stand.
+        // Counted as kept and logged, escaped: the first id, type and
+        // name stand.
         let keep = |have: &Option<String>, given: Option<String>| given.filter(|_| have.is_none());
         let [id, kind, name] = [
             keep(&call.id, text(fragment.get("id"))),
             keep(&call.kind, text(fragment.get("type"))),
             keep(&call.name, text(function.and_then(|f| f.get("name")))),
         ];
-        let kept = [&id, &kind, &name].into_iter().flatten().map(String::len);
-        self.grow(kept.fold(arguments.len(), usize::saturating_add))?;
+        let kept = [&id, &kind, &name]
+            .into_iter()
+            .flatten()
+            .map(|t| logged(t, false));
+        self.grow(kept.fold(logged(arguments, false), usize::saturating_add))?;
         let Some(call) = self.calls.get_mut(at) else {
             return Ok(());
         };
@@ -315,14 +319,17 @@ impl Assembly {
         &self.calls
     }
 
-    /// Whether nothing worth keeping has come: no text, reasoning or
-    /// reasoning details.
+    /// Whether nothing worth keeping has come: no text, reasoning,
+    /// reasoning details or tool calls.
     pub fn is_empty(&self) -> bool {
-        self.content.is_empty() && self.reasoning.is_empty() && self.details.is_empty()
+        self.content.is_empty()
+            && self.reasoning.is_empty()
+            && self.details.is_empty()
+            && self.calls.is_empty()
     }
 
     /// The reply as a completion; its `reasoning_details` serialized here,
-    /// once.
+    /// once. A call that came without an id or name has it empty.
     pub fn completion(&self) -> Completion {
         let some = |text: &str| (!text.is_empty()).then(|| text.to_string());
         Completion {
@@ -332,7 +339,25 @@ impl Assembly {
                 .then(|| Json::Arr(self.details.clone()).to_string()),
             finish: self.finish.clone().unwrap_or_else(|| "unknown".into()),
             usage: self.usage,
+            calls: self
+                .calls
+                .iter()
+                .map(|call| Call {
+                    id: call.id.clone().unwrap_or_default(),
+                    name: call.name.clone().unwrap_or_default(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect(),
         }
+    }
+
+    /// The whole reply as a completion: every tool call must pass
+    /// `client::check_calls`, or the reply is a failure inside a 200,
+    /// charged and offered again.
+    pub fn whole(&self) -> Result<Completion, Failure> {
+        let completion = self.completion();
+        client::check_calls(&completion.calls).map_err(|e| failed(e, self.usage))?;
+        Ok(completion)
     }
 }
 
@@ -544,6 +569,26 @@ mod tests {
         }
         assert_eq!(reply.completion().finish, "tool_calls");
         assert_eq!(reply.completion().content, None);
+        let whole = reply.whole().unwrap();
+        let names: Vec<(&str, &str)> = whole
+            .calls
+            .iter()
+            .map(|c| (c.id.as_str(), c.name.as_str()))
+            .collect();
+        assert_eq!(names, [("call_a", "read_file"), ("call_b", "grep")]);
+        // A call with no id cannot be answered, nor one with no name run.
+        for delta in [
+            r#"{"tool_calls":[{"index":0,"function":{"name":"grep","arguments":"{}"}}]}"#,
+            r#"{"tool_calls":[{"index":0,"id":"call_c","function":{"arguments":"{}"}}]}"#,
+        ] {
+            let stream = chunk(delta)
+                + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+            let reply = assemble(&stream).unwrap();
+            let Err(Failure::Retryable { message, .. }) = reply.whole() else {
+                panic!("whole: {delta}")
+            };
+            assert!(message.starts_with("tool call 0 came without"), "{message}");
+        }
         // A fragment with no index cannot be placed.
         let mut reply = Assembly::default();
         assert!(reply

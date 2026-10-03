@@ -5,18 +5,27 @@
 //! and then serves the window's messages until the socketpair closes,
 //! when it exits.
 //!
-//! A turn is one exchange with the model (DESIGN.md §5), with no tools:
-//! the human's message is logged, the request is reserved against the
-//! turn's, the conversation's and, through the window, the day's limits,
-//! logged as started and synced, and only then sent through the fetch
-//! service as a stream. Its reply is drawn in the window as it arrives
-//! and logged whole when it ends, with its usage; a stream that breaks
-//! off, fails or is interrupted logs what it had brought, marked
-//! incomplete. A rate-limited request is asked again after a bounded
-//! wait; any other failure ends the turn and says why, with a retry
-//! action where asking again may succeed. After a conversation's first
-//! exchange its title comes from `title_model`, reserved like any request
-//! and asked for whole, not streamed.
+//! A turn (DESIGN.md §5) begins with a message, the human's or another
+//! conversation's, and is a loop of steps. Each step's request is
+//! reserved against the turn's, the conversation's and, through the
+//! window, the day's limits, logged as started and synced, and only then
+//! sent through the fetch service as a stream. Its reply is drawn in the
+//! window as it arrives and logged whole when it ends, with its usage; a
+//! stream that breaks off, fails or is interrupted logs what it had
+//! brought, marked incomplete. A whole reply's tool calls (`tools`) run
+//! one at a time, in order, each logged as started and synced before it
+//! runs and answered by exactly one result, and the next step sends them
+//! back; a reply with no calls ends the turn, and so does `MAX_STEPS`. A
+//! rate-limited request is asked again after a bounded wait; any other
+//! failure ends the turn and says why, with a retry action where asking
+//! again may succeed. After a conversation's first turn that replied its
+//! title comes from `title_model`, reserved like any request and asked
+//! for whole, not streamed.
+//!
+//! A message from another conversation, which the window routes, is
+//! taken between turns. It starts a turn unless the human paused the
+//! conversation or its wake budget is spent (`wake`), when it is logged
+//! held, and the human is told once.
 //!
 //! The window's frames are read on a thread of their own into a channel,
 //! so that the window's writes never wait on a request in flight; what
@@ -40,21 +49,43 @@ use crate::client::{self, Completion, Failure, Params};
 use crate::config::Client;
 use crate::cost;
 use crate::frame;
+use crate::history;
 use crate::key::Secret;
 use crate::models::{Model, Models};
 use crate::protocol::{Down, Up, MAX_TEXT};
 use crate::sse::{self, Fault};
 use crate::store::{
-    Basis, Conversation, Effect, Event, Id, Kind, Purpose, Role, StateDir, LOCK_WAIT,
+    self, Basis, Call, Conversation, Effect, Event, Held, Id, Kind, Purpose, Role, StateDir,
+    Status, TodoItem, LOCK_WAIT,
 };
 use crate::td_fetch;
+use crate::tools::{self, Args, Listed, Op, Target};
+use crate::wake;
 
 /// What a turn ends with when there is no window settings to make a
 /// request with: the window sends them first, so only a harness that
 /// does not sees this.
 pub const NO_SETTINGS: &str = "no settings from the window";
-/// How long a request waits for the window to answer its reservation.
-const RESERVE_WAIT: Duration = Duration::from_secs(30);
+/// How long a request waits for the window to answer: a reservation, a
+/// message queued, the conversations' states.
+const ANSWER_WAIT: Duration = Duration::from_secs(30);
+/// The most steps one turn takes, each a request answered by a reply; a
+/// rate-limited request asked again is the same step (DESIGN.md §5).
+pub const MAX_STEPS: usize = 40;
+/// The most conversations `conversations` lists.
+const MAX_LISTED: usize = 200;
+/// What a call the human interrupted before it ran is answered with.
+const CALL_SKIPPED: &str = "not run: the person interrupted the turn before this call ran";
+/// What a call the log has no room to run is answered with.
+const CALL_NO_ROOM: &str =
+    "not run: the conversation's log is full; tell the person to start another conversation";
+/// The log room one call takes when answered without running: its
+/// `tool_call` and `tool_result` records at their longest, an id and a
+/// name at their bounds escaped.
+const CALL_RECORDS: u64 = 4096;
+/// The log room one call's result may take at most: the longest line a
+/// log holds, which `result` answers in place of anything longer.
+const RESULT_ROOM: u64 = store::MAX_LINE as u64 + 1;
 
 /// Runs the conversation over the socketpair on standard input and
 /// output until it closes. An error is why it could not go on.
@@ -122,6 +153,18 @@ impl Reading {
         (!self.reply.is_empty()).then(|| self.reply.completion())
     }
 
+    /// The reply finished: whole, or a failure when a tool call came
+    /// without what it needs.
+    fn whole(&self) -> Streamed {
+        match self.reply.whole() {
+            Ok(completion) => Streamed::Replied(completion),
+            Err(failure) => Streamed::Failed {
+                failure,
+                partial: self.partial(),
+            },
+        }
+    }
+
     /// The stream broke off: charged and offered again.
     fn broken(&self, message: String) -> Streamed {
         Streamed::Failed {
@@ -158,6 +201,7 @@ pub fn serve(
         live: Arc::new(AtomicU64::new(0)),
         interrupt: false,
         queue: VecDeque::new(),
+        ended: None,
         setup: None,
         state: state.root().to_path_buf(),
         // Random, so no two processes of one conversation share an id,
@@ -171,6 +215,7 @@ pub fn serve(
         title: session.conversation.meta().title.clone(),
         torn: load.torn,
         interrupted: load.interrupted,
+        paused: session.conversation.meta().paused,
     });
     for event in session.conversation.events().to_vec() {
         session.send(&Up::Event(event));
@@ -250,12 +295,14 @@ fn fetch(
     }
 }
 
-/// How a turn ended: what the window shows, whether the human may ask
-/// for it again, and whether the model replied.
+/// How a step, or the turn, ended: what the window shows, whether the
+/// human may ask for it again, whether the model replied, and the logged
+/// reply whose tool calls are to run, when it asked for any.
 struct Outcome {
     text: String,
     retry: bool,
     replied: bool,
+    calls: Option<u64>,
 }
 
 impl Outcome {
@@ -264,6 +311,14 @@ impl Outcome {
             text: text.into(),
             retry: false,
             replied: false,
+            calls: None,
+        }
+    }
+
+    fn again(text: impl Into<String>) -> Self {
+        Self {
+            retry: true,
+            ..Self::stop(text)
         }
     }
 }
@@ -299,6 +354,9 @@ struct Session {
     interrupt: bool,
     /// Messages that came while a turn waited on the window.
     queue: VecDeque<Down>,
+    /// The window's end, found while taking what came into `queue`: closed,
+    /// or why it broke. Taken once the queue is empty.
+    ended: Option<Result<(), String>>,
     setup: Option<(Result<Secret, String>, Client)>,
     state: PathBuf,
     /// The last reservation id asked for.
@@ -338,8 +396,33 @@ impl Session {
     }
 
     fn next(&mut self) -> Result<Option<Down>, String> {
-        if let Some(down) = self.queue.pop_front() {
+        // What came meanwhile joins the queue first, so that a pause sent
+        // after messages from other conversations, while a turn ran, is
+        // taken before them and holds them (DESIGN.md §3). It goes ahead
+        // of messages only: the human's own message or retry before it
+        // keeps its place.
+        while self.ended.is_none() {
+            match self.inbox.try_recv() {
+                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Closed) => self.ended = Some(Ok(())),
+                Ok(Inbound::Broken(e)) => self.ended = Some(Err(e)),
+                Err(_) => break,
+            }
+        }
+        let pause = self
+            .queue
+            .iter()
+            .position(|down| !matches!(down, Down::Message { .. }))
+            .filter(|at| matches!(self.queue.get(*at), Some(Down::Pause { .. })))
+            .unwrap_or(0);
+        if let Some(down) = self.queue.remove(pause) {
             return Ok(Some(down));
+        }
+        match self.ended.take() {
+            Some(Ok(())) => return Ok(None),
+            Some(Err(e)) => return Err(format!("the window: {e}")),
+            None => {}
         }
         loop {
             match self.inbox.recv() {
@@ -360,12 +443,26 @@ impl Session {
             match down {
                 Down::Setup { key, client } => self.setup = Some((key, client)),
                 Down::User { delivery, text } => self.user(delivery, text)?,
+                Down::Message {
+                    delivery,
+                    from,
+                    role,
+                    text,
+                    status,
+                } => self.message(delivery, from, role, text, status)?,
                 Down::Retry => self.retry()?,
+                Down::Pause { paused } => self.pause(paused)?,
+                Down::ClearTodo => self.clear_todo()?,
                 // A reservation granted after its request gave up waiting:
                 // nothing was sent, so the window's hold is released.
                 Down::Reservation { id, refusal: None } => self.spent(id, 0),
-                // Between turns there is nothing to interrupt.
-                Down::Reservation { .. } | Down::Interrupt => {}
+                // Between turns there is nothing to interrupt, and an
+                // answer that comes after its call gave up is not waited
+                // for.
+                Down::Reservation { .. }
+                | Down::Interrupt
+                | Down::Sent { .. }
+                | Down::States { .. } => {}
             }
             if !self.gone {
                 let _ = self.writer.flush();
@@ -394,6 +491,9 @@ impl Session {
             self.send(&Up::Refused { delivery, reason });
             return Ok(());
         }
+        // A message from the human resumes a paused conversation; what
+        // was held meanwhile is in the log before it, and in its turn.
+        self.resume()?;
         // Titled by its first message, or by the next one should the
         // title not have been written then, until a title model's.
         let untitled = self.conversation.meta().role == Role::Conversation
@@ -447,6 +547,8 @@ impl Session {
             });
             return Ok(());
         };
+        // The human asking again resumes a paused conversation.
+        self.resume()?;
         let started = self.log(Kind::Started {
             effect: Effect::Turn,
             of,
@@ -458,8 +560,8 @@ impl Session {
     /// Runs turn `turn` to its end in the log.
     fn turn(&mut self, turn: u64) -> Result<(), String> {
         self.interrupt = false;
-        let outcome = self.exchange(turn)?;
-        if outcome.replied && self.first_reply() {
+        let outcome = self.steps(turn)?;
+        if outcome.replied && self.first_reply(turn) {
             self.title(turn)?;
         }
         self.log(Kind::Finished {
@@ -471,31 +573,81 @@ impl Session {
         self.sync()
     }
 
-    /// Whether the conversation has had exactly one whole reply, and no
-    /// title from a model yet.
-    fn first_reply(&self) -> bool {
+    /// The turn's steps: a request, then its reply's tool calls, until a
+    /// reply asks for none or `MAX_STEPS` steps have been taken. The
+    /// outcome says the model replied when any step did, so a turn
+    /// that ends after a whole reply, however it ends, is titled as the
+    /// first that replied (`first_reply`) and none later is left untitled.
+    fn steps(&mut self, turn: u64) -> Result<Outcome, String> {
+        let mut replied = false;
+        for _ in 0..MAX_STEPS {
+            let outcome = self.exchange(turn)?;
+            let Some(reply) = outcome.calls else {
+                return Ok(Outcome {
+                    replied: replied || outcome.replied,
+                    ..outcome
+                });
+            };
+            replied = true;
+            if !self.answer(reply)? {
+                return Ok(Outcome {
+                    replied,
+                    ..Outcome::again(
+                        "interrupted between tool calls; each call that had not run is answered as not run",
+                    )
+                });
+            }
+        }
+        // Every step replied, or the loop would have ended.
+        Ok(Outcome {
+            replied: true,
+            ..Outcome::stop(format!(
+                "stopped after {MAX_STEPS} steps, each a reply the model gave, the most one turn takes; every tool call has its result, and a message goes on from there"
+            ))
+        })
+    }
+
+    /// Whether `turn` is the first of the conversation's turns begun by the
+    /// human to have a whole reply, and it has no title from a model yet.
+    /// A turn a message from another conversation began does not count,
+    /// since the title quotes the human's first message (§13).
+    fn first_reply(&self, turn: u64) -> bool {
         if self.conversation.meta().role != Role::Conversation {
             return false;
         }
         let events = self.conversation.events();
-        let mut turns = Vec::new();
-        let mut replies = 0usize;
+        let mut users: Vec<u64> = Vec::new();
+        let mut human: Vec<u64> = Vec::new();
+        let mut requests: Vec<(u64, u64)> = Vec::new();
+        let mut replied: Vec<u64> = Vec::new();
         for event in events {
             match &event.kind {
                 Kind::Title { .. } => return false,
+                Kind::User { .. } => users.push(event.seq),
+                Kind::Started {
+                    effect: Effect::Turn,
+                    of,
+                } if users.contains(of) => human.push(event.seq),
                 Kind::Request {
                     purpose: Purpose::Turn,
+                    turn,
                     ..
-                } => turns.push(event.seq),
+                } => requests.push((event.seq, *turn)),
                 Kind::Assistant {
                     request,
                     incomplete: false,
                     ..
-                } if turns.contains(request) => replies += 1,
+                } => {
+                    if let Some((_, of)) = requests.iter().find(|(seq, _)| seq == request) {
+                        if human.contains(of) && !replied.contains(of) {
+                            replied.push(*of);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        replies == 1
+        replied == [turn]
     }
 
     /// The models cache and the entry for `model`, the configuration's
@@ -524,26 +676,39 @@ impl Session {
     /// Asks the window to reserve `amount` against the day: the request's
     /// id when granted, or why not.
     fn reserve(&mut self, amount: u64) -> Result<u64, String> {
-        self.next_reservation = self.next_reservation.wrapping_add(1);
-        let id = self.next_reservation;
+        let id = self.ask_id();
         self.send(&Up::Reserve { id, amount });
+        match self.wait(|down| matches!(down, Down::Reservation { id: a, .. } if *a == id))? {
+            Down::Reservation { refusal, .. } => refusal.map_or(Ok(id), Err),
+            _ => Err("the window answered something else".into()),
+        }
+    }
+
+    /// A fresh id for something asked of the window.
+    fn ask_id(&mut self) -> u64 {
+        self.next_reservation = self.next_reservation.wrapping_add(1);
+        self.next_reservation
+    }
+
+    /// Waits for the window's answer, `wanted`, still hearing it: an
+    /// interrupt is noted for the turn, an earlier request's grant that
+    /// came after it gave up is released, and anything else waits its
+    /// turn. Why not, when the window closes or does not answer.
+    fn wait(&mut self, wanted: impl Fn(&Down) -> bool) -> Result<Down, String> {
         if self.gone {
             return Err("the window has closed".into());
         }
-        let deadline = Instant::now() + RESERVE_WAIT;
+        let deadline = Instant::now() + ANSWER_WAIT;
         loop {
-            let wait = deadline.saturating_duration_since(Instant::now());
-            match self.inbox.recv_timeout(wait) {
-                Ok(Inbound::Down(Down::Reservation {
-                    id: answered,
-                    refusal,
-                })) if answered == id => return refusal.map_or(Ok(id), Err),
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.inbox.recv_timeout(left) {
+                Ok(Inbound::Down(down)) if wanted(&down) => return Ok(down),
                 // An earlier request's grant, come after it gave up.
                 Ok(Inbound::Down(Down::Reservation {
                     id: late,
                     refusal: None,
                 })) => self.spent(late, 0),
-                // Said while waiting: the request is not sent.
+                // Said while waiting: the turn ends at its next step.
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
                 Ok(Inbound::Fetch { .. }) => {}
@@ -553,10 +718,24 @@ impl Session {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(format!(
-                        "the window did not answer a reservation in {} s",
-                        RESERVE_WAIT.as_secs()
+                        "the window did not answer in {} s",
+                        ANSWER_WAIT.as_secs()
                     ))
                 }
+            }
+        }
+    }
+
+    /// What the window said meanwhile, without waiting: an interrupt is
+    /// noted, a late grant released, and the rest waits its turn.
+    fn hear(&mut self) {
+        while let Ok(inbound) = self.inbox.try_recv() {
+            match inbound {
+                Inbound::Down(Down::Interrupt) => self.interrupt = true,
+                Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
+                Inbound::Down(down) => self.queue.push_back(down),
+                Inbound::Fetch { .. } => {}
+                Inbound::Closed | Inbound::Broken(_) => self.gone = true,
             }
         }
     }
@@ -607,9 +786,16 @@ impl Session {
             Ok(model) => model,
             Err(why) => return Ok(Outcome::stop(why)),
         };
+        // Every request carries the tools, and `require_parameters` would
+        // route one to no provider of a model that takes none (§5).
+        if model.as_ref().is_some_and(|m| !m.supports("tools")) {
+            return Ok(Outcome::stop(format!(
+                "{name} takes no tools (the provider's models list gives it no `tools` parameter); set `{setting}` to a model that does"
+            )));
+        }
         let pricing = model.as_ref().and_then(|m| m.pricing);
         // The prefix this program writes; a conversation begun by another
-        // (an empty one from before the model client, say) takes it as an
+        // (one from before the conversation tools, say) takes it as an
         // event, at the cost of one cache miss.
         let expected = crate::prompt::prefix(role);
         if client::current_prefix(self.conversation.events(), self.conversation.prefix_file()).1
@@ -673,7 +859,12 @@ impl Session {
             }) {
                 return Ok(Outcome::stop(why));
             }
-            let room = (body.len() as u64).saturating_add(client::MAX_REPLY.saturating_mul(2));
+            // Room for the reply, and for every call it may make to be
+            // answered, if only as not run (`answer`), at load or after.
+            let calls = (crate::assemble::MAX_ENTRIES as u64).saturating_mul(CALL_RECORDS);
+            let room = (body.len() as u64)
+                .saturating_add(client::MAX_REPLY.saturating_mul(2))
+                .saturating_add(calls);
             if !self.conversation.has_room_for(room) {
                 return Ok(Outcome::stop(
                     "the conversation's log is full; start another conversation",
@@ -685,20 +876,16 @@ impl Session {
                 // may be asked again when the conversation is reopened.
                 Err(why) => {
                     return Ok(Outcome {
-                        text: why,
                         retry: self.gone,
-                        replied: false,
+                        ..Outcome::stop(why)
                     })
                 }
             };
             if self.interrupt {
-                // Interrupted while the window reserved it: never sent.
+                // Interrupted while the window reserved it, or between
+                // steps: never sent.
                 self.spent(id, 0);
-                return Ok(Outcome {
-                    text: "interrupted before its request was sent".into(),
-                    retry: true,
-                    replied: false,
-                });
+                return Ok(Outcome::again("interrupted before its request was sent"));
             }
             let request = self.log(Kind::Request {
                 turn,
@@ -714,13 +901,9 @@ impl Session {
             let failure = match self.stream(request.seq, &client, &key, body) {
                 Streamed::Replied(completion) => {
                     let cost = charge(completion.usage, pricing, reserved);
-                    let text = self.reply(request.seq, &completion, cost)?;
+                    let outcome = self.reply(request.seq, &completion, cost)?;
                     self.spent(id, cost.0);
-                    return Ok(Outcome {
-                        text,
-                        retry: false,
-                        replied: true,
-                    });
+                    return Ok(outcome);
                 }
                 Streamed::Failed { failure, partial } => {
                     if let Some(partial) = partial {
@@ -747,17 +930,15 @@ impl Session {
                             client::MAX_WAIT.as_secs()
                         )));
                     };
-                    if self.pause(wait) {
+                    if self.linger(wait) {
                         let why = if self.gone {
                             "the window closed"
                         } else {
                             "interrupted"
                         };
-                        return Ok(Outcome {
-                            text: format!("error 429: {message}; {why} before asking again"),
-                            retry: true,
-                            replied: false,
-                        });
+                        return Ok(Outcome::again(format!(
+                            "error 429: {message}; {why} before asking again"
+                        )));
                     }
                     attempt += 1;
                 }
@@ -775,24 +956,21 @@ impl Session {
                     };
                     self.settle(request.seq, usage, cost, outcome.clone())?;
                     self.spent(id, cost.0);
-                    return Ok(Outcome {
-                        text: outcome,
-                        retry: true,
-                        replied: false,
-                    });
+                    return Ok(Outcome::again(outcome));
                 }
             }
         }
     }
 
     /// Logs a completion: the assistant message, its usage and the
-    /// request's finish. The outcome is the turn's.
+    /// request's finish. The outcome is the step's: a reply with tool
+    /// calls names itself for them to run, whatever its finish says.
     fn reply(
         &mut self,
         request: u64,
         completion: &Completion,
         cost: (u64, Basis),
-    ) -> Result<String, String> {
+    ) -> Result<Outcome, String> {
         let assistant = Kind::Assistant {
             request,
             content: completion.content.clone(),
@@ -800,22 +978,471 @@ impl Session {
             details: completion.details.clone(),
             finish: completion.finish.clone(),
             incomplete: false,
+            calls: completion.calls.clone(),
         };
-        if let Err(e) = self.log(assistant) {
-            // A reply past what a log line holds: its cost still counts.
-            let outcome = format!("the reply could not be logged: {e}");
-            self.settle(request, completion.usage, cost, outcome.clone())?;
-            return Ok(outcome);
-        }
-        let outcome = match completion.finish.as_str() {
+        let logged = match self.log(assistant) {
+            Ok(event) => event.seq,
+            Err(e) => {
+                // A reply past what a log line holds: its cost still
+                // counts, and its calls never run.
+                let outcome = format!("the reply could not be logged: {e}");
+                self.settle(request, completion.usage, cost, outcome.clone())?;
+                return Ok(Outcome::stop(outcome));
+            }
+        };
+        let text = match completion.finish.as_str() {
             "stop" => "replied".to_string(),
             "length" => "replied, cut short at max_tokens".to_string(),
             "content_filter" => "stopped by the provider's content filter".to_string(),
-            "tool_calls" => "asked for a tool; this conversation has none yet".to_string(),
+            "tool_calls" if completion.calls.is_empty() => {
+                "replied, ending for tool calls it did not make".to_string()
+            }
             other => format!("replied ({other})"),
         };
         self.settle(request, completion.usage, cost, completion.finish.clone())?;
-        Ok(outcome)
+        Ok(Outcome {
+            text,
+            retry: false,
+            replied: true,
+            calls: (!completion.calls.is_empty()).then_some(logged),
+        })
+    }
+
+    /// Runs the tool calls the reply at `reply` asked for, one at a time
+    /// in their order, each logged as started and synced before it runs
+    /// and answered by exactly one result (DESIGN.md §5, §6). False when
+    /// the human interrupted them: each call not yet run is answered as
+    /// not run, so the next request still has a result for every call.
+    fn answer(&mut self, reply: u64) -> Result<bool, String> {
+        let calls = self
+            .conversation
+            .events()
+            .iter()
+            .rev()
+            .find(|e| e.seq == reply)
+            .and_then(|e| match &e.kind {
+                Kind::Assistant { calls, .. } => Some(calls.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let role = self.conversation.meta().role;
+        for (at, call) in calls.iter().enumerate() {
+            self.hear();
+            if self.interrupt {
+                self.result(reply, call, 0, CALL_SKIPPED.into(), true)?;
+                continue;
+            }
+            // Run only while its result and every later call's answer fit,
+            // which the room checked before the request keeps true of
+            // the latter.
+            let later = (calls.len() - at) as u64;
+            if !self
+                .conversation
+                .has_room_for(RESULT_ROOM.saturating_add(later.saturating_mul(CALL_RECORDS)))
+            {
+                self.result(reply, call, 0, CALL_NO_ROOM.into(), true)?;
+                continue;
+            }
+            let started = self
+                .log(Kind::ToolCall {
+                    reply,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                })?
+                .seq;
+            // Durable before it runs: a restart never runs it again.
+            self.sync()?;
+            let answer = match tools::parse(role, &call.name, &call.arguments) {
+                Ok(args) => self.run(args)?,
+                Err(why) => Err(why),
+            };
+            let (content, error) = match answer {
+                Ok(content) => (content, false),
+                Err(why) => (format!("error: {why}"), true),
+            };
+            self.result(reply, call, started, content, error)?;
+        }
+        self.sync()?;
+        Ok(!self.interrupt)
+    }
+
+    /// Logs a call's result; one past what a log line holds is answered
+    /// with why instead, so the call still has its one result.
+    fn result(
+        &mut self,
+        reply: u64,
+        call: &Call,
+        started: u64,
+        content: String,
+        error: bool,
+    ) -> Result<(), String> {
+        let result = |content: String, error: bool| Kind::ToolResult {
+            reply,
+            id: call.id.clone(),
+            name: call.name.clone(),
+            call: started,
+            content,
+            error,
+        };
+        if let Err(e) = self.log(result(content, error)) {
+            self.log(result(
+                format!("error: the result could not be logged: {e}"),
+                true,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Runs one call: the tool's answer, or why it failed, which the model
+    /// is told; an error of the log's own ends the process.
+    fn run(&mut self, args: Args) -> Result<Result<String, String>, String> {
+        Ok(match args {
+            Args::Todo(items) => {
+                let text = tools::todo_text(&items);
+                self.log(Kind::Todo {
+                    items,
+                    cleared: false,
+                })?;
+                Ok(text)
+            }
+            Args::Search(search) => self.with_log(search.conversation, |events| {
+                Ok(history::search(
+                    events,
+                    &search.query,
+                    &search.kinds,
+                    search.limit,
+                ))
+            }),
+            Args::Read(read) => self.with_log(read.conversation, |events| {
+                history::read(events, read.from, read.offset, read.count, read.max_bytes)
+            }),
+            Args::Conversations => self.conversations(),
+            Args::Send { to, text } => self.post(to, text, None),
+            Args::Report { status, summary } => {
+                self.post(Target::Orchestrator, summary, Some(status))
+            }
+        })
+    }
+
+    /// The conversations of the store, by their `meta`.
+    fn metas(&self) -> Vec<store::Meta> {
+        StateDir::at(self.state.clone()).list().0
+    }
+
+    /// The conversation `target` names, checked against the crossings of
+    /// `op`: `None` for this one.
+    fn resolve(&self, target: Target, op: Op) -> Result<Option<Id>, String> {
+        let metas = self.metas();
+        let (id, role) = match target {
+            Target::Orchestrator => metas
+                .iter()
+                .find(|m| m.role == Role::Orchestrator)
+                .map(|m| (m.id.clone(), m.role))
+                .ok_or("there is no orchestrator")?,
+            Target::Id(id) => {
+                let role = metas
+                    .iter()
+                    .find(|m| m.id == id)
+                    .map(|m| m.role)
+                    .ok_or_else(|| format!("there is no conversation {id}"))?;
+                (id, role)
+            }
+        };
+        let me = self.conversation.meta();
+        tools::crossing(&me.id, me.role, &id, role, op)?;
+        Ok((id != me.id).then_some(id))
+    }
+
+    /// `read` over the log `target` names, this conversation's own when
+    /// none.
+    fn with_log(
+        &self,
+        target: Option<Target>,
+        read: impl FnOnce(&[Event]) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let other = match target {
+            None => None,
+            Some(target) => self.resolve(target, Op::Read)?,
+        };
+        match other {
+            None => read(self.conversation.events()),
+            Some(id) => read(&store::read_log(&StateDir::at(self.state.clone()), &id)?),
+        }
+    }
+
+    /// `send_message` and `report`: the message queued by the window for
+    /// its receiver, or why not.
+    fn post(&mut self, to: Target, text: String, status: Option<String>) -> Result<String, String> {
+        let to = self
+            .resolve(to, Op::Message)?
+            .ok_or("a conversation does not send messages to itself")?;
+        let id = self.ask_id();
+        self.send(&Up::Send {
+            id,
+            to: to.clone(),
+            text,
+            status: status.clone(),
+        });
+        // Unanswered, the window may still have queued it before closing
+        // or while this gave up: the model is not invited to send twice.
+        let answer = self
+            .wait(|down| matches!(down, Down::Sent { id: a, .. } if *a == id))
+            .map_err(|why| {
+                format!("{why}, so whether the message was queued is unknown; it may yet be delivered, so do not send it again unless an answer that needs it does not come")
+            })?;
+        match answer {
+            Down::Sent { refusal: None, .. } => Ok(match status {
+                Some(_) => "reported to the orchestrator; it reads the report between its turns".to_string(),
+                None => format!("queued for conversation {to}; it is delivered between that conversation's turns, and any reply comes back here as a message, later"),
+            }),
+            Down::Sent {
+                refusal: Some(why),
+                ..
+            } => Err(why),
+            _ => Err("the window answered something else".into()),
+        }
+    }
+
+    /// `conversations`: what td-agent writes of each conversation, and
+    /// what models wrote of the ones the caller may see (DESIGN.md §3).
+    fn conversations(&mut self) -> Result<String, String> {
+        let id = self.ask_id();
+        self.send(&Up::Query { id });
+        let states =
+            match self.wait(|down| matches!(down, Down::States { id: a, .. } if *a == id))? {
+                Down::States { states, .. } => states,
+                _ => return Err("the window answered something else".into()),
+            };
+        let state_dir = StateDir::at(self.state.clone());
+        let me = self.conversation.meta().clone();
+        // Ordered and bounded first, so only the logs listed are read: the
+        // orchestrator first, then the most recently active.
+        let mut metas: Vec<(store::Meta, u64)> = self
+            .metas()
+            .into_iter()
+            .map(|meta| {
+                let activity = std::fs::metadata(state_dir.conversation(&meta.id).join("log"))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(meta.created, |d| d.as_secs());
+                (meta, activity)
+            })
+            .collect();
+        metas.sort_by(|(a, at), (b, bt)| {
+            (b.role == Role::Orchestrator)
+                .cmp(&(a.role == Role::Orchestrator))
+                .then(bt.cmp(at))
+        });
+        let omitted = metas.len().saturating_sub(MAX_LISTED);
+        metas.truncate(MAX_LISTED);
+        let mut entries: Vec<Listed> = Vec::with_capacity(metas.len());
+        for (meta, activity) in metas {
+            let own;
+            let events: &[Event] = if meta.id == me.id {
+                self.conversation.events()
+            } else {
+                // A log that cannot be read lists with nothing spent and
+                // nothing in progress; its own process says why.
+                own = store::read_log(&state_dir, &meta.id).unwrap_or_default();
+                &own
+            };
+            let state = states
+                .iter()
+                .find(|(id, _)| *id == meta.id)
+                .map_or("idle", |(_, state)| state.as_str());
+            let state = match state {
+                "idle" if meta.paused => "paused",
+                other => other,
+            };
+            entries.push(Listed {
+                state: state.to_string(),
+                cost: accounts::spent(events),
+                activity,
+                title: meta.title.clone(),
+                doing: doing(events),
+                id: meta.id,
+                role: meta.role,
+            });
+        }
+        Ok(tools::listing(&me.id, me.role, &entries, omitted))
+    }
+
+    /// A message from another conversation, which the window routed:
+    /// logged once by its delivery id, and starting a turn unless the
+    /// conversation is paused or its wake budget is spent (DESIGN.md §3).
+    fn message(
+        &mut self,
+        delivery: String,
+        from: Id,
+        role: Role,
+        text: String,
+        status: Option<String>,
+    ) -> Result<(), String> {
+        if self.conversation.delivered(&delivery) {
+            self.send(&Up::Delivered { delivery });
+            return Ok(());
+        }
+        if text.len() > tools::MAX_MESSAGE || !self.conversation.has_room(text.len()) {
+            let reason = if text.len() > tools::MAX_MESSAGE {
+                format!("a message is at most {} bytes", tools::MAX_MESSAGE)
+            } else {
+                "the conversation's log is full".to_string()
+            };
+            self.send(&Up::Refused { delivery, reason });
+            return Ok(());
+        }
+        let elsewhere = self.orchestrator_wrote();
+        let events = self.conversation.events();
+        // A report is a notification another workspace's own budget bounds.
+        let counts = status.is_none();
+        let held = if self.conversation.meta().paused {
+            Some(Held::Paused)
+        } else if counts && wake::spent(events, elsewhere) >= wake::BUDGET {
+            Some(Held::Budget)
+        } else {
+            None
+        };
+        let tell = held == Some(Held::Budget) && !wake::told(events, elsewhere);
+        let logged = self
+            .conversation
+            .append(Kind::Message {
+                delivery: delivery.clone(),
+                from,
+                role,
+                text,
+                status,
+                held,
+            })?
+            .clone();
+        let started = match held {
+            None => Some(
+                self.conversation
+                    .append(Kind::Started {
+                        effect: Effect::Turn,
+                        of: logged.seq,
+                    })?
+                    .clone(),
+            ),
+            Some(_) => None,
+        };
+        self.sync()?;
+        self.send(&Up::Event(logged));
+        if let Some(started) = &started {
+            self.send(&Up::Event(started.clone()));
+        }
+        if tell {
+            self.log(Kind::Notice {
+                text: wake::notice(),
+            })?;
+            self.sync()?;
+        }
+        self.send(&Up::Delivered { delivery });
+        match started {
+            Some(started) => self.turn(started.seq),
+            None => Ok(()),
+        }
+    }
+
+    /// When the human last wrote to the orchestrator, for the wake budget;
+    /// `None` for the orchestrator itself, whose own log says.
+    fn orchestrator_wrote(&self) -> Option<u64> {
+        if self.conversation.meta().role == Role::Orchestrator {
+            return None;
+        }
+        let orchestrator = self
+            .metas()
+            .into_iter()
+            .find(|m| m.role == Role::Orchestrator)?;
+        match store::read_log(&StateDir::at(self.state.clone()), &orchestrator.id) {
+            Ok(events) => events.iter().rev().find_map(|e| match e.kind {
+                Kind::User { .. } => Some(e.time),
+                _ => None,
+            }),
+            Err(e) => {
+                eprintln!("td-agent: the wake budget could not read the orchestrator's log: {e}");
+                None
+            }
+        }
+    }
+
+    /// The human paused or resumed the conversation, which is logged even
+    /// when it already was: the window keeps a resuming process until it
+    /// hears the resumption. Resumed, the newest message held since the
+    /// last turn began starts a turn, which sees every one, unless one of
+    /// them would be a wake past the budget. That turn's start is logged
+    /// before the resumption, so the window never lets the process go
+    /// between the two.
+    fn pause(&mut self, paused: bool) -> Result<(), String> {
+        if paused {
+            self.log(Kind::Pause { paused })?;
+            self.conversation.set_paused(true)?;
+            return self.sync();
+        }
+        let events = self.conversation.events();
+        let since = events
+            .iter()
+            .rposition(|e| matches!(e.kind, Kind::Started { .. }))
+            .map_or(0, |at| at + 1);
+        let mut newest = None;
+        let mut counts = false;
+        for event in events.get(since..).unwrap_or_default() {
+            if let Kind::Message {
+                held: Some(_),
+                status,
+                ..
+            } = &event.kind
+            {
+                newest = Some(event.seq);
+                counts |= status.is_none();
+            }
+        }
+        let spent = counts && {
+            let elsewhere = self.orchestrator_wrote();
+            wake::spent(self.conversation.events(), elsewhere) >= wake::BUDGET
+        };
+        let started = match newest.filter(|_| !spent) {
+            Some(of) => Some(
+                self.conversation
+                    .append(Kind::Started {
+                        effect: Effect::Turn,
+                        of,
+                    })?
+                    .clone(),
+            ),
+            None => None,
+        };
+        if let Some(started) = &started {
+            self.send(&Up::Event(started.clone()));
+        }
+        self.log(Kind::Pause { paused: false })?;
+        self.conversation.set_paused(false)?;
+        self.sync()?;
+        match started {
+            Some(started) => self.turn(started.seq),
+            None => Ok(()),
+        }
+    }
+
+    /// Resumes a paused conversation for the human's own turn.
+    fn resume(&mut self) -> Result<(), String> {
+        if !self.conversation.meta().paused {
+            return Ok(());
+        }
+        self.log(Kind::Pause { paused: false })?;
+        self.conversation.set_paused(false)
+    }
+
+    /// The human cleared the todo list.
+    fn clear_todo(&mut self) -> Result<(), String> {
+        if todo(self.conversation.events()).is_empty() {
+            return Ok(());
+        }
+        self.log(Kind::Todo {
+            items: Vec::new(),
+            cleared: true,
+        })?;
+        self.sync()
     }
 
     /// Logs what a stream that did not finish had brought, marked
@@ -828,6 +1455,7 @@ impl Session {
             details: partial.details,
             finish: partial.finish,
             incomplete: true,
+            calls: partial.calls,
         });
         if let Err(e) = logged {
             self.log(Kind::Notice {
@@ -840,7 +1468,7 @@ impl Session {
     /// Waits out a rate limit, still hearing the window: whether the
     /// human interrupted the turn meanwhile, or the window closed, when
     /// the next request could not be reserved.
-    fn pause(&mut self, wait: Duration) -> bool {
+    fn linger(&mut self, wait: Duration) -> bool {
         if self.gone {
             return true;
         }
@@ -974,7 +1602,7 @@ impl Session {
                     // `[DONE]` with no finish is a stream cut short, as a
                     // counted reply with no choice is.
                     Ok(()) if reading.reader.done() && reading.reply.finished() => {
-                        Some(Streamed::Replied(reading.reply.completion()))
+                        Some(reading.whole())
                     }
                     Ok(()) if reading.reader.done() => {
                         Some(reading.broken("the stream ended before the reply finished".into()))
@@ -985,9 +1613,7 @@ impl Session {
             Fetched::End => match (reading.plain.take(), reading.head.take()) {
                 (Some(body), Some((status, headers))) => Some(whole(status, headers, body)),
                 // Whole without `[DONE]` only once a finish has come.
-                _ if reading.reply.finished() => {
-                    Some(Streamed::Replied(reading.reply.completion()))
-                }
+                _ if reading.reply.finished() => Some(reading.whole()),
                 _ => Some(reading.broken("the stream ended before the reply finished".into())),
             },
             Fetched::Failed(e) => match (reading.plain.take(), reading.head.take()) {
@@ -1114,6 +1740,26 @@ impl Session {
         self.spent(id, cost.0);
         Ok(())
     }
+}
+
+/// The todo list as `events` last wrote it.
+pub fn todo(events: &[Event]) -> Vec<TodoItem> {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.kind {
+            Kind::Todo { items, .. } => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The todo item in progress, as `conversations` shows it.
+fn doing(events: &[Event]) -> Option<String> {
+    todo(events)
+        .into_iter()
+        .find(|i| i.status == Status::InProgress)
+        .map(|i| i.content)
 }
 
 /// The most text one `delta` frame carries in a field: six times it,

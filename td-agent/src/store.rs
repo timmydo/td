@@ -308,6 +308,10 @@ pub struct Meta {
     pub role: Role,
     pub title: String,
     pub created: u64,
+    /// The human paused it (DESIGN.md §3): it starts no turn of its own
+    /// until resumed. The log's `Pause` events are the record; this is
+    /// the list's copy, absent and false in a meta written before.
+    pub paused: bool,
 }
 
 impl Meta {
@@ -322,6 +326,7 @@ impl Meta {
             ("mode".into(), Json::Null),
             ("parent".into(), Json::Null),
             ("created".into(), Json::from(self.created)),
+            ("paused".into(), Json::Bool(self.paused)),
         ])
     }
 
@@ -340,6 +345,10 @@ impl Meta {
                 .get("created")
                 .and_then(Json::as_u64)
                 .ok_or("meta has no creation time")?,
+            paused: match value.get("paused") {
+                None => false,
+                Some(paused) => paused.as_bool().ok_or("meta's paused is not a boolean")?,
+            },
         })
     }
 }
@@ -444,6 +453,105 @@ impl Basis {
     }
 }
 
+/// One tool call an assistant message asked for, as its reply assembled
+/// it and as every later request sends it back (DESIGN.md §5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Call {
+    pub id: String,
+    pub name: String,
+    /// The function's arguments as the model wrote them, kept whether or
+    /// not they parse: a JSON text when whole.
+    pub arguments: String,
+}
+
+impl Call {
+    fn to_json(&self) -> Json {
+        Json::Obj(vec![
+            ("id".into(), Json::Str(self.id.clone())),
+            ("name".into(), Json::Str(self.name.clone())),
+            ("arguments".into(), Json::Str(self.arguments.clone())),
+        ])
+    }
+
+    fn from_json(value: &Json) -> Result<Self, String> {
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(Json::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("a tool call with no {name}"))
+        };
+        Ok(Self {
+            id: field("id")?,
+            name: field("name")?,
+            arguments: field("arguments")?,
+        })
+    }
+}
+
+/// A todo item's state (DESIGN.md §12).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Status {
+    Pending,
+    InProgress,
+    Done,
+    Cancelled,
+}
+
+impl Status {
+    pub const ALL: [Self; 4] = [Self::Pending, Self::InProgress, Self::Done, Self::Cancelled];
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+        }
+    }
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.word() == word)
+    }
+}
+
+/// One item of a todo list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: Status,
+}
+
+/// Why a message from another conversation started no turn (DESIGN.md
+/// §3): its receiver was paused, or had spent its wake budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Held {
+    Paused,
+    Budget,
+}
+
+impl Held {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Paused => "paused",
+            Self::Budget => "budget",
+        }
+    }
+    fn parse(word: &str) -> Option<Self> {
+        match word {
+            "paused" => Some(Self::Paused),
+            "budget" => Some(Self::Budget),
+            _ => None,
+        }
+    }
+}
+
+/// What a restart tells the model of a tool call it found started and
+/// not finished (DESIGN.md §6, Recovery).
+pub const CALL_INTERRUPTED: &str = "interrupted: td-agent restarted while this call ran, so whether it had any effect is unknown; check the state before relying on it";
+/// What a tool call that never ran is answered with, so that every call
+/// a reply asked for has its one result.
+pub const CALL_NOT_RUN: &str = "not run: the turn ended before this call ran";
+
 /// One log event's content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -465,8 +573,10 @@ pub enum Kind {
     /// Something the store reports about itself, a torn line dropped.
     Notice { text: String },
     /// A request prefix (DESIGN.md §6, §13) superseding the `prefix` file
-    /// and any earlier one from here on: a JSON array of the messages
-    /// every request of the conversation begins with, as exact text.
+    /// and any earlier one from here on, as exact text: a JSON object of
+    /// the tools and the messages every request of the conversation begins
+    /// with, its `messages` last, or, as increment 7 wrote it, an array of
+    /// the messages alone (`client::turn_body`).
     Prefix { text: String },
     /// A model request, logged and synced before it is sent: the turn it
     /// belongs to, what it is for, the prefix it begins with (0 for the
@@ -487,7 +597,8 @@ pub enum Kind {
     /// exact bytes of the response that carried them (from a stream, the
     /// array as assembled, serialized once), and why it ended.
     /// `incomplete` marks what a stream that broke off, failed or was
-    /// interrupted had brought: kept and shown, never sent back.
+    /// interrupted had brought: kept and shown, never sent back, its tool
+    /// calls never run.
     Assistant {
         request: u64,
         content: Option<String>,
@@ -495,6 +606,8 @@ pub enum Kind {
         details: Option<String>,
         finish: String,
         incomplete: bool,
+        /// The tool calls it asked for, in their order.
+        calls: Vec<Call>,
     },
     /// A request's token counts and what it cost, in pico-credits.
     Usage {
@@ -505,6 +618,53 @@ pub enum Kind {
     },
     /// The title a title request gave the conversation.
     Title { request: u64, text: String },
+    /// A message from another conversation (DESIGN.md §3), with the
+    /// window's delivery id, which a receiver logs once: its sender and
+    /// the sender's role, its text, the status a `report` gave it, and
+    /// why it started no turn, when it did not.
+    Message {
+        delivery: String,
+        from: Id,
+        role: Role,
+        text: String,
+        status: Option<String>,
+        held: Option<Held>,
+    },
+    /// Tool call `id` of the assistant message at `reply` started: logged
+    /// and synced before it runs (DESIGN.md §6, Recovery).
+    ToolCall {
+        reply: u64,
+        id: String,
+        name: String,
+    },
+    /// A tool call's result as returned to the model, whole: the
+    /// `ToolCall` record it finishes (0 for a call that never ran), and
+    /// whether it is a refusal or a failure rather than the tool's answer.
+    ToolResult {
+        reply: u64,
+        id: String,
+        name: String,
+        call: u64,
+        content: String,
+        error: bool,
+    },
+    /// The todo list as written, whole (DESIGN.md §12); `cleared` when the
+    /// human cleared it from the window.
+    Todo { items: Vec<TodoItem>, cleared: bool },
+    /// The human paused or resumed the conversation (DESIGN.md §3).
+    Pause { paused: bool },
+    /// An approval decision (DESIGN.md §6, §11): the `ToolCall` it
+    /// decided, its outcome, who decided it (a rule, a classifier stage or
+    /// the human), Jev's probabilities where it gave them, and the reason.
+    /// Nothing writes one until approvals land (increment 13); the history
+    /// tools already show a model only its outcome and who decided.
+    Approval {
+        call: u64,
+        outcome: String,
+        by: String,
+        probabilities: Option<String>,
+        reason: Option<String>,
+    },
 }
 
 /// One line of the log.
@@ -580,6 +740,7 @@ impl Event {
                 details,
                 finish,
                 incomplete,
+                calls,
             } => {
                 let text = |v: &Option<String>| v.clone().map_or(Json::Null, Json::Str);
                 put("kind", Json::Str("assistant".into()));
@@ -590,6 +751,12 @@ impl Event {
                 put("finish", Json::Str(finish.clone()));
                 if *incomplete {
                     put("incomplete", Json::Bool(true));
+                }
+                if !calls.is_empty() {
+                    put(
+                        "tool_calls",
+                        Json::Arr(calls.iter().map(Call::to_json).collect()),
+                    );
                 }
             }
             Kind::Usage {
@@ -613,6 +780,88 @@ impl Event {
                 put("request", Json::from(*request));
                 put("text", Json::Str(text.clone()));
             }
+            Kind::Message {
+                delivery,
+                from,
+                role,
+                text,
+                status,
+                held,
+            } => {
+                put("kind", Json::Str("message".into()));
+                put("delivery", Json::Str(delivery.clone()));
+                put("from", Json::Str(from.to_string()));
+                put("role", Json::Str(role.word().into()));
+                put("text", Json::Str(text.clone()));
+                if let Some(status) = status {
+                    put("status", Json::Str(status.clone()));
+                }
+                if let Some(held) = held {
+                    put("held", Json::Str(held.word().into()));
+                }
+            }
+            Kind::ToolCall { reply, id, name } => {
+                put("kind", Json::Str("tool_call".into()));
+                put("reply", Json::from(*reply));
+                put("id", Json::Str(id.clone()));
+                put("name", Json::Str(name.clone()));
+            }
+            Kind::ToolResult {
+                reply,
+                id,
+                name,
+                call,
+                content,
+                error,
+            } => {
+                put("kind", Json::Str("tool_result".into()));
+                put("reply", Json::from(*reply));
+                put("id", Json::Str(id.clone()));
+                put("name", Json::Str(name.clone()));
+                put("call", Json::from(*call));
+                put("content", Json::Str(content.clone()));
+                if *error {
+                    put("error", Json::Bool(true));
+                }
+            }
+            Kind::Todo { items, cleared } => {
+                put("kind", Json::Str("todo".into()));
+                let items = items
+                    .iter()
+                    .map(|item| {
+                        Json::Obj(vec![
+                            ("content".into(), Json::Str(item.content.clone())),
+                            ("status".into(), Json::Str(item.status.word().into())),
+                        ])
+                    })
+                    .collect();
+                put("items", Json::Arr(items));
+                if *cleared {
+                    put("cleared", Json::Bool(true));
+                }
+            }
+            Kind::Pause { paused } => {
+                put("kind", Json::Str("pause".into()));
+                put("paused", Json::Bool(*paused));
+            }
+            Kind::Approval {
+                call,
+                outcome,
+                by,
+                probabilities,
+                reason,
+            } => {
+                put("kind", Json::Str("approval".into()));
+                put("call", Json::from(*call));
+                put("outcome", Json::Str(outcome.clone()));
+                put("by", Json::Str(by.clone()));
+                if let Some(probabilities) = probabilities {
+                    put("probabilities", Json::Str(probabilities.clone()));
+                }
+                if let Some(reason) = reason {
+                    put("reason", Json::Str(reason.clone()));
+                }
+            }
         }
         Json::Obj(pairs)
     }
@@ -630,6 +879,21 @@ impl Event {
                 .and_then(Json::as_str)
                 .map(str::to_string)
                 .ok_or_else(|| format!("no {name}"))
+        };
+        let optional = |name: &str| -> Result<Option<String>, String> {
+            match value.get(name) {
+                None | Some(Json::Null) => Ok(None),
+                Some(Json::Str(text)) => Ok(Some(text.clone())),
+                Some(_) => Err(format!("{name} is not a string")),
+            }
+        };
+        let flag = |name: &str| -> Result<bool, String> {
+            match value.get(name) {
+                None => Ok(false),
+                Some(flag) => flag
+                    .as_bool()
+                    .ok_or_else(|| format!("{name} is not a boolean")),
+            }
         };
         let kind = match value.get("kind").and_then(Json::as_str) {
             Some("user") => Kind::User {
@@ -673,26 +937,23 @@ impl Event {
                 bytes: number("bytes")?,
                 reserved: number("reserved")?,
             },
-            Some("assistant") => {
-                let text = |name: &str| -> Result<Option<String>, String> {
-                    match value.get(name) {
-                        None | Some(Json::Null) => Ok(None),
-                        Some(Json::Str(text)) => Ok(Some(text.clone())),
-                        Some(_) => Err(format!("{name} is not a string")),
-                    }
-                };
-                Kind::Assistant {
-                    request: number("request")?,
-                    content: text("content")?,
-                    reasoning: text("reasoning")?,
-                    details: text("reasoning_details")?,
-                    finish: string("finish")?,
-                    incomplete: match value.get("incomplete") {
-                        None => false,
-                        Some(flag) => flag.as_bool().ok_or("incomplete is not a boolean")?,
-                    },
-                }
-            }
+            Some("assistant") => Kind::Assistant {
+                request: number("request")?,
+                content: optional("content")?,
+                reasoning: optional("reasoning")?,
+                details: optional("reasoning_details")?,
+                finish: string("finish")?,
+                incomplete: flag("incomplete")?,
+                calls: match value.get("tool_calls") {
+                    None => Vec::new(),
+                    Some(calls) => calls
+                        .as_arr()
+                        .ok_or("tool_calls is not a list")?
+                        .iter()
+                        .map(Call::from_json)
+                        .collect::<Result<_, _>>()?,
+                },
+            },
             Some("usage") => Kind::Usage {
                 request: number("request")?,
                 tokens: Tokens {
@@ -712,6 +973,66 @@ impl Event {
             Some("title") => Kind::Title {
                 request: number("request")?,
                 text: string("text")?,
+            },
+            Some("message") => Kind::Message {
+                delivery: string("delivery")?,
+                from: Id::parse(&string("from")?).ok_or("from is not an id")?,
+                role: Role::parse(&string("role")?).ok_or("no role")?,
+                text: string("text")?,
+                status: optional("status")?,
+                held: match optional("held")? {
+                    None => None,
+                    Some(word) => Some(Held::parse(&word).ok_or("held is not a reason")?),
+                },
+            },
+            Some("tool_call") => Kind::ToolCall {
+                reply: number("reply")?,
+                id: string("id")?,
+                name: string("name")?,
+            },
+            Some("tool_result") => Kind::ToolResult {
+                reply: number("reply")?,
+                id: string("id")?,
+                name: string("name")?,
+                call: number("call")?,
+                content: string("content")?,
+                error: flag("error")?,
+            },
+            Some("todo") => Kind::Todo {
+                items: value
+                    .get("items")
+                    .and_then(Json::as_arr)
+                    .ok_or("no items")?
+                    .iter()
+                    .map(|item| {
+                        Ok(TodoItem {
+                            content: item
+                                .get("content")
+                                .and_then(Json::as_str)
+                                .ok_or("an item with no content")?
+                                .to_string(),
+                            status: item
+                                .get("status")
+                                .and_then(Json::as_str)
+                                .and_then(Status::parse)
+                                .ok_or("an item with no status")?,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?,
+                cleared: flag("cleared")?,
+            },
+            Some("pause") => Kind::Pause {
+                paused: value
+                    .get("paused")
+                    .and_then(Json::as_bool)
+                    .ok_or("no paused")?,
+            },
+            Some("approval") => Kind::Approval {
+                call: number("call")?,
+                outcome: string("outcome")?,
+                by: string("by")?,
+                probabilities: optional("probabilities")?,
+                reason: optional("reason")?,
             },
             Some(other) => return Err(format!("unknown kind {other:?}")),
             None => return Err("no kind".into()),
@@ -775,6 +1096,7 @@ impl Conversation {
                     role,
                     title: role.first_title().to_string(),
                     created: now(),
+                    paused: false,
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
@@ -839,18 +1161,50 @@ impl Conversation {
         // A user message logged without its turn's start, the process
         // having died between the two lines: its turn is started here so
         // that, like every other, it is recorded as interrupted.
+        let mut repaired = false;
         for of in conversation.unturned() {
             conversation.append(Kind::Started {
                 effect: Effect::Turn,
                 of,
             })?;
         }
+        // Every call a whole reply asked for has its one result before any
+        // later request: one found started is interrupted, its effect
+        // unknown, and one never started was not run. Neither runs again.
+        for (reply, id, name, call) in conversation.unanswered() {
+            let content = if call == 0 {
+                CALL_NOT_RUN
+            } else {
+                CALL_INTERRUPTED
+            };
+            conversation.append(Kind::ToolResult {
+                reply,
+                id,
+                name,
+                call,
+                content: content.into(),
+                error: true,
+            })?;
+            if call != 0 {
+                load.interrupted.push(call);
+            }
+            repaired = true;
+        }
         for started in conversation.unfinished() {
             conversation.append(Kind::Interrupted { started })?;
             load.interrupted.push(started);
         }
-        if load.torn.is_some() || !load.interrupted.is_empty() {
+        if repaired || load.torn.is_some() || !load.interrupted.is_empty() {
             conversation.sync()?;
+        }
+        // The log is the record of pausing; `meta` follows it, and a
+        // process that died between the two is put right here.
+        let paused = conversation.events.iter().rev().find_map(|e| match e.kind {
+            Kind::Pause { paused } => Some(paused),
+            _ => None,
+        });
+        if let Some(paused) = paused.filter(|p| *p != conversation.meta.paused) {
+            conversation.set_paused(paused)?;
         }
         Ok((conversation, load))
     }
@@ -885,24 +1239,68 @@ impl Conversation {
             <= MAX_LOG
     }
 
-    /// Whether a user message with this delivery id is already logged.
+    /// Whether a message with this delivery id, the human's or another
+    /// conversation's, is already logged.
     pub fn delivered(&self, delivery: &str) -> bool {
-        self.events
-            .iter()
-            .any(|e| matches!(&e.kind, Kind::User { delivery: d, .. } if d == delivery))
+        self.events.iter().any(|e| match &e.kind {
+            Kind::User { delivery: d, .. } | Kind::Message { delivery: d, .. } => d == delivery,
+            _ => false,
+        })
     }
 
-    /// Every user message no turn was started for.
+    /// Every message that should have started a turn and has none: the
+    /// human's, and another conversation's that was not held.
     fn unturned(&self) -> Vec<u64> {
         let mut users = Vec::new();
         for event in &self.events {
             match &event.kind {
-                Kind::User { .. } => users.push(event.seq),
+                Kind::User { .. } | Kind::Message { held: None, .. } => users.push(event.seq),
                 Kind::Started { of, .. } => users.retain(|seq| seq != of),
                 _ => {}
             }
         }
         users
+    }
+
+    /// Every tool call a whole reply asked for that has no result yet: its
+    /// reply, id and name, and its `ToolCall` record, 0 when it never
+    /// started.
+    fn unanswered(&self) -> Vec<(u64, String, String, u64)> {
+        let mut open: Vec<(u64, String, String, u64)> = Vec::new();
+        for event in &self.events {
+            match &event.kind {
+                Kind::Assistant {
+                    incomplete: false,
+                    calls,
+                    ..
+                } => open.extend(
+                    calls
+                        .iter()
+                        .map(|c| (event.seq, c.id.clone(), c.name.clone(), 0)),
+                ),
+                Kind::ToolCall { reply, id, .. } => {
+                    if let Some(entry) = open.iter_mut().find(|(r, i, _, _)| r == reply && i == id)
+                    {
+                        entry.3 = event.seq;
+                    }
+                }
+                Kind::ToolResult { reply, id, .. } => {
+                    open.retain(|(r, i, _, _)| !(r == reply && i == id))
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    /// Marks the conversation paused or resumed in its `meta`, the list's
+    /// copy of the log's `Pause` events.
+    pub fn set_paused(&mut self, paused: bool) -> Result<(), String> {
+        let mut meta = self.meta.clone();
+        meta.paused = paused;
+        replace(&self.dir, "meta", meta.to_json().to_string().as_bytes())?;
+        self.meta = meta;
+        Ok(())
     }
 
     /// Every effect started and neither finished nor interrupted.
@@ -1011,6 +1409,16 @@ fn create_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Conversation `id`'s log as the store holds it now, read by a process
+/// that is not its writer: a final line still being written is left out.
+pub fn read_log(state: &StateDir, id: &Id) -> Result<Vec<Event>, String> {
+    let path = state.conversation(id).join("log");
+    let bytes = read_bounded(&path, MAX_LOG).map_err(|e| format!("{}: {e}", path.display()))?;
+    parse_log(&bytes)
+        .map(|(events, _)| events)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -1262,6 +1670,185 @@ pub mod tests {
         let (conversation, load) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
         assert!(load.interrupted.is_empty(), "recorded once");
         assert_eq!(conversation.events().len(), 3);
+    }
+
+    #[test]
+    fn the_tool_events_replay_exactly_and_pausing_is_kept_in_meta() {
+        let scratch = Scratch::new("tools");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let from = Id::random().unwrap();
+        let call = |n: &str| Call {
+            id: format!("call_{n}"),
+            name: "todo_write".into(),
+            arguments: "{\"items\":[]}".into(),
+        };
+        let kinds = vec![
+            Kind::Message {
+                delivery: "d1".into(),
+                from: from.clone(),
+                role: Role::Orchestrator,
+                text: "look \"here\"".into(),
+                status: None,
+                // One that started no turn: an unheld one would be given
+                // its turn at load.
+                held: Some(Held::Paused),
+            },
+            Kind::Message {
+                delivery: "d2".into(),
+                from,
+                role: Role::Conversation,
+                text: "done".into(),
+                status: Some("done".into()),
+                held: Some(Held::Budget),
+            },
+            Kind::Assistant {
+                request: 1,
+                content: None,
+                reasoning: None,
+                details: None,
+                finish: "tool_calls".into(),
+                incomplete: false,
+                calls: vec![call("1"), call("2")],
+            },
+            Kind::ToolCall {
+                reply: 3,
+                id: "call_1".into(),
+                name: "todo_write".into(),
+            },
+            Kind::ToolResult {
+                reply: 3,
+                id: "call_1".into(),
+                name: "todo_write".into(),
+                call: 4,
+                content: "The todo list is empty.".into(),
+                error: false,
+            },
+            Kind::ToolResult {
+                reply: 3,
+                id: "call_2".into(),
+                name: "todo_write".into(),
+                call: 0,
+                content: CALL_NOT_RUN.into(),
+                error: true,
+            },
+            Kind::Todo {
+                items: vec![TodoItem {
+                    content: "x".into(),
+                    status: Status::InProgress,
+                }],
+                cleared: false,
+            },
+            Kind::Pause { paused: true },
+            Kind::Approval {
+                call: 4,
+                outcome: "allowed".into(),
+                by: "a rule".into(),
+                probabilities: None,
+                reason: Some("read-only".into()),
+            },
+        ];
+        let written = {
+            let (mut conversation, _) =
+                Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+            for kind in kinds {
+                conversation.append(kind).unwrap();
+            }
+            conversation.set_paused(true).unwrap();
+            conversation.sync().unwrap();
+            assert!(conversation.delivered("d2"), "a message's delivery counts");
+            conversation.events().to_vec()
+        };
+        let (conversation, load) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(load, Load::default(), "every call has its result");
+        assert_eq!(conversation.events(), written.as_slice());
+        assert!(conversation.meta().paused);
+        assert_eq!(read_log(&state, &id).unwrap(), written);
+        // A resumption logged by a process that died before writing
+        // `meta`: the log wins at the next open.
+        let mut conversation = conversation;
+        conversation.append(Kind::Pause { paused: false }).unwrap();
+        conversation.sync().unwrap();
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert!(!conversation.meta().paused);
+        drop(conversation);
+        let (metas, _) = state.list();
+        assert!(metas.iter().all(|m| !m.paused), "and `meta` is written");
+    }
+
+    #[test]
+    fn a_whole_replys_calls_without_results_are_answered_at_load() {
+        let scratch = Scratch::new("unanswered");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let call = |n: &str| Call {
+            id: n.into(),
+            name: "history_search".into(),
+            arguments: "{}".into(),
+        };
+        let reply = |calls: Vec<Call>, incomplete: bool| Kind::Assistant {
+            request: 0,
+            content: None,
+            reasoning: None,
+            details: None,
+            finish: "tool_calls".into(),
+            incomplete,
+            calls,
+        };
+        {
+            let (mut conversation, _) =
+                Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+            // An incomplete reply's calls never run and need no result.
+            conversation.append(reply(vec![call("x")], true)).unwrap();
+            conversation
+                .append(reply(vec![call("a"), call("b"), call("c")], false))
+                .unwrap();
+            conversation
+                .append(Kind::ToolCall {
+                    reply: 2,
+                    id: "a".into(),
+                    name: "history_search".into(),
+                })
+                .unwrap();
+            conversation
+                .append(Kind::ToolResult {
+                    reply: 2,
+                    id: "a".into(),
+                    name: "history_search".into(),
+                    call: 3,
+                    content: "No event matches.".into(),
+                    error: false,
+                })
+                .unwrap();
+            conversation
+                .append(Kind::ToolCall {
+                    reply: 2,
+                    id: "b".into(),
+                    name: "history_search".into(),
+                })
+                .unwrap();
+            conversation.sync().unwrap();
+        }
+        let (conversation, load) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(load.interrupted, [5]);
+        let added: Vec<(&str, u64, &str)> = conversation
+            .events()
+            .get(5..)
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::ToolResult {
+                    id, call, content, ..
+                } => Some((id.as_str(), *call, content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(added, [("b", 5, CALL_INTERRUPTED), ("c", 0, CALL_NOT_RUN)]);
+        drop(conversation);
+        let (conversation, load) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(load, Load::default(), "answered once");
+        assert_eq!(conversation.events().len(), 7);
     }
 
     #[test]

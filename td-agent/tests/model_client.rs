@@ -62,6 +62,8 @@ struct Harness {
     /// Every reservation asked for and every cost reported.
     reserved: Vec<(u64, u64)>,
     spent: Vec<(u64, u64)>,
+    /// Every message sent through the window: to, text and status.
+    sent: Vec<(Id, String, Option<String>)>,
     /// Every streamed delta: its request, reasoning and text.
     deltas: Vec<(u64, String, String)>,
     /// Events `until_text` heard, which the next `turn` begins with.
@@ -100,6 +102,7 @@ impl Harness {
             day: Day::Grant,
             reserved: Vec::new(),
             spent: Vec::new(),
+            sent: Vec::new(),
             deltas: Vec::new(),
             heard: Vec::new(),
             stderr,
@@ -149,6 +152,24 @@ impl Harness {
                 self.down(&Down::Reservation { id: *id, refusal });
             }
             Up::Spent { id, amount } => self.spent.push((*id, *amount)),
+            // The window queues a message and knows no conversation's
+            // state.
+            Up::Send {
+                id,
+                to,
+                text,
+                status,
+            } => {
+                self.sent.push((to.clone(), text.clone(), status.clone()));
+                self.down(&Down::Sent {
+                    id: *id,
+                    refusal: None,
+                });
+            }
+            Up::Query { id } => self.down(&Down::States {
+                id: *id,
+                states: Vec::new(),
+            }),
             Up::Delta {
                 request,
                 reasoning,
@@ -347,6 +368,12 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Assistant { .. } => "assistant",
             Kind::Usage { .. } => "usage",
             Kind::Title { .. } => "title",
+            Kind::Message { .. } => "message",
+            Kind::ToolCall { .. } => "tool_call",
+            Kind::ToolResult { .. } => "tool_result",
+            Kind::Todo { .. } => "todo",
+            Kind::Pause { .. } => "pause",
+            Kind::Approval { .. } => "approval",
         })
         .collect()
 }
@@ -465,7 +492,12 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert_eq!(body["cache_control.type"], "ephemeral");
     assert_eq!(body["messages.0.role"], "system");
     assert_eq!(body["messages.1.content"], "What is a sparse checkout?");
-    assert!(!body.contains_key("tools"), "no tools in this increment");
+    // Every request carries the conversation's tools.
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["parallel_tool_calls"], "true");
+    assert_eq!(body["tools.0.type"], "function");
+    assert_eq!(body["tools.0.function.name"], "todo_write");
+    assert_eq!(body["tools.5.function.name"], "report");
     // The title comes from the title model, quoting the first exchange.
     let title = flat(&requests[1].text());
     assert_eq!(title["model"], "anthropic/claude-haiku-4.5");
@@ -1038,4 +1070,775 @@ fn without_a_key_a_turn_says_why_and_sends_nothing() {
     let (_, outcome, _) = h.turn();
     assert!(outcome.starts_with("no API key"), "{outcome}");
     assert!(h.mock.requests().is_empty());
+}
+
+// --- the conversation tools (DESIGN.md §3, §5, §12) ---------------------
+
+/// The tool results of `events`: call id, content and whether an error.
+fn results(events: &[Event]) -> Vec<(String, String, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::ToolResult {
+                id, content, error, ..
+            } => Some((id.clone(), content.clone(), *error)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The body request `n` sent equals the one its log rebuilds.
+fn rebuilt(conversation: &Conversation, n: usize, sent: &str) {
+    let at = conversation
+        .events()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(
+                e.kind,
+                Kind::Request {
+                    purpose: Purpose::Turn,
+                    ..
+                }
+            )
+        })
+        .nth(n)
+        .unwrap()
+        .0;
+    assert_eq!(
+        td_agent::client::body(conversation.events(), at, conversation.prefix_file()).unwrap(),
+        sent
+    );
+}
+
+const TODO_ARGUMENTS: &str = "{\"items\":[{\"content\":\"Read the design\",\"status\":\"in_progress\"},{\"content\":\"Write the tests\",\"status\":\"pending\"}]}";
+
+#[test]
+fn a_tool_call_runs_once_and_its_result_goes_back_with_the_next_step() {
+    let mut h = Harness::new(
+        "tool",
+        Role::Orchestrator,
+        vec![
+            Reply::sse("stream-tool-todo.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Plan the work.");
+    let (events, outcome, retry) = h.turn();
+    assert_eq!((outcome.as_str(), retry), ("replied", false));
+    assert_eq!(
+        kinds(&events),
+        [
+            "user",
+            "started",
+            "request",
+            "assistant",
+            "usage",
+            "finished",
+            "tool_call",
+            "todo",
+            "tool_result",
+            "request",
+            "assistant",
+            "usage",
+            "finished",
+            "finished"
+        ]
+    );
+    // Every step reserves its own cost.
+    assert_eq!(h.reserved.len(), 2);
+    assert_eq!(h.spent.len(), 2);
+    let requests = h.mock.requests();
+    assert_eq!(requests.len(), 2);
+    let second = flat(&requests[1].text());
+    assert_eq!(second["messages.2.role"], "assistant");
+    assert_eq!(second["messages.2.content"], "null");
+    assert_eq!(second["messages.2.tool_calls.0.id"], "toolu_todo_01");
+    assert_eq!(second["messages.2.tool_calls.0.type"], "function");
+    assert_eq!(
+        second["messages.2.tool_calls.0.function.name"],
+        "todo_write"
+    );
+    assert_eq!(
+        second["messages.2.tool_calls.0.function.arguments"],
+        TODO_ARGUMENTS
+    );
+    assert_eq!(second["messages.3.role"], "tool");
+    assert_eq!(second["messages.3.tool_call_id"], "toolu_todo_01");
+    assert_eq!(
+        second["messages.3.content"],
+        "The todo list has 2 items, 0 done:\n[>] Read the design\n[ ] Write the tests"
+    );
+    assert!(!second.contains_key("messages.4.role"));
+    let (conversation, _) = h.close();
+    for (n, request) in requests.iter().enumerate() {
+        rebuilt(&conversation, n, &request.text());
+    }
+    assert_eq!(
+        td_agent::conversation::todo(conversation.events()).len(),
+        2,
+        "the list as the log holds it"
+    );
+}
+
+#[test]
+fn parallel_calls_run_in_their_order_each_answered_once() {
+    let mut h = Harness::new(
+        "parallel",
+        Role::Orchestrator,
+        vec![
+            Reply::sse("stream-tool-parallel.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Plan it, and look for the design.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let results = results(&events);
+    let ids: Vec<&str> = results.iter().map(|(id, _, _)| id.as_str()).collect();
+    assert_eq!(ids, ["toolu_par_01", "toolu_par_02"]);
+    assert!(results.iter().all(|(_, _, error)| !error), "{results:?}");
+    // The search found the user's message, which names the design.
+    assert!(results[1].1.contains("design"), "{}", results[1].1);
+    let calls: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::ToolCall { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls, ["toolu_par_01", "toolu_par_02"]);
+    let second = flat(&h.mock.requests()[1].text());
+    assert_eq!(
+        second["messages.2.content"],
+        "I will note the plan and look back."
+    );
+    assert_eq!(second["messages.2.tool_calls.1.id"], "toolu_par_02");
+    assert_eq!(second["messages.3.tool_call_id"], "toolu_par_01");
+    assert_eq!(second["messages.4.tool_call_id"], "toolu_par_02");
+}
+
+#[test]
+fn malformed_arguments_are_answered_with_an_error_and_the_turn_goes_on() {
+    let mut h = Harness::new(
+        "malformed",
+        Role::Orchestrator,
+        vec![
+            Reply::sse("stream-tool-malformed.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Plan it.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let results = results(&events);
+    assert_eq!(results.len(), 1);
+    let (id, content, error) = &results[0];
+    assert_eq!(id, "toolu_bad_01");
+    assert!(error);
+    assert!(content.starts_with("error: "), "{content}");
+    assert!(content.contains("JSON"), "{content}");
+    assert!(!kinds(&events).contains(&"todo"), "nothing ran");
+    assert_eq!(h.mock.requests().len(), 2);
+}
+
+#[test]
+fn the_step_bound_ends_a_turn_that_keeps_calling_tools() {
+    let steps = td_agent::conversation::MAX_STEPS;
+    let mut h = Harness::new(
+        "steps",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-tool-todo.sse"); steps + 1],
+    );
+    h.setup(Client::default());
+    h.say("Plan it forever.");
+    let (events, outcome, retry) = h.turn();
+    assert!(
+        outcome.starts_with(&format!("stopped after {steps} steps")),
+        "{outcome}"
+    );
+    assert!(!retry);
+    assert_eq!(h.mock.requests().len(), steps);
+    assert_eq!(results(&events).len(), steps, "every call answered");
+    let last = kinds(&events);
+    assert_eq!(last[last.len() - 2], "tool_result");
+}
+
+#[test]
+fn a_model_without_tools_is_refused_by_name() {
+    let mut h = Harness::new("no-tools", Role::Orchestrator, Vec::new());
+    h.setup(Client {
+        orchestrator_model: "example/no-tools".into(),
+        ..Client::default()
+    });
+    h.say("hello");
+    let (events, outcome, _) = h.turn();
+    assert!(
+        outcome.starts_with("example/no-tools takes no tools"),
+        "{outcome}"
+    );
+    assert!(outcome.contains("orchestrator_model"), "{outcome}");
+    assert!(!kinds(&events).contains(&"request"));
+    assert!(h.mock.requests().is_empty());
+}
+
+/// A message from another conversation, as the window hands it on.
+fn message(from: &Id, text: &str) -> Down {
+    Down::Message {
+        delivery: td_agent::store::random_hex(16).unwrap(),
+        from: from.clone(),
+        role: Role::Conversation,
+        text: text.into(),
+        status: None,
+    }
+}
+
+/// What the process says until it acknowledges a delivery, reservations
+/// answered on the way: the events.
+fn until_delivered(h: &mut Harness) -> Vec<Event> {
+    let mut events = Vec::new();
+    loop {
+        let up = h.next();
+        if h.hear(&up) {
+            continue;
+        }
+        match up {
+            Up::Event(event) => events.push(event),
+            Up::Delivered { .. } => return events,
+            other => panic!("not delivered: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_wake_budget_holds_messages_past_twenty_turns_until_the_human_writes() {
+    let budget = td_agent::wake::BUDGET;
+    let mut h = Harness::new(
+        "wake",
+        Role::Conversation,
+        vec![Reply::sse("stream-sonnet.sse"); budget],
+    );
+    h.setup(Client::default());
+    let peer = Id::parse(&"c".repeat(32)).unwrap();
+    for n in 0..budget {
+        h.down(&message(&peer, &format!("wake {n}")));
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "turn {n}");
+        assert_eq!(kinds(&events)[..2], ["message", "started"]);
+    }
+    let body = h.mock.requests()[0].text();
+    assert!(
+        body.contains(&format!(
+            "[a message from conversation {peer}, not from the person]\\nwake 0"
+        )),
+        "{body}"
+    );
+    // Spent: held, said once, and no request.
+    h.down(&message(&peer, "one more"));
+    let events = until_delivered(&mut h);
+    assert_eq!(kinds(&events), ["message", "notice"]);
+    assert!(matches!(
+        events[0].kind,
+        Kind::Message {
+            held: Some(td_agent::store::Held::Budget),
+            ..
+        }
+    ));
+    h.down(&message(&peer, "and another"));
+    assert_eq!(kinds(&until_delivered(&mut h)), ["message"]);
+    // A report is no wake of its own making: it starts a turn.
+    // The report's turn, the human's (the first they began, so titled),
+    // and the next message's.
+    h.mock.then(vec![
+        Reply::sse("stream-sonnet.sse"),
+        Reply::sse("stream-sonnet.sse"),
+        Reply::ok("title.json"),
+        Reply::sse("stream-sonnet.sse"),
+    ]);
+    h.down(&Down::Message {
+        delivery: td_agent::store::random_hex(16).unwrap(),
+        from: peer.clone(),
+        role: Role::Conversation,
+        text: "finished".into(),
+        status: Some("done".into()),
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert_eq!(h.mock.requests().len(), budget + 1);
+    // The human writes: the budget is renewed, and the held messages are
+    // in the next request.
+    h.say("Go on.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert!(h.mock.requests()[budget + 1].text().contains("and another"));
+    h.down(&message(&peer, "after"));
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert_eq!(kinds(&events)[..2], ["message", "started"]);
+}
+
+#[test]
+fn a_paused_conversation_holds_messages_until_it_is_resumed() {
+    let mut h = Harness::new(
+        "pause",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.setup(Client::default());
+    h.down(&Down::Pause { paused: true });
+    let peer = Id::parse(&"d".repeat(32)).unwrap();
+    h.down(&message(&peer, "while paused"));
+    let events = until_delivered(&mut h);
+    assert_eq!(kinds(&events), ["pause", "message"]);
+    assert!(matches!(
+        events[1].kind,
+        Kind::Message {
+            held: Some(td_agent::store::Held::Paused),
+            ..
+        }
+    ));
+    assert!(h.mock.requests().is_empty());
+    // Resumed: the held message starts its turn.
+    h.down(&Down::Pause { paused: false });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert_eq!(kinds(&events)[..2], ["started", "pause"]);
+    assert!(h.mock.requests()[0].text().contains("while paused"));
+    let (conversation, _) = h.close();
+    assert!(!conversation.meta().paused);
+}
+
+#[test]
+fn a_call_started_and_not_finished_is_answered_as_interrupted_after_a_restart() {
+    let mut h = Harness::new(
+        "call-restart",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    let _ = h.window.shutdown(std::net::Shutdown::Both);
+    wait(&mut h.child);
+    // The log as a process killed mid-call leaves it: two calls asked
+    // for, the first started.
+    {
+        let (mut c, _) = Conversation::open(&h.state, &h.id, None, Duration::from_secs(3)).unwrap();
+        let call = |id: &str| td_agent::store::Call {
+            id: id.into(),
+            name: "todo_write".into(),
+            arguments: TODO_ARGUMENTS.into(),
+        };
+        let user = c
+            .append(Kind::User {
+                delivery: "0".repeat(32),
+                text: "Plan it.".into(),
+            })
+            .unwrap()
+            .seq;
+        let turn = c
+            .append(Kind::Started {
+                effect: td_agent::store::Effect::Turn,
+                of: user,
+            })
+            .unwrap()
+            .seq;
+        let request = c
+            .append(Kind::Request {
+                turn,
+                purpose: Purpose::Turn,
+                prefix: 0,
+                head: "\"model\":\"x\"".into(),
+                bytes: 0,
+                reserved: 0,
+            })
+            .unwrap()
+            .seq;
+        let reply = c
+            .append(Kind::Assistant {
+                request,
+                content: None,
+                reasoning: None,
+                details: None,
+                finish: "tool_calls".into(),
+                incomplete: false,
+                calls: vec![call("toolu_a"), call("toolu_b")],
+            })
+            .unwrap()
+            .seq;
+        let started = c
+            .append(Kind::ToolCall {
+                reply,
+                id: "toolu_a".into(),
+                name: "todo_write".into(),
+            })
+            .unwrap()
+            .seq;
+        c.sync().unwrap();
+        assert_eq!(started, 5);
+    }
+    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    h.child = child;
+    h.window = window;
+    let Up::Hello { interrupted, .. } = h.next() else {
+        panic!("no hello")
+    };
+    let mut interrupted = interrupted;
+    interrupted.sort_unstable();
+    assert_eq!(interrupted, [2, 3, 5], "the turn, its request and the call");
+    h.setup(Client::default());
+    h.say("Go on.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let body = flat(&h.mock.requests()[0].text());
+    assert_eq!(body["messages.3.tool_call_id"], "toolu_a");
+    assert_eq!(
+        body["messages.3.content"],
+        td_agent::store::CALL_INTERRUPTED
+    );
+    assert_eq!(body["messages.4.tool_call_id"], "toolu_b");
+    assert_eq!(body["messages.4.content"], td_agent::store::CALL_NOT_RUN);
+    assert_eq!(body["messages.5.content"], "Go on.");
+    let (conversation, _) = h.close();
+    assert!(
+        !conversation
+            .events()
+            .iter()
+            .any(|e| matches!(&e.kind, Kind::Todo { .. })),
+        "never run again"
+    );
+}
+
+/// The orchestrator sends a conversation a message through the window,
+/// which queues it, starts the receiver's process, and hands it on: the
+/// receiver's turn answers it.
+#[test]
+fn a_message_between_two_conversations_wakes_the_receiver() {
+    use td_agent::post::{Entry, Outbox, Post};
+    use td_agent::supervisor::{Opened, Supervisor, Update};
+
+    let root = std::env::temp_dir().join(format!(
+        "td-agent-model-post-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let state = StateDir::at(root.join("state"));
+    state.ensure().unwrap();
+    let runtime = root.join("run");
+    std::fs::create_dir(&runtime).unwrap();
+    let mock = MockFetch::start(
+        &runtime,
+        vec![
+            Reply::sse("stream-tool-send.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    mock.route(
+        "[a message from the orchestrator, not from the person]",
+        vec![Reply::sse("stream-gemini.sse")],
+    );
+    Models::from_provider(&fixture("models.json"))
+        .unwrap()
+        .save(state.root())
+        .unwrap();
+    let orchestrator = Id::parse(&"a".repeat(32)).unwrap();
+    let receiver = Id::parse(&"b".repeat(32)).unwrap();
+    let setup = Down::Setup {
+        key: Ok(Secret::new(KEY.into())),
+        client: Client::default(),
+    };
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), setup)
+        .env("XDG_RUNTIME_DIR", &runtime);
+    // The receiver exists, closed; the orchestrator is open.
+    assert_eq!(
+        supervisor
+            .open(receiver.clone(), Some(Role::Conversation))
+            .unwrap(),
+        Opened::Started
+    );
+    supervisor
+        .open(orchestrator.clone(), Some(Role::Orchestrator))
+        .unwrap();
+    let directory = || -> Vec<Entry> {
+        state
+            .list()
+            .0
+            .into_iter()
+            .map(|meta| Entry {
+                id: meta.id,
+                role: meta.role,
+                state: "idle".into(),
+                failed: false,
+            })
+            .collect()
+    };
+    let (outbox, problems) = Outbox::load(&state);
+    assert!(problems.is_empty(), "{problems:?}");
+    let mut post = Post::new(outbox);
+    supervisor
+        .send("Ask the conversation to summarise.".into())
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut finished: Vec<Id> = Vec::new();
+    while finished.len() < 2 {
+        assert!(Instant::now() < deadline, "finished: {finished:?}");
+        let entries = directory();
+        for (id, update) in supervisor.poll() {
+            assert!(post.hear(&id, &update, &mut supervisor, &entries).is_none());
+            match &update {
+                Update::Up(Up::Reserve { id: request, .. }) => supervisor.answer(
+                    &id,
+                    &Down::Reservation {
+                        id: *request,
+                        refusal: None,
+                    },
+                ),
+                Update::Up(Up::Event(Event {
+                    kind: Kind::Finished { outcome, .. },
+                    ..
+                })) if outcome == "replied" => finished.push(id.clone()),
+                Update::Failed { reason } | Update::Restarting { reason } => {
+                    panic!("{id}: {reason}")
+                }
+                _ => {}
+            }
+        }
+        assert!(post.deliver(&mut supervisor, &directory()).is_empty());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(finished.contains(&receiver), "{finished:?}");
+    assert!(post.outbox().queued().is_empty(), "acknowledged and gone");
+    drop(supervisor);
+    let log = td_agent::store::read_log(&state, &receiver).unwrap();
+    assert_eq!(kinds(&log)[..2], ["message", "started"]);
+    let Kind::Message {
+        from, role, text, ..
+    } = &log[0].kind
+    else {
+        panic!("not a message")
+    };
+    assert_eq!(
+        (from, *role, text.as_str()),
+        (
+            &orchestrator,
+            Role::Orchestrator,
+            "Please summarise the sparse checkout notes."
+        )
+    );
+    let sender = td_agent::store::read_log(&state, &orchestrator).unwrap();
+    let results = results(&sender);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].2, "{}", results[0].1);
+    assert!(results[0].1.starts_with("queued for conversation"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A pause the human sent while a turn ran is taken before a message that
+/// came meanwhile, which it then holds.
+#[test]
+fn a_pause_sent_mid_turn_holds_a_message_that_came_before_it() {
+    let mut h = Harness::new(
+        "pause-mid-turn",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.setup(Client::default());
+    let peer = Id::parse(&"e".repeat(32)).unwrap();
+    // The turn cannot end before its reservation is answered, so both
+    // frames come while it runs.
+    h.say("hello");
+    h.down(&message(&peer, "during the turn"));
+    h.down(&Down::Pause { paused: true });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let events = until_delivered(&mut h);
+    assert_eq!(kinds(&events), ["pause", "message"]);
+    assert!(matches!(
+        events[1].kind,
+        Kind::Message {
+            held: Some(td_agent::store::Held::Paused),
+            ..
+        }
+    ));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(h.mock.requests().len(), 1, "no turn for it");
+}
+
+/// A message handed on again, after a restart of the window or the
+/// receiver, is acknowledged and not logged twice.
+#[test]
+fn a_message_delivered_twice_is_logged_once() {
+    let mut h = Harness::new(
+        "twice",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.setup(Client::default());
+    let peer = Id::parse(&"f".repeat(32)).unwrap();
+    let once = message(&peer, "once");
+    h.down(&once);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert_eq!(kinds(&events)[..2], ["message", "started"]);
+    h.down(&once);
+    assert!(
+        until_delivered(&mut h).is_empty(),
+        "acknowledged, not logged"
+    );
+    let (conversation, _) = h.close();
+    let messages = conversation
+        .events()
+        .iter()
+        .filter(|e| matches!(e.kind, Kind::Message { .. }))
+        .count();
+    assert_eq!(messages, 1);
+    assert_eq!(conversation.events().len(), events.len());
+}
+
+/// A conversation's message to another conversation is a crossing,
+/// refused as the call's result; the turn goes on.
+#[test]
+fn a_crossing_is_refused_as_the_calls_result() {
+    let mut h = Harness::new(
+        "crossing",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-tool-send.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    // The receiver exists, a conversation of its own workspace.
+    let other = Id::parse(&"b".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    h.setup(Client::default());
+    h.say("Tell the other conversation.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let results = results(&events);
+    assert_eq!(results.len(), 1);
+    let (_, content, error) = &results[0];
+    assert!(error);
+    assert!(content.contains("is a crossing"), "{content}");
+    assert!(
+        content.contains("do not try to reach it another way"),
+        "{content}"
+    );
+    assert!(h.sent.is_empty(), "never handed to the window");
+}
+
+/// A conversation a message woke first is titled after the human's first
+/// turn, quoting the human.
+#[test]
+fn a_conversation_woken_first_by_a_message_is_titled_when_the_human_writes() {
+    let mut h = Harness::new(
+        "title-later",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    let peer = Id::parse(&"a".repeat(32)).unwrap();
+    h.down(&message(&peer, "summarise the notes"));
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert!(!kinds(&events).contains(&"title"));
+    assert_eq!(h.mock.requests().len(), 1, "no title request");
+    h.say("What is a sparse checkout?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert!(kinds(&events).contains(&"title"), "{:?}", kinds(&events));
+    let title = flat(&h.mock.requests()[2].text());
+    assert!(title["messages.1.content"].contains("What is a sparse checkout?"));
+}
+
+/// An interrupt while a call waits on the window lets that call finish
+/// and answers each later call as not run; the turn offers `C-r`, which
+/// goes on from the log.
+#[test]
+fn an_interrupt_between_calls_answers_the_rest_as_not_run() {
+    let mut h = Harness::new(
+        "between-calls",
+        Role::Conversation,
+        vec![
+            Reply::sse("stream-tool-send-todo.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    // The orchestrator the first call messages.
+    let orchestrator = Id::parse(&"a".repeat(32)).unwrap();
+    drop(
+        Conversation::open(
+            &h.state,
+            &orchestrator,
+            Some(Role::Orchestrator),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
+    h.setup(Client::default());
+    h.say("Plan it and tell the orchestrator.");
+    // Answered by hand: the interrupt comes while the send waits.
+    let mut events = Vec::new();
+    let (outcome, retry) = loop {
+        let up = h.next();
+        if let Up::Send { id, .. } = up {
+            h.down(&Down::Interrupt);
+            h.down(&Down::Sent { id, refusal: None });
+            continue;
+        }
+        if h.hear(&up) {
+            continue;
+        }
+        if let Up::Event(event) = up {
+            let end = match &event.kind {
+                Kind::Finished {
+                    started: 2,
+                    outcome,
+                    retry,
+                } => Some((outcome.clone(), *retry)),
+                _ => None,
+            };
+            events.push(event);
+            if let Some(end) = end {
+                break end;
+            }
+        }
+    };
+    assert!(
+        outcome.starts_with("interrupted between tool calls"),
+        "{outcome}"
+    );
+    assert!(retry);
+    let results = results(&events);
+    assert_eq!(results.len(), 2, "each call answered once");
+    assert_eq!(results[0].0, "toolu_st_01");
+    assert!(!results[0].2, "the send finished: {}", results[0].1);
+    assert_eq!(results[1].0, "toolu_st_02");
+    assert!(results[1].2);
+    assert!(results[1].1.starts_with("not run: the person interrupted"));
+    assert!(!kinds(&events).contains(&"todo"), "the second never ran");
+    // The turn had a whole reply, so it is titled however it ended.
+    assert!(kinds(&events).contains(&"title"), "{:?}", kinds(&events));
+    // Asked again, the next request carries both results.
+    h.mock.then(vec![Reply::sse("stream-sonnet.sse")]);
+    h.down(&Down::Retry);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    assert!(!kinds(&events).contains(&"title"), "titled once");
+    let body = flat(&h.mock.requests()[2].text());
+    assert_eq!(body["messages.3.tool_call_id"], "toolu_st_01");
+    assert_eq!(body["messages.4.tool_call_id"], "toolu_st_02");
 }
