@@ -15,6 +15,7 @@ pub mod frame_changes;
 pub mod gateway_policy;
 pub mod generations;
 pub mod header_cfws;
+pub mod header_date;
 pub mod header_property;
 pub mod header_raw;
 pub mod header_select;

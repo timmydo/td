@@ -1350,6 +1350,13 @@ Initial independently landable increments:
   long comments, EOF and allocation-free turns. Value grammars, comment text
   decoding and structured-form publication remain open.
 
+- **M06x — resident date-time interpretation:** compose CFWS with bounded
+  lexical/grammar state and validate the complete field before returning
+  Gregorian components and a known/unknown offset. Cover obsolete years,
+  zones and adjacency, weekday agreement, clock/day ranges, malformed tails,
+  long inputs, sticky resource refusals and allocation-free polling. UTC
+  conversion, RFC 3339 rendering and JMAP projection remain separate.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

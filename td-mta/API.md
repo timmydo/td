@@ -1412,6 +1412,52 @@ intervals cover long Unicode comments, folds, nesting, empty matches and
 syntax/depth refusal. Full structured forms and worker integration remain
 open.
 
+### 1.31 Resident date-time interpretation
+
+M06x supplies `header_date::Cursor` over one complete immutable field value,
+excluding its final line ending. The caller first admits that field and
+its requested form. The cursor composes CFWS with fixed token/grammar state
+and returns Complete(Some(Date)) only after the entire value, including any
+trailing comments, validates. Empty, malformed or out-of-range input returns
+Complete(None). No accepted date prefix escapes before trailing validation.
+Comment nesting and work exhaustion remain typed errors, never null. Both
+completion and failure are sticky; cached results consume no additional work.
+
+Date contains year, month, day, hour, minute, second and an Offset: known
+signed minutes east of UTC or Unknown. These are copied interpretation data,
+not a capability or an encoded JMAP Date. RFC 5322 sections 3.3 and 4.3 govern
+syntax and semantics: English month/weekday names compare without ASCII case,
+optional weekdays must agree with the Gregorian date, day and clock ranges
+are checked, and omitted seconds become zero. Seconds through 60 are retained
+as the RFC mail grammar permits; this parser does not consult leap-second
+announcements or claim to validate an RFC 3339 instant.
+
+Two-digit years 00..49 map to 2000..2049, 50..99 to 1950..1999; three-digit
+years add 1900. Four or more digits mean the literal year, including leading
+zeroes. The supported interpreted range is 1900..9999. Obsolete optional
+CFWS and adjacent year/hour digits are accepted: when the next token after
+optional CFWS is a colon, the last two digits of a combined year/hour run
+are the hour and the preceding at-least-two digits are the year. The raw-
+file bare-LF fold policy applies.
+
+Numeric zones require trailing FWS before their sign and exactly four
+unseparated digits. Offset minutes must be below 60; RFC mail offset hours
+may reach 99, unlike RFC 3339's 23-hour ceiling. -0000 stays Unknown; +0000,
+UT and GMT are known zero. The eight US standard/daylight spellings have
+the RFC offsets. Single military letters other than J, including Z, and
+unknown multi-letter alphabetic zones become Unknown under the RFC's
+recommendation. No locale, OS time zone, DNS or external data is consulted.
+
+A poll either advances one CFWS turn plus one charged delimiter-state visit,
+or inspects at most 32 token bytes/EOF positions and performs one bounded
+grammar transition. Its ceilings are 161 source-byte visits and 33 records,
+with no output bytes. Revisited token delimiters and the trailing-FWS check
+are charged. The non-Copy cursor fits 192 bytes, including inline CFWS state,
+a three-byte word prefix and scalar counters. Long comments, zone names and
+zero-prefixed years use constant storage. Source capture and enclosing
+aggregate interpretation admission remain external. UTC conversion, RFC 3339
+rendering, JSON output and the JMAP method adapter remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

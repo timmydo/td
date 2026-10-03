@@ -2064,6 +2064,69 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_dates() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_date::{Cursor, Error, Offset, Status},
+        ports::{Deadline, Tick},
+    };
+    let long = format!("({})21 Nov 1997 09:55:06 CST", "🐈".repeat(10_000));
+    let year = format!("21 Nov {}1997 09:55:06 CST", "0".repeat(10_000));
+    let over = format!(
+        "{}{}21 Nov 1997 09:55:06 CST",
+        "(".repeat(33),
+        ")".repeat(33)
+    );
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1_000_000,
+            records: 200_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for source in [
+        b"Fri, 21 Nov 1997 09:55:06 -0600".as_slice(),
+        long.as_bytes(),
+        year.as_bytes(),
+    ] {
+        let mut cursor = Cursor::new(black_box(source));
+        let mut complete = false;
+        for _ in 0..10_000 {
+            if let Status::Complete(value) = cursor.poll(Tick(1), &mut work).unwrap() {
+                let value = value.unwrap();
+                assert_eq!(value.year, 1997);
+                assert_eq!(value.offset, Offset::Known(-360));
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+    }
+    for source in [
+        b"31 Feb 2000 00:00 +0000".as_slice(),
+        b"1 Jan 2000 00:00 +0000 (bad",
+    ] {
+        let mut cursor = Cursor::new(source);
+        let mut complete = false;
+        for _ in 0..100 {
+            if let Status::Complete(value) = cursor.poll(Tick(1), &mut work).unwrap() {
+                assert!(value.is_none());
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+    }
+    let mut cursor = Cursor::new(over.as_bytes());
+    assert_eq!(cursor.poll(Tick(1), &mut work), Ok(Status::Yield));
+    assert_eq!(cursor.poll(Tick(1), &mut work), Err(Error::NestingLimit));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "header date parsing allocated");
+}
+
 fn header_comments() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2838,6 +2901,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        header_dates();
         header_comments();
         header_selection();
         header_properties();
@@ -2940,6 +3004,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    header_dates();
     header_comments();
     header_selection();
     header_properties();
