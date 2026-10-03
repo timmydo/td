@@ -200,9 +200,13 @@ paragraph is a target contract rather than a whole-image completeness claim.
 1. **No undeclared dependencies.** Builds are offline except for declared
    fixed-output fetches. Never make a build pass by reaching outside its
    sandbox or adding an undeclared input.
-2. **Avoid external dependencies.** Get explicit sign-off before adding one
-   and call it out in the landing commit. The dependency-free Rust surfaces
-   should remain pure `std`.
+2. **Avoid external dependencies.** An external dependency is code from
+   outside this repository. Get explicit sign-off before adding one and call
+   it out in the landing commit. The dependency-free Rust surfaces should
+   remain pure `std` plus td's own crates: a sibling `td-*` crate in this
+   repository, depended on by path as td-ui is, is not external and needs no
+   sign-off. Code two crates need lives in one such crate, not in a copy per
+   consumer.
 3. **Avoid shell.** Prefer dependency-free Rust. Existing recipe shell is not
    precedent for new control-plane or target logic.
 4. **Migrations are atomic.** Cut over completely and delete the old mechanism
