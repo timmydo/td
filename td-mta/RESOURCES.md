@@ -1112,6 +1112,15 @@ retains its eight-byte charge ceiling. Allocation intervals cover long URLs,
 null/NO, short drains and late refusal. Combined worker/native/RSS
 qualification remains open.
 
+The budgeted address/group parser (M06bd) fits 800 bytes in the existing
+16 KiB parser reservation, replacing standalone list state. Original budgets
+and private credit cover boundary/CFWS/phrase/mailbox/route parsing and raw
+recovery. No token text or list is retained. Turn ceilings are 161 source
+visits, 196 aggregate steps, thirteen job records and zero output bytes.
+Allocation intervals cover long group/name input, routes, comments, malformed
+recovery and terminal refusal. Budgeted text/NFC composition and combined
+worker/native/RSS qualification remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

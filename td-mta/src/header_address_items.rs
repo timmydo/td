@@ -1,6 +1,7 @@
 //! Structural recovery boundaries, not an address grammar or SMTP validator.
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     ports::Tick,
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +28,7 @@ pub enum Status {
 pub enum Error {
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl From<Stop> for Error {
@@ -39,11 +41,21 @@ impl std::fmt::Display for Error {
         match self {
             Self::NestingLimit => f.write_str("address boundary nesting limit"),
             Self::Work(error) => write!(f, "address boundary work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid address boundary cursor state"),
         }
     }
 }
 impl std::error::Error for Error {}
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Work(stop) => Self::Work(stop),
+            DecodeError::InterpretationLimit => Self::InterpretationLimit,
+            DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
+}
 /// Retains no token text. Input ends at scanner value_end without final ending.
 pub struct Cursor<'a> {
     source: &'a [u8],
@@ -75,6 +87,13 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -97,7 +116,7 @@ impl<'a> Cursor<'a> {
     fn unclosed(&self) -> bool {
         self.comments != 0 || self.angles != 0 || self.quoted || self.literal
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         if self.position > self.source.len() {
             return Err(Error::InvalidState);
         }

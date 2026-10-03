@@ -1,10 +1,13 @@
 //! Provisional groups and mailboxes with deterministic raw-item recovery.
 pub use crate::header_message_ids::Extent;
+mod budgeted;
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     header_address_items as items, header_cfws, header_mailbox, header_phrase,
     ports::Tick,
 };
+pub use budgeted::Budgeted;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     NestingLimit,
@@ -23,6 +26,15 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Work(stop) => Self::Work(stop),
+            DecodeError::InterpretationLimit => Self::InterpretationLimit,
+            DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Address {
@@ -123,6 +135,13 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -137,21 +156,25 @@ impl<'a> Cursor<'a> {
                     ..Charge::default()
                 },
             )
-            .map_err(Error::Work)
+            .map_err(Error::from)
             .and_then(|()| self.step(now, work));
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         match &mut self.phase {
             Phase::Item => {
-                let status = self.items.poll(now, work).map_err(|error| match error {
-                    items::Error::NestingLimit => Error::NestingLimit,
-                    items::Error::Work(stop) => Error::Work(stop),
-                    items::Error::InvalidState => Error::InvalidState,
-                })?;
+                let status = self
+                    .items
+                    .poll_with_work(now, work)
+                    .map_err(|error| match error {
+                        items::Error::NestingLimit => Error::NestingLimit,
+                        items::Error::Work(stop) => Error::Work(stop),
+                        items::Error::InterpretationLimit => Error::InterpretationLimit,
+                        items::Error::InvalidState => Error::InvalidState,
+                    })?;
                 match status {
                     items::Status::Yield => {}
                     items::Status::Item(item) => {
@@ -171,7 +194,7 @@ impl<'a> Cursor<'a> {
                     }
                 }
             }
-            Phase::Empty(cursor) => match cursor.poll(now, work) {
+            Phase::Empty(cursor) => match cursor.poll_with_work(now, work) {
                 Ok(header_cfws::Status::Complete(end)) => {
                     if end.position
                         == self
@@ -203,7 +226,7 @@ impl<'a> Cursor<'a> {
                     return Err(Error::InterpretationLimit)
                 }
             },
-            Phase::GroupName(cursor) => match cursor.poll(now, work) {
+            Phase::GroupName(cursor) => match cursor.poll_with_work(now, work) {
                 Ok(header_phrase::Status::Complete(_)) => {
                     let colon = self.item()?.colon.ok_or(Error::InvalidState)?;
                     self.candidate.start = colon.checked_add(1).ok_or(Error::InvalidState)?;
@@ -236,7 +259,7 @@ impl<'a> Cursor<'a> {
                 self.empty()?;
                 return Ok(Status::BeginGroup(Some(name)));
             }
-            Phase::Mailbox(cursor) => match cursor.poll(now, work) {
+            Phase::Mailbox(cursor) => match cursor.poll_with_work(now, work) {
                 Ok(header_mailbox::Status::Yield) => {}
                 Ok(header_mailbox::Status::Complete(mailbox)) => {
                     let name = match mailbox.name {
@@ -284,7 +307,7 @@ impl<'a> Cursor<'a> {
                             ..Charge::default()
                         },
                     )
-                    .map_err(Error::Work)?;
+                    .map_err(Error::from)?;
                     let byte = self
                         .source
                         .get(position)

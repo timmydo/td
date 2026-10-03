@@ -2871,6 +2871,47 @@ Allocation intervals include long URLs, null/NO, short drains and late
 refusal in both registered modes. Other structured forms and unpublished
 response-spool retention remain follow-on work.
 
+### 1.62 Budgeted resident address/group parsing
+
+M06bd adds `header_addresses::Budgeted` over the original job Meter and
+per-email HeaderBudget. It retains exclusive borrows, private prepaid credit
+and a terminal failure alongside the existing list cursor; it cannot be
+cloned. Boundaries, CFWS, phrases, mailbox scanning, obsolete routes and
+addr-spec grammar all use the same private parsing admission interface.
+Their public Meter entry points retain their existing events and costs.
+Address-boundary errors gain a typed InterpretationLimit for propagation.
+
+Each admission counts source visits and aggregate steps before access. Steps
+are max(visits plus parser records, one), including EOF and fixed
+transitions; job records are reserved in groups of sixteen by this field's
+private credit. Dropping a field discards its credit. Earlier successful
+charges remain when a later admission refuses. An empty list costs zero
+visits, seven steps and one job record: list/item EOF costs two, empty-CFWS
+checking costs three, and the after-item and final-completion turns cost one
+each.
+
+Group and mailbox extents are provisional through whole-field Complete.
+Malformed candidates retain the existing deterministic raw-item recovery;
+aggregate, job and nesting failures remain distinct terminal errors and
+never enter that recovery. Any late failure retires earlier mailbox and
+closed-group results. Aggregate exhaustion latches across fields without
+stopping the job; a job stop preserves the email budget's prior charges
+without exhausting it. Cached Complete is inert; explicit check_deadline
+remains live and can retire it. This parser grants no SMTP recipient or
+delivery authority.
+
+The wrapper fits 800 bytes in the existing 16 KiB parser reservation,
+replacing standalone list state. Each poll admits at most 161 visits, 196
+aggregate steps and thirteen job records, with no output charge. No token
+text, mailbox list, heap allocation or new scratch is retained. Tests
+compare plain/budgeted events and visits across valid, malformed, long and
+non-ASCII inputs; exhaust both partial aggregate budgets; and pin field
+credit, EOF, prior charges, nesting and late refusal. Probe intervals cover
+long group/name input, routes, comments, malformed recovery and terminal
+refusal in both registered modes. Budgeted address text/normalization,
+property JSON, response-spool publication and complete worker/native/RSS
+qualification remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

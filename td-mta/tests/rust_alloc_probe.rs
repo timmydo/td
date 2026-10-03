@@ -3202,6 +3202,113 @@ fn url_header_values() {
     assert_eq!(before, after, "URLs property assembly allocated");
 }
 
+fn budgeted_header_addresses() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_addresses::{Address, Budgeted, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        "{}: {} <@route:é@例.test>,bad;",
+        "🐈".repeat(4096),
+        "é".repeat(4096)
+    );
+    let nested = format!("a@b,{}", "(".repeat(33));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut limited_budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for (source, parsed, raw, nesting) in [
+        (long.as_bytes(), 1, 1, false),
+        (b"a@b (Name), \"Jo\" <q@[x y]>".as_slice(), 2, 0, false),
+        (b"bad, \"unclosed,tail", 0, 2, false),
+        (b"G:; H:a@b;", 1, 0, false),
+        (nested.as_bytes(), 1, 0, true),
+    ] {
+        let mut cursor = Budgeted::new(black_box(source), &mut work, &mut budget);
+        let mut parsed_count = 0;
+        let mut raw_count = 0;
+        let mut finished = false;
+        for _ in 0..200_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Mailbox(Address::Parsed(_))) => parsed_count += 1,
+                Ok(Status::Mailbox(Address::Raw(_))) => raw_count += 1,
+                Ok(Status::Complete) => {
+                    assert!(!nesting);
+                    cursor.check_deadline(Tick(1)).unwrap();
+                    finished = true;
+                    break;
+                }
+                Err(Error::NestingLimit) => {
+                    assert!(nesting);
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::NestingLimit));
+                    finished = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("unexpected budgeted address failure: {error}"),
+            }
+        }
+        assert!(finished);
+        assert_eq!((parsed_count, raw_count), (parsed, raw));
+    }
+    let mut exhausted = false;
+    for _ in 0..1000 {
+        let mut cursor = Budgeted::new(black_box(long.as_bytes()), &mut work, &mut limited_budget);
+        let mut complete = false;
+        for _ in 0..200_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Complete) => {
+                    complete = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(Error::InterpretationLimit) => {
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::InterpretationLimit));
+                    exhausted = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected aggregate address failure: {error}"),
+            }
+        }
+        assert!(complete || exhausted);
+        if exhausted {
+            break;
+        }
+    }
+    assert!(exhausted);
+    let mut cursor = Budgeted::new(b"a@b", &mut work, &mut limited_budget);
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::InterpretationLimit));
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::InterpretationLimit));
+    let mut no_io = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            records: 100,
+            ..Charge::default()
+        },
+    );
+    let mut cursor = Budgeted::new(b"a@b", &mut no_io, &mut budget);
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::IoBytes)));
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::IoBytes)));
+    let mut cursor = Budgeted::new(b"a@b", &mut work, &mut budget);
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted address parsing allocated");
+}
+
 fn budgeted_header_urls() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -5099,6 +5206,7 @@ fn main() {
         budgeted_date_projection();
         header_dates();
         url_header_values();
+        budgeted_header_addresses();
         budgeted_header_urls();
         message_id_header_values();
         budgeted_message_id_text();
@@ -5231,6 +5339,7 @@ fn main() {
     budgeted_date_projection();
     header_dates();
     url_header_values();
+    budgeted_header_addresses();
     budgeted_header_urls();
     message_id_header_values();
     budgeted_message_id_text();

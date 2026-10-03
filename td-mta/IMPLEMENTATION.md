@@ -1592,6 +1592,12 @@ Initial independently landable increments:
   refusal and allocation-free drains. Other structured forms and unpublished
   response retention remain open.
 
+- **M06bd — budgeted resident address/group parsing:** thread original job
+  and email budgets through boundaries, CFWS, phrase/mailbox/route grammar
+  and raw recovery. Preserve typed resource failure and provisional extents.
+  Pin EOF, private credit, partial cutoffs, late group refusal and fixed-state
+  allocation evidence. Text conversion and property composition remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

@@ -2,6 +2,7 @@
 pub use crate::header_message_ids::Extent;
 use crate::{
     admission::work::{Meter, Stop},
+    decode_work::Work,
     header_message_ids,
     ports::Tick,
 };
@@ -55,10 +56,17 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let result = match self.inner.poll(now, work) {
+        let result = match self.inner.poll_with_work(now, work) {
             Ok(header_message_ids::Status::Yield) => Ok(Status::Yield),
             Ok(header_message_ids::Status::Part(extent)) => Ok(Status::Part(extent)),
             Ok(header_message_ids::Status::Complete) => Ok(Status::Complete),

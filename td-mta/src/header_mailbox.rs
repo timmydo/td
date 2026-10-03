@@ -2,6 +2,7 @@
 pub use crate::header_message_ids::Extent;
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     header_addr_spec, header_cfws, header_delimited, header_message_ids, header_phrase,
     ports::Tick,
 };
@@ -36,6 +37,15 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Work(stop) => Self::Work(stop),
+            DecodeError::InterpretationLimit => Self::InterpretationLimit,
+            DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Name {
@@ -125,6 +135,13 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -139,7 +156,7 @@ impl<'a> Cursor<'a> {
                     ..Charge::default()
                 },
             )
-            .map_err(Error::Work)
+            .map_err(Error::from)
             .and_then(|()| self.step(now, work));
         if let Err(error) = result {
             self.failure = Some(error);
@@ -179,7 +196,7 @@ impl<'a> Cursor<'a> {
             _ => Err(Error::Malformed),
         }
     }
-    fn scan(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
+    fn scan(&mut self, now: Tick, work: &mut impl Work) -> Result<(), Error> {
         if self.position > self.source.len() {
             return Err(Error::InvalidState);
         }
@@ -190,7 +207,7 @@ impl<'a> Cursor<'a> {
                 ..Charge::default()
             },
         )
-        .map_err(Error::Work)?;
+        .map_err(Error::from)?;
         let Some(byte) = self.source.get(self.position).copied() else {
             return self.scan_complete();
         };
@@ -227,12 +244,12 @@ impl<'a> Cursor<'a> {
         self.position = Self::add(self.position, 1)?;
         Ok(())
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         match &mut self.phase {
             Phase::Scan => self.scan(now, work)?,
             Phase::ScanCfws(cursor) => {
                 if let header_cfws::Status::Complete(end) =
-                    cursor.poll(now, work).map_err(Self::cfws)?
+                    cursor.poll_with_work(now, work).map_err(Self::cfws)?
                 {
                     if end.position < self.position {
                         return Err(Error::InvalidState);
@@ -245,12 +262,14 @@ impl<'a> Cursor<'a> {
                 }
             }
             Phase::ScanDelimited(cursor) => {
-                let status = cursor.poll(now, work).map_err(|error| match error {
-                    header_delimited::Error::Malformed => Error::Malformed,
-                    header_delimited::Error::Work(stop) => Error::Work(stop),
-                    header_delimited::Error::InvalidState => Error::InvalidState,
-                    header_delimited::Error::InterpretationLimit => Error::InterpretationLimit,
-                })?;
+                let status = cursor
+                    .poll_with_work(now, work)
+                    .map_err(|error| match error {
+                        header_delimited::Error::Malformed => Error::Malformed,
+                        header_delimited::Error::Work(stop) => Error::Work(stop),
+                        header_delimited::Error::InvalidState => Error::InvalidState,
+                        header_delimited::Error::InterpretationLimit => Error::InterpretationLimit,
+                    })?;
                 if let header_delimited::Status::Complete(extent) = status {
                     self.position = extent.end;
                     self.phase = Phase::Scan;
@@ -258,7 +277,7 @@ impl<'a> Cursor<'a> {
             }
             Phase::Prefix(cursor) => {
                 if let header_cfws::Status::Complete(end) =
-                    cursor.poll(now, work).map_err(Self::cfws)?
+                    cursor.poll_with_work(now, work).map_err(Self::cfws)?
                 {
                     let open = self.open.ok_or(Error::InvalidState)?;
                     if end.position == open {
@@ -273,13 +292,15 @@ impl<'a> Cursor<'a> {
                 }
             }
             Phase::Phrase(cursor) => {
-                let status = cursor.poll(now, work).map_err(|error| match error {
-                    header_phrase::Error::Malformed => Error::Malformed,
-                    header_phrase::Error::NestingLimit => Error::NestingLimit,
-                    header_phrase::Error::Work(stop) => Error::Work(stop),
-                    header_phrase::Error::InvalidState => Error::InvalidState,
-                    header_phrase::Error::InterpretationLimit => Error::InterpretationLimit,
-                })?;
+                let status = cursor
+                    .poll_with_work(now, work)
+                    .map_err(|error| match error {
+                        header_phrase::Error::Malformed => Error::Malformed,
+                        header_phrase::Error::NestingLimit => Error::NestingLimit,
+                        header_phrase::Error::Work(stop) => Error::Work(stop),
+                        header_phrase::Error::InvalidState => Error::InvalidState,
+                        header_phrase::Error::InterpretationLimit => Error::InterpretationLimit,
+                    })?;
                 if matches!(status, header_phrase::Status::Complete(_)) {
                     self.name = Some(Name::Phrase(Extent {
                         start: 0,
@@ -290,7 +311,7 @@ impl<'a> Cursor<'a> {
             }
             Phase::Tail(cursor) => {
                 if let header_cfws::Status::Complete(end) =
-                    cursor.poll(now, work).map_err(Self::cfws)?
+                    cursor.poll_with_work(now, work).map_err(Self::cfws)?
                 {
                     if end.position != self.source.len() {
                         return Err(Error::Malformed);
@@ -305,7 +326,7 @@ impl<'a> Cursor<'a> {
             }
             Phase::RouteCfws(cursor) => {
                 if let header_cfws::Status::Complete(end) =
-                    cursor.poll(now, work).map_err(Self::cfws)?
+                    cursor.poll_with_work(now, work).map_err(Self::cfws)?
                 {
                     self.position = end.position;
                     self.phase = Phase::RouteSyntax;
@@ -330,7 +351,7 @@ impl<'a> Cursor<'a> {
                             ..Charge::default()
                         },
                     )
-                    .map_err(Error::Work)?;
+                    .map_err(Error::from)?;
                     match self
                         .source
                         .get(self.position)
@@ -356,7 +377,7 @@ impl<'a> Cursor<'a> {
                 }
             }
             Phase::RouteDomain(cursor) => {
-                if cursor.poll(now, work)? == header_message_ids::Status::Complete {
+                if cursor.poll_with_work(now, work)? == header_message_ids::Status::Complete {
                     let length = cursor.route_domain_end().ok_or(Error::InvalidState)?;
                     self.position = Self::add(self.position, length)?;
                     self.route_seen = true;
@@ -365,13 +386,15 @@ impl<'a> Cursor<'a> {
                 }
             }
             Phase::Address(cursor) => {
-                let status = cursor.poll(now, work).map_err(|error| match error {
-                    header_addr_spec::Error::Malformed => Error::Malformed,
-                    header_addr_spec::Error::NestingLimit => Error::NestingLimit,
-                    header_addr_spec::Error::Work(stop) => Error::Work(stop),
-                    header_addr_spec::Error::InvalidState => Error::InvalidState,
-                    header_addr_spec::Error::InterpretationLimit => Error::InterpretationLimit,
-                })?;
+                let status = cursor
+                    .poll_with_work(now, work)
+                    .map_err(|error| match error {
+                        header_addr_spec::Error::Malformed => Error::Malformed,
+                        header_addr_spec::Error::NestingLimit => Error::NestingLimit,
+                        header_addr_spec::Error::Work(stop) => Error::Work(stop),
+                        header_addr_spec::Error::InvalidState => Error::InvalidState,
+                        header_addr_spec::Error::InterpretationLimit => Error::InterpretationLimit,
+                    })?;
                 match status {
                     header_addr_spec::Status::Part(extent) => self.address_end = extent.end,
                     header_addr_spec::Status::Complete => {
@@ -387,7 +410,7 @@ impl<'a> Cursor<'a> {
                     header_addr_spec::Status::Yield => {}
                 }
             }
-            Phase::Comment(cursor) => match cursor.poll(now, work).map_err(Self::cfws)? {
+            Phase::Comment(cursor) => match cursor.poll_with_work(now, work).map_err(Self::cfws)? {
                 header_cfws::Status::Comment(comment) if self.name.is_none() => {
                     self.name = Some(Name::Comment(Extent {
                         start: Self::add(self.address.start, comment.start)?,

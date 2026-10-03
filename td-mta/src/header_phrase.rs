@@ -4,6 +4,7 @@ pub mod replay;
 pub use crate::header_message_ids::Extent;
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     header_message_ids,
     ports::Tick,
 };
@@ -38,6 +39,15 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Work(stop) => Self::Work(stop),
+            DecodeError::InterpretationLimit => Self::InterpretationLimit,
+            DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     Atom,
@@ -107,6 +117,13 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -119,8 +136,8 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
-        match self.inner.poll(now, work)? {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
+        match self.inner.poll_with_work(now, work)? {
             header_message_ids::Status::Yield => Ok(Status::Yield),
             header_message_ids::Status::Complete => {
                 if self.end > self.source.len() {
@@ -141,7 +158,7 @@ impl<'a> Cursor<'a> {
                         ..Charge::default()
                     },
                 )
-                .map_err(Error::Work)?;
+                .map_err(Error::from)?;
                 let kind = match self
                     .source
                     .get(text.start)
