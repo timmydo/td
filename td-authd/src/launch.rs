@@ -227,6 +227,7 @@ fn terminal_command(
 ) -> std::io::Result<Command> {
     if let Some(program) = terminal.desktop_program() {
         let mut command = Command::new(program);
+        command.args(terminal.desktop_arguments());
         command.env(
             "WAYLAND_DISPLAY",
             format!("/run/td-compositor/{uid}/wayland-0"),
@@ -262,38 +263,24 @@ fn terminal_command(
         }
         Program::Home | Program::Task => {}
         // Desktop programs returned above; listed so a new kind is a decision.
-        Program::TaskManager | Program::Editor | Program::Photo => {}
+        Program::TaskManager | Program::Editor | Program::Photo | Program::Review => {}
     }
     Ok(command)
 }
 
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
+    const USAGE: &str = "terminal-exec requires UID GENERATION HANDLE \
+                         [task|codex|claude|taskmgr|editor|photo|review]";
     let (uid, generation, handle, terminal) = match arguments {
-        [uid, generation, handle] => (uid, generation, handle, Program::Home),
-        [uid, generation, handle, task] if task == "task" => {
-            (uid, generation, handle, Program::Task)
+        [uid, generation, handle] => (uid, generation, handle, Some(Program::Home)),
+        [uid, generation, handle, literal] => {
+            (uid, generation, handle, Program::from_selection(literal))
         }
-        [uid, generation, handle, agent] if agent == "codex" => {
-            (uid, generation, handle, Program::Codex)
-        }
-        [uid, generation, handle, agent] if agent == "claude" => {
-            (uid, generation, handle, Program::Claude)
-        }
-        [uid, generation, handle, program] if program == "taskmgr" => {
-            (uid, generation, handle, Program::TaskManager)
-        }
-        [uid, generation, handle, program] if program == "editor" => {
-            (uid, generation, handle, Program::Editor)
-        }
-        [uid, generation, handle, program] if program == "photo" => {
-            (uid, generation, handle, Program::Photo)
-        }
-        _ => {
-            return Err("terminal-exec requires UID GENERATION HANDLE \
-                 [task|codex|claude|taskmgr|editor|photo]"
-                .into())
-        }
+        _ => return Err(USAGE.into()),
+    };
+    let Some(terminal) = terminal else {
+        return Err(USAGE.into());
     };
     let uid = number(uid, 1000..=1000)?;
     if generation.len() != 32
@@ -402,6 +389,7 @@ enum Program {
     TaskManager,
     Editor,
     Photo,
+    Review,
 }
 
 impl Program {
@@ -414,7 +402,23 @@ impl Program {
             Self::TaskManager => Some("taskmgr"),
             Self::Editor => Some("editor"),
             Self::Photo => Some("photo"),
+            Self::Review => Some("review"),
         }
+    }
+
+    /// The program `selection` names: its inverse, kept beside it and held
+    /// to it by a round-trip test.
+    fn from_selection(literal: &str) -> Option<Self> {
+        Some(match literal {
+            "task" => Self::Task,
+            "codex" => Self::Codex,
+            "claude" => Self::Claude,
+            "taskmgr" => Self::TaskManager,
+            "editor" => Self::Editor,
+            "photo" => Self::Photo,
+            "review" => Self::Review,
+            _ => return None,
+        })
     }
 
     /// The fixed system program a desktop request execs directly, with no
@@ -424,7 +428,23 @@ impl Program {
             Self::TaskManager => Some("/bin/td-taskmgr"),
             Self::Editor => Some("/bin/td-editor"),
             Self::Photo => Some("/bin/td-photo"),
+            Self::Review => Some("/bin/td-review"),
             Self::Home | Self::Task | Self::Codex | Self::Claude => None,
+        }
+    }
+
+    /// The fixed arguments a desktop program is started with: none, but
+    /// the review window's choice of repository, which it makes itself.
+    fn desktop_arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::Review => &["--choose-repo"],
+            Self::Home
+            | Self::Task
+            | Self::Codex
+            | Self::Claude
+            | Self::TaskManager
+            | Self::Editor
+            | Self::Photo => &[],
         }
     }
 
@@ -432,7 +452,7 @@ impl Program {
     /// dialogs begin. The task manager has no files to open.
     fn starts_in_account_home(self) -> bool {
         match self {
-            Self::Editor | Self::Photo => true,
+            Self::Editor | Self::Photo | Self::Review => true,
             Self::Home | Self::Task | Self::Codex | Self::Claude | Self::TaskManager => false,
         }
     }
@@ -447,6 +467,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [7] => Ok(Request::Start(Program::TaskManager)),
         [8] => Ok(Request::Start(Program::Editor)),
         [9] => Ok(Request::Start(Program::Photo)),
+        [0x0a] => Ok(Request::Start(Program::Review)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);

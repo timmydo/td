@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const CARD_WIDTH: usize = 480;
-const CARD_HEIGHT: usize = 336;
+const CARD_HEIGHT: usize = 378;
 const CARD: [u8; 4] = [0x20, 0x18, 0x28, 0];
 const HIGHLIGHT: [u8; 4] = [0x58, 0x30, 0x70, 0];
 const CARD_PADDING: usize = 24;
@@ -54,6 +54,7 @@ pub enum LaunchRequest {
     TaskManager,
     Editor,
     Photo,
+    Review,
 }
 
 impl LaunchRequest {
@@ -64,6 +65,7 @@ impl LaunchRequest {
             Self::TaskManager => Some(crate::authority::Program::TaskManager),
             Self::Editor => Some(crate::authority::Program::Editor),
             Self::Photo => Some(crate::authority::Program::Photo),
+            Self::Review => Some(crate::authority::Program::Review),
             Self::UiDemo | Self::Terminal | Self::TaskTerminal => None,
         }
     }
@@ -92,7 +94,7 @@ const CLOSE_ENTRY: Entry = Entry {
 
 // The image's desktop programs, each a fixed authority request: shown only
 // when the compositor has that authority, as the task manager is.
-const AUTHORITY_ENTRIES: [Entry; 3] = [
+const AUTHORITY_ENTRIES: &[Entry] = &[
     Entry {
         label: "TASK MANAGER",
         search: "task manager processes cpu memory network disk",
@@ -107,6 +109,11 @@ const AUTHORITY_ENTRIES: [Entry; 3] = [
         label: "PHOTOS",
         search: "photos photo image picture viewer",
         request: Some(LaunchRequest::Photo),
+    },
+    Entry {
+        label: "CODE REVIEW",
+        search: "code review git branch repository land merge",
+        request: Some(LaunchRequest::Review),
     },
 ];
 
@@ -731,7 +738,13 @@ pub(crate) fn launch_command(
     // activates the observed surface through Runtime and must never create a
     // second process over the same persistent profile.
     let (program, published_ready, tracked_ready) = match (request, &options.application) {
-        (LaunchRequest::TaskManager | LaunchRequest::Editor | LaunchRequest::Photo, _) => {
+        (
+            LaunchRequest::TaskManager
+            | LaunchRequest::Editor
+            | LaunchRequest::Photo
+            | LaunchRequest::Review,
+            _,
+        ) => {
             return Err("desktop programs are not configured for this development launcher".into());
         }
         (LaunchRequest::UiDemo, Some(_)) => {
@@ -1097,7 +1110,7 @@ mod tests {
         assert!(final_row <= CARD_HEIGHT);
         for entry in [TERMINAL_ENTRY, CLOSE_ENTRY, DIRECT_UI_ENTRY]
             .into_iter()
-            .chain(AUTHORITY_ENTRIES)
+            .chain(AUTHORITY_ENTRIES.iter().copied())
         {
             assert!(entry.search.is_ascii());
             assert_eq!(entry.search, entry.search.to_ascii_lowercase());
@@ -1433,6 +1446,7 @@ mod authority_entry_tests {
                 "TASK MANAGER",
                 "TEXT EDITOR",
                 "PHOTOS",
+                "CODE REVIEW",
                 "CLOSE LAUNCHER",
             ]
         );
@@ -1440,6 +1454,7 @@ mod authority_entry_tests {
             ("process", "TASK MANAGER", LaunchRequest::TaskManager),
             ("editor", "TEXT EDITOR", LaunchRequest::Editor),
             ("picture", "PHOTOS", LaunchRequest::Photo),
+            ("git", "CODE REVIEW", LaunchRequest::Review),
         ] {
             launcher.apply(LauncherAction::Open);
             for character in word.chars() {
@@ -1473,6 +1488,7 @@ mod authority_entry_tests {
             LaunchRequest::TaskManager,
             LaunchRequest::Editor,
             LaunchRequest::Photo,
+            LaunchRequest::Review,
         ] {
             assert!(launch_command(&options, request, 1).is_err(), "{request:?}");
         }

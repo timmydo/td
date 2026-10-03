@@ -135,6 +135,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[7]).unwrap(), Request::Start(Program::TaskManager));
     assert_eq!(request(&[8]).unwrap(), Request::Start(Program::Editor));
     assert_eq!(request(&[9]).unwrap(), Request::Start(Program::Photo));
+    assert_eq!(request(&[0x0a]).unwrap(), Request::Start(Program::Review));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -150,7 +151,8 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![7, 0],
         vec![8, 0],
         vec![9, 0],
-        vec![10],
+        vec![0x0a, 0],
+        vec![0x0b],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -587,10 +589,37 @@ fn task_manager_has_fixed_unprivileged_exec_and_display_only() {
 }
 
 #[test]
+fn every_selection_literal_names_its_program_back() {
+    for program in [
+        Program::Task,
+        Program::Codex,
+        Program::Claude,
+        Program::TaskManager,
+        Program::Editor,
+        Program::Photo,
+        Program::Review,
+    ] {
+        let literal = program.selection().unwrap();
+        assert_eq!(Program::from_selection(literal), Some(program), "{literal}");
+    }
+    assert_eq!(Program::Home.selection(), None);
+    for literal in ["", "home", "Review", "/bin/td-review", "review "] {
+        assert_eq!(Program::from_selection(literal), None, "{literal:?}");
+    }
+}
+
+#[test]
 fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
-    for (program, selection, binary) in [
-        (Program::Editor, "editor", "/bin/td-editor"),
-        (Program::Photo, "photo", "/bin/td-photo"),
+    let none: &[&str] = &[];
+    for (program, selection, binary, expected) in [
+        (Program::Editor, "editor", "/bin/td-editor", none),
+        (Program::Photo, "photo", "/bin/td-photo", none),
+        (
+            Program::Review,
+            "review",
+            "/bin/td-review",
+            &["--choose-repo"][..],
+        ),
     ] {
         let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, program);
         assert_eq!(wrapper.get_program(), "/bin/td-login");
@@ -608,7 +637,7 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
             let home = format!("/home/{name}");
             assert_eq!(command.get_current_dir(), Some(std::path::Path::new(&home)));
             let arguments: Vec<_> = command.get_args().collect();
-            assert!(arguments.is_empty(), "{binary}: {arguments:?}");
+            assert_eq!(arguments, expected, "{binary}");
             assert_eq!(
                 command.get_envs().collect::<Vec<_>>(),
                 vec![(
@@ -654,6 +683,7 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Claude,
         Program::Editor,
         Program::Photo,
+        Program::Review,
     ] {
         let mut loaded = false;
         let result = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {

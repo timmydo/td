@@ -2485,9 +2485,10 @@ same credential and cgroup checks, it execs only /bin/td-taskmgr with no
 arguments and the fixed human Wayland socket. This ordinary human program
 retains the system PID view and current signal permissions; it gains no
 elevation or authority descriptor. Requests 08 and 09 are the same fixed
-exec of /bin/td-editor or /bin/td-photo with no arguments, started in the
-verified account home. They add no raw syscall, descriptor or credential
-operation.
+exec of /bin/td-editor or /bin/td-photo with no arguments, and request 0a
+of /bin/td-review with the one fixed argument --choose-repo, each started
+in the verified account home. They add no raw syscall, descriptor or
+credential operation.
 Confinement pins the complete startup and launch sources as well as the raw
 channel boundary.
 

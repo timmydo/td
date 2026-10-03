@@ -8243,7 +8243,9 @@ ordinary kernel permission checks. The compositor exposes its Task Manager
 card only in authority mode. This does not add an elevation operation.
 td-editor and td-photo are launched by fixed requests 08 and 09 under the
 same checks, starting in the account home rather than at `/`, each with its
-own card in authority mode. td-review has none: see td-authd/DESIGN.md.
+own card in authority mode; td-review by request 0a, the same way, with
+its fixed `--choose-repo` so the human picks the repository (see
+td-authd/DESIGN.md).
 
 ### L.1 Elevation — consent without a secret
 

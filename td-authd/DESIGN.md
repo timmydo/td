@@ -554,8 +554,9 @@ spawn and shorter than the channel frame deadline. Failure kills and reaps
 the trusted validator and closes the channel. There is no caller-provided
 executable, environment, directory path, account, uid or argument vector. A
 typed program kind selects a fixed executable and, for terminals, either
-the account home or td's fixed task worktree; the editor and photo tool
-start in the account home. All
+the account home or td's fixed task worktree; the editor, photo tool and
+review window start in the account home, and the review window's one
+argument is fixed by the authority. All
 authority-spawned credential-helper children replace stdin, stdout and stderr
 with `/dev/null`, clear the environment, and start from `/`. The task variant's
 eventual td-term child enters only the fixed worktree described below. Replacing
@@ -581,6 +582,7 @@ Subsequent payloads are exact byte records:
 | `07` | `81` plus a process handle for the human task manager |
 | `08` | `81` plus a process handle for the human text editor |
 | `09` | `81` plus a process handle for the human photo tool |
+| `0a` | `81` plus a process handle for the human code review window |
 
 A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
 request, trailing byte, unknown handle, wait error, timeout or transport
@@ -604,8 +606,9 @@ request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|codex|claude|taskmgr|editor|photo]` in a new process group. The
-optional literal selects requests `04` through `09`; it is not a pathname.
+[task|codex|claude|taskmgr|editor|photo|review]` in a new process group.
+The optional literal selects requests `04` through `0a`; it is not a
+pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
 environment is `HOME`, `SHELL`, `USER`, `LOGNAME` from the account and
@@ -632,17 +635,35 @@ account home, derived through the shared primary-account reader as the
 task terminal's worktree is, so its file dialogs begin there rather than
 at `/`. No request carries a path, file or argument.
 
-td-review has no request, deliberately. It needs a git repository, every
-fixed one it could open lies under the human's `src`, which Claude's
-application view can write (§Application filesystem grants), and its git
-honours that repository's configuration (hooks, fsmonitor, ssh command).
-Launched unconfined from a desktop card it would run whatever a jailed
-agent planted there as the human. A request for it needs either a
-repository no application can write or a git invocation that ignores
-repository-configured commands.
+Request `0a` is the same shape for td-review, the one desktop program
+with a fixed argument: it execs `/bin/td-review --choose-repo` from the
+verified account home. Every repository td-review could open lies under
+the human's `src`, which Claude's application view can write
+(§Application filesystem grants), and git honours a repository's own
+configuration (hooks, fsmonitor, ssh command). This document earlier
+gave td-review no request until a repository no application can write,
+or a git invocation that ignores repository-configured commands,
+existed. Neither does; that condition is withdrawn for another: the
+human chooses the repository each time, and nothing else does. The
+request names none, since a fixed one would be opened on every press.
+`--choose-repo` opens a chooser over the repositories td-review's window
+opened before, kept in `~/.config/td-review/repositories`, outside every
+application view, and a folder browser from `~/src` in which Return and
+a double press only enter folders; a repository opens only on
+Ctrl+Return in it or from the saved list. A folder's `git` mark is
+state an application can set, so it never turns a navigation key into a
+git run. The folder chosen must be a work tree's top through its own
+`.git`, so a repository planted above it is not taken for it. Git then
+runs in that repository as under `td-review -C`, and so with the same
+exposure to configuration an application planted in it as a terminal
+start has: the card adds a way to start, not a new way for planted
+configuration to run. It differs from a terminal start in its
+environment, td-login's alone: no ssh agent, `LANG` or
+`XDG_CONFIG_HOME`, and standard streams on `/dev/null`, so a push that
+needs an agent fails from the card where a terminal's may not.
 
-An older authority closes the entire launch channel on an unknown request
-`07` through `09`; its paired compositor then restarts. The image ships
+An authority older than one of requests `07` through `0a` closes the
+entire launch channel on it; its paired compositor then restarts. The image ships
 both peers atomically. The exact new record is additive within TDLA002, without
 negotiation or mixed-version compatibility.
 

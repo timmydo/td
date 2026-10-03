@@ -3893,6 +3893,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::TaskManager) => "TASK MANAGER",
                 Bound::Launch(LaunchRequest::Editor) => "TEXT EDITOR",
                 Bound::Launch(LaunchRequest::Photo) => "PHOTOS",
+                Bound::Launch(LaunchRequest::Review) => "CODE REVIEW",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
             }
