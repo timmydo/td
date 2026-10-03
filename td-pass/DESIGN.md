@@ -27,13 +27,14 @@ newlines. Disable Auto Fill and spelling for vault documents. Standard
 editor navigation, undo/redo, selection, find and keyboard profiles remain
 available. Only titles participate in sidebar search initially.
 
-Unlock explicitly authorizes a bounded notebook browsing session. Entry
-selection and copy do not request repeated token touches. Saving and
-protector changes follow td-secret's fresh-operation authorization contract.
-Switching away from a dirty entry, closing the window or explicitly locking
-asks Save / Discard / Cancel; failed Save keeps the document dirty. Save
-captures an immutable entry revision before authentication and reports
-success only after durable publication. A later edit stays dirty.
+Unlock explicitly authorizes a bounded notebook session for browsing and
+saving, until it locks. Entry selection, copy and Save do not request
+repeated token touches. Protector changes and import follow td-secret's
+fresh-operation authorization contract. Switching away from a dirty
+entry, closing the window or explicitly locking asks Save / Discard /
+Cancel; failed Save keeps the document dirty. Save captures an immutable
+entry revision and reports success only after durable publication. A
+later edit stays dirty.
 
 System lock, suspend, authority loss and session expiry cannot be delayed by
 a dirty-document dialog. They hide the notebook and discard volatile unsaved
@@ -148,17 +149,17 @@ mode.
   says so when it opens, and its keys view says Insert adds a backup;
   Replace on the only key refuses and says to add a backup first.
 - **Keys.** Keys (Ctrl+K) shows the notebook's enrolled keys in place
-  of the panes, naming the one that authorizes saves; the open entry
-  and its unsaved edits stay as they were, a paste asked for a pane is
-  dropped and a drag ends, and putting the view away returns the focus
-  it had, or the one an operation that ended under the view gave. Use for
-  saves (Return) picks another enrolled key for later saves, without a
-  token. Add backup (Insert) enrolls one more backup through the
-  prompt, authorized by the key that authorizes saves. Replace (Delete)
-  revokes the keys marked with Space or Shift and a press, or else the
-  selected one, after a question naming them: every kept key is asked
-  for, and one new key is enrolled, as the primary when a primary is
-  revoked. The window refuses to revoke every key. It names keys by
+  of the panes, naming the one that authorizes adding a key: the key it
+  was unlocked with, or that key's replacement; the open entry and its
+  unsaved edits stay as they were, a paste asked for a pane is dropped
+  and a drag ends, and putting the view away returns the focus it had,
+  or the one an operation that ended under the view gave. Add backup
+  (Insert) enrolls one more backup through the prompt, authorized by
+  that key. Replace (Delete) revokes the keys marked with Space or Shift
+  and a press, or else the selected one, after a question naming them:
+  every kept key is asked for, and one new key is enrolled, as the
+  primary when a primary is revoked. The window refuses to revoke every
+  key. It names keys by
   their place in the list the vault thread last gave it; the thread
   holds their credentials.
 - **Keyboard.** `F1` shows td-ui's key list over the window
@@ -237,9 +238,9 @@ swap question and a waiting prompt as well), selection-only copy and cut,
 paste, creation, rename, delete, a declined prompt, lock during a save
 with its late replies ignored, the rules for a save in flight, a read
 answered after an edit, pastes bound to their place, the dialog's
-placement, the keys view's use, add and replace by key and by pointer,
-the refusal to revoke every key, marks that a held Space does not
-flicker, lock during a key operation, a failure's report kept past the
+placement, the keys view's adding key, add and replace by key and by
+pointer, the refusal to revoke every key, marks that a held Space does
+not flicker, lock during a key operation, a failure's report kept past the
 view, the unsaved edits and focus kept under the view, the lists given
 their keys when the window grows, the key list's order, the pane's
 bezel on every side and its seams with the list and the search field
@@ -280,16 +281,16 @@ lets its vault do, and on td it refuses with td mode's reason. The rest
 run over a test vault, `src/backend/fixture.rs`, which the `test-vault`
 feature mounts in place of the vault thread's td-secret calls and host
 watch, and which no recipe enables: two synthetic entries under one
-primary key whose PIN is 1234, unlocking and saving asking its presence
-and then its PIN in td-secret's words, a journal of what it was asked,
-and one-shot controls that report swap on storage at the first open,
-refuse a save, save the entry elsewhere first so the save is stale, or
-hold a save in flight after its PIN until the window cancels it. Its
+primary key whose PIN is 1234, unlocking asking its presence and then
+its PIN in td-secret's words and a save asking nothing, a journal of
+what it was asked, and one-shot controls that report swap on storage at
+the first open, refuse a save, save the entry elsewhere first so the
+save is stale, or hold a save in flight until the window cancels it. Its
 build gives mode admission a synthetic identity, so it runs on td too.
 Over it they observe unlocking through both prompts, entry selection,
 select all and copy offered as the window's selection, a paste held by
 the compositor and released back to the window, an edit undone, the
-save, authorized through both prompts, carrying exactly the text against
+save, asking nothing under the unlock, carrying exactly the text against
 the revision read, a refused and a stale save, the closing question's
 Save meeting the stale revision and Discard closing, and a lock while a
 save is held asking only to discard, cancelling the save and saving

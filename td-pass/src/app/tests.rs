@@ -82,7 +82,6 @@ fn op_of(out: &[Out]) -> Op {
                 Command::Unlock { op, .. }
                 | Command::Create { op, .. }
                 | Command::Apply { op, .. }
-                | Command::UseKey { op, .. }
                 | Command::AddKey { op }
                 | Command::ReplaceKeys { op, .. }
                 | Command::Export { op, .. }
@@ -151,7 +150,7 @@ fn unlocked(board: &mut Board, entries: Vec<Item>) -> App {
     app
 }
 
-/// The primary, authorizing saves, and one backup.
+/// The primary, which unlocked the notebook, and one backup.
 fn two_keys() -> Keys {
     Keys {
         labels: vec![
@@ -379,18 +378,6 @@ fn lock_during_an_operation_cancels_it_and_ignores_its_late_answers() {
     typed(&mut app, &mut board, "x");
     key(&mut app, &mut board, "C-s");
     let op = op_of(&app.take_out());
-    app.reply(Reply::Ask {
-        op,
-        ask: Ask {
-            operation: "save",
-            role: Role::Primary,
-            key: Some("0a0b0c0d".to_owned()),
-            pin: None,
-        },
-    });
-    // The key is connected; the save waits on the token.
-    key(&mut app, &mut board, "Return");
-    assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Proceed)] if o == op));
     // A dirty entry asks even on lock; a save in flight leaves Discard.
     key(&mut app, &mut board, "C-l");
     let (dialog, _) = app.dialog.as_ref().unwrap();
@@ -404,19 +391,27 @@ fn lock_during_an_operation_cancels_it_and_ignores_its_late_answers() {
         matches!(out[..], [Out::Cancel, Out::Send(Command::Lock)]),
         "{out:?}"
     );
+    // The save's late commit is not taken for the locked notebook's.
     app.reply(Reply::Committed {
         op,
         id: [1; 16],
         revision: Some(2),
     });
+    assert!(app.notebook().is_none());
+    assert!(app.take_out().is_empty());
+    // A key addition locked in flight: its late prompt is declined.
+    let mut app = keys_view(&mut board);
+    key(&mut app, &mut board, "Insert");
+    let op = op_of(&app.take_out());
+    key(&mut app, &mut board, "C-l");
+    let out = app.take_out();
+    assert!(
+        matches!(out[..], [Out::Cancel, Out::Send(Command::Lock)]),
+        "{out:?}"
+    );
     app.reply(Reply::Ask {
         op,
-        ask: Ask {
-            operation: "save",
-            role: Role::Primary,
-            key: None,
-            pin: None,
-        },
+        ask: add_ask(None),
     });
     assert!(app.prompt.is_none());
     assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Decline)] if o == op));
@@ -713,19 +708,15 @@ fn every_phase_paints() {
     key(&mut app, &mut board, "C-n");
     assert!(app.dialog.is_some());
     paint(&mut app, &mut frames);
-    // Saving from the question brings the PIN prompt.
-    key(&mut app, &mut board, "Tab");
-    key(&mut app, &mut board, "Tab");
-    key(&mut app, &mut board, "Return");
+    // Cancelled, then adding a key brings the PIN prompt.
+    key(&mut app, &mut board, "Escape");
+    assert!(app.dialog.is_none());
+    key(&mut app, &mut board, "C-k");
+    key(&mut app, &mut board, "Insert");
     let op = op_of(&app.take_out());
     app.reply(Reply::Ask {
         op,
-        ask: Ask {
-            operation: "save",
-            role: Role::Primary,
-            key: Some("0a0b0c0d".to_owned()),
-            pin: Some(PinUse::Authorize),
-        },
+        ask: add_ask(Some(PinUse::Authorize)),
     });
     typed(&mut app, &mut board, "12");
     paint(&mut app, &mut frames);
@@ -806,6 +797,30 @@ fn discard_leaves_no_edit_on_screen_when_the_next_entry_is_gone() {
     assert!(app.open_tab().is_none());
     assert!(notebook(&app).open.is_none());
     assert_eq!(app.pane.editor().tabs().count(), 0);
+}
+
+/// Unsaved text in the open entry, under the keys view, while a backup
+/// key is added: an operation that waits on a token with text unsaved.
+fn adding(app: &mut App, board: &mut Board) -> Op {
+    key(app, board, "Return");
+    open(app, board, "Down", "body");
+    key(app, board, "Return");
+    typed(app, board, "x");
+    key(app, board, "C-k");
+    key(app, board, "Insert");
+    let out = app.take_out();
+    assert!(matches!(out[..], [Out::Send(Command::AddKey { .. })]));
+    op_of(&out)
+}
+
+/// The add's first presentation.
+fn add_ask(pin: Option<PinUse>) -> Ask {
+    Ask {
+        operation: "authorize adding a key with an enrolled key",
+        role: Role::Primary,
+        key: Some("0a0b0c0d".to_owned()),
+        pin,
+    }
 }
 
 /// An app with entry 1 of two open, its text edited in the pane, and its
@@ -897,15 +912,10 @@ fn save_and_leave_asks_again_about_edits_made_while_saving() {
 fn closing_declines_a_waiting_prompt_and_asks_about_unsaved_text() {
     let mut board = Board::default();
     let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
-    let op = saving(&mut app, &mut board);
+    let op = adding(&mut app, &mut board);
     app.reply(Reply::Ask {
         op,
-        ask: Ask {
-            operation: "save",
-            role: Role::Primary,
-            key: Some("0a0b0c0d".to_owned()),
-            pin: None,
-        },
+        ask: add_ask(None),
     });
     app.input(Input::Close, &mut board);
     assert!(app.prompt.is_none());
@@ -918,21 +928,16 @@ fn closing_declines_a_waiting_prompt_and_asks_about_unsaved_text() {
 fn a_prompt_replaces_a_question_it_would_hide() {
     let mut board = Board::default();
     let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
-    let op = saving(&mut app, &mut board);
+    let op = adding(&mut app, &mut board);
     key(&mut app, &mut board, "C-l");
     assert!(app.dialog.is_some());
     app.reply(Reply::Ask {
         op,
-        ask: Ask {
-            operation: "save",
-            role: Role::Primary,
-            key: Some("0a0b0c0d".to_owned()),
-            pin: Some(PinUse::Authorize),
-        },
+        ask: add_ask(Some(PinUse::Authorize)),
     });
     assert!(app.dialog.is_none());
     assert!(app.prompt.is_some());
-    // The save fails: the lock asked meanwhile is asked again.
+    // The add fails: the lock asked meanwhile is asked again.
     app.reply(Reply::Failed {
         op,
         failure: Failure {
@@ -1076,42 +1081,33 @@ fn search_folds_case_without_copies() {
 }
 
 #[test]
-fn the_keys_view_lists_the_keys_and_use_chooses_the_key_for_saves() {
+fn the_keys_view_lists_the_keys_and_marks_the_one_that_authorizes_adding() {
     let mut board = Board::default();
     let mut app = keys_view(&mut board);
-    // The key already authorizing saves asks nothing.
-    key(&mut app, &mut board, "Return");
-    assert!(app.take_out().is_empty());
+    assert_eq!(notebook(&app).keys.keys.using, Some(0));
+    // Return chooses nothing: a save asks no key.
     key(&mut app, &mut board, "Down");
     key(&mut app, &mut board, "Return");
-    let out = app.take_out();
-    assert!(matches!(
-        out[..],
-        [Out::Send(Command::UseKey { key: 1, .. })]
-    ));
-    let op = op_of(&out);
-    // A key operation in flight holds the next.
-    key(&mut app, &mut board, "Return");
     assert!(app.take_out().is_empty());
-    app.reply(Reply::Keys {
-        op,
-        keys: Keys {
-            using: Some(1),
-            ..two_keys()
-        },
-    });
+    // A key operation in flight holds the next.
+    key(&mut app, &mut board, "Insert");
+    let op = op_of(&app.take_out());
+    key(&mut app, &mut board, "Insert");
+    assert!(app.take_out().is_empty());
+    // The added backup is listed; the unlocking key stays marked.
+    let mut three = two_keys();
+    three.labels.push(label(Role::Backup, "05060708"));
+    app.reply(Reply::Keys { op, keys: three });
     assert!(app.busy.is_none());
-    assert_eq!(notebook(&app).keys.keys.using, Some(1));
-    assert_eq!(
-        app.status,
-        "Saves are now authorized by the backup key 01020304"
-    );
+    assert_eq!(notebook(&app).keys.keys.labels.len(), 3);
+    assert_eq!(notebook(&app).keys.keys.using, Some(0));
+    assert_eq!(app.status, "Added the backup key 05060708");
     // A late or foreign answer changes nothing.
     app.reply(Reply::Keys {
         op,
         keys: two_keys(),
     });
-    assert_eq!(notebook(&app).keys.keys.using, Some(1));
+    assert_eq!(notebook(&app).keys.keys.labels.len(), 3);
     key(&mut app, &mut board, "Escape");
     assert!(!notebook(&app).keys.showing);
     // Back to the field focused before the view.
@@ -1309,21 +1305,11 @@ fn the_strips_buttons_reach_the_keys_view_and_its_actions() {
     click_row(&mut app, &mut board, 0, false);
     assert_eq!(notebook(&app).keys.marked, vec![false, true]);
     // Replace asks about the marked key, not the selected one.
-    click_button(&mut app, &mut board, &layout::KEYS, 3);
+    click_button(&mut app, &mut board, &layout::KEYS, 2);
     assert!(app.dialog.is_some());
     key(&mut app, &mut board, "Escape");
     assert!(app.take_out().is_empty());
-    // Use for saves on the selected primary, which already authorizes.
     click_button(&mut app, &mut board, &layout::KEYS, 1);
-    assert!(app.take_out().is_empty());
-    click_row(&mut app, &mut board, 1, false);
-    click_button(&mut app, &mut board, &layout::KEYS, 1);
-    assert!(matches!(
-        app.take_out()[..],
-        [Out::Send(Command::UseKey { key: 1, .. })]
-    ));
-    app.busy = None;
-    click_button(&mut app, &mut board, &layout::KEYS, 2);
     assert!(matches!(
         app.take_out()[..],
         [Out::Send(Command::AddKey { .. })]
@@ -1384,27 +1370,22 @@ fn every_strip_ends_with_a_quit_that_asks_as_closing_does() {
     assert!(app.quitting());
     // The keys view locks the vault as it quits.
     let mut app = keys_view(&mut board);
-    click_button(&mut app, &mut board, &layout::KEYS, 6);
+    click_button(&mut app, &mut board, &layout::KEYS, 5);
     assert!(app.quitting());
     assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
     // A waiting prompt is declined, and unsaved text asks first, as
     // closing the window does; Quit again asks again.
     let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
-    let op = saving(&mut app, &mut board);
+    let op = adding(&mut app, &mut board);
     app.reply(Reply::Ask {
         op,
-        ask: Ask {
-            operation: "save",
-            role: Role::Primary,
-            key: Some("0a0b0c0d".to_owned()),
-            pin: None,
-        },
+        ask: add_ask(None),
     });
-    click_button(&mut app, &mut board, &layout::NOTEBOOK, 7);
+    click_button(&mut app, &mut board, &layout::KEYS, 5);
     assert!(app.prompt.is_none());
     assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Decline)] if o == op));
     assert_eq!(app.dialog.as_ref().unwrap().1, Some(Then::Quit));
-    click_button(&mut app, &mut board, &layout::NOTEBOOK, 7);
+    click_button(&mut app, &mut board, &layout::KEYS, 5);
     assert_eq!(app.dialog.as_ref().unwrap().1, Some(Then::Quit));
     assert!(!app.quitting());
 }
@@ -1828,7 +1809,7 @@ fn the_strips_lock_is_not_held_back_by_the_finder() {
         false,
     );
     assert!(app.chooser.is_some());
-    click_button(&mut app, &mut board, &layout::KEYS, 5);
+    click_button(&mut app, &mut board, &layout::KEYS, 4);
     assert!(app.chooser.is_none());
     assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
 }

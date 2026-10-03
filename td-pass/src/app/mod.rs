@@ -246,7 +246,6 @@ struct Chooser {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KeyOp {
-    Use,
     Add,
     Replace,
 }
@@ -603,18 +602,12 @@ impl App {
                 .find(|label| !notebook.keys.keys.labels.contains(label))
                 .cloned()
         });
-        let using = keys.using.and_then(|index| keys.labels.get(index)).cloned();
         self.set_keys(keys);
-        self.say(match (what, added, using) {
-            (KeyOp::Use, _, Some(key)) => format!(
-                "Saves are now authorized by the {} key {}",
-                key.role.name(),
-                key.fingerprint
-            ),
-            (KeyOp::Add, Some(key), _) => {
+        self.say(match (what, added) {
+            (KeyOp::Add, Some(key)) => {
                 format!("Added the {} key {}", key.role.name(), key.fingerprint)
             }
-            (KeyOp::Replace, Some(key), _) => format!(
+            (KeyOp::Replace, Some(key)) => format!(
                 "Replaced: the new {} key is {}; revoked keys no longer open the notebook",
                 key.role.name(),
                 key.fingerprint
@@ -623,7 +616,8 @@ impl App {
         });
     }
 
-    /// Shows `keys` in the keys view, selecting the one authorizing saves.
+    /// Shows `keys` in the keys view, selecting the one that authorizes
+    /// adding a key.
     fn set_keys(&mut self, keys: Keys) {
         let surface = self.surface;
         let Some(notebook) = self.notebook() else {
@@ -1660,29 +1654,6 @@ impl App {
             *mark = !*mark;
             self.redraw = true;
         }
-    }
-
-    /// Authorizes later saves with the selected key; no token is asked.
-    fn use_key(&mut self) {
-        if self.busy.is_some() {
-            return self.say("Wait for the current operation to finish");
-        }
-        let Some(key) = self.selected_key() else {
-            return self.say("Choose a key to authorize saves with");
-        };
-        let using = self
-            .notebook()
-            .and_then(|notebook| notebook.keys.keys.using);
-        if using == Some(key) {
-            return self.say("That key already authorizes saves");
-        }
-        let op = self.op();
-        self.out.push(Out::Send(Command::UseKey { op, key }));
-        self.busy = Some(Busy::Keys {
-            op,
-            what: KeyOp::Use,
-        });
-        self.say("Choosing the key that authorizes saves");
     }
 
     fn add_key(&mut self) {

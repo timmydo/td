@@ -469,7 +469,18 @@ impl LockedVault {
             .iter()
             .find(|s| s.credential == credential)
             .ok_or("portable credential is not enrolled")?;
-        let master = slot.unwrap(&self.id, secret)?;
+        self.open_body(slot.unwrap(&self.id, secret)?)
+    }
+
+    /// Opens a revision of the session's own vault with the session's vault
+    /// key, proving a save's proposal before publication without a token.
+    /// The slots are not unwrapped: a revision copies them unchanged, and
+    /// the body tag authenticates them.
+    pub fn reopen(&self, session: &OpenVault) -> Result<OpenVault> {
+        self.open_body(Secret32(session.master.0))
+    }
+
+    fn open_body(&self, master: Secret32) -> Result<OpenVault> {
         let key = Secret32(crypto::hkdf(&master.0, &self.id, BODY));
         let mut aad = BODY.to_vec();
         aad.extend_from_slice(
@@ -1228,6 +1239,38 @@ mod tests {
             .revise(&opened, &changed, &mut Cursor::new(Vec::<u8>::new()))
             .is_err());
         assert_eq!(old.bytes(), original);
+    }
+
+    #[test]
+    fn a_revision_reopens_only_under_its_own_session_key() {
+        let old = fixture();
+        let opened = old.open(b"primary", &Secret32([0x11; 32])).unwrap();
+        let mut changed = notebook();
+        changed.entries[0].replace_text("Bank".into(), b"new".to_vec());
+        let revised = old.revise(&opened, &changed, &mut random()).unwrap();
+        let reopened = revised.reopen(&opened).unwrap();
+        assert!(reopened.same_key(&opened));
+        assert_eq!(reopened.notebook.entries[0].body(), b"new");
+        // The reopening is of the revised bytes, so it revises them next.
+        assert!(revised.revise(&reopened, &changed, &mut random()).is_ok());
+        // A flipped byte in a slot's wrapped key, which decoding does not
+        // authenticate: the body tag covers the whole table.
+        let slot_size = 1 + 2 + b"backup".len() + KEY_BYTES + 32 + 12 + 48;
+        let mut slot = revised.bytes().to_vec();
+        slot[49 + slot_size - 1] ^= 1;
+        let slot = LockedVault::decode(&slot).unwrap();
+        assert!(slot.reopen(&opened).is_err());
+        // Another vault's key, and a flipped body byte, are refused.
+        let mut other_entropy = random();
+        other_entropy.set_position(10);
+        let other = LockedVault::create(&notebook(), &protectors(), &mut other_entropy).unwrap();
+        let foreign = other.open(b"primary", &Secret32([0x11; 32])).unwrap();
+        assert!(revised.reopen(&foreign).is_err());
+        let mut flipped = revised.bytes().to_vec();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 1;
+        let flipped = LockedVault::decode(&flipped).unwrap();
+        assert!(flipped.reopen(&opened).is_err());
     }
 
     #[test]

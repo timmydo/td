@@ -11,9 +11,8 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 pub const NOTEBOOK: [&str; 8] = [
     "New", "Rename", "Delete", "Save", "Find", "Keys", "Lock", "Quit",
 ];
-pub const KEYS: [&str; 7] = [
+pub const KEYS: [&str; 6] = [
     "Notebook",
-    "Use for saves",
     "Add backup",
     "Replace",
     "Export",

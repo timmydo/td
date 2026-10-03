@@ -61,10 +61,15 @@ explicit cancellation and no automatic retry after an uncertain result.
 On td, the dedicated backend identity, exclusive token mediation and trusted
 compositor/td-authd presentation enforce authorization. Authentication input
 does not go through the notebook text editor. An explicitly authorized
-notebook browsing session permits list/read to its pinned application
-instance; it grants no other application personal-vault access. Writes and
-protector changes require fresh authentication bound to the exact immutable
-operation, independently of an existing browsing session.
+notebook session permits list, read and entry writes to its pinned
+application instance until it locks; it grants no other application
+personal-vault access. That one unlock is the consent for the session's
+saves: a save presents no token, so anything able to drive the unlocked
+notebook can change or delete its entries, which earlier revisions and
+exports still hold. Protector changes and import require fresh
+authentication bound to the exact immutable operation, independently of
+the session, because a key enrolled through a reachable session would
+keep reading every later revision after the lock.
 
 Standalone mode trusts the host kernel, compositor and invoking account. Its
 authentication adapter must identify its own prompt as host authentication;
@@ -864,11 +869,11 @@ Every client-data hash is SHA-256 over `td-secret/portable/operation/v1`
 and a zero byte, the purpose and phase bytes, a u32-length-prefixed
 operation binding, and 32 fresh bytes. Creation, proof, repeat and
 authorization phases are distinct. Bindings after creation start with the
-vault ID and baseline revision. Saves add the digest of the exact proposed
-envelope, binding consent to that ciphertext. Replacement adds an
-order-independent digest of the revoked credential set. Adding a key binds
-only the vault and revision, since the new key does not exist when the
-existing key authorizes it.
+vault ID and baseline revision. A save has no client-data hash: it
+presents no token. Purpose byte 4, a save's former authorization, is
+not reused. Replacement adds an order-independent digest of the revoked
+credential set. Adding a key binds only the vault and revision, since
+the new key does not exist when the existing key authorizes it.
 
 Each newly enrolled key is created and proved in one transaction, then
 asserted again on a new channel. The repeat must recover the identical
@@ -886,9 +891,9 @@ hint, and requires an assertion that opens the whole envelope. The caller
 chooses which enrolled key to present; this increment does not probe a
 token for its credentials, so a different token is refused only after its
 PIN. A session holds the authenticated baseline, the opened vault key and
-notebook, the identity of the directory it was opened from, its authorizing
-key and the verified counters observed during the session. The caller may
-switch the authorizing key to another enrolled key. Counters are not
+notebook, the identity of the directory it was opened from, the key that
+unlocked it, which authorizes adding a key, and the verified counters
+observed during the session. Counters are not
 persisted, so they detect only regression within a session, not across
 restarts or copies. An operation checks its counters as it goes and
 records them only after it commits.
@@ -908,13 +913,15 @@ tool's rename leaves them, are accepted. The write publishes against that
 snapshot, so the store's baseline check refuses a change made while a
 token is being presented.
 
-A save revises first, then requires a fresh assertion from the session key
-bound to that proposal. The assertion must unwrap the session's vault key
-and the proposal must open to it before publication. A refusal leaves the
-vault and the session's contents unchanged, and the session's next write
-takes a new snapshot. An uncertain publication is reported as such: if the
-new bytes were committed, every later write is refused until lock and
-unlock; if not, the session continues.
+A save revises with the session's vault key, presents no token, and
+proves its proposal by opening it with that same key before publication:
+the revision copies every slot unchanged and the body tag authenticates
+the whole table. The owner's lock is checked once more before
+publication. A refusal leaves the vault and the session's contents
+unchanged, and the session's next write takes a new snapshot. An
+uncertain publication is reported as such: if the new bytes were
+committed, every later write is refused until lock and unlock; if not,
+the session continues.
 
 Adding a key is refused at eight keys before any token. The session key
 authorizes it, the new key is enrolled with every existing credential
@@ -951,12 +958,14 @@ real P-256 public keys and per-credential secrets. They cover:
 
 - the operator presenting the wrong token or the same token twice;
 - mismatched repeat secrets during creation, key addition and replacement;
-- stalled counters during creation and on a later write;
-- token refusal and unavailability on unlock, save and creation;
+- stalled counters during creation and on a later key addition;
+- token refusal and unavailability on unlock and creation;
+- saves that present no token, each sealed afresh, and the adding key
+  being the one that unlocked;
 - writes from a stale session and to another location holding the same
   vault, refused before any token;
-- a vault replaced, or a store locked, while a token is presented, refused
-  at publication, followed by a successful write;
+- a vault replaced, or a store locked, while a key addition's token is
+  presented, refused at publication, followed by a successful save;
 - the eight-key limit and invalid revocation sets;
 - revocation of the primary, of the session key, and of a stolen key
   together with the key its thief added;
@@ -986,10 +995,10 @@ it on drop as an accepted one clears its entry.
 Create draws a fresh random 16-byte ID and starts at entry revision one.
 Edit and rename advance the revision by exactly one; rename keeps the body.
 Delete removes the entry. Each accepted change builds the complete next
-notebook and runs one save, so it receives fresh authorization bound to the
-exact proposed ciphertext. A refused or failed save leaves the session's
-entry at its base revision with its old contents. Committed changes report
-the entry ID and its new revision, or none after deletion. The API never
+notebook and runs one save under the session's unlock, presenting no
+token. A refused or failed save leaves the session's entry at its base
+revision with its old contents. Committed changes report the entry ID
+and its new revision, or none after deletion. The API never
 writes plaintext outside the session; body bytes are UTF-8 and stored
 exactly.
 
@@ -1011,10 +1020,11 @@ or merge.
 
 Tests cover each entry operation and read the final notebook through the
 other key after unlock. They cover every typed refusal for each change kind
-before any token, a refused save keeping the base entry, and both notebook
-bounds, reached by creation, edit and rename. Export is refused after an
-uncertain publication. Import tests refuse an unenrolled key and an
-undecodable copy before any token, and refuse a tampered body or a
+before any token, that no change presents one, a save refused by a lock
+keeping the base entry, and both notebook bounds, reached by creation,
+edit and rename. Export is refused after an uncertain publication.
+Import tests refuse an unenrolled key and an undecodable copy before
+any token, and refuse a tampered body or a
 tampered slot salt, and a wrongly presented token, without writing. A
 fresh-location restore with only the backup is followed by replacement
 of the lost primary. Store tests cover adoption into an absent baseline
@@ -1039,11 +1049,12 @@ notebook process composes them with its own host-authentication prompt.
   and returns a `SwapRisk` naming every such device. The window explains
   that risk and how to avoid it, and opens only if the person accepts
   it, Cancel being the default; the acceptance covers those devices for
-  that process alone and is never stored. Opening a token requires the
-  evidence protection returns and rechecks the core limit and swap
-  first, refusing a storage device that was not accepted, since the
-  notebook process is long-lived. Swap enabled while a vault key is
-  already held is not detected until the next presentation.
+  that process alone and is never stored. Opening a token, and a save,
+  which opens none, require the evidence protection returns and recheck
+  the core limit and swap first, refusing a storage device that was not
+  accepted, since the notebook process is long-lived. Swap enabled while
+  a vault key is already held is not detected until the next
+  presentation or save.
 - **Location.** The vault directory is `$XDG_DATA_HOME/td-pass`, or
   `$HOME/.local/share/td-pass` when that variable is unset, empty or
   relative, as the XDG base directory specification requires. The adapter
@@ -1138,8 +1149,9 @@ both.
   one that reaches the extra byte.
 - **Vault.** An unlocked `Vault` lends entry summaries and entries (the
   title and the stored body bytes), names its revision, its keys and the
-  key authorizing its saves, switches that key with `use_key`, and
-  exports its authenticated ciphertext. Dropping it is the lock.
+  key that unlocked it, which authorizes adding a key, and exports its
+  authenticated ciphertext. Dropping it is the lock. `Host::apply` saves
+  a change under that unlock and takes no `Prompt`.
 - **Changes.** `Change` carries owned text and clears it on drop,
   whether it is applied, refused or never sent; applying moves the text
   into the entry API's clearing owners.
@@ -1159,12 +1171,14 @@ both.
   including its startup, which reports cancellation, not a missing key;
   a presentation not yet asked for; and a publication not yet begun. The
   lifecycle checks the token adapter's revocation once more after the
-  last token exchange, before every publication, so a save, key change,
-  creation or import cancelled then publishes nothing. A revocation
-  after that check cannot stop the publication already begun, which then
-  reports its result; a creation or import that returns its `Vault` so
-  is the caller's to drop when it has locked. An unlock cancelled before
-  it returns drops the session. A presentation or startup the cancel
+  last token exchange, before every publication, so a key change,
+  creation or import cancelled then publishes nothing; a save, which
+  has no token exchange, checks the `Cancel` itself before publishing.
+  A revocation after that check cannot stop the publication already
+  begun, which then reports its result; a creation or import that
+  returns its `Vault` so is the caller's to drop when it has locked. An
+  unlock cancelled before it returns drops the session. A presentation
+  or startup the cancel
   interrupts reports cancellation, whatever startup then failed with. A
   `Cancel` stays cancelled, so each cancellable operation takes a fresh
   one.
@@ -1181,8 +1195,9 @@ detail is not shown, and each failure predicate. They also cover the
 fingerprint, a presentation's request, the refusal of an undecodable
 copy, the worker's argument vector, the change conversion and the
 library's public surface. The lifecycle's tests add a revocation after
-the last token exchange: the token is asked, and neither a save nor a
-creation publishes. The operations themselves are the lifecycle's,
+the last token exchange: the token is asked, and neither a key change
+nor a creation publishes; a save under a revocation asks no token and
+does not publish. The operations themselves are the lifecycle's,
 tested above with synthetic tokens. Their production adapter path, from
 `present` to a real token, remains hardware evidence.
 

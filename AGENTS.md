@@ -228,9 +228,12 @@ paragraph is a target contract rather than a whole-image completeness claim.
    Elevation is one named operation with typed, descriptor-pinned arguments
    and one consent bound to that request, never a shell, account password,
    remembered approval, or grace window. Sensitive protector changes require
-   fresh hardware-backed authentication. The compositor must provide a secure
-   attention and trusted-input path before this ships. Other secrets require
-   a second recovery token or an explicit unrecoverability decision.
+   fresh hardware-backed authentication. An unlocked personal notebook
+   (`td-secret/PORTABLE.md`) is not elevation: its unlock authorizes its own
+   entry writes until it locks, and no protector change or import. The
+   compositor must provide a secure attention and trusted-input path before
+   this ships. Other secrets require a second recovery token or an explicit
+   unrecoverability decision.
 
 Principle 7 is a target, not a current claim. The stock VM writes empty
 shadow fields for `root` and `tester`, auto-logs in, and retains `su` as an

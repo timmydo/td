@@ -25,6 +25,15 @@ pub(super) struct Protected {
     accepted: Vec<String>,
 }
 
+impl Protected {
+    /// Rechecks what `protect` admitted, before each presentation and each
+    /// save: the notebook process is long-lived.
+    pub(super) fn recheck(&self) -> Result<(), &'static str> {
+        memory(&self.accepted)
+            .map_err(|_| "swap the account did not accept, or core dumps, became enabled")
+    }
+}
+
 /// Why `protect` refused.
 pub(super) enum Refusal {
     /// Active swap that can put memory on storage, every such device by
@@ -372,9 +381,7 @@ pub(super) fn open(
     _presented: Presented<'_>,
     cancellation: &Cancellation,
 ) -> Result<Session, TokenError> {
-    memory(&protected.accepted).map_err(|_| {
-        TokenError::Host("swap the account did not accept, or core dumps, became enabled")
-    })?;
+    protected.recheck().map_err(TokenError::Host)?;
     let found = Device::discover_desktop()
         .map_err(|_| TokenError::Host("this process is not an ordinary desktop account"))?;
     let device = choose(&found)?;

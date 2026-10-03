@@ -748,20 +748,6 @@ mod fixture {
             self.after("unlocked", unlocked + 1);
         }
 
-        /// Return at a save's presence prompt, then its PIN. Return in the
-        /// pane is an edit, so each waits for its prompt to show.
-        fn authorize_save(&mut self) {
-            let asked = self.count("ask save None");
-            let pins = self.count("ask save Some(Authorize)");
-            self.after("ask save None", asked + 1);
-            self.tap(KEY_ENTER);
-            self.after("ask save Some(Authorize)", pins + 1);
-            for key in [KEY_1, KEY_2, KEY_3, KEY_4] {
-                self.tap(key);
-            }
-            self.tap(KEY_ENTER);
-        }
-
         /// Every distinct frame the window holds over a second and a
         /// half, so a blinking caret's frames are all among them.
         fn sampled(&self) -> BTreeSet<Vec<u8>> {
@@ -865,9 +851,18 @@ mod fixture {
                 .count()
         };
         assert_eq!(edits(), 0);
+        // The unlock authorized the session: the save asks nothing.
         case.ctrl(KEY_S);
-        case.authorize_save();
         case.after("committed 1 Some(2)", 1);
+        let lines = case.lines();
+        let unlocked = lines.iter().rposition(|l| l == "unlocked").unwrap();
+        let after = lines.get(unlocked..).unwrap();
+        let committed = after
+            .iter()
+            .position(|l| l == "committed 1 Some(2)")
+            .unwrap();
+        let asked = after.get(..committed).unwrap();
+        assert!(!asked.iter().any(|l| l.starts_with("ask ")), "{lines:?}");
         let saved: Vec<String> = case
             .lines()
             .into_iter()
@@ -963,7 +958,6 @@ mod fixture {
         case.tap(KEY_X);
         case.control("hold");
         case.ctrl(KEY_S);
-        case.authorize_save();
         case.after("held", 1);
 
         // The lock's question opens as Ctrl+L is read, so the keys after

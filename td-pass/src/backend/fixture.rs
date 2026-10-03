@@ -8,9 +8,9 @@
 //! answers the first open with swap on storage the window must accept,
 //! `fail` refuses the next save, `elsewhere` saves the entry from another
 //! device first, so the next save is stale, and `hold` keeps the next
-//! save in flight after its PIN, as a token at work would, until the
-//! window cancels it. Unlocking and saving ask the key's presence and
-//! then its PIN, with td-secret's words for each.
+//! save in flight, as a slow publication would, until the window cancels
+//! it. Unlocking asks the key's presence and then its PIN, with
+//! td-secret's words; a save asks nothing, as td-secret's does.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,9 +26,8 @@ use crate::protocol::{
 /// Where the case's journal and controls are.
 const DIRECTORY: &str = "TD_PASS_TEST_VAULT";
 
-/// td-secret's names for the operations the test vault authorizes.
-const UNLOCK: &str = "unlock the portable vault for browsing";
-const SAVE: &str = "save a new portable vault revision";
+/// td-secret's name for the one operation the test vault authorizes.
+const UNLOCK: &str = "unlock the portable vault for browsing and saving";
 
 /// How long a held save waits for the window before failing.
 const HOLD: Duration = Duration::from_secs(10);
@@ -137,7 +136,6 @@ pub(super) fn serve(
             Command::Apply { op, .. } => closed(op),
             Command::Create { op, .. }
             | Command::Unlock { op, .. }
-            | Command::UseKey { op, .. }
             | Command::AddKey { op }
             | Command::ReplaceKeys { op, .. }
             | Command::Export { op, .. }
@@ -211,10 +209,9 @@ impl Vault<'_> {
         }
     }
 
-    /// Saves `change` against the revision it names: the case's controls,
-    /// then the stale check td-secret makes before any token, then the
-    /// key's authorization: the entry and its new revision, `None` once
-    /// deleted.
+    /// Saves `change` against the revision it names, under the unlock: the
+    /// case's controls, then td-secret's stale check: the entry and its
+    /// new revision, `None` once deleted.
     fn apply(
         &self,
         op: Op,
@@ -277,7 +274,6 @@ impl Vault<'_> {
                 });
             }
         }
-        self.authorize(op, "save", SAVE)?;
         if self.take("hold") {
             self.note("held");
             self.hold(op)?;

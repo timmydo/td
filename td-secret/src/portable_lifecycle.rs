@@ -24,7 +24,7 @@ pub(super) enum Purpose {
     CreatePrimary = 1,
     CreateBackup = 2,
     Unlock = 3,
-    Save = 4,
+    // 4 was a save's authorization; an unlocked session now saves.
     AuthorizeAddKey = 5,
     AddKey = 6,
     AuthorizeReplaceKey = 7,
@@ -37,8 +37,7 @@ impl Purpose {
         match self {
             Self::CreatePrimary => "create a portable vault: enroll the primary key",
             Self::CreateBackup => "create a portable vault: enroll the separate backup key",
-            Self::Unlock => "unlock the portable vault for browsing",
-            Self::Save => "save a new portable vault revision",
+            Self::Unlock => "unlock the portable vault for browsing and saving",
             Self::AuthorizeAddKey => "authorize adding a key with an enrolled key",
             Self::AddKey => "enroll the added key",
             Self::AuthorizeReplaceKey => "authorize key replacement with a retained key",
@@ -159,11 +158,15 @@ pub(super) trait Tokens {
 
 fn check_revoked(tokens: &(impl Tokens + ?Sized)) -> Result<(), Error> {
     if tokens.revoked() {
-        return Err(Error::Token(TokenError::Failed(
-            transaction::Error::Interrupted(crate::fido_device::Interruption::Cancelled),
-        )));
+        return Err(cancelled());
     }
     Ok(())
+}
+
+fn cancelled() -> Error {
+    Error::Token(TokenError::Failed(transaction::Error::Interrupted(
+        crate::fido_device::Interruption::Cancelled,
+    )))
 }
 
 /// The production adapter over the owned transaction runner.
@@ -547,7 +550,8 @@ fn publish(
     })
 }
 
-/// Authenticates one enrolled key against the committed vault for browsing.
+/// Authenticates one enrolled key against the committed vault for browsing
+/// and saving.
 pub(super) fn unlock(
     directory: &Directory,
     credential: &[u8],
@@ -673,17 +677,10 @@ impl Session {
         self.baseline.unlock_hints().map(key_info).collect()
     }
 
-    /// The enrolled key that authorizes this session's writes.
+    /// The enrolled key that unlocked this session, which authorizes adding
+    /// a key; a replacement takes over when it is revoked.
     pub fn credential(&self) -> &[u8] {
         &self.credential
-    }
-
-    pub fn use_key(&mut self, credential: &[u8]) -> Result<(), Error> {
-        self.baseline
-            .unlock_hint(credential)
-            .map_err(|_| Error::State("that key is not enrolled in this vault"))?;
-        self.credential = credential.to_vec();
-        Ok(())
     }
 
     // Refuses a counter that regressed against this session's observations.
@@ -802,31 +799,29 @@ impl Session {
         Ok(())
     }
 
-    /// Publishes `notebook` as the next revision after fresh authorization
-    /// bound to the exact proposed ciphertext.
+    /// Publishes `notebook` as the next revision under the unlock that
+    /// opened this session; no token is presented. `revoked` is the
+    /// owner's lock, checked once more before publication.
     pub fn save(
         &mut self,
         directory: &Directory,
         notebook: &Notebook,
-        tokens: &mut impl Tokens,
+        revoked: &dyn Fn() -> bool,
         random: &mut impl Read,
     ) -> Result<(), Error> {
+        if revoked() {
+            return Err(cancelled());
+        }
         let snapshot = self.current(directory)?;
         let proposed = self
             .baseline
             .revise(&self.opened, notebook, random)
             .map_err(Error::Refused)?;
-        let credential = self.credential.clone();
-        let detail = crypto::digest(proposed.bytes());
-        let (key, counter) = self.authorize(Purpose::Save, &credential, &detail, tokens, random)?;
-        let opened = prove_all(&proposed, std::slice::from_ref(&key), None)?;
-        if !opened.same_key(&self.opened) {
-            return Err(Error::Refused("portable revision changed its key".into()));
+        let opened = proposed.reopen(&self.opened).map_err(Error::Refused)?;
+        if revoked() {
+            return Err(cancelled());
         }
-        check_revoked(&*tokens)?;
-        self.commit(directory, snapshot, proposed, opened, random)?;
-        self.record(vec![(credential, counter)]);
-        Ok(())
+        self.commit(directory, snapshot, proposed, opened, random)
     }
 
     /// Adds a backup after authorization by the session key, then proves
@@ -1373,22 +1368,24 @@ pub(in crate::portable) mod tests {
     }
 
     #[test]
-    fn saves_publish_fresh_bound_revisions_that_every_key_opens() {
+    fn saves_publish_revisions_under_the_unlock_that_every_key_opens() {
         let place = Place::new();
         let mut bench = Bench::new(2);
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
+        let calls = bench.calls.len();
+        let mut sealed = Vec::new();
         for (revision, body) in [(2, b"first".as_slice()), (3, b"second")] {
-            bench.present(&[1]);
             session
-                .save(&place.1, &entry("Bank", body), &mut bench, &mut random)
+                .save(&place.1, &entry("Bank", body), &|| false, &mut random)
                 .unwrap();
             assert_eq!(session.revision(), revision);
             assert_eq!(session.notebook().entries[0].body(), body);
-            assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::Save)));
+            sealed.push(place.bytes().unwrap());
         }
-        let saves = &bench.challenges[bench.challenges.len() - 2..];
-        assert_ne!(saves[0], saves[1]);
+        // No token is asked, and each revision is sealed afresh.
+        assert_eq!(bench.calls.len(), calls);
+        assert_ne!(sealed[0], sealed[1]);
         drop(session);
         for token in [0, 1] {
             let session = unlocked(&place, &mut bench, token);
@@ -1410,12 +1407,21 @@ pub(in crate::portable) mod tests {
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
         let stored = place.bytes().unwrap();
-        bench.present(&[1]);
-        bench.revoked = true;
-        let refused = session.save(&place.1, &entry("Bank", b"late"), &mut bench, &mut random);
+        let calls = bench.calls.len();
+        // A lock before a save starts, and one that comes while it
+        // revises: neither publishes, and no token is asked.
+        let refused = session.save(&place.1, &entry("Bank", b"early"), &|| true, &mut random);
         assert_eq!(refused, Err(cancelled()));
-        // The token was asked; only publication was stopped.
-        assert_eq!(bench.calls.last(), Some(&Call::Assert(Purpose::Save)));
+        let asked = std::cell::Cell::new(0);
+        let late = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        let refused = session.save(&place.1, &entry("Bank", b"late"), &late, &mut random);
+        assert_eq!(refused, Err(cancelled()));
+        assert_eq!(asked.get(), 2);
+        assert_eq!(bench.calls.len(), calls);
+        bench.revoked = true;
         bench.present(&[1, 2, 2]);
         assert_eq!(
             session.add_key(&place.1, &mut bench, &mut random),
@@ -1435,9 +1441,8 @@ pub(in crate::portable) mod tests {
         // The session is unchanged and still saves once nothing revokes.
         bench.revoked = false;
         assert_eq!(session.revision(), 1);
-        bench.present(&[1]);
         session
-            .save(&place.1, &entry("Bank", b"kept"), &mut bench, &mut random)
+            .save(&place.1, &entry("Bank", b"kept"), &|| false, &mut random)
             .unwrap();
         assert_eq!(unlocked(&place, &mut bench, 0).revision(), 2);
         let exported = session.ciphertext().unwrap().to_vec();
@@ -1466,41 +1471,6 @@ pub(in crate::portable) mod tests {
     }
 
     #[test]
-    fn refused_save_authorization_preserves_the_vault_and_session() {
-        let place = Place::new();
-        let mut bench = Bench::new(2);
-        let mut random = Random(0);
-        let mut session = created(&place, &mut bench, &mut random);
-        let before = place.bytes();
-        for (order, failure) in [
-            (
-                [1],
-                Some(TokenError::Failed(transaction::Error::Status(
-                    Status::PinInvalid,
-                ))),
-            ),
-            ([1], Some(TokenError::Unavailable)),
-            ([0], None),
-        ] {
-            bench.present(&order);
-            if let Some(failure) = failure {
-                bench.fail = Some((bench.calls.len(), failure));
-            }
-            assert!(matches!(
-                session.save(&place.1, &entry("A", b"x"), &mut bench, &mut random),
-                Err(Error::Token(_))
-            ));
-            assert_eq!(place.bytes(), before);
-            assert_eq!(session.revision(), 1);
-        }
-        bench.present(&[1]);
-        session
-            .save(&place.1, &entry("A", b"x"), &mut bench, &mut random)
-            .unwrap();
-        assert_eq!(session.revision(), 2);
-    }
-
-    #[test]
     fn writes_from_a_stale_session_are_refused_before_any_token() {
         let place = Place::new();
         let mut bench = Bench::new(2);
@@ -1508,9 +1478,8 @@ pub(in crate::portable) mod tests {
         drop(created(&place, &mut bench, &mut random));
         let mut first = unlocked(&place, &mut bench, 0);
         let mut second = unlocked(&place, &mut bench, 1);
-        bench.present(&[0]);
         first
-            .save(&place.1, &entry("A", b"first"), &mut bench, &mut random)
+            .save(&place.1, &entry("A", b"first"), &|| false, &mut random)
             .unwrap();
         let committed = place.bytes();
         let calls = bench.calls.len();
@@ -1519,7 +1488,7 @@ pub(in crate::portable) mod tests {
             "the portable vault changed; lock and unlock again",
         ));
         for body in [b"second".as_slice(), b"again"] {
-            let saved = second.save(&place.1, &entry("B", body), &mut bench, &mut random);
+            let saved = second.save(&place.1, &entry("B", body), &|| false, &mut random);
             assert_eq!(saved.err(), stale);
         }
         assert_eq!(
@@ -1535,7 +1504,7 @@ pub(in crate::portable) mod tests {
     #[test]
     fn a_change_during_authorization_is_refused_at_publication() {
         let place = Place::new();
-        let mut bench = Bench::new(2);
+        let mut bench = Bench::new(3);
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
         let path = place.0.clone();
@@ -1545,17 +1514,16 @@ pub(in crate::portable) mod tests {
             fs::copy(path.join("vault"), &copy).unwrap();
             fs::rename(copy, path.join("vault")).unwrap();
         }));
-        bench.present(&[1]);
+        bench.present(&[1, 2, 2]);
         assert!(matches!(
-            session.save(&place.1, &entry("A", b"x"), &mut bench, &mut random),
+            session.add_key(&place.1, &mut bench, &mut random),
             Err(Error::Refused(_))
         ));
         bench.during = None;
         assert_eq!(session.revision(), 1);
         // The bytes are unchanged, so the next write proceeds.
-        bench.present(&[1]);
         session
-            .save(&place.1, &entry("A", b"x"), &mut bench, &mut random)
+            .save(&place.1, &entry("A", b"x"), &|| false, &mut random)
             .unwrap();
         assert_eq!(session.revision(), 2);
     }
@@ -1573,7 +1541,7 @@ pub(in crate::portable) mod tests {
             "this session belongs to another vault location",
         ));
         let primary = id(&bench, 0);
-        let saved = session.save(&copy.1, &entry("A", b"x"), &mut bench, &mut random);
+        let saved = session.save(&copy.1, &entry("A", b"x"), &|| false, &mut random);
         assert_eq!(saved.err(), elsewhere);
         assert_eq!(
             session.add_key(&copy.1, &mut bench, &mut random).err(),
@@ -1594,9 +1562,8 @@ pub(in crate::portable) mod tests {
         let mut bench = Bench::new(3);
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
-        bench.present(&[1]);
         session
-            .save(&place.1, &entry("Kept", b"body"), &mut bench, &mut random)
+            .save(&place.1, &entry("Kept", b"body"), &|| false, &mut random)
             .unwrap();
         let old = LockedVault::decode(&place.bytes().unwrap()).unwrap();
         bench.present(&[1, 2, 2]);
@@ -1680,9 +1647,8 @@ pub(in crate::portable) mod tests {
         let mut bench = Bench::new(3);
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
-        bench.present(&[1]);
         session
-            .save(&place.1, &entry("Kept", b"body"), &mut bench, &mut random)
+            .save(&place.1, &entry("Kept", b"body"), &|| false, &mut random)
             .unwrap();
         let old_bytes = place.bytes().unwrap();
         let lost = id(&bench, 0);
@@ -1758,29 +1724,29 @@ pub(in crate::portable) mod tests {
             .keys()
             .iter()
             .any(|k| k.role == Role::Backup && k.credential == replacement));
-        bench.present(&[3]);
         session
-            .save(&place.1, &entry("After", b"x"), &mut bench, &mut random)
+            .save(&place.1, &entry("After", b"x"), &|| false, &mut random)
             .unwrap();
         assert_eq!(bench.credential(&replacement), 3);
     }
 
     #[test]
     fn operation_challenges_bind_purpose_phase_and_operation() {
-        let base = challenge(Purpose::Save, Phase::Assert, b"one", &mut Random(5)).unwrap();
+        let add = Purpose::AuthorizeAddKey;
+        let base = challenge(add, Phase::Assert, b"one", &mut Random(5)).unwrap();
         for other in [
             challenge(Purpose::Unlock, Phase::Assert, b"one", &mut Random(5)),
-            challenge(Purpose::Save, Phase::Repeat, b"one", &mut Random(5)),
-            challenge(Purpose::Save, Phase::Assert, b"two", &mut Random(5)),
-            challenge(Purpose::Save, Phase::Assert, b"one", &mut Random(6)),
+            challenge(add, Phase::Repeat, b"one", &mut Random(5)),
+            challenge(add, Phase::Assert, b"two", &mut Random(5)),
+            challenge(add, Phase::Assert, b"one", &mut Random(6)),
         ] {
             assert_ne!(other.unwrap(), base);
         }
         assert_eq!(
-            challenge(Purpose::Save, Phase::Assert, b"one", &mut Random(5)).unwrap(),
+            challenge(add, Phase::Assert, b"one", &mut Random(5)).unwrap(),
             base
         );
-        assert!(challenge(Purpose::Save, Phase::Assert, b"", &mut std::io::empty()).is_err());
+        assert!(challenge(add, Phase::Assert, b"", &mut std::io::empty()).is_err());
     }
 
     #[test]
@@ -1904,16 +1870,14 @@ pub(in crate::portable) mod tests {
     #[test]
     fn a_counter_that_did_not_advance_refuses_the_write() {
         let place = Place::new();
-        let mut bench = Bench::new(2);
+        let mut bench = Bench::new(3);
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
         let before = place.bytes();
         bench.frozen = true;
-        bench.present(&[1]);
+        bench.present(&[1, 2, 2]);
         assert_eq!(
-            session
-                .save(&place.1, &entry("A", b"x"), &mut bench, &mut random)
-                .err(),
+            session.add_key(&place.1, &mut bench, &mut random).err(),
             Some(Error::Refused(
                 "portable key counter did not advance".into()
             ))
@@ -1925,62 +1889,62 @@ pub(in crate::portable) mod tests {
     #[test]
     fn a_busy_store_refuses_the_write_and_leaves_the_session_usable() {
         let place = Place::new();
-        let mut bench = Bench::new(2);
+        let mut bench = Bench::new(3);
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
         let open =
             |place: &Place| Store::open(place.1.file.try_clone().unwrap(), place.1.owner).unwrap();
-        // Busy before authorization: refused with no token presented.
+        // Busy before a save or an authorization: refused, no token asked.
         let held = open(&place);
         let calls = bench.calls.len();
         assert!(matches!(
-            session.save(&place.1, &entry("A", b"x"), &mut bench, &mut random),
+            session.save(&place.1, &entry("A", b"x"), &|| false, &mut random),
+            Err(Error::Store(_))
+        ));
+        assert!(matches!(
+            session.add_key(&place.1, &mut bench, &mut random),
             Err(Error::Store(_))
         ));
         assert_eq!(bench.calls.len(), calls);
         drop(held);
-        // Busy only once the token is presented: refused at publication.
+        // Busy only once a token is presented: refused at publication.
         let held = std::rc::Rc::new(std::cell::RefCell::new(None));
         let (slot, directory) = (held.clone(), place.1.file.try_clone().unwrap());
         let owner = place.1.owner;
         bench.during = Some(Box::new(move || {
-            *slot.borrow_mut() = Some(Store::open(directory.try_clone().unwrap(), owner).unwrap());
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(Store::open(directory.try_clone().unwrap(), owner).unwrap());
+            }
         }));
-        bench.present(&[1]);
+        bench.present(&[1, 2, 2]);
         assert!(matches!(
-            session.save(&place.1, &entry("A", b"x"), &mut bench, &mut random),
+            session.add_key(&place.1, &mut bench, &mut random),
             Err(Error::Store(_))
         ));
         bench.during = None;
         held.borrow_mut().take();
         for revision in [2, 3] {
-            bench.present(&[1]);
             session
-                .save(&place.1, &entry("A", b"x"), &mut bench, &mut random)
+                .save(&place.1, &entry("A", b"x"), &|| false, &mut random)
                 .unwrap();
             assert_eq!(session.revision(), revision);
         }
     }
 
     #[test]
-    fn the_session_key_selects_which_token_authorizes_writes() {
+    fn the_unlocking_key_authorizes_adding_a_key() {
         let place = Place::new();
-        let mut bench = Bench::new(2);
+        let mut bench = Bench::new(3);
         let mut random = Random(0);
-        let mut session = created(&place, &mut bench, &mut random);
+        drop(created(&place, &mut bench, &mut random));
+        let mut session = unlocked(&place, &mut bench, 0);
+        assert_eq!(session.credential(), id(&bench, 0));
+        bench.present(&[0, 2, 2]);
+        session.add_key(&place.1, &mut bench, &mut random).unwrap();
         assert_eq!(
-            session.use_key(b"unknown").err(),
-            Some(Error::State("that key is not enrolled in this vault"))
-        );
-        assert_eq!(session.credential(), id(&bench, 1));
-        session.use_key(&id(&bench, 0)).unwrap();
-        bench.present(&[0]);
-        session
-            .save(&place.1, &entry("A", b"x"), &mut bench, &mut random)
-            .unwrap();
-        assert_eq!(
-            bench.presented.last(),
-            Some(&(Role::Primary, Some(id(&bench, 0))))
+            bench.presented[bench.presented.len() - 3],
+            (Role::Primary, Some(id(&bench, 0)))
         );
     }
 
@@ -2020,9 +1984,8 @@ pub(in crate::portable) mod tests {
         let mut bench = Bench::new(3);
         let mut random = Random(0);
         let mut session = created(&place, &mut bench, &mut random);
-        bench.present(&[1]);
         session
-            .save(&place.1, &entry("Kept", b"body"), &mut bench, &mut random)
+            .save(&place.1, &entry("Kept", b"body"), &|| false, &mut random)
             .unwrap();
         let exported = session.ciphertext().unwrap().to_vec();
         drop(session);

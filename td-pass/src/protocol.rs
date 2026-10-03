@@ -45,8 +45,8 @@ pub enum PinUse {
     Proof,
 }
 
-/// The keys an unlocked notebook holds, and which of them authorizes its
-/// saves.
+/// The keys an unlocked notebook holds, and the one that authorizes adding
+/// a key: the key it was unlocked with, or that key's replacement.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Keys {
     pub labels: Vec<KeyLabel>,
@@ -118,11 +118,6 @@ pub enum Command {
     Apply {
         op: Op,
         change: Change,
-    },
-    /// Authorize later saves with the unlocked notebook's key `key`.
-    UseKey {
-        op: Op,
-        key: usize,
     },
     /// Enroll another backup key.
     AddKey {

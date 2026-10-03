@@ -106,7 +106,7 @@ impl From<Presented<'_>> for Request {
 }
 
 /// Why the presented key needs its PIN. `Request::operation` names what
-/// an authorization is for: unlocking, a save, a key change or an import.
+/// an authorization is for: unlocking, a key change or an import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinUse {
     /// An enrolled key authorizing the named operation.
@@ -381,16 +381,12 @@ impl Vault {
         self.0.keys().into_iter().map(Key::from).collect()
     }
 
-    /// The key that authorizes this session's saves.
+    /// The key that unlocked this session, which authorizes adding a key;
+    /// after a replacement revokes it, the replacement.
     pub fn key(&self) -> Option<Key> {
         self.keys()
             .into_iter()
             .find(|key| key.credential == self.0.credential())
-    }
-
-    /// Authorizes later saves with another enrolled key, one of `keys`.
-    pub fn use_key(&mut self, key: &Key) -> Result<(), Failure> {
-        self.0.use_key(&key.credential).map_err(Failure)
     }
 
     /// The authenticated ciphertext of the revision this session holds,
@@ -520,9 +516,9 @@ impl Host {
         .map(Vault)
     }
 
-    /// Unlocks the vault for browsing with `key`, one of `keys`. A cancel
-    /// that arrives before the unlocked session is returned drops it, and
-    /// the unlock ends as cancelled.
+    /// Unlocks the vault for browsing and saving with `key`, one of `keys`.
+    /// A cancel that arrives before the unlocked session is returned drops
+    /// it, and the unlock ends as cancelled.
     pub fn unlock(
         &mut self,
         key: &Key,
@@ -575,8 +571,8 @@ impl Host {
         .map(Vault)
     }
 
-    /// Enrolls another backup key after authorization by the key `vault`
-    /// was unlocked with.
+    /// Enrolls another backup key after authorization by `vault.key()`:
+    /// the key it was unlocked with, or that key's replacement.
     pub fn add_key(
         &mut self,
         vault: &mut Vault,
@@ -618,30 +614,32 @@ impl Host {
         })
     }
 
-    /// Saves one change under fresh authorization by the key `vault` was
-    /// unlocked with. Refusals of the change come before any token.
+    /// Saves one change under the unlock that opened `vault`; no token is
+    /// presented. Memory is rechecked first, as before a presentation, and
+    /// a `cancel` before publication publishes nothing.
     pub fn apply(
         &mut self,
         vault: &mut Vault,
         change: Change,
-        prompt: &mut dyn Prompt,
         cancel: &Cancel,
     ) -> Result<Committed, Failure> {
-        let Self {
-            protected,
-            directory,
-            random,
-            tokens,
-        } = self;
-        with_tokens(protected, tokens, prompt, cancel, |hardware| {
-            vault
-                .0
-                .apply(directory, change.into(), hardware, &mut Random(random))
-        })
-        .map(|committed| Committed {
-            id: committed.id,
-            revision: committed.revision,
-        })
+        self.protected
+            .recheck()
+            .map_err(|reason| Failure(Error::Refused(reason.into())))?;
+        let revoked = || cancel.0.cancelled();
+        vault
+            .0
+            .apply(
+                &self.directory,
+                change.into(),
+                &revoked,
+                &mut Random(&mut self.random),
+            )
+            .map(|committed| Committed {
+                id: committed.id,
+                revision: committed.revision,
+            })
+            .map_err(Failure)
     }
 }
 

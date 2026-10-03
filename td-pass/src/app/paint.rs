@@ -325,15 +325,10 @@ impl Frame<'_> {
         let app = self.app;
         let surface = app.surface;
         let idle = app.busy.is_none();
-        let selected = view.list.selected();
         let count = view.keys.labels.len();
         layout::strip(surface, &layout::KEYS).emit(
             [
                 (false, true),
-                (
-                    false,
-                    idle && selected.is_some() && selected != view.keys.using,
-                ),
                 (false, idle),
                 (false, idle && count > 1),
                 (false, idle),
@@ -347,7 +342,7 @@ impl Frame<'_> {
         let row = layout::row(surface);
         for (index, text) in [
             "The keys that open this notebook. Each one can unlock it alone.",
-            "Space marks keys for Replace; Use for saves picks the key a save asks for.",
+            "Space marks keys for Replace. Saves need no key until the notebook locks.",
         ]
         .into_iter()
         .enumerate()
@@ -388,7 +383,7 @@ impl Frame<'_> {
                     Item {
                         label,
                         meta: if view.keys.using == Some(index) {
-                            "authorizes saves"
+                            "authorizes adding"
                         } else {
                             ""
                         },

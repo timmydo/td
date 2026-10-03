@@ -71,7 +71,6 @@ impl Client {
         if let Command::Create { op, .. }
         | Command::Unlock { op, .. }
         | Command::Apply { op, .. }
-        | Command::UseKey { op, .. }
         | Command::AddKey { op }
         | Command::ReplaceKeys { op, .. }
         | Command::Export { op, .. }
@@ -286,36 +285,17 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                 },
                 None => Reply::Missing { id },
             },
-            Command::Apply { op, change } => {
-                let mut asker = Asker {
-                    op,
-                    replies,
-                    answers,
-                };
-                match (host.as_mut(), vault.as_mut()) {
-                    (Some(host), Some(vault)) => {
-                        match host.apply(vault, convert(change), &mut asker, &cancel) {
-                            Ok(committed) => Reply::Committed {
-                                op,
-                                id: committed.id,
-                                revision: committed.revision,
-                            },
-                            Err(failure) => failed(op, &failure),
-                        }
-                    }
-                    _ => closed(op),
-                }
-            }
-            Command::UseKey { op, key } => match (vault.as_mut(), enrolled.get(key)) {
-                (Some(vault), Some(key)) => match vault.use_key(key) {
-                    Ok(()) => Reply::Keys {
+            // A save asks no token: the unlock authorized the session.
+            Command::Apply { op, change } => match (host.as_mut(), vault.as_mut()) {
+                (Some(host), Some(vault)) => match host.apply(vault, convert(change), &cancel) {
+                    Ok(committed) => Reply::Committed {
                         op,
-                        keys: listing(vault, &mut enrolled),
+                        id: committed.id,
+                        revision: committed.revision,
                     },
                     Err(failure) => failed(op, &failure),
                 },
-                (Some(_), None) => refused(op, "that key is no longer listed"),
-                (None, _) => closed(op),
+                _ => closed(op),
             },
             Command::AddKey { op } => {
                 let mut asker = Asker {
@@ -478,7 +458,7 @@ fn labels(keys: &mut Vec<pass::Key>, listed: Option<Vec<pass::Key>>) -> Option<V
 }
 
 /// Keeps the unlocked notebook's credentials here and gives the window
-/// their labels, with the one authorizing saves.
+/// their labels, with the one that authorizes adding a key.
 fn listing(vault: &pass::Vault, enrolled: &mut Vec<pass::Key>) -> Keys {
     *enrolled = vault.keys();
     let using = vault.key();
@@ -698,10 +678,9 @@ mod tests {
         let (_answers, answer_rx) = mpsc::channel();
         let (reply_tx, replies) = mpsc::channel();
         for command in [
-            Command::UseKey { op: 1, key: 0 },
-            Command::AddKey { op: 2 },
+            Command::AddKey { op: 1 },
             Command::ReplaceKeys {
-                op: 3,
+                op: 2,
                 revoked: vec![0],
             },
         ] {
@@ -713,7 +692,7 @@ mod tests {
         }
         drop(jobs);
         serve(&job_rx, &answer_rx, &reply_tx);
-        for expected in 1..=3 {
+        for expected in 1..=2 {
             match replies.try_recv() {
                 Ok(Reply::Failed { op, failure }) => {
                     assert_eq!(op, expected);

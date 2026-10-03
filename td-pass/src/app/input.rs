@@ -441,17 +441,15 @@ impl App {
     }
 
     /// The keys view's keys: the list's steps, Space to mark a key for
-    /// replacement, Return to authorize saves with the selected key,
-    /// Insert to add a backup and Delete to replace.
+    /// replacement, Insert to add a backup and Delete to replace.
     fn keys_key(&mut self, chord: &str, repeat: bool) {
         match chord {
             "Escape" | "C-k" => return self.show_keys(false),
             "C-l" => return self.request(Then::Lock, None),
             // A held key acts once: Space would flicker a mark, and the
             // rest would ask again over the operation they began.
-            "Space" | " " | "Return" | "Insert" | "Delete" if repeat => return,
+            "Space" | " " | "Insert" | "Delete" if repeat => return,
             "Space" | " " => return self.toggle_mark(),
-            "Return" => return self.use_key(),
             "Insert" => return self.add_key(),
             "Delete" => return self.replace_keys(None),
             "C-e" => return self.start_export(),
@@ -1035,11 +1033,10 @@ impl App {
             Phase::Unlocked(notebook) if notebook.keys.showing => {
                 match layout::strip(surface, &layout::KEYS).hit(x, y) {
                     Some(0) => return self.show_keys(false),
-                    Some(1) => return self.use_key(),
-                    Some(2) => return self.add_key(),
-                    Some(3) => return self.replace_keys(opener),
-                    Some(4) => return self.start_export(),
-                    Some(5) => return self.request(Then::Lock, opener),
+                    Some(1) => return self.add_key(),
+                    Some(2) => return self.replace_keys(opener),
+                    Some(3) => return self.start_export(),
+                    Some(4) => return self.request(Then::Lock, opener),
                     _ => {}
                 }
                 let Some(notebook) = self.notebook() else {

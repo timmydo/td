@@ -1,7 +1,7 @@
 //! Entry operations over an unlocked session. Each change is one
-//! revision-checked, freshly authorized save of the whole notebook.
+//! revision-checked save of the whole notebook under the session's unlock.
 
-use super::lifecycle::{Directory, Error, Session, Tokens};
+use super::lifecycle::{Directory, Error, Session};
 use super::{Entry, Notebook, MAX_BODY, MAX_ENTRIES, MAX_PLAIN, MAX_TITLE};
 use std::io::Read;
 
@@ -118,13 +118,13 @@ impl Session {
         self.notebook().entries.iter().find(|entry| &entry.id == id)
     }
 
-    /// Builds the next notebook, then saves it under fresh authorization.
-    /// Refusals happen before any token is presented.
+    /// Builds the next notebook, then saves it under the session's unlock;
+    /// `revoked` is the owner's lock, checked before publication.
     pub fn apply(
         &mut self,
         directory: &Directory,
         change: Change,
-        tokens: &mut impl Tokens,
+        revoked: &dyn Fn() -> bool,
         random: &mut impl Read,
     ) -> Result<Committed, Error> {
         let mut entries: Vec<Entry> = self
@@ -224,7 +224,7 @@ impl Session {
         if plaintext_size(&entries).is_none_or(|size| size > MAX_PLAIN) {
             return Err(Error::Entry(EntryError::Full));
         }
-        self.save(directory, &Notebook { entries }, tokens, random)?;
+        self.save(directory, &Notebook { entries }, revoked, random)?;
         Ok(committed)
     }
 }
@@ -237,9 +237,7 @@ fn next(base: u64) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fido_transaction::{self as transaction, Status};
     use crate::portable::lifecycle::tests::{created, unlocked, Bench, Place, Random};
-    use crate::portable::lifecycle::TokenError;
 
     struct Fixture {
         place: Place,
@@ -262,12 +260,12 @@ mod tests {
             }
         }
         fn apply(&mut self, change: Change) -> Result<Committed, Error> {
-            self.bench.present(&[1]);
-            let result =
-                self.session
-                    .apply(&self.place.1, change, &mut self.bench, &mut self.random);
-            // A refusal before authorization leaves the presentation unused.
-            self.bench.present.clear();
+            let calls = self.bench.calls.len();
+            let result = self
+                .session
+                .apply(&self.place.1, change, &|| false, &mut self.random);
+            // A save asks no token, whether it commits or is refused.
+            assert_eq!(self.bench.calls.len(), calls);
             result
         }
         fn create(&mut self, title: &str, body: &str) -> Committed {
@@ -405,17 +403,17 @@ mod tests {
         let mut fixture = Fixture::new();
         let mail = fixture.create("Mail", "old");
         let before = fixture.place.bytes();
-        fixture.bench.fail = Some((
-            fixture.bench.calls.len(),
-            TokenError::Failed(transaction::Error::Status(Status::PinInvalid)),
-        ));
         let edit = || Change::Edit {
             id: mail.id,
             base: 1,
             title: "Mail".into(),
             body: "new".into(),
         };
-        assert!(matches!(fixture.apply(edit()), Err(Error::Token(_))));
+        // A lock before publication refuses the save.
+        let locked = fixture
+            .session
+            .apply(&fixture.place.1, edit(), &|| true, &mut fixture.random);
+        assert!(matches!(locked, Err(Error::Token(_))));
         assert_eq!(fixture.place.bytes(), before);
         let entry = fixture.session.entry(&mail.id).unwrap();
         assert_eq!((entry.revision, entry.body()), (1, b"old".as_slice()));
@@ -432,13 +430,12 @@ mod tests {
                 Entry::new(id, 1, format!("entry {n}"), Vec::new())
             })
             .collect();
-        fixture.bench.present(&[1]);
         fixture
             .session
             .save(
                 &fixture.place.1,
                 &Notebook { entries },
-                &mut fixture.bench,
+                &|| false,
                 &mut fixture.random,
             )
             .unwrap();
@@ -459,13 +456,12 @@ mod tests {
         let entries = (0..63u8)
             .map(|n| Entry::new([n; 16], 1, format!("large {n}"), body.clone().into_bytes()))
             .collect();
-        fixture.bench.present(&[1]);
         fixture
             .session
             .save(
                 &fixture.place.1,
                 &Notebook { entries },
-                &mut fixture.bench,
+                &|| false,
                 &mut fixture.random,
             )
             .unwrap();
