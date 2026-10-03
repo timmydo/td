@@ -765,27 +765,35 @@ changes display. Auto Fill is off by default, per document. The fill column
 defaults to 72 and accepts integers from 20 through 240. Columns follow the
 scalar-cell and eight-column tab rules above. An overlong word stays intact.
 
-A paragraph is the maximal run of nonblank logical lines with exactly the
-same leading space/tab byte prefix. A blank line contains only spaces/tabs.
+A line's fill prefix is its leading spaces/tabs followed by any run of mail
+quote markers, each a `>` with the spaces/tabs after it, so `> `, `> > `
+and `  >> ` are prefixes. A paragraph is the maximal run of nonblank logical
+lines with exactly the same fill prefix bytes: a quote, a deeper quote and
+the unquoted reply beneath them are separate paragraphs. A blank line
+contains only its fill prefix, so `>` and `> ` separate quoted paragraphs.
 The caret selects its current logical line; on a blank line Fill Paragraph
-does nothing. Version 1 has no special mail quote, list, source comment or
-Markdown syntax: their non-whitespace prefix characters are ordinary words.
-Auto Fill remains off unless explicitly enabled, including for `.eml` files.
+does nothing. There is no special list, source comment or Markdown syntax
+beyond the `>` marker: other non-whitespace prefix characters are ordinary
+words. Auto Fill remains off unless explicitly enabled, including for `.eml`
+files.
 
-Fill removes the shared indentation for word splitting, treats runs of ASCII
-space/tab/newline as separators, and joins words with one ASCII space. It
-greedily places each whole word on the current line if its ending column is
-at most the fill column; otherwise it starts a line with the original
-indentation. The first word always fits by itself, even when it exceeds the
-column. Trailing horizontal whitespace is removed; the paragraph's final
-newline and surrounding blank lines are preserved exactly. A selection does
-not change which paragraph is filled. Repeating Fill is byte-idempotent.
+Fill removes the shared fill prefix from every line for word splitting,
+treats runs of ASCII space/tab/newline as separators, and joins words with
+one ASCII space. It greedily places each whole word on the current line if
+its ending column is at most the fill column; otherwise it starts a line
+with the original fill prefix. The first word always fits by itself, even
+when it exceeds the column. A word beginning with `>` never starts a wrapped
+line, where it would read as a quote marker: it stays on the line before,
+even past the column. Trailing horizontal whitespace is removed; the
+paragraph's final newline and surrounding blank lines are preserved exactly.
+A selection does not change which paragraph is filled. Repeating Fill is
+byte-idempotent.
 
 Reflow records the original-to-new offset of each preserved word scalar.
 Cursor and both selection endpoints inside words follow those scalars;
 endpoints in collapsed separators go before the next word, or after the last
-word when there is no next word. Endpoints in indentation clamp to the same
-indent column on the first output line. Endpoints outside the replacement
+word when there is no next word. Endpoints in the fill prefix clamp to the
+same prefix offset on the first output line. Endpoints outside the replacement
 shift by its byte-length delta. Filling is one undo transaction restoring
 the exact original bytes and selection; a no-op creates no history entry.
 
@@ -795,14 +803,16 @@ until the caret's column exceeds the fill column, even if untouched text to
 its right makes the logical line longer. It greedily finds the first break
 at or before the caret, and makes at most one wrap per typed separator.
 Unlike Fill Paragraph, retain horizontal whitespace, replacing only the
-final space/tab before a wrapped word with newline plus the original
-indentation. Extra separators remain as trailing whitespace on the preceding
-line; trailing whitespace may exceed the fill column. Retain the trailing
-typed separator so typing the next word remains separated. An interior typed
-separator remains a separator or becomes a line break, never a collapsed
-no-op. Do not pull text from the next logical line. The inserted separator
-and any resulting wrap form one transaction. A limit failure refuses that
-entire typing transaction.
+final space/tab before a wrapped word with newline plus the line's fill
+prefix, so a wrapped quoted line stays quoted; a line holding only its fill
+prefix never wraps, and a word beginning with `>` is never wrapped. Extra
+separators remain as trailing whitespace on the preceding line; trailing
+whitespace may exceed the fill column. Retain the trailing typed separator
+so typing the next word remains separated. An interior typed separator
+remains a separator or becomes a line break, never a collapsed no-op. Do
+not pull text from the next logical line. The inserted separator and any
+resulting wrap form one transaction. A limit failure refuses that entire
+typing transaction.
 
 ## On-demand spelling
 

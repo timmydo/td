@@ -21,6 +21,22 @@ fn indent(line: &str) -> &str {
     line.get(..len).unwrap_or("")
 }
 
+/// The indentation, then each mail quote `>` with the blanks after it, so a
+/// quote and the reply under it stay apart and a wrap keeps its markers.
+fn fill_prefix(line: &str) -> &str {
+    let mut len = indent(line).len();
+    while let Some(rest) = line.get(len..).and_then(|rest| rest.strip_prefix('>')) {
+        len += 1 + indent(rest).len();
+    }
+    line.get(..len).unwrap_or("")
+}
+
+/// A word that would read as a quote marker at the start of a line. It
+/// never starts a wrapped one, or the next fill would take it for a prefix.
+fn quotes(word: &str) -> bool {
+    word.starts_with('>')
+}
+
 fn get(text: &str, range: Range<usize>) -> Result<&str> {
     text.get(range).ok_or(Error::InvalidPosition)
 }
@@ -44,7 +60,7 @@ pub fn paragraph(text: &str, anchor: usize, caret: usize, column: usize) -> Resu
     get(text, anchor..anchor)?;
     let current = text::line(text, caret)?;
     let content = get(text, current.clone())?;
-    let prefix = indent(content);
+    let prefix = fill_prefix(content);
     if content.len() == prefix.len() {
         return Ok(Edit {
             range: caret..caret,
@@ -57,7 +73,7 @@ pub fn paragraph(text: &str, anchor: usize, caret: usize, column: usize) -> Resu
     while range.start > 0 {
         let previous = text::line(text, range.start - 1)?;
         let line = get(text, previous.clone())?;
-        if indent(line) != prefix || line.len() == prefix.len() {
+        if fill_prefix(line) != prefix || line.len() == prefix.len() {
             break;
         }
         range.start = previous.start;
@@ -65,7 +81,7 @@ pub fn paragraph(text: &str, anchor: usize, caret: usize, column: usize) -> Resu
     while range.end < text.len() {
         let next = text::line(text, range.end + 1)?;
         let line = get(text, next.clone())?;
-        if indent(line) != prefix || line.len() == prefix.len() {
+        if fill_prefix(line) != prefix || line.len() == prefix.len() {
             break;
         }
         range.end = next.end;
@@ -98,33 +114,38 @@ fn reflow(
         }
     }
     let mut at = 0usize;
-    for part in source.split_inclusive([' ', '\t', '\n']) {
-        let word = part.trim_end_matches([' ', '\t', '\n']);
-        if !word.is_empty() {
-            let width = word.chars().count();
-            if !first {
-                if col.saturating_add(1).saturating_add(width) > column {
-                    append(&mut out, "\n")?;
-                    append(&mut out, prefix)?;
-                    col = text::column(prefix);
-                } else {
-                    append(&mut out, " ")?;
-                    col += 1;
+    // Every line shares the prefix; its quote markers are not words.
+    for line in source.split_inclusive('\n') {
+        at += prefix.len();
+        let body = line.get(prefix.len()..).ok_or(Error::InvalidPosition)?;
+        for part in body.split_inclusive([' ', '\t', '\n']) {
+            let word = part.trim_end_matches([' ', '\t', '\n']);
+            if !word.is_empty() {
+                let width = word.chars().count();
+                if !first {
+                    if col.saturating_add(1).saturating_add(width) > column && !quotes(word) {
+                        append(&mut out, "\n")?;
+                        append(&mut out, prefix)?;
+                        col = text::column(prefix);
+                    } else {
+                        append(&mut out, " ")?;
+                        col += 1;
+                    }
                 }
-            }
-            let new_start = range.start + out.len();
-            let old_start = range.start + at;
-            let old_end = old_start + word.len();
-            for (point, result) in points.iter().zip(mapped.iter_mut()) {
-                if result.is_none() && *point >= range.start && *point < old_end {
-                    *result = Some(new_start + point.saturating_sub(old_start));
+                let new_start = range.start + out.len();
+                let old_start = range.start + at;
+                let old_end = old_start + word.len();
+                for (point, result) in points.iter().zip(mapped.iter_mut()) {
+                    if result.is_none() && *point >= range.start && *point < old_end {
+                        *result = Some(new_start + point.saturating_sub(old_start));
+                    }
                 }
+                append(&mut out, word)?;
+                col = col.saturating_add(width);
+                first = false;
             }
-            append(&mut out, word)?;
-            col = col.saturating_add(width);
-            first = false;
+            at += part.len();
         }
-        at += part.len();
     }
     let map = |point: usize, mapped: Option<usize>| -> usize {
         if point < range.start {
@@ -168,7 +189,7 @@ pub fn auto_fill(
     let row_text = get(&working, row.clone())?;
     let caret_in_row = caret - row.start;
     if text::column(get(row_text, 0..caret_in_row)?) <= column
-        || indent(row_text).len() == row_text.len()
+        || fill_prefix(row_text).len() == row_text.len()
     {
         let caret = selection.start + 1;
         return Ok(Edit {
@@ -180,7 +201,7 @@ pub fn auto_fill(
     }
     // Wrap only the words reached by typing. Rewrapping the untouched tail
     // can leave a sequence of single-word rows after an interior insertion.
-    let prefix = indent(row_text);
+    let prefix = fill_prefix(row_text);
     let mut out = String::new();
     append(&mut out, prefix)?;
     let mut col = text::column(prefix);
@@ -202,6 +223,7 @@ pub fn auto_fill(
             });
             if !first
                 && !wrapped
+                && !quotes(word)
                 && at <= caret_in_row
                 && next_col.saturating_add(word.chars().count()) > column
             {

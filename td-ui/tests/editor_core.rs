@@ -436,6 +436,135 @@ fn fill_keeps_a_caret_at_the_first_word_of_a_continuation_line() {
     assert_eq!(edit.caret, edit.insert.find("delta").unwrap());
 }
 
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helper: the fixture holds `at` and fills at a valid column"
+)]
+fn filled(source: &str, at: &str, column: usize) -> String {
+    let caret = source.find(at).unwrap();
+    let edit = fill::paragraph(source, caret, caret, column).unwrap();
+    let mut out = source.to_string();
+    out.replace_range(edit.range, &edit.insert);
+    out
+}
+
+#[test]
+fn fill_keeps_a_reply_apart_from_the_quote_above_it() {
+    let draft = "On Monday, A wrote:\n> alpha bravo\n> charlie delta echo foxtrot golf\nmy reply runs on\nand on here\n";
+    assert_eq!(
+        filled(draft, "my reply", 20),
+        "On Monday, A wrote:\n> alpha bravo\n> charlie delta echo foxtrot golf\nmy reply runs on and\non here\n"
+    );
+    assert_eq!(
+        filled(draft, "charlie", 20),
+        "On Monday, A wrote:\n> alpha bravo\n> charlie delta echo\n> foxtrot golf\nmy reply runs on\nand on here\n"
+    );
+    assert_eq!(
+        filled(draft, "On Monday", 40),
+        draft,
+        "the attribution is its own paragraph"
+    );
+}
+
+#[test]
+fn fill_separates_quote_depths_and_stops_at_an_empty_quoted_line() {
+    let draft = "> > deep one\n> > deep two\n> shallow one\n> shallow two\n> \n> after the gap\n";
+    assert_eq!(
+        filled(draft, "deep two", 40),
+        "> > deep one deep two\n> shallow one\n> shallow two\n> \n> after the gap\n"
+    );
+    assert_eq!(
+        filled(draft, "shallow two", 40),
+        "> > deep one\n> > deep two\n> shallow one shallow two\n> \n> after the gap\n"
+    );
+    let gap = draft.find("> \n").unwrap();
+    let blank = fill::paragraph(draft, gap + 1, gap + 1, 40).unwrap();
+    assert!(blank.insert.is_empty());
+    let bare = "> alpha\n>\n> bravo\n";
+    assert_eq!(filled(bare, "alpha", 40), bare);
+    let indented = "  > alpha bravo charlie\n  > delta\n";
+    assert_eq!(
+        filled(indented, "delta", 20),
+        "  > alpha bravo\n  > charlie delta\n"
+    );
+}
+
+#[test]
+fn fill_paragraph_in_a_quote_is_idempotent_and_one_undo() {
+    let original = "> alpha bravo charlie delta echo foxtrot\n> golf\nreply\n";
+    let mut e = Editor::default();
+    let id = e.load_bytes(original.as_bytes()).unwrap();
+    let caret = original.find("golf").unwrap() + 2;
+    select(&mut e, id, caret, caret);
+    apply(&mut e, id, Command::FillColumn(20));
+    apply(&mut e, id, Command::FillParagraph);
+    let expected = "> alpha bravo\n> charlie delta echo\n> foxtrot golf\nreply\n";
+    assert_eq!(e.document(id).unwrap().text(), expected);
+    let caret = expected.find("golf").unwrap() + 2;
+    assert_eq!(
+        e.document(id).unwrap().selection(),
+        Selection {
+            anchor: caret,
+            caret
+        }
+    );
+    apply(&mut e, id, Command::FillParagraph);
+    assert_eq!(e.document(id).unwrap().revision(), 1);
+    apply(&mut e, id, Command::Undo);
+    assert_eq!(e.document(id).unwrap().text(), original);
+}
+
+#[test]
+fn fill_never_starts_a_wrapped_line_with_a_quote_marker_word() {
+    let quoted = "> abcdefghijklmnopqr >>>abc >>>abc >>>abc\n";
+    assert_eq!(filled(quoted, ">>>abc", 20), quoted);
+    let reply = "alpha bravo charlie delta > echo\n";
+    let once = filled(reply, "alpha", 25);
+    assert_eq!(once, "alpha bravo charlie delta >\necho\n");
+    assert_eq!(filled(&once, "echo", 25), once);
+    assert_eq!(filled(&once, "alpha", 72), reply);
+    let deeper = "> one two three four five six > seven\n";
+    assert_eq!(
+        filled(deeper, "one", 30),
+        "> one two three four five six >\n> seven\n"
+    );
+}
+
+#[test]
+fn fill_clamps_endpoints_in_a_quote_prefix_to_the_first_line() {
+    let source = "> alpha bravo\n> charlie\n";
+    let second = source.find("> charlie").unwrap();
+    for (point, expected) in [(1, 1), (second, 0), (second + 1, 1)] {
+        let edit = fill::paragraph(source, point, point, 40).unwrap();
+        assert_eq!(edit.insert, "> alpha bravo charlie");
+        assert_eq!(edit.caret, expected, "from {point}");
+    }
+    let tabbed = "\t>\talpha bravo charlie\n\t>\tdelta\n";
+    assert_eq!(
+        filled(tabbed, "delta", 30),
+        "\t>\talpha bravo\n\t>\tcharlie delta\n"
+    );
+}
+
+#[test]
+fn auto_fill_continues_a_quoted_line_with_its_marker() {
+    let text = "> alpha bravo charlie";
+    let edit = fill::auto_fill(text, text.len()..text.len(), ' ', 20).unwrap();
+    let mut actual = text.to_string();
+    actual.replace_range(edit.range, &edit.insert);
+    assert_eq!(actual, "> alpha bravo\n> charlie ");
+    assert_eq!(edit.caret, actual.len());
+    let markers = "> ".repeat(12);
+    let edit = fill::auto_fill(&markers, markers.len()..markers.len(), ' ', 20).unwrap();
+    assert_eq!(edit.range, markers.len()..markers.len());
+    assert_eq!(edit.insert, " ");
+    let text = "if alpha bravo charlie >";
+    let edit = fill::auto_fill(text, text.len()..text.len(), ' ', 22).unwrap();
+    let mut actual = text.to_string();
+    actual.replace_range(edit.range, &edit.insert);
+    assert_eq!(actual, "if alpha bravo charlie > ");
+}
+
 #[test]
 fn replacing_a_selection_with_identical_text_collapses_without_history() {
     let mut e = Editor::default();

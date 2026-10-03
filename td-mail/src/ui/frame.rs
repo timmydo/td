@@ -976,6 +976,44 @@ mod tests {
     }
 
     #[test]
+    fn draft_pane_fill_keeps_the_quote_and_the_reply_apart() {
+        let mut pane = Pane::new().unwrap();
+        pane.place(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 240,
+                height: 64,
+            },
+            Surface::new(240, 64, Default::default()).unwrap(),
+        );
+        let quote = "On Monday, A wrote:\n\
+                     > the quoted mail runs on for a while\n\
+                     > and wraps here\n\
+                     > \n\
+                     > a second quoted paragraph\n";
+        let reply = "my answer\nis typed under it";
+        let mut draft = None;
+        pane.edit(&mut draft, "reply-fill", || format!("{quote}{reply}"));
+        let tab = pane.tab().unwrap();
+        let text = |pane: &Pane| pane.editor().document(tab).unwrap().text().to_string();
+        assert_eq!(pane.chord("C-End"), Outcome::Changed);
+        assert_eq!(pane.chord("M-q"), Outcome::Changed);
+        assert_eq!(text(&pane), format!("{quote}my answer is typed under it"));
+        assert_eq!(pane.chord("C-Home"), Outcome::Changed);
+        assert_eq!(pane.chord("Down"), Outcome::Changed);
+        assert_eq!(pane.chord("M-q"), Outcome::Changed);
+        assert_eq!(
+            text(&pane),
+            "On Monday, A wrote:\n\
+             > the quoted mail runs on for a while and wraps here\n\
+             > \n\
+             > a second quoted paragraph\n\
+             my answer is typed under it"
+        );
+    }
+
+    #[test]
     fn draft_pane_copies_and_cuts_the_current_line_without_a_selection() {
         let mut pane = Pane::new().unwrap();
         assert_eq!(pane.copy(), Ok(false));
