@@ -10006,8 +10006,11 @@ used) landed copied byte for byte between the two and held so by a
 recipe test; `json`, `toml`, `html`, `civil`, `kv` and `td_fetch` have
 since become the td-json, td-toml, td-html, td-civil, td-kv and
 td-fetch-client crates both depend on by path (AGENTS.md principle 2).
-Each is built by a static Cargo recipe over the tree interned as its
-`<crate>-source` seed, its td sibling trees staged beside it
+td-mail's `regex` module carried a copy of td-txt's engine; it keeps
+only its rules-dialect adapter over the td-regex crate, which td-txt
+includes by path. Each tree is built by a static Cargo recipe over
+the tree interned as its `<crate>-source` seed, its td sibling trees
+staged beside it
 (`local_source_trees`), with the local-source exclusions specified in
 `DEVELOPMENT.md`. Each crate's identity is
 declaration-pinned by `seed/local-source-roster.txt` and re-derived live

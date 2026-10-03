@@ -36,8 +36,11 @@ use crate::types::{Recipe, Step};
 // the loop sandbox); the sibling td-txt-test carries that build+assert check.
 //
 // The crate root (`main.rs`) declares each sibling module with `mod NAME;`, so a
-// single `rustc src/main.rs` pulls them all in — but only if every module file is
-// present next to it in {src}. Keep MODULES in sync with `main.rs`'s `mod` lines.
+// single `rustc td-txt/src/main.rs` pulls them all in — but only if every module
+// file is present where rustc resolves it. Keep MODULES in sync with `main.rs`'s
+// `mod` lines. `regex` is the td-regex crate's one file, which `main.rs` names by
+// `#[path = "../../td-regex/src/lib.rs"]`, so the sources are staged in the
+// checkout's own layout under {src}, as td-login stages td-authd's file.
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command surface.
@@ -50,12 +53,25 @@ use crate::types::{Recipe, Step};
 // premise true. td-sh and td-netd document the constraint as it stands for them.
 const MAIN_RS: &str = include_str!("../../../td-txt/src/main.rs");
 
-// (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
+// (staged path, source text): each module where rustc resolves it from
+// `{src}/td-txt/src/main.rs` — `mod NAME;` beside it, `regex` at its `#[path]`.
 const MODULES: &[(&str, &str)] = &[
-    ("grep", include_str!("../../../td-txt/src/grep.rs")),
-    ("regex", include_str!("../../../td-txt/src/regex.rs")),
-    ("sed", include_str!("../../../td-txt/src/sed.rs")),
-    ("util", include_str!("../../../td-txt/src/util.rs")),
+    (
+        "{src}/td-txt/src/grep.rs",
+        include_str!("../../../td-txt/src/grep.rs"),
+    ),
+    (
+        "{src}/td-regex/src/lib.rs",
+        include_str!("../../../td-regex/src/lib.rs"),
+    ),
+    (
+        "{src}/td-txt/src/sed.rs",
+        include_str!("../../../td-txt/src/sed.rs"),
+    ),
+    (
+        "{src}/td-txt/src/util.rs",
+        include_str!("../../../td-txt/src/util.rs"),
+    ),
 ];
 
 pub fn recipe() -> Recipe {
@@ -84,19 +100,22 @@ pub fn recipe() -> Recipe {
     let path = format!("{bbin}:{gccbin}");
 
     let mut steps = Vec::new();
+    for directory in ["{src}/td-txt/src", "{src}/td-regex/src"] {
+        steps.push(Step::MkDir {
+            path: directory.into(),
+        });
+    }
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
     steps.push(Step::WriteFile {
-        path: "{src}/main.rs".into(),
+        path: "{src}/td-txt/src/main.rs".into(),
         content: MAIN_RS.into(),
         exec: false,
     });
-    // Every module `main.rs` declares must sit beside it so `rustc src/main.rs`
-    // can resolve `mod NAME;` from the filesystem.
-    for (name, source) in MODULES {
+    for (path, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: format!("{{src}}/{name}.rs"),
+            path: (*path).into(),
             content: (*source).into(),
             exec: false,
         });
@@ -140,7 +159,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-txt",
-                "{src}/main.rs",
+                "{src}/td-txt/src/main.rs",
             ],
         )
         .env("PATH", &path)

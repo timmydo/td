@@ -2147,7 +2147,19 @@ mod tests {
     /// `.rs` handed to anything but rustc. That test is a TRIPWIRE and not a
     /// gate — it cannot exempt anything, only complain — which is why it is
     /// safe for it to be approximate where a gate would not be.
-    const RUST_NOT_A_COMMAND_SURFACE: &[(&str, &str)] = &[("td-txt", "{src}/sed.rs")];
+    ///
+    /// An entry is a recipe and a file of that crate's `src`; `staged_body`
+    /// spells where the recipe writes it.
+    const RUST_NOT_A_COMMAND_SURFACE: &[(&str, &str)] = &[("td-txt", "sed.rs")];
+
+    /// Where a rostered recipe writes `file` of its crate: the checkout's own
+    /// layout under `{src}`, which a crate `#[path]`-including a sibling's file
+    /// stages so the relative include resolves. Composed rather than spelled
+    /// because this module is every recipe's, and a crate directory named in
+    /// its code is read by `build.rs` as a read of that crate.
+    fn staged_body(stem: &str, file: &str) -> String {
+        format!("{{src}}/{stem}/src/{file}")
+    }
 
     /// Whether this step writes a rostered `.rs` body of `stem`.
     ///
@@ -2162,7 +2174,7 @@ mod tests {
         };
         RUST_NOT_A_COMMAND_SURFACE
             .iter()
-            .any(|(recipe, body)| *recipe == stem && *body == path)
+            .any(|(recipe, file)| *recipe == stem && staged_body(recipe, file) == path)
     }
 
     /// The retired tools, named once: the farm branch and the text branch each
@@ -2924,7 +2936,7 @@ mod tests {
         };
         const SED: &str =
             "fn refuse() -> Error {\n    Error::new(\"can't find label for jump to `\")\n}\n";
-        let diagnostic = rs("{src}/sed.rs", SED);
+        let diagnostic = rs(&staged_body("td-txt", "sed.rs"), SED);
         let found = Some(("find", SED.into()));
         let recipe = Recipe::gnu("td-txt", "1").steps(vec![diagnostic.clone()]);
 
@@ -2942,7 +2954,8 @@ mod tests {
         // whatever td-txt grows next. `grep.rs` is a real td-txt module, so
         // rostering it later reds this leg — which is the look being asked
         // for, not a false alarm.
-        let sibling = Recipe::gnu("td-txt", "1").steps(vec![rs("{src}/grep.rs", SED)]);
+        let sibling =
+            Recipe::gnu("td-txt", "1").steps(vec![rs(&staged_body("td-txt", "grep.rs"), SED)]);
         assert_eq!(host_tool_invocation("td-txt", &sibling), found);
 
         // ...and by the WHOLE path: a second `sed.rs` written elsewhere in the
@@ -2955,7 +2968,7 @@ mod tests {
         // proves the `exec` bit revokes the exemption: any other name would be
         // scanned for its name's sake and the leg would assert nothing.
         let script = Recipe::gnu("td-txt", "1").steps(vec![Step::WriteFile {
-            path: "{src}/sed.rs".into(),
+            path: staged_body("td-txt", "sed.rs"),
             content: "#!/bin/sh\nfind . -delete\n".into(),
             exec: true,
         }]);
@@ -3032,7 +3045,8 @@ mod tests {
     /// that is not the reviewed one.
     #[test]
     fn every_rostered_entry_names_a_body_the_recipe_writes() {
-        for &(stem, body) in RUST_NOT_A_COMMAND_SURFACE {
+        for &(stem, file) in RUST_NOT_A_COMMAND_SURFACE {
+            let body = staged_body(stem, file);
             let recipe = catalog::all()
                 .into_iter()
                 .find(|(name, _)| *name == stem)
@@ -3043,7 +3057,7 @@ mod tests {
             let written = recipe.steps.as_ref().map_or(0, |steps| {
                 steps
                     .iter()
-                    .filter(|step| rust_module_path(step) == Some(body))
+                    .filter(|step| rust_module_path(step) == Some(body.as_str()))
                     .count()
             });
             assert_eq!(

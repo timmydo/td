@@ -15,6 +15,12 @@
 //! differ (`x\|xy` on `xy`). Exploring was once limited to patterns containing an
 //! alternation; a bounded repeat can also need an earlier greedy one to give ground,
 //! so that shortcut returned a short match (see `match_from`).
+//!
+//! It is one crate td's programs share (AGENTS.md principle 2): td-txt, built by
+//! a direct rustc, includes this file as its `regex` module by `#[path]`, and
+//! td-mail depends on the crate by path for the engine under its rules dialect.
+
+#![forbid(unsafe_code)]
 
 /// A compile error. The message follows GNU's wording where the corpus asserts a
 /// diagnostic; callers prefix it with the program name.
@@ -28,7 +34,7 @@ pub struct Error {
 }
 
 impl Error {
-    fn new(msg: impl Into<String>) -> Self {
+    pub fn new(msg: impl Into<String>) -> Self {
         Self { msg: msg.into() }
     }
 }
@@ -2318,6 +2324,12 @@ fn m_repeat(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

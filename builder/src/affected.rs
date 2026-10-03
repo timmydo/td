@@ -1580,12 +1580,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 
     // The library crates the applications share are staged into their
     // recipes beside the toolkit, so an edit reaches the same consumers.
-    const SHARED_LIBRARIES: [&str; 6] = [
+    const SHARED_LIBRARIES: &[&str] = &[
         "td-civil/",
         "td-fetch-client/",
         "td-html/",
         "td-json/",
         "td-kv/",
+        "td-regex/",
         "td-toml/",
     ];
     if SHARED_LIBRARIES.iter().any(|dir| p.starts_with(dir)) && !p.contains("..") {
@@ -2674,6 +2675,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-html/src/lib.rs",
         "td-json/src/lib.rs",
         "td-kv/src/lib.rs",
+        "td-regex/src/lib.rs",
         "td-toml/src/lib.rs",
         "td-json/Cargo.toml",
         "td-toml/Cargo.toml",

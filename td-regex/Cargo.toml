@@ -1,0 +1,26 @@
+[package]
+name = "td-regex"
+version = "0.1.0"
+edition = "2021"
+description = "td's dependency-free POSIX regular expressions (BRE and ERE) over bytes in the C locale, with a step budget: the engine behind td's grep and sed and the mail client's rules"
+license = "GPL-3.0-or-later"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from
+# a worktree nested under it (see the root Cargo.toml). td-mail names this
+# crate as `td-regex = { path = "../td-regex" }`, the one sibling-dependency
+# spelling the lock guard admits (AGENTS.md 'Rust code'); td-txt, built by a
+# direct rustc, includes src/lib.rs as a module by `#[path]` instead. This
+# crate depends on nothing but `std`.
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

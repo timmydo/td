@@ -17,6 +17,8 @@
 //! contract.
 
 mod grep;
+// The engine is the td-regex crate's one file, shared with td-mail.
+#[path = "../../td-regex/src/lib.rs"]
 mod regex;
 mod sed;
 mod util;
@@ -178,10 +180,14 @@ mod tests {
         // marker it counts -- which it would, three times, and scan itself
         // into a failure.
         let marker = concat!("#[cfg", "(test)]");
-        for name in ["main.rs", "grep.rs", "regex.rs", "sed.rs", "util.rs"] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join(name);
+        for name in [
+            "src/main.rs",
+            "src/grep.rs",
+            "../td-regex/src/lib.rs",
+            "src/sed.rs",
+            "src/util.rs",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
             let text = std::fs::read_to_string(&path).unwrap();
             // Truncating at the marker strips the WHOLE test half only while
             // there is exactly one, which is what makes this scan complete.

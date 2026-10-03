@@ -17,6 +17,7 @@ pub fn recipe() -> Recipe {
             "td-html",
             "td-json",
             "td-kv",
+            "td-regex",
             "td-toml",
             "td-ui",
             "td-compositor",
@@ -52,6 +53,7 @@ mod tests {
                 "td-html".into(),
                 "td-json".into(),
                 "td-kv".into(),
+                "td-regex".into(),
                 "td-toml".into(),
                 "td-ui".into(),
                 "td-compositor".into(),
@@ -86,6 +88,7 @@ mod tests {
                 "td-json",
                 "td-kv",
                 "td-mail",
+                "td-regex",
                 "td-toml",
                 "td-ui",
             ]
@@ -98,6 +101,7 @@ mod tests {
             "td-html",
             "td-json",
             "td-kv",
+            "td-regex",
             "td-toml",
             "td-ui",
         ] {

@@ -461,6 +461,7 @@ mod tests {
                 "td-pass",
                 "td-photo",
                 "td-portal",
+                "td-regex",
                 "td-review",
                 "td-secret",
                 "td-setup",

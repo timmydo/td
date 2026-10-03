@@ -15,8 +15,7 @@ mod compose;
 mod config;
 mod jmap;
 mod keybindings;
-// The shared module carries td-txt's whole engine; td-mail reads one adapter.
-#[allow(dead_code)]
+// td-mail's rules dialect over td-txt's engine, the td-regex crate.
 mod regex;
 mod rules;
 mod spam;
