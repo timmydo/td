@@ -4,6 +4,7 @@ use td_ui::chrome::{self, Bar};
 use td_ui::editor_dialog::Target;
 use td_ui::editor_keys::Profile;
 use td_ui::editor_render::{Geometry, MENU_LABELS};
+use td_ui::keys;
 use td_ui::menus;
 use td_ui::raster::Raster;
 #[cfg(test)]
@@ -448,6 +449,135 @@ pub(crate) fn header(geometry: Geometry, x: i64, y: i64) -> Option<Group> {
     Group::ALL.get(index).copied()
 }
 
+/// What the window binds outside the menus' items in the Windows profile,
+/// spelled as its menus spell their shortcuts.
+const WINDOWS_KEYS: &[(&str, &str)] = &[
+    ("F10", "open the menus; F10 or Escape closes them"),
+    (
+        "arrows",
+        "move the caret; in a menu, move, and Enter or Space chooses",
+    ),
+    ("Escape", "cancel a menu, a prompt, a search or a notice"),
+    ("Ctrl+Tab", "next tab"),
+    ("Ctrl+Shift+Tab", "previous tab"),
+    ("Ctrl+Left/Right", "back or forward a word"),
+    ("Home/End", "start or end of the line"),
+    ("Ctrl+Home/End", "start or end of the document"),
+    ("PageUp/PageDown", "up or down a page"),
+    (
+        "Shift+arrows etc.",
+        "extend the selection: Shift with any key above that moves the caret",
+    ),
+    ("Ctrl+L", "centre the caret's row in the view"),
+    ("Ctrl+click", "follow the link under the pointer"),
+];
+
+/// What the window binds outside the menus' items in the Emacs profile.
+const EMACS_KEYS: &[(&str, &str)] = &[
+    ("F10", "open the menus; F10 or C-g closes them"),
+    (
+        "arrows",
+        "move the caret; in a menu, move, and RET or SPC chooses",
+    ),
+    (
+        "C-g",
+        "cancel a prefix, the mark, a menu, a prompt, a search or a notice; Escape too",
+    ),
+    ("C-SPC", "set the mark"),
+    ("C-a / C-e", "start or end of the line"),
+    ("C-b / C-f", "back or forward a character"),
+    ("C-p / C-n", "previous or next line"),
+    ("M-b / M-f", "back or forward a word"),
+    ("Home / End", "start or end of the line"),
+    ("C-Home / C-End", "start or end of the document"),
+    ("PageUp / PageDown", "up or down a page"),
+    ("C-Tab", "next tab"),
+    ("C-S-Tab", "previous tab"),
+    (
+        "S-arrows etc.",
+        "extend the selection: Shift with an arrow, Home, End, a page key, C-Home or C-End",
+    ),
+    ("C-l", "centre the caret's row in the view"),
+    ("C-click", "follow the link under the pointer"),
+];
+
+/// A directory listing's keys beside its menu's, the same in both
+/// profiles but for how each spells Return.
+const LISTING_KEYS: &[(&str, &str)] = &[
+    ("s", "sort by the next of name, size and modified"),
+    ("^", "open the parent directory in place"),
+    ("g", "read the directory again"),
+    ("q", "close the directory tab"),
+];
+const WINDOWS_LISTING_OPEN: &[(&str, &str)] = &[
+    ("Enter", "open the entry; a directory in place"),
+    ("Shift+Enter", "open the entry in a new tab"),
+];
+const EMACS_LISTING_OPEN: &[(&str, &str)] = &[
+    ("RET", "open the entry; a directory in place"),
+    ("S-RET", "open the entry in a new tab"),
+];
+
+impl Group {
+    fn title(self) -> &'static str {
+        MENU_LABELS.get(self.index()).copied().unwrap_or_default()
+    }
+
+    /// The group's items that `profile` binds a key to, as the menu shows
+    /// them.
+    fn rows(self, profile: Profile) -> Vec<keys::Row> {
+        self.items()
+            .iter()
+            .filter(|item| !item.shortcut(profile).is_empty())
+            .map(|item| keys::row((item.shortcut(profile), item.label())))
+            .collect()
+    }
+}
+
+/// The key list's sections for `profile`: a section per menu group,
+/// titled as its header, from the shortcuts its items show, then the keys
+/// no item carries. The Directory group's section adds a listing's own
+/// keys; it is left out of a window that cannot show a listing
+/// (`listings` false) and comes first when the active tab is one
+/// (`in_listing`). A group with no bound item has no section.
+pub(crate) fn key_sections(
+    profile: Profile,
+    listings: bool,
+    in_listing: bool,
+) -> Vec<keys::Section> {
+    let mut directory = keys::Section {
+        title: Group::Directory.title(),
+        rows: Group::Directory.rows(profile),
+    };
+    let open = match profile {
+        Profile::Windows => WINDOWS_LISTING_OPEN,
+        Profile::Emacs => EMACS_LISTING_OPEN,
+    };
+    directory
+        .rows
+        .extend(open.iter().chain(LISTING_KEYS).copied().map(keys::row));
+    let mut sections: Vec<keys::Section> = Group::ALL
+        .into_iter()
+        .filter(|group| *group != Group::Directory)
+        .map(|group| keys::Section {
+            title: group.title(),
+            rows: group.rows(profile),
+        })
+        .filter(|section| !section.rows.is_empty())
+        .collect();
+    let other = match profile {
+        Profile::Windows => WINDOWS_KEYS,
+        Profile::Emacs => EMACS_KEYS,
+    };
+    if in_listing {
+        sections.insert(0, directory);
+    } else if listings {
+        sections.push(directory);
+    }
+    sections.push(keys::Section::new("Other keys", other));
+    sections
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +697,85 @@ mod tests {
         assert!(geometry.menu(usize::MAX).is_none());
         let help = geometry.menu(Group::Help.index()).unwrap();
         assert_eq!(help.x + i64::from(help.width), 248);
+    }
+
+    /// The key list's sections are the menus' groups with their bound
+    /// items as the menus show them, each profile in its own spelling,
+    /// then the keys no item carries; the Directory section is a file
+    /// window's, first when a listing is active.
+    #[test]
+    fn key_sections_are_the_menus_bound_items_then_the_other_keys() {
+        let titles = |sections: &[keys::Section]| -> Vec<&str> {
+            sections.iter().map(|section| section.title).collect()
+        };
+        let find = |sections: &[keys::Section], title: &str| -> keys::Section {
+            sections
+                .iter()
+                .find(|section| section.title == title)
+                .unwrap()
+                .clone()
+        };
+        let windows = key_sections(Profile::Windows, false, false);
+        // Windows binds no Help item, so Help has no section.
+        assert_eq!(titles(&windows), ["File", "Edit", "Format", "Other keys"]);
+        let emacs = key_sections(Profile::Emacs, true, false);
+        assert_eq!(
+            titles(&emacs),
+            ["File", "Edit", "Format", "Help", "Directory", "Other keys"]
+        );
+        let listing = key_sections(Profile::Emacs, true, true);
+        assert_eq!(
+            titles(&listing),
+            ["Directory", "File", "Edit", "Format", "Help", "Other keys"]
+        );
+        for (profile, sections) in [(Profile::Windows, &windows), (Profile::Emacs, &emacs)] {
+            for group in [Group::File, Group::Edit, Group::Format] {
+                let derived: Vec<keys::Row> = group
+                    .items()
+                    .iter()
+                    .filter(|item| !item.shortcut(profile).is_empty())
+                    .map(|item| keys::Row {
+                        keys: item.shortcut(profile),
+                        what: item.label(),
+                    })
+                    .collect();
+                assert_eq!(find(sections, group.title()).rows, derived);
+            }
+        }
+        let row = |keys, what| keys::Row { keys, what };
+        let file = find(&windows, "File");
+        assert!(file.rows.contains(&row("Ctrl+S", "Save")));
+        assert!(!file.rows.iter().any(|r| r.what == "Quit"));
+        let file = find(&emacs, "File");
+        assert!(file.rows.contains(&row("C-x C-s", "Save")));
+        assert!(file.rows.contains(&row("C-x C-c", "Quit")));
+        assert_eq!(find(&emacs, "Help").rows, [row("M-x", "Command...")]);
+        assert!(!find(&emacs, "Edit").rows.iter().any(|r| r.what == "Redo"));
+        let directory = find(&emacs, "Directory");
+        assert_eq!(
+            directory.rows.first(),
+            Some(&row("w", "Copy Entry Full Path"))
+        );
+        for keys in ["S", "R", "d", "u", "x", "+", "C", "RET", "s", "^", "g", "q"] {
+            assert!(directory.rows.iter().any(|r| r.keys == keys), "{keys}");
+        }
+        assert!(
+            find(&key_sections(Profile::Windows, true, false), "Directory")
+                .rows
+                .contains(&row("Shift+Enter", "open the entry in a new tab"))
+        );
+        let other = find(&windows, "Other keys");
+        assert_eq!(other.rows.first().map(|r| r.keys), Some("F10"));
+        assert!(other.rows.iter().any(|r| r.keys == "Ctrl+Shift+Tab"));
+        let other = find(&emacs, "Other keys");
+        assert!(other.rows.iter().any(|r| r.keys == "C-g"));
+        assert!(other.rows.iter().any(|r| r.keys == "C-S-Tab"));
+        // The window's own F1 and F12 are the overlay's to add.
+        for sections in [&windows, &emacs] {
+            assert!(sections
+                .iter()
+                .flat_map(|section| &section.rows)
+                .all(|r| r.keys != keys::CHORD && r.keys != td_ui::theme::CHORD));
+        }
     }
 }

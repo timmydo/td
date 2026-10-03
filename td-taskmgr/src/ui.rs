@@ -13,11 +13,112 @@ use crate::view::View;
 use crate::worker::{Failure, Update};
 use std::fmt::Write;
 use std::sync::Arc;
+use td_ui::keys::{self, Section};
 use td_ui::raster::{
     self, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK, PAPER, SELECTED,
 };
 use td_ui::{charts, chrome, split, tree_table as tree};
 const TABS: [&str; 5] = ["Overview", "CPU", "Memory", "Network", "Disk"];
+/// What `State::key` does with each key, for the window's key list: in
+/// every focus after `control::BINDINGS`' chords, then in each focus, and
+/// in the process actions' menus and confirmation, which take keys first.
+const EVERYWHERE_KEYS: &[(&str, &str)] = &[
+    (
+        "Tab/S-Tab",
+        "Focus the next or previous of tabs, graph, devices, divider, search, tree and actions.",
+    ),
+    (
+        "Escape",
+        "Leave the contributors; otherwise close a process's detail and focus the tree.",
+    ),
+    ("F10/S-F10", "Open the Process menu for the selected row."),
+    ("M-Up", "In a process's detail, show its parent's."),
+    (
+        "C-a",
+        "Outside search, compare all processes: no selection and no detail.",
+    ),
+];
+const TABS_KEYS: &[(&str, &str)] = &[
+    ("Left/Right", "The previous or next tab."),
+    ("Home/End", "The first or last tab."),
+];
+const GRAPH_KEYS: &[(&str, &str)] = &[
+    ("Left/Right", "Inspect the previous or next sample time."),
+    ("Home/End", "Inspect the first or last sample time."),
+    ("Up/Down", "The previous or next series."),
+    (
+        "Space",
+        "Clear the series: rank the contributors at this time.",
+    ),
+    ("C-Tab", "The next graph."),
+    ("PageUp/PageDown", "Scroll the graph cards."),
+];
+const CONTRIBUTORS_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "The contributor above or below."),
+    ("PageUp/PageDown", "A page of contributors up or down."),
+    ("Home/End", "The first or last contributor."),
+    (
+        "Return/Space",
+        "Reveal the contributor in the process tree.",
+    ),
+    ("Escape", "Back to the graphs."),
+];
+const DEVICES_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "The device above or below."),
+    ("PageUp/PageDown", "A page of devices up or down."),
+    ("Home/End", "The first or last device."),
+    (
+        "Return/Space",
+        "Add the device to the graph or take it out.",
+    ),
+];
+const DIVIDER_KEYS: &[(&str, &str)] = &[
+    (
+        "Up/Down",
+        "Move the divider up or down a step; Left and Right too.",
+    ),
+    ("Home/End", "Move the divider to the top or bottom."),
+];
+const SEARCH_KEYS: &[(&str, &str)] = &[
+    ("a character", "Typed into the query at the caret."),
+    ("Left/Right", "Move the caret."),
+    ("Home/End", "The caret to the start or end."),
+    ("Backspace/Delete", "Delete before or at the caret."),
+    (
+        "C-a",
+        "Select the whole query, which the next edit replaces.",
+    ),
+];
+const TREE_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "The row above or below."),
+    ("PageUp/PageDown", "A page of rows up or down."),
+    ("Home/End", "The first or last row."),
+    ("Left", "Collapse, or go to the parent."),
+    ("Right", "Expand, or go to the first child."),
+    ("S-Left/S-Right", "Scroll sideways."),
+    ("Return/Space", "Show the process's detail."),
+];
+const ACTIONS_KEYS: &[(&str, &str)] = &[("Return", "Open the Process menu for the selected row.")];
+const MENU_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "The item above or below."),
+    ("Left/Right", "Close or open a submenu."),
+    ("Return/Space", "Choose the item."),
+    ("Escape", "Close the innermost menu."),
+];
+const RESULTS_KEYS: &[(&str, &str)] = &[(
+    "Return/Space",
+    "Once signals are sent and no dialog is up, show their results again.",
+)];
+/// While a request is preparing, sending or cancelling, the process
+/// actions take every key but C-q.
+const UNDER_WAY_KEYS: &[(&str, &str)] = &[
+    ("Escape", "Ask to cancel the process request."),
+    ("C-q", "Cancel the request and close the task manager."),
+    (
+        "Any other key",
+        "Nothing, until the confirmation, the results or the cancellation arrives.",
+    ),
+];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
     Tabs,
@@ -1518,6 +1619,56 @@ impl State {
             }
         }
         Outcome::Ignored
+    }
+    /// The keys `key` takes, for the window's key list: what has the
+    /// keyboard first (an open menu, the confirmation, a request under
+    /// way, else the focused pane), then the keys of every focus, then
+    /// the rest.
+    pub fn key_sections(&self) -> Vec<Section> {
+        let mut everywhere = Section::new("Everywhere", &[]);
+        everywhere.rows.extend(
+            crate::control::BINDINGS
+                .iter()
+                .filter_map(|binding| Some(keys::row((binding.chord?, binding.help)))),
+        );
+        everywhere
+            .rows
+            .extend(EVERYWHERE_KEYS.iter().copied().map(keys::row));
+        let mut confirmation = Section::new("Confirmation", td_ui::confirmations::KEYS);
+        confirmation
+            .rows
+            .extend(RESULTS_KEYS.iter().copied().map(keys::row));
+        let mut sections = vec![
+            everywhere,
+            Section::new("Tabs", TABS_KEYS),
+            Section::new("Graph", GRAPH_KEYS),
+            Section::new("Contributors", CONTRIBUTORS_KEYS),
+            Section::new("Devices", DEVICES_KEYS),
+            Section::new("Divider", DIVIDER_KEYS),
+            Section::new("Search", SEARCH_KEYS),
+            Section::new("Process tree", TREE_KEYS),
+            Section::new("Process actions", ACTIONS_KEYS),
+            Section::new("Menus", MENU_KEYS),
+            confirmation,
+            Section::new("Action under way", UNDER_WAY_KEYS),
+        ];
+        let lead = match (self.actions.stage(), self.focus) {
+            ("menu", _) => 9,
+            ("confirmation" | "results", _) => 10,
+            ("preparing" | "sending" | "cancelling", _) => 11,
+            (_, Focus::Tabs) => 1,
+            (_, Focus::Graph) if self.ranking.is_some() => 3,
+            (_, Focus::Graph) => 2,
+            (_, Focus::Devices) => 4,
+            (_, Focus::Divider) => 5,
+            (_, Focus::Search) => 6,
+            (_, Focus::Tree) => 7,
+            (_, Focus::Actions) => 8,
+        };
+        if let Some(head) = sections.get_mut(..=lead) {
+            head.rotate_right(1);
+        }
+        sections
     }
     fn graph_scroll(&mut self, delta: i64) {
         let columns = if self
@@ -3355,5 +3506,119 @@ mod tests {
             .rows()
             .iter()
             .any(|row| row.key == Key::Process(key(1)) && row.exception));
+    }
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn the_key_list_leads_with_what_has_the_keyboard_and_derives_the_bindings() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        let titles = |state: &State| -> Vec<&'static str> {
+            state.key_sections().iter().map(|s| s.title).collect()
+        };
+        let all = [
+            "Everywhere",
+            "Tabs",
+            "Graph",
+            "Contributors",
+            "Devices",
+            "Divider",
+            "Search",
+            "Process tree",
+            "Process actions",
+            "Menus",
+            "Confirmation",
+            "Action under way",
+        ];
+        assert_eq!(state.focus, Focus::Tree);
+        assert_eq!(titles(&state)[0], "Process tree");
+        // The control socket's chorded bindings lead the rows every focus
+        // takes, row for row.
+        let sections = state.key_sections();
+        let everywhere = sections.iter().find(|s| s.title == "Everywhere").unwrap();
+        let bound: Vec<_> = crate::control::BINDINGS
+            .iter()
+            .map(|b| keys::row((b.chord.unwrap(), b.help)))
+            .collect();
+        assert_eq!(everywhere.rows[..bound.len()], bound[..]);
+        assert_eq!(
+            everywhere.rows[bound.len()..],
+            EVERYWHERE_KEYS
+                .iter()
+                .copied()
+                .map(keys::row)
+                .collect::<Vec<_>>()[..]
+        );
+        assert!(bound
+            .iter()
+            .any(|r| r.keys == "C-q" && r.what == "Close the task manager."));
+        let confirmation = sections.iter().find(|s| s.title == "Confirmation").unwrap();
+        assert_eq!(
+            confirmation.rows[..td_ui::confirmations::KEYS.len()],
+            td_ui::confirmations::KEYS
+                .iter()
+                .copied()
+                .map(keys::row)
+                .collect::<Vec<_>>()[..]
+        );
+        assert_eq!(
+            confirmation.rows[td_ui::confirmations::KEYS.len()..],
+            RESULTS_KEYS
+                .iter()
+                .copied()
+                .map(keys::row)
+                .collect::<Vec<_>>()[..]
+        );
+        // Each focus leads with its own; the rest keep their order.
+        for (focus, title) in [
+            (Focus::Tabs, "Tabs"),
+            (Focus::Graph, "Graph"),
+            (Focus::Devices, "Devices"),
+            (Focus::Divider, "Divider"),
+            (Focus::Search, "Search"),
+            (Focus::Tree, "Process tree"),
+            (Focus::Actions, "Process actions"),
+        ] {
+            state.focus = focus;
+            let shown = titles(&state);
+            assert_eq!(shown[0], title);
+            let rest: Vec<_> = all.iter().copied().filter(|t| *t != title).collect();
+            assert_eq!(shown[1..], rest[..]);
+        }
+        state.focus = Focus::Tree;
+        assert!(state.key_sections()[0]
+            .rows
+            .contains(&keys::row(("Left", "Collapse, or go to the parent."))));
+        // An open menu takes the keys first, and leads.
+        state.action_update(crate::actions::Update::Available);
+        state.key("Home", false);
+        state.key("F10", false);
+        assert_eq!(state.actions.stage(), "menu");
+        assert_eq!(titles(&state)[0], "Menus");
+        // A chosen action is under way while it prepares: what the
+        // process actions do with the keys they take then leads.
+        state.key("Right", false);
+        state.key("Return", false);
+        assert_eq!(state.actions.stage(), "preparing");
+        let shown = titles(&state);
+        assert_eq!(shown[0], "Action under way");
+        assert_eq!(shown[1..], all[..all.len() - 1]);
+        let under_way = &state.key_sections()[0];
+        assert_eq!(
+            under_way.rows,
+            UNDER_WAY_KEYS
+                .iter()
+                .copied()
+                .map(keys::row)
+                .collect::<Vec<_>>()
+        );
+        // Escape there cancels the request, which is no longer under way.
+        state.key("Escape", false);
+        assert_ne!(state.actions.stage(), "preparing");
+        assert_eq!(titles(&state)[0], "Process tree");
     }
 }

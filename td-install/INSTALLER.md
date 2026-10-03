@@ -89,6 +89,21 @@ The live window paints in the td-ui theme its file names
 F12, td-ui's theme chord, moves it to the next and keeps it
 (td-ui/DESIGN.md, "Themes"); the window takes F12 before any page does, so
 it asks the service nothing, and the headless renders paint in `SAND`.
+F1, td-ui's key list chord, is the window's too (td-ui/DESIGN.md, "Key
+list"): it opens the list of the pages' keys over the page, the shown
+page's first (with the time zone row focused, its keys and then the
+rest of the form's) and the window's F1 and F12 last, each page's rows
+a table beside the code that binds them (the form's beside its drafts).
+While the list is open it takes every key but F12, its reading keys
+scrolling it and F1, `q` or Escape closing it, and no page hears one or
+asks the service anything; a resize lays it out again. The window
+ignores the pointer, so the list scrolls by its keys only, not the
+wheel. It is painted last over the live frame, never in a headless
+render, and the boot evidence still says the page under it, a frame
+repainted for the list saying nothing new. A native compositor case presses F1 on the seat
+and finds welcome around the panel and its title bar in the selection's
+colour, Enter reaching no page while it is open, and Escape painting
+welcome whole again.
 Its library also has pure, unconnected progress and completion views. A
 live boot starts the window in the graphical session ("Live startup"); the
 end-to-end installation evidence is in place with the medium booted as

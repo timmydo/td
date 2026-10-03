@@ -11,6 +11,7 @@ use td_ui::chrome::{Block, Button, Buttons, Item, List, Slider, Status, DISABLED
 use td_ui::control::{self, decimal, hex, ErrorCode};
 use td_ui::driven::{self, Binding, Input, Outcome, PointerPhase};
 use td_ui::finder;
+use td_ui::keys;
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Scale, Surface, CHROME, INK,
     MISSPELLED, PAPER, SELECTED,
@@ -308,7 +309,7 @@ pub enum Action {
     Contrast,
     Auto,
     AutoPicks,
-    /// The Nth (from 1) of the available looks, `F1`..`F9`.
+    /// The Nth (from 1) of the available looks, `C-1`..`C-9`.
     LookAt(u8),
     ZoomFit,
     Zoom100,
@@ -481,7 +482,7 @@ impl Action {
 /// binds, the argument shape and the help line. Actions without a chord
 /// take an argument or are the agent's (`open`); the pointer reaches
 /// `select` by pressing a cell and `scroll` by the wheel.
-pub const BINDINGS: [Binding; 63] = [
+pub const BINDINGS: &[Binding] = &[
     Binding {
         name: "open",
         chord: None,
@@ -730,55 +731,55 @@ pub const BINDINGS: [Binding; 63] = [
     },
     Binding {
         name: "look-1",
-        chord: Some("F1"),
+        chord: Some("C-1"),
         arguments: "",
         help: "Set the look to the first of the available looks, the look strip's order (develop mode).",
     },
     Binding {
         name: "look-2",
-        chord: Some("F2"),
+        chord: Some("C-2"),
         arguments: "",
         help: "Set the look to the second available look (develop mode).",
     },
     Binding {
         name: "look-3",
-        chord: Some("F3"),
+        chord: Some("C-3"),
         arguments: "",
         help: "Set the look to the third available look (develop mode).",
     },
     Binding {
         name: "look-4",
-        chord: Some("F4"),
+        chord: Some("C-4"),
         arguments: "",
         help: "Set the look to the fourth available look (develop mode).",
     },
     Binding {
         name: "look-5",
-        chord: Some("F5"),
+        chord: Some("C-5"),
         arguments: "",
         help: "Set the look to the fifth available look (develop mode).",
     },
     Binding {
         name: "look-6",
-        chord: Some("F6"),
+        chord: Some("C-6"),
         arguments: "",
         help: "Set the look to the sixth available look (develop mode).",
     },
     Binding {
         name: "look-7",
-        chord: Some("F7"),
+        chord: Some("C-7"),
         arguments: "",
         help: "Set the look to the seventh available look (develop mode).",
     },
     Binding {
         name: "look-8",
-        chord: Some("F8"),
+        chord: Some("C-8"),
         arguments: "",
         help: "Set the look to the eighth available look (develop mode).",
     },
     Binding {
         name: "look-9",
-        chord: Some("F9"),
+        chord: Some("C-9"),
         arguments: "",
         help: "Set the look to the ninth available look (develop mode).",
     },
@@ -2418,6 +2419,29 @@ impl Controller {
         }
     }
 
+    /// The window's key list (`F1`): the chooser's keys first while it
+    /// owns the keyboard, then every chorded binding in `BINDINGS`, its
+    /// chord and help line, so the list cannot drift from the table.
+    pub fn key_sections(&self) -> Vec<keys::Section> {
+        let mut sections = Vec::new();
+        if self.chooser.is_some() {
+            sections.push(keys::Section::new("Roll chooser", Self::CHOOSER_KEYS));
+        }
+        sections.push(keys::Section {
+            title: "td-photo",
+            rows: BINDINGS
+                .iter()
+                .filter_map(|binding| {
+                    Some(keys::Row {
+                        keys: binding.chord?,
+                        what: binding.help,
+                    })
+                })
+                .collect(),
+        });
+        sections
+    }
+
     /// The open chooser: the listed folder's path and the finder.
     pub fn chooser(&self) -> Option<(&[u8], &finder::Controller)> {
         self.chooser
@@ -3306,7 +3330,7 @@ impl Controller {
             // finder's key or a typed filter character, and no binding is
             // looked up under it.
             Input::Key { chord } if self.chooser.is_some() => self.chooser_key(chord),
-            Input::Key { chord } => match driven::bound(&BINDINGS, chord) {
+            Input::Key { chord } => match driven::bound(BINDINGS, chord) {
                 Some(binding) => {
                     let action = Action::parse(binding.name).ok_or(Error::BadArgument)?;
                     self.dispatch(action, &[])
@@ -4647,6 +4671,23 @@ impl Controller {
         });
         Ok((Outcome::Changed, effects))
     }
+
+    /// The chooser's keys as the key list shows them: `chooser_key`'s,
+    /// each with the finder's rule for it.
+    const CHOOSER_KEYS: &'static [(&'static str, &'static str)] = &[
+        ("Up/Down", "Move the selection a folder."),
+        ("PageUp/PageDown", "Move the selection a page."),
+        ("Home/End", "Select the first or the last folder."),
+        ("Return", "Enter the selected folder."),
+        ("C-Return", "Open the listed folder as the roll."),
+        (
+            "Backspace",
+            "Delete the filter's last character; with no filter, go up a folder.",
+        ),
+        ("M-Up/^", "Go up a folder."),
+        ("Escape", "Close the chooser."),
+        ("a character", "Type it into the filter."),
+    ];
 
     /// A chord while the chooser is open: the finder's keys by their
     /// names, `C-Return` its accept, `M-Up` and `^` its parent (so a caret

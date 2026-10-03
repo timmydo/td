@@ -534,6 +534,79 @@ fn physical_f12_moves_keeps_and_paints_the_theme() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "harbor\n");
 }
 
+/// F1 on the seat opens the window's key list: its title bar is painted
+/// over the frame in the selection's colour; Tab, a key the state binds,
+/// and a click on a tab reach nothing while it is open; Escape closes it,
+/// the frame is the state's again, and Tab then moves the focus.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn physical_f1_shows_the_key_list_until_escape_and_keeps_the_state() {
+    use td_ui::raster::{Scale, Surface, SELECTED};
+    let server_directory = Directory::new();
+    let mut compositor = Compositor::start(&server_directory);
+    let client_directory = Directory::new();
+    let client = TaskProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-taskmgr") {
+            break place;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mapping deadline: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let before = wait_state(&client, |s| counter(s, "presentations") > 0);
+    let surface = Surface::new(place.width, place.height, Scale::default()).unwrap();
+    let title = td_ui::keys::Panel::new(surface).unwrap().title;
+    let selected = &SELECTED.to_be_bytes()[1..];
+    // The title bar's top row, above its text, all in the selection's
+    // colour: the frame shows the list.
+    let listed = |tile: &[u8]| {
+        let row = title.y as usize * place.width;
+        (title.x as usize..title.x as usize + title.width as usize)
+            .all(|x| &tile[(row + x) * 3..(row + x) * 3 + 3] == selected)
+    };
+    let shown = |compositor: &Compositor, open: bool, label: &str| {
+        let deadline = Instant::now() + TIMEOUT;
+        while listed(&compositor.tile(&place)) != open {
+            assert!(
+                Instant::now() < deadline,
+                "{label} deadline: {}",
+                client.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    shown(&compositor, false, "the state's frame");
+    tap(&mut compositor, 59);
+    shown(&compositor, true, "the key list");
+    tap(&mut compositor, 15);
+    compositor.click(place.x + 350, place.y + 10);
+    // The cursor goes to the bottom corner, off the title bar.
+    compositor.pointer(place.x + 2, place.y + place.height - 2, 0);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(listed(&compositor.tile(&place)), "the list stays open");
+    let after = state(&client);
+    // The live counters move with the sampling; where the user is does not.
+    for field in ["tab", "focus", "query", "live", "actions", "detail"] {
+        assert_eq!(
+            after.get(field),
+            before.get(field),
+            "{field}: the list keeps the state's keys and clicks"
+        );
+    }
+    tap(&mut compositor, 1);
+    shown(&compositor, false, "the frame again");
+    assert_eq!(state(&client).get("focus"), before.get("focus"));
+    tap(&mut compositor, 15);
+    wait_state(&client, |s| s.get("focus") != before.get("focus"));
+    drop(client);
+    compositor.stop();
+}
+
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn live_history_graph_tree_and_hidden_window_collection() {

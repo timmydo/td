@@ -254,11 +254,12 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
 }
 
 /// Which files may name which toolkit modules (td-ui/DESIGN.md, Public
-/// surface): the controller the pure seam, raster, chrome and control;
-/// `main` the seam, the replay runner, the raster's surface and control;
-/// `window` the client, the wire, the display, the font, the pointer, the
-/// socket and its worker, the seam, the raster, control, and the theme
-/// with the file it is kept in. A braced group
+/// surface): the controller the pure seam, raster, chrome, control and
+/// the key list's sections; `main` the seam, the replay runner, the
+/// raster's surface and control; `window` the client, the wire, the
+/// display, the font, the pointer, the socket and its worker, the seam,
+/// the raster, control, the key list, and the theme with the file it is
+/// kept in. A braced group
 /// after the crate's path would read as no name, so the scanner refuses
 /// one: name one item per line.
 #[test]
@@ -289,6 +290,7 @@ fn the_toolkit_is_named_only_where_the_design_says() {
                 "control",
                 "driven",
                 "finder",
+                "keys",
                 "raster",
             ])
         } else {
@@ -310,6 +312,7 @@ fn the_toolkit_is_named_only_where_the_design_says() {
             "driven",
             "font",
             "keyboard",
+            "keys",
             "pinned_face",
             "pointer",
             "raster",

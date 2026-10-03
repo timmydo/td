@@ -20,6 +20,8 @@ const HELP: &str = concat!(
     "Page Down move between details, Enter asks the service to seek consent\n",
     "at the secure prompt, and Escape withdraws it; Escape at the consent\n",
     "view withdraws it too. Progress and its outcome follow the service.\n",
+    "On any page F1 shows these keys over it until F1, q or Escape, and\n",
+    "F12 moves the window to the next colour theme and keeps it.\n",
     "When the boot's command line holds td.setup-input=1 it also says, on\n",
     "standard error, each page state it showed while holding the keyboard.\n",
     "--preview writes the welcome page as a PPM image to stdout.\n",

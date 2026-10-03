@@ -59,7 +59,11 @@ and Save As through one worker, with literal keyboard path prompts and both
 key profiles. Native mouse input selects/drags text, switches tabs, uses their
 close marks and scrolls with wheels/touchpads. A small bitmap arrow supplies
 the cursor. Click File/Edit/Format/Help or press F10 for menus; arrow keys
-navigate, Return activates and Escape/Ctrl+G cancels. Edit switches key
+navigate, Return activates and Escape/Ctrl+G cancels. F1 shows the
+window's keys over it, the menus' shortcuts in the active profile's
+spelling and the keys no menu carries; F1, q or Escape closes the list,
+and the editor hears no key while it is open. F12 moves the window to
+td-ui's next colour theme. Edit switches key
 profiles; Format exposes Soft Wrap, Auto Fill and Fill Paragraph.
 Format > Fill Column sets the active tab's fill width (20–240 cells,
 default 72) without reflowing existing text. Return applies the number,
@@ -391,7 +395,8 @@ The default appearance uses warm off-white paper and charcoal text, with
 muted chrome and blue-grey selection. A synthetic medium bitmap weight adds
 a faint right edge while preserving the original glyph pixels and 8x16
 cell spacing. Both previews use it; no system fonts or theme services are
-needed. There is no theme or weight settings UI yet.
+needed. A live window moves to td-ui's next fixed theme on F12 and keeps
+it; there is no weight setting.
 
 Inspect a deterministic 800x600 rendering without a display:
 

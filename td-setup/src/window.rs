@@ -14,6 +14,7 @@ use td_install::installation_plan::{Destination, Plan, Settings};
 
 use td_ui::client::{run, App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
+use td_ui::keys::{self, Overlay, Section, Step};
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Scale, Surface, CHROME};
 use td_ui::theme_file::Kept;
 use td_ui::wayland::{connect, endpoint};
@@ -54,6 +55,8 @@ struct Window {
     typeface: Option<td_ui::typeface::Typeface>,
     /// The theme the live window paints in and the file it is kept in.
     theme: Kept,
+    /// The key list `keys::CHORD` shows over the page.
+    key_list: Overlay,
     size: (usize, usize),
     dirty: bool,
     front: Front,
@@ -106,6 +109,38 @@ enum Action {
     /// Stop waiting: the outstanding request, and its connection, go.
     Abandon,
 }
+
+/// The keys `Wizard::key` takes on each page, for the window's key list;
+/// the settings form's own are `settings`'.
+const WELCOME_KEYS: &[(&str, &str)] =
+    &[("Return", "ask the installer service for the eligible disks")];
+const DISK_KEYS: &[(&str, &str)] = &[
+    ("Up/Down", "select the disk above or below"),
+    (
+        "PageUp/PageDown",
+        "page through the selected disk's identity",
+    ),
+    ("Return", "continue with the selected disk to the settings"),
+    (
+        "Escape",
+        "return to welcome; while the disks are awaited, stop asking",
+    ),
+];
+const SETTINGS_KEYS: &[(&str, &str)] = &[("Escape", "back to the disks, keeping the drafts")];
+const TIME_ZONE_KEYS: &[(&str, &str)] = &[
+    ("Return", "ask the installer service to review the form"),
+    ("Escape", "back to the disks, keeping the drafts"),
+];
+const REVIEW_KEYS: &[(&str, &str)] = &[
+    ("PageUp/PageDown", "page through the review's details"),
+    (
+        "Return",
+        "ask the installer service to seek consent at the secure prompt",
+    ),
+    ("Escape", "withdraw the review and go back to the settings"),
+];
+const CONSENT_KEYS: &[(&str, &str)] =
+    &[("Escape", "withdraw the review and go back to the settings")];
 
 /// Shown on settings while a proposal is with the service.
 const REVIEWING: &str = "Asking the installer service for a review\u{2026}";
@@ -262,6 +297,44 @@ impl Wizard {
             _ => {}
         }
         Action::None
+    }
+
+    /// The pages' keys for the window's list, as `key` and the drafts take
+    /// them, the shown page's first: the time zone's before the rest of
+    /// the form's while its row has the focus.
+    fn key_sections(&self) -> Vec<Section> {
+        let mut settings = Section::new("Settings", SETTINGS_KEYS);
+        let fields = crate::settings::FIELD_KEYS.iter().copied().map(keys::row);
+        settings.rows.extend(fields);
+        let mut zone = Section::new("Time zone", TIME_ZONE_KEYS);
+        let zones = crate::settings::ZONE_KEYS.iter().copied().map(keys::row);
+        zone.rows.extend(zones);
+        let mut sections = vec![
+            Some(Section::new("Welcome", WELCOME_KEYS)),
+            Some(Section::new("Disks", DISK_KEYS)),
+            Some(settings),
+            Some(zone),
+            Some(Section::new("Review", REVIEW_KEYS)),
+            Some(Section::new("Consent", CONSENT_KEYS)),
+        ];
+        let leads: &[usize] = match &self.page {
+            Page::Welcome => &[0],
+            Page::Waiting | Page::Unavailable | Page::Refused(_) | Page::Destinations => &[1],
+            Page::Settings if self.draft.focused() == TIME_ZONE => &[3, 2],
+            Page::Settings => &[2],
+            Page::Review => &[4],
+            Page::Progress(Progress::Consent) => &[5],
+            // These take no key.
+            Page::Progress(_) | Page::Complete => &[],
+        };
+        let mut ordered = Vec::with_capacity(sections.len());
+        ordered.extend(
+            leads
+                .iter()
+                .filter_map(|&lead| sections.get_mut(lead).and_then(Option::take)),
+        );
+        ordered.extend(sections.into_iter().flatten());
+        ordered
     }
 
     fn select(&mut self, index: usize) {
@@ -725,6 +798,7 @@ impl Window {
             font: td_ui::font::pinned()?,
             typeface: None,
             theme: Kept::default(),
+            key_list: Overlay::default(),
             size: DEFAULT_SIZE,
             dirty: true,
             front: Front::new(),
@@ -791,6 +865,8 @@ impl Window {
                         },
                     );
                     self.dirty = true;
+                    let surface = self.surface()?;
+                    self.key_list.lay_out(surface);
                 }
                 self.client.acknowledge(serial)
             }
@@ -806,21 +882,10 @@ impl Window {
             }
             | Handled::SeatRemoved => Err("installer keyboard is unavailable".into()),
             // Only translated keyboard presses navigate the live pages.
-            Handled::Keyboard(event) => {
-                if let Some(chord) = keyboard_chord(event)? {
-                    // The toolkit's theme chord is the window's, never a
-                    // page's, and asks the service for nothing.
-                    if chord == td_ui::theme::CHORD {
-                        if let Err(why) = self.theme.advance() {
-                            let _ = writeln!(std::io::stderr(), "td-setup: {why}");
-                        }
-                    } else {
-                        self.front.key(&chord, Path::new(SOCKET));
-                    }
-                    self.dirty = true;
-                }
-                Ok(())
-            }
+            Handled::Keyboard(event) => match keyboard_chord(event)? {
+                Some(chord) => self.chord(chord),
+                None => Ok(()),
+            },
             Handled::GlobalRemoved { .. }
             | Handled::Capabilities { .. }
             | Handled::Pointer(_)
@@ -833,12 +898,43 @@ impl Window {
         }
     }
 
+    /// The surface the window paints at its current extent.
+    fn surface(&self) -> Result<Surface> {
+        let (width, height) = self.size;
+        Surface::new(width, height, Scale::new(1).map_err(error)?).map_err(error)
+    }
+
+    /// A chord from the seat's keyboard. The theme chord is the window's,
+    /// never a page's, and asks the service for nothing; so is
+    /// `keys::CHORD`, which opens the key list, and while that is open it
+    /// takes every other chord and no page hears one.
+    fn chord(&mut self, chord: String) -> Result<()> {
+        if chord == td_ui::theme::CHORD {
+            if let Err(why) = self.theme.advance() {
+                let _ = writeln!(std::io::stderr(), "td-setup: {why}");
+            }
+        } else if self.key_list.is_open() {
+            let surface = self.surface()?;
+            if self.key_list.key(&chord, surface) == Step::Kept {
+                return Ok(());
+            }
+        } else if chord == keys::CHORD {
+            let surface = self.surface()?;
+            self.key_list
+                .open(self.front.wizard.key_sections(), surface);
+        } else {
+            self.front.key(&chord, Path::new(SOCKET));
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
     fn draw(&mut self) -> Result<()> {
         if !self.dirty || !self.client.can_present() {
             return Ok(());
         }
         let (width, height) = self.size;
-        let surface = Surface::new(width, height, Scale::new(1).map_err(error)?).map_err(error)?;
+        let surface = self.surface()?;
         let wizard = &mut self.front.wizard;
         let settings = match &wizard.page {
             Page::Settings => Some(
@@ -901,6 +997,7 @@ impl Window {
             font,
             typeface,
             theme,
+            key_list,
             ..
         } = self;
         // Whether the frame shows the page, not the too-small ground.
@@ -926,7 +1023,7 @@ impl Window {
                     .as_ref()
                     .map(|view| raster.paint(view, surface.bounds()).map_err(error)),
             };
-            match painted {
+            let result = match painted {
                 Some(result) => result,
                 // Too small for the page: a plain chrome ground, never garbage.
                 None => {
@@ -940,7 +1037,10 @@ impl Window {
                     });
                     Ok(())
                 }
-            }
+            };
+            // The key list, when open, is the last thing painted.
+            key_list.emit(surface, surface.bounds(), &mut |draw| raster.draw(draw));
+            result
         })?;
         if presented {
             self.dirty = false;
@@ -2009,5 +2109,139 @@ mod tests {
         settle(&mut front, Page::Unavailable);
         assert!(front.wizard.disks.is_empty());
         assert!(front.service.is_none());
+    }
+
+    fn titles(wizard: &Wizard) -> Vec<&'static str> {
+        wizard
+            .key_sections()
+            .iter()
+            .map(|section| section.title)
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn the_key_list_leads_with_the_shown_page_and_derives_the_form() {
+        let mut wizard = Wizard::new();
+        let order = [
+            "Welcome",
+            "Disks",
+            "Settings",
+            "Time zone",
+            "Review",
+            "Consent",
+        ];
+        assert_eq!(titles(&wizard), order);
+        let sections = wizard.key_sections();
+        assert_eq!(
+            sections[0].rows,
+            [keys::row((
+                "Return",
+                "ask the installer service for the eligible disks"
+            ))]
+        );
+        // The form's rows are the drafts' own tables, after the wizard's.
+        let settings = &sections[2];
+        assert_eq!(settings.rows[0].keys, "Escape");
+        let fields: Vec<_> = crate::settings::FIELD_KEYS
+            .iter()
+            .copied()
+            .map(keys::row)
+            .collect();
+        assert_eq!(settings.rows[1..], fields[..]);
+        let zone = &sections[3];
+        assert_eq!(zone.rows[0].keys, "Return");
+        let zones: Vec<_> = crate::settings::ZONE_KEYS
+            .iter()
+            .copied()
+            .map(keys::row)
+            .collect();
+        assert_eq!(zone.rows[2..], zones[..]);
+
+        wizard.key("Return");
+        assert_eq!(titles(&wizard)[..2], ["Disks", "Welcome"]);
+        let mut wizard = listed();
+        assert_eq!(titles(&wizard)[..2], ["Disks", "Welcome"]);
+        assert!(wizard.key_sections()[0]
+            .rows
+            .contains(&keys::row(("Up/Down", "select the disk above or below"))));
+        wizard.key("Down");
+        wizard.key("Return");
+        assert_eq!(wizard.page, Page::Settings);
+        assert_eq!(titles(&wizard)[..3], ["Settings", "Welcome", "Disks"]);
+        let wizard = filled();
+        assert_eq!(wizard.draft.focused(), TIME_ZONE);
+        assert_eq!(
+            titles(&wizard),
+            [
+                "Time zone",
+                "Settings",
+                "Welcome",
+                "Disks",
+                "Review",
+                "Consent"
+            ]
+        );
+        let mut wizard = on_review();
+        assert_eq!(titles(&wizard)[0], "Review");
+        wizard.key("Return");
+        send_execute(&mut wizard);
+        wizard.follow(Standing::Review {
+            nonce: wizard.executing.unwrap(),
+            stage: Stage::AwaitingConsent,
+        });
+        assert_eq!(wizard.page, Page::Progress(Progress::Consent));
+        assert_eq!(titles(&wizard)[0], "Consent");
+        wizard.page = Page::Complete;
+        assert_eq!(titles(&wizard), order);
+    }
+
+    /// A window over one end of a socket pair: no compositor reads it.
+    fn window() -> (Window, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        (
+            Window::new(ours, std::env::temp_dir(), false).unwrap(),
+            theirs,
+        )
+    }
+
+    #[test]
+    fn f1_opens_the_key_list_which_keeps_every_key_from_the_pages() {
+        let (mut window, _peer) = window();
+        window.front.wizard = listed();
+        window.dirty = false;
+        window.chord(keys::CHORD.into()).unwrap();
+        assert!(window.key_list.is_open());
+        assert!(window.dirty);
+        assert_eq!(window.key_list.help().first(), 0);
+        // A reading key moves the list, not the disk selection.
+        window.dirty = false;
+        window.chord("Down".into()).unwrap();
+        assert!(window.dirty);
+        assert_eq!(window.key_list.help().first(), 1);
+        assert_eq!(window.front.wizard.selected, None);
+        // A key the page binds, and one nobody does, change nothing and
+        // paint nothing.
+        window.dirty = false;
+        for chord in ["Return", "Tab", "Left", "x"] {
+            window.chord(chord.into()).unwrap();
+        }
+        assert!(!window.dirty);
+        assert!(window.key_list.is_open());
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        assert_eq!(window.front.wizard.detail, 0);
+        // Escape closes the list and goes nowhere else.
+        window.chord("Escape".into()).unwrap();
+        assert!(!window.key_list.is_open());
+        assert!(window.dirty);
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        // F1 closes it as it opens it; the page hears neither.
+        window.chord(keys::CHORD.into()).unwrap();
+        window.chord(keys::CHORD.into()).unwrap();
+        assert!(!window.key_list.is_open());
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        // Closed, the page has its keys again.
+        window.chord("Down".into()).unwrap();
+        assert_eq!(window.front.wizard.selected, Some(0));
     }
 }

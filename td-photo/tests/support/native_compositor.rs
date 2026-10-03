@@ -703,6 +703,106 @@ fn f12_on_the_seat_paints_and_keeps_the_next_theme() {
     assert_eq!(compositor.tile(&place), harbor);
 }
 
+/// F1 on the seat is the window's key list: the frame is painted again
+/// with the list's title bar over it while the session hears nothing; a
+/// key the session binds is the list's while it is open, a reading key
+/// scrolls it, and Escape closes it, the frame the session's again.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn f1_on_the_seat_shows_the_key_list_over_the_frame() {
+    const KEY_ESCAPE: u32 = 1;
+    const KEY_P: u32 = 25;
+    const KEY_F1: u32 = 59;
+    let compositor_directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let client_directory = Directory::new();
+    let roll = client_directory.0.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    std::fs::write(roll.join("DSC_0001.NEF"), b"not really a nef").unwrap();
+    let client = PhotoProcess::start(
+        &client_directory,
+        &compositor.directory.join("wayland-0"),
+        &roll,
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-photo") {
+            break place;
+        }
+        assert!(Instant::now() < deadline, "unmapped: {}", client.stderr());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    client.settle(1);
+    let state = client.request(2, &["state"]);
+    let frame = compositor.tile(&place);
+    // The receipt says the compositor queued a press, not that the window
+    // took it: a changed frame does, and `wait-idle` speaks for it after.
+    let changed = |compositor: &Compositor, from: &[u8]| {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let tile = compositor.tile(&place);
+            if tile != from {
+                break tile;
+            }
+            assert!(Instant::now() < deadline, "unchanged: {}", client.stderr());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    compositor.key(KEY_F1, true);
+    compositor.key(KEY_F1, false);
+    changed(&compositor, &frame);
+    client.settle(3);
+    let open = compositor.tile(&place);
+    let surface =
+        td_ui::raster::Surface::new(place.width, place.height, td_ui::raster::Scale::default())
+            .unwrap();
+    let title = td_ui::keys::Panel::new(surface).unwrap().title;
+    let selected = td_ui::raster::SELECTED.to_be_bytes();
+    let (x0, y0) = (title.x as usize, title.y as usize);
+    let (width, height) = (title.width as usize, title.height as usize);
+    let filled = (y0..y0 + height)
+        .flat_map(|y| (x0..x0 + width).map(move |x| (y * place.width + x) * 3))
+        .filter(|at| open[*at..*at + 3] == selected[1..])
+        .count();
+    assert!(
+        filled > width * height / 2,
+        "the title bar is not the list's: {filled} of {}",
+        width * height
+    );
+    assert_eq!(
+        client.request(4, &["state"]),
+        state,
+        "F1 is not the session's"
+    );
+    // `p` would pick the photo; the list keeps it. `End` then scrolls the
+    // list, a frame that says the window took both.
+    compositor.key(KEY_P, true);
+    compositor.key(KEY_P, false);
+    compositor.key(KEY_END, true);
+    compositor.key(KEY_END, false);
+    changed(&compositor, &open);
+    client.settle(5);
+    assert_eq!(
+        client.request(6, &["state"]),
+        state,
+        "p reached the session"
+    );
+    compositor.key(KEY_ESCAPE, true);
+    compositor.key(KEY_ESCAPE, false);
+    let deadline = Instant::now() + TIMEOUT;
+    while compositor.tile(&place) != frame {
+        assert!(Instant::now() < deadline, "still open: {}", client.stderr());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    client.settle(7);
+    assert_eq!(compositor.tile(&place), frame);
+    assert_eq!(
+        client.request(8, &["state"]),
+        state,
+        "Escape is the list's, not the session's"
+    );
+}
+
 /// The status row, the last line of `text`, is `full`, or, when the tile is
 /// narrower than the row, its head ended with an ellipsis; either way the row shown
 /// reaches `note`, the start of the note under test. The wide replay test

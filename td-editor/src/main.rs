@@ -32,6 +32,7 @@ const HELP: &str = concat!(
     "Dirty Reload additionally requires Ctrl+D and clears undo history.\n",
     "Mouse: select/drag, tab clicks/close marks, wheel/touchpad scrolling.\n",
     "Menus: click a header or F10; arrows navigate, Return selects, Escape cancels.\n",
+    "F1 lists the window's keys over it; F1 or Escape closes. F12: next theme.\n",
     "Edit switches key profiles. Format: Soft Wrap, Auto Fill, Fill Paragraph.\n",
     "Format > Fill Column sets 20..=240 cells for that tab (default 72).\n",
     "Emacs M-x or Help > Command: exact editor names; Tab completes, Return runs.\n",

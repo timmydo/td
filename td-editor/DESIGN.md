@@ -145,6 +145,8 @@ or an Emacs Lisp interface. Ctrl+Shift+Tab selects the previous tab in both
 profiles. M-q fills the current paragraph and C-l centers the caret's visual
 row in the viewport in both profiles, including an embedded mail draft pane.
 Common navigation keys and Shift-selection work in both profiles.
+F1 lists the profile's keys over the window and F12 moves it to the next
+colour theme; both are the window's, never the editor's.
 
 Find and Replace use literal, case-sensitive UTF-8 strings, without regular
 expressions. Search reports reaching the end before an explicit next search
@@ -1158,7 +1160,8 @@ theme. A live window paints in the theme its file names
 theme chord, moves it to the next and keeps it there: the window takes F12
 from the keyboard before the editor's own chords, so neither the editor
 nor the control socket's keys ever see it, and a modified F12 is the
-editor's. Tests, `--preview` and the window preview's in-process cases
+editor's. F1 is the window's too, the key list over the frame ("Implemented
+key list"). Tests, `--preview` and the window preview's in-process cases
 paint in `SAND`. The caret is one logical pixel wide; an upstream
 soft-wrap caret remains inside the row's right edge.
 
@@ -2241,7 +2244,9 @@ File, Edit, Format and Help open with a left-button press on their header.
 F10 opens File in both key profiles; F10, Escape or C-g closes an open menu
 without changing document selection. Left/Right switches groups and Up/Down
 moves among enabled items, wrapping within that group. Return or Space
-activates the selected item. Repeated keys never activate or navigate menus.
+(the keymap spells an unmodified space `" "`) activates the selected item;
+with no menu open Space types a space. Repeated keys never activate or
+navigate menus.
 Other keys are consumed while open, not interpreted as text or Emacs prefixes.
 Opening cancels pending key prefix, Emacs mark, controller drag and native
 held/repeat/wheel state, preserving the document and selection. The new
@@ -2313,6 +2318,59 @@ cancellation with selection retained. Fake-compositor tests drive physical
 F10, mouse menus, disabled/outside/repeated input, profile/format changes,
 Save and dirty-close flows, stale targets, resize and late file completion.
 Menus do not imply a remote-control socket, GPU or jail milestone.
+
+### Implemented key list
+
+F1, td-ui's `keys::CHORD`, shows the window's keys over the frame in
+td-ui's `keys::Overlay` and hides them again, as the widget window does
+(td-ui/DESIGN.md "Key list"). The window takes it in the physical
+keyboard's key arm after F12, before the editor's chords, so the control
+socket's keys and a replay never open, move or close it. Opening ends a
+pointer gesture under way through the ordinary pointer stop, leaving the
+document, its selection, a pending Emacs prefix and the mark as they
+were, and opens over whatever menu or prompt is showing. While it is
+open every key but F12 is the list's: its reading keys scroll it, F1, q,
+? and Escape close it, and any other key is kept from the editor, its
+menus and its prompts, which hear nothing until it closes; closing it
+leaves an open menu or prompt as it was. A held key repeats only while
+the list moves; a repeat that does not move it, one held at its end
+included, is cancelled. A
+left-button press is the list's, motion reaches neither the menu nor
+the document, and wheel rows scroll it, wherever the pointer is and
+whatever menu or prompt is under it; columns are dropped. A configure
+lays the list out again for the new surface. It is painted last, after
+the scene, the prompt and the menu, in the window's theme; every open,
+move and close asks for a frame. `--preview`, the render checks and the
+window preview's in-process cases never open it.
+
+The rows come from the menus: one section per menu group, titled as its
+header, with each item that has a shortcut in the profile in force, as
+`menu::Item::shortcut` shows it beside `Item::label`, so the list says
+what the menus say and cannot drift from them; a group with no bound
+item (Help, in the Windows profile) has none. The Directory section adds
+a listing's keys that no item carries (`s`, `^`, `g`, `q`, and Return
+and Shift+Return as each profile spells them); it is shown in a file
+window, and first when the active tab is a listing. "Other keys" lists,
+in the profile's own spelling, what the window binds outside the menus:
+F10, the arrows, cancelling, tab switching, motion, Shift-selection, C-l
+and the Control-click that follows a link, and in the Emacs profile the
+mark and C-a/e/b/f/p/n and M-b/f. td-ui ends the list with F1 and F12.
+
+A pure test pins the sections in both profiles: their titles and order,
+the menu-derived rows equal to the items' shortcuts and labels, sample
+rows, the Directory section's place, and no row of F1 or F12. Seat
+fixture tests pin F1 opening over an open menu with a frame asked for, a
+typed letter, Ctrl+A and F10 changing nothing while it is open, `j` and
+the wheel scrolling it, a press reaching neither the menu nor the
+document, F12 still moving the theme, Escape closing the list alone with
+the menu left open, the editor hearing keys again after it, the Emacs
+profile's spelling, the panel's title bar painted over the frame, a
+configure laying the lines out again, and closing painting the frame as
+it was. Another pins the repeat: a held `j` moving the list on each
+repeat with the document unchanged, a held key the list only keeps
+arming no repeat, and End or `j` held at the list's end cancelled on
+its first repeat. Space choosing File > New from F10 in both profiles,
+and typing a space with no menu open, is pinned too.
 
 ### Implemented clipboard admission prerequisite
 

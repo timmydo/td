@@ -3763,7 +3763,7 @@ impl driven::Controller for Session {
     type Error = ui::Error;
 
     fn bindings(&self) -> &'static [Binding] {
-        &ui::BINDINGS
+        ui::BINDINGS
     }
 
     fn action(&mut self, name: &str, arguments: &[&str]) -> Result<Outcome, ui::Error> {
@@ -3851,7 +3851,7 @@ fn replay(rest: &[OsString]) -> Result<(), String> {
 fn help_actions() -> Result<(), String> {
     io::stdout()
         .lock()
-        .write_all(driven::help(&ui::BINDINGS).as_bytes())
+        .write_all(driven::help(ui::BINDINGS).as_bytes())
         .map_err(|e| e.to_string())
 }
 

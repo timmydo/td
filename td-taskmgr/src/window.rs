@@ -9,6 +9,7 @@ use td_taskmgr::ui::{Outcome, Phase, State};
 use td_taskmgr::worker::Worker;
 use td_ui::client::{App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
+use td_ui::keys::{self, Overlay, Step};
 use td_ui::pointer::{self, Wheel};
 use td_ui::raster::{Raster, Scale, Surface};
 use td_ui::wire::Message;
@@ -30,8 +31,11 @@ struct Window {
     typeface: Option<td_ui::typeface::Typeface>,
     /// The theme the live window paints in and the file it is kept in.
     theme: td_ui::theme_file::Kept,
-    /// The theme changed since the last frame, which the state cannot see.
+    /// The theme or the key list changed since the last frame, which the
+    /// state cannot see.
     repaint: bool,
+    /// The key list `keys::CHORD` shows over the frame.
+    key_list: Overlay,
     state: State,
     worker: Option<Worker>,
     actions: Option<td_taskmgr::action_worker::Worker>,
@@ -44,6 +48,9 @@ struct Window {
     last_collection: u64,
     control: Option<td_ui::control_worker::Worker<td_ui::driven::Payload>>,
     remote_pointer: (i64, i64),
+    /// The left button is down from a press the key list took, so its
+    /// release is the list's too.
+    list_press: bool,
     presentations: u64,
 }
 impl Window {
@@ -75,6 +82,7 @@ impl Window {
             typeface: None,
             theme: td_ui::theme_file::Kept::default(),
             repaint: false,
+            key_list: Overlay::default(),
             state,
             worker,
             actions,
@@ -87,6 +95,7 @@ impl Window {
             last_collection: 0,
             control,
             remote_pointer: (0, 0),
+            list_press: false,
             presentations: 0,
         })
     }
@@ -136,16 +145,58 @@ impl Window {
         self.apply(outcome)?;
         Ok(outcome)
     }
+    /// Opens the key list from its top with the state's keys as they are
+    /// now; a drag under way ends first, as the list takes the pointer.
+    fn show_keys(&mut self) {
+        self.state.cancel_gesture();
+        let surface = self.state.surface();
+        self.key_list.open(self.state.key_sections(), surface);
+        self.repaint = true;
+    }
+    /// A chord the open key list takes in the state's stead.
+    fn help_key(&mut self, chord: &str) -> Step {
+        let step = self.key_list.key(chord, self.state.surface());
+        if step != Step::Kept {
+            self.repaint = true;
+        }
+        step
+    }
     fn pointer(&mut self, event: pointer::Event) -> Result<()> {
         match event {
+            // The key list over the frame takes a press and the left
+            // button's release after it; a release ending a press made
+            // before it opened still reaches the state, whose drag the
+            // opening ended.
+            pointer::Event::Button {
+                button,
+                pressed: true,
+                ..
+            } if self.key_list.is_open() && matches!(button, 272 | 273) => {
+                self.list_press |= button == 272;
+            }
+            pointer::Event::Button {
+                button: 272,
+                pressed: false,
+                ..
+            } if self.list_press => self.list_press = false,
+            // Motion under the open list only moves the pointer: the
+            // state behind it would otherwise hover its hidden rows,
+            // and the list itself follows the pointer only in a drag,
+            // which opening ended.
             pointer::Event::Enter { x, y, .. } | pointer::Event::Motion(x, y) => {
                 self.pointer = (i64::from(x).div_euclid(256), i64::from(y).div_euclid(256));
+                if self.key_list.is_open() {
+                    return Ok(());
+                }
                 let outcome = self
                     .state
                     .pointer(Phase::Move, self.pointer.0, self.pointer.1);
                 self.apply(outcome)?;
             }
-            pointer::Event::Leave(_) => self.state.cancel_gesture(),
+            pointer::Event::Leave(_) => {
+                self.list_press = false;
+                self.state.cancel_gesture();
+            }
             pointer::Event::Button {
                 button: 272,
                 pressed,
@@ -167,7 +218,13 @@ impl Window {
             pointer::Event::Button { .. } => {}
             pointer::Event::Frame => {
                 let (rows, cols) = self.wheel.frame();
-                if rows != 0 || cols != 0 {
+                if self.key_list.is_open() {
+                    // Rows scroll the list; columns are dropped.
+                    if rows != 0 {
+                        self.key_list.wheel(rows, self.state.surface());
+                        self.repaint = true;
+                    }
+                } else if rows != 0 || cols != 0 {
                     let outcome =
                         self.state
                             .scroll(self.pointer.0, self.pointer.1, rows as i64, cols as i64);
@@ -211,7 +268,10 @@ impl App for Window {
                     }
                 }
                 match Surface::new(self.size.0, self.size.1, Scale::default()) {
-                    Ok(surface) => self.state.resize(surface)?,
+                    Ok(surface) => {
+                        self.state.resize(surface)?;
+                        self.key_list.lay_out(surface);
+                    }
                     Err(why) => {
                         let current = self.state.surface();
                         self.size = (current.width, current.height);
@@ -234,6 +294,17 @@ impl App for Window {
                     }
                     self.repaint = true;
                 }
+                // The key list, open, takes every other press, its reading
+                // keys repeating as the state's would; the state hears none.
+                KeyboardEvent::Key { key, stroke, .. } if self.key_list.is_open() => {
+                    if self.help_key(&stroke.chord) == Step::Moved && stroke.repeat {
+                        self.client.arm(key, self.clock);
+                    }
+                }
+                // `keys::CHORD` opens it, arming no repeat.
+                KeyboardEvent::Key { stroke, .. } if stroke.chord == keys::CHORD => {
+                    self.show_keys()
+                }
                 KeyboardEvent::Key { key, stroke, .. } => {
                     let outcome = self.key(&stroke.chord, false)?;
                     if stroke.repeat
@@ -251,11 +322,19 @@ impl App for Window {
                 _ => {}
             },
             Handled::Pointer(event) => self.pointer(event)?,
-            Handled::SeatRemoved => self.state.cancel(),
-            Handled::Capabilities {
-                keyboard: false, ..
-            } => self.state.cancel(),
-            Handled::Capabilities { pointer: false, .. } => self.state.cancel_gesture(),
+            Handled::SeatRemoved => {
+                self.list_press = false;
+                self.state.cancel();
+            }
+            Handled::Capabilities { keyboard, pointer } => {
+                if !pointer {
+                    self.list_press = false;
+                    self.state.cancel_gesture();
+                }
+                if !keyboard {
+                    self.state.cancel();
+                }
+            }
             Handled::GlobalRemoved { required: true, .. } => {
                 return Err("required Wayland global was removed".into())
             }
@@ -273,7 +352,12 @@ impl App for Window {
         self.clock = now;
         if idle {
             if let Some(stroke) = self.client.repeat(now)? {
-                if self.key(&stroke.chord, true)? == Outcome::Ignored {
+                if self.key_list.is_open() {
+                    // A repeat that stops moving the list stops.
+                    if self.help_key(&stroke.chord) != Step::Moved {
+                        self.client.cancel_repeat();
+                    }
+                } else if self.key(&stroke.chord, true)? == Outcome::Ignored {
                     self.client.cancel_repeat();
                 }
             }
@@ -348,6 +432,7 @@ impl App for Window {
         }
         let surface = self.state.surface();
         let state = &self.state;
+        let key_list = &mut self.key_list;
         let font = &self.font;
         let typeface = &mut self.typeface;
         let theme = self.theme.theme();
@@ -359,6 +444,8 @@ impl App for Window {
                     .with_typeface(typeface.as_mut())
                     .with_theme(theme);
                 state.emit(surface.bounds(), &mut |draw| raster.draw(draw));
+                // The key list, when open, is the last thing painted.
+                key_list.emit(surface, surface.bounds(), &mut |draw| raster.draw(draw));
                 Ok(())
             })?
         {

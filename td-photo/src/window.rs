@@ -27,6 +27,7 @@ use td_ui::control_worker::{Job, Worker, CONNECTIONS};
 use td_ui::driven::{self, Input, Outcome, Payload, PointerPhase};
 use td_ui::font::Font;
 use td_ui::keyboard::Held;
+use td_ui::keys;
 use td_ui::pointer::{self, Wheel};
 use td_ui::raster::{Raster, Scale, Surface, MAX_FRAME_BYTES};
 use td_ui::theme_file::Kept;
@@ -1460,6 +1461,9 @@ struct Window {
     typeface: Option<td_ui::typeface::Typeface>,
     /// The theme the live window paints in and the file it is kept in.
     theme: Kept,
+    /// The key list `keys::CHORD` shows over the frame, the window's as
+    /// the theme is: open, it takes the keyboard and the wheel.
+    key_list: keys::Overlay,
     session: Session,
     pool: Pool,
     /// The roll and the scale the held thumbnails are for: another roll's,
@@ -1558,6 +1562,7 @@ impl Window {
             font: td_ui::font::pinned()?,
             typeface: None,
             theme: Kept::default(),
+            key_list: keys::Overlay::default(),
             session,
             pool: Pool::start(threads())?,
             held: None,
@@ -1680,8 +1685,26 @@ impl Window {
                     }
                     // Neither drawn nor shown in the theme yet, so a
                     // `wait-idle` waits for the frame that is.
-                    self.submitted = None;
-                    self.presented = None;
+                    self.repaint();
+                    return;
+                }
+                // The key list, open, takes every other press, its reading
+                // keys repeating; the session hears none of them.
+                if self.key_list.is_open() {
+                    let step = self.list_key(&stroke.chord);
+                    if stroke.repeat && step == keys::Step::Moved {
+                        self.client.arm(key, self.clock);
+                    }
+                    return;
+                }
+                // `keys::CHORD` opens it with the keys as they are now; a
+                // drag under way ends first, as the list takes the
+                // pointer. The opening key arms no repeat.
+                if stroke.chord == keys::CHORD {
+                    self.abort_pointer_grab();
+                    let sections = self.session.ui.key_sections();
+                    self.key_list.open(sections, self.session.ui.surface());
+                    self.repaint();
                     return;
                 }
                 let outcome = self.input(Input::Key {
@@ -1692,7 +1715,7 @@ impl Window {
                 let repeats = if self.session.ui.chooser().is_some() {
                     self.session.ui.chooser_repeats(&stroke.chord)
                 } else {
-                    driven::bound(&BINDINGS, &stroke.chord)
+                    driven::bound(BINDINGS, &stroke.chord)
                         .and_then(|binding| Action::parse(binding.name))
                         .is_some_and(Action::repeats)
                 };
@@ -1717,6 +1740,34 @@ impl Window {
             KeyboardEvent::Refused(why) => note(&why),
             KeyboardEvent::Ready => {}
         }
+    }
+
+    /// The frame is drawn again though the model's generation has not
+    /// moved, and `wait-idle` waits for it to be shown: the theme or the
+    /// key list changed over it.
+    fn repaint(&mut self) {
+        self.submitted = None;
+        self.presented = None;
+    }
+
+    /// A chord the open key list takes in the session's stead, a frame to
+    /// paint unless it kept it.
+    fn list_key(&mut self, chord: &str) -> keys::Step {
+        let surface = self.list_surface();
+        let step = self.key_list.key(chord, surface);
+        if step != keys::Step::Kept {
+            self.repaint();
+        }
+        step
+    }
+
+    /// The surface as it is now, the open list laid out for it first: a
+    /// configure or a socket's `resize` may land between frames, and a
+    /// key, repeat or wheel then reads the lines it reflows to.
+    fn list_surface(&mut self) -> Surface {
+        let surface = self.session.ui.surface();
+        self.key_list.lay_out(surface);
+        surface
     }
 
     fn pointer(&mut self, event: pointer::Event) -> Result<()> {
@@ -1752,6 +1803,11 @@ impl Window {
                 pressed: true,
                 ..
             } => {
+                // The key list over the frame takes a press; a release
+                // still ends a drag begun before it opened.
+                if self.key_list.is_open() {
+                    return Ok(());
+                }
                 self.pressed = true;
                 // A press is a real on-surface location: one off the top-left
                 // (a left press while another button holds a cross-button grab)
@@ -1783,6 +1839,15 @@ impl Window {
             }
             P::Frame => {
                 let (rows, columns) = self.wheel.frame();
+                // Rows scroll the open key list, columns are dropped.
+                if self.key_list.is_open() {
+                    if rows != 0 {
+                        let surface = self.list_surface();
+                        self.key_list.wheel(rows, surface);
+                        self.repaint();
+                    }
+                    return Ok(());
+                }
                 let clamp = |value: isize| {
                     i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
                 };
@@ -1824,6 +1889,13 @@ impl Window {
         }
         if idle {
             match self.client.repeat(now) {
+                Ok(Some(stroke)) if self.key_list.is_open() => {
+                    // A repeat that stops moving the list stops; the next
+                    // press arms another.
+                    if self.list_key(&stroke.chord) != keys::Step::Moved {
+                        self.client.cancel_repeat();
+                    }
+                }
                 Ok(Some(stroke)) => {
                     // A repeat the chooser no longer wants (Backspace once
                     // the filter it was editing is empty) stops here, or a
@@ -2470,7 +2542,8 @@ impl Window {
     /// photos on screen (the grid's cells, or develop's filmstrip) and, in
     /// develop or the single view, the developed preview in its box, each
     /// centred and clipped to the grid's area, then the flag badges again
-    /// over the thumbnails, within the area too.
+    /// over the thumbnails, within the area too, and last the open key
+    /// list over the whole frame.
     fn draw(&mut self) -> Result<()> {
         let generation = self.session.ui.generation();
         if self.submitted == Some(generation) || !self.client.can_present() {
@@ -2479,11 +2552,15 @@ impl Window {
         let surface = self.session.ui.surface();
         let stride = surface.width * 4;
         let held_shift = self.held_shift();
+        // Laid out for the surface the frame is drawn at too, so a
+        // configure or a socket's `resize` no key followed reflows it.
+        self.key_list.lay_out(surface);
         let Window {
             client,
             font,
             typeface,
             theme,
+            key_list,
             session,
             thumbs,
             developed,
@@ -2552,13 +2629,15 @@ impl Window {
                 .paint(&badges, area)
                 .map_err(error)?;
             // The crop marquee over the develop image, as the badges are
-            // painted over the thumbnails.
-            Raster::new(pixels, font, surface, stride)
+            // painted over the thumbnails; the key list over everything,
+            // on the same raster, which clips each draw to the surface.
+            let mut raster = Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
                 .with_typeface(typeface.as_mut())
-                .with_theme(theme)
-                .paint(&marquee, area)
-                .map_err(error)
+                .with_theme(theme);
+            raster.paint(&marquee, area).map_err(error)?;
+            key_list.emit(surface, surface.bounds(), &mut |draw| raster.draw(draw));
+            Ok(())
         })?;
         if submitted {
             self.submitted = Some(generation);

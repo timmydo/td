@@ -30,6 +30,40 @@ const ZONE_PAGE: usize = 16;
 /// The time zone field, the last.
 pub const TIME_ZONE: usize = 3;
 
+/// What `Draft::key` does with a key outside the time zone row, for the
+/// window's key list.
+pub const FIELD_KEYS: &[(&str, &str)] = &[
+    (
+        "Tab/S-Tab",
+        "the next or previous field, round from the last",
+    ),
+    ("Down/Return", "the next field"),
+    ("Up", "the previous field"),
+    ("Left/Right", "move the caret in the username or hostname"),
+    ("Home/End", "the caret to the start or end of its text"),
+    (
+        "Backspace/Delete",
+        "delete the character before or at the caret",
+    ),
+    (
+        "a character",
+        "typed at the caret in the username or hostname: printable ASCII, no space",
+    ),
+];
+
+/// What `Draft::key` does with a key in the time zone row.
+pub const ZONE_KEYS: &[(&str, &str)] = &[
+    ("Tab/S-Tab", "the first or previous field"),
+    ("Up/Down", "the time zone above or below"),
+    ("PageUp/PageDown", "a page of time zones up or down"),
+    ("Home/End", "the first or last time zone"),
+    (
+        "a character",
+        "seek the first time zone beginning with what was typed, ignoring case",
+    ),
+    ("Backspace", "drop the last character sought"),
+];
+
 /// The form's drafts, focus and carets, edited a key at a time. A draft
 /// is only typed text: the service checks every value it is proposed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

@@ -138,7 +138,7 @@ modes are the photographer's order of work.
    exposure's `-` and `+` beside a slider over the exposure's whole range,
    and Fit and 100% (the zoom, the one in force selected), and
    a look band with None and every available look, the current one selected,
-   the first nine on `F1`..`F9`. The preview fits the box until it is
+   the first nine on `C-1`..`C-9`. The preview fits the box until it is
    zoomed: `Z` (or the 100% button) shows the photosites around the centre
    one a pixel, the wheel or `]` and `[` step through 25, 50 and 100
    percent from the fit and back, `f` (or Fit) fits again, and a drag over
@@ -371,7 +371,7 @@ window, all speaking the toolkit's one vocabulary.
   the `uncrop` action) clears the crop through the same `Edit` the `crop`
   action makes; Undo and Reset ask what `z` and `0` do; `-` and `+` nudge
   the exposure a third of a stop as `-` and `=` do; a look button sets that
-  look (None clears it) as the `look` action does, and `F1`..`F9` (the
+  look (None clears it) as the `look` action does, and `C-1`..`C-9` (the
   `look-1`..`look-9` actions) pick the first nine, `Ignored` past the
   list. Uncrop is enabled only with a crop, Undo and Reset only with a
   step; a press on a disabled button, on a band's chrome, and a move or a
@@ -739,7 +739,11 @@ window, all speaking the toolkit's one vocabulary.
   marquee or a crop-adjust handle over the develop preview) or is the
   agent's (`open`; `choose`, `o`, is the person's way to one).
   `td-photo --help actions` prints the table so an agent can read it
-  instead of guessing.
+  instead of guessing. The live window's `F1` key list shows the same
+  table's chorded rows, each chord with its help line
+  (`Controller::key_sections`), under the chooser's own keys while the
+  chooser owns the keyboard; `F1` and `F12` are the window's and bind
+  no action (see Window).
 
 ## Files
 
@@ -981,7 +985,8 @@ The library is folders of originals; there is no database.
   theme chord, moves it on; td-ui's `theme_file` reads and writes it
   (td-ui/DESIGN.md, "Themes"), and a failure is said on stderr. The
   window takes F12 from the keyboard alone, before the session, so
-  neither the session nor the control socket sees it. Photo pixels and
+  neither the session nor the control socket sees it; F1, the key list
+  (see Window), is taken the same way. Photo pixels and
   the placeholder are content and keep their colours; `--preview` paints
   in `SAND`.
 
@@ -1628,7 +1633,7 @@ does not execute darktable's pipeline and does not claim to reproduce those
 styles. A converter that reads a `.dtstyle` and emits the nearest `.look` for
 that module subset is a later increment and is a translation the user runs,
 not a runtime dependency. The looks are listed sorted by stem, so with more
-than nine the `F1`..`F9` shortcuts reach the first nine of that order and the
+than nine the `C-1`..`C-9` shortcuts reach the first nine of that order and the
 band and the palette the rest (the palette laying a list taller than its
 panel in columns).
 
@@ -1715,8 +1720,8 @@ While Alt is held every button shows its chord under its caption in
 td-ui's hint face (`Buttons::emit_hinted`, `Button::emit_hinted`): the
 mode strip's `o`, `Escape`, `Return` and `d`, the filter strip's `1`
 through `4`,
-the tool band's `c`, `C`, `z`, `0`, `-`, `=`, `f` and `Z`, the look band's `F1`
-through `F9` under the first nine looks (`None` has none, and a tenth
+the tool band's `c`, `C`, `z`, `0`, `-`, `=`, `f` and `Z`, the look band's `C-1`
+through `C-9` under the first nine looks (`None` has none, and a tenth
 look none), and the pane's `t`, `Backspace` and `z`; each is the chord
 of the action the button presses, read from `BINDINGS`, so the two
 cannot drift. The hints are shown from the keyboard's `Held` report
@@ -1727,6 +1732,27 @@ chooser is open no chord is shown, since it owns the keyboard and a
 chord would not do what the button does. `Controller::hints` is the
 fact, a change a new generation, absent from `state` (the `held` verb
 drives it, the frame witnesses it).
+
+`F1` with no modifier is the window's key list, `td_ui::keys::Overlay`,
+routed as td-ui/DESIGN.md "Key list" says every window routes it: the
+window takes it from the keyboard alone, after `F12`, and opens the list
+with `Controller::key_sections` as they are then (the chooser's keys, a
+`(keys, what)` slice beside `chooser_key`, first while it is open, then
+the action table's chorded rows) and the window's own `F1` and `F12`.
+A drag under way when it opens is ended as a leave ends one, by a
+release at the last point. While it is open every key but `F12` is the
+list's, the session hearing none; a held key repeats only while the list
+answers `Moved`, the repeat cancelled otherwise; a left-button press
+reaches nobody and the wheel's rows scroll it (its columns dropped). The
+list is laid out again for the current surface before it takes a key, a
+repeat or the wheel, and for the surface each frame is drawn at, so a
+configure or a socket's `resize` reflows it before the next key scores
+against its lines and before the next frame shows them; it is painted
+last over the frame, on the marquee's raster across the whole surface,
+in the window's theme. Opening, moving and closing it change no
+generation, so each clears the frame submitted and the one presented as
+`F12` does, and `wait-idle` waits for the frame that shows the change.
+Neither the control socket, the replay nor `--preview` ever shows it.
 
 `td-photo open [ROLL] [--control-socket PATH]` runs the window (`window`), a
 `td_ui::client::App` in the shape td-setup's is, and one adapter over the same
@@ -2207,7 +2233,9 @@ reported as moved without it, the rest going on, and the real mover refusing
 a taken name and finishing its own interrupted move.
 
 `tests/ui.rs` holds the action table to `driven::check` and to its alignment
-with `Action`, and the error codes to the code grammar; drives `ui::Controller`
+with `Action`, its chorded rows to the key list's section (the chooser's
+keys first while it is open, `F1` and `F12` binding no action), and the
+error codes to the code grammar; drives `ui::Controller`
 in-process (the state before a roll and after, walking with every step and page,
 `select`, the filters and the cursor they keep or move, the single view and back
 by action and by key, unbound keys, `quit`, scrolling by action and by wheel
@@ -2267,7 +2295,7 @@ as text (the strips with their buttons in place under every filter, the names
 and badges by row, the status line, the single view, the empty and filtered-out
 messages, a scale of 2) and holds its frame digest to equality and to change;
 shows the chords under the buttons while Alt is held (each band's in its
-order, the look band's `F1`..`F3` after `None`, marks the text read-back
+order, the look band's `C-1`..`C-3` after `None`, marks the text read-back
 passes over, the frame changed and the plain one back on release or focus
 loss, Control alone showing none, none under the open chooser, the
 strips' in the cull grid too);
@@ -2368,7 +2396,7 @@ the slider's mapping at its ends and between, a press on the knob's own
 step and a release there writing nothing, a jump, a drag and its release
 committing, a drag back to the value in force releasing without a write,
 the last column the last step and a drag off the edge staying there, a
-photo switch dropping the drag; the look band's buttons and `F1`..`F9`
+photo switch dropping the drag; the look band's buttons and `C-1`..`C-9`
 picking and clearing, a key past the list ignored, the band read back and
 the palette's status word); the filmstrip (its band and boxes at 800 by 600
 and at scale two, the develop box above it, the cursor centred as the ends
@@ -2472,8 +2500,12 @@ native case presses F12 on the seat: once the theme file under the
 process's private `XDG_CONFIG_HOME` reads `harbor`, `wait-idle` answers
 for a tile no longer `--preview`'s sand one and holding harbor's paper,
 the state is unchanged, and S-F12 from the seat leaves the file and the
-tile alone. Every native case's process has that private configuration
-home.
+tile alone. A fourth presses F1 on the seat: the tile changes and holds
+the key list's title bar (`keys::Panel`'s, in the selection's colour),
+the state is unchanged, `p` then `End` leave the state alone while
+`End` scrolls the list, and `Escape` closes it, the tile the frame
+before `F1` again with the state unchanged. Every native case's process
+has that private configuration home.
 
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.
@@ -2623,7 +2655,7 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    edits to one key folding into its step landed after. (b) The develop
    controls: a tool strip above the preview with the crop, uncrop, undo and
    reset buttons and the exposure in a td-ui slider (`chrome::Slider`) beside
-   its step buttons, a look strip with the looks on `F1`..`F9`, and the status
+   its step buttons, a look strip with the looks on `C-1`..`C-9`, and the status
    row naming the crop sub-mode. Landed. (c) A filmstrip of the shown photos
    under the preview, `Left` and `Right` or a press moving between them. Landed.
    (d) The crop tool: a press off the crop in crop-adjust (or off its handles,

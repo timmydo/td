@@ -448,6 +448,96 @@ fn f12_on_the_seat_paints_welcome_in_the_next_theme_and_keeps_it() {
     compositor.stop();
 }
 
+/// F1 on the seat opens the window's key list over welcome: welcome
+/// stands around the panel and the panel's title bar is in the selection's
+/// colour. Enter, which welcome binds, reaches no page while it is open;
+/// Escape closes it, welcome is painted whole again, and Enter then moves
+/// on as ever.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn f1_on_the_seat_shows_the_key_list_over_welcome_until_escape() {
+    use td_ui::raster::{Scale, Surface, SELECTED};
+    let compositor_directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let client_directory = Directory::new();
+    let client = SetupProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-setup") {
+            break place;
+        }
+        assert!(Instant::now() < deadline, "unmapped: {}", client.stderr());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let welcome = td_setup::preview(place.width, place.height, 1).unwrap();
+    assert_frame(&compositor, &place, &welcome, &client, "welcome");
+    let mut action = 0;
+    let mut press = |compositor: &mut Compositor, code: u32| {
+        for state in ["down", "up"] {
+            action += 1;
+            let request = format!("key {} {action} {code} {state}", compositor.session);
+            let reply = compositor.request(&request, 1024);
+            assert_eq!(
+                reply,
+                format!(
+                    "ok\ntd-action-v1 session={} action={action}\n",
+                    compositor.session
+                )
+                .as_bytes(),
+                "key {code} {state}"
+            );
+        }
+    };
+    let surface = Surface::new(place.width, place.height, Scale::new(1).unwrap()).unwrap();
+    let panel = td_ui::keys::Panel::new(surface).unwrap();
+    let inside = |rect: td_ui::raster::Rect, x: usize, y: usize| {
+        let (x, y) = (x as i64, y as i64);
+        x >= rect.x
+            && y >= rect.y
+            && x < rect.x + i64::from(rect.width)
+            && y < rect.y + i64::from(rect.height)
+    };
+    // The title bar's top row, clear of its text, and its middle column.
+    let (probe_x, probe_y) = (
+        panel.title.x as usize + panel.title.width as usize / 2,
+        panel.title.y as usize,
+    );
+    let selected = [
+        (SELECTED >> 16) as u8,
+        (SELECTED >> 8) as u8,
+        SELECTED as u8,
+    ];
+    let at = (probe_y * place.width + probe_x) * 4;
+    assert_ne!(
+        [welcome[at + 2], welcome[at + 1], welcome[at]],
+        selected,
+        "welcome alone shows the probe"
+    );
+    let listed = |x: usize, y: usize| {
+        if (x, y) == (probe_x, probe_y) {
+            Some(selected)
+        } else if inside(panel.frame, x, y) {
+            None
+        } else {
+            let target = (y * place.width + x) * 4;
+            Some([welcome[target + 2], welcome[target + 1], welcome[target]])
+        }
+    };
+    press(&mut compositor, 59);
+    assert_frame_where(&compositor, &place, &listed, &client, "the key list");
+    // Enter would ask for the disks and show the service unavailable.
+    press(&mut compositor, 28);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_frame_where(&compositor, &place, &listed, &client, "the list kept");
+    press(&mut compositor, 1);
+    assert_frame(&compositor, &place, &welcome, &client, "welcome again");
+    press(&mut compositor, 28);
+    let unavailable = unavailable_pixels(place.width, place.height);
+    assert_frame(&compositor, &place, &unavailable, &client, "unavailable");
+    drop(client);
+    compositor.stop();
+}
+
 fn welcome_pixels(width: usize, height: usize, theme: &'static td_ui::theme::Theme) -> Vec<u8> {
     use td_ui::raster::{Raster, Scale, Surface};
     let surface = Surface::new(width, height, Scale::new(1).unwrap()).unwrap();
@@ -487,6 +577,22 @@ fn assert_frame(
     client: &SetupProcess,
     label: &str,
 ) {
+    let want = |x: usize, y: usize| {
+        let target = (y * place.width + x) * 4;
+        Some([expected[target + 2], expected[target + 1], expected[target]])
+    };
+    assert_frame_where(compositor, place, &want, client, label);
+}
+
+/// Waits for a settled frame whose every pixel is the RGB `want` gives
+/// for its client-relative position, or any where it gives `None`.
+fn assert_frame_where(
+    compositor: &Compositor,
+    place: &Placement,
+    want: &dyn Fn(usize, usize) -> Option<[u8; 3]>,
+    client: &SetupProcess,
+    label: &str,
+) {
     let render_deadline = Instant::now() + TIMEOUT;
     let mut rendered = false;
     while Instant::now() < render_deadline {
@@ -506,9 +612,7 @@ fn assert_frame(
         let matches = (0..place.height).all(|y| {
             (0..place.width).all(|x| {
                 let source = ((place.y + y) * OUTPUT_WIDTH + place.x + x) * 3;
-                let target = (y * place.width + x) * 4;
-                pixels[source..source + 3]
-                    == [expected[target + 2], expected[target + 1], expected[target]]
+                want(x, y).is_none_or(|rgb| pixels[source..source + 3] == rgb)
             })
         });
         if matches {

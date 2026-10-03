@@ -79,6 +79,29 @@ alone, so the state and the control socket never see it; the plots'
 series colours are data and keep their values in every theme.
 `--preview` paints in `SAND`.
 
+F1, td-ui's key list chord, is the window's too, taken from the
+keyboard alone (td-ui/DESIGN.md, "Key list"). It opens the list of the
+state's keys over the frame, from `State::key_sections`: what has the
+keyboard first (an open menu, the confirmation or its results, a
+request preparing, sending or cancelling, else the focused pane, the
+contributors in the graph's stead while they are shown), then
+Everywhere, whose first rows are derived from the control socket's
+chorded `control::BINDINGS`, then each focus's, the menus', the
+confirmation's, td-ui's `confirmations::KEYS`, and Action under way's:
+while a request is under way the process actions take every key but
+C-q, Escape asks to cancel it and the rest do nothing until it settles.
+The rest of the rows are tables beside `State::key`, and the window's
+own F1 and F12 end it. While it is open the state hears no key, no
+press and no motion: the list's reading keys scroll it, repeating while
+they move it, and F1, `q` or Escape close it; a drag under way ends
+when it opens, a left or right press and the left release after it
+reach nothing, the pointer's position is only recorded, so a menu
+behind the list keeps its hover and submenus, wheel rows scroll it and
+columns are dropped. Losing the seat or its pointer forgets a press
+the list took. A resize lays it out again; it is
+painted last, in the theme, and never in `--preview`. The control
+socket's input still reaches the state while it is open.
+
 ```text
 +------------------------------------------------------------------+
 | Overview | CPU | Memory | Network | Disk                          |
@@ -630,7 +653,13 @@ check host. The native process fixture uses an explicitly built
 td-compositor, validates input receipts and correlates capture with client/commit/output counters. It
 drives a graph through ranked contributors into the persistent tree, proves
 search and tab retention, and checks continuing collection on another
-workspace. td-compositor currently completes hidden-client callbacks, so
+workspace. Its F1 case finds the key list's title bar painted in the
+selection's colour after F1 on the seat, the state's tab, focus, query,
+live, actions and detail unchanged by Tab and a click on a tab while it
+is open, and after Escape the state's frame again with Tab moving the
+focus; a unit test pins the sections' order for each focus, an open
+menu and a preparing request, and the derived rows equal
+`control::BINDINGS`, `confirmations::KEYS` and the results' rows. td-compositor currently completes hidden-client callbacks, so
 that case bounds updates rather than assuming callbacks stop. The separately
 opt-in Weston fixture requires `TD_TEST_WESTON`, scopes protocol evidence to
 the client that set our app ID, and checks configure, repeated attachments,

@@ -26,7 +26,9 @@ impl ErrorCode for Refusal {
         }
     }
 }
-const BINDINGS: [Binding; 4] = [
+/// The control socket's named actions, each a chord `State::key` takes; the
+/// key list's first rows are derived from them.
+pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         name: "live",
         chord: Some("C-l"),
@@ -71,7 +73,7 @@ impl Remote<'_> {
 impl Controller for Remote<'_> {
     type Error = Refusal;
     fn bindings(&self) -> &'static [Binding] {
-        &BINDINGS
+        BINDINGS
     }
     fn action(&mut self, name: &str, arguments: &[&str]) -> Result<driven::Outcome, Refusal> {
         if !arguments.is_empty() {
@@ -142,7 +144,7 @@ mod tests {
     use td_ui::raster::Surface;
     #[test]
     fn optional_driver_uses_shared_actions_and_refuses_unavailable_inputs() {
-        driven::check(&BINDINGS).unwrap();
+        driven::check(BINDINGS).unwrap();
         let budget = Budget::new(LIMIT).unwrap();
         let mut state =
             State::new(&budget, Surface::new(800, 600, Default::default()).unwrap()).unwrap();

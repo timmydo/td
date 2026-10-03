@@ -14,6 +14,7 @@ use td_ui::editor::{Controller, Event, Outcome};
 use td_ui::editor_dialog::{Close, Closed, Conflict, Scope, Target};
 use td_ui::editor_keys::Profile;
 use td_ui::editor_render::{Geometry, Label};
+use td_ui::keys::{Overlay, Step};
 use td_ui::raster::Raster;
 use td_ui::wayland::{connect, endpoint};
 
@@ -95,6 +96,9 @@ struct Window {
     conflict: Option<Conflict>,
     reloading: Option<Target>,
     menu: Option<crate::menu::Menu>,
+    /// The key list `td_ui::keys::CHORD` shows over the frame, which takes
+    /// the keyboard while it is open.
+    key_list: Overlay,
     clipboard: Clipboard,
     activation_serial: Option<u32>,
     search: Option<crate::search::Prompt>,
@@ -334,6 +338,7 @@ impl Window {
             conflict: None,
             reloading: None,
             menu: None,
+            key_list: Overlay::default(),
             clipboard: Clipboard::default(),
             activation_serial: None,
             search: None,
@@ -402,6 +407,7 @@ impl Window {
                             scale: 1,
                         })
                         .map_err(|e| format!("Wayland configure geometry: {e}"))?;
+                    self.key_list.lay_out(self.ui.geometry().surface());
                 }
                 self.client.acknowledge(serial)?;
                 self.frames.invalidate(true);
@@ -570,7 +576,9 @@ impl Window {
         if self.control_pointer.is_some() {
             self.stop_pointer();
         }
-        if self.pointer_modal() {
+        // The open key list keeps the pointer inert itself, and keeps the
+        // wheel it scrolls by.
+        if self.pointer_modal() && !self.key_list.is_open() {
             self.stop_pointer();
         }
         match event {
@@ -586,7 +594,7 @@ impl Window {
             P::Motion(x, y) => {
                 self.pointer.x = x;
                 self.pointer.y = y;
-                if !self.menu_hover(x, y) {
+                if !self.key_list.is_open() && !self.menu_hover(x, y) {
                     self.pointer_action(td_ui::editor::PointerPhase::Move)?;
                 }
             }
@@ -595,6 +603,11 @@ impl Window {
                 pressed,
                 serial,
             } if self.client.entered().is_some() && !self.pointer_modal() => {
+                // The key list over the frame takes a press; a release
+                // ends nothing, as opening it ended any drag.
+                if pressed && self.key_list.is_open() {
+                    return Ok(());
+                }
                 if pressed != self.pointer.held {
                     self.pointer.held = pressed;
                     self.activation_serial = pressed.then_some(serial);
@@ -605,6 +618,12 @@ impl Window {
                     })?;
                     self.activation_serial = None;
                 }
+            }
+            P::Axis(..) | P::Source(_) | P::Stop(_) | P::Discrete(..)
+                if self.client.entered().is_some() && self.key_list.is_open() =>
+            {
+                self.pointer.wheel_target = None;
+                self.pointer.wheel.update(event)?;
             }
             P::Axis(..) | P::Source(_) | P::Stop(_) | P::Discrete(..)
                 if self.client.entered().is_some()
@@ -628,7 +647,14 @@ impl Window {
             }
             P::Frame => {
                 let (rows, columns) = self.pointer.wheel.frame();
-                if let Some(Target { tab, revision }) = self.pointer.wheel_target.take() {
+                if self.key_list.is_open() {
+                    // Rows scroll the open list; columns are dropped.
+                    self.pointer.wheel_target = None;
+                    if rows != 0 {
+                        self.key_list.wheel(rows, self.ui.geometry().surface());
+                        self.frames.invalidate(true);
+                    }
+                } else if let Some(Target { tab, revision }) = self.pointer.wheel_target.take() {
                     if (rows != 0 || columns != 0)
                         && !self.pointer_modal()
                         && self.ui.editor().active() == Some(tab)
@@ -893,6 +919,20 @@ impl Window {
                     self.frames.invalidate(true);
                     return Ok(());
                 }
+                // The key list, open, takes every other press, menus and
+                // prompts under it hearing nothing until it closes; its
+                // reading keys repeat. `keys::CHORD` opens it.
+                if self.key_list.is_open() {
+                    let step = self.list_key(&stroke.chord);
+                    if stroke.repeat && step == Step::Moved {
+                        self.client.arm(key, self.clock);
+                    }
+                    return Ok(());
+                }
+                if stroke.chord == td_ui::keys::CHORD {
+                    self.show_keys();
+                    return Ok(());
+                }
                 self.activation_serial = Some(serial);
                 if self.chord(&stroke.chord, false)? && stroke.repeat {
                     self.client.arm(key, self.clock);
@@ -904,6 +944,38 @@ impl Window {
             KeyboardEvent::Held(_) => {}
         }
         Ok(())
+    }
+
+    /// Opens the key list from its top with the active profile's keys
+    /// over whatever menu or prompt is showing. A drag under way ends
+    /// first, as the list takes the pointer.
+    fn show_keys(&mut self) {
+        self.stop_pointer();
+        let sections = self.key_sections();
+        self.key_list.open(sections, self.ui.geometry().surface());
+        self.frames.invalidate(true);
+    }
+
+    /// The menus' bound items and the keys beside them, for the profile
+    /// in force; a directory listing's first when one is active.
+    fn key_sections(&self) -> Vec<td_ui::keys::Section> {
+        let editor = self.ui.editor();
+        let in_listing = editor
+            .active()
+            .and_then(|tab| editor.document(tab).ok())
+            .is_some_and(|doc| doc.directory());
+        crate::menu::key_sections(
+            self.ui.keys().profile(),
+            self.files.is_some() || in_listing,
+            in_listing,
+        )
+    }
+
+    /// A chord the open key list takes in the editor's stead.
+    fn list_key(&mut self, chord: &str) -> Step {
+        let step = self.key_list.key(chord, self.ui.geometry().surface());
+        self.frames.invalidate(step != Step::Kept);
+        step
     }
 
     fn chord(&mut self, chord: &str, repeated: bool) -> Result<bool> {
@@ -1300,7 +1372,14 @@ impl Window {
         if repeat {
             match self.client.repeat(now) {
                 Ok(Some(stroke)) => {
-                    if !self.chord(&stroke.chord, true)? {
+                    // A repeat that stops moving the open list stops;
+                    // one held at an end answers Kept.
+                    let moved = if self.key_list.is_open() {
+                        self.list_key(&stroke.chord) == Step::Moved
+                    } else {
+                        self.chord(&stroke.chord, true)?
+                    };
+                    if !moved {
                         self.client.cancel_repeat();
                     }
                 }
@@ -2980,6 +3059,7 @@ impl Window {
             theme,
             spelling,
             menu,
+            key_list,
             ..
         } = self;
         let (spelling_status, spelling_marks) = spelling.view(ui.editor());
@@ -3003,6 +3083,8 @@ impl Window {
             if let Some(menu) = menu {
                 menu.paint(&mut raster, geometry);
             }
+            let surface = geometry.surface();
+            key_list.emit(surface, surface.bounds(), &mut |draw| raster.draw(draw));
             Ok(())
         })?;
         if presented {
@@ -3213,7 +3295,8 @@ impl Window {
             "Down" => Some(Key::Down),
             "Left" => Some(Key::Left),
             "Right" => Some(Key::Right),
-            "Return" | "Space" => Some(Key::Activate),
+            // The keymap spells an unmodified space as itself.
+            "Return" | "Space" | " " => Some(Key::Activate),
             _ => None,
         };
         self.menu_event(key.map_or(Event::Other, |key| Event::Key { key, repeated }))
@@ -5881,6 +5964,213 @@ mod tests {
         w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
         key(&mut w, keyboard, 88);
         assert_eq!(w.theme.theme(), &td_ui::theme::MOSS);
+    }
+
+    /// F1 opens the key list over the frame, the menu under it included;
+    /// while it is open the keyboard's keys, a press and the wheel are
+    /// the list's, the editor and its menu hearing nothing, F12 still the
+    /// window's; Escape closes the list alone. Each step asks for the
+    /// frame again.
+    #[test]
+    fn f1_shows_the_key_list_and_keeps_every_key_from_the_editor() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Windows);
+        let doc = |w: &Window| {
+            let doc = w.ui.editor().document(1).unwrap();
+            (doc.text().to_string(), doc.selection().range(), doc.dirty())
+        };
+        let before = doc(&w);
+        key(&mut w, keyboard, 68); // F10
+        assert!(w.menu.is_some());
+        let mut input = w.frames.input_generation().unwrap();
+        let mut asked = |w: &Window| {
+            let now = w.frames.input_generation().unwrap();
+            let advanced = now > input;
+            input = now;
+            advanced
+        };
+        key(&mut w, keyboard, 59); // F1
+        assert!(w.key_list.is_open() && w.menu.is_some());
+        assert!(asked(&w));
+        let first = w.key_list.lines().first().map(|line| line.text.clone());
+        assert_eq!(first.as_deref(), Some("File"));
+        assert!(w
+            .key_list
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("Ctrl+S")));
+        // `x` would type and Escape would close the menu; F10 would too.
+        key(&mut w, keyboard, 45);
+        w.event(message(keyboard, 4, &[0, 4, 0, 0, 0])).unwrap();
+        key(&mut w, keyboard, 30); // Ctrl+A
+        w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
+        key(&mut w, keyboard, 68);
+        assert!(w.key_list.is_open() && w.menu.is_some());
+        assert_eq!(doc(&w), before);
+        assert_eq!(w.key_list.help().first(), 0);
+        key(&mut w, keyboard, 36); // j
+        assert_eq!(w.key_list.help().first(), 1);
+        assert!(asked(&w));
+        // A press is the list's; the wheel scrolls it.
+        pointer_enter(&mut w);
+        pointer_move(&mut w, 400, 300);
+        pointer_button(&mut w, true);
+        pointer_button(&mut w, false);
+        assert!(w.key_list.is_open() && w.menu.is_some());
+        assert!(!w.pointer.held);
+        assert_eq!(doc(&w), before);
+        asked(&w);
+        let pointer = w.client.pointer().unwrap();
+        w.event(message(pointer, 4, &[0, 0, 10000])).unwrap();
+        w.event(message(pointer, 5, &[])).unwrap();
+        assert!(w.key_list.help().first() > 1);
+        assert!(asked(&w));
+        key(&mut w, keyboard, 88); // F12
+        assert_eq!(w.theme.theme(), &td_ui::theme::HARBOR);
+        assert!(w.key_list.is_open());
+        assert!(asked(&w));
+        key(&mut w, keyboard, 1); // Escape
+        assert!(!w.key_list.is_open() && w.key_list.lines().is_empty());
+        assert!(w.menu.is_some(), "the menu under the list stays");
+        assert!(asked(&w));
+        key(&mut w, keyboard, 1);
+        assert!(w.menu.is_none());
+        key(&mut w, keyboard, 45);
+        assert_ne!(doc(&w), before, "the editor hears keys again");
+    }
+
+    /// A held key the open key list moves it on each repeat, the editor
+    /// hearing none; a key the list only keeps arms no repeat; and a
+    /// repeat that no longer moves the list, held at its end, stops.
+    #[test]
+    fn the_open_key_list_takes_repeats_and_stops_one_held_at_its_end() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Windows);
+        let doc = |w: &Window| {
+            let doc = w.ui.editor().document(1).unwrap();
+            (doc.text().to_string(), doc.selection().range(), doc.dirty())
+        };
+        let before = doc(&w);
+        let hold = |w: &mut Window, code: u32| {
+            w.event(message(keyboard, 3, &[3, 0, code, 1])).unwrap();
+        };
+        let release = |w: &mut Window, code: u32| {
+            w.event(message(keyboard, 3, &[4, 0, code, 0])).unwrap();
+        };
+        key(&mut w, keyboard, 59); // F1
+        assert!(w.key_list.is_open());
+        assert_eq!(w.key_list.help().first(), 0);
+        hold(&mut w, 36); // j
+        assert_eq!(w.key_list.help().first(), 1);
+        // The fixture's repeat is 25 a second after 600 ms.
+        let start = w.clock;
+        w.tick(start + 599, true).unwrap();
+        assert_eq!(w.key_list.help().first(), 1);
+        w.tick(start + 600, true).unwrap();
+        assert_eq!(w.key_list.help().first(), 2);
+        w.tick(start + 640, true).unwrap();
+        assert_eq!(w.key_list.help().first(), 3);
+        assert_eq!(doc(&w), before);
+        release(&mut w, 36);
+        hold(&mut w, 45); // x, a key the list keeps
+        assert!(w.client.repeat(w.clock + 10_000).unwrap().is_none());
+        w.tick(w.clock + 10_000, true).unwrap();
+        assert_eq!(w.key_list.help().first(), 3);
+        assert_eq!(doc(&w), before);
+        release(&mut w, 45);
+        hold(&mut w, 107); // End
+        let last = w.key_list.help().first();
+        assert!(last > 3);
+        let start = w.clock;
+        w.tick(start + 600, true).unwrap();
+        assert_eq!(w.key_list.help().first(), last);
+        assert!(w.client.repeat(start + 10_000).unwrap().is_none());
+        release(&mut w, 107);
+        // `j` held at the bottom stops the same way.
+        hold(&mut w, 36);
+        let start = w.clock;
+        w.tick(start + 600, true).unwrap();
+        assert_eq!(w.key_list.help().first(), last);
+        assert!(w.client.repeat(start + 10_000).unwrap().is_none());
+        release(&mut w, 36);
+        assert!(w.key_list.is_open());
+        assert_eq!(doc(&w), before);
+    }
+
+    /// Space chooses a menu's selected item as Return does, the keymap
+    /// spelling it `" "`; with no menu open it types a space.
+    #[test]
+    fn space_chooses_in_a_menu_and_types_in_the_document() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, _peer, keyboard) = find_fixture(profile);
+            key(&mut w, keyboard, 57); // space
+            assert_eq!(
+                w.ui.editor().document(1).unwrap().text(),
+                " one two one",
+                "{profile:?}"
+            );
+            assert_eq!(w.ui.editor().tabs().count(), 1);
+            key(&mut w, keyboard, 68); // F10
+            assert_eq!(
+                w.menu.as_ref().map(|menu| menu.group()),
+                Some(crate::menu::Group::File)
+            );
+            key(&mut w, keyboard, 57); // space chooses File > New
+            assert!(w.menu.is_none(), "{profile:?}");
+            assert_eq!(w.ui.editor().tabs().count(), 2, "{profile:?}");
+            assert_eq!(w.ui.editor().document(1).unwrap().text(), " one two one");
+        }
+    }
+
+    /// The list is painted last over the frame, its title bar in the
+    /// selection's colour, laid out again on a configure, and closing it
+    /// paints the editor's frame as it was.
+    #[test]
+    fn the_key_list_paints_over_the_frame_and_closing_restores_it() {
+        let (mut w, peer, keyboard) = find_fixture(Profile::Windows);
+        configure(&mut w, 800, 600);
+        w.event(message(SHM, 0, &[1])).unwrap();
+        w.draw().unwrap();
+        let original = w.client.pixels().to_vec();
+        done(&mut w);
+        drain(&peer);
+        key(&mut w, keyboard, 59);
+        w.draw().unwrap();
+        let surface = w.ui.geometry().surface();
+        let title = td_ui::keys::Panel::new(surface).unwrap().title;
+        let at = |w: &Window, x: i64, y: i64| {
+            let offset = (y as usize * surface.width + x as usize) * 4;
+            let bytes = w.client.pixels().get(offset..offset + 4).unwrap();
+            u32::from_le_bytes(bytes.try_into().unwrap()) & 0xff_ffff
+        };
+        let (x, y) = (title.x + i64::from(title.width) / 2, title.y + 1);
+        assert_eq!(at(&w, x, y), td_ui::raster::SELECTED);
+        assert_eq!(at(&w, 0, 300), {
+            let offset = 300 * surface.width * 4;
+            u32::from_le_bytes(original[offset..offset + 4].try_into().unwrap()) & 0xff_ffff
+        });
+        done(&mut w);
+        drain(&peer);
+        let lines = w.key_list.lines().len();
+        configure(&mut w, 400, 600);
+        assert!(w.key_list.lines().len() > lines, "narrower lines wrap");
+        configure(&mut w, 800, 600);
+        assert_eq!(w.key_list.lines().len(), lines);
+        key(&mut w, keyboard, 1);
+        w.draw().unwrap();
+        assert!(w.client.pixels() == original);
+    }
+
+    /// The Emacs profile's list is in its own spelling.
+    #[test]
+    fn f1_lists_the_profile_in_force() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Emacs);
+        key(&mut w, keyboard, 59);
+        assert!(w
+            .key_list
+            .lines()
+            .iter()
+            .any(|line| line.text.contains("C-x C-s")));
+        key(&mut w, keyboard, 59);
+        assert!(!w.key_list.is_open());
     }
 
     /// A theme file that could not be read is said with the keymap's

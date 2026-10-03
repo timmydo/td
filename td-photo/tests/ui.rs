@@ -140,9 +140,52 @@ fn release(controller: &mut Controller, x: u32, y: u32) -> (Outcome, Vec<Effect>
         .unwrap()
 }
 
+/// The window's key list is the table's chorded rows, in its order and
+/// words, under the chooser's own while the chooser owns the keyboard;
+/// the window's `F1` and `F12` bind nothing of the session's.
+#[test]
+fn the_key_list_is_the_table_under_the_chooser_while_it_is_open() {
+    let chorded: Vec<td_ui::keys::Row> = BINDINGS
+        .iter()
+        .filter_map(|b| {
+            Some(td_ui::keys::Row {
+                keys: b.chord?,
+                what: b.help,
+            })
+        })
+        .collect();
+    let mut c = Controller::new(surface(800, 600));
+    let sections = c.key_sections();
+    let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
+    assert_eq!(titles, ["td-photo"]);
+    assert_eq!(sections[0].rows, chorded);
+    assert_eq!(sections[0].rows.len(), 52);
+    assert!(sections[0]
+        .rows
+        .iter()
+        .any(|r| r.keys == "C-1" && r.what.contains("first of the available looks")));
+    assert!(sections[0].rows.iter().any(|r| r.keys == "q"));
+    for chord in [td_ui::keys::CHORD, td_ui::theme::CHORD] {
+        assert!(driven::bound(BINDINGS, chord).is_none(), "{chord}");
+    }
+    assert_eq!(key(&mut c, "F1"), Outcome::Ignored);
+    let (outcome, _) = c.action("choose", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    let sections = c.key_sections();
+    let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
+    assert_eq!(titles, ["Roll chooser", "td-photo"]);
+    assert_eq!(sections[1].rows, chorded);
+    let chooser: Vec<&str> = sections[0].rows.iter().map(|r| r.keys).collect();
+    assert!(chooser.contains(&"C-Return") && chooser.contains(&"M-Up/^"));
+    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
+    assert_eq!(c.key_sections().len(), 1);
+}
+
 #[test]
 fn the_action_table_is_closed_aligned_and_reachable() {
-    driven::check(&BINDINGS).unwrap();
+    driven::check(BINDINGS).unwrap();
     assert_eq!(Action::ALL.len(), BINDINGS.len());
     for (action, binding) in Action::ALL.iter().zip(BINDINGS.iter()) {
         assert_eq!(action.name(), binding.name);
@@ -180,7 +223,7 @@ fn the_action_table_is_closed_aligned_and_reachable() {
     assert_eq!(Action::parse("look-10"), None);
     assert_eq!(Action::LookAt(0).name(), "look-0");
     assert_eq!(Action::LookAt(10).name(), "look-0");
-    let help = driven::help(&BINDINGS);
+    let help = driven::help(BINDINGS);
     for binding in BINDINGS {
         assert!(help.contains(binding.name) && help.contains(binding.help));
     }
@@ -1739,7 +1782,7 @@ fn the_binary_replays_the_cull_over_a_roll_and_writes_through_the_sidecar() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        driven::help(&BINDINGS)
+        driven::help(BINDINGS)
     );
     // `--replay --help` is the help, as after every verb.
     let help = Command::new(env!("CARGO_BIN_EXE_td-photo"))
@@ -6648,19 +6691,19 @@ fn zoom_walks_the_ladder_from_the_fit_and_the_wheel_turns_it() {
     assert_eq!(fields(&c)[ZOOM], "fit");
     // The bindings and the hints: the four chords are the actions'.
     assert_eq!(
-        driven::bound(&BINDINGS, "f").map(|b| b.name),
+        driven::bound(BINDINGS, "f").map(|b| b.name),
         Some("zoom-fit")
     );
     assert_eq!(
-        driven::bound(&BINDINGS, "Z").map(|b| b.name),
+        driven::bound(BINDINGS, "Z").map(|b| b.name),
         Some("zoom-100")
     );
     assert_eq!(
-        driven::bound(&BINDINGS, "]").map(|b| b.name),
+        driven::bound(BINDINGS, "]").map(|b| b.name),
         Some("zoom-in")
     );
     assert_eq!(
-        driven::bound(&BINDINGS, "[").map(|b| b.name),
+        driven::bound(BINDINGS, "[").map(|b| b.name),
         Some("zoom-out")
     );
 }
@@ -7026,14 +7069,15 @@ fn the_exposure_slider_commits_on_release() {
 }
 
 /// The look band: `None` then the available looks, the current one
-/// selected; a press sets that look as the `look` action does; `F1`..`F9`
-/// pick the first nine, and a key past the list is ignored.
+/// selected; a press sets that look as the `look` action does; `C-1`..`C-9`
+/// pick the first nine, and a key past the list is ignored. `F1` is the
+/// window's key list, never a look.
 #[test]
-fn the_look_band_and_the_f_keys_pick_looks() {
+fn the_look_band_and_the_control_digits_pick_looks() {
     let mut c = Controller::new(surface(800, 600));
     c.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
-    assert_eq!(key(&mut c, "F1"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "C-1"), Outcome::Ignored);
     c.set_looks(vec![
         "alpha".to_string(),
         "beta".to_string(),
@@ -7075,7 +7119,7 @@ fn the_look_band_and_the_f_keys_pick_looks() {
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(fields(&c)[LOOK], "beta");
-    let (_, effects) = c.input(Input::Key { chord: "F3" }).unwrap();
+    let (_, effects) = c.input(Input::Key { chord: "C-3" }).unwrap();
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -7087,8 +7131,9 @@ fn the_look_band_and_the_f_keys_pick_looks() {
     );
     assert_eq!(apply(&mut c, &effects).unwrap(), Outcome::Changed);
     assert_eq!(fields(&c)[LOOK], "gamma");
-    assert_eq!(key(&mut c, "F4"), Outcome::Ignored);
-    assert_eq!(key(&mut c, "F9"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "C-4"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "C-9"), Outcome::Ignored);
+    assert_eq!(key(&mut c, "F1"), Outcome::Ignored);
     let (_, effects) = click(&mut c, buttons[0].unwrap().rect());
     assert_eq!(
         effects,
@@ -7154,7 +7199,7 @@ fn the_look_band_and_the_f_keys_pick_looks() {
     // on 400, so the strips are 72) the region is 184 wide, the tool
     // band three rows (the slider on its own) and a look a row, and the
     // look band is cut to the four rows that leave that room; the looks
-    // past it are not laid, and the palette (and `F5`) reach them.
+    // past it are not laid, and the palette (and `C-5`) reach them.
     let mut short = Controller::new(surface(400, 424));
     short.open("roll", b"/r", photos(5)).unwrap();
     assert_eq!(act(&mut short, "develop", &[]), Outcome::Changed);
@@ -7169,13 +7214,13 @@ fn the_look_band_and_the_f_keys_pick_looks() {
     assert!(laid[4..].iter().all(Option::is_none));
     assert_eq!(act(&mut short, "looks", &[]), Outcome::Changed);
     assert!(short.look_rows().is_some());
-    let (_, effects) = short.input(Input::Key { chord: "F5" }).unwrap();
+    let (_, effects) = short.input(Input::Key { chord: "C-5" }).unwrap();
     assert!(matches!(
         &effects[..],
         [Effect::Edit { key: Key::Look, value: Some(stem), .. }] if stem == "look-number-04"
     ));
-    // `F5` picks the fifth too: the keys are the list's.
-    let (_, effects) = c.input(Input::Key { chord: "F5" }).unwrap();
+    // `C-5` picks the fifth too: the keys are the list's.
+    let (_, effects) = c.input(Input::Key { chord: "C-5" }).unwrap();
     assert_eq!(
         effects,
         [Effect::Edit {
@@ -7802,7 +7847,7 @@ fn the_neighbours_are_the_shown_photos_either_side_of_the_cursor_nearer_first() 
 }
 
 /// Alt held shows each button's chord under its caption: the mode and
-/// filter strips', the tool band's, the look band's (`F1` through `F9`
+/// filter strips', the tool band's, the look band's (`C-1` through `C-9`
 /// for the first nine looks, none for `None`) and the history pane's;
 /// released, or the focus leaving, hides them again. The hints are the
 /// frame's, not `state`'s, and only Alt shows them.
@@ -7869,7 +7914,7 @@ fn alt_held_shows_each_buttons_chord_under_its_caption() {
         .into_iter()
         .map(under)
         .collect();
-    assert_eq!(looks, ["", "F1", "F2", "F3"]);
+    assert_eq!(looks, ["", "C-1", "C-2", "C-3"]);
     assert_eq!(layout.history_buttons().map(under), ["t", "Backspace", "z"]);
     // The strips' hints read in the strips' order, a row each.
     let mut all = marks(&c);
