@@ -714,9 +714,10 @@ fn the_theme_chord_repaints_in_the_next_theme_keeps_it_and_is_not_delivered() {
 }
 
 /// F1 shows the key list over the handler's frame; while it is open the
-/// list takes every press but F12, repeats included, and the left
-/// button's press, and the wheel scrolls it; Escape closes it, and the
-/// handler's own help key opens it through `take_show_keys`.
+/// list takes every press but F12, repeats included, and the wheel
+/// scrolls it; the left button's press closes it, reaching nobody, nor
+/// do the release after it and a held key's repeat; Escape closes it,
+/// and the handler's own help key opens it through `take_show_keys`.
 #[test]
 fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
     const F1: u32 = 59;
@@ -766,7 +767,7 @@ fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
     press(&mut w, keyboard, 35, X);
     release(&mut w, keyboard, 36, X);
     assert_eq!(w.handler().inputs.len(), seen);
-    // The wheel scrolls it and a press on it reaches nobody either.
+    // The wheel scrolls it.
     w.event(message(pointer, 0, &[37, SURFACE, fixed(200), fixed(120)]))
         .unwrap();
     let before = w.help().first();
@@ -774,13 +775,35 @@ fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
     w.event(message(pointer, 4, &[0, 0, fixed(15)])).unwrap();
     w.event(message(pointer, 5, &[])).unwrap();
     assert_eq!(w.help().first(), before + 3);
-    w.event(message(pointer, 3, &[38, 0, 0x110, 1])).unwrap();
-    w.event(message(pointer, 3, &[39, 0, 0x110, 0])).unwrap();
-    assert_eq!(w.handler().inputs.len(), seen);
     // F12 is still the window's theme chord.
-    press(&mut w, keyboard, 40, 88);
-    release(&mut w, keyboard, 41, 88);
+    press(&mut w, keyboard, 38, 88);
+    release(&mut w, keyboard, 39, 88);
     assert_eq!(w.theme(), &HARBOR);
+    assert!(w.help().is_open());
+    // A left press closes it and reaches nobody, nor does the release
+    // after it; the frame is painted again without it. j, held through
+    // the press with its repeat armed, repeats nowhere after.
+    press(&mut w, keyboard, 142, J);
+    done(&mut w);
+    w.draw().unwrap();
+    done(&mut w);
+    let paints = w.handler().paints();
+    w.event(message(pointer, 3, &[40, 0, 0x110, 1])).unwrap();
+    assert!(!w.help().is_open());
+    w.event(message(pointer, 3, &[41, 0, 0x110, 0])).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+    w.draw().unwrap();
+    assert_eq!(w.handler().paints(), paints + 1, "closing repaints");
+    w.end_turn(12_000, true).unwrap();
+    w.end_turn(13_000, true).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen, "the held j repeats nowhere");
+    release(&mut w, keyboard, 143, J);
+    let ids: Vec<u32> = w.client().buffers().iter().map(|b| b.id()).collect();
+    for id in ids {
+        w.event(message(id, 0, &[])).unwrap();
+    }
+    press(&mut w, keyboard, 140, F1);
+    release(&mut w, keyboard, 141, F1);
     assert!(w.help().is_open());
     // Escape closes it, and x is the handler's again; there it asks for
     // the list, which opens from its top.

@@ -346,8 +346,10 @@ pub trait Handler {
         Vec::new()
     }
     /// Takes a request to show the key list, asked after every input: a
-    /// program's own help key opens the window's list with it. An edge,
-    /// answered once per request.
+    /// program's own help key, or a press on its `keys::BUTTON`, opens
+    /// the window's list with it. An edge, answered once per request. A
+    /// program sets it from the live pointer or the physical keyboard
+    /// only, never from its control socket or a replay.
     fn take_show_keys(&mut self) -> bool {
         false
     }
@@ -709,9 +711,15 @@ impl<'h, H: Handler> Window<'h, H> {
                 button: LEFT,
                 pressed,
             } if self.client.entered().is_some() => {
-                // The key list over the frame takes a press; a release
-                // ends a drag begun before it opened.
+                // A press closes the key list over the frame and reaches
+                // nobody else; nothing is held, so neither does the
+                // release after it. A reading key held through it stops
+                // repeating, so it reaches no handler once the list is gone.
                 if pressed && self.keys.is_open() {
+                    if self.keys.press() == Step::Closed {
+                        self.client.cancel_repeat();
+                        self.dirty = true;
+                    }
                     return Ok(());
                 }
                 if pressed && !self.held {

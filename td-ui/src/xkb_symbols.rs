@@ -115,36 +115,43 @@ pub(crate) fn ascii(value: u32) -> Option<char> {
         .flatten()
 }
 
+/// The named keys a chord spells, each with the keysyms it stands for:
+/// the keymap's whole vocabulary of key names, which `keys::check`
+/// reads too.
+pub(crate) const COMMANDS: &[(&str, &[u32])] = &[
+    ("Backspace", &[0xff08]),
+    ("Tab", &[0xff09, 0xfe20, 0xff89]),
+    ("Return", &[0xff0d, 0xff8d]),
+    ("Escape", &[0xff1b]),
+    ("Home", &[0xff50, 0xff95]),
+    ("Left", &[0xff51, 0xff96]),
+    ("Up", &[0xff52, 0xff97]),
+    ("Right", &[0xff53, 0xff98]),
+    ("Down", &[0xff54, 0xff99]),
+    ("PageUp", &[0xff55, 0xff9a]),
+    ("PageDown", &[0xff56, 0xff9b]),
+    ("End", &[0xff57, 0xff9c]),
+    ("Insert", &[0xff63, 0xff9e]),
+    ("Delete", &[0xffff, 0xff9f]),
+    ("F1", &[0xffbe]),
+    ("F2", &[0xffbf]),
+    ("F3", &[0xffc0]),
+    ("F4", &[0xffc1]),
+    ("F5", &[0xffc2]),
+    ("F6", &[0xffc3]),
+    ("F7", &[0xffc4]),
+    ("F8", &[0xffc5]),
+    ("F9", &[0xffc6]),
+    ("F10", &[0xffc7]),
+    ("F11", &[0xffc8]),
+    ("F12", &[0xffc9]),
+];
+
 pub(crate) fn command(value: u32) -> Option<&'static str> {
-    Some(match value {
-        0xff08 => "Backspace",
-        0xff09 | 0xfe20 | 0xff89 => "Tab",
-        0xff0d | 0xff8d => "Return",
-        0xff1b => "Escape",
-        0xff50 | 0xff95 => "Home",
-        0xff51 | 0xff96 => "Left",
-        0xff52 | 0xff97 => "Up",
-        0xff53 | 0xff98 => "Right",
-        0xff54 | 0xff99 => "Down",
-        0xff55 | 0xff9a => "PageUp",
-        0xff56 | 0xff9b => "PageDown",
-        0xff57 | 0xff9c => "End",
-        0xff63 | 0xff9e => "Insert",
-        0xffff | 0xff9f => "Delete",
-        0xffbe => "F1",
-        0xffbf => "F2",
-        0xffc0 => "F3",
-        0xffc1 => "F4",
-        0xffc2 => "F5",
-        0xffc3 => "F6",
-        0xffc4 => "F7",
-        0xffc5 => "F8",
-        0xffc6 => "F9",
-        0xffc7 => "F10",
-        0xffc8 => "F11",
-        0xffc9 => "F12",
-        _ => return None,
-    })
+    COMMANDS
+        .iter()
+        .find(|(_, keysyms)| keysyms.contains(&value))
+        .map(|(name, _)| *name)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

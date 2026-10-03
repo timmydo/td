@@ -63,6 +63,60 @@ fn chord(map: &Keymap, code: u32, mask: u32) -> Option<String> {
         .map(|stroke| stroke.chord)
 }
 
+/// The key list's spelling is the keymap's: every chord the supplied td
+/// and ordinary US maps emit, under every modifier state they admit, is
+/// a keys cell `keys::check` passes once an unmodified space is written
+/// `Space`; and the names it adds beyond them are refused.
+#[test]
+fn every_chord_the_maps_emit_is_spelled_as_the_key_list_spells_it() {
+    let mut named = std::collections::BTreeSet::new();
+    for source in [td(), US] {
+        let map = Keymap::parse(source).unwrap();
+        for code in map.keycodes().collect::<Vec<_>>() {
+            for mask in 0..256 {
+                let Ok(Some(stroke)) = map.translate(code, state(mask)) else {
+                    continue;
+                };
+                let cell = if stroke.chord == " " {
+                    td_ui::keys::SPACE.to_string()
+                } else {
+                    stroke.chord
+                };
+                assert!(td_ui::keys::spelled(&cell), "{cell:?}");
+                let key = cell.rsplit('-').next().unwrap_or_default();
+                if key.len() > 1 {
+                    named.insert(key.to_string());
+                }
+            }
+        }
+    }
+    // The maps reach every name the keymap spells.
+    for name in [
+        "Backspace",
+        "Tab",
+        "Return",
+        "Escape",
+        "Home",
+        "Left",
+        "Up",
+        "Right",
+        "Down",
+        "PageUp",
+        "PageDown",
+        "End",
+        "Insert",
+        "Delete",
+        "F1",
+        "F12",
+        "Space",
+    ] {
+        assert!(named.contains(name), "{name} unreached: {named:?}");
+    }
+    for name in ["F13", "Enter", "Esc", "Prior", "Next", "space", "KP_Enter"] {
+        assert!(!td_ui::keys::spelled(name), "{name}");
+    }
+}
+
 #[test]
 fn supplied_td_and_ordinary_us_maps_translate_editor_keys() {
     for source in [td(), US] {

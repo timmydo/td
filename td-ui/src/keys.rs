@@ -1,20 +1,45 @@
 //! The key list a window shows over its frame on `CHORD`: the sections of
 //! keys its program says it binds, then the window's own, in a bordered
 //! panel with a title bar, scrolled by the reading keys and the wheel and
-//! closed by `Escape`, `q` or `CHORD` again. A program says what its keys
-//! are as `Section`s of `Row`s, the keys as the user reads them (`j/k`,
-//! `C-x C-s`) and what they do; nothing here reads a keymap or checks a
-//! row against one. Pure: the lines, a chord's effect on the list's state
-//! and a draw stream, and the `Overlay` a window keeps them in.
+//! closed by `Escape`, `q`, `CHORD` again or a left press. A program says
+//! what its keys are as `Section`s of `Row`s, the keys spelled as the
+//! keymap spells its chords (`j/Down`, `C-x C-s`) and what they do;
+//! `check` holds a program's rows to that spelling, and `lines` shows
+//! each description as a sentence. Pure: the lines, a chord's effect on
+//! the list's state and a draw stream, and the `Overlay` a window keeps
+//! them in.
 
 use crate::chrome::{Item, List, ROW};
 use crate::raster::{
     text_run, Draw, GlyphStyle, Primitive, Rect, Surface, ACCENT, BORDER, CHROME, PAPER, SELECTED,
 };
+use crate::xkb_symbols::COMMANDS;
 use crate::{theme, CELL_WIDTH};
 
 /// The chord that shows the key list, and hides it again.
 pub const CHORD: &str = "F1";
+/// The label of a bar's or a strip's button that opens the list.
+pub const BUTTON: &str = "Help";
+/// The label of the item that opens the list in a menu named `BUTTON`.
+pub const ITEM: &str = "Keys";
+/// How a keys cell writes the space bar, which the keymap spells `" "`
+/// unmodified.
+pub const SPACE: &str = "Space";
+/// The words a keys cell may use, each whole, for what is not one key.
+pub const WORDS: &[&str] = &[
+    "a character",
+    "characters",
+    "any other key",
+    "click",
+    "C-click",
+    "S-click",
+    "double-click",
+    "drag",
+    "wheel",
+    "arrows",
+    "S-arrows",
+    "C-arrows",
+];
 /// The widest keys column the lines pad to; a wider keys cell runs into
 /// its description, two spaces after it.
 pub const MAX_KEYS_COLUMN: usize = 24;
@@ -30,8 +55,8 @@ pub const TITLE_HINT: &str = "F1, q or Escape closes";
 /// description runs on and the list clips it.
 pub const MIN_WRAP: usize = 16;
 
-/// A key, or keys read together, and what it does. Empty keys continue
-/// the row above's description.
+/// A key, or keys read together, and what it does. A row with empty keys
+/// is a sentence of prose, or with an empty description too a spacer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Row {
     pub keys: &'static str,
@@ -70,6 +95,173 @@ pub fn window() -> Section {
     )
 }
 
+/// One problem per cell of `sections` that breaks the list's spelling or
+/// style, naming its section and row: a keys cell `spelled` refuses, a
+/// row with keys and a blank description, a description whose first
+/// word is one letter other than `a` (a key's name or a variable, which
+/// `sentence` would capitalise), or a section title not starting with an
+/// upper-case letter. A row with empty keys is prose, or with an empty
+/// description a spacer, and is held only to that first word.
+pub fn check(sections: &[Section]) -> Vec<String> {
+    checked(sections, |keys| {
+        (!spelled(keys)).then_some("keys not spelled as the keymap spells them")
+    })
+}
+
+/// `check` without the spelling, for a program whose rows show the
+/// spelling of its own menus (td-editor's key profiles): the
+/// descriptions and titles as `check` holds them, and alternatives
+/// joined by a `/` with no space beside it.
+pub fn check_style(sections: &[Section]) -> Vec<String> {
+    checked(sections, |keys| {
+        (keys.contains(" /") || keys.contains("/ "))
+            .then_some("alternatives joined by a spaced `/`")
+    })
+}
+
+fn checked(
+    sections: &[Section],
+    keys_problem: impl Fn(&str) -> Option<&'static str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for section in sections {
+        let title = section.title;
+        if !title.chars().next().is_some_and(char::is_uppercase) {
+            out.push(format!(
+                "section {title:?}: title does not start with an upper-case letter"
+            ));
+        }
+        for (index, row) in section.rows.iter().enumerate() {
+            let number = index + 1;
+            let keys = row.keys;
+            if letter_first(row.what) {
+                out.push(format!(
+                    "section {title:?} row {number} keys {keys:?}: description starts with \
+                     a one-letter word, a key or a variable the list would capitalise"
+                ));
+            }
+            if keys.is_empty() {
+                continue;
+            }
+            if let Some(problem) = keys_problem(keys) {
+                out.push(format!(
+                    "section {title:?} row {number} keys {keys:?}: {problem}"
+                ));
+            }
+            if row.what.trim().is_empty() {
+                out.push(format!(
+                    "section {title:?} row {number} keys {keys:?}: blank description"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Whether `what`'s first word is one letter other than `a` or `A`: a
+/// key's name or a variable, which `sentence` would capitalise.
+fn letter_first(what: &str) -> bool {
+    let first = what.split_whitespace().next().unwrap_or_default();
+    let mut chars = first.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(c), None) if c.is_ascii_alphabetic() && !c.eq_ignore_ascii_case(&'a')
+    )
+}
+
+/// Whether `cell` is keys as the keymap spells them: alternatives joined
+/// by an unspaced `/`, each one of `WORDS` whole or a sequence of items
+/// joined by one space, each item a chord or a range `A..B` of two
+/// chords. A chord is the prefixes `C-`, `M-`, `S-` in that order, then
+/// a key name the keymap emits, `SPACE`, or one printable ASCII
+/// character. As the keymap spells them, `S-` with a character needs
+/// `C-` or `M-` beside it (Shift alone types the shifted character), and
+/// a letter under `C-` or `M-` is lower-case. The `/` key stands alone:
+/// unmodified, it is a whole cell.
+pub fn spelled(cell: &str) -> bool {
+    if cell == "/" {
+        return true;
+    }
+    let mut rest = cell;
+    loop {
+        let after = match WORDS.iter().find_map(|word| {
+            rest.strip_prefix(word)
+                .filter(|after| after.is_empty() || after.starts_with('/'))
+        }) {
+            Some(after) => after,
+            None => match sequence(rest) {
+                Some(after) => after,
+                None => return false,
+            },
+        };
+        if after.is_empty() {
+            return true;
+        }
+        match after.strip_prefix('/') {
+            Some(next) if !next.is_empty() => rest = next,
+            _ => return false,
+        }
+    }
+}
+
+/// Items joined by one space, up to the end or a `/`; what follows.
+fn sequence(text: &str) -> Option<&str> {
+    let mut rest = item(text)?;
+    while let Some(next) = rest.strip_prefix(' ') {
+        rest = item(next)?;
+    }
+    Some(rest)
+}
+
+/// A chord, or a range of two; what follows.
+fn item(text: &str) -> Option<&str> {
+    let rest = chord(text)?;
+    match rest.strip_prefix("..") {
+        Some(next) => chord(next),
+        None => Some(rest),
+    }
+}
+
+/// A chord as the keymap spells it; what follows.
+fn chord(text: &str) -> Option<&str> {
+    let mut rest = text;
+    let mut held = [false; 3];
+    for (mark, slot) in ["C-", "M-", "S-"].into_iter().zip(held.iter_mut()) {
+        if let Some(after) = rest.strip_prefix(mark) {
+            *slot = true;
+            rest = after;
+        }
+    }
+    let [control, alt, shift] = held;
+    // A name is a run of letters and digits; any other character is one
+    // key by itself.
+    let run = rest
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .unwrap_or(rest.len());
+    let length = match run {
+        0 => rest.chars().next()?.len_utf8(),
+        run => run,
+    };
+    let (name, after) = rest.split_at_checked(length)?;
+    let named = COMMANDS.iter().any(|(command, _)| *command == name);
+    let character = match name.as_bytes() {
+        [byte] if byte.is_ascii_graphic() => Some(char::from(*byte)),
+        _ => None,
+    };
+    let typed = character.is_some() || name == SPACE;
+    let fits = if named {
+        true
+    } else if typed {
+        let chorded = control || alt;
+        (!shift || chorded)
+            && !(chorded && character.is_some_and(|c| c.is_ascii_uppercase()))
+            && !(character == Some('/') && !(control || alt || shift))
+    } else {
+        false
+    };
+    fits.then_some(after)
+}
+
 /// One line of the list: a section's title, or a row as text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Line {
@@ -80,9 +272,10 @@ pub struct Line {
 /// The list's lines for `sections` at `columns` cells wide: each
 /// section's title, then its rows, indented, with the keys padded to the
 /// widest of them all but at most `MAX_KEYS_COLUMN`, a blank line between
-/// sections. A description wider than what is left of `columns` wraps at
-/// its spaces onto lines under it, a word wider than that at its width;
-/// the space left is at least `MIN_WRAP`.
+/// sections. Each description is shown as a `sentence`. A description
+/// wider than what is left of `columns` wraps at its spaces onto lines
+/// under it, a word wider than that at its width; the space left is at
+/// least `MIN_WRAP`.
 pub fn lines(sections: &[Section], columns: usize) -> Vec<Line> {
     let width = sections
         .iter()
@@ -104,11 +297,29 @@ pub fn lines(sections: &[Section], columns: usize) -> Vec<Line> {
         for row in &section.rows {
             let head = format!("  {:width$}  ", row.keys);
             let room = columns.saturating_sub(head.chars().count()).max(MIN_WRAP);
-            let mut parts = wrap(row.what, room).into_iter();
+            let mut parts = wrap(&sentence(row.what), room).into_iter();
             out.push(plain(format!("{head}{}", parts.next().unwrap_or_default())));
             let indent = " ".repeat(width + 4);
             out.extend(parts.map(|part| plain(format!("{indent}{part}"))));
         }
+    }
+    out
+}
+
+/// `what`, trimmed, as a sentence: a lower-case ASCII letter first is
+/// upper-cased, and a `.` ends it unless it ends in `.`, `?`, `!` or `:`
+/// already. A blank description stays blank.
+pub fn sentence(what: &str) -> String {
+    let what = what.trim();
+    let mut chars = what.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(what.len() + 1);
+    out.push(first.to_ascii_uppercase());
+    out.push_str(chars.as_str());
+    if !what.ends_with(['.', '?', '!', ':']) {
+        out.push('.');
     }
     out
 }
@@ -432,6 +643,18 @@ impl Overlay {
             self.close();
         }
         step
+    }
+
+    /// A left-button press while the list is open: it closes the list as
+    /// `Escape` does, and the window lets neither it nor the release
+    /// after it reach anything else. On a closed list it returns `Kept`
+    /// and changes nothing, so there is nothing to repaint.
+    pub fn press(&mut self) -> Step {
+        if !self.is_open() {
+            return Step::Kept;
+        }
+        self.close();
+        Step::Closed
     }
 
     /// Wheel travel of `rows` lines over `surface`'s page, while open.

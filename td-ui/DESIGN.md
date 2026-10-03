@@ -231,6 +231,13 @@ keeps it, which the widget window now holds, so a program with a window
 of its own keeps the same list by routing its keys, wheel and resizes
 to it and painting it last.
 
+Newly built (increment 37): one spelling and style for the key list's
+rows. `keys::check` holds a program's rows to the keymap's own spelling
+of its chords and to the list's style, `lines` shows every description
+as a sentence, a left press closes the open list (`Overlay::press`, and
+the widget window itself), and `keys::BUTTON` and `keys::ITEM` label a
+program's pointer entry to it (see "Key list").
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -415,14 +422,16 @@ of its own files may name each module.
   returning why it was not kept).
 - `keys`: `Row` and `row`, a key and what it does; `Section`, a titled
   block of rows (`new` from `(keys, what)` pairs); `window`, the
-  window's own section; `Line` and `lines`, the list as text; `Help`, the
+  window's own section; `check`, `check_style` and `spelled`, the rows'
+  spelling and style, with `SPACE` and `WORDS`; `Line` and `lines`, the
+  list as text, and `sentence`, a description as it shows; `Help`, the
   list's state (`open`, `close`, `is_open`, `first`, `key` with its
   `Step`, `clamp`, `wheel`); `Panel`, its place over a surface (`new`,
   `page`, `columns`, `emit`); `Overlay`, the list as a window keeps it
-  (`open`, `lay_out`, `key`, `wheel`, `emit`, `is_open`, `help`,
-  `lines`); `CHORD`, `MAX_KEYS_COLUMN`, `MIN_WRAP`,
-  `MAX_COLUMNS`, `MARGIN`, `TITLE` and `TITLE_HINT`. Pure. Under "Key
-  list" below.
+  (`open`, `lay_out`, `key`, `press`, `wheel`, `emit`, `is_open`,
+  `help`, `lines`); `CHORD`, `BUTTON`, `ITEM`, `MAX_KEYS_COLUMN`,
+  `MIN_WRAP`, `MAX_COLUMNS`, `MARGIN`, `TITLE` and `TITLE_HINT`. Pure.
+  Under "Key list" below.
 - `pinned_face`: `load` from `host_places`, `load_in` given places and
   `load_from` a directory, the regular style through `face_file::read`;
   `SETTING`, re-exported; and `load_or_note` and `load_in_or_note` given
@@ -2042,44 +2051,95 @@ naming no theme starting the default with a notice.
 key list over the frame (see "Key list" below), asking the handler's
 `keys` for its sections then and ending them with `keys::window`. While
 the list is open the window keeps every press but `theme::CHORD` from
-the handler, the list taking its reading and closing keys and a held
-key repeating there while it moves the list; a drag under way when it
-opens is cancelled, so a left-button press, the motion and the release
-after it are the list's and reach nobody; the wheel scrolls it. A
-handler's own help key opens the same list through `take_show_keys`, an
-edge asked after every input and every poll as `take_withdrawal` is; a
-closed window opens nothing. The lines are laid out at the panel's
-width when the list opens and again when the surface changes, and the
-first shown line is held to the last page before each paint. The list
-is painted after the handler's paint, into the same raster, so it is in
-the window's theme; a surface with no room for it shows the handler's
-frame alone while the list keeps the keys until it is closed, and
-closing it drops its lines and paints the frame again. The test pins
-`F1` kept and the list open, its title bar painted over the handler's
-frame and the frame in the margin, a reading key and its repeat
-scrolling it, a handler key, a press and a release reaching nobody, the
-wheel scrolling it, `F12` still moving the theme, `Escape` closing it,
-the handler's key opening it from its top through `take_show_keys`,
-`F1` closing it unheard and the frame painted again, and a drag cancelled
-when the list opens with its motion and release reaching nobody.
+the handler, the list taking its reading and closing keys and a held key
+repeating there while it moves the list; a drag under way when it opens
+is cancelled, so its motion and release are the list's and reach nobody;
+a left-button press closes the list and reaches nobody else, and with
+nothing held the release after it reaches nobody either, and a key held
+through it stops repeating; the wheel scrolls it. A handler's own help
+key, or a press on its `keys::BUTTON`, opens the same list through
+`take_show_keys`, an edge asked after every input and every poll as
+`take_withdrawal` is; a closed window opens nothing. A handler sets that
+edge from the live pointer or the physical keyboard only, never from its
+control socket or a replay. The lines are laid out at the panel's width
+when the list opens and again when the surface changes, and the first
+shown line is held to the last page before each paint. The list is
+painted after the handler's paint, into the same raster, so it is in the
+window's theme; a surface with no room for it shows the handler's frame
+alone while the list keeps the keys until it is closed, and closing it
+drops its lines and paints the frame again. The test pins `F1` kept and
+the list open, its title bar painted over the handler's frame and the
+frame in the margin, a reading key and its repeat scrolling it, a
+handler key reaching nobody, the wheel scrolling it, `F12` still moving
+the theme, a left press closing it with neither it nor its release
+reaching the handler, the frame painted again and a reading key held
+through it repeating nowhere after, `Escape` closing it, the handler's
+key opening it from its top through `take_show_keys`, `F1` closing it
+unheard and the frame painted again, and a drag cancelled when the list
+opens with its motion and release reaching nobody.
 
 ## Key list
 
 `keys` is what a program's keys look like to the person reading them:
-sections of rows, each row the keys as written in the program's own
-documentation (`j/k`, `C-x C-s`, `1-9`) and what they do, a row with
-no keys continuing the description above it. A program owns its rows;
-nothing checks them against a keymap, so a program whose bindings live
-in a table derives its rows from that table and one whose bindings are
-code lists them beside it. `lines` makes the text: each section's
-title, its rows indented with the keys padded to the widest of all the
-rows, at most `MAX_KEYS_COLUMN` cells, so one long key runs on rather
-than pushing every description right, and a blank line between
-sections. A description wider than the columns left beside its keys
-wraps at its spaces onto lines under it, aligned with it, a word wider
-than that at its width; at least `MIN_WRAP` columns are left, below
-which the list clips it. Every list ends with `window`, the window's
-own `F1` and `F12`.
+sections of rows, each row the keys spelled as td-ui's keymap spells its
+chords (`j/Down`, `C-x C-s`, `1..9`) and what they do, a row with no
+keys a sentence of prose, or with no description either a spacer. A
+program owns its rows: one whose bindings live in a table derives its
+rows from that table, and one whose bindings are code lists them beside
+it. Nothing checks a row against the program's bindings; `check` holds
+its spelling and style.
+
+The spelling is the keymap's, so a key reads as the chord a program
+matches:
+
+- a chord is the prefixes `C-`, `M-` and `S-`, in that order, then a
+  key: a name the keymap emits (`Return`, `Escape`, `Tab`,
+  `Backspace`, `Delete`, `Insert`, `Home`, `End`, `PageUp`,
+  `PageDown`, `Up`, `Down`, `Left`, `Right`, `F1` to `F12`, read from
+  the keymap's own table, `xkb_symbols::COMMANDS`), `SPACE` (`Space`,
+  which the keymap spells `" "` unmodified and `Space` under `C-` or
+  `M-`), or one printable ASCII character as itself (`j`, `?`, `G`). As
+  the keymap spells them, `S-` with a character needs `C-` or `M-`
+  beside it, since Shift alone types the shifted character, and a
+  letter under `C-` or `M-` is lower-case;
+- alternatives join with an unspaced `/`, each written out whole
+  (`Tab/S-Tab`, `C-c/C-x/C-v`); the `/` key unmodified stands alone as
+  a whole cell, so no `/` is read two ways;
+- a sequence joins chords with one space (`C-x C-s`, `s y`), and a
+  range is `A..B` of two chords (`1..9`, `C-1..C-9`);
+- what is not one key is one of `WORDS`, as a whole alternative:
+  `a character`, `characters`, `any other key`, `click`, `C-click`,
+  `S-click`, `double-click`, `drag`, `wheel`, `arrows`, `S-arrows`,
+  `C-arrows`. The list grows only for a row that needs a word.
+
+A description is written as its source keeps it, for its other readers
+(CLI help, a control socket's `actions`, an export); `lines` shows it as
+a `sentence`, its first character upper-cased when it is a lower-case
+ASCII letter and a `.` appended unless it ends in `.`, `?`, `!` or `:`.
+A description must not start with a lower-case key name or variable
+(`p and P push`, `n of its m`), since the list capitalises it; a first
+word of one letter other than `a` is refused. A section's title starts
+with an upper-case letter.
+
+`check` returns one problem per bad cell, naming its section and row: a
+keys cell `spelled` refuses, a row with keys and a blank description, a
+description whose first word is one letter other than `a`, or a title
+not starting with an upper-case letter; a row with empty keys is prose,
+or with an empty description a spacer, and is held only to its first
+word. `check_style` is the same without the spelling, alternatives still
+joined by an unspaced `/`, for a program whose rows show its own menus'
+spelling: td-editor's key profiles, which keep `Ctrl+N` or `C-x C-s` as
+their menus show them. Each program's tests are to run one of them over
+every list it shows, as their landings follow increment 37.
+
+`lines` makes the text: each section's title, its rows indented with the
+keys padded to the widest of all the rows, at most `MAX_KEYS_COLUMN`
+cells, so one long key runs on rather than pushing every description
+right, and a blank line between sections. A description wider than the
+columns left beside its keys wraps at its spaces onto lines under it,
+aligned with it, a word wider than that at its width; at least
+`MIN_WRAP` columns are left, below which the list clips it. Every list
+ends with `window`, the window's own `F1` and `F12`.
 
 `Help` is the list's state, whether it is open and its first shown line.
 `Escape`, `q`, `?` (the help key of the programs that have one) and
@@ -2100,8 +2160,9 @@ when the surface cannot hold the title bar and one row.
 `Overlay` is the list as a window keeps it: `open` with the program's
 sections, which it ends with `window`'s, laid out for the surface;
 `lay_out` again when the surface changes, which holds the first line
-to the new page; `key` and `wheel` while it is open, which keep nothing
-and move nothing while it is closed; `close`, for a window that ends it
+to the new page; `key`, `press` (a left-button press, which closes it
+as `Escape` does) and `wheel` while it is open, which keep nothing and
+move nothing while it is closed; `close`, for a window that ends it
 itself; and `emit` last over the frame, which holds the first line to
 the page first and paints nothing when the surface has no room for a
 panel. The window decides when the list opens and what it keeps from
@@ -2119,7 +2180,17 @@ the program, and every window routes alike, as the widget window does
   moves nothing and answers `Kept`, so a key held there stops; a key
   that opened it arms no repeat;
 - opening it ends a drag under way; a left-button press while it is
-  open reaches nobody;
+  open goes to `press`, which closes it, and reaches nobody else, and
+  the release after it reaches nobody either; a click that closes it
+  cancels a held key's repeat;
+- a program may open it from the pointer too: a bar's or strip's
+  button labelled `BUTTON` (`Help`), or an item `ITEM` (`Keys`) in a
+  menu named `BUTTON`, whose shortcut shows `CHORD`; the list's
+  sections gain no row for that entry, `window` already listing
+  `CHORD`. Only the live pointer or a physical-keyboard menu choice
+  opens it so; a control socket, a replay, a preview or a render check
+  never does, and in the widget window that is the rule for
+  `take_show_keys`;
 - wheel rows scroll it while it is open, columns are dropped;
 - a resize calls `lay_out`;
 - every step but `Kept`, and every wheel scroll, is a frame to paint,
@@ -2127,13 +2198,20 @@ the program, and every window routes alike, as the widget window does
   program's own previews and render checks never show it.
 
 The tests pin the lines (titles, padding, the ceiling, the window's
-section last, wrapping and its floor), every reading and closing key
-with the clamp at both ends, `clamp`, the wheel, a kept key, the hint
-naming `CHORD`, the overlay's opening, laying out again, scrolling,
-clamping as it paints and emptying on close, the panel's place, title
-bar, hint left out on a slim panel and accented titles, the lines
-fitting its columns, nothing painted outside its frame, and no panel on
-a surface too small.
+section last, wrapping and its floor, descriptions as sentences,
+trimmed, with their sources kept), `check` passing each form of the
+spelling, the words and td-ui's own rows (`window`,
+`confirmations::KEYS`) and naming each bad cell of each kind, a
+one-letter first word named in keyed and prose rows by both checks,
+`check_style` skipping the spelling, every chord the supplied td and US
+keymaps emit passing `spelled` with every key name reached and names
+beyond the keymap's refused, every reading and closing key with the
+clamp at both ends, `clamp`, the wheel, a kept key, the hint naming
+`CHORD`, the overlay's opening, laying out again, scrolling, clamping as
+it paints, closing on `press` and emptying on close, the labels, the
+panel's place, title bar, hint left out on a slim panel and accented
+titles, the lines fitting its columns, nothing painted outside its
+frame, and no panel on a surface too small.
 
 ## Themes
 
@@ -3720,3 +3798,9 @@ regressions. Those increments extend the original sequence below.
 36. The key list in the programs with their own windows:
     `keys::Overlay`, the list's state, sections and laid-out lines,
     held by the widget window, and the rules a window routes to it by.
+37. One spelling and style for the key list, and the list from the
+    pointer: `keys::check` and `check_style` over the keymap's own key
+    names and the fixed words, descriptions shown as sentences, a left
+    press closing the open list (`Overlay::press` and the widget
+    window), and the `BUTTON` and `ITEM` labels. Each program's rows,
+    check tests and pointer entry follow in its own landing.

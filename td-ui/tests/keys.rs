@@ -5,7 +5,7 @@ use td_ui::raster::{Draw, Primitive, Scale, Surface, ACCENT, SELECTED};
 
 fn sections() -> Vec<Section> {
     vec![
-        Section::new("List", &[("j/k", "move"), ("Enter", "open")]),
+        Section::new("List", &[("j/k", "move"), ("Return", "open")]),
         Section::new("Article", &[("Space", "page down"), ("", "and on")]),
         keys::window(),
     ]
@@ -19,16 +19,16 @@ fn lines_title_each_section_pad_the_keys_and_end_with_the_windows() {
         text,
         [
             "List",
-            "  j/k    move",
-            "  Enter  open",
+            "  j/k     Move.",
+            "  Return  Open.",
             "",
             "Article",
-            "  Space  page down",
-            "         and on",
+            "  Space   Page down.",
+            "          And on.",
             "",
             "Window",
-            "  F1     show or hide this list of keys",
-            "  F12    next colour theme, kept for this program",
+            "  F1      Show or hide this list of keys.",
+            "  F12     Next colour theme, kept for this program.",
         ]
     );
     let titles: Vec<usize> = lines
@@ -49,7 +49,7 @@ fn lines_title_each_section_pad_the_keys_and_end_with_the_windows() {
     assert_eq!(
         lines[2],
         Line {
-            text: format!("  a{}  b", " ".repeat(keys::MAX_KEYS_COLUMN - 1)),
+            text: format!("  a{}  B.", " ".repeat(keys::MAX_KEYS_COLUMN - 1)),
             title: false
         }
     );
@@ -118,7 +118,7 @@ fn the_reading_keys_scroll_within_the_lines_and_the_closing_keys_close() {
 fn a_description_wider_than_the_columns_wraps_under_itself() {
     let rows = [
         ("j/k", "move the selection up and down the list"),
-        ("Enter", "open"),
+        ("Return", "open"),
         ("x", "supercalifragilisticexpialidocious"),
     ];
     let text: Vec<String> = keys::lines(&[Section::new("List", &rows)], 24)
@@ -129,34 +129,34 @@ fn a_description_wider_than_the_columns_wraps_under_itself() {
         text,
         [
             "List",
-            "  j/k    move the",
-            "         selection up and",
-            "         down the list",
-            "  Enter  open",
-            "  x      supercalifragili",
-            "         sticexpialidocio",
-            "         us",
+            "  j/k     Move the",
+            "          selection up and",
+            "          down the list.",
+            "  Return  Open.",
+            "  x       Supercalifragili",
+            "          sticexpialidocio",
+            "          us.",
         ]
     );
-    // Wider, the room left beside the keys decides: 30 less the 9-cell
+    // Wider, the room left beside the keys decides: 31 less the 10-cell
     // head is 21.
-    let text: Vec<String> = keys::lines(&[Section::new("List", &rows)], 30)
+    let text: Vec<String> = keys::lines(&[Section::new("List", &rows)], 31)
         .into_iter()
         .map(|line| line.text)
         .collect();
     assert_eq!(
         &text[1..3],
         [
-            "  j/k    move the selection up",
-            "         and down the list"
+            "  j/k     Move the selection up",
+            "          and down the list."
         ]
     );
-    assert!(text.iter().all(|line| line.chars().count() <= 30));
+    assert!(text.iter().all(|line| line.chars().count() <= 31));
     // However narrow, a description keeps MIN_WRAP.
     let narrow = keys::lines(&[Section::new("List", &rows)], 4);
     assert!(narrow
         .iter()
-        .all(|line| line.text.chars().count() <= 9 + keys::MIN_WRAP));
+        .all(|line| line.text.chars().count() <= 10 + keys::MIN_WRAP));
 }
 
 #[test]
@@ -296,4 +296,259 @@ fn the_overlay_opens_lays_out_scrolls_paints_and_closes() {
     assert_eq!(overlay.key("j", tiny), Step::Moved);
     overlay.close();
     assert!(!overlay.is_open());
+}
+
+/// Every description shows as a sentence, its source text kept.
+#[test]
+fn descriptions_show_as_sentences() {
+    for (what, shown) in [
+        ("open", "Open."),
+        ("Open", "Open."),
+        ("open the thread.", "Open the thread."),
+        ("quit?", "Quit?"),
+        ("now!", "Now!"),
+        ("one of:", "One of:"),
+        ("page down  ", "Page down."),
+        ("  page up", "Page up."),
+        ("\t open it \n", "Open it."),
+        ("2 up", "2 up."),
+        ("élan", "élan."),
+        ("", ""),
+        ("   ", ""),
+    ] {
+        assert_eq!(keys::sentence(what), shown, "{what:?}");
+    }
+    let rows = [("q", "quit, or go back"), ("", "a held key repeats")];
+    let text: Vec<String> = keys::lines(&[Section::new("List", &rows)], usize::MAX)
+        .into_iter()
+        .map(|line| line.text)
+        .collect();
+    assert_eq!(
+        text,
+        ["List", "  q  Quit, or go back.", "     A held key repeats."]
+    );
+    assert_eq!(rows[0].1, "quit, or go back", "the source is kept");
+}
+
+fn problems(keys_cell: &'static str) -> Vec<String> {
+    keys::check(&[Section::new("List", &[(keys_cell, "do it")])])
+}
+
+/// The keymap's own spelling passes: its key names, `Space`, single
+/// printable characters, modifiers in order, alternatives, sequences,
+/// ranges, the words, and prose rows with no keys.
+#[test]
+fn the_check_passes_the_keymaps_spelling() {
+    for cell in [
+        "j",
+        "?",
+        "=",
+        "G",
+        "-",
+        ".",
+        "/",
+        "C-/",
+        "Return",
+        "Escape",
+        "Space",
+        "C-Space",
+        "Tab",
+        "S-Tab",
+        "Tab/S-Tab",
+        "Backspace/Delete",
+        "Insert",
+        "Home/End",
+        "PageUp/PageDown",
+        "Up/Down/Left/Right",
+        "F1",
+        "F12",
+        "S-F10",
+        "j/Down",
+        "C-c/C-x/C-v",
+        "C-M-S-Delete",
+        "C-S-c",
+        "M-x",
+        "C--",
+        "C-x C-s",
+        "s y",
+        "1..9",
+        "C-1..C-9",
+        "F1..F12",
+        "a character",
+        "characters",
+        "any other key",
+        "click",
+        "C-click",
+        "S-click",
+        "double-click",
+        "drag",
+        "wheel",
+        "arrows",
+        "S-arrows",
+        "C-arrows",
+        "click/Return",
+        "j/k/arrows",
+        "",
+    ] {
+        assert_eq!(problems(cell), Vec::<String>::new(), "{cell:?}");
+    }
+    // td-ui's own rows.
+    assert!(keys::check(&[keys::window()]).is_empty());
+    assert!(keys::check(&[Section::new("Dialog", td_ui::confirmations::KEYS)]).is_empty());
+}
+
+/// One problem per bad cell, naming its section and row, for each kind:
+/// a keys cell outside the spelling, a blank description, and a title
+/// not starting with an upper-case letter.
+#[test]
+fn the_check_names_each_bad_cell() {
+    for cell in [
+        "Enter",
+        "RET",
+        "Esc",
+        "enter",
+        "PgUp",
+        "PgUp/PgDn",
+        "F13",
+        "F24",
+        " ",
+        "space",
+        "SPC",
+        "Ctrl-X",
+        "Ctrl+N",
+        "C-X",
+        "M-A",
+        "S-a",
+        "S-?",
+        "S-Space",
+        "M-C-x",
+        "S-C-x",
+        "C-",
+        "C-x/",
+        "/j",
+        "j//k",
+        "j / k",
+        "g / G",
+        "j/k or arrows",
+        "arrows, Home/End",
+        "q, then p",
+        "C-x  C-s",
+        "C-x C-s ",
+        " C-x",
+        "1-9",
+        "1..",
+        "..9",
+        "1..9..",
+        "jk",
+        "click an article",
+        "C-x click",
+        "Ctrl-X/C/V",
+        "é",
+        "n/m!x",
+    ] {
+        let found = problems(cell);
+        assert_eq!(found.len(), 1, "{cell:?}: {found:?}");
+        assert!(
+            found[0].starts_with(&format!("section \"List\" row 1 keys {cell:?}")),
+            "{found:?}"
+        );
+    }
+    let sections = [
+        Section::new("keys", &[("j", "move"), ("k", ""), ("l", "  ")]),
+        // Prose, and a blank spacer row before it, pass.
+        Section::new(
+            "Good",
+            &[("C-x C-s", "save"), ("", ""), ("", "a held key repeats")],
+        ),
+        Section::new("", &[("Enter", " ")]),
+    ];
+    assert_eq!(
+        keys::check(&sections),
+        [
+            "section \"keys\": title does not start with an upper-case letter",
+            "section \"keys\" row 2 keys \"k\": blank description",
+            "section \"keys\" row 3 keys \"l\": blank description",
+            "section \"\": title does not start with an upper-case letter",
+            "section \"\" row 1 keys \"Enter\": keys not spelled as the keymap spells them",
+            "section \"\" row 1 keys \"Enter\": blank description",
+        ]
+    );
+}
+
+/// A description whose first word is one letter other than `a`, a key or
+/// a variable, is named in a keyed row and in prose alike, by both
+/// checks: the list would show it capitalised.
+#[test]
+fn the_check_names_a_one_letter_first_word() {
+    for what in ["p and P push", "n of its m", "  x marks it", "P pushes"] {
+        let rows = [("p", what), ("", what)];
+        for found in [
+            keys::check(&[Section::new("List", &rows)]),
+            keys::check_style(&[Section::new("List", &rows)]),
+        ] {
+            assert_eq!(
+                found,
+                [
+                    "section \"List\" row 1 keys \"p\": description starts with \
+                     a one-letter word, a key or a variable the list would capitalise",
+                    "section \"List\" row 2 keys \"\": description starts with \
+                     a one-letter word, a key or a variable the list would capitalise",
+                ],
+                "{what:?}"
+            );
+        }
+    }
+    for what in [
+        "a key", "A key", "Open it", "open it", "an item", "1 up", "é", "",
+    ] {
+        let rows = [("p", "push"), ("", what)];
+        assert!(
+            keys::check(&[Section::new("List", &rows)]).is_empty(),
+            "{what:?}"
+        );
+        assert!(
+            keys::check_style(&[Section::new("List", &rows)]).is_empty(),
+            "{what:?}"
+        );
+    }
+}
+
+/// The variant for a program that spells keys as its menus do keeps the
+/// style and the unspaced `/`, and skips the spelling.
+#[test]
+fn the_style_check_skips_the_spelling() {
+    let good = [Section::new(
+        "File",
+        &[("Ctrl+N", "new"), ("C-x C-s", "save"), ("RET/SPC", "open")],
+    )];
+    assert!(keys::check_style(&good).is_empty());
+    assert!(!keys::check(&good).is_empty());
+    let bad = [Section::new(
+        "file",
+        &[("C-s / C-r", "search"), ("Shift+F3", "")],
+    )];
+    assert_eq!(keys::check_style(&bad).len(), 3);
+}
+
+/// A left press closes the open list as `Escape` does; a closed list
+/// keeps it from nobody.
+#[test]
+fn a_press_closes_the_overlay() {
+    use td_ui::keys::Overlay;
+    let surface = Surface::new(800, 300, Scale::new(1).unwrap()).unwrap();
+    let mut overlay = Overlay::default();
+    assert_eq!(overlay.press(), Step::Kept);
+    overlay.open(sections(), surface);
+    overlay.key("End", surface);
+    assert_eq!(overlay.press(), Step::Closed);
+    assert!(!overlay.is_open());
+    assert_eq!(overlay, Overlay::default(), "emptied");
+    assert_eq!(overlay.press(), Step::Kept);
+}
+
+#[test]
+fn the_labels_name_the_list() {
+    assert_eq!(keys::BUTTON, "Help");
+    assert_eq!(keys::ITEM, "Keys");
+    assert_eq!(keys::ITEM, keys::TITLE);
 }
