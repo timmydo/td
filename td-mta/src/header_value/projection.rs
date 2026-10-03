@@ -100,21 +100,24 @@ impl<'a, 'w> Projection<'a, 'w> for TextMode {
         let field = match name.len() {
             7 => Some("Subject"),
             8 => Some("Comments"),
+            19 => Some("Content-Description"),
             _ => None,
         };
-        budget.charge(
-            work,
-            now,
-            field.map_or(0, |field| field.len() as u64),
-            1,
-            &mut 0,
-        )?;
-        if field.is_some_and(|field| name.eq_ignore_ascii_case(field)) {
+        if let Some(field) = field {
+            budget.charge(work, now, field.len() as u64, 1, &mut 0)?;
+            if name.eq_ignore_ascii_case(field) {
+                return Ok(());
+            }
+        }
+        let prefix = name.as_bytes().get(..2);
+        budget.charge(work, now, prefix.map_or(0, |_| 2), 1, &mut 0)?;
+        if prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"X-")) {
             Ok(())
         } else {
             Err(Error::UnsupportedGrammar)
         }
     }
+
     fn start(
         bytes: &'a [u8],
         work: &'w mut Meter,

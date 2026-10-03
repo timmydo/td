@@ -2431,13 +2431,17 @@ M06au adds `header_value::Text` with an Input descriptor, the caller's NFC
 Scratch and the same exclusive job/email budget borrows. Input holds resident
 bytes, base offset, header limit, parsed property and Prefix/EOF meaning. Only
 Text-form properties are admitted. The first active poll additionally admits
-only Subject and Comments, case-insensitively, before staging any JSON. Their
-grammar is unstructured. Keywords, MIME fields and unknown fields return
-UnsupportedGrammar until grammar-aware Text conversion is implemented. This is
-an implementation limit, not an invalid-property or invalidArguments claim;
-Text-form authorization alone cannot authorize encoded words in structured
-syntax. Last/all, absence, provisional output, backpressure and final
-retirement follow section 1.52; Raw's public API and identity stay unchanged.
+Subject, Comments and Content-Description, plus user-defined X- fields,
+case-insensitively, before staging any JSON. M06bj extends the unstructured
+path using RFC 2045 section 8 and RFC 2047 section 5's field rules.
+Parentheses and quotes in these fields are text, not structured comments or
+quoted strings. Keywords, List-Id, other MIME fields and unknown non-X- fields
+return UnsupportedGrammar until grammar-aware Text conversion is implemented.
+This is an implementation limit, not an invalid-property or invalidArguments
+claim; Text-form authorization alone cannot authorize encoded words in
+structured syntax. Last/all, absence, provisional output, backpressure and
+final retirement follow section 1.52; Raw's public API and identity stay
+unchanged.
 
 A private generic core owns the shared selector, punctuation, JSON Frame and
 failure state. Its two private projections provide Raw or normalized Text
@@ -2445,11 +2449,16 @@ sources; there is no trait object, heap allocation or duplicated framing state
 machine. The Text source is the existing unstructured-header NFC cursor: it
 removes initial SP, unfolds while retaining following whitespace, decodes
 originally permitted encoded words and normalizes the filtered scalars.
-Grammar admission dispatches by name length, prepays at most eight name-byte
-visits and one interpretation step, then makes one case-insensitive
-comparison. It uses the original job/email budgets and discards unused prepaid
-credit; empty output performs only the live deadline check until capacity is
-supplied.
+Grammar admission dispatches by name length and prepays each comparison.
+Subject/Comments keep their seven/eight visits and one step. Content-
+Description costs nineteen visits/one step. If a same-length known-name
+comparison fails, check the two-byte X- prefix in a separate admission; other
+lengths check only that prefix. Maximum dispatch cost is twenty-one visits,
+two steps and two job records, with no scan of the remaining extension name. A
+name shorter than two bytes has no byte comparison but still costs one step
+and one job record. Use the original job/email budgets and discard unused
+prepaid credit; empty output performs only the live deadline check until
+capacity is supplied.
 
 The same ownership enum moves scratch and budget borrows into each fresh NFC
 cursor. A private consuming NFC handoff returns them only after successful
@@ -2472,11 +2481,12 @@ qualify combined worker stacks or native/process memory.
 Tests distinguish Raw identity from Text decoding/NFC, cover last/all and
 absence, repair diagnostics, encoded-word and fold handling, overflow segments
 followed by a second field, exact charges against separate selector/converter
-runs, structured-field refusal, comma/output exhaustion, partial handoff, late
-scan refusal and final deadline retirement. The allocation probe covers
-overflow plus subsequent scratch reuse and late failure in both registered
-modes. Other parsed forms and ADMISSION.md's unpublished response-spool
-implementation remain separate.
+runs, Content-Description/X- admission, exact classification costs, partial
+job/email admission refusals, structured-field refusal, comma/output
+exhaustion, partial handoff, late scan refusal and final deadline retirement.
+The allocation probe covers overflow plus subsequent scratch reuse and late
+failure in both registered modes. Other parsed forms and ADMISSION.md's
+unpublished response-spool implementation remain separate.
 
 ### 1.54 Budgeted resident Date parsing
 

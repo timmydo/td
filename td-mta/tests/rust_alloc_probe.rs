@@ -4695,93 +4695,103 @@ fn text_header_values() {
         nfc::{HeaderBudget, Scratch},
         ports::{Deadline, Tick},
     };
-    let source = format!(
-        "Subject: a{}\u{323}\r\nSubject: =?utf-8?Q?cafe=CC=81?=\r\n\r\n",
-        "\u{301}".repeat(300)
-    );
-    let mut work = Meter::new(
-        Deadline::after(Tick(0), 100).unwrap(),
-        Charge {
-            io_bytes: 100_000_000,
-            records: 2_000_000,
-            output_bytes: 1_000_000,
-            ..Charge::default()
-        },
-    );
-    let mut budget = HeaderBudget::new();
-    let mut scratch = Scratch::new();
-    let mut key =
-        header_property::Cursor::new("header:Subject:asText:all", header_property::Context::Email);
-    let mut selected = None;
-    for _ in 0..100 {
-        if let header_property::Status::Complete(value) = key.poll(Tick(1), &mut work).unwrap() {
-            selected = value;
-            break;
-        }
-    }
-    let selected = selected.unwrap();
-    let before = COUNTERS.snapshot();
-    let mut cursor = Text::new(
-        Input {
-            bytes: black_box(source.as_bytes()),
-            base: 0,
-            header_limit: source.len() as u64,
-            property: selected,
-            source_end: SourceEnd::Eof,
-        },
-        &mut scratch,
-        &mut work,
-        &mut budget,
-    )
-    .unwrap();
-    let mut output = [0; 1];
-    let mut written = 0;
-    let mut complete = false;
-    for _ in 0..100_000 {
-        let progress = cursor.poll(Tick(1), &mut output).unwrap();
-        written += progress.written;
-        if matches!(progress.status, Status::Complete(_)) {
-            complete = true;
-            break;
-        }
-    }
-    assert!(complete);
-    // U+1EA1 plus 300 acute marks, café, quotes and array punctuation.
-    assert_eq!(written, 3 + 600 + 5 + 7);
-    cursor.check_deadline(Tick(1)).unwrap();
-    let mut cursor = Text::new(
-        Input {
-            bytes: b"Subject: a\nOther: long\n\n",
-            base: 0,
-            header_limit: 12,
-            property: selected,
-            source_end: SourceEnd::Eof,
-        },
-        &mut scratch,
-        &mut work,
-        &mut budget,
-    )
-    .unwrap();
-    let mut refused = false;
-    let mut written = 0;
-    for _ in 0..1000 {
-        match cursor.poll(Tick(1), &mut output) {
-            Ok(progress) => {
-                assert!(!matches!(progress.status, Status::Complete(_)));
-                written += progress.written;
-            }
-            Err(error) => {
-                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
-                refused = true;
+    for field in [
+        "Subject",
+        "Content-Description",
+        "X-Long-Header",
+        "X-Custom",
+    ] {
+        let refused_source = format!("{field}: a\nOther: long\n\n");
+        let refused_limit = field.len() as u64 + 5;
+        let property_name = format!("header:{field}:asText:all");
+        let source = format!(
+            "{field}: a{}\u{323}\r\n{field}: =?utf-8?Q?cafe=CC=81?=\r\n\r\n",
+            "\u{301}".repeat(300)
+        );
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 2_000_000,
+                output_bytes: 1_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut key = header_property::Cursor::new(&property_name, header_property::Context::Email);
+        let mut selected = None;
+        for _ in 0..100 {
+            if let header_property::Status::Complete(value) = key.poll(Tick(1), &mut work).unwrap()
+            {
+                selected = value;
                 break;
             }
         }
+        let selected = selected.unwrap();
+        let before = COUNTERS.snapshot();
+        let mut cursor = Text::new(
+            Input {
+                bytes: black_box(source.as_bytes()),
+                base: 0,
+                header_limit: source.len() as u64,
+                property: selected,
+                source_end: SourceEnd::Eof,
+            },
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut output = [0; 1];
+        let mut written = 0;
+        let mut complete = false;
+        for _ in 0..100_000 {
+            let progress = cursor.poll(Tick(1), &mut output).unwrap();
+            written += progress.written;
+            if matches!(progress.status, Status::Complete(_)) {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        // U+1EA1 plus 300 acute marks, café, quotes and array punctuation.
+        assert_eq!(written, 3 + 600 + 5 + 7);
+        cursor.check_deadline(Tick(1)).unwrap();
+        let mut cursor = Text::new(
+            Input {
+                bytes: refused_source.as_bytes(),
+                base: 0,
+                header_limit: refused_limit,
+                property: selected,
+                source_end: SourceEnd::Eof,
+            },
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut refused = false;
+        let mut written = 0;
+        for _ in 0..1000 {
+            match cursor.poll(Tick(1), &mut output) {
+                Ok(progress) => {
+                    assert!(!matches!(progress.status, Status::Complete(_)));
+                    written += progress.written;
+                }
+                Err(error) => {
+                    assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused);
+        assert_eq!(written, 4);
+        let after = COUNTERS.snapshot();
+        assert!(!before.invalid && !after.invalid);
+        assert_eq!(before, after, "Text property assembly allocated");
     }
-    assert!(refused);
-    assert_eq!(written, 4);
-    let after = COUNTERS.snapshot();
-    assert!(!before.invalid && !after.invalid);
-    assert_eq!(before, after, "Text property assembly allocated");
 }
 
 fn header_properties() {

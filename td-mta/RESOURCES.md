@@ -1003,7 +1003,11 @@ region is unused on this path; the inline cursor lives in parser state. Generic
 projection selection adds no trait object, allocation or second source. Turn
 bounds remain 255 visits, 256 aggregate steps, 16 job records and six output
 bytes. Allocation intervals cover overflow normalization, scratch reuse for
-another field and late refusal. Combined worker qualification remains open.
+another field and late refusal. M06bj's Content-Description/X- admission
+adds no retained state: at most twenty-one name visits, two steps and two
+records before any JSON. Existing source/turn bounds hold, and allocation
+intervals include both new field classes. Combined worker qualification
+remains open.
 
 Private JSON Frame state fits 32 bytes and owns no source or work reference.
 The public borrowed adapter still fits 64 bytes; extraction does not introduce

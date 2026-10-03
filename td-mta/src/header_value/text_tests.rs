@@ -373,7 +373,6 @@ fn text_grammar_is_checked_before_output_and_cannot_authorize_structured_words()
         "header:Content-Disposition:asText:all",
         "header:Keywords:asText",
         "header:List-Id:asText",
-        "header:X-Custom:asText",
         "header:Unknown:asText",
     ] {
         let mut work = work();
@@ -450,4 +449,190 @@ fn comma_refusal_uses_the_text_owner_error() {
     }
     assert!(failed);
     assert_eq!(prefix, b"[\"a\"");
+}
+
+#[test]
+fn description_and_user_fields_use_text_rules_in_email_and_body_parts() {
+    for field in ["Content-Description", "X-Custom", "x-short", "X-"] {
+        let source = format!("{field}: \u{fffd}\n{field}: (literal) \" =?utf-8?q?e=CC=81?= \"\n\n");
+        for context in [
+            header_property::Context::Email,
+            header_property::Context::BodyPart,
+        ] {
+            for width in 1..=8 {
+                for (suffix, expected) in [
+                    ("", "\"(literal) \\\" é \\\"\""),
+                    (":all", "[\"�\",\"(literal) \\\" é \\\"\"]"),
+                ] {
+                    let key = format!("header:{field}:asText{suffix}");
+                    let mut request = header_property::Cursor::new(&key, context);
+                    let mut work = work();
+                    let property = loop {
+                        if let header_property::Status::Complete(value) =
+                            request.poll(Tick(1), &mut work).unwrap()
+                        {
+                            break value.unwrap();
+                        }
+                    };
+                    let mut spec = input(source.as_bytes(), &key);
+                    spec.property = property;
+                    let mut budget = HeaderBudget::new();
+                    let mut scratch = nfc::Scratch::new();
+                    let mut cursor = Text::new(spec, &mut scratch, &mut work, &mut budget).unwrap();
+                    assert_eq!(drain(&mut cursor, width), expected.as_bytes(), "{key}");
+                    assert!(!cursor.is_encoding_problem());
+                }
+            }
+        }
+    }
+    for (key, expected, diagnostic) in [
+        ("header:x-custom:asText", "\"é\"", false),
+        ("header:x-custom:asText:all", "[\"�\",\"é\"]", true),
+        ("header:X-Missing:asText", "null", false),
+        ("header:X-Missing:asText:all", "[]", false),
+    ] {
+        let mut work = work();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = nfc::Scratch::new();
+        let mut cursor = Text::new(
+            input(b"X-Custom:\xff\nX-Custom:e\xcc\x81\n\n", key),
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(drain(&mut cursor, 1), expected.as_bytes());
+        assert_eq!(cursor.is_encoding_problem(), diagnostic);
+    }
+}
+#[test]
+fn text_grammar_admission_preserves_known_costs_and_bounds_prefix_work() {
+    for (name, visits, steps, accepted) in [
+        ("Subject", 7, 1, true),
+        ("cOmMeNtS", 8, 1, true),
+        ("cOnTeNt-DeScRiPtIoN", 19, 1, true),
+        ("X-", 2, 1, true),
+        ("x-long-header", 2, 1, true),
+        ("X-Cats!", 9, 2, true),
+        ("X-Custom", 10, 2, true),
+        ("X-12345678901234567", 21, 2, true),
+        ("X", 0, 1, false),
+        ("X_Header", 10, 2, false),
+        ("Content-Type", 2, 1, false),
+        ("Content-DispositioN", 21, 2, false),
+        ("Unknown", 9, 2, false),
+    ] {
+        let mut work = work();
+        let initial = work.remaining();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = nfc::Scratch::new();
+        let result = TextMode::validate(name, Tick(1), &mut work, &mut budget, &mut &mut scratch);
+        assert_eq!(
+            result,
+            if accepted {
+                Ok(())
+            } else {
+                Err(Error::UnsupportedGrammar)
+            },
+            "{name}"
+        );
+        assert_eq!(
+            initial.io_bytes - work.remaining().io_bytes,
+            visits,
+            "{name}"
+        );
+        assert_eq!(initial.records - work.remaining().records, steps, "{name}");
+        assert_eq!(16_000_000 - budget.steps_remaining(), steps);
+        assert_eq!(16 * 1024 * 1024 - budget.source_bytes_remaining(), visits);
+        assert_eq!(work.remaining().output_bytes, initial.output_bytes);
+    }
+}
+#[test]
+fn description_and_prefix_admission_refuse_before_json_on_every_partial_allowance() {
+    for (field, visits, steps) in [
+        ("Content-Description", 19, 1),
+        ("X-12345678901234567", 21, 2),
+    ] {
+        let key = format!("header:{field}:asText:all");
+        let source = format!("{field}:secret\n\n");
+        for (bytes, steps) in (0..visits)
+            .map(|cut| (cut, steps))
+            .chain((0..steps).map(|cut| (visits, cut)))
+        {
+            let mut work = work();
+            let mut budget = HeaderBudget::new();
+            budget
+                .charge(
+                    &mut self::work(),
+                    Tick(1),
+                    budget.source_bytes_remaining() - bytes,
+                    budget.steps_remaining() - steps,
+                    &mut 0,
+                )
+                .unwrap();
+            let mut scratch = nfc::Scratch::new();
+            let mut cursor = Text::new(
+                input(source.as_bytes(), &key),
+                &mut scratch,
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            let mut output = [0xa5; 8];
+            assert_eq!(
+                cursor.poll(Tick(1), &mut output),
+                Err(Error::InterpretationLimit)
+            );
+            assert_eq!(
+                cursor.poll(Tick(1), &mut output),
+                Err(Error::InterpretationLimit)
+            );
+            assert_eq!(output, [0xa5; 8]);
+            assert_eq!(work.remaining().output_bytes, 1_000_000);
+            assert_eq!(work.stopped(), None);
+        }
+    }
+}
+
+#[test]
+fn prefix_admission_preserves_paid_comparison_when_job_budget_refuses() {
+    for (io_bytes, records, stop, paid) in [
+        (18, 2, Stop::IoBytes, 0),
+        (19, 2, Stop::IoBytes, 19),
+        (20, 2, Stop::IoBytes, 19),
+        (21, 0, Stop::Records, 0),
+        (21, 1, Stop::Records, 19),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes,
+                records,
+                output_bytes: 100,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = nfc::Scratch::new();
+        let mut cursor = Text::new(
+            input(
+                b"X-12345678901234567:secret\n\n",
+                "header:X-12345678901234567:asText:all",
+            ),
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut output = [0xa5; 8];
+        assert_eq!(cursor.poll(Tick(1), &mut output), Err(Error::Work(stop)));
+        assert_eq!(cursor.poll(Tick(1), &mut output), Err(Error::Work(stop)));
+        assert_eq!(output, [0xa5; 8]);
+        assert_eq!(work.stopped(), Some(stop));
+        assert_eq!(work.remaining().io_bytes, io_bytes - paid);
+        assert_eq!(work.remaining().records, records - u64::from(paid != 0));
+        assert_eq!(work.remaining().output_bytes, 100);
+        assert_eq!(budget.source_bytes_remaining(), 16 * 1024 * 1024 - paid);
+        assert_eq!(budget.steps_remaining(), 16_000_000 - u64::from(paid != 0));
+    }
 }

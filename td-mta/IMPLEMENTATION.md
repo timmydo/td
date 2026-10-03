@@ -1631,6 +1631,13 @@ Initial independently landable increments:
   composed costs, partial limits, late failure and allocation-free drains.
   Remaining Text grammars and unpublished response retention remain open.
 
+- **M06bj — additional unstructured Text fields:** admit Content-Description
+  and user-defined X- fields under their MIME encoded-word rules. Prepay
+  bounded name/prefix comparisons, preserve existing Subject/Comments costs,
+  and keep other grammars explicit refusals. Cover Email/BodyPart contexts,
+  selection/diagnostics, admission limits and allocation-free overflow replay.
+  Structured Text grammars and unpublished response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
