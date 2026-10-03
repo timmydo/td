@@ -920,6 +920,17 @@ output charging belongs to the enclosing serializer. Allocation intervals
 cover the complete phrase composition and refusal. NFC Source/whole-worker
 integration must still demonstrate their existing size and work ceilings.
 
+Phrase display-name NFC retains the existing 3072-byte Scratch and at most
+1024 bytes for cursor plus HeaderBudget. Each private source checkpoint fits
+256 bytes including phrase decoder state and pending canonical expansion.
+Checkpoints compare exact field/range/turn identity without prefix scans.
+Each phrase poll charges at most 231 aggregate steps and 15 job records;
+all decoding/replay visits debit the same live budgets. The maximal one-MiB
+ASCII phrase fits default limits; hostile-tail replay does not revisit a
+finished prefix. Allocation intervals cover full decoding/normalization fast
+and overflow paths. Caller-owned grammar/whole-field aggregate admission,
+response storage and complete worker stack/RSS remain unqualified.
+
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
 including the fixed one-byte handoff; public MessageIds state remains

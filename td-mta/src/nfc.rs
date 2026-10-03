@@ -1,4 +1,4 @@
-//! Bounded NFC over resident UTF-8 or authorized unstructured header bytes.
+//! Bounded NFC over resident UTF-8 and authorized header scalar sources.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     ports::Tick,
@@ -153,6 +153,7 @@ impl From<crate::header_text::Error> for Error {
 enum Input<'a> {
     Utf8 { text: &'a str, position: usize },
     Header(crate::header_text::Cursor<'a>),
+    Phrase(crate::header_phrase::decode::Cursor<'a>),
 }
 #[derive(Clone, Copy)]
 struct Source<'a> {
@@ -180,6 +181,13 @@ impl<'a> Source<'a> {
             next: 0,
         }
     }
+    fn phrase(cursor: crate::header_phrase::decode::Cursor<'a>) -> Self {
+        Self {
+            input: Input::Phrase(cursor),
+            pending: None,
+            next: 0,
+        }
+    }
     fn at(&self, other: &Self) -> bool {
         let same = match (self.input, other.input) {
             (
@@ -190,16 +198,18 @@ impl<'a> Source<'a> {
                 },
             ) => std::ptr::eq(text, right) && position == at,
             (Input::Header(left), Input::Header(right)) => left.at(&right),
+            (Input::Phrase(left), Input::Phrase(right)) => left.at(&right),
             _ => false,
         };
         same && self.pending == other.pending && self.next == other.next
     }
     fn is_header(&self) -> bool {
-        matches!(self.input, Input::Header(_))
+        matches!(self.input, Input::Header(_) | Input::Phrase(_))
     }
     fn is_encoding_problem(&self) -> bool {
         match self.input {
             Input::Header(cursor) => cursor.is_encoding_problem(),
+            Input::Phrase(cursor) => cursor.is_encoding_problem(),
             Input::Utf8 { .. } => false,
         }
     }
@@ -244,6 +254,22 @@ impl<'a> Source<'a> {
                         }
                         crate::header_text::Status::Yield => return Ok(Read::Yield),
                         crate::header_text::Status::Complete => return Ok(Read::End),
+                    }
+                }
+                Input::Phrase(cursor) => {
+                    budget.charge(work, now, 0, 1, credit)?;
+                    let mut charged = DecodeWork {
+                        work,
+                        budget,
+                        credit,
+                    };
+                    match cursor.poll_with_work(now, &mut charged)? {
+                        crate::header_phrase::decode::Status::Scalar(value) => {
+                            budget.charge(work, now, 0, 1, credit)?;
+                            value
+                        }
+                        crate::header_phrase::decode::Status::Yield => return Ok(Read::Yield),
+                        crate::header_phrase::decode::Status::Complete => return Ok(Read::End),
                     }
                 }
             };
@@ -331,6 +357,24 @@ impl<'a, 'w> Cursor<'a, 'w> {
         budget: &'w mut HeaderBudget,
     ) -> Self {
         Self::from_source(Source::header(bytes), scratch, work, budget)
+    }
+    /// Supply a complete validated phrase and its exact range in the admitted
+    /// field value. The caller authorizes field/form selection before this call.
+    pub fn from_phrase(
+        proof: crate::header_phrase::Validated<'a>,
+        field: &'a [u8],
+        extent: crate::header_phrase::Extent,
+        scratch: &'w mut Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        let cursor = crate::header_phrase::decode::Cursor::new(proof, field, extent)?;
+        Ok(Self::from_source(
+            Source::phrase(cursor),
+            scratch,
+            work,
+            budget,
+        ))
     }
     fn from_source(
         source: Source<'a>,
@@ -953,6 +997,298 @@ mod tests {
         let mut cursor = Cursor::new("e\u{301}", &mut scratch, &mut work, &mut budget);
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Scalar('é')));
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Complete));
+    }
+    fn phrase_proof(input: &[u8]) -> crate::header_phrase::Validated<'_> {
+        let mut parser = crate::header_phrase::Cursor::new(input);
+        let mut work = work();
+        while !matches!(
+            parser.poll(Tick(1), &mut work).unwrap(),
+            crate::header_phrase::Status::Complete(_)
+        ) {}
+        parser.into_validated().unwrap()
+    }
+    fn phrase_trace(input: &[u8]) -> (String, bool, u64, u64) {
+        let proof = phrase_proof(input);
+        let mut scratch = Scratch::new();
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 1000).unwrap(),
+            Charge {
+                io_bytes: crate::admission::WorkLimits::default().foreground_io_bytes,
+                records: crate::admission::WorkLimits::default().foreground_records,
+                output_bytes: 32 * 1024 * 1024,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let before = work.remaining();
+        let mut cursor = Cursor::from_phrase(
+            proof,
+            input,
+            crate::header_phrase::Extent {
+                start: 0,
+                end: input.len(),
+            },
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(std::mem::size_of::<Source<'_>>() <= 256);
+        assert!(
+            std::mem::size_of_val(&cursor) + std::mem::size_of::<HeaderBudget>() <= 1024,
+            "NFC cursor + budget {}",
+            std::mem::size_of_val(&cursor) + std::mem::size_of::<HeaderBudget>()
+        );
+        let mut text = String::new();
+        let mut peak_steps = 0;
+        for _ in 0..20_000_000 {
+            let steps = cursor.budget.steps_remaining();
+            let records = cursor.work.remaining().records;
+            let status = cursor.poll(Tick(1)).unwrap();
+            peak_steps = peak_steps.max(steps - cursor.budget.steps_remaining());
+            assert!(peak_steps <= 231);
+            assert!(records - cursor.work.remaining().records <= 15);
+            match status {
+                Status::Yield => {}
+                Status::Scalar(value) => {
+                    cursor
+                        .charge_output(Tick(1), value.len_utf8() as u64)
+                        .unwrap();
+                    text.push(value);
+                }
+                Status::Complete => {
+                    let problem = cursor.is_encoding_problem();
+                    let visits = before.io_bytes - work.remaining().io_bytes;
+                    assert_eq!(visits, 16 * 1024 * 1024 - budget.source_bytes_remaining());
+                    return (text, problem, visits, peak_steps);
+                }
+            }
+        }
+        panic!("phrase NFC did not finish");
+    }
+    fn phrase(input: &[u8]) -> (String, bool, u64) {
+        let (text, problem, visits, _) = phrase_trace(input);
+        (text, problem, visits)
+    }
+    #[test]
+    fn phrase_names_normalize_after_placement_unquoting_and_filtering() {
+        for (source, expected, problem) in [
+            (" \" e\u{301} \" ", "é", false),
+            ("=?utf-8?q?e?= =?utf-8?q?=CC=81?=", "é", false),
+            ("=?utf-8?q?e=00=CC=81?=", "é", false),
+            ("\"e\"\u{301}", "é", false),
+            ("=?utf-8?q?=E1=84=80?= =?utf-8?q?=E1=85=A1?=", "가", false),
+            ("\"\\\0e\u{301}\u{fdd0}\"", "é�", true),
+            ("=?utf-8?q?=FF?=", "�", true),
+            ("=?utf-8?q?e?= (x) =?utf-8?q?=CC=81?=", "e \u{301}", false),
+        ] {
+            let (text, diagnostic, _) = phrase(source.as_bytes());
+            assert_eq!(
+                (text, diagnostic),
+                (expected.to_owned(), problem),
+                "{source}"
+            );
+        }
+    }
+    #[test]
+    fn phrase_recognition_with_a_gap_covers_the_maximal_poll() {
+        let source = format!("x {}", "a".repeat(75));
+        let (text, _, _, peak) = phrase_trace(source.as_bytes());
+        assert_eq!(text, source);
+        assert_eq!(peak, 231);
+    }
+    #[test]
+    fn phrase_pending_decomposition_is_actually_restored() {
+        let source = format!(
+            "=?utf-8?q?=C3=A9?={} =?utf-8?q?=C3=A9?={} =?utf-8?q?z?=",
+            " =?utf-8?q?=CC=95=CD=84?=".repeat(257),
+            " =?utf-8?q?=CC=81=CC=80?=".repeat(257)
+        );
+        let expected = format!(
+            "é{}{}é{}z",
+            "\u{308}\u{301}".repeat(257),
+            "\u{315}".repeat(257),
+            "\u{301}\u{300}".repeat(257)
+        );
+        let proof = phrase_proof(source.as_bytes());
+        let mut scratch = Scratch::new();
+        let mut meter = work();
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::from_phrase(
+            proof,
+            source.as_bytes(),
+            crate::header_phrase::Extent {
+                start: 0,
+                end: source.len(),
+            },
+            &mut scratch,
+            &mut meter,
+            &mut budget,
+        )
+        .unwrap();
+        let mut text = String::new();
+        let mut start_restored = false;
+        let mut resume_restored = false;
+        for _ in 0..2_000_000 {
+            start_restored |= cursor.overflow
+                && matches!(cursor.phase, Phase::Compute | Phase::Emit)
+                && cursor.scan.at(&cursor.start)
+                && cursor.scan.pending.is_some();
+            resume_restored |= matches!(cursor.phase, Phase::Scan)
+                && cursor.scan.at(&cursor.resume)
+                && cursor.scan.pending.is_some();
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Yield => {}
+                Status::Scalar(value) => text.push(value),
+                Status::Complete => {
+                    assert_eq!(text, expected);
+                    assert!(start_restored && resume_restored);
+                    return;
+                }
+            }
+        }
+        panic!("pending decomposition replay did not finish");
+    }
+    #[test]
+    fn phrase_overflow_restores_word_and_pending_decomposition_checkpoints() {
+        let word = "=?utf-8?q?=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80?=";
+        let source = format!("=?utf-8?q?a?={}", format!(" {word}").repeat(30));
+        assert_eq!(
+            phrase(source.as_bytes()).0,
+            format!("à{}{}", "\u{300}".repeat(149), "\u{315}".repeat(150))
+        );
+        let source = format!("=?utf-8?q?a?={}", " =?utf-8?q?=CD=84?=".repeat(257));
+        assert_eq!(
+            phrase(source.as_bytes()).0,
+            format!("ä\u{301}{}", "\u{308}\u{301}".repeat(256))
+        );
+        let source = format!("\" a{} \"", "\u{315}\u{300}".repeat(150));
+        assert_eq!(
+            phrase(source.as_bytes()).0,
+            format!("à{}{}", "\u{300}".repeat(149), "\u{315}".repeat(150))
+        );
+    }
+    #[test]
+    fn phrase_replay_never_rescans_prefix_and_maximal_ascii_fits() {
+        let tail = format!("=?utf-8?q?a?={}", " =?utf-8?q?=CC=95=CC=80?=".repeat(150));
+        let (_, _, short) = phrase(format!("x {tail}").as_bytes());
+        let (_, _, long) = phrase(format!("x{} {tail}", "x".repeat(10_000)).as_bytes());
+        assert_eq!(long - short, 40_000);
+        let input = "a".repeat(1024 * 1024);
+        let (output, problem, visits) = phrase(input.as_bytes());
+        assert_eq!(output, input);
+        assert!(!problem);
+        assert_eq!(visits, 4 * 1024 * 1024 + 2);
+    }
+    #[test]
+    fn phrase_context_and_terminal_failures_survive_normalization() {
+        let field = b"=?utf-8?q?e=CC=81?=<a@b>";
+        let length = field.len() - b"<a@b>".len();
+        let proof = phrase_proof(field.get(..length).unwrap());
+        let mut scratch = Scratch::new();
+        let mut meter = work();
+        let mut budget = HeaderBudget::new();
+        assert!(matches!(
+            Cursor::from_phrase(
+                proof,
+                field,
+                crate::header_phrase::Extent {
+                    start: 1,
+                    end: length
+                },
+                &mut scratch,
+                &mut meter,
+                &mut budget
+            ),
+            Err(Error::InvalidState)
+        ));
+        let mut cursor = Cursor::from_phrase(
+            proof,
+            field,
+            crate::header_phrase::Extent {
+                start: 0,
+                end: length,
+            },
+            &mut scratch,
+            &mut meter,
+            &mut budget,
+        )
+        .unwrap();
+        let mut text = String::new();
+        loop {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Yield => {}
+                Status::Scalar(value) => text.push(value),
+                Status::Complete => break,
+            }
+        }
+        assert_eq!(text.as_bytes(), field.get(..length).unwrap());
+        assert_eq!(
+            cursor.charge_output(Tick(1), 1),
+            Err(Error::Work(Stop::OutputBytes))
+        );
+        assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::OutputBytes)));
+        let input = b"name more";
+        let proof = phrase_proof(input);
+        for deadline in [false, true] {
+            let mut meter = work();
+            let mut budget = HeaderBudget::new();
+            let mut cursor = Cursor::from_phrase(
+                proof,
+                input,
+                crate::header_phrase::Extent {
+                    start: 0,
+                    end: input.len(),
+                },
+                &mut scratch,
+                &mut meter,
+                &mut budget,
+            )
+            .unwrap();
+            while !matches!(cursor.poll(Tick(1)).unwrap(), Status::Scalar(_)) {}
+            let expected = if deadline {
+                Error::Work(Stop::Deadline)
+            } else {
+                cursor.budget.steps = 0;
+                Error::InterpretationLimit
+            };
+            assert_eq!(
+                cursor.poll(if deadline { Tick(1000) } else { Tick(1) }),
+                Err(expected)
+            );
+            *cursor.work = work();
+            assert_eq!(cursor.poll(Tick(1)), Err(expected));
+        }
+        let mut meter = work();
+        let mut budget = HeaderBudget::new();
+        budget.bytes = 0;
+        let mut cursor = Cursor::from_phrase(
+            proof,
+            input,
+            crate::header_phrase::Extent {
+                start: 0,
+                end: input.len(),
+            },
+            &mut scratch,
+            &mut meter,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(cursor.poll(Tick(1)), Err(Error::InterpretationLimit));
+        let mut fresh = work();
+        let mut next = Cursor::from_phrase(
+            proof,
+            input,
+            crate::header_phrase::Extent {
+                start: 0,
+                end: input.len(),
+            },
+            &mut scratch,
+            &mut fresh,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(next.poll(Tick(1)), Err(Error::InterpretationLimit));
     }
     fn header(input: &[u8]) -> (String, bool, u64) {
         let mut scratch = Scratch::new();

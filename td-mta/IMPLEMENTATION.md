@@ -1471,6 +1471,14 @@ Initial independently landable increments:
   copies, exact work and allocation-free refusal. Comment names, NFC and
   JMAP publication remain open.
 
+- **M06am — normalized phrase names:** connect the validated phrase scalar
+  source to NFC with exact field/range/turn checkpoint identity. Retain live
+  aggregate charging and existing scratch/cursor ceilings. Cover canonical
+  and Hangul composition, hostile overflow, decoder/decomposition restoration,
+  exact prefix visits, maximal ASCII, terminal refusal and allocation-free
+  composition. Comment fallback, whole-field publication and worker resource
+  qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

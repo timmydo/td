@@ -2047,6 +2047,44 @@ repair, long Unicode, exact work, every copied suffix, refusal after output
 and aggregate refusal inside replay. Allocation intervals cover composition
 and refusal. Complete NFC Source and worker resource qualification remain open.
 
+### 1.45 Normalized phrase display names
+
+M06am adds `nfc::Cursor::from_phrase(proof, field, extent, scratch, meter,
+header_budget)`. It binds the completed phrase proof to the field range as in
+section 1.44, then composes that decoder with the existing NFC engine.
+Construction is fallible for a mismatched source/range. The caller authorizes
+the header form and supplies an admitted immutable field, excluding its final
+line ending. Initial grammar validation remains separately charged by its
+caller; complete header-form aggregate admission and response publication
+remain outside this adapter.
+
+The private Source now supports valid UTF-8, unstructured text and phrase
+text. Phrase checkpoint identity uses the whole field's pointer/length,
+phrase extent and checked successful-turn ordinal, plus pending canonical
+decomposition. No source prefix is scanned to compare checkpoints. Copies
+retain decoder/replay/trim state, including positions inside encoded words;
+meters, aggregate budget, scratch and record credit remain borrowed once.
+Diagnostics accumulate across original scanning and normalization replay.
+
+The same 3072-byte Scratch and at most 1024 bytes for cursor plus aggregate
+budget remain sufficient; each Source fits 256 bytes. Phrase polls execute
+one normalizer transition and charge at most 231 aggregate steps/15 job
+records, within the existing 256-step ceiling. All classification, trimming,
+lookahead, conversion and replay visits pass through the live HeaderBudget
+before work. Output is charged separately by `charge_output`; failure there
+retires even a completed cursor. Cached completion is otherwise inert.
+
+Tests cover literal/quoted/cross-word canonical and Hangul composition,
+filtering before NFC, overflow with multiple combining classes, restoration
+inside encoded words and pending canonical decomposition, and precise prefix
+visits. A maximal one-MiB ASCII phrase fits the default foreground and header
+budgets with 4194306 decoding visits, excluding initial grammar validation.
+An added 10000-byte prefix costs 40000 visits even when the tail replays.
+Shared aggregate exhaustion, progressed deadline refusal and output refusal
+remain terminal. Allocation intervals cover the complete phrase/NFC fast and
+replay paths. Comment fallback names, field assembly, JSON serialization and
+complete worker memory/RSS qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

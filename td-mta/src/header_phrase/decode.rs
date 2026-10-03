@@ -28,7 +28,7 @@ pub struct Cursor<'a> {
     phase: Phase<'a>,
     token: Extent,
     scan: usize,
-    // Retained for deterministic NFC checkpoint identity in the next adapter.
+    // Successful turns identify deterministic NFC checkpoints without prefix scans.
     turn: u64,
     kind: Kind,
     first: bool,
@@ -66,6 +66,9 @@ impl<'a> Cursor<'a> {
     }
     pub const fn is_encoding_problem(&self) -> bool {
         self.problem
+    }
+    pub(crate) fn at(&self, other: &Self) -> bool {
+        std::ptr::eq(self.field, other.field) && self.name == other.name && self.turn == other.turn
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         self.poll_with_work(now, work)

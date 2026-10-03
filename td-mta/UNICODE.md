@@ -190,19 +190,20 @@ available. No runtime timing claim is made.
 
 ## Current resident implementation
 
-M06p implements the ordering/composition algorithm above for immutable valid
-UTF-8 strings. Its fixed 3072-byte scratch and at most 1024 bytes of cursor
-plus aggregate budget fit the existing 4 KiB reservation. Private source
-checkpoints now fit 256 bytes each, including the M06t header-decoder state
-and pending canonical expansion. API.md sections 1.23 and 1.27 define exact
-charging and ownership. Valid-UTF8 turns have at most 32 state transitions
-and 128 charged steps; unstructured-header turns have one transition and at
-most 228 steps. Both fit the 256-step ceiling. One job-meter record prepays
-16 internal steps using private cursor credit; individual steps still debit
-the header budget. The cursor's output charge method lets the caller debit
-the same meter before serialization and check its deadline after a turn.
-External clock/cancellation checks belong to the caller. On any error the
-entire provisional property must be discarded.
+M06p implements the ordering/composition algorithm above for immutable
+valid UTF-8 strings. Its fixed 3072-byte scratch and at most 1024 bytes of
+cursor plus aggregate budget fit the existing 4 KiB reservation. Private
+source checkpoints now fit 256 bytes each, including the M06t header-
+decoder state and pending canonical expansion. API.md sections 1.23 and
+1.27 define exact charging and ownership. Valid-UTF8 turns have at most 32
+state transitions and 128 charged steps; unstructured-header turns have one
+transition and at most 228 steps. Phrase decoding adds a 231-step bound;
+all fit the 256-step ceiling. One job-meter record prepays 16 internal
+steps using private cursor credit; individual steps still debit the header
+budget. The cursor's output charge method lets the caller debit the same
+meter before serialization and check its deadline after a turn. External
+clock/cancellation checks belong to the caller. On any error the entire
+provisional property must be discarded.
 
 Ordinary tests run all five NFC equations for each of the 20034 official
 vectors, including idempotence, plus every scalar outside Part 1 as an
@@ -238,6 +239,26 @@ budgets and retains exact source accounting. Isolated allocation intervals
 cover the complete decoding/normalization fast and replay paths. Structured
 headers, source gathering, outer property failure publication and worker
 scheduling remain open; this does not qualify their stacks or the service RSS.
+
+M06am adds validated phrase names as a third resident source. It preserves
+whole-field placement context and binds the proof to its exact phrase range.
+Unquoting, sole-quoted trimming, conditional encoded-word gap suppression and
+scalar filtering precede NFC. A checked turn ordinal plus field/range identity
+identifies deterministic decoder progress; pending decomposition remains part
+of each source checkpoint. The same source/cursor/scratch ceilings hold.
+Every decoding prepass and replay spends the aggregate budget before work;
+phrase polls stay within 231 steps and 15 job records. Initial grammar proof
+validation is separately caller-charged; complete header-form aggregate
+admission remains part of the future owner composition.
+
+Literal and encoded-name oracles cover canonical/Hangul composition,
+noncharacter filtering, overflow across words and pending decomposition, and
+prefixes that are not revisited with their hostile tail. One MiB of ASCII
+fits the default budgets; its decoder visits each byte four times plus two
+initial peeks. Shared budget exhaustion and progressed deadline/output refusal
+remain terminal. The allocation probe composes validation, decoding and NFC
+without allocating after admission. Comment fallback and whole-field/JMAP
+publication remain open, as do worker-stack and service RSS qualification.
 
 ## Acceptance evidence owned by M06
 
