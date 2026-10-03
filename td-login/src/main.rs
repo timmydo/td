@@ -643,208 +643,32 @@ mod tests {
 mod confinement {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use std::path::Path;
+    use td_source_scan::{self as scan, squeeze, unsafe_allows, unsafe_blocks, unsafe_items};
 
-    /// Local sources plus the one explicitly admitted shared account reader.
-    ///
-    /// A hand-written list is a hole: adding `mod newmod;` alongside a
-    /// `newmod.rs` full of `unsafe` would leave every assertion below passing
-    /// because they never saw the file. The directory is the authority.
-    /// Sub-directories too: `mod deep;` inside a module puts `deep.rs` one level
-    /// down, and a scan that stopped at the top would never read it.
-    /// Files are keyed by their path RELATIVE to `src/`, never by basename: a
-    /// `decoy/sys.rs` is not the `sys.rs` the crate compiles, and a key that
-    /// could not tell them apart would let the decoy answer for the real file.
-    /// A non-`.rs` file under `src/` is not inert — it is exactly what the two
-    /// refused constructs compile — so it is collected separately rather than
-    /// skipped, and asserted absent below.
-    fn collect(base: &Path, dir: &Path, out: &mut Vec<(String, String)>, other: &mut Vec<String>) {
-        let entries = std::fs::read_dir(dir).unwrap();
-        for entry in entries {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                collect(base, &path, out, other);
-                continue;
-            }
-            let name = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_str()
-                .unwrap_or_default()
-                .to_string();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                other.push(name);
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).unwrap();
-            out.push((name, strip_comments(&text)));
-        }
-    }
-
-    fn walk() -> (Vec<(String, String)>, Vec<String>) {
+    /// Every source file of the crate, read from disk (see `scan::read_tree`),
+    /// plus the one explicitly admitted shared account reader.
+    fn walk() -> scan::Tree {
         let base = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-        let (mut out, mut other) = (Vec::new(), Vec::new());
-        collect(base, base, &mut out, &mut other);
+        let mut tree = scan::read_tree(base).unwrap();
         let shared = base.join("../../td-authd/src/primary_account.rs");
-        out.push((
+        tree.rs.push((
             "primary_account.rs".into(),
-            strip_comments(&std::fs::read_to_string(shared).unwrap()),
+            scan::strip_comments(&std::fs::read_to_string(shared).unwrap()),
         ));
-        out.sort();
-        other.sort();
-        (out, other)
+        tree.rs.sort();
+        tree
     }
 
     fn sources() -> Vec<(String, String)> {
-        walk().0
+        walk().rs
     }
 
-    /// Where a file's `mod x;` puts `x.rs`: beside `main.rs` for the crate root,
-    /// and in a like-named subdirectory for every other module.
-    fn submodule_dir(file: &str) -> String {
-        if file == "main.rs" {
-            String::new()
-        } else {
-            format!("{}/", file.trim_end_matches(".rs"))
-        }
+    fn source(name: &str) -> String {
+        scan::source(&sources(), name)
     }
 
-    /// The scans below read tokens off raw text, so a comment BETWEEN two tokens
-    /// slips past all of them: `un`+`safe /* here */ {` is one construct to the
-    /// compiler. Rust's lexer is not reachable from a test, so this is the part
-    /// that matters — comments, and the literals a comment marker hides inside.
-    /// Newlines are preserved so the per-line scans still see lines.
-    fn strip_comments(text: &str) -> String {
-        let src: Vec<char> = text.chars().collect();
-        let mut out = String::with_capacity(text.len());
-        let mut i = 0;
-        let at = |i: usize| src.get(i).copied();
-        while i < src.len() {
-            let c = at(i).unwrap_or(' ');
-            if c == '/' && at(i + 1) == Some('/') {
-                while i < src.len() && at(i) != Some('\n') {
-                    i += 1;
-                }
-                continue;
-            }
-            if c == '/' && at(i + 1) == Some('*') {
-                let mut depth = 1usize; // Rust's block comments nest.
-                let mut newlines = 0usize;
-                i += 2;
-                while i < src.len() && depth > 0 {
-                    if at(i) == Some('/') && at(i + 1) == Some('*') {
-                        depth += 1;
-                        i += 2;
-                    } else if at(i) == Some('*') && at(i + 1) == Some('/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        if at(i) == Some('\n') {
-                            newlines += 1;
-                        }
-                        i += 1;
-                    }
-                }
-                // A space, so the tokens either side stay separate tokens.
-                out.push(' ');
-                for _ in 0..newlines {
-                    out.push('\n');
-                }
-                continue;
-            }
-            // Raw strings hold no escapes, so their terminator is the quote
-            // followed by as many hashes as opened them. Modelling them is not
-            // optional: a raw string containing an unbalanced `/*` would
-            // otherwise open a block comment that swallows the rest of the file,
-            // hiding a real unsafe block from the count while it still compiles.
-            if c == 'r' || (c == 'b' && at(i + 1) == Some('r')) {
-                let mut k = if c == 'b' { i + 2 } else { i + 1 };
-                let mut hashes = 0usize;
-                while at(k) == Some('#') {
-                    hashes += 1;
-                    k += 1;
-                }
-                if at(k) == Some('"') {
-                    for j in i..=k {
-                        if let Some(ch) = at(j) {
-                            out.push(ch);
-                        }
-                    }
-                    i = k + 1;
-                    while let Some(ch) = at(i) {
-                        if ch == '"' {
-                            let mut seen = 0usize;
-                            while seen < hashes && at(i + 1 + seen) == Some('#') {
-                                seen += 1;
-                            }
-                            if seen == hashes {
-                                for j in 0..=hashes {
-                                    if let Some(c2) = at(i + j) {
-                                        out.push(c2);
-                                    }
-                                }
-                                i += hashes + 1;
-                                break;
-                            }
-                        }
-                        out.push(ch);
-                        i += 1;
-                    }
-                    continue;
-                }
-            }
-            if c == '"' {
-                out.push(c);
-                i += 1;
-                while i < src.len() {
-                    let s = at(i).unwrap_or(' ');
-                    out.push(s);
-                    i += 1;
-                    if s == '\\' {
-                        if let Some(escaped) = at(i) {
-                            out.push(escaped);
-                            i += 1;
-                        }
-                        continue;
-                    }
-                    if s == '"' {
-                        break;
-                    }
-                }
-                continue;
-            }
-            // A quote opens a char literal or a lifetime. A lifetime is a quote,
-            // an identifier, and NO closing quote; only a char literal can hold a
-            // comment marker, and it is copied whole so `'/'` cannot open one.
-            if c == '\'' {
-                let ident = at(i + 1).is_some_and(|n| n.is_alphabetic() || n == '_');
-                if !(ident && at(i + 2) != Some('\'')) {
-                    let mut k = i + 1;
-                    let mut close = None;
-                    while let Some(ch) = at(k) {
-                        match ch {
-                            '\\' => k += 2,
-                            '\'' => {
-                                close = Some(k);
-                                break;
-                            }
-                            _ => k += 1,
-                        }
-                    }
-                    if let Some(end) = close {
-                        for j in i..=end {
-                            if let Some(ch) = at(j) {
-                                out.push(ch);
-                            }
-                        }
-                        i = end + 1;
-                        continue;
-                    }
-                }
-            }
-            out.push(c);
-            i += 1;
-        }
-        out
+    fn squeezed() -> String {
+        scan::squeezed(&sources())
     }
 
     /// The syscalls UNSAFE.md records for this crate, with the x86_64 number
@@ -867,148 +691,18 @@ mod confinement {
     const ORDER: &[&str] = &["setgroups", "setgid", "setuid"];
     const SWITCH: &str = "creds.rs";
 
-    fn source(name: &str) -> String {
-        for (n, text) in sources() {
-            if n == name {
-                return text;
-            }
-        }
-        String::new()
-    }
-
-    /// What follows each `unsafe` keyword, with everything the compiler treats
-    /// as noise in between removed: any gap (one space, several, a newline, a
-    /// stripped comment, or none at all before a brace) and the `extern "ABI"`
-    /// of an unsafe foreign item. Reading the following TOKEN rather than
-    /// matching a fixed spelling is what stops this whole family of evasions —
-    /// `unsafe  fn` and `unsafe extern "C" fn` are the same item to rustc.
-    fn after_unsafe(text: &str) -> Vec<&str> {
-        let word = concat!("un", "safe");
-        let mut out = Vec::new();
-        for (offset, _) in text.match_indices(word) {
-            let Some(rest) = text.get(offset + word.len()..) else {
-                continue;
-            };
-            // `unsafe_code` is ONE identifier; a brace or a gap means two tokens.
-            if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-                continue;
-            }
-            let mut rest = rest.trim_start();
-            while let Some(tail) = rest.strip_prefix("extern") {
-                rest = tail.trim_start();
-                let Some(tail) = rest.strip_prefix('"') else {
-                    break;
-                };
-                match tail.split_once('"') {
-                    Some((_, after)) => rest = after.trim_start(),
-                    None => break,
-                }
-            }
-            out.push(rest);
-        }
-        out
-    }
-
-    fn unsafe_blocks(text: &str) -> usize {
-        after_unsafe(text)
-            .iter()
-            .filter(|rest| rest.starts_with('{'))
-            .count()
-    }
-
-    fn unsafe_items(text: &str, keyword: &str) -> usize {
-        after_unsafe(text)
-            .iter()
-            .filter(|rest| match rest.strip_prefix(keyword) {
-                Some(after) => !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'),
-                None => false,
-            })
-            .count()
-    }
-
-    /// Every source with whitespace squeezed out. Whitespace is not a token
-    /// boundary the compiler cares about — `# [path`, `include !` and
-    /// `macro_rules !` all compile — so a construct refused by exact substring
-    /// is one space away from being allowed.
-    fn squeeze(text: &str) -> String {
-        text.chars().filter(|c| !c.is_whitespace()).collect()
-    }
-
-    fn squeezed() -> String {
-        let mut out = String::new();
-        for (_, text) in sources() {
-            out.push_str(&squeeze(&text));
-            out.push('\n');
-        }
-        out
-    }
-
-    /// Count `allow(..)` groups that name the unsafe lint anywhere inside them,
-    /// so a multi-lint allow is worth exactly as much as a lone one.
-    fn unsafe_allows(text: &str) -> usize {
-        let lint = concat!("un", "safe_code");
-        let mut count = 0;
-        // `expect` re-permits the lint exactly as `allow` does — only noisily
-        // when unused — so both are counted. Whitespace before the group is
-        // legal Rust and is skipped rather than assumed absent: an
-        // `#[allow (…)]` the scan walked past would be a permission nobody sees.
-        for keyword in ["allow", "expect"] {
-            for (offset, _) in text.match_indices(keyword) {
-                let Some(rest) = text.get(offset + keyword.len()..) else {
-                    continue;
-                };
-                let Some(rest) = rest.trim_start().strip_prefix('(') else {
-                    continue;
-                };
-                let group = match rest.match_indices(')').next() {
-                    Some((end, _)) => rest.get(..end).unwrap_or(rest),
-                    None => rest,
-                };
-                if group
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .any(|t| t == lint)
-                {
-                    count += 1;
-                }
-            }
-        }
-        count
-    }
-
     /// Reading the directory only equals reading `main.rs` if the two agree, so
     /// assert it: a `mod` whose file the scan missed would make every assertion
     /// below vacuous for exactly the file that needed checking.
     #[test]
     fn the_scan_covers_every_module_the_crate_declares() {
         let files = sources();
-        let mut declared = Vec::new();
-        for (path, text) in &files {
-            for line in text.lines() {
-                // `pub mod` and `pub(crate) mod` declare a module just as much.
-                let mut line = line.trim();
-                if let Some(unprefixed) = line.strip_prefix("pub") {
-                    let unprefixed = unprefixed.trim_start();
-                    line = match unprefixed.strip_prefix('(') {
-                        Some(vis) => match vis.split_once(')') {
-                            Some((_, after)) => after.trim_start(),
-                            None => unprefixed,
-                        },
-                        None => unprefixed,
-                    };
-                }
-                let Some(rest) = line.strip_prefix("mod ") else {
-                    continue;
-                };
-                let Some(name) = rest.strip_suffix(';') else {
-                    continue; // an inline `mod tests {` block, already in this file
-                };
-                let target = format!("{}{name}.rs", submodule_dir(path));
-                assert!(
-                    files.iter().any(|(f, _)| *f == target),
-                    "module '{target}' is declared but was not scanned"
-                );
-                declared.push(target);
-            }
+        let declared = scan::declared_modules(&files);
+        for target in &declared {
+            assert!(
+                files.iter().any(|(f, _)| f == target),
+                "module '{target}' is declared but was not scanned"
+            );
         }
         assert_eq!(
             declared.len(),
@@ -1037,7 +731,7 @@ mod confinement {
     /// compiles perfectly well through the constructs refused below.
     #[test]
     fn the_scan_holds_exactly_the_twelve_audited_modules() {
-        let (rs, other) = walk();
+        let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
@@ -1209,12 +903,7 @@ mod confinement {
             1
         );
         let squeezed = squeezed().replacen(permitted_path, "", 1);
-        for construct in [
-            concat!("[", "path="),
-            concat!(",", "path="),
-            concat!("inc", "lude!"),
-            concat!("macro_", "rules!"),
-        ] {
+        for construct in scan::DECOUPLING {
             assert_eq!(
                 squeezed.matches(construct).count(),
                 0,

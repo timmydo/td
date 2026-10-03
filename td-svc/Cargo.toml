@@ -13,6 +13,12 @@ clippy-all-targets = true
 name = "td-svc"
 path = "src/main.rs"
 
+# The confinement tests read src/ through td-source-scan's shared scans.
+# Dev-only: the recipe compiles src/main.rs with a direct rustc and no
+# `--test`, so the shipped binary never sees it.
+[dev-dependencies]
+td-source-scan = { path = "../td-source-scan" }
+
 # The engine root carries no `exclude` list and never needed one: an `exclude`
 # stops cargo only at THAT manifest.
 # From a nested checkout (`.claude/worktrees/*` lives physically under the main

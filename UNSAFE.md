@@ -100,6 +100,15 @@ a transfer, and nothing else; reusing a module does not transfer its
 authorization to a raw boundary of the consumer's own, which gets its
 own entry.
 
+The confinement tests of `td-init`, `td-login`, `td-svc` and `td-util`
+read their `src/` through `td-source-scan`: one comment stripper, the
+tokens after each `unsafe`, the allow and block counts, module coverage,
+and the constructs that would decouple the scanned text from the compiled
+crate. It is a dev-dependency only, absent from every recipe and shipped
+binary, and forbids `unsafe` itself. A change to how it reads comments,
+literals or tokens is a change to each consumer's confinement and is
+reviewed as one.
+
 ## Roster
 
 | # | crate | syscalls |

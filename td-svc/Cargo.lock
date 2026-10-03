@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "td-source-scan"
+version = "0.1.0"
+
+[[package]]
 name = "td-svc"
 version = "0.1.0"
+dependencies = [
+ "td-source-scan",
+]

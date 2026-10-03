@@ -1513,6 +1513,19 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-source-scan is the confinement tests' shared source reader and only
+    // ever a dev-dependency: no recipe stages, embeds or names it, and the
+    // recipes compile its consumers' src/ with a direct rustc and no
+    // `--test` (td-svc's `--test` build is tests/pair.rs, its own crate
+    // root), so no target artifact can change. The cargo-test preflight is everything that
+    // reads it: its own suite and lints, and through the reader closure every
+    // consumer's confinement tests. `source_scan_reaches_no_recipe` holds the
+    // premise.
+    if p.starts_with("td-source-scan/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-agent the same way until its packaging increment: no recipe, recipe
     // test or seed roster names it, and nothing reads it, so its own tests
     // and lints are all a confined edit can break (td-agent/DESIGN.md §17).
@@ -5865,6 +5878,12 @@ mod tests {
             ]
         );
         assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
+        // Dev-dependency edges count: a td-source-scan change runs every
+        // consumer's confinement tests.
+        assert_eq!(
+            readers_of("td-source-scan"),
+            ["td-init", "td-login", "td-svc", "td-util"]
+        );
         // td-authd compiles td-install's consent codec by `#[path]`, and the
         // installation fixture its three protocol codecs.
         assert_eq!(
@@ -8752,6 +8771,85 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// A td-source-scan change selects the cargo-test preflight over the crate
+    /// and every consumer's confinement tests, and no target gate.
+    #[test]
+    fn source_scan_changes_run_consumer_tests_without_distro_checks() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        if !roster.iter().any(|c| c.name == "td-source-scan") {
+            eprintln!("SKIP: td-source-scan is not in the gate roster");
+            return;
+        }
+        for path in [
+            "td-source-scan/src/lib.rs",
+            "td-source-scan/Cargo.toml",
+            "td-source-scan/Cargo.lock",
+        ] {
+            let output = path_output(&root, path);
+            for krate in ["td-source-scan", "td-init", "td-login", "td-svc", "td-util"] {
+                assert!(
+                    output.contains(&format!("--manifest-path {krate}/Cargo.toml")),
+                    "{path} selects no preflight over {krate}: {output}"
+                );
+            }
+            assert!(!output.contains("td-builder check"), "{path}: {output}");
+            assert!(!output.contains("recipe-checks scope"), "{path}: {output}");
+        }
+        for path in [
+            "td-source-scan-x/src/lib.rs",
+            "td-source-scan/../td-sh/src/main.rs",
+        ] {
+            assert!(
+                path_output(&root, path).contains("td-builder check"),
+                "{path}"
+            );
+        }
+    }
+
+    /// The premise of td-source-scan's cargo-test-only arm: it is a
+    /// dev-dependency of every crate that names it and a dependency of none,
+    /// and no recipe or staged tree names it, so no target artifact compiles
+    /// it. A recipe that built a consumer's tests would void the arm.
+    #[test]
+    fn source_scan_reaches_no_recipe() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        let name = "td-source-scan";
+        // The crate-name spelling too: `--extern td_source_scan=...` is how a
+        // recipe compiling a consumer's tests would name it.
+        let spellings = [name, "td_source_scan"];
+        for krate in &roster {
+            assert!(
+                !krate.path_dependencies.iter().any(|d| d == name),
+                "{} takes {name} as a dependency; only a dev-dependency keeps \
+                 it out of every shipped binary",
+                krate.name
+            );
+        }
+        let mut recipes = Vec::new();
+        collect_rs_recursive(&root.join("recipes/src"), &mut recipes);
+        assert!(!recipes.is_empty());
+        for path in recipes {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for spelling in spellings {
+                assert!(
+                    !text.contains(spelling),
+                    "{} names {spelling}; revisit its affected-check mapping",
+                    path.display()
+                );
+            }
+        }
+        let staged = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
+        assert!(!staged.contains(name), "{name} now enters a recipe closure");
     }
 
     #[test]
