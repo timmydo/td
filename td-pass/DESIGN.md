@@ -299,6 +299,14 @@ host lock and sleep evidence on the supported host, td mode, the
 foreign-host acceptance of the same executable, and increment 5's
 independent recovery, migration and hardware evidence.
 
+Not yet, in the window: the search field and the title field are not
+visibly separated from the title list and the editor pane below them.
+td-ui's `chrome::TextEntry` paints only a paper ground, so a field's
+bounds are not obvious. Each field, the list and the pane should carry
+an outline. That is td-ui chrome work shared with td-ui's other
+`TextEntry` and `List` consumers (td-agent, td-setup, td-mail), not a
+td-pass-only paint.
+
 ## Delivery and proof
 
 ### First foreign host: Guix System
