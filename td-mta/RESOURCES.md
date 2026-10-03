@@ -868,6 +868,16 @@ Returned raw parts charge no output. Allocation intervals cover long UTF-8,
 quoted folds, malformed tails and nesting/work refusal. Mailbox/group and
 text/NFC composition remain to be qualified.
 
+The phrase token cursor fits 320 bytes in the body parser reservation,
+including shared word/CFWS state, source/extent bookkeeping and its error
+latch. Its private purpose adds no copied display name or arena. Exact
+leading/trailing CFWS extents preserve later encoding-placement context.
+Token classification adds one prepaid byte visit and record to the shared
+core's turn, for ceilings of 161 bytes/33 records and no output charge.
+Allocation intervals cover long Unicode atoms, quoted folds, obsolete dots,
+malformed tails and nesting/work refusal. Complete mailbox/group and
+text/NFC composition remain to be qualified.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

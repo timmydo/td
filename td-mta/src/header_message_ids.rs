@@ -9,7 +9,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     Strict,
-    /// Only authorized for References and In-Reply-To obsolete phrase syntax.
+    /// Public selection is restricted to References and In-Reply-To.
     ObsoletePhrases,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,12 +66,18 @@ enum Phase {
     Delimited { emit: bool },
     Complete,
 }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Purpose {
+    MessageIds,
+    AddrSpec,
+    Phrase,
+}
 /// Every Begin/Part/End is provisional until Complete validates the full input.
-/// Public list input ends at field value_end; private addr-spec input is one candidate.
+/// Public list input ends at field value_end; private inputs are single candidates.
 pub struct Cursor<'a> {
     source: &'a [u8],
     mode: Mode,
-    bare: bool,
+    purpose: Purpose,
     position: usize,
     grammar: Grammar,
     phase: Phase,
@@ -86,7 +92,7 @@ impl<'a> Cursor<'a> {
         Self {
             source,
             mode,
-            bare: false,
+            purpose: Purpose::MessageIds,
             position: 0,
             grammar: Grammar::Between,
             phase: Phase::Cfws,
@@ -100,8 +106,14 @@ impl<'a> Cursor<'a> {
     // Enter the shared local/domain grammar without copying enclosing angles.
     pub(crate) const fn addr_spec(source: &'a [u8]) -> Self {
         let mut cursor = Self::new(source, Mode::Strict);
-        cursor.bare = true;
+        cursor.purpose = Purpose::AddrSpec;
         cursor.grammar = Grammar::LeftWord;
+        cursor
+    }
+    // Reuse word and CFWS parsing while retaining tokens for display decoding.
+    pub(crate) const fn phrase(source: &'a [u8]) -> Self {
+        let mut cursor = Self::new(source, Mode::ObsoletePhrases);
+        cursor.purpose = Purpose::Phrase;
         cursor
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
@@ -150,7 +162,7 @@ impl<'a> Cursor<'a> {
                     header_delimited::Status::Complete(extent) => {
                         self.position = extent.end;
                         self.delimited = None;
-                        self.finish_word(emit);
+                        self.finish_word();
                         Ok(if emit {
                             Status::Part(Extent {
                                 start: extent.start,
@@ -218,12 +230,15 @@ impl<'a> Cursor<'a> {
         let byte = self.visit(now, work)?;
         match (self.grammar, byte) {
             (Grammar::Between, None)
-                if self.any || (self.mode == Mode::ObsoletePhrases && self.source.is_empty()) =>
+                if self.any
+                    || (self.purpose == Purpose::MessageIds
+                        && self.mode == Mode::ObsoletePhrases
+                        && self.source.is_empty()) =>
             {
                 self.phase = Phase::Complete;
                 Ok(Status::Complete)
             }
-            (Grammar::Between, Some(b'<')) => {
+            (Grammar::Between, Some(b'<')) if self.purpose == Purpose::MessageIds => {
                 self.advance(1)?;
                 self.grammar = Grammar::LeftWord;
                 self.phase = Phase::Cfws;
@@ -232,13 +247,20 @@ impl<'a> Cursor<'a> {
             }
             (Grammar::Between, Some(byte)) if self.mode == Mode::ObsoletePhrases => {
                 if byte == b'.' && self.phrase {
-                    self.advance(1)?;
-                    self.phase = Phase::Cfws;
-                    Ok(Status::Yield)
+                    let part = self.punctuation(Grammar::Between)?;
+                    Ok(if self.purpose == Purpose::Phrase {
+                        part
+                    } else {
+                        Status::Yield
+                    })
                 } else if byte == b'"' {
-                    Ok(self.word(Some(Kind::QuotedString), Grammar::Between, false))
+                    Ok(self.word(
+                        Some(Kind::QuotedString),
+                        Grammar::Between,
+                        self.purpose == Purpose::Phrase,
+                    ))
                 } else if atext(byte) {
-                    Ok(self.word(None, Grammar::Between, false))
+                    Ok(self.word(None, Grammar::Between, self.purpose == Purpose::Phrase))
                 } else {
                     Err(Error::Malformed)
                 }
@@ -258,11 +280,15 @@ impl<'a> Cursor<'a> {
                 Ok(self.word(None, Grammar::RightTail, true))
             }
             (Grammar::RightTail, Some(b'.')) => self.punctuation(Grammar::RightAtom),
-            (Grammar::RightTail | Grammar::LiteralTail, None) if self.bare => {
+            (Grammar::RightTail | Grammar::LiteralTail, None)
+                if self.purpose == Purpose::AddrSpec =>
+            {
                 self.phase = Phase::Complete;
                 Ok(Status::Complete)
             }
-            (Grammar::RightTail | Grammar::LiteralTail, Some(b'>')) if !self.bare => {
+            (Grammar::RightTail | Grammar::LiteralTail, Some(b'>'))
+                if self.purpose == Purpose::MessageIds =>
+            {
                 self.advance(1)?;
                 self.grammar = Grammar::Between;
                 self.phase = Phase::Cfws;
@@ -272,9 +298,9 @@ impl<'a> Cursor<'a> {
             _ => Err(Error::Malformed),
         }
     }
-    fn finish_word(&mut self, emit: bool) {
+    fn finish_word(&mut self) {
         self.phase = Phase::Cfws;
-        if !emit {
+        if matches!(self.grammar, Grammar::Between) {
             self.phrase = true;
             self.any = true;
         }
@@ -292,7 +318,7 @@ impl<'a> Cursor<'a> {
                 if self.position == start {
                     return Err(Error::Malformed);
                 }
-                self.finish_word(emit);
+                self.finish_word();
                 return Ok(if emit {
                     Status::Part(Extent {
                         start,

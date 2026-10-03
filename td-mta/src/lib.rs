@@ -20,6 +20,7 @@ pub mod header_cfws;
 pub mod header_date;
 pub mod header_delimited;
 pub mod header_message_ids;
+pub mod header_phrase;
 pub mod header_property;
 pub mod header_raw;
 pub mod header_select;

@@ -1422,6 +1422,14 @@ Initial independently landable increments:
   Complete mailbox/group parsing, raw fallback/display projection and NFC
   remain follow-on work; SMTP envelope validation remains separate.
 
+- **M06ag — resident phrase tokens:** share fixed word/CFWS grammar through
+  a private purpose without changing MessageIds or addr-spec behavior.
+  Retain token kinds and exact leading/trailing gaps for later display-name
+  decoding and encoded-word placement. Cover adjacent/quoted/obsolete words,
+  malformed tails, Unicode, long input, exact work and allocation-free
+  refusal. Complete mailbox/group assembly, display decoding/NFC and
+  publication remain follow-on work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

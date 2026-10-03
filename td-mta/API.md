@@ -1779,6 +1779,45 @@ refusal; allocation intervals include success, malformed tails and resource
 failure. Admission, address/group assembly, decoding/NFC, JSON serialization
 and complete worker qualification remain open.
 
+### 1.39 Resident phrase token grammar
+
+M06ag supplies `header_phrase::Cursor` over one admitted immutable phrase
+slice, using the identifier core's private phrase purpose. That purpose
+reuses obsolete-word syntax for display names; public ObsoletePhrases
+selection remains restricted to References and In-Reply-To. Public MessageIds
+and single addr-spec semantics remain unchanged. Accept RFC 5322 phrase and
+obsolete phrase syntax plus RFC 6532 UTF-8: at least one atom or quoted word,
+then words, obsolete dots and optional CFWS. Empty and CFWS-only input,
+leading dots, enclosing angles, address/group separators and malformed tails
+refuse. Empty quoted words remain valid lexical words.
+
+Each Token returns its Atom/Quoted/Dot kind, exact raw text extent and exact
+leading CFWS extent. Complete returns the trailing CFWS extent. Offsets are
+relative to the supplied slice. Tokens retain quotes, quoted pairs, folds,
+noncharacters and valid obsolete quoted controls. Adjacent words can have
+empty gaps. Tokens are provisional until the entire phrase completes;
+Malformed invalidates them all. No text is copied, decoded, unquoted,
+unfolded, normalized, serialized or authorized for publication here.
+
+Exact CFWS is retained for later RFC 2047 placement: a comment-only gap is
+not linear white space. An encoded-word-looking atom remains literal here;
+quoted tokens never authorize encoded-word recognition. The later decoder
+must inspect charged raw gaps and token boundaries, and the enclosing
+mailbox/group parser must supply context outside the slice at `<` or `:`.
+A nonempty gap alone never authorizes an encoded word.
+
+The non-Copy cursor fits 320 bytes including the shared core and error latch.
+Each poll visits at most 161 source bytes and charges at most 33 records:
+core grammar work plus one prepaid byte/record to classify an emitted token.
+Raw extents charge no output. A single ASCII letter costs four byte visits
+and seven records; one four-byte scalar costs eight/seven. All errors latch
+across replacement meters; cached completion performs no work. Tests cover
+literal token/gap boundaries, encoding context, obsolete and Unicode data,
+long tokens, complete-input rejection and exact/sticky resource refusal.
+Allocation intervals cover success and malformed/nesting/work failures.
+Mailbox/group assembly, display decoding/NFC, JSON output and composed
+worker resource qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
