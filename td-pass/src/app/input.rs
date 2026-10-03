@@ -25,17 +25,7 @@ impl App {
                 self.sync_focus();
                 self.redraw = true;
             }
-            Input::Close => {
-                // Closing declines a waiting prompt and replaces an open
-                // question with the question about closing.
-                if self.prompt.is_some() {
-                    self.answer_prompt(false);
-                }
-                if self.dialog.take().is_some() || self.chooser.take().is_some() {
-                    self.sync_focus();
-                }
-                self.request(Then::Quit, None);
-            }
+            Input::Close => self.close(None),
             Input::Key { chord, repeat } => self.key(chord, repeat, clipboard),
             Input::Pointer {
                 phase,
@@ -53,6 +43,37 @@ impl App {
             Input::Paste(text) => self.pasted(text),
         }
         self.reveal_fields();
+    }
+
+    /// Closing the window, or the strip's Quit, declines a waiting prompt
+    /// and replaces an open question with the question about closing.
+    fn close(&mut self, opener: Option<(i64, i64)>) {
+        if self.prompt.is_some() {
+            self.answer_prompt(false);
+        }
+        if self.dialog.take().is_some() || self.chooser.take().is_some() {
+            self.sync_focus();
+        }
+        self.request(Then::Quit, opener);
+    }
+
+    /// Whether (x, y) is on the strip's Quit and no prompt or question
+    /// lies over it.
+    fn quit_at(&self, x: i64, y: i64) -> bool {
+        let labels = self.strip();
+        let hit = layout::strip(self.surface, labels).hit(x, y);
+        if !hit.is_some_and(|index| index + 1 == labels.len()) {
+            return false;
+        }
+        let prompt = self.prompt.as_ref().map(|prompt| {
+            let (view, ..) = prompt_view(self.surface, &prompt.ask);
+            view.rect
+        });
+        let dialog = self.dialog.as_ref().map(|(dialog, _)| dialog.rect());
+        ![prompt, dialog]
+            .into_iter()
+            .flatten()
+            .any(|rect| rect.contains(x, y))
     }
 
     fn key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
@@ -725,6 +746,11 @@ impl App {
 
     fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool) {
         self.pointer = Some((x, y));
+        // Quit ends every strip and answers in every phase, before an open
+        // prompt, question or finder, as closing the window does.
+        if phase == PointerPhase::Press && self.quit_at(x, y) {
+            return self.close(Some((x, y)));
+        }
         if self.prompt.is_some() {
             return self.prompt_pointer(phase, x, y, extend);
         }

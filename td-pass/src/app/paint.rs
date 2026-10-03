@@ -105,6 +105,7 @@ impl Composition for Frame<'_> {
                     app.open_tab().is_some(),
                     true,
                     true,
+                    true,
                 ];
                 layout::strip(surface, &layout::NOTEBOOK).emit(
                     states.map(|enabled| (false, enabled)),
@@ -120,6 +121,7 @@ impl Composition for Frame<'_> {
                         (false, idle && keys.is_some()),
                         (false, idle && keys.is_none()),
                         (false, idle && keys.is_none()),
+                        (false, true),
                     ],
                     damage,
                     sink,
@@ -187,7 +189,11 @@ impl Composition for Frame<'_> {
             Phase::Importing { keys, list } => {
                 let idle = app.busy.is_none();
                 layout::strip(surface, &layout::IMPORT).emit(
-                    [(false, idle && list.selected().is_some()), (false, true)],
+                    [
+                        (false, idle && list.selected().is_some()),
+                        (false, true),
+                        (false, true),
+                    ],
                     damage,
                     sink,
                 );
@@ -228,7 +234,12 @@ impl Composition for Frame<'_> {
             }
             Phase::Opening | Phase::Swap(_) | Phase::Locking | Phase::Refused(_) => {
                 layout::strip(surface, &layout::LOCKED).emit(
-                    [(false, false), (false, false), (false, false)],
+                    [
+                        (false, false),
+                        (false, false),
+                        (false, false),
+                        (false, true),
+                    ],
                     damage,
                     sink,
                 );
@@ -300,6 +311,7 @@ impl Frame<'_> {
                 (false, idle),
                 (false, idle && count > 1),
                 (false, idle),
+                (false, true),
                 (false, true),
             ],
             damage,

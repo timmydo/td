@@ -114,20 +114,23 @@ mode.
   it carried. Lock cancels the operation's `pass::Cancel` and declines
   the prompt it may wait on, then drops the vault.
 - **Window state.** `src/app/` is the notebook as td-ui widgets: the
-  action strip (New, Rename, Delete, Save, Find, Keys, Lock), the search
-  field over the title list, the title field over the editor pane, and
-  the status row. It reaches the vault only through commands and replies, so
-  its tests run without a token. Titles and bodies travel in clearing
+  action strip (New, Rename, Delete, Save, Find, Keys, Lock, Quit), the
+  search field over the title list, the title field over the editor pane,
+  and the status row. Every strip, locked or unlocked, ends with Quit,
+  which does what closing the window does, over an open prompt, question
+  or finder too: it declines a waiting prompt and asks about unsaved
+  changes. It reaches the vault only through commands and replies, so its
+  tests run without a token. Titles and bodies travel in clearing
   owners (`src/plain.rs`), and the window's title names no entry.
 - **Entries.** Every entry document is loaded through one function that
   refuses filling first; copy and cut take the selection alone. Save
   sends an edit, a creation or, for a title alone, a rename against the
   entry revision read; it reports success only on the vault's commit,
   and an edit made meanwhile stays dirty. Delete asks first.
-- **Unsaved changes.** Choosing another entry, New, Lock or closing the
-  window with unsaved changes asks Save, Discard or Cancel. While a save
-  or a key operation is in flight another entry and New wait for it,
-  and Lock or closing offers only Discard; when it ends the question is
+- **Unsaved changes.** Choosing another entry, New, Lock, Quit or closing
+  the window with unsaved changes asks Save, Discard or Cancel. While a
+  save or a key operation is in flight another entry and New wait for it,
+  and Lock, Quit or closing offers only Discard; when it ends the question is
   asked again against what is then unsaved, so edits made meanwhile are
   never given up unasked. Discard closes the entry's document. A failed save
   keeps the entry dirty. A save is recorded for the document it saved
@@ -221,7 +224,8 @@ mode.
 
 Tests drive the window state headless: unlock through both prompts,
 search, open, edit and save with the entry's line endings, a failed and
-a stale save, the unsaved-changes question, selection-only copy and cut,
+a stale save, the unsaved-changes question, each strip's Quit (over the
+swap question and a waiting prompt as well), selection-only copy and cut,
 paste, creation, rename, delete, a declined prompt, lock during a save
 with its late replies ignored, the rules for a save in flight, a read
 answered after an edit, pastes bound to their place, the dialog's

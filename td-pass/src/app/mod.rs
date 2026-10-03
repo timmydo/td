@@ -380,6 +380,20 @@ impl App {
         self.quit
     }
 
+    /// The labels of the strip this phase shows.
+    fn strip(&self) -> &'static [&'static str] {
+        match &self.phase {
+            Phase::Unlocked(notebook) if notebook.keys.showing => &layout::KEYS,
+            Phase::Unlocked(_) => &layout::NOTEBOOK,
+            Phase::Importing { .. } => &layout::IMPORT,
+            Phase::Locked { .. }
+            | Phase::Opening
+            | Phase::Swap(_)
+            | Phase::Locking
+            | Phase::Refused(_) => &layout::LOCKED,
+        }
+    }
+
     /// Whether the clipboard text this window offered must be withdrawn;
     /// answered once per lock.
     pub fn take_withdrawal(&mut self) -> bool {

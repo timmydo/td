@@ -1234,6 +1234,79 @@ fn the_strips_buttons_reach_the_keys_view_and_its_actions() {
 }
 
 #[test]
+fn every_strip_ends_with_a_quit_that_asks_as_closing_does() {
+    let mut board = Board::default();
+    // Before the vault answers, and when locked, nothing is unsaved and
+    // nothing is held to lock.
+    let mut app = watched();
+    app.take_out();
+    click_button(&mut app, &mut board, &layout::LOCKED, 3);
+    assert!(app.quitting());
+    assert!(app.take_out().is_empty());
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Opened {
+        keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
+    });
+    click_button(&mut app, &mut board, &layout::LOCKED, 3);
+    assert!(app.quitting());
+    assert!(app.take_out().is_empty());
+    // The swap question is open over the body, and Quit still answers.
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned()],
+    });
+    assert!(app.dialog.is_some());
+    click_button(&mut app, &mut board, &layout::LOCKED, 3);
+    assert!(app.quitting());
+    assert!(app.take_out().is_empty());
+    // A copy read for import.
+    let mut app = empty();
+    key(&mut app, &mut board, "C-o");
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/media/usb"),
+        Ok(listing("/media/usb", &[], &["copy.tdpass"])),
+        None,
+    );
+    key(&mut app, &mut board, "Return");
+    let op = op_of(&app.take_out());
+    app.reply(Reply::Copy {
+        op,
+        keys: two_keys().labels,
+    });
+    assert!(matches!(app.phase, Phase::Importing { .. }));
+    click_button(&mut app, &mut board, &layout::IMPORT, 2);
+    assert!(app.quitting());
+    // The keys view locks the vault as it quits.
+    let mut app = keys_view(&mut board);
+    click_button(&mut app, &mut board, &layout::KEYS, 6);
+    assert!(app.quitting());
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+    // A waiting prompt is declined, and unsaved text asks first, as
+    // closing the window does; Quit again asks again.
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = saving(&mut app, &mut board);
+    app.reply(Reply::Ask {
+        op,
+        ask: Ask {
+            operation: "save",
+            role: Role::Primary,
+            key: Some("0a0b0c0d".to_owned()),
+            pin: None,
+        },
+    });
+    click_button(&mut app, &mut board, &layout::NOTEBOOK, 7);
+    assert!(app.prompt.is_none());
+    assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Decline)] if o == op));
+    assert_eq!(app.dialog.as_ref().unwrap().1, Some(Then::Quit));
+    click_button(&mut app, &mut board, &layout::NOTEBOOK, 7);
+    assert_eq!(app.dialog.as_ref().unwrap().1, Some(Then::Quit));
+    assert!(!app.quitting());
+}
+
+#[test]
 fn a_held_space_marks_once_and_the_hint_does_not_outlive_the_view() {
     let mut board = Board::default();
     let mut app = keys_view(&mut board);
