@@ -1,18 +1,23 @@
-//! Provisional Raw property JSON for an unpublished response-spool tail.
+//! Provisional Raw and Text property JSON for an unpublished response-spool tail.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     header_property::{Form, Occurrence, Property},
     header_raw, header_select,
-    json_string::{self, Frame, Source},
+    json_string::{self, Frame},
     mime_headers::{End, Field},
     nfc::{self, HeaderBudget},
     ports::Tick,
 };
+mod projection;
+use projection::{Projection, RawMode, TextMode};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     UnsupportedForm,
+    UnsupportedGrammar,
     Selection(header_select::Error),
     Raw(header_raw::Error),
+    Text(nfc::Error),
     Json(json_string::Error),
     Work(Stop),
     InterpretationLimit,
@@ -21,9 +26,11 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedGrammar => f.write_str("unsupported header value grammar"),
             Self::UnsupportedForm => f.write_str("unsupported header value form"),
             Self::Selection(error) => write!(f, "header value selection: {error}"),
             Self::Raw(error) => write!(f, "header value Raw: {error}"),
+            Self::Text(error) => write!(f, "header value Text: {error}"),
             Self::Json(error) => write!(f, "header value JSON: {error}"),
             Self::Work(error) => write!(f, "header value work: {error}"),
             Self::InterpretationLimit => f.write_str("header value interpretation limit"),
@@ -61,18 +68,83 @@ enum Phase {
     Drain,
     Complete,
 }
-enum Owner<'a, 'w> {
-    Budgets(&'w mut Meter, &'w mut HeaderBudget),
-    Value(header_raw::Budgeted<'a, 'w>),
+/// Immutable selection input; the owner authorizes and retains these bytes.
+pub struct Input<'a> {
+    pub bytes: &'a [u8],
+    pub base: u64,
+    pub header_limit: u64,
+    pub property: Property<'a>,
+    pub source_end: header_select::SourceEnd,
+}
+enum Owner<'a, 'w, P: Projection<'a, 'w>> {
+    Budgets(&'w mut Meter, &'w mut HeaderBudget, P::Workspace),
+    Value(P::Source),
     Retired,
 }
-/// Retain all bytes in an unpublished response tail until the whole method succeeds.
-/// This owner borrows the original job/email budgets across selection and values.
-pub struct Raw<'a, 'w> {
+/// Provisional Raw property; retain chunks in an unpublished response tail.
+/// Borrows the same job/email budgets across selection and values.
+pub struct Raw<'a, 'w>(Core<'a, 'w, RawMode>);
+impl<'a, 'w> Raw<'a, 'w> {
+    pub fn new(
+        input: &'a [u8],
+        base: u64,
+        header_limit: u64,
+        property: Property<'a>,
+        source_end: header_select::SourceEnd,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        Core::new(
+            Input {
+                bytes: input,
+                base,
+                header_limit,
+                property,
+                source_end,
+            },
+            work,
+            budget,
+            (),
+        )
+        .map(Self)
+    }
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.0.is_encoding_problem()
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.0.check_deadline(now)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.0.poll(now, output)
+    }
+}
+/// Provisional normalized Text property using the existing caller-owned NFC scratch.
+pub struct Text<'a, 'w>(Core<'a, 'w, TextMode>);
+impl<'a, 'w> Text<'a, 'w> {
+    pub fn new(
+        input: Input<'a>,
+        scratch: &'w mut nfc::Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        Core::new(input, work, budget, scratch).map(Self)
+    }
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.0.is_encoding_problem()
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.0.check_deadline(now)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.0.poll(now, output)
+    }
+}
+struct Core<'a, 'w, P: Projection<'a, 'w>> {
     input: &'a [u8],
+    name: &'a str,
     base: u64,
     selector: header_select::Cursor<'a>,
-    owner: Owner<'a, 'w>,
+    owner: Owner<'a, 'w, P>,
     frame: Frame,
     phase: Phase,
     next: Phase,
@@ -85,31 +157,35 @@ pub struct Raw<'a, 'w> {
     end: Option<End>,
     failure: Option<Error>,
 }
-impl<'a, 'w> Raw<'a, 'w> {
-    pub fn new(
-        input: &'a [u8],
-        base: u64,
-        header_limit: u64,
-        property: Property<'a>,
-        source_end: header_select::SourceEnd,
+impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
+    fn new(
+        input: Input<'a>,
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
+        workspace: P::Workspace,
     ) -> Result<Self, Error> {
-        if property.form() != Form::Raw {
+        if input.property.form() != P::FORM {
             return Err(Error::UnsupportedForm);
         }
         Ok(Self {
-            input,
-            base,
-            selector: header_select::Cursor::new(input, base, header_limit, property, source_end),
-            owner: Owner::Budgets(work, budget),
+            input: input.bytes,
+            name: input.property.name(),
+            base: input.base,
+            selector: header_select::Cursor::new(
+                input.bytes,
+                input.base,
+                input.header_limit,
+                input.property,
+                input.source_end,
+            ),
+            owner: Owner::Budgets(work, budget, workspace),
             frame: Frame::new(),
             phase: Phase::Start,
             next: Phase::Start,
             literal: [0; 4],
             used: 0,
             position: 0,
-            all: property.occurrence() == Occurrence::All,
+            all: input.property.occurrence() == Occurrence::All,
             seen: false,
             problem: false,
             end: None,
@@ -122,7 +198,7 @@ impl<'a, 'w> Raw<'a, 'w> {
     }
     fn charge_output(&mut self, now: Tick, output_bytes: u64) -> Result<(), Error> {
         match &mut self.owner {
-            Owner::Budgets(work, budget) => {
+            Owner::Budgets(work, budget, _) => {
                 budget.charge(work, now, 0, 0, &mut 0)?;
                 work.charge(
                     now,
@@ -133,7 +209,7 @@ impl<'a, 'w> Raw<'a, 'w> {
                 )
                 .map_err(Error::Work)
             }
-            Owner::Value(source) => source.charge_output(now, output_bytes).map_err(Error::Raw),
+            Owner::Value(source) => P::charge_output(source, now, output_bytes),
             Owner::Retired => Err(Error::InvalidState),
         }
     }
@@ -194,11 +270,12 @@ impl<'a, 'w> Raw<'a, 'w> {
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(Error::InvalidState)?;
         let bytes = self.input.get(start..end).ok_or(Error::InvalidState)?;
-        let Owner::Budgets(work, budget) = std::mem::replace(&mut self.owner, Owner::Retired)
+        let Owner::Budgets(work, budget, workspace) =
+            std::mem::replace(&mut self.owner, Owner::Retired)
         else {
             return Err(Error::InvalidState);
         };
-        self.owner = Owner::Value(header_raw::Budgeted::new(bytes, work, budget));
+        self.owner = Owner::Value(P::start(bytes, work, budget, workspace));
         self.frame = Frame::new();
         Ok(())
     }
@@ -212,6 +289,10 @@ impl<'a, 'w> Raw<'a, 'w> {
         }
         match self.phase {
             Phase::Start => {
+                let Owner::Budgets(work, budget, _) = &mut self.owner else {
+                    return Err(Error::InvalidState);
+                };
+                P::validate(self.name, now, work, budget)?;
                 if self.all {
                     self.stage(now, b"[", Phase::Select)?;
                 } else {
@@ -219,7 +300,7 @@ impl<'a, 'w> Raw<'a, 'w> {
                 }
             }
             Phase::Select => {
-                let Owner::Budgets(work, budget) = &mut self.owner else {
+                let Owner::Budgets(work, budget, _) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
                 match self
@@ -257,12 +338,9 @@ impl<'a, 'w> Raw<'a, 'w> {
                 let Owner::Value(source) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
-                let progress = self
-                    .frame
-                    .poll(&mut Source::BudgetedRaw(source), now, output)
-                    .map_err(Error::Json)?;
+                let progress = P::poll(source, &mut self.frame, now, output)?;
                 if progress.status == json_string::Status::Complete {
-                    self.problem |= source.is_encoding_problem();
+                    self.problem |= P::is_encoding_problem(source);
                     self.phase = Phase::Release;
                 }
                 return Ok(Progress {
@@ -275,8 +353,8 @@ impl<'a, 'w> Raw<'a, 'w> {
                 else {
                     return Err(Error::InvalidState);
                 };
-                let (work, budget) = source.finish().map_err(Error::Raw)?;
-                self.owner = Owner::Budgets(work, budget);
+                let (work, budget, workspace) = P::finish(source)?;
+                self.owner = Owner::Budgets(work, budget, workspace);
                 self.phase = Phase::Select;
             }
             Phase::Drain => {
@@ -346,7 +424,7 @@ mod tests {
         }
         panic!("property did not complete");
     }
-    fn drain(cursor: &mut Raw<'_, '_>, width: usize) -> (Vec<u8>, End) {
+    pub(super) fn drain(cursor: &mut Raw<'_, '_>, width: usize) -> (Vec<u8>, End) {
         assert!(std::mem::size_of_val(cursor) <= 640);
         let mut output = [0xa5; 16];
         let mut bytes = Vec::new();
@@ -610,7 +688,7 @@ mod tests {
                 })
             );
         }
-        assert!(matches!(cursor.phase, Phase::Start));
+        assert!(matches!(cursor.0.phase, Phase::Start));
         assert_eq!(drain(&mut cursor, 1).0, b"null");
         assert_eq!(
             cursor.check_deadline(Tick(100)),
@@ -637,3 +715,6 @@ mod tests {
         assert_eq!(work.remaining().output_bytes, 10_000_000);
     }
 }
+
+#[cfg(test)]
+mod text_tests;

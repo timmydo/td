@@ -995,6 +995,16 @@ reservation. Allocation intervals cover long values, live budget handoffs and
 late refusal. Spool I/O and combined worker/native/RSS qualification remain
 open.
 
+The Text property coordinator (M06au) fits 1664 bytes in the existing 16 KiB
+parser-state reservation, including one inline NFC cursor and the shared
+selector/framing state. Raw remains within 640 bytes. Text borrows the existing
+3072-byte NFC scratch. The standalone 1 KiB cursor slot in the 4 KiB NFC
+region is unused on this path; the inline cursor lives in parser state. Generic
+projection selection adds no trait object, allocation or second source. Turn
+bounds remain 255 visits, 256 aggregate steps, 16 job records and six output
+bytes. Allocation intervals cover overflow normalization, scratch reuse for
+another field and late refusal. Combined worker qualification remains open.
+
 Private JSON Frame state fits 32 bytes and owns no source or work reference.
 The public borrowed adapter still fits 64 bytes; extraction does not introduce
 another simultaneous frame. A future coordinator may retain its parser and

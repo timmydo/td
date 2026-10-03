@@ -3430,6 +3430,104 @@ fn raw_header_values() {
     assert_eq!(before, after, "Raw property assembly allocated");
 }
 
+fn text_header_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property,
+        header_select::SourceEnd,
+        header_value::{Input, Status, Text},
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let source = format!(
+        "Subject: a{}\u{323}\r\nSubject: =?utf-8?Q?cafe=CC=81?=\r\n\r\n",
+        "\u{301}".repeat(300)
+    );
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut scratch = Scratch::new();
+    let mut key =
+        header_property::Cursor::new("header:Subject:asText:all", header_property::Context::Email);
+    let mut selected = None;
+    for _ in 0..100 {
+        if let header_property::Status::Complete(value) = key.poll(Tick(1), &mut work).unwrap() {
+            selected = value;
+            break;
+        }
+    }
+    let selected = selected.unwrap();
+    let before = COUNTERS.snapshot();
+    let mut cursor = Text::new(
+        Input {
+            bytes: black_box(source.as_bytes()),
+            base: 0,
+            header_limit: source.len() as u64,
+            property: selected,
+            source_end: SourceEnd::Eof,
+        },
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut output = [0; 1];
+    let mut written = 0;
+    let mut complete = false;
+    for _ in 0..100_000 {
+        let progress = cursor.poll(Tick(1), &mut output).unwrap();
+        written += progress.written;
+        if matches!(progress.status, Status::Complete(_)) {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    // U+1EA1 plus 300 acute marks, café, quotes and array punctuation.
+    assert_eq!(written, 3 + 600 + 5 + 7);
+    cursor.check_deadline(Tick(1)).unwrap();
+    let mut cursor = Text::new(
+        Input {
+            bytes: b"Subject: a\nOther: long\n\n",
+            base: 0,
+            header_limit: 12,
+            property: selected,
+            source_end: SourceEnd::Eof,
+        },
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut refused = false;
+    let mut written = 0;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                assert!(!matches!(progress.status, Status::Complete(_)));
+                written += progress.written;
+            }
+            Err(error) => {
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(written, 4);
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Text property assembly allocated");
+}
+
 fn header_properties() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4350,6 +4448,7 @@ fn main() {
         header_selection_budget();
         budgeted_raw_output();
         raw_header_values();
+        text_header_values();
         header_properties();
         header_nfc();
         phrase_nfc();
@@ -4473,6 +4572,7 @@ fn main() {
     header_selection_budget();
     budgeted_raw_output();
     raw_header_values();
+    text_header_values();
     header_properties();
     header_nfc();
     phrase_nfc();

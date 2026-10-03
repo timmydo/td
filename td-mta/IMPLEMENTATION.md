@@ -1529,6 +1529,15 @@ Initial independently landable increments:
   Cover exact layered charges, tiny sinks, late refusal and allocation-free
   assembly. Other forms and unpublished response-spool retention remain open.
 
+- **M06au — provisional Text property values:** share the value coordinator
+  through private statically selected projections, retaining Raw semantics.
+  Admit only unstructured Subject/Comments with charged name comparisons;
+  other Text grammars remain unsupported, including Keywords and MIME fields.
+  Move NFC scratch and live budgets into each normalized Text source and back
+  only after successful completion. Cover words/folds, scratch overflow/reuse,
+  exact composed charges, late failures and allocation-free output. Other
+  parsed forms and unpublished response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

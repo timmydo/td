@@ -451,6 +451,19 @@ impl<'a, 'w> Cursor<'a, 'w> {
     pub const fn is_encoding_problem(&self) -> bool {
         self.encoding_problem
     }
+    /// The owner must serialize the last scalar and finish its JSON frame first.
+    /// Done may already hold when poll returns that final scalar.
+    pub(crate) fn finish(
+        self,
+    ) -> Result<(&'w mut Meter, &'w mut HeaderBudget, &'w mut Scratch), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !matches!(self.phase, Phase::Done) {
+            return Err(Error::InvalidState);
+        }
+        Ok((self.work, self.budget, self.scratch))
+    }
     /// Charge actual serialized bytes, or zero for a post-turn deadline check.
     /// Refusal retires the cursor even after its final scalar was returned.
     pub fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {

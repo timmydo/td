@@ -1,0 +1,453 @@
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+use super::*;
+use crate::{header_property, ports::Deadline};
+fn work() -> Meter {
+    Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    )
+}
+fn property(key: &str) -> Property<'_> {
+    let mut cursor = header_property::Cursor::new(key, header_property::Context::Email);
+    let mut work = work();
+    for _ in 0..1000 {
+        if let header_property::Status::Complete(value) = cursor.poll(Tick(1), &mut work).unwrap() {
+            return value.unwrap();
+        }
+    }
+    panic!("property did not complete");
+}
+fn input<'a>(bytes: &'a [u8], key: &'a str) -> Input<'a> {
+    Input {
+        bytes,
+        base: 4096,
+        header_limit: bytes.len() as u64,
+        property: property(key),
+        source_end: header_select::SourceEnd::Eof,
+    }
+}
+fn drain(cursor: &mut Text<'_, '_>, width: usize) -> Vec<u8> {
+    assert!(std::mem::size_of_val(cursor) <= 1664);
+    let mut output = [0xa5; 8];
+    let mut bytes = Vec::new();
+    for _ in 0..100_000 {
+        output.fill(0xa5);
+        let progress = cursor.poll(Tick(1), &mut output[..width]).unwrap();
+        assert!(progress.written <= 6);
+        bytes.extend_from_slice(&output[..progress.written]);
+        assert!(output[progress.written..].iter().all(|byte| *byte == 0xa5));
+        if let Status::Complete(end) = progress.status {
+            assert!(end.body_start >= 4096);
+            assert_eq!(
+                cursor.poll(Tick(100), &mut []),
+                Ok(Progress {
+                    written: 0,
+                    status: Status::Complete(end)
+                })
+            );
+            cursor.check_deadline(Tick(1)).unwrap();
+            return bytes;
+        }
+    }
+    panic!("Text property did not finish");
+}
+#[test]
+fn text_properties_normalize_words_and_folds_and_keep_raw_identity_separate() {
+    let source = b"Subject: =?utf-8?Q?cafe=CC=81?=\r\nSubject: e\xcc\x81\r\n\tend\r\n\r\n";
+    for width in 1..=8 {
+        for (key, expected) in [
+            ("subject", "\"é\\tend\""),
+            ("header:Subject:asText:all", "[\"café\",\"é\\tend\"]"),
+            ("header:Comments:asText", "null"),
+            ("header:Comments:asText:all", "[]"),
+        ] {
+            let mut work = work();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = nfc::Scratch::new();
+            let mut cursor =
+                Text::new(input(source, key), &mut scratch, &mut work, &mut budget).unwrap();
+            assert_eq!(drain(&mut cursor, width), expected.as_bytes());
+            assert!(!cursor.is_encoding_problem());
+            assert_eq!(
+                1_000_000 - work.remaining().output_bytes,
+                expected.len() as u64
+            );
+        }
+    }
+    for (source, expected, problem) in [
+        (b"Subject:\n\n".as_slice(), "\"\"", false),
+        (b"Subject: \xff\n\n", "\"�\"", true),
+        (b"Subject: \xef\xb7\x90\n\n", "\"�\"", true),
+    ] {
+        let mut work = work();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = nfc::Scratch::new();
+        let mut cursor = Text::new(
+            input(source, "subject"),
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(drain(&mut cursor, 1), expected.as_bytes());
+        assert_eq!(cursor.is_encoding_problem(), problem);
+    }
+    let mut work = work();
+    let mut budget = HeaderBudget::new();
+    let mut cursor = Raw::new(
+        source,
+        4096,
+        source.len() as u64,
+        property("header:Subject"),
+        header_select::SourceEnd::Eof,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        super::tests::drain(&mut cursor, 1).0,
+        "\" e\u{301}\\r\\n\\tend\"".as_bytes()
+    );
+}
+fn normalized_json(
+    source: &[u8],
+    scratch: &mut nfc::Scratch,
+    work: &mut Meter,
+    budget: &mut HeaderBudget,
+) -> Vec<u8> {
+    let mut source = nfc::Cursor::from_unstructured_header(source, scratch, work, budget);
+    let mut cursor = json_string::Cursor::new(&mut source);
+    let mut output = [0; 1];
+    let mut bytes = Vec::new();
+    for _ in 0..100_000 {
+        let progress = cursor.poll(Tick(1), &mut output).unwrap();
+        bytes.extend_from_slice(&output[..progress.written]);
+        if progress.status == json_string::Status::Complete {
+            return bytes;
+        }
+    }
+    panic!("reference did not finish");
+}
+#[test]
+fn overflow_scratch_handoffs_keep_exact_selection_and_conversion_charges() {
+    let first = format!(" a{}\u{323}", "\u{301}".repeat(300));
+    let source = format!("Subject:{first}\r\nSubject: plain\r\n\r\n");
+    let selected = property("header:Subject:asText:all");
+    let mut reference_work = work();
+    let mut reference_budget = HeaderBudget::new();
+    reference_budget
+        .charge(&mut reference_work, Tick(1), 7, 1, &mut 0)
+        .unwrap();
+    let mut scratch = nfc::Scratch::new();
+    let mut selector = header_select::Cursor::new(
+        source.as_bytes(),
+        0,
+        source.len() as u64,
+        selected,
+        header_select::SourceEnd::Eof,
+    );
+    let mut fields = Vec::new();
+    let mut complete = false;
+    for _ in 0..100_000 {
+        match selector
+            .poll_with_budget(Tick(1), &mut reference_work, &mut reference_budget)
+            .unwrap()
+        {
+            header_select::Status::Match(field) => fields.push(field),
+            header_select::Status::Yield => {}
+            header_select::Status::Complete(_) => {
+                complete = true;
+                break;
+            }
+        }
+    }
+    assert!(complete);
+    assert_eq!(fields.len(), 2);
+    let mut expected = vec![b'['];
+    for (index, field) in fields.iter().enumerate() {
+        if index != 0 {
+            expected.push(b',');
+        }
+        expected.extend(normalized_json(
+            &source.as_bytes()[field.value_start as usize..field.value_end as usize],
+            &mut scratch,
+            &mut reference_work,
+            &mut reference_budget,
+        ));
+    }
+    expected.push(b']');
+    reference_work
+        .charge(
+            Tick(1),
+            Charge {
+                output_bytes: 3,
+                ..Charge::default()
+            },
+        )
+        .unwrap();
+    let mut work = work();
+    let mut budget = HeaderBudget::new();
+    let mut cursor = Text::new(
+        input(source.as_bytes(), "header:Subject:asText:all"),
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(drain(&mut cursor, 1), expected);
+    assert_eq!(work.remaining(), reference_work.remaining());
+    assert_eq!(
+        budget.source_bytes_remaining(),
+        reference_budget.source_bytes_remaining()
+    );
+    assert_eq!(budget.steps_remaining(), reference_budget.steps_remaining());
+}
+#[test]
+fn text_refusal_after_a_provisional_value_and_final_checks_are_terminal() {
+    let mut work = work();
+    let mut budget = HeaderBudget::new();
+    let mut scratch = nfc::Scratch::new();
+    let mut spec = input(b"Subject: a\nOther: long\n\n", "header:Subject:asText:all");
+    spec.header_limit = 12;
+    let mut cursor = Text::new(spec, &mut scratch, &mut work, &mut budget).unwrap();
+    let mut output = [0xa5; 1];
+    let mut prefix = Vec::new();
+    let mut refused = false;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                assert!(!matches!(progress.status, Status::Complete(_)));
+                prefix.extend_from_slice(&output[..progress.written]);
+            }
+            Err(error) => {
+                assert_eq!(
+                    error,
+                    Error::Selection(header_select::Error::Headers(
+                        crate::mime_headers::Error::HeaderLimit
+                    ))
+                );
+                output.fill(0xa5);
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                assert_eq!(output, [0xa5]);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(prefix, b"[\"a\"");
+    let mut work = self::work();
+    let mut budget = HeaderBudget::new();
+    let mut cursor = Text::new(
+        input(b"Subject: a", "subject"),
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    assert_eq!(
+        cursor.poll(Tick(1), &mut []),
+        Ok(Progress {
+            written: 0,
+            status: Status::NeedOutput
+        })
+    );
+    assert_eq!(drain(&mut cursor, 1), b"\"a\"");
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(
+        cursor.poll(Tick(1), &mut output),
+        Err(Error::Work(Stop::Deadline))
+    );
+    let mut work = self::work();
+    let mut budget = HeaderBudget::new();
+    assert!(matches!(
+        Text::new(
+            input(b"X:a", "header:X"),
+            &mut scratch,
+            &mut work,
+            &mut budget
+        ),
+        Err(Error::UnsupportedForm)
+    ));
+}
+#[test]
+fn normalized_handoff_refuses_partial_and_failed_sources() {
+    let mut work = work();
+    let mut budget = HeaderBudget::new();
+    let mut scratch = nfc::Scratch::new();
+    let cursor = nfc::Cursor::from_unstructured_header(b"a", &mut scratch, &mut work, &mut budget);
+    assert!(matches!(cursor.finish(), Err(nfc::Error::InvalidState)));
+    let mut cursor =
+        nfc::Cursor::from_unstructured_header(b"abc", &mut scratch, &mut work, &mut budget);
+    let mut scalar = false;
+    for _ in 0..100 {
+        if matches!(cursor.poll(Tick(1)).unwrap(), nfc::Status::Scalar(_)) {
+            scalar = true;
+            break;
+        }
+    }
+    assert!(scalar);
+    assert!(matches!(cursor.finish(), Err(nfc::Error::InvalidState)));
+    let mut cursor =
+        nfc::Cursor::from_unstructured_header(b"", &mut scratch, &mut work, &mut budget);
+    let mut complete = false;
+    for _ in 0..100 {
+        if cursor.poll(Tick(1)).unwrap() == nfc::Status::Complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(
+        cursor.charge_output(Tick(100), 0),
+        Err(nfc::Error::Work(Stop::Deadline))
+    );
+    assert!(matches!(
+        cursor.finish(),
+        Err(nfc::Error::Work(Stop::Deadline))
+    ));
+}
+
+#[test]
+fn normalized_output_refusal_retires_the_whole_provisional_value() {
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10000,
+            records: 10000,
+            output_bytes: 1,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut scratch = nfc::Scratch::new();
+    let mut cursor = Text::new(
+        input(b"Subject: a", "subject"),
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut output = [0; 1];
+    let mut prefix = Vec::new();
+    let mut refused = false;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                assert!(!matches!(progress.status, Status::Complete(_)));
+                prefix.extend_from_slice(&output[..progress.written]);
+            }
+            Err(error) => {
+                assert_eq!(
+                    error,
+                    Error::Json(json_string::Error::Source(nfc::Error::Work(
+                        Stop::OutputBytes
+                    )))
+                );
+                output.fill(0xa5);
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                assert_eq!(output, [0xa5]);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(prefix, b"\"");
+    assert_eq!(work.stopped(), Some(Stop::OutputBytes));
+}
+
+#[test]
+fn text_grammar_is_checked_before_output_and_cannot_authorize_structured_words() {
+    for key in [
+        "header:Content-Type:asText",
+        "header:Content-Disposition:asText:all",
+        "header:Keywords:asText",
+        "header:List-Id:asText",
+        "header:X-Custom:asText",
+        "header:Unknown:asText",
+    ] {
+        let mut work = work();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = nfc::Scratch::new();
+        let source = b"Content-Type: text/plain; name=\" =?utf-8?Q?caf=C3=A9?= \"\nKeywords: \"a =?utf-8?Q?caf=C3=A9?= b\"\n\n";
+        let mut cursor =
+            Text::new(input(source, key), &mut scratch, &mut work, &mut budget).unwrap();
+        let mut output = [0xa5; 8];
+        assert_eq!(
+            cursor.poll(Tick(1), &mut output),
+            Err(Error::UnsupportedGrammar)
+        );
+        assert_eq!(
+            cursor.poll(Tick(1), &mut output),
+            Err(Error::UnsupportedGrammar)
+        );
+        assert_eq!(output, [0xa5; 8]);
+        assert_eq!(work.remaining().output_bytes, 1_000_000);
+    }
+    for (key, source) in [
+        (
+            "header:sUbJeCt:asText",
+            b"Subject: =?utf-8?Q?caf=C3=A9?=\n\n".as_slice(),
+        ),
+        (
+            "header:cOmMeNtS:asText",
+            b"Comments: =?utf-8?Q?caf=C3=A9?=\n\n",
+        ),
+    ] {
+        let mut work = work();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = nfc::Scratch::new();
+        let mut cursor =
+            Text::new(input(source, key), &mut scratch, &mut work, &mut budget).unwrap();
+        assert_eq!(drain(&mut cursor, 1), "\"café\"".as_bytes());
+    }
+}
+#[test]
+fn comma_refusal_uses_the_text_owner_error() {
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10000,
+            records: 10000,
+            output_bytes: 4,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut scratch = nfc::Scratch::new();
+    let mut cursor = Text::new(
+        input(b"Subject:a\nSubject:b\n\n", "header:Subject:asText:all"),
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut output = [0xa5; 1];
+    let mut prefix = Vec::new();
+    let mut failed = false;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => prefix.extend_from_slice(&output[..progress.written]),
+            Err(error) => {
+                assert_eq!(error, Error::Text(nfc::Error::Work(Stop::OutputBytes)));
+                output.fill(0xa5);
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                assert_eq!(output, [0xa5]);
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed);
+    assert_eq!(prefix, b"[\"a\"");
+}

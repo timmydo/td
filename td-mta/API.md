@@ -2425,6 +2425,59 @@ allocation interval covers long values and failure after a provisional prefix.
 Other parsed forms, spool retention and complete worker qualification remain
 separate increments.
 
+### 1.53 Complete provisional Text header values
+
+M06au adds `header_value::Text` with an Input descriptor, the caller's NFC
+Scratch and the same exclusive job/email budget borrows. Input holds resident
+bytes, base offset, header limit, parsed property and Prefix/EOF meaning. Only
+Text-form properties are admitted. The first active poll additionally admits
+only Subject and Comments, case-insensitively, before staging any JSON. Their
+grammar is unstructured. Keywords, MIME fields and unknown fields return
+UnsupportedGrammar until grammar-aware Text conversion is implemented. This is
+an implementation limit, not an invalid-property or invalidArguments claim;
+Text-form authorization alone cannot authorize encoded words in structured
+syntax. Last/all, absence, provisional output, backpressure and final
+retirement follow section 1.52; Raw's public API and identity stay unchanged.
+
+A private generic core owns the shared selector, punctuation, JSON Frame and
+failure state. Its two private projections provide Raw or normalized Text
+sources; there is no trait object, heap allocation or duplicated framing state
+machine. The Text source is the existing unstructured-header NFC cursor: it
+removes initial SP, unfolds while retaining following whitespace, decodes
+originally permitted encoded words and normalizes the filtered scalars.
+Grammar admission dispatches by name length, prepays at most eight name-byte
+visits and one interpretation step, then makes one case-insensitive
+comparison. It uses the original job/email budgets and discards unused prepaid
+credit; empty output performs only the live deadline check until capacity is
+supplied.
+
+The same ownership enum moves scratch and budget borrows into each fresh NFC
+cursor. A private consuming NFC handoff returns them only after successful
+Done with no failure. Checkpoints and unused prepaid credit cannot escape or
+be copied; the next field starts with fresh cursor state over the reused
+scratch. Original job/email counters and selector credit persist. Text source
+checks, comma staging and handoffs report Text(nfc::Error); its string
+serializer reports Json(Source(nfc::Error)). Direct framing and selection
+retain their existing error wrappers. Callers classify the underlying cause.
+
+Raw still fits 640 bytes. The Text coordinator fits 1664 bytes including its
+inline NFC cursor, within the existing 16 KiB parser reservation. Its
+3072-byte scratch remains in the 4 KiB NFC region; the standalone
+checkpoint-state slice of that region is unused for this path. No second NFC
+cursor is retained. Each poll calls at most one child plus fixed
+ownership/literal actions, with at most 255 visits, 256 interpretation steps,
+16 job records and six copied output bytes. These component bounds do not
+qualify combined worker stacks or native/process memory.
+
+Tests distinguish Raw identity from Text decoding/NFC, cover last/all and
+absence, repair diagnostics, encoded-word and fold handling, overflow segments
+followed by a second field, exact charges against separate selector/converter
+runs, structured-field refusal, comma/output exhaustion, partial handoff, late
+scan refusal and final deadline retirement. The allocation probe covers
+overflow plus subsequent scratch reuse and late failure in both registered
+modes. Other parsed forms and ADMISSION.md's unpublished response-spool
+implementation remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
