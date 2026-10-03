@@ -1551,6 +1551,13 @@ Initial independently landable increments:
   preserve untouched buffers on refusal. Cover exact costs, repeated calls
   and allocation-free formatting. Complete Date property JSON remains open.
 
+- **M06ax — provisional Date property values:** compose selection, budgeted
+  parsing and formatting through the shared value core. Stage quoted dates or
+  null in 27 inline bytes; retain a separate unverified-leap diagnostic across
+  selected values. Cover last/all, exact charges, resource/late refusal,
+  handoff guards and allocation-free output. Other structured forms and
+  unpublished response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

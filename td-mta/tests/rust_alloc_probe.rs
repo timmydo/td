@@ -3584,6 +3584,100 @@ fn raw_header_values() {
     assert_eq!(before, after, "Raw property assembly allocated");
 }
 
+fn date_header_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property::{self, Context},
+        header_select::SourceEnd,
+        header_value::{Date, Input, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let source = format!("Date: ({})21 Nov 1997 09:55:06 CST\nDate: 31 Dec 2020 23:59:60 +0000\nDate: 31 Dec 2016 23:59:60 +0000\n\n", "🐈".repeat(4096));
+    let expected = b"[\"1997-11-21T15:55:06Z\",null,\"2016-12-31T23:59:60Z\"]";
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 10000,
+            ..Charge::default()
+        },
+    );
+    let mut selector = header_property::Cursor::new("header:Date:asDate:all", Context::Email);
+    let selected = loop {
+        if let header_property::Status::Complete(value) = selector.poll(Tick(1), &mut work).unwrap()
+        {
+            break value.unwrap();
+        }
+    };
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    let mut cursor = Date::new(
+        Input {
+            bytes: source.as_bytes(),
+            base: 0,
+            header_limit: source.len() as u64,
+            property: selected,
+            source_end: SourceEnd::Eof,
+        },
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut output = [0; 1];
+    let mut count = 0;
+    let mut complete = false;
+    for _ in 0..100_000 {
+        let progress = cursor.poll(Tick(1), &mut output).unwrap();
+        if progress.written != 0 {
+            assert_eq!(expected.get(count), output.first());
+            count += 1;
+        }
+        if matches!(progress.status, Status::Complete(_)) {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(count, expected.len());
+    assert!(cursor.has_unverified_leap());
+    cursor.check_deadline(Tick(1)).unwrap();
+    let late = b"Date: 1 Jan 2000 00:00 +0000\nOther: long\n\n";
+    let mut cursor = Date::new(
+        Input {
+            bytes: late,
+            base: 0,
+            header_limit: b"Date: 1 Jan 2000 00:00 +0000\nO".len() as u64,
+            property: selected,
+            source_end: SourceEnd::Eof,
+        },
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut refused = false;
+    let mut count = 0;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                assert!(!matches!(progress.status, Status::Complete(_)));
+                count += progress.written;
+            }
+            Err(error) => {
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(count, 23);
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Date property assembly allocated");
+}
+
 fn text_header_values() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4605,6 +4699,7 @@ fn main() {
         budgeted_raw_output();
         raw_header_values();
         text_header_values();
+        date_header_values();
         header_properties();
         header_nfc();
         phrase_nfc();
@@ -4731,6 +4826,7 @@ fn main() {
     budgeted_raw_output();
     raw_header_values();
     text_header_values();
+    date_header_values();
     header_properties();
     header_nfc();
     phrase_nfc();

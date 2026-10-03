@@ -1,4 +1,4 @@
-//! Provisional Raw and Text property JSON for an unpublished response-spool tail.
+//! Provisional header property JSON for an unpublished response-spool tail.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     header_property::{Form, Occurrence, Property},
@@ -8,6 +8,8 @@ use crate::{
     nfc::{self, HeaderBudget},
     ports::Tick,
 };
+mod date;
+use date::DateMode;
 mod projection;
 use projection::{Projection, RawMode, TextMode};
 
@@ -18,6 +20,8 @@ pub enum Error {
     Selection(header_select::Error),
     Raw(header_raw::Error),
     Text(nfc::Error),
+    Date(crate::header_date::Error),
+    DateProjection(crate::header_date::project::Error),
     Json(json_string::Error),
     Work(Stop),
     InterpretationLimit,
@@ -30,6 +34,8 @@ impl std::fmt::Display for Error {
             Self::UnsupportedForm => f.write_str("unsupported header value form"),
             Self::Selection(error) => write!(f, "header value selection: {error}"),
             Self::Raw(error) => write!(f, "header value Raw: {error}"),
+            Self::Date(error) => write!(f, "header value Date: {error}"),
+            Self::DateProjection(error) => write!(f, "header value Date projection: {error}"),
             Self::Text(error) => write!(f, "header value Text: {error}"),
             Self::Json(error) => write!(f, "header value JSON: {error}"),
             Self::Work(error) => write!(f, "header value work: {error}"),
@@ -139,6 +145,27 @@ impl<'a, 'w> Text<'a, 'w> {
         self.0.poll(now, output)
     }
 }
+/// Provisional Date property using bounded caller-independent inline staging.
+pub struct Date<'a, 'w>(Core<'a, 'w, DateMode>);
+impl<'a, 'w> Date<'a, 'w> {
+    pub fn new(
+        input: Input<'a>,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        Core::new(input, work, budget, ()).map(Self)
+    }
+    /// Final only after Complete; an unqualified :60 produced a null value.
+    pub const fn has_unverified_leap(&self) -> bool {
+        self.0.unverified_leap
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.0.check_deadline(now)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.0.poll(now, output)
+    }
+}
 struct Core<'a, 'w, P: Projection<'a, 'w>> {
     input: &'a [u8],
     name: &'a str,
@@ -154,6 +181,7 @@ struct Core<'a, 'w, P: Projection<'a, 'w>> {
     all: bool,
     seen: bool,
     problem: bool,
+    unverified_leap: bool,
     end: Option<End>,
     failure: Option<Error>,
 }
@@ -188,6 +216,7 @@ impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
             all: input.property.occurrence() == Occurrence::All,
             seen: false,
             problem: false,
+            unverified_leap: false,
             end: None,
             failure: None,
         })
@@ -341,6 +370,7 @@ impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
                 let progress = P::poll(source, &mut self.frame, now, output)?;
                 if progress.status == json_string::Status::Complete {
                     self.problem |= P::is_encoding_problem(source);
+                    self.unverified_leap |= P::has_unverified_leap(source);
                     self.phase = Phase::Release;
                 }
                 return Ok(Progress {
@@ -718,3 +748,6 @@ mod tests {
 
 #[cfg(test)]
 mod text_tests;
+
+#[cfg(test)]
+mod date_tests;

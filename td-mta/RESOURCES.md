@@ -1041,13 +1041,24 @@ into 20 or 25 caller bytes. Placement and exclusive lifetime of that output
 remain the enclosing owner's responsibility; no existing scratch partition
 is claimed by this helper. Its calendar shift is bounded to five days and
 uses scalar locals. It allocates no time-zone table or owned string. The
-complete Date form's output reservation and composed worker stack remain
+standalone formatter retains its caller-output obligation; M06ax supplies
+the complete Date property reservation below. Combined worker stacks remain
 open. Pinned leap qualification adds only the static payload above. M06aw's
 budgeted formatter adds a transient adapter of at most 24 bytes, with the
 same 25-byte caller output obligation. It charges at most 14 aggregate steps,
 one prepaid job record and 25 output bytes, without source visits. Allocation
 intervals cover ordinary/leap formatting, invalid/unverified outcomes and
 refusal. These component bounds do not qualify the combined worker stack.
+
+The Date property coordinator (M06ax) fits 896 bytes inside the existing
+16 KiB parser reservation, including inline Date/CFWS state, its budget
+references, 27 bytes of staged JSON and shared selection/framing state.
+It replaces standalone Date parsing/output storage on this path, borrows no
+NFC scratch and allocates no arena. The formatter's transient 24-byte adapter
+is unchanged. Turn bounds remain 255 visits, 256 aggregate steps, 16 job
+records and six external output bytes. Allocation intervals cover long
+comments, multiple dates, leap outcomes and late selection refusal. Combined
+worker/native/RSS qualification remains open.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also

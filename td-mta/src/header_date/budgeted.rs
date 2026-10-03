@@ -28,6 +28,32 @@ impl<'a, 'w> Budgeted<'a, 'w> {
             failure: None,
         }
     }
+    pub(crate) fn finish(self) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.cursor.complete.is_none() {
+            return Err(Error::InvalidState);
+        }
+        Ok((self.work, self.budget))
+    }
+    pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        self.check_deadline(now)?;
+        let result = self
+            .work
+            .charge(
+                now,
+                Charge {
+                    output_bytes: bytes,
+                    ..Charge::default()
+                },
+            )
+            .map_err(Error::Work);
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
     /// Final admission stays live even after a cached Complete result.
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         if let Some(error) = self.failure {

@@ -1456,8 +1456,8 @@ are charged. The non-Copy cursor fits 192 bytes, including inline CFWS state,
 a three-byte word prefix and scalar counters. Long comments, zone names and
 zero-prefixed years use constant storage. Source capture remains external;
 section 1.54 adds aggregate interpretation admission. Section 1.32 projects
-ordinary dates and pinned leap insertions; JSON output and the JMAP method
-adapter remain follow-on work.
+ordinary dates and pinned leap insertions; section 1.56 adds Date property
+JSON. The JMAP method adapter remains follow-on work.
 
 ### 1.32 Date projection
 
@@ -2520,8 +2520,8 @@ and job exhaustion, credit discard between fields and live final checks.
 Every partial byte/step budget is tested across malformed UTF-8, folds,
 malformed trailing comments and valid dates with comments. The
 allocation probe adds long valid dates, malformed tails, budget reuse and
-terminal deadline refusal in both registered modes. Date formatting under the
-aggregate budget and complete Date property JSON remain follow-on work.
+terminal deadline refusal in both registered modes. Sections 1.55 and 1.56
+add aggregate formatting and complete provisional Date property JSON.
 
 ### 1.55 Budgeted Date formatting
 
@@ -2541,9 +2541,9 @@ exactly once, before any caller-buffer write: 20 bytes for UTC Z or 25 bytes
 for unknown -00:00. Invalid or unqualified dates produce no output charge.
 Capacity and work errors also leave the output untouched, although already
 performed interpretation remains charged. Repeated calls retain the same
-budgets; the aggregate exhaustion latch and job stop remain authoritative.
-The private adapter rejects mixed interpretation/output charges before any
-debit; the formatter uses separate work and output admission points.
+budgets; the aggregate exhaustion latch and job stop remain authoritative. The
+private adapter rejects mixed interpretation/output charges before any debit;
+the formatter uses separate work and output admission points.
 
 The private work adapter fits 24 bytes of bounded transient state. It adds no
 arena, source copy or owned string; the 25-byte caller output has the same
@@ -2557,8 +2557,64 @@ pinned/unverified leap outcomes, pin exact step/record/output costs, and cover
 aggregate, record, output, capacity and deadline refusals before mutation.
 Repeated projection proves credit discard without budget reset. Allocation
 intervals cover successful dates/leaps, invalid/unverified outcomes and output
-and deadline refusal in both registered modes. Complete Date property JSON and
-unpublished response-spool retention remain follow-on work.
+and deadline refusal in both registered modes. Section 1.56 adds Date property
+JSON; unpublished response-spool retention remains follow-on work.
+
+### 1.56 Complete provisional Date header values
+
+M06ax adds `header_value::Date` over the resident Input descriptor and the
+original job/email budgets. Only Date-form properties are admitted. It uses
+the same selector, last/all/absence framing and provisional-output contract as
+Raw and Text; missing values are null or [], and malformed fields become null
+values in their selected positions. It does not publish a method result or an
+HTTP response. Late selection/resource failure retires all output.
+
+The private Date projection first validates the whole field with Budgeted Date
+parsing, then consumes that successful cursor to recover its original budget
+borrows. A private formatter call retains the budgets and renders into 25
+bytes inside a 27-byte inline staging array. Known/unknown timestamps are
+quoted directly: checked Date formatting emits only fixed ASCII syntax, so no
+escaping or second scalar parser is required. Malformed or out-of-range dates
+stage null. LeapSecondUnverified also stages null and retains a separate flag.
+`has_unverified_leap` is final only after property Complete and ORs that
+diagnostic across selected values; it does not describe unselected fields. Raw
+bytes and the leap table remain unchanged.
+
+Date parsing and formatting charge their aggregate work as in sections 1.54
+and 1.55. Formatting prepays the 20/25 timestamp bytes; staging then prepays
+the two quotes, or all four null bytes. Array punctuation uses the shared
+core. Every external byte is charged once, before staging/draining it; drains
+copy at most six already-paid bytes and never charge again. An output refusal
+can leave earlier internal formatting work charged while exposing no bytes
+from that timestamp. Previously emitted array bytes remain provisional.
+
+Source parsing and checks while that parser owns the budgets report Date;
+formatting reports DateProjection; later literal/quote checks report Work or
+InterpretationLimit. In particular comma staging on a fresh parser uses
+Date(Work). Selection retains its existing wrappers. Callers classify the
+underlying resource cause; none becomes a null-producing malformed outcome.
+Date(NestingLimit) also remains a typed resource failure, never null. Both
+private owners reject consuming handoff before successful completion or after
+failure. Empty-output polls and final deadline retirement follow the shared
+core; cached completion alone does not perform final admission.
+
+The Date coordinator fits 896 bytes in the existing 16 KiB parser region,
+including one inline Date/CFWS cursor, its budget borrows, the 27-byte staging
+array and shared selection/framing state. It replaces standalone Date state
+and output storage on this path. It needs no NFC scratch or extra arena. The
+transient formatter adapter remains at most 24 bytes. Poll ceilings stay 255
+source visits, 256 aggregate steps, 16 job records and six externally copied
+output bytes. Those component bounds do not qualify combined worker stacks or
+native/process RSS.
+
+Tests cover widths one through eight, last/all/absence, known/unknown offsets,
+malformed/out-of-range dates, pinned/unverified leaps and diagnostic scope.
+Composed charges match separate selection/parsing/formatting. Tests exhaust
+partial aggregate step budgets, pin timestamp/comma output refusal, retire a
+late scan failure, check final deadlines and reject partial/failed handoffs.
+Allocation intervals include long Unicode comments, multiple dates, leap
+outcomes, one-byte drains and late selection refusal in both registered modes.
+Other structured forms and unpublished response-spool retention remain open.
 
 ## 2. Read views and change history
 

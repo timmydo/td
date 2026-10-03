@@ -35,6 +35,9 @@ pub(super) trait Projection<'a, 'w> {
         output: &mut [u8],
     ) -> Result<Progress, Error>;
     fn is_encoding_problem(source: &Self::Source) -> bool;
+    fn has_unverified_leap(_: &Self::Source) -> bool {
+        false
+    }
 }
 pub(super) struct RawMode;
 impl<'a, 'w> Projection<'a, 'w> for RawMode {
