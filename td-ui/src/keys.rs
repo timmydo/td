@@ -5,7 +5,7 @@
 //! are as `Section`s of `Row`s, the keys as the user reads them (`j/k`,
 //! `C-x C-s`) and what they do; nothing here reads a keymap or checks a
 //! row against one. Pure: the lines, a chord's effect on the list's state
-//! and a draw stream.
+//! and a draw stream, and the `Overlay` a window keeps them in.
 
 use crate::chrome::{Item, List, ROW};
 use crate::raster::{
@@ -147,10 +147,10 @@ fn wrap(text: &str, room: usize) -> Vec<String> {
 pub enum Step {
     /// The list closed.
     Closed,
-    /// The list scrolled, or held at an end.
+    /// The list scrolled.
     Moved,
-    /// Not one of the list's keys. The list keeps it from the program all
-    /// the same while it is open.
+    /// Nothing moved: not one of the list's keys, or one held at an end.
+    /// The list keeps it from the program all the same while it is open.
     Kept,
 }
 
@@ -203,7 +203,12 @@ impl Help {
             "End" | "G" => last,
             _ => return Step::Kept,
         };
-        self.first = first.min(last);
+        let first = first.min(last);
+        if first == self.first {
+            // A held key at an end stops repeating and paints nothing.
+            return Step::Kept;
+        }
+        self.first = first;
         Step::Moved
     }
 
@@ -362,6 +367,98 @@ impl Panel {
             }
         }
     }
+}
+
+/// The key list as a window keeps it over its frame: the list's state,
+/// the sections it was opened with, and their lines laid out at the
+/// surface's width. A window routes its keyboard's chords, its wheel and
+/// its resizes here while the list is open, and paints it last, as
+/// td-ui/DESIGN.md's "Key list" says.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Overlay {
+    help: Help,
+    sections: Vec<Section>,
+    lines: Vec<Line>,
+}
+
+impl Overlay {
+    pub fn is_open(&self) -> bool {
+        self.help.is_open()
+    }
+
+    pub fn help(&self) -> Help {
+        self.help
+    }
+
+    /// The lines as laid out for the surface last given.
+    pub fn lines(&self) -> &[Line] {
+        &self.lines
+    }
+
+    /// Opens from the top with `sections`, then `window`'s, laid out for
+    /// `surface`.
+    pub fn open(&mut self, mut sections: Vec<Section>, surface: Surface) {
+        sections.push(window());
+        self.sections = sections;
+        self.help.open();
+        self.lay_out(surface);
+    }
+
+    /// Lays the open list out again for `surface`, as after a resize,
+    /// its first line held to the new last page.
+    pub fn lay_out(&mut self, surface: Surface) {
+        if !self.is_open() {
+            return;
+        }
+        let columns = Panel::new(surface).map_or(usize::MAX, |panel| panel.columns(surface));
+        self.lines = lines(&self.sections, columns);
+        self.help.clamp(self.lines.len(), page(surface));
+    }
+
+    /// Closes the list and drops its lines, as for a focus or mode the
+    /// window ends it on.
+    pub fn close(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A chord while the list is open (`Help::key`), over `surface`'s
+    /// page; closing drops the lines. A closed list keeps nothing.
+    pub fn key(&mut self, chord: &str, surface: Surface) -> Step {
+        if !self.is_open() {
+            return Step::Kept;
+        }
+        let step = self.help.key(chord, self.lines.len(), page(surface));
+        if step == Step::Closed {
+            self.close();
+        }
+        step
+    }
+
+    /// Wheel travel of `rows` lines over `surface`'s page, while open.
+    pub fn wheel(&mut self, rows: isize, surface: Surface) {
+        if self.is_open() {
+            self.help.wheel(rows, self.lines.len(), page(surface));
+        }
+    }
+
+    /// Paints the open list over `surface`, its first line held to the
+    /// last page first; nothing when it is closed or the surface holds no
+    /// panel, the list keeping its keys all the same.
+    pub fn emit(&mut self, surface: Surface, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        if !self.is_open() {
+            return;
+        }
+        let Some(panel) = Panel::new(surface) else {
+            return;
+        };
+        self.help.clamp(self.lines.len(), panel.page());
+        panel.emit(surface, &self.help, &self.lines, damage, sink);
+    }
+}
+
+/// The lines a panel over `surface` shows at once; one without a panel.
+fn page(surface: Surface) -> usize {
+    Panel::new(surface).map_or(1, |panel| panel.page())
 }
 
 fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {

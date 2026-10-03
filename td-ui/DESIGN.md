@@ -226,6 +226,11 @@ The widget window shows it for every program it serves, asking the
 handler for its sections when it opens; a program that lists none shows
 the window's own keys alone.
 
+Newly built (increment 36): `keys::Overlay`, the key list as a window
+keeps it, which the widget window now holds, so a program with a window
+of its own keeps the same list by routing its keys, wheel and resizes
+to it and painting it last.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -413,7 +418,9 @@ of its own files may name each module.
   window's own section; `Line` and `lines`, the list as text; `Help`, the
   list's state (`open`, `close`, `is_open`, `first`, `key` with its
   `Step`, `clamp`, `wheel`); `Panel`, its place over a surface (`new`,
-  `page`, `columns`, `emit`); `CHORD`, `MAX_KEYS_COLUMN`, `MIN_WRAP`,
+  `page`, `columns`, `emit`); `Overlay`, the list as a window keeps it
+  (`open`, `lay_out`, `key`, `wheel`, `emit`, `is_open`, `help`,
+  `lines`); `CHORD`, `MAX_KEYS_COLUMN`, `MIN_WRAP`,
   `MAX_COLUMNS`, `MARGIN`, `TITLE` and `TITLE_HINT`. Pure. Under "Key
   list" below.
 - `pinned_face`: `load` from `host_places`, `load_in` given places and
@@ -2088,13 +2095,45 @@ at its left and `TITLE_HINT` at its right where it fits beside the
 title, and chrome's `List` under it: no row is selected, and a section
 title's row is left blank there and its title painted in `ACCENT` where
 the list puts a label. `columns` is the cells a line has there. `None`
-when the surface cannot hold the title bar and one row. The tests pin
-the lines (titles, padding, the ceiling, the window's section last,
-wrapping and its floor), every reading and closing key with the clamp at
-both ends, `clamp`, the wheel, a kept key, the hint naming `CHORD`, the
-panel's place, title bar, hint left out on a slim panel and accented
-titles, the lines fitting its columns, nothing painted outside its
-frame, and no panel on a surface too small.
+when the surface cannot hold the title bar and one row.
+
+`Overlay` is the list as a window keeps it: `open` with the program's
+sections, which it ends with `window`'s, laid out for the surface;
+`lay_out` again when the surface changes, which holds the first line
+to the new page; `key` and `wheel` while it is open, which keep nothing
+and move nothing while it is closed; `close`, for a window that ends it
+itself; and `emit` last over the frame, which holds the first line to
+the page first and paints nothing when the surface has no room for a
+panel. The window decides when the list opens and what it keeps from
+the program, and every window routes alike, as the widget window does
+(see "Widget window"):
+
+- the physical keyboard's unmodified `CHORD` opens it, and the
+  keyboard's chords go to `key` while it is open, `theme::CHORD`
+  excepted; nothing from a control socket or a replay reaches it;
+- the program hears no keyboard chord while it is open; focus,
+  resizes, the close request and, in the widget window, Control's hover
+  still reach it, as does anything its own control socket drives;
+- a held key repeats only while `key` answers `Moved`, and a repeat
+  that does not move the list is cancelled; a reading key at an end
+  moves nothing and answers `Kept`, so a key held there stops; a key
+  that opened it arms no repeat;
+- opening it ends a drag under way; a left-button press while it is
+  open reaches nobody;
+- wheel rows scroll it while it is open, columns are dropped;
+- a resize calls `lay_out`;
+- every step but `Kept`, and every wheel scroll, is a frame to paint,
+  and `emit` is the last thing painted, in the window's theme; a
+  program's own previews and render checks never show it.
+
+The tests pin the lines (titles, padding, the ceiling, the window's
+section last, wrapping and its floor), every reading and closing key
+with the clamp at both ends, `clamp`, the wheel, a kept key, the hint
+naming `CHORD`, the overlay's opening, laying out again, scrolling,
+clamping as it paints and emptying on close, the panel's place, title
+bar, hint left out on a slim panel and accented titles, the lines
+fitting its columns, nothing painted outside its frame, and no panel on
+a surface too small.
 
 ## Themes
 
@@ -3678,3 +3717,6 @@ regressions. Those increments extend the original sequence below.
     frame with the handler's sections and the window's own, scrolled and
     closed by its own keys, and opened by a handler's help key through
     `take_show_keys`. Landed.
+36. The key list in the programs with their own windows:
+    `keys::Overlay`, the list's state, sections and laid-out lines,
+    held by the widget window, and the rules a window routes to it by.

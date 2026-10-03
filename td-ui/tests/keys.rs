@@ -62,22 +62,26 @@ fn the_reading_keys_scroll_within_the_lines_and_the_closing_keys_close() {
     help.open();
     assert!(help.is_open());
     // Twenty lines, five shown: the last page starts at fifteen.
-    for (chord, first) in [
-        ("j", 1),
-        ("Down", 2),
-        ("k", 1),
-        ("PageDown", 6),
-        (" ", 11),
-        (" ", 15),
-        ("j", 15),
-        ("PageUp", 10),
-        ("Home", 0),
-        ("Up", 0),
-        ("G", 15),
-        ("g", 0),
-        ("End", 15),
+    // A reading key held at an end moves nothing and is only kept.
+    let (moved, kept) = (Step::Moved, Step::Kept);
+    for (chord, first, step) in [
+        ("j", 1, moved),
+        ("Down", 2, moved),
+        ("k", 1, moved),
+        ("PageDown", 6, moved),
+        (" ", 11, moved),
+        (" ", 15, moved),
+        ("j", 15, kept),
+        ("End", 15, kept),
+        ("PageUp", 10, moved),
+        ("Home", 0, moved),
+        ("Up", 0, kept),
+        ("g", 0, kept),
+        ("G", 15, moved),
+        ("g", 0, moved),
+        ("End", 15, moved),
     ] {
-        assert_eq!(help.key(chord, 20, 5), Step::Moved, "{chord}");
+        assert_eq!(help.key(chord, 20, 5), step, "{chord}");
         assert_eq!(help.first(), first, "{chord}");
     }
     assert_eq!(help.key("x", 20, 5), Step::Kept);
@@ -106,7 +110,7 @@ fn the_reading_keys_scroll_within_the_lines_and_the_closing_keys_close() {
     assert_eq!(help.first(), 0);
     // Fewer lines than rows: nothing to scroll.
     help.open();
-    assert_eq!(help.key("End", 3, 5), Step::Moved);
+    assert_eq!(help.key("End", 3, 5), Step::Kept);
     assert_eq!(help.first(), 0);
 }
 
@@ -223,4 +227,73 @@ fn the_panel_sits_inside_the_margin_and_paints_its_title_and_section_titles() {
     let narrow = Surface::new(400, 300, Scale::new(2).unwrap()).unwrap();
     let panel = Panel::new(narrow).unwrap();
     assert_eq!(i64::from(panel.frame.width), 400 - 4 * margin);
+}
+
+/// The overlay a window keeps: opened with the program's sections and
+/// the window's, laid out for its surface and again for another, scrolled
+/// by key and wheel, its first line held to the page when it paints, and
+/// emptied when it closes.
+#[test]
+fn the_overlay_opens_lays_out_scrolls_paints_and_closes() {
+    use td_ui::keys::Overlay;
+    let wide = Surface::new(1200, 300, Scale::new(1).unwrap()).unwrap();
+    let narrow = Surface::new(300, 300, Scale::new(1).unwrap()).unwrap();
+    let rows = vec![("x", "a description long enough to wrap on a narrow surface"); 20];
+    let mut overlay = Overlay::default();
+    assert!(!overlay.is_open());
+    let mut draws = 0;
+    overlay.emit(wide, wide.bounds(), &mut |_| draws += 1);
+    assert_eq!(draws, 0, "closed, nothing painted");
+    overlay.open(vec![Section::new("Program", &rows)], wide);
+    assert!(overlay.is_open());
+    let wide_lines = overlay.lines().len();
+    assert!(overlay
+        .lines()
+        .iter()
+        .any(|l| l.title && l.text == "Window"));
+    overlay.lay_out(narrow);
+    assert!(overlay.lines().len() > wide_lines, "wrapped");
+    assert_eq!(overlay.key("End", narrow), Step::Moved);
+    let end = overlay.help().first();
+    overlay.wheel(-2, narrow);
+    assert_eq!(overlay.help().first(), end - 2);
+    assert_eq!(overlay.key("x", narrow), Step::Kept);
+    overlay.key("End", narrow);
+    let narrow_end = overlay.help().first();
+    overlay.lay_out(wide);
+    overlay.emit(wide, wide.bounds(), &mut |_| draws += 1);
+    assert!(draws > 0);
+    assert!(overlay.help().first() < narrow_end, "held to the wide page");
+    assert_eq!(overlay.key("Escape", wide), Step::Closed);
+    assert_eq!(overlay, td_ui::keys::Overlay::default(), "emptied");
+    // Closed, it keeps nothing and moves nothing.
+    assert_eq!(overlay.key("q", wide), Step::Kept);
+    assert_eq!(overlay.key("j", wide), Step::Kept);
+    overlay.wheel(3, wide);
+    assert_eq!(overlay, td_ui::keys::Overlay::default());
+    // Opened again, from the top, with one window section.
+    overlay.open(vec![Section::new("Program", &rows)], narrow);
+    overlay.key("End", narrow);
+    overlay.open(vec![Section::new("Program", &rows)], narrow);
+    assert_eq!(overlay.help().first(), 0);
+    let windows = overlay
+        .lines()
+        .iter()
+        .filter(|l| l.title && l.text == "Window")
+        .count();
+    assert_eq!(windows, 1);
+    // A resize holds the first line to the new page before any paint.
+    overlay.key("End", narrow);
+    let narrow_end = overlay.help().first();
+    overlay.lay_out(wide);
+    assert!(overlay.help().first() < narrow_end);
+    // On a surface with no room it paints nothing but keeps its keys.
+    let tiny = Surface::new(120, 40, Scale::new(1).unwrap()).unwrap();
+    overlay.lay_out(tiny);
+    let mut drawn = 0;
+    overlay.emit(tiny, tiny.bounds(), &mut |_| drawn += 1);
+    assert_eq!(drawn, 0);
+    assert_eq!(overlay.key("j", tiny), Step::Moved);
+    overlay.close();
+    assert!(!overlay.is_open());
 }
