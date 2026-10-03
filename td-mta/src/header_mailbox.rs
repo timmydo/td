@@ -10,6 +10,7 @@ pub enum Error {
     Malformed,
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl From<header_message_ids::Error> for Error {
@@ -19,6 +20,7 @@ impl From<header_message_ids::Error> for Error {
             header_message_ids::Error::NestingLimit => Self::NestingLimit,
             header_message_ids::Error::Work(stop) => Self::Work(stop),
             header_message_ids::Error::InvalidState => Self::InvalidState,
+            header_message_ids::Error::InterpretationLimit => Self::InterpretationLimit,
         }
     }
 }
@@ -28,6 +30,7 @@ impl std::fmt::Display for Error {
             Self::Malformed => f.write_str("malformed mailbox"),
             Self::NestingLimit => f.write_str("mailbox comment nesting limit"),
             Self::Work(error) => write!(f, "mailbox work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid mailbox cursor state"),
         }
     }
@@ -118,6 +121,7 @@ impl<'a> Cursor<'a> {
             header_cfws::Error::NestingLimit => Error::NestingLimit,
             header_cfws::Error::Work(stop) => Error::Work(stop),
             header_cfws::Error::InvalidState => Error::InvalidState,
+            header_cfws::Error::InterpretationLimit => Error::InterpretationLimit,
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
@@ -273,6 +277,7 @@ impl<'a> Cursor<'a> {
                     header_phrase::Error::NestingLimit => Error::NestingLimit,
                     header_phrase::Error::Work(stop) => Error::Work(stop),
                     header_phrase::Error::InvalidState => Error::InvalidState,
+                    header_phrase::Error::InterpretationLimit => Error::InterpretationLimit,
                 })?;
                 if matches!(status, header_phrase::Status::Complete(_)) {
                     self.name = Some(Name::Phrase(Extent {
@@ -364,6 +369,7 @@ impl<'a> Cursor<'a> {
                     header_addr_spec::Error::NestingLimit => Error::NestingLimit,
                     header_addr_spec::Error::Work(stop) => Error::Work(stop),
                     header_addr_spec::Error::InvalidState => Error::InvalidState,
+                    header_addr_spec::Error::InterpretationLimit => Error::InterpretationLimit,
                 })?;
                 match status {
                     header_addr_spec::Status::Part(extent) => self.address_end = extent.end,

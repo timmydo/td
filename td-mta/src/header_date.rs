@@ -1,9 +1,12 @@
 //! Complete resident RFC 5322 date-time parsing; output formatting is separate.
+mod budgeted;
 mod leap_dates;
 pub mod project;
+pub use budgeted::Budgeted;
 
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::Work,
     header_cfws,
     ports::Tick,
 };
@@ -34,6 +37,7 @@ pub enum Status {
 pub enum Error {
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl std::fmt::Display for Error {
@@ -41,11 +45,21 @@ impl std::fmt::Display for Error {
         match self {
             Self::NestingLimit => f.write_str("date comment nesting limit"),
             Self::Work(error) => write!(f, "date work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid date parser state"),
         }
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            crate::decode_work::Error::InterpretationLimit => Self::InterpretationLimit,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 impl From<Stop> for Error {
     fn from(error: Stop) -> Self {
         Self::Work(error)
@@ -126,6 +140,13 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -142,9 +163,9 @@ impl<'a> Cursor<'a> {
         self.complete = Some(value);
         Status::Complete(value)
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         if let Some(cursor) = self.cfws.as_mut() {
-            match cursor.poll(now, work) {
+            match cursor.poll_with_work(now, work) {
                 Ok(header_cfws::Status::Comment(_) | header_cfws::Status::Yield) => {}
                 Ok(header_cfws::Status::Complete(end)) => {
                     self.position = end.position;
@@ -163,6 +184,9 @@ impl<'a> Cursor<'a> {
                 Err(header_cfws::Error::NestingLimit) => return Err(Error::NestingLimit),
                 Err(header_cfws::Error::Work(stop)) => return Err(Error::Work(stop)),
                 Err(header_cfws::Error::InvalidState) => return Err(Error::InvalidState),
+                Err(header_cfws::Error::InterpretationLimit) => {
+                    return Err(Error::InterpretationLimit)
+                }
             }
             return Ok(Status::Yield);
         }
@@ -406,7 +430,7 @@ fn obsolete_zone(prefix: [u8; 3], len: u8) -> Option<Offset> {
         _ => None,
     }
 }
-fn charge(now: Tick, work: &mut Meter, bytes: u64, records: u64) -> Result<(), Error> {
+fn charge(now: Tick, work: &mut impl Work, bytes: u64, records: u64) -> Result<(), Error> {
     work.charge(
         now,
         Charge {

@@ -23,6 +23,7 @@ pub enum Error {
     Malformed,
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl From<Stop> for Error {
@@ -37,6 +38,7 @@ impl From<header_cfws::Error> for Error {
             header_cfws::Error::NestingLimit => Self::NestingLimit,
             header_cfws::Error::Work(stop) => Self::Work(stop),
             header_cfws::Error::InvalidState => Self::InvalidState,
+            header_cfws::Error::InterpretationLimit => Self::InterpretationLimit,
         }
     }
 }
@@ -46,6 +48,7 @@ impl std::fmt::Display for Error {
             Self::Malformed => f.write_str("malformed URL header"),
             Self::NestingLimit => f.write_str("URL header comment nesting limit"),
             Self::Work(error) => write!(f, "URL header work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid URL header cursor state"),
         }
     }

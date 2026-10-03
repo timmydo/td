@@ -1454,8 +1454,8 @@ grammar transition. Its ceilings are 161 source-byte visits and 33 records,
 with no output bytes. Revisited token delimiters and the trailing-FWS check
 are charged. The non-Copy cursor fits 192 bytes, including inline CFWS state,
 a three-byte word prefix and scalar counters. Long comments, zone names and
-zero-prefixed years use constant storage. Source capture and enclosing
-aggregate interpretation admission remain external. Section 1.32 projects
+zero-prefixed years use constant storage. Source capture remains external;
+section 1.54 adds aggregate interpretation admission. Section 1.32 projects
 ordinary dates and pinned leap insertions; JSON output and the JMAP method
 adapter remain follow-on work.
 
@@ -2477,6 +2477,51 @@ scan refusal and final deadline retirement. The allocation probe covers
 overflow plus subsequent scratch reuse and late failure in both registered
 modes. Other parsed forms and ADMISSION.md's unpublished response-spool
 implementation remain separate.
+
+### 1.54 Budgeted resident Date parsing
+
+M06av adds `header_date::Budgeted`, owning one Date cursor and exclusive
+borrows of the original job Meter and shared per-email HeaderBudget. It
+cannot be cloned or copied. Polling returns the same Yield or
+Complete(Option<Date>) outcomes as section 1.31, including whole-field
+validation and malformed-date None. No formatted or JSON output is produced.
+
+The existing Date and CFWS parsers use a private generic charging seam. Plain
+public polling still uses the original Meter and retains its exact charges.
+The budgeted adapter charges each original source-byte visit and record as an
+interpretation step, with at least one step for an EOF-only charge. CFWS
+lookahead, UTF-8 revalidation, token delimiters and the parent's trailing-FWS
+visit are charged before source access. Sixteen steps prepay one job record;
+credit stays private to this non-replayable wrapper across all child turns.
+Dropping it discards unused credit without refunding or resetting counters.
+Subsequent header projections retain the same job and email budgets.
+
+InterpretationLimit remains distinct from Work(Stop), malformed-date None and
+NestingLimit. CFWS callers carry the typed aggregate refusal through their
+existing error adapters; their plain APIs do not acquire an aggregate budget.
+A failure retires the wrapper permanently. Cached Complete is inert, while
+check_deadline performs a live zero-cost check even after Complete and retires
+that result on refusal. The enclosing owner must make that final check before
+publishing any dependent result. It also brackets active polls with fresh
+clock/cancellation checks as for the other resident parsers.
+
+The wrapper fits 224 bytes, including inline Date/CFWS state, budget
+references and credit, in the existing 16 KiB parser-state reservation. One
+poll charges at most 161 source visits, 194 interpretation steps and 13 job
+records, with zero output bytes. The same live budget covers nested comments
+and dates; there is no child budget reset, copied string, heap allocation or
+new arena. These are component bounds, not a combined worker-stack
+qualification.
+
+Tests compare plain and budgeted parsing results and visits, exercise long
+Unicode comments, nesting and malformed tails, pin exact EOF/fold/revisit
+charges, and prove refusal before source access. They cover sticky aggregate
+and job exhaustion, credit discard between fields and live final checks.
+Every partial byte/step budget is tested across malformed UTF-8, folds,
+malformed trailing comments and valid dates with comments. The
+allocation probe adds long valid dates, malformed tails, budget reuse and
+terminal deadline refusal in both registered modes. Date formatting under the
+aggregate budget and complete Date property JSON remain follow-on work.
 
 ## 2. Read views and change history
 

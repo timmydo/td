@@ -12,6 +12,7 @@ pub enum Error {
     Malformed,
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl From<header_message_ids::Error> for Error {
@@ -21,6 +22,7 @@ impl From<header_message_ids::Error> for Error {
             header_message_ids::Error::NestingLimit => Self::NestingLimit,
             header_message_ids::Error::Work(stop) => Self::Work(stop),
             header_message_ids::Error::InvalidState => Self::InvalidState,
+            header_message_ids::Error::InterpretationLimit => Self::InterpretationLimit,
         }
     }
 }
@@ -30,6 +32,7 @@ impl std::fmt::Display for Error {
             Self::Malformed => f.write_str("malformed phrase"),
             Self::NestingLimit => f.write_str("phrase comment nesting limit"),
             Self::Work(error) => write!(f, "phrase work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid phrase cursor state"),
         }
     }

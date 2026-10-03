@@ -1023,6 +1023,14 @@ same output budget. Allocation intervals cover long Unicode, malformed
 UTF-8, noncharacters, literal controls, empty values and refusal. Complete
 display-name/NFC, response storage and worker stack composition remain open.
 
+The budgeted Date wrapper (M06av) fits 224 bytes, including the inline cursor,
+budget references and private credit, in the existing 16 KiB parser region.
+It replaces the standalone Date cursor on this path. Each poll charges at
+most 161 source visits, 194 aggregate steps and 13 job records, without output
+bytes. Child CFWS turns share its budget and credit. Allocation intervals
+cover long Unicode comments, malformed tails, shared budgets and retirement;
+combined worker/native/RSS qualification remains open.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

@@ -1,6 +1,7 @@
 //! Optional structured-header CFWS; the enclosing grammar authorizes placement.
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::Work,
     ports::Tick,
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +25,7 @@ pub enum Error {
     Malformed,
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl std::fmt::Display for Error {
@@ -32,11 +34,21 @@ impl std::fmt::Display for Error {
             Self::Malformed => f.write_str("malformed header comment"),
             Self::NestingLimit => f.write_str("header comment nesting limit"),
             Self::Work(error) => write!(f, "header comment work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid header comment state"),
         }
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            crate::decode_work::Error::InterpretationLimit => Self::InterpretationLimit,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 impl From<Stop> for Error {
     fn from(error: Stop) -> Self {
         Self::Work(error)
@@ -78,6 +90,13 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -90,7 +109,7 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn peek(&self, offset: usize, now: Tick, work: &mut Meter) -> Result<Option<u8>, Error> {
+    fn peek(&self, offset: usize, now: Tick, work: &mut impl Work) -> Result<Option<u8>, Error> {
         let position = self
             .position
             .checked_add(offset)
@@ -114,7 +133,7 @@ impl<'a> Cursor<'a> {
         }
         Ok(())
     }
-    fn fold(&self, byte: u8, now: Tick, work: &mut Meter) -> Result<Option<usize>, Error> {
+    fn fold(&self, byte: u8, now: Tick, work: &mut impl Work) -> Result<Option<usize>, Error> {
         let width = if byte == b'\r' {
             if self.peek(1, now, work)? != Some(b'\n') {
                 return Ok(None);
@@ -125,7 +144,7 @@ impl<'a> Cursor<'a> {
         };
         Ok(matches!(self.peek(width, now, work)?, Some(b' ' | b'\t')).then_some(width))
     }
-    fn character(&self, byte: u8, now: Tick, work: &mut Meter) -> Result<usize, Error> {
+    fn character(&self, byte: u8, now: Tick, work: &mut impl Work) -> Result<usize, Error> {
         let width = match byte {
             0..=127 => return Ok(1),
             0xc2..=0xdf => 2,
@@ -160,7 +179,7 @@ impl<'a> Cursor<'a> {
         }
         Ok(width)
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         if self.position > self.source.len() {
             return Err(Error::InvalidState);
         }

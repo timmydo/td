@@ -30,6 +30,7 @@ pub enum Error {
     Malformed,
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl std::fmt::Display for Error {
@@ -38,6 +39,7 @@ impl std::fmt::Display for Error {
             Self::Malformed => f.write_str("malformed message-id list"),
             Self::NestingLimit => f.write_str("message-id comment nesting limit"),
             Self::Work(error) => write!(f, "message-id work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid message-id cursor state"),
         }
     }
@@ -152,6 +154,7 @@ impl<'a> Cursor<'a> {
                     header_cfws::Error::NestingLimit => Error::NestingLimit,
                     header_cfws::Error::Work(error) => Error::Work(error),
                     header_cfws::Error::InvalidState => Error::InvalidState,
+                    header_cfws::Error::InterpretationLimit => Error::InterpretationLimit,
                 })?;
                 if let header_cfws::Status::Complete(end) = status {
                     self.position = end.position;

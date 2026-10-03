@@ -1538,6 +1538,13 @@ Initial independently landable increments:
   exact composed charges, late failures and allocation-free output. Other
   parsed forms and unpublished response retention remain open.
 
+- **M06av — budgeted resident Date parsing:** reuse the Date and CFWS parsers
+  through private charged work, retaining the plain APIs' exact behavior. Own
+  original job/email borrows and non-copyable credit; distinguish aggregate
+  exhaustion from malformed dates. Pin EOF, fold and revisit costs, fairness,
+  pre-access refusal, field reuse and allocation-free long-comment parsing.
+  Aggregate date formatting and complete Date property JSON remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

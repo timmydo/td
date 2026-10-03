@@ -2992,6 +2992,52 @@ fn header_date_projection() {
     assert_eq!(before, after, "header date projection allocated");
 }
 
+fn budgeted_header_dates() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_date::{Budgeted, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("({})21 Nov 1997 09:55:06 CST", "🐈".repeat(4096));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for source in [
+        long.as_bytes(),
+        b"1 Jan 2000 00:00 -0000",
+        b"1 Jan 2000 00:00 +0000 (bad",
+    ] {
+        let mut cursor = Budgeted::new(black_box(source), &mut work, &mut budget);
+        let mut complete = false;
+        for _ in 0..10000 {
+            if let Status::Complete(value) = cursor.poll(Tick(1)).unwrap() {
+                assert_eq!(value.is_none(), source.ends_with(b"(bad"));
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        cursor.check_deadline(Tick(1)).unwrap();
+    }
+    let mut cursor = Budgeted::new(b"", &mut work, &mut budget);
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted header date parsing allocated");
+}
+
 fn header_dates() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4443,6 +4489,7 @@ fn main() {
         header_single_addr_spec();
         header_date_projection();
         header_dates();
+        budgeted_header_dates();
         header_comments();
         header_selection();
         header_selection_budget();
@@ -4567,6 +4614,7 @@ fn main() {
     header_single_addr_spec();
     header_date_projection();
     header_dates();
+    budgeted_header_dates();
     header_comments();
     header_selection();
     header_selection_budget();

@@ -9,6 +9,7 @@ use crate::{
 pub enum Error {
     NestingLimit,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl std::fmt::Display for Error {
@@ -16,6 +17,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::NestingLimit => f.write_str("address list comment nesting limit"),
             Self::Work(error) => write!(f, "address list work: {error}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
             Self::InvalidState => f.write_str("invalid address list cursor state"),
         }
     }
@@ -197,6 +199,9 @@ impl<'a> Cursor<'a> {
                 Err(header_cfws::Error::NestingLimit) => return Err(Error::NestingLimit),
                 Err(header_cfws::Error::Work(stop)) => return Err(Error::Work(stop)),
                 Err(header_cfws::Error::InvalidState) => return Err(Error::InvalidState),
+                Err(header_cfws::Error::InterpretationLimit) => {
+                    return Err(Error::InterpretationLimit)
+                }
             },
             Phase::GroupName(cursor) => match cursor.poll(now, work) {
                 Ok(header_phrase::Status::Complete(_)) => {
@@ -216,6 +221,9 @@ impl<'a> Cursor<'a> {
                 Err(header_phrase::Error::NestingLimit) => return Err(Error::NestingLimit),
                 Err(header_phrase::Error::Work(stop)) => return Err(Error::Work(stop)),
                 Err(header_phrase::Error::InvalidState) => return Err(Error::InvalidState),
+                Err(header_phrase::Error::InterpretationLimit) => {
+                    return Err(Error::InterpretationLimit)
+                }
             },
             Phase::CloseForNamed => {
                 self.group = Group::None;
@@ -249,6 +257,9 @@ impl<'a> Cursor<'a> {
                 Err(header_mailbox::Error::NestingLimit) => return Err(Error::NestingLimit),
                 Err(header_mailbox::Error::Work(stop)) => return Err(Error::Work(stop)),
                 Err(header_mailbox::Error::InvalidState) => return Err(Error::InvalidState),
+                Err(header_mailbox::Error::InterpretationLimit) => {
+                    return Err(Error::InterpretationLimit)
+                }
             },
             Phase::TrimStart | Phase::TrimEnd => {
                 if self.candidate.start > self.candidate.end {
