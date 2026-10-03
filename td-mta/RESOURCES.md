@@ -1067,7 +1067,18 @@ reservation. The transient shared Parsing adapter consists of three
 references; no scratch region or process allowance grows. A turn charges at
 most 160 visits, 192 aggregate steps, 12 job records and zero output bytes.
 Allocation intervals cover long Unicode comments, atoms and delimited tokens,
-multiple fields, malformed tails and terminal refusal. Scalar conversion,
+multiple fields, malformed tails and terminal refusal. M06az adds scalar
+conversion below; property JSON and combined worker/native/RSS qualification
+remain open.
+
+The budgeted MessageIds converter (M06az) fits 416 bytes, replacing the
+standalone converter in the existing 16 KiB parser reservation. It includes
+inline parser/unfolder/charset state, one conversion byte and original budget
+references; no NFC scratch or owned string/list is needed. Its transient
+adapter holds three references. Private unfolding turns use 127 transitions;
+public plain turns retain 256. A conversion poll stays within 160 source or
+intermediate visits, 255 aggregate steps, sixteen job records and four output
+bytes. Probe intervals cover long text, folds, repairs and refusals. Complete
 property JSON and combined worker/native/RSS qualification remain open.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32

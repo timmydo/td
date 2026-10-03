@@ -2662,8 +2662,59 @@ They exhaust partial byte/step budgets, including refusal after End, and pin
 pre-access refusal, field-credit retirement, job limits and final deadlines.
 An allocation interval covers long comments/atoms/delimited tokens, repeated
 fields, malformed tails and terminal deadline refusal in both registered
-probe modes. Aggregate conversion and complete MessageIds property JSON remain
-follow-on work with unpublished response-spool retention.
+probe modes. Section 1.58 adds aggregate conversion; complete MessageIds
+property JSON and unpublished response-spool retention remain follow-on work.
+
+### 1.58 Budgeted validated MessageIds text
+
+M06az adds `header_message_ids::project::Budgeted`, retaining the original
+job/email budget borrows and private prepaid credit across full validation,
+replay, unfolding and UTF-8 conversion. It accepts the same resident field
+slice and explicitly authorized mode as section 1.57. Whole-field malformed
+or nesting refusal precedes any Begin/Scalar/End event. Later resource failure
+still retires all provisional text. The encoding-problem diagnostic is final
+only after Complete; cached completion is inert and explicit final deadline
+admission can retire it.
+
+Grammar, source revisits, parent records and UTF-8 consumption use the shared
+Parsing policy. Each unfolding transition charges a step even for EOF or
+backpressure. Output-only operations first charge one aggregate step, then
+prepay job output bytes. A subsequent output refusal retains that admitted
+interpretation step and any prepaid job record. Mixed output/input/record or
+unlink charges are invalid before counters change. Plain APIs retain their
+previous byte/record/output charges and turn sizes.
+
+The private conversion path caps unfolding at 127 transitions per child turn;
+the public unfolder retains 256. This leaves room for the parent's step and
+both transition and byte charges, keeping a conversion poll within 160 source
+or intermediate visits, 255 aggregate steps, sixteen job records and four
+output bytes. Parsing/replay and byte conversion share one field's credit;
+unused credit is discarded between fields. An empty obsolete list costs zero
+visits, ten steps and one job record. Output work still includes intermediate
+unfolding bytes and final scalar UTF-8 lengths. JSON framing and escaping are
+separate work; none is emitted by this helper.
+
+The unfolder now exposes typed Error variants Work, InterpretationLimit and
+InvalidState, with a private generic work entry point. Its public Meter call
+cannot produce InterpretationLimit. Both the unfolder and enclosing cursor
+latch failures; internal copied decoding state never carries a budget or
+credit. Byte lookahead is charged before reading input, including revisits
+after nonfold endings. The public failure accessor retains the typed cause.
+
+The budgeted converter fits 416 bytes, including inline parser, unfolding and
+charset state, one conversion byte and original budget references. It replaces
+the standalone converter in the existing 16 KiB parser reservation, without
+NFC scratch, retained strings, lists or another arena. The transient adapter
+uses three references. Combined worker stacks and native/process RSS remain
+unqualified.
+
+Tests compare plain/budgeted events, diagnostics, visits and output charges;
+cover folds, controls, decomposed text, noncharacters and long input; exhaust
+partial aggregate budgets through validation and replay; and pin output
+refusal, retained costs, field-credit retirement and final deadlines. Probe
+intervals exercise long Unicode values, folded tokens, noncharacter repair,
+malformed tails and terminal refusal in both registered modes. Complete
+MessageIds property JSON and unpublished response retention remain open.
 
 ## 2. Read views and change history
 

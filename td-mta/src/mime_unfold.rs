@@ -2,9 +2,35 @@
 pub use crate::mime_base64::{Progress, Status};
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     ports::Tick,
 };
 const STEP_TRANSITIONS: usize = 256;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    Work(Stop),
+    InterpretationLimit,
+    InvalidState,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Work(stop) => write!(f, "header unfolding work: {stop}"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
+            Self::InvalidState => f.write_str("invalid header unfolding state"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Work(stop) => Self::Work(stop),
+            DecodeError::InterpretationLimit => Self::InterpretationLimit,
+            DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum Held {
@@ -20,10 +46,10 @@ pub struct Decoder {
     output: u16,
     pending: u8,
     eof: bool,
-    failure: Option<Stop>,
+    failure: Option<Error>,
 }
 impl Decoder {
-    pub const fn failure(&self) -> Option<Stop> {
+    pub const fn failure(&self) -> Option<Error> {
         self.failure
     }
     fn flush(&mut self) {
@@ -45,7 +71,17 @@ impl Decoder {
         last: bool,
         now: Tick,
         meter: &mut Meter,
-    ) -> Result<Progress, Stop> {
+    ) -> Result<Progress, Error> {
+        self.poll_with_work::<STEP_TRANSITIONS>(input, output, last, now, meter)
+    }
+    pub(crate) fn poll_with_work<const TRANSITIONS: usize>(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        last: bool,
+        now: Tick,
+        meter: &mut impl Work,
+    ) -> Result<Progress, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -56,26 +92,29 @@ impl Decoder {
                 status: Status::Complete,
             });
         }
-        let result = self.advance(input, output, last, now, meter);
+        let result = self.advance::<TRANSITIONS>(input, output, last, now, meter);
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn advance(
+    fn advance<const TRANSITIONS: usize>(
         &mut self,
         input: &[u8],
         output: &mut [u8],
         last: bool,
         now: Tick,
-        meter: &mut Meter,
-    ) -> Result<Progress, Stop> {
+        meter: &mut impl Work,
+    ) -> Result<Progress, Error> {
+        if TRANSITIONS == 0 || TRANSITIONS > STEP_TRANSITIONS {
+            return Err(Error::InvalidState);
+        }
         let mut step = Progress {
             consumed: 0,
             written: 0,
             status: Status::Yield,
         };
-        for _ in 0..STEP_TRANSITIONS {
+        for _ in 0..TRANSITIONS {
             meter.charge(now, Charge::default())?;
             if self.pending != 0 {
                 let Some(target) = output.get_mut(step.written) else {
@@ -99,7 +138,7 @@ impl Decoder {
                 step.status = Status::Complete;
                 return Ok(step);
             }
-            let Some(byte) = input.get(step.consumed).copied() else {
+            if step.consumed >= input.len() {
                 if !last {
                     step.status = Status::NeedInput;
                     return Ok(step);
@@ -107,7 +146,7 @@ impl Decoder {
                 self.flush();
                 self.eof = true;
                 continue;
-            };
+            }
             meter.charge(
                 now,
                 Charge {
@@ -115,6 +154,10 @@ impl Decoder {
                     ..Charge::default()
                 },
             )?;
+            let byte = input
+                .get(step.consumed)
+                .copied()
+                .ok_or(Error::InvalidState)?;
             match self.held {
                 Held::Cr if byte == b'\n' => {
                     self.held = Held::CrLf;
@@ -296,14 +339,14 @@ mod tests {
         let mut partial = [0xee; 3];
         assert_eq!(
             decoder.poll(b"\r\na", &mut partial, true, Tick(1), &mut exact),
-            Err(Stop::IoBytes)
+            Err(Error::Work(Stop::IoBytes))
         );
         assert_eq!(partial, [b'\r', b'\n', 0xee]);
         let mut fresh = meter(100, 100);
         let before = fresh.remaining();
         assert_eq!(
             decoder.poll(b"a", &mut [0; 3], true, Tick(1), &mut fresh),
-            Err(Stop::IoBytes)
+            Err(Error::Work(Stop::IoBytes))
         );
         assert_eq!(fresh.remaining(), before);
     }
@@ -334,16 +377,16 @@ mod tests {
             let mut work = meter(io, out);
             assert_eq!(
                 decoder.poll(b"a", &mut [0; 1], true, Tick(tick), &mut work),
-                Err(reason)
+                Err(Error::Work(reason))
             );
             let mut fresh = meter(10, 10);
             let before = fresh.remaining();
             assert_eq!(
                 decoder.poll(b"a", &mut [0; 1], true, Tick(1), &mut fresh),
-                Err(reason)
+                Err(Error::Work(reason))
             );
             assert_eq!(fresh.remaining(), before);
-            assert_eq!(decoder.failure(), Some(reason));
+            assert_eq!(decoder.failure(), Some(Error::Work(reason)));
         }
     }
 }

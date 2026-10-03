@@ -1565,6 +1565,13 @@ Initial independently landable increments:
   event retirement, field-credit isolation and allocation-free long input.
   Aggregate conversion and complete MessageIds property JSON remain open.
 
+- **M06az — budgeted validated MessageIds conversion:** carry original budgets
+  through whole-field validation, replay, unfolding and scalar conversion.
+  Bound private unfolding turns and preserve intermediate output charges;
+  make unfolder failures typed and charge before input access. Cover partial
+  budgets, provisional retirement, exact field credit and allocation-free
+  long conversion. Complete MessageIds property JSON remains open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

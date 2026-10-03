@@ -1,11 +1,14 @@
 //! Shared conversion engine; public MessageIds construction validates the whole field.
+mod budgeted;
 use super::{Cursor as Parser, Error, Extent, Mode, Status as Parsed};
 use crate::{
     admission::work::{Charge, Meter},
-    mime_charset::{self, Charset, Decoder as CharsetDecoder, Status as Decoded},
-    mime_unfold::{Decoder as Unfolder, Status as Unfolded},
+    decode_work::Work,
+    mime_charset::{Charset, Decoder as CharsetDecoder, Status as Decoded},
+    mime_unfold::{self, Decoder as Unfolder, Status as Unfolded},
     ports::Tick,
 };
+pub use budgeted::Budgeted;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Yield,
@@ -83,19 +86,30 @@ impl<'a> Cursor<'a> {
         self.encoding_problem
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work::<256>(now, work)
+    }
+    fn poll_with_work<const UNFOLD_TRANSITIONS: usize>(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
         if matches!(self.phase, Phase::Complete) {
             return Ok(Status::Complete);
         }
-        let result = self.step(now, work);
+        let result = self.step::<UNFOLD_TRANSITIONS>(now, work);
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step<const UNFOLD_TRANSITIONS: usize>(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         work.charge(
             now,
             Charge {
@@ -105,7 +119,7 @@ impl<'a> Cursor<'a> {
         )?;
         match self.phase {
             Phase::Validate => {
-                if self.parser.poll(now, work)? == Parsed::Complete {
+                if self.parser.poll_with_work(now, work)? == Parsed::Complete {
                     self.parser = match self.purpose {
                         Purpose::MessageIds(mode) => Parser::new(self.source, mode),
                         Purpose::AddrSpec => Parser::addr_spec(self.source),
@@ -116,7 +130,7 @@ impl<'a> Cursor<'a> {
                 Ok(Status::Yield)
             }
             Phase::TrimStart | Phase::TrimEnd => self.trim(now, work),
-            Phase::Replay => match self.parser.poll(now, work)? {
+            Phase::Replay => match self.parser.poll_with_work(now, work)? {
                 Parsed::Yield => Ok(Status::Yield),
                 Parsed::Begin => Ok(Status::Begin),
                 Parsed::End => Ok(Status::End),
@@ -138,12 +152,12 @@ impl<'a> Cursor<'a> {
                     Ok(Status::Yield)
                 }
             },
-            Phase::Unfold => self.unfold(now, work),
+            Phase::Unfold => self.unfold::<UNFOLD_TRANSITIONS>(now, work),
             Phase::Decode => self.decode(now, work),
             Phase::Complete => Ok(Status::Complete),
         }
     }
-    fn trim(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn trim(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         if self.extent.start > self.extent.end {
             return Err(Error::InvalidState);
         }
@@ -187,7 +201,11 @@ impl<'a> Cursor<'a> {
         }
         Ok(Status::Yield)
     }
-    fn unfold(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn unfold<const TRANSITIONS: usize>(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if self.byte.is_some() || self.unfolded {
             return Err(Error::InvalidState);
         }
@@ -196,7 +214,14 @@ impl<'a> Cursor<'a> {
             .get(self.position..self.extent.end)
             .ok_or(Error::InvalidState)?;
         let mut output = [0; 1];
-        let progress = self.unfolder.poll(input, &mut output, true, now, work)?;
+        let progress = self
+            .unfolder
+            .poll_with_work::<TRANSITIONS>(input, &mut output, true, now, work)
+            .map_err(|error| match error {
+                mime_unfold::Error::Work(stop) => Error::Work(stop),
+                mime_unfold::Error::InterpretationLimit => Error::InterpretationLimit,
+                mime_unfold::Error::InvalidState => Error::InvalidState,
+            })?;
         if progress.consumed > input.len() || progress.written > 1 {
             return Err(Error::InvalidState);
         }
@@ -222,15 +247,11 @@ impl<'a> Cursor<'a> {
         }
         Ok(Status::Yield)
     }
-    fn decode(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn decode(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         let input = self.byte.as_slice();
         let progress = self
             .decoder
-            .poll(input, self.unfolded, now, work)
-            .map_err(|error| match error {
-                mime_charset::Error::Work(stop) => Error::Work(stop),
-                mime_charset::Error::InvalidState => Error::InvalidState,
-            })?;
+            .poll_with_work(input, self.unfolded, now, work)?;
         if progress.consumed > input.len() {
             return Err(Error::InvalidState);
         }

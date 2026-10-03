@@ -935,7 +935,7 @@ fn header_raw() {
 fn mime_unfold() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
-        mime_unfold::{Decoder, Status},
+        mime_unfold::{Decoder, Error, Status},
         ports::{Deadline, Tick},
     };
     fn budget(io: u64) -> Meter {
@@ -990,13 +990,13 @@ fn mime_unfold() {
     let mut decoder = Decoder::default();
     assert_eq!(
         decoder.poll(b"a", &mut [0; 1], true, Tick(1), &mut budget(0)),
-        Err(Stop::IoBytes)
+        Err(Error::Work(Stop::IoBytes))
     );
     let mut fresh = budget(100);
     let remaining = fresh.remaining();
     assert_eq!(
         decoder.poll(b"a", &mut [0; 1], true, Tick(1), &mut fresh),
-        Err(Stop::IoBytes)
+        Err(Error::Work(Stop::IoBytes))
     );
     assert_eq!(fresh.remaining(), remaining);
     assert_eq!(COUNTERS.snapshot(), before, "header unfolding allocated");
@@ -3100,6 +3100,71 @@ fn header_date_projection() {
     assert_eq!(before, after, "header date projection allocated");
 }
 
+fn budgeted_message_id_text() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_message_ids::{
+            project::{Budgeted, Status},
+            Error, Mode,
+        },
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("<{}@b>", "🐈".repeat(4096));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for (source, scalars, problem, malformed) in [
+        (long.as_bytes(), 4098, false, false),
+        (b"<\"a\r\n b\"@[c\n\td]>".as_slice(), 11, false, false),
+        ("<\u{fdd0}@b>".as_bytes(), 3, true, false),
+        (b"<a@b> (bad", 0, false, true),
+    ] {
+        let mut cursor = Budgeted::new(black_box(source), Mode::Strict, &mut work, &mut budget);
+        let mut count = 0;
+        let mut finished = false;
+        for _ in 0..200_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Scalar(_)) => count += 1,
+                Ok(Status::Complete) => {
+                    assert!(!malformed);
+                    assert_eq!(cursor.is_encoding_problem(), problem);
+                    cursor.check_deadline(Tick(1)).unwrap();
+                    finished = true;
+                    break;
+                }
+                Err(Error::Malformed) => {
+                    assert!(malformed);
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Malformed));
+                    finished = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("unexpected MessageIds conversion failure: {error}"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(count, scalars);
+    }
+    let mut cursor = Budgeted::new(b"", Mode::ObsoletePhrases, &mut work, &mut budget);
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted MessageIds conversion allocated");
+}
+
 fn budgeted_message_ids() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -4756,6 +4821,7 @@ fn main() {
         header_date_projection();
         budgeted_date_projection();
         header_dates();
+        budgeted_message_id_text();
         budgeted_message_ids();
         budgeted_header_dates();
         header_comments();
@@ -4884,6 +4950,7 @@ fn main() {
     header_date_projection();
     budgeted_date_projection();
     header_dates();
+    budgeted_message_id_text();
     budgeted_message_ids();
     budgeted_header_dates();
     header_comments();
