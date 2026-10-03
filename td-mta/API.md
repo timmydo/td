@@ -1366,6 +1366,52 @@ whitespace, folds, EOF/body boundaries, long-name comparisons, offset/work
 refusal and provisional result retirement. Allocation probes cover last/all,
 absence and long names. Whole-worker stack and source capture remain open.
 
+### 1.30 Structured-header comments and whitespace
+
+M06w supplies `header_cfws::Cursor` over immutable field bytes and a
+starting resident offset. The source must end at the enclosing scanner
+Field.value_end, excluding its final CRLF or bare LF; never pass the
+remaining message or a subsequent field. This lexical helper does not
+discover field boundaries. The caller invokes it only where its structured
+field grammar permits optional CFWS, never inside a quoted string or
+arbitrarily across a field. It skips SP/HTAB and CRLF or bare-LF folds
+followed by SP/HTAB under the raw-file policy. The first non-CFWS byte is
+left untouched. Complete returns that position and whether any CFWS was
+consumed, allowing the enclosing grammar to require a nonempty run where
+appropriate.
+
+Top-level comments yield their original start/end offsets including the
+outer parentheses; nested comments stay inside that extent. Quoted pairs
+suppress delimiter interpretation, including RFC 5322 obsolete ASCII quoted
+controls and RFC 6532 UTF-8 characters. Unescaped obsolete comment controls
+are accepted; unescaped NUL, bare CR, nonfold LF/CRLF, invalid/truncated UTF-8
+inside comments, an unfinished escape or an unclosed comment are Malformed.
+A non-CFWS byte outside a comment is left to the enclosing grammar.
+Comment depth includes the outer pair and is capped at 32; excess depth is
+NestingLimit, distinct from malformed syntax or work refusal. Non-CFWS text
+is not Unicode-validated by this helper.
+
+Comments are provisional until the optional run completes; a later refusal
+invalidates earlier events. The form parser maps Malformed to strict null or
+its specified syntax-recovery policy. NestingLimit remains an interpretation
+refusal and work failures retain their resource meaning, never a fabricated
+empty value. This helper neither decodes quoted pairs or encoded words nor
+authorizes their placement, and it emits no display name, normalized text or
+JSON. The raw source remains immutable. Source capture, complete field
+admission and aggregate enclosing-parser limits are external.
+
+A poll advances at most 32 transitions, charging at most 32 records and 160
+byte visits before inspection. UTF-8 validation charges its bounded reread
+of the lead octet; folding lookahead is charged even when it cannot fold.
+No output bytes are charged. Failures latch with a replacement meter and
+cached Complete is inert. Callers supply fresh clock/cancellation checks
+around active turns. The non-Copy cursor fits 64 bytes in the existing body
+parser reservation, with a depth counter and escape flag instead of a
+recursive call stack. It owns no source copy or comment list. Allocation
+intervals cover long Unicode comments, folds, nesting, empty matches and
+syntax/depth refusal. Full structured forms and worker integration remain
+open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

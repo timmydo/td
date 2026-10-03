@@ -803,6 +803,13 @@ match list is allocated. All matches stream provisionally; last selection
 retains one extent. Isolated allocation intervals cover last/all, absence
 and long matching names. Complete capture and worker stack remain open.
 
+The structured CFWS cursor fits 64 bytes in the body job's 16 KiB
+parser/boundary/locator state. A depth counter enforces the 32-level comment
+nesting limit; no recursive stack or comment collection is allocated.
+Returned extents describe the immutable source using offsets. Allocation
+intervals cover long UTF-8 comments, folding, nesting and malformed/depth
+refusal. The complete structured-form parser stack remains unqualified.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

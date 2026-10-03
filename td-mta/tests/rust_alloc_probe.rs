@@ -2064,6 +2064,70 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_comments() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_cfws::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    let long = format!("({}) token", "🐈".repeat(10_000));
+    let nested = format!("{}{}", "(".repeat(32), ")".repeat(32));
+    let over = format!("{}{}", "(".repeat(33), ")".repeat(33));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1_000_000,
+            records: 100_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, count, consumed) in [
+        (b" (one)\r\n\t(two(nested)) <id>".as_slice(), 2, 23),
+        (long.as_bytes(), 1, 40003),
+        (nested.as_bytes(), 1, 64),
+        (b"not-cfws", 0, 0),
+    ] {
+        let mut cursor = Cursor::new(black_box(source), 0);
+        let mut comments = 0;
+        let mut complete = false;
+        for _ in 0..10_000 {
+            match cursor.poll(Tick(1), &mut work).unwrap() {
+                Status::Comment(comment) => {
+                    assert!(comment.end <= source.len());
+                    comments += 1;
+                }
+                Status::Yield => {}
+                Status::Complete(end) => {
+                    assert_eq!(end.position, consumed);
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete);
+        assert_eq!(comments, count);
+    }
+    for (source, expected) in [
+        (b"(bad".as_slice(), Error::Malformed),
+        (over.as_bytes(), Error::NestingLimit),
+    ] {
+        let mut cursor = Cursor::new(source, 0);
+        let mut refused = false;
+        for _ in 0..100 {
+            if let Err(error) = cursor.poll(Tick(1), &mut work) {
+                assert_eq!(error, expected);
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused);
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "header comment scanning allocated");
+}
+
 fn header_selection() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2774,6 +2838,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        header_comments();
         header_selection();
         header_properties();
         header_nfc();
@@ -2875,6 +2940,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    header_comments();
     header_selection();
     header_properties();
     header_nfc();

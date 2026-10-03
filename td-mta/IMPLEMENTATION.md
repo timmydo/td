@@ -1343,6 +1343,13 @@ Initial independently landable increments:
   absence, long names, malformed body boundaries, limits and allocation-free
   traversal. Source capture, value projection and protocol wiring remain open.
 
+- **M06w — structured comment/whitespace cursor:** scan optional CFWS only at
+  caller-authorized grammar positions. Preserve top-level raw comment extents,
+  bound nesting/UTF-8/fold lookahead, and distinguish malformed syntax from
+  nesting/work refusal. Verify escaped delimiters, obsolete controls, Unicode,
+  long comments, EOF and allocation-free turns. Value grammars, comment text
+  decoding and structured-form publication remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
