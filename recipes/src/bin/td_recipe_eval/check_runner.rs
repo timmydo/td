@@ -701,12 +701,28 @@ pub fn qemu_install_cli(args: &[String]) -> Result<(), String> {
     )
 }
 
+/// A host oracle's needs, checked before it builds anything: no host qemu,
+/// or (for a UEFI boot) no firmware the host search finds, is a host gap
+/// the integration tier counts apart, not a failure. Firmware named by
+/// `TD_QEMU_EFI_CODE`/`TD_QEMU_EFI_VARS` that does not check out stays an
+/// error, as a misconfiguration is no host gap.
+fn oracle_host(uefi: bool) -> Result<(), String> {
+    let qemu = crate::checks::qemu_boot::find_qemu().map_err(|e| format!("{HOST_GAP}{e}"))?;
+    let named =
+        env::var_os("TD_QEMU_EFI_CODE").is_some() || env::var_os("TD_QEMU_EFI_VARS").is_some();
+    if uefi && !named {
+        crate::checks::qemu_boot::efi::firmware(&qemu).map_err(|e| format!("{HOST_GAP}{e}"))?;
+    }
+    Ok(())
+}
+
 /// Boot the production live medium into its session and the installer wizard.
 pub fn qemu_boot_live_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {
         return Err("usage: qemu-boot-live [system-x86-64]".into());
     }
+    oracle_host(true)?;
     let targets = [STEM];
     ensure_targets_provenance(&targets)?;
     let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
@@ -726,6 +742,7 @@ pub fn qemu_install_system_cli(args: &[String]) -> Result<(), String> {
     if args.len() > 1 || args.first().is_some_and(|value| value != STEM) {
         return Err("usage: qemu-install-system [system-x86-64]".into());
     }
+    oracle_host(true)?;
     let targets = [STEM, "td-install-qemu-test"];
     ensure_targets_provenance(&targets)?;
     let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
@@ -820,6 +837,7 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     if args.get(1).is_some() {
         return Err(format!("usage: qemu-boot-system [{STEM}]"));
     }
+    oracle_host(false)?;
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
     let targets = [stem, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
@@ -2188,10 +2206,20 @@ fn append_check_history(path: &Path, line: &str) -> Result<(), String> {
 /// time, and the last run's outcome, age and reason; the checks that cost
 /// the most in all first. Narrowed to the named checks (`STEM#INDEX` or a
 /// stem) when given.
+///
+/// `check-history --record CHECK OUTCOME SECS` appends one record instead:
+/// how `td-builder check integration` keeps its steps' times beside the
+/// recipe checks'.
 pub fn check_history_cli(args: &[String]) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let home = env::var_os("HOME").map(PathBuf::from);
     let path = check_history_path(&ladder_work_dir(&root, home.as_deref()));
+    if let Some(record) = args.strip_prefix(&["--record".to_string()]) {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        return append_check_history(&path, &recorded_history_line(record, at)?);
+    }
     let mut text = fs::read_to_string(path.with_extension("jsonl.1")).unwrap_or_default();
     match fs::read_to_string(&path) {
         Ok(t) => text.push_str(&t),
@@ -2239,7 +2267,8 @@ fn summarize_check_history(text: &str, only: &[String], now: u64) -> Vec<String>
             skipped += 1;
             continue;
         };
-        let stem = check.split('#').next().unwrap_or(&check);
+        // `STEM#INDEX` for a recipe check, `integration:STEP` for a tier step.
+        let stem = check.split(['#', ':']).next().unwrap_or(&check);
         if !only.is_empty() && !only.iter().any(|o| *o == check || o == stem) {
             continue;
         }
@@ -2307,6 +2336,25 @@ fn summarize_check_history(text: &str, only: &[String], now: u64) -> Vec<String>
         out.push(format!("({skipped} unreadable history line(s) skipped)"));
     }
     out
+}
+
+/// The history line `check-history --record CHECK OUTCOME SECS` appends at
+/// `at`: an outcome the summary reads, and seconds a `Duration` holds.
+fn recorded_history_line(args: &[String], at: u64) -> Result<String, String> {
+    let [check, outcome, secs] = args else {
+        return Err("usage: check-history --record CHECK OUTCOME SECS".to_string());
+    };
+    if !["pass", "fail", "host-gap"].contains(&outcome.as_str()) {
+        return Err(format!(
+            "check-history --record: outcome `{outcome}` is not pass, fail or host-gap"
+        ));
+    }
+    let took = secs
+        .parse::<f64>()
+        .ok()
+        .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
+        .ok_or_else(|| format!("check-history --record: `{secs}` is not seconds"))?;
+    Ok(check_history_line(at, check, outcome, took, "", ""))
 }
 
 /// What changed between the components of a recorded pass (`was`) and this
@@ -11081,6 +11129,33 @@ chmod 755 '{}'
             Some(verdict_key_of(&parts))
         );
         let _ = fs::remove_dir_all(&lw);
+    }
+
+    /// A recorded integration step is checked before it is written, and the
+    /// summary narrows to the tier by its name before the `:`.
+    #[test]
+    fn a_recorded_step_is_checked_before_it_is_written() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let line = recorded_history_line(&args(&["integration:warm", "pass", "12.5"]), 7).unwrap();
+        assert!(
+            line.starts_with("{\"at\":7,\"check\":\"integration:warm\""),
+            "{line}"
+        );
+        let rows = summarize_check_history(&line, &["integration".to_string()], 7);
+        assert!(
+            rows[0].starts_with("integration:warm: 1 executed"),
+            "{rows:?}"
+        );
+        for bad in [
+            &["c", "maybe", "1"][..],
+            &["c", "pass", "-1"],
+            &["c", "pass", "NaN"],
+            &["c", "pass", "inf"],
+            &["c", "pass", "1e100"],
+            &["c", "pass"],
+        ] {
+            assert!(recorded_history_line(&args(bad), 0).is_err(), "{bad:?}");
+        }
     }
 
     /// A history line is one compact JSON record; the summary orders checks

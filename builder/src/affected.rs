@@ -1331,8 +1331,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // are interpreted by it, and td-login execs it by absolute path — but
     // `system-x86-64` owns no gated check (it is absent from `check-list`), so its
     // `shape_check` probes of the packed shell and the boot oracle behind
-    // `qemu-boot-system` run only in a full image build, which no gate runs. The
-    // host-side recipe TESTS are what stand in, and they are cargo-test's.
+    // `qemu-boot-system` run only in the integration tier (`td-builder check
+    // integration`), which a td-sh change selects through `boot_path`. In the
+    // gates, the host-side recipe TESTS are what stand in, and they are
+    // cargo-test's.
     //
     // Its RECIPE files under recipes/src/recipes/ are routed by the recipes arm
     // above, not here. The spec/ corpus and tests/ carry no standalone shell
@@ -1920,6 +1922,11 @@ fn format_output(
             }
         }
     }
+    // What a selection that runs the gates leaves to main, said where
+    // `ready` shows it.
+    if !sel.targets.is_empty() && !sel.targets.iter().any(|t| t == crate::integration::GOAL) {
+        o.push_str(&format!("  {}\n", crate::integration::deferred_note()));
+    }
 
     o.push('\n');
     if header.explicit {
@@ -1987,9 +1994,66 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
     for p in changed {
         if !p.is_empty() {
             map_path(root, &roster, p, &mut sel);
+            if boot_path(p) {
+                sel.add_target(crate::integration::GOAL);
+                sel.add_note(&format!(
+                    "{p} is on the boot path: the system-level qemu oracles run \
+                     too (td-builder check {}), after the gates",
+                    crate::integration::GOAL
+                ));
+            }
         }
     }
     sel
+}
+
+/// The crates the system image boots through or the oracles drive: init,
+/// the shell its scripts run in, the boot protocol and kexec, login, the
+/// service supervisor, first boot, and the installer with its test driver.
+/// A change to one's code, manifest, lock or build script, or to its recipe
+/// file of the same name, opts a branch into the integration tier, which
+/// otherwise runs on main alone. Its tests, docs and ignore files do not.
+const BOOT_CRATES: &[&str] = &[
+    "td-boot",
+    "td-firstboot",
+    "td-init",
+    "td-install",
+    "td-install-qemu-test",
+    "td-kexec",
+    "td-login",
+    "td-sh",
+    "td-svc",
+];
+
+/// Beyond the boot crates: the kernel and system recipes, the oracles'
+/// own code, and the tier's runner. A name ending `/` is a directory.
+const BOOT_FILES: &[&str] = &[
+    "recipes/src/recipes/linux-x86-64.rs",
+    "recipes/src/recipes/system-x86-64.rs",
+    "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
+    "recipes/src/bin/td_recipe_eval/checks/qemu_boot/",
+    "builder/src/integration.rs",
+];
+
+fn boot_path(p: &str) -> bool {
+    let crate_file = BOOT_CRATES.iter().any(|c| {
+        p.strip_prefix(c)
+            .and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|r| {
+                r.starts_with("src/") || matches!(r, "Cargo.toml" | "Cargo.lock" | "build.rs")
+            })
+            || p.strip_prefix("recipes/src/recipes/")
+                .and_then(|f| f.strip_suffix(".rs"))
+                == Some(c)
+    });
+    crate_file
+        || BOOT_FILES.iter().any(|b| {
+            if b.ends_with('/') {
+                p.starts_with(b)
+            } else {
+                p == *b
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -5936,6 +6000,69 @@ mod tests {
         }
     }
 
+    /// A boot-path change opts a branch into the integration tier, with a
+    /// note; anything else leaves it to main and says so where the gates
+    /// run. A boot crate's tests, docs and ignore file do not boot, nor
+    /// does a crate whose name only starts like one.
+    #[test]
+    fn a_boot_path_change_runs_the_integration_tier() {
+        let root = repo_root();
+        let goal = crate::integration::GOAL;
+        for path in [
+            "td-init/src/main.rs",
+            "td-sh/src/lib.rs",
+            "td-boot/src/protocol.rs",
+            "td-login/src/main.rs",
+            "td-svc/src/main.rs",
+            "td-kexec/Cargo.toml",
+            "td-install/Cargo.lock",
+            "td-install-qemu-test/src/main.rs",
+            "td-firstboot/src/main.rs",
+            "recipes/src/recipes/td-init.rs",
+            "recipes/src/recipes/td-install-qemu-test.rs",
+            "recipes/src/recipes/linux-x86-64.rs",
+            "recipes/src/recipes/system-x86-64.rs",
+            "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
+            "recipes/src/bin/td_recipe_eval/checks/qemu_boot/live.rs",
+            "builder/src/integration.rs",
+        ] {
+            let sel = compute_selection(&root, &[path.to_string()]);
+            assert!(
+                sel.targets.iter().any(|t| t == goal),
+                "{path}: {:?}",
+                sel.targets
+            );
+            assert!(
+                sel.notes.iter().any(|n| n.contains("on the boot path")),
+                "{path}"
+            );
+            assert!(
+                !path_output(&root, path).contains("deferred to main"),
+                "{path}"
+            );
+        }
+        for path in [
+            "td-init/README.md",
+            "td-init/.gitignore",
+            "td-sh/spec/README",
+            "td-sh/tests/posix.rs",
+            "td-bootx/src/main.rs",
+            "recipes/src/recipes/td-bootx.rs",
+            "recipes/src/recipes/uutils.rs",
+            "td-compositor/src/main.rs",
+            "builder/src/main.rs",
+        ] {
+            let sel = compute_selection(&root, &[path.to_string()]);
+            assert!(
+                !sel.targets.iter().any(|t| t == goal),
+                "{path}: {:?}",
+                sel.targets
+            );
+        }
+        assert!(path_output(&root, "recipes/src/recipes/uutils.rs").contains("deferred to main"));
+        assert!(!default_check_covers_target(&root, goal));
+    }
+
     /// The recipe-checks scope follows the cargo narrowing's confinement
     /// without its reader closure: a td-compositor change scopes to its own
     /// changed path, though many crates read td-compositor; paths travel
@@ -6047,7 +6174,7 @@ mod tests {
         );
         let out = path_output(&root, "td-sh/src/lib.rs");
         assert!(
-            out.contains("  td-builder check check recipe-checks\n  recipe-checks scope: td-sh/src/lib.rs (TD_CHECK_SCOPE on the command above)\n"),
+            out.contains("  td-builder check check recipe-checks integration\n  recipe-checks scope: td-sh/src/lib.rs (TD_CHECK_SCOPE on the command above)\n"),
             "{out}"
         );
         assert!(!path_output(&root, "check.sh").contains("recipe-checks scope"));
@@ -10675,6 +10802,9 @@ mod tests {
             return;
         };
         let full_cargo = render_cargo_test(&cmds);
+        // What a selection that runs the gates without the integration tier
+        // says it leaves to main.
+        let deferred = format!("  {}", crate::integration::deferred_note());
         let expect = |lines: &[&str]| -> String {
             let mut s = lines.join("\n");
             s.push('\n');
@@ -10693,6 +10823,7 @@ mod tests {
                 "Selected checks:",
                 &full_cargo,
                 "  td-builder check check-engine check",
+                &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
@@ -10717,6 +10848,7 @@ mod tests {
                 "  for f in start build-qcow build-iso test-iso host-preflight.sh news mail agent install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
+                &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
@@ -10746,6 +10878,7 @@ mod tests {
                 "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check recipe-checks",
                 "  recipe-checks scope: td-review/src/land.rs (TD_CHECK_SCOPE on the command above)",
+                &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
@@ -10783,6 +10916,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  td-builder check check",
+                &deferred,
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",

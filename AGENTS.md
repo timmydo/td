@@ -256,6 +256,10 @@ The single full pass/fail command is:
 cargo run --release --manifest-path builder/Cargo.toml -- check
 ```
 
+The system-level qemu oracles are the separate `td-builder check
+integration` tier, which main runs and a branch runs only when it changes
+the boot path; `DEVELOPMENT.md` says when.
+
 Build the builder with:
 
 ```text

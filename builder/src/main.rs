@@ -55,6 +55,7 @@ mod host_bin;
 mod host_run;
 mod install_apps;
 mod install_fonts;
+mod integration;
 mod kernel_headers;
 mod lock;
 mod mes_boot;

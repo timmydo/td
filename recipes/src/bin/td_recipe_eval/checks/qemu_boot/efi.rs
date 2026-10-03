@@ -88,7 +88,7 @@ fn missing_entry_observed(console: &str) -> bool {
     })
 }
 
-pub(super) fn firmware(qemu: &str) -> Result<(PathBuf, PathBuf), String> {
+pub(crate) fn firmware(qemu: &str) -> Result<(PathBuf, PathBuf), String> {
     match (
         env::var_os("TD_QEMU_EFI_CODE"),
         env::var_os("TD_QEMU_EFI_VARS"),

@@ -261,6 +261,32 @@ scoped pass is journaled under its scope, so
 one. `TD_CHECK_FULL` runs every check in full, scope or not, and
 `td-builder check recipe-checks` on its own has no scope.
 
+The system-level qemu oracles are a separate tier, `td-builder check
+integration`, which `check` alone does not include. It runs on the host,
+never in the gate sandbox: it warms the system image's inputs, then runs
+`qemu-boot-system`, `qemu-boot-live` and `qemu-install-system`, each
+with a banner saying what it proves, its outcome and wall time, recorded
+in the check history as `integration:STEP` (`td-recipe-eval
+check-history integration`). On its own it runs only those steps; beside
+gate goals, as `affected-checks` selects it (`td-builder check check
+recipe-checks integration`), it runs after the gates pass and says so
+when they do not. It needs the host's qemu, and OVMF for the last two
+(found beside qemu or in /usr/share/OVMF, or named by `TD_QEMU_EFI_CODE`
+and `TD_QEMU_EFI_VARS`). An oracle the host cannot run is an
+unprovisioned skip; when none could run the tier exits 69, which `ready`
+does not take for a pass. It keeps no verdict journal, so each run boots
+again.
+
+It belongs to main: after a landing, an agent on a provisioned host runs
+`td-builder check integration` on main, and a red one is healed as any
+red gate on main is (`ci/revert-suspect.sh`). A branch runs it only when
+it changes the boot path: the code, manifest, lock or build script of
+td-boot, td-firstboot, td-init, td-install, td-install-qemu-test,
+td-kexec, td-login, td-sh or td-svc, or the recipe of the same name; the
+linux-x86-64 or system-x86-64 recipe; the oracles' code; or the tier's
+runner. Otherwise the selection prints that the tier is deferred to
+main. Run it on a branch by hand with `td-builder check integration`.
+
 When `ready` passes, push the branch:
 
 ```text

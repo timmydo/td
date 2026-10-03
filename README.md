@@ -210,6 +210,11 @@ td-recipe-eval qemu-install          # disposable offline ISO installation test
 td-recipe-eval qemu-boot-live        # live wizard installs a disk, which then boots through firmware
 ```
 
+`td-builder check integration` runs the system-level oracles —
+`qemu-boot-system`, `qemu-boot-live` and `qemu-install-system` — on the
+host; main runs it, and a branch runs it when it changes the boot path
+(`DEVELOPMENT.md`).
+
 To build a bootable live ISO of the system, signed with a key made for that
 ISO alone:
 

@@ -1429,6 +1429,28 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
             goals.push(a.clone());
         }
     }
+    // The integration tier is no gate: it runs on the host, after the
+    // gates, so it leaves the goals the sandbox is handed.
+    let integration = goals.iter().any(|g| g == crate::integration::GOAL);
+    goals.retain(|g| g != crate::integration::GOAL);
+    if integration
+        && goals
+            .iter()
+            .any(|g| matches!(g.as_str(), "list-gates" | "gate-timing-report"))
+    {
+        return Err(fatal(&format!(
+            "{} runs the oracles; it does not combine with a listing goal",
+            crate::integration::GOAL
+        ))
+        .into());
+    }
+    if integration && goals.is_empty() {
+        // The tier alone runs no gate, so it provisions nothing the sandbox
+        // needs: only the evaluator that drives the oracles.
+        let placed =
+            crate::stage0::recipe_eval_place(&root, &root.join(".td-build-cache/recipe-eval"));
+        return integration_tier(&root, placed);
+    }
     if goals.is_empty() {
         goals.push("check".to_string());
     }
@@ -1464,11 +1486,12 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     let listing_only = goals
         .iter()
         .all(|g| matches!(g.as_str(), "list-gates" | "gate-timing-report"));
-    if let Err(e) = if listing_only {
+    let placed = if listing_only {
         Ok(String::new())
     } else {
         crate::stage0::recipe_eval_place(&root, &root.join(".td-build-cache/recipe-eval"))
-    } {
+    };
+    if let Err(e) = &placed {
         match e.strip_prefix(UNPROVISIONED_TAG) {
             Some(why) => eprintln!(
                 "td-builder check: no td-recipe-eval for the gates — {why} \
@@ -1582,8 +1605,46 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     let st = cmd
         .status()
         .map_err(|e| fatal(&format!("could not start the loop sandbox: {e}")))?;
+    let code = st.code().unwrap_or(1);
     let _ = std::io::stdout().flush();
-    Ok(st.code().unwrap_or(1))
+    if !integration {
+        return Ok(code);
+    }
+    if code != 0 {
+        // A red or unprovisioned gate already says the image is not worth
+        // booting; say the tier was not reached rather than leave it silent.
+        println!(
+            ">> {}: not run — the gates exited {code}",
+            crate::integration::GOAL
+        );
+        return Ok(code);
+    }
+    integration_tier(&root, placed)
+}
+
+/// The system-level oracles on the host, with the evaluator `placed`: a
+/// toolchain gap is the tier's unprovisioned exit, any other placement
+/// failure fatal.
+fn integration_tier(root: &Path, placed: Result<String, String>) -> Result<i32, CheckError> {
+    let goal = crate::integration::GOAL;
+    let code = match placed {
+        Ok(eval) => crate::integration::run(root, &eval),
+        Err(e) => match e.strip_prefix(UNPROVISIONED_TAG) {
+            Some(why) => {
+                eprintln!("td-builder check: {goal}: no td-recipe-eval for the oracles — {why}");
+                println!(">> {goal}: UNPROVISIONED — no evaluator on this host; no oracle ran");
+                eprintln!("{}", td_engine::exit::UNPROVISIONED_SENTINEL);
+                EXIT_UNPROVISIONED
+            }
+            None => {
+                return Err(CheckError::Fatal(fatal(&format!(
+                    "could not build td-recipe-eval for {goal} ({e})"
+                ))))
+            }
+        },
+    };
+    let _ = std::io::stdout().flush();
+    Ok(code)
 }
 
 /// `td-builder check-rung HARNESS [ARGS...]` — DEV ITERATION helper (NOT a

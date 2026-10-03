@@ -15,7 +15,7 @@
 //!   build-run TARGET [OUTPUT_STEM ...]
 //!                         build a catalog target through the same Rust recipe
 //!                         runner and print machine-readable local output paths
-//!   check-history [CHECK...]
+//!   check-history [CHECK...] | --record CHECK OUTCOME SECS
 //!                         per check, from this machine's check history: runs
 //!                         executed and memoized, median and longest wall time,
 //!                         and the last run's outcome and why it ran

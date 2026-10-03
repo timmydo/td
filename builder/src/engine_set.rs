@@ -48,6 +48,7 @@ pub const HOST_ONLY: &[&str] = &[
     "gate_lint.rs",
     "gate_timing.rs",
     "gates.rs",
+    "integration.rs",
     "ready.rs",
 ];
 

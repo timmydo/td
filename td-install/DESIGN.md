@@ -2813,8 +2813,10 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
      is `/run`, which is `rw`. A "last covering entry" rule therefore refuses
      td's own volume and would have failed every update on every booted machine.
      No gate would have caught it — not because nothing boots a VM, since
-     `qemu-boot-system` does, but because that check runs only in a full image
-     build and no gate runs one. The obvious alternative,
+     `qemu-boot-system` does, but because that check ran only in a full image
+     build and no gate ran one; it now runs in the `td-builder check
+     integration` tier, on main and on a boot-path branch. The obvious
+     alternative,
      "deepest covering entry", is wrong in the other direction: a read-only
      mount at `/vol/sub` hidden by a later writable one at `/vol` is still in
      the table, and a path under it resolves through the writable mount. Both
