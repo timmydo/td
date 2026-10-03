@@ -4222,9 +4222,9 @@ pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String
 /// sibling tree under it. A scope none of whose directories any recipe reads is an error
 /// rather than an empty reach: a scope that missed a read would skip every
 /// check, so the caller lists them all instead. One unread directory beside
-/// a read one contributes nothing: the dispatcher sends a changed crate with
-/// its readers, and a reader no recipe embeds is not a miss. `dirs` are
-/// top-level directory names.
+/// a read one contributes nothing: the dispatcher sends every changed crate
+/// and not its readers, since a recipe that builds a reader stages what it
+/// reads. `dirs` are top-level directory names.
 pub(crate) fn checks_reaching(dirs: &[&str]) -> Result<BTreeSet<String>, String> {
     if dirs.is_empty() {
         return Err("empty scope".to_string());

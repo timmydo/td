@@ -4831,13 +4831,12 @@ fn close_over_readers(selected: &mut Vec<String>, readers: &[(String, Vec<String
 }
 
 /// The recipe-checks scope of a change: the roster crates it is confined
-/// to, closed over their readers and sorted, when the targets run the
-/// recipe-checks gate at all; None otherwise, which runs every check. The
-/// same confinement the cargo narrowing uses, so the two cannot disagree
-/// about what a change touches; the evaluator turns the crates into checks
-/// from its own table of what each recipe embeds. A tree the reader scan
-/// cannot read gives no scope, and the cargo preflight over the same tree
-/// has already failed the run by then.
+/// to, sorted, when the targets run the recipe-checks gate at all; None
+/// otherwise, which runs every check. The cargo narrowing's confinement
+/// without its reader closure: the evaluator turns the crates into checks
+/// from its own table of what each recipe stages, and a recipe whose crate
+/// reads another builds only if it stages that one too, so the table
+/// already follows every read a recipe build makes.
 fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Vec<String>> {
     let runs_recipe_checks = targets.iter().any(|t| t == "check" || t == "recipe-checks");
     if !runs_recipe_checks {
@@ -4845,9 +4844,8 @@ fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Ve
     }
     let roster = discover_gate_crates(root).ok()?;
     let mut selected = changed_roster_crates(&roster, changed)?;
-    let readers = crate_readers(root, &roster).ok()?;
-    close_over_readers(&mut selected, &readers);
     selected.sort();
+    selected.dedup();
     Some(selected)
 }
 
@@ -5844,8 +5842,9 @@ mod tests {
         }
     }
 
-    /// The recipe-checks scope follows the cargo narrowing's confinement: a
-    /// td-compositor change scopes to it and its readers, a change that leaves
+    /// The recipe-checks scope follows the cargo narrowing's confinement
+    /// without its reader closure: a td-compositor change scopes to
+    /// td-compositor alone, though many crates read it, a change that leaves
     /// the roster has none, `..` has none, and targets without the
     /// recipe-checks gate have none. The dry run prints the scope on its own
     /// line under the check command, and only then.
@@ -5860,35 +5859,21 @@ mod tests {
         let paths = |ps: &[&str]| ps.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
         assert_eq!(
             check_scope(&root, &paths(&["td-compositor/src/main.rs"]), &check),
-            Some(paths(&[
-                "td-agent",
-                "td-authd",
-                "td-compositor",
-                "td-crypto",
-                "td-dua",
-                "td-editor",
-                "td-firstboot",
-                "td-install",
-                "td-install-qemu-test",
-                "td-jail",
-                "td-login",
-                "td-mail",
-                "td-mta",
-                "td-news",
-                "td-open",
-                "td-pass",
-                "td-photo",
-                "td-portal",
-                "td-review",
-                "td-seatd",
-                "td-secret",
-                "td-setup",
-                "td-taskmgr",
-                "td-term",
-                "td-ui",
-                "td-vm",
-                "td-vm-guest"
-            ]))
+            Some(paths(&["td-compositor"]))
+        );
+        // Sorted, deduplicated, and still without readers when several
+        // crates change at once.
+        assert_eq!(
+            check_scope(
+                &root,
+                &paths(&[
+                    "td-ui/src/lib.rs",
+                    "td-compositor/src/main.rs",
+                    "td-ui/src/face.rs"
+                ]),
+                &check
+            ),
+            Some(paths(&["td-compositor", "td-ui"]))
         );
         assert_eq!(
             check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check),
