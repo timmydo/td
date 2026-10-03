@@ -2064,6 +2064,76 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_message_id_text() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_message_ids::{
+            project::{Cursor, Status},
+            Error, Mode,
+        },
+        ports::{Deadline, Tick},
+    };
+    fn drive(cursor: &mut Cursor<'_>, work: &mut Meter) -> Result<(usize, usize), Error> {
+        let mut ends = 0;
+        let mut scalars = 0;
+        for _ in 0..1_000_000 {
+            match cursor.poll(Tick(1), work)? {
+                Status::Complete => return Ok((ends, scalars)),
+                Status::End => ends += 1,
+                Status::Scalar(value) => {
+                    black_box(value);
+                    scalars += 1;
+                }
+                _ => {}
+            }
+        }
+        panic!("message-id text allocation probe did not finish");
+    }
+    let source = format!("<{}@b>", "🐈".repeat(10_000));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 10_000_000,
+            output_bytes: 10_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, mode, expected, problem) in [
+        (source.as_bytes(), Mode::Strict, Ok((1, 10002)), false),
+        (b"".as_slice(), Mode::ObsoletePhrases, Ok((0, 0)), false),
+        (b"<\"a\r\n b\"@[c\n\td]>", Mode::Strict, Ok((1, 11)), false),
+        ("<\u{fdd0}@b>".as_bytes(), Mode::Strict, Ok((1, 3)), true),
+        (b"<a@b><bad>", Mode::Strict, Err(Error::Malformed), false),
+    ] {
+        let mut cursor = Cursor::new(black_box(source), mode);
+        assert_eq!(drive(&mut cursor, &mut work), expected);
+        assert_eq!(cursor.is_encoding_problem(), problem);
+    }
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1000,
+            records: 1000,
+            output_bytes: 1,
+            ..Charge::default()
+        },
+    );
+    let mut cursor = Cursor::new(b"<a@b>", Mode::Strict);
+    assert_eq!(
+        drive(&mut cursor, &mut limited),
+        Err(Error::Work(Stop::OutputBytes))
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut work),
+        Err(Error::Work(Stop::OutputBytes))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "message-id projection allocated");
+}
+
 fn header_message_id_lists() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3159,6 +3229,7 @@ fn main() {
         unicode_nfc();
         header_delimited_tokens();
         header_message_id_lists();
+        header_message_id_text();
         header_date_projection();
         header_dates();
         header_comments();
@@ -3265,6 +3336,7 @@ fn main() {
     unicode_nfc();
     header_delimited_tokens();
     header_message_id_lists();
+    header_message_id_text();
     header_date_projection();
     header_dates();
     header_comments();

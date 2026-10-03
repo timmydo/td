@@ -1591,10 +1591,10 @@ Malformed trailing values or comments invalidate every previously yielded
 message-id. Malformed means the eventual MessageIds form is null; nesting
 and work limits retain their resource-failure meaning. The eventual response
 owner must validate before publishing and charge any replay against the same
-live job. Raw extents still need unfolding, JSON-safe scalar projection and
-separately charged copying/serialization; they are not publishable JSON or
-SMTP recipients. A completed field is inert; every error remains sticky even
-if a caller supplies a replacement meter.
+live job. Section 1.35 supplies unfolding and scalar projection; raw extents
+still need separately charged copying/serialization. They are not
+publishable JSON or SMTP recipients. A completed field is inert; every error
+remains sticky even if a caller supplies a replacement meter.
 
 A poll performs one CFWS or delimited-token turn, one grammar transition, or
 at most 32 atom visits. The maximum is 160 source-byte visits and 32 records,
@@ -1605,6 +1605,51 @@ Whole-field admission, response lifetime, JSON framing and service integration
 remain external. Fixtures pin literal projected byte segments, obsolete
 phrases, Unicode, comments, malformed tails, exact charges, long atoms,
 nesting/work refusals and allocation-free success/refusal paths.
+
+### 1.35 Validated MessageIds text
+
+M06ac supplies `header_message_ids::project::Cursor` over the same admitted
+immutable field slice and explicitly authorized grammar mode as section
+1.34. A complete syntax pass discards all raw events before restarting the
+parser on that unchanged source. Replay uses the same caller meter. Thus
+malformed tails, invalid UTF-8 and nesting refusal precede any Begin,
+Scalar or End event. Empty obsolete lists complete without identifier text.
+
+Replay emits Begin/Scalar/End for each identifier. Each raw part passes
+through the existing byte-preserving unfolder and UTF-8 decoder using a
+fixed one-byte handoff. CRLF or bare LF followed by SP/HTAB is unfolded;
+interior whitespace, quoted pairs, quotes and domain brackets are retained.
+Unicode noncharacters become U+FFFD and set is_encoding_problem, final at
+Complete. NUL and other valid obsolete quoted controls remain scalars;
+the eventual JSON serializer must escape them. No NFC, case folding,
+encoded-word decoding, semantic unquoting or recipient validation occurs.
+
+Each active poll prepays one parent record and performs at most one child
+turn. The bound is 256 source/intermediate byte visits, 33 records and four
+output bytes per poll. Both full grammar passes and intermediate UTF-8
+byte consumption are charged. Output work includes unfolded intermediate
+bytes plus final scalar UTF-8 lengths; JSON quotes, escaping, arrays and
+framing require separate charges. For `<a@b>`, both syntax passes visit 28
+bytes; unfolding/decoding visit six more and charge six output bytes.
+
+Long ASCII atoms cost about 5.06 records per source byte, including the
+two syntax passes and byte/scalar handoff, plus field/token overhead. A
+256 KiB atom uses roughly two thirds of the default two-million-record
+foreground allowance; a permitted 1 MiB header does not necessarily fit
+that allowance. Field admission never promises successful projection under
+a job's remaining work. The owner must account for all selected fields and
+forms; exhaustion remains a resource refusal, preserving raw mail.
+
+The non-Copy cursor fits 384 bytes including the parser and conversion
+states; no identifier string or list is allocated. Every error latches
+across fresh meters and cached Complete is inert. Work failure can still
+follow text emission, so this helper grants no response publication or
+capacity authority. The enclosing owner retains admission, live aggregate
+work, clock/cancellation checks and reserved response lifetime. Tests cover
+folds, obsolete controls, all Unicode noncharacters, unchanged decomposed
+text, whole-field refusal, exact charges, long inputs and allocation-free
+success/refusal. Complete JMAP serialization and worker qualification remain
+open.
 
 ## 2. Read views and change history
 

@@ -1,4 +1,5 @@
 //! Provisional raw segments of complete MessageIds lists; no strings are copied.
+pub mod project;
 use crate::{
     admission::work::{Charge, Meter, Stop},
     header_cfws, header_delimited,

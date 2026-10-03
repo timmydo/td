@@ -1377,8 +1377,8 @@ Initial independently landable increments:
   grammatical CFWS and outer angles; authorize obsolete discarded phrases
   only for References/In-Reply-To. Cover complete-field rejection, Unicode,
   quoted data, long atoms, nesting/work refusal and allocation-free parsing.
-  Unfolding, JSON-safe projection, response publication and method
-  integration remain open.
+  M06ac supplies unfolding and scalar projection; response publication and
+  method integration remain open.
 
 - **M06ab — pinned positive leap seconds:** add the operator-approved IANA
   source with exact offline verification and deterministic static generation.
@@ -1387,6 +1387,14 @@ Initial independently landable increments:
   leap components. Cover all insertions, source corruption, malformed rows,
   numeric calendar conversion, search bounds and capacity/work refusal.
   JSON/JMAP publication and complete worker composition remain open.
+
+- **M06ac — validated MessageIds text:** finish complete syntax validation
+  before replaying the same field under the live meter. Unfold raw parts,
+  decode UTF-8 through a fixed one-byte handoff and replace noncharacters
+  without NFC, unquoting or encoded-word interpretation. Cover malformed
+  tails, long/folded/obsolete/Unicode text, exact charges, sticky failures
+  and allocation-free polling. State fits 384 bytes. JSON serialization,
+  response admission and complete worker qualification remain open.
 
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement

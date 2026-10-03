@@ -832,6 +832,17 @@ quoted data, obsolete phrases, malformed tails, nesting and work refusal.
 Returned byte extents allocate no output. The enclosing response owner must
 reserve its own projection storage and qualify complete worker composition.
 
+The validated MessageIds projector fits 384 bytes in the same body parser
+reservation, including the raw parser, unfolding/UTF-8 states and one-byte
+handoff. It charges both complete validation and replay, and emits
+individual scalars without retaining identifiers. Intermediate unfolded
+bytes and final UTF-8 lengths both consume output work. Long ASCII atoms
+cost about 5.06 records per byte plus field overhead; permitted header size
+does not guarantee fitting the remaining foreground work (API section 1.35).
+Allocation intervals cover long Unicode text, folds, noncharacters,
+malformed tails and output refusal. Response storage, JSON escaping and
+complete worker composition remain the enclosing owner's responsibility.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no
