@@ -3399,3 +3399,77 @@ fn the_landed_sweep_keeps_a_rolling_branch() -> Res<()> {
     );
     Ok(())
 }
+
+/// `--choose-repo` picks the work tree in a window, so it refuses what would
+/// name one or skip the window before it runs anything.
+#[test]
+fn choose_repo_refuses_a_work_tree_and_the_headless_modes() -> Res<()> {
+    let dir = TempDir::new("choose")?;
+    let extras: &[&[&str]] = &[
+        &["-C", "."],
+        &["--list"],
+        &["--land", "x", "--yes"],
+        &["--prune-worktrees"],
+        &["--yes"],
+    ];
+    // No display to open a chooser on, should a refusal ever come late.
+    let chooser = |extra: &[&str]| {
+        Command::new(BIN)
+            .current_dir(dir.path())
+            .arg("--choose-repo")
+            .args(extra)
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("HOME")
+            .env_remove("GIT_DIR")
+            .output()
+    };
+    for extra in extras {
+        let out = chooser(extra)?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{extra:?}: {err}");
+        assert!(
+            err.contains("--choose-repo opens the window"),
+            "{extra:?}: {err}"
+        );
+    }
+    let out = Command::new(BIN).arg("--choose-repo=yes").output()?;
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--choose-repo takes no value"));
+    // An environment naming a repository would outrank the one chosen.
+    let out = Command::new(BIN)
+        .current_dir(dir.path())
+        .arg("--choose-repo")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("WAYLAND_SOCKET")
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("HOME")
+        .env("GIT_DIR", dir.path())
+        .output()?;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("GIT_DIR would override it"), "{err}");
+    Ok(())
+}
+
+/// Only the window saves the repository it opened: a scripted mode leaves
+/// the chooser's list alone.
+#[test]
+fn a_headless_mode_saves_no_repository() -> Res<()> {
+    let s = scenario("unsaved")?;
+    let config = TempDir::new("unsaved-config")?;
+    let mut cmd = Command::new(BIN);
+    cmd.arg("--repo").arg(&s.work).arg("--list");
+    for (k, v) in CLEAN_ENV {
+        cmd.env(k, v);
+    }
+    let out = cmd.env("XDG_CONFIG_HOME", config.path()).output()?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!config.path().join("td-review").exists());
+    Ok(())
+}

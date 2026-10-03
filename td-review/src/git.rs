@@ -277,10 +277,96 @@ impl Git {
         Ok(Git::new(PathBuf::from(stdout)))
     }
 
+    /// The work tree whose top is `dir` itself, from the repository `dir`'s
+    /// own `.git` names, so one in a folder above is never taken for it: a
+    /// `.git` file git reads or refuses, or a `.git` directory that must be
+    /// the repository git finds (an empty one, which git steps past, is not).
+    /// Anything else there, git would step past too. Git's search is also
+    /// held to `dir` (`GIT_CEILING_DIRECTORIES` at its parent). Refused while
+    /// the environment overrides where git looks (`location_override`):
+    /// every later command would follow that instead.
+    pub fn at_top(dir: &Path) -> io::Result<Git> {
+        if let Some(name) = location_override() {
+            return Err(io::Error::other(format!(
+                "{name} is set, which git would follow instead of the folder chosen"
+            )));
+        }
+        let dir = std::fs::canonicalize(dir)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
+        let not_top = || {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not the top of a git work tree", dir.display()),
+            )
+        };
+        let own = dir.join(".git");
+        let own_directory = match std::fs::metadata(&own) {
+            Ok(kind) if kind.is_file() => None,
+            Ok(kind) if kind.is_dir() => Some(std::fs::canonicalize(&own)?),
+            _ => return Err(not_top()),
+        };
+        let mut command = Command::new("git");
+        command
+            .current_dir(&dir)
+            .args(["rev-parse", "--show-toplevel", "--absolute-git-dir"])
+            .stdin(Stdio::null());
+        if let Some(parent) = dir.parent() {
+            command.env("GIT_CEILING_DIRECTORIES", parent);
+        }
+        let out = command
+            .output()
+            .map_err(|e| io::Error::new(e.kind(), format!("running git: {e}")))?;
+        if !out.status.success() {
+            // Git's own reason: its fatal line, past any warning before it.
+            let why = String::from_utf8_lossy(&out.stderr);
+            let line = why
+                .lines()
+                .find(|l| l.starts_with("fatal:"))
+                .or_else(|| why.lines().find(|l| !l.trim().is_empty()));
+            return Err(match line {
+                Some(line) => io::Error::other(format!("{}: {}", dir.display(), line.trim())),
+                None => not_top(),
+            });
+        }
+        // A line each, split at git's line ends only: a folder's name may end
+        // in a space.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut answers = stdout.split('\n');
+        let (Some(top), Some(git_dir)) = (answers.next(), answers.next()) else {
+            return Err(not_top());
+        };
+        if Path::new(top) != dir || own_directory.is_some_and(|own| Path::new(git_dir) != own) {
+            return Err(not_top());
+        }
+        Ok(Git::new(dir))
+    }
+
     pub fn repo(&self) -> &Path {
         &self.repo
     }
+}
 
+/// Variables that point git at a repository other than the one it would
+/// find from its working directory.
+const LOCATION: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// The first of `LOCATION` the environment sets, if any.
+pub fn location_override() -> Option<&'static str> {
+    LOCATION
+        .iter()
+        .copied()
+        .find(|name| std::env::var_os(name).is_some())
+}
+
+impl Git {
     /// Run git with output captured. Never fails on a non-zero exit status —
     /// inspect [`Run::ok`].
     pub fn run(&self, args: &[&str]) -> io::Result<Run> {

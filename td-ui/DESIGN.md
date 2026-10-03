@@ -2184,12 +2184,12 @@ it carries the mark, the list's star prefix: set on the entry with
 refused `NoEntry` for one not there; what a mark means, a multiple
 selection in td-portal, is the consumer's, and the marks go with the
 listing they were on. The consumer reads the filesystem under its own
-bounds and trust, as td-portal's chooser and td-editor's directory tabs
-do, and the widget reads nothing: at most 4096
-entries, 1024-byte names, 16-byte metas, a 4096-byte path and one MiB of
-name and meta text between the entries, all control-free, refused before
-capture. `storage_bytes` on the listing and the controller exposes the
-retained capacities for consumer accounting.
+bounds and trust, as td-portal's chooser, td-editor's directory tabs
+and td-review's repository chooser do, and the widget reads nothing: at
+most 4096 entries, 1024-byte names, 16-byte metas, a 4096-byte path and
+one MiB of name and meta text between the entries, all control-free,
+refused before capture. `storage_bytes` on the listing and the
+controller exposes the retained capacities for consumer accounting.
 
 `finder::Controller` lays a path row, a filter `TextEntry`, the entries as
 a `List` and a status row inside one rectangle: four `ROW`s and twenty

@@ -8,16 +8,18 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod chooser;
 mod git;
 mod land;
 mod record;
+mod saved;
 mod view;
 mod window;
 mod worktrees;
 
 use std::env;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use app::App;
@@ -32,6 +34,11 @@ usage: td-review [options]
 
 options:
   -C, --repo <path>   work tree to operate on (default: current directory)
+      --choose-repo   open a window to choose the work tree first: the
+                      repositories the window opened before, most recent
+                      first, then a folder browser. Each one the window
+                      opens is saved in $XDG_CONFIG_HOME/td-review/
+                      repositories (default ~/.config/td-review/)
   -b, --base <name>   branch to review against and land into (default: main)
       --list          print the branch table and exit (no window)
       --preview <br>  print what landing <br> would stage, and exit
@@ -67,7 +74,9 @@ keys (window; it opens on $WAYLAND_DISPLAY):
 ";
 
 struct Args {
-    repo: PathBuf,
+    /// The work tree `-C` named; the current directory when none did.
+    repo: Option<PathBuf>,
+    choose_repo: bool,
     base: String,
     list: bool,
     preview: Option<String>,
@@ -84,7 +93,8 @@ struct Args {
 
 fn parse_args() -> Result<Option<Args>, String> {
     let mut args = Args {
-        repo: env::current_dir().map_err(|e| format!("current directory: {e}"))?,
+        repo: None,
+        choose_repo: false,
         base: "main".to_string(),
         list: false,
         preview: None,
@@ -117,7 +127,11 @@ fn parse_args() -> Result<Option<Args>, String> {
         };
         match flag.as_str() {
             "-h" | "--help" => return Ok(None),
-            "-C" | "--repo" => args.repo = PathBuf::from(value("a path")?),
+            "-C" | "--repo" => args.repo = Some(PathBuf::from(value("a path")?)),
+            "--choose-repo" => {
+                bare()?;
+                args.choose_repo = true
+            }
             "-b" | "--base" => args.base = value("a branch name")?,
             "--list" => {
                 bare()?;
@@ -176,7 +190,41 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> io::Result<ExitCode> {
-    let git = Git::discover(&args.repo)?;
+    if args.choose_repo {
+        if args.repo.is_some()
+            || args.list
+            || args.preview.is_some()
+            || args.land.is_some()
+            || args.delete.is_some()
+            || args.prune_worktrees
+            || args.squash
+            || args.push
+            || args.expect.is_some()
+            || args.expect_base.is_some()
+            || args.delete_landed
+            || args.yes
+        {
+            return Err(io::Error::other(
+                "--choose-repo opens the window on the work tree chosen; it takes no -C and no headless mode",
+            ));
+        }
+        // Checked again by the opener; said here before a window opens.
+        if let Some(name) = git::location_override() {
+            return Err(io::Error::other(format!(
+                "--choose-repo opens the work tree chosen, and {name} would override it; unset it"
+            )));
+        }
+        if let Some(opened) = choose_repo(&args.base)? {
+            show(opened)?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let repo = match &args.repo {
+        Some(repo) => repo.clone(),
+        None => env::current_dir()
+            .map_err(|e| io::Error::new(e.kind(), format!("current directory: {e}")))?,
+    };
+    let git = Git::discover(&repo)?;
 
     // The base must exist locally: it is both the review target and the branch
     // the squash commit lands on.
@@ -522,11 +570,185 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
     Ok(ExitCode::SUCCESS)
 }
 
+/// A review read and ready for its window.
+struct Opened {
+    app: App,
+    repo: PathBuf,
+}
+
+/// The chooser's verdict on a folder: a review of the work tree whose top
+/// it is, with `base` a local branch, as `run` requires, and the branches
+/// read. Every refusal is the chooser's to show, so nothing that can fail
+/// is left for after it closes.
+fn open_repo(path: &Path, base: &str) -> Result<Opened, String> {
+    let git = Git::at_top(path).map_err(|e| e.to_string())?;
+    if git.rev_parse(&format!("refs/heads/{base}")).is_err() {
+        return Err(format!(
+            "{} has no local branch '{base}'",
+            git.repo().display()
+        ));
+    }
+    prepare(git, base.to_string()).map_err(|e| e.to_string())
+}
+
+/// Opens the chooser, browsing from `~/src` (else the home, else the
+/// current directory); none when it was closed without a choice.
+fn choose_repo(base: &str) -> io::Result<Option<Opened>> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute());
+    let start = match home.as_ref() {
+        Some(h) if h.join("src").is_dir() => h.join("src"),
+        Some(h) => h.clone(),
+        None => env::current_dir()?,
+    };
+    let file = saved::file();
+    // A list that cannot be read is offered as empty, the reason on the
+    // status row; `record` leaves such a file alone.
+    let (list, warning) = match file.as_deref().map(saved::load).transpose() {
+        Ok(list) => (list.unwrap_or_default(), None),
+        Err(e) => (Vec::new(), Some(format!("saved repositories: {e}"))),
+    };
+    let base = base.to_string();
+    chooser::run(
+        list,
+        warning,
+        file,
+        home,
+        start,
+        Box::new(move |path| open_repo(path, &base)),
+    )
+}
+
 fn run_window(git: Git, base: String) -> io::Result<()> {
-    let title = format!("td-review {}", scrub(&git.repo().display().to_string()));
+    show(prepare(git, base)?)
+}
+
+/// The review of `git`, read before the window opens, so a repository git
+/// cannot list is an error on the command line (or the chooser's status
+/// row) rather than a window that shows nothing.
+fn prepare(git: Git, base: String) -> io::Result<Opened> {
+    let repo = git.repo().to_path_buf();
     let mut app = App::new(git, base);
-    // Read before the window opens, so a repository git cannot list is an
-    // error on the command line rather than a window that shows nothing.
     app.reload()?;
+    Ok(Opened { app, repo })
+}
+
+fn show(Opened { app, repo }: Opened) -> io::Result<()> {
+    let title = format!("td-review {}", scrub(&repo.display().to_string()));
+    // Saved for `--choose-repo`; a list that cannot be written costs only
+    // that.
+    if let Some(file) = saved::file() {
+        if let Err(e) = saved::record(&file, &repo) {
+            eprintln!(
+                "td-review: saving {}: {}",
+                scrub(&file.display().to_string()),
+                scrub(&e.to_string())
+            );
+        }
+    }
     window::run(app, title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn the_chooser_opens_only_a_work_trees_top_that_has_the_base() {
+        let root = env::temp_dir().join(format!("td-review-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        git_in(
+            &root,
+            &["init", "-q", "-b", "main", &work.to_string_lossy()],
+        );
+        git_in(&work, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let top = std::fs::canonicalize(&work).unwrap();
+        let opened = match open_repo(&work, "main") {
+            Ok(opened) => opened,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(opened.repo, top);
+        let missing = open_repo(&work, "trunk").err().unwrap();
+        assert!(missing.contains("no local branch 'trunk'"), "{missing}");
+        // A folder inside a work tree is not its top.
+        let sub = open_repo(&work.join("sub"), "main").err().unwrap();
+        assert!(sub.contains("is not the top of a git work tree"), "{sub}");
+        // A repository planted above a plain folder is not taken for it.
+        git_in(
+            &root,
+            &["init", "-q", "-b", "main", &root.to_string_lossy()],
+        );
+        git_in(&root, &["commit", "-q", "--allow-empty", "-m", "planted"]);
+        std::fs::create_dir_all(root.join("plain")).unwrap();
+        let plain = open_repo(&root.join("plain"), "main").err().unwrap();
+        assert!(
+            plain.contains("is not the top of a git work tree"),
+            "{plain}"
+        );
+        // Nor one whose work tree is set to that folder, above a folder name
+        // with a colon, which splits GIT_CEILING_DIRECTORIES.
+        let colon = root.join("a:b");
+        git_in(
+            &root,
+            &["init", "-q", "-b", "main", &colon.to_string_lossy()],
+        );
+        git_in(&colon, &["commit", "-q", "--allow-empty", "-m", "planted"]);
+        let aimed = colon.join("plain");
+        std::fs::create_dir_all(&aimed).unwrap();
+        git_in(
+            &colon,
+            &["config", "core.worktree", &aimed.to_string_lossy()],
+        );
+        let aimed = open_repo(&aimed, "main").err().unwrap();
+        assert!(
+            aimed.contains("is not the top of a git work tree"),
+            "{aimed}"
+        );
+        // A name ending in a space is its own.
+        let spaced = root.join("spaced ");
+        git_in(
+            &root,
+            &["init", "-q", "-b", "main", &spaced.to_string_lossy()],
+        );
+        git_in(&spaced, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let opened = match open_repo(&spaced, "main") {
+            Ok(opened) => opened,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(opened.repo, std::fs::canonicalize(&spaced).unwrap());
+        // Nor through an empty `.git` there, which git steps past.
+        std::fs::create_dir_all(colon.join("plain/.git")).unwrap();
+        let empty = open_repo(&colon.join("plain"), "main").err().unwrap();
+        assert!(
+            empty.contains("is not the top of a git work tree"),
+            "{empty}"
+        );
+        // Git's own reason, when it has one, is the refusal.
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(".git"), "not a gitfile\n").unwrap();
+        let broken = open_repo(&broken, "main").err().unwrap();
+        assert!(broken.contains("broken: fatal:"), "{broken}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

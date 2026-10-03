@@ -234,6 +234,15 @@ branches and their review records, `r` replays the branch's commits onto main,
 `p` pushes, and `w` sweeps fully landed worktrees. Rebase landing preserves
 each commit, subject, body, and review record. The post-push branch and worktree
 sweeps remove fully landed ordinary branches and skip `-rolling` workstreams.
+Started with `--choose-repo` instead of in a work tree, it first opens a
+chooser: the repositories its window opened before, most recent first
+(saved in `~/.config/td-review/repositories`, which no application view
+can write), then a folder browser from `~/src`, where Return only
+enters a folder and Ctrl+Return opens the one in view. The folder
+chosen must be a work tree's top through its own `.git`, so a
+repository in a folder above is never taken for it, and no `GIT_DIR`
+or like variable may override it. Git then runs in it as it would
+under `-C`, repository configuration included.
 
 ## Rebase a rolling workstream
 
