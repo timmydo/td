@@ -1953,6 +1953,59 @@ fn encoded_word_candidates() {
     assert_eq!(before, after, "encoded-word recognition allocated");
 }
 
+fn encoded_word_decoding() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        encoded_word::{
+            decode::{Cursor, Status},
+            Context, Word,
+        },
+        ports::{Deadline, Tick},
+    };
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10000,
+            records: 10000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (input, expected, problem) in [
+        (b"=?utf-8?B?4oKsZm8=?=".as_slice(), "€fo", false),
+        (b"=?utf-8?Q?=E1=QZ=80=00a?=", "��QZ�a", true),
+        (b"=?utf-8?B?SGVs----bG8=?=", "Hel�lo", true),
+        (b"=?utf-8?Q?=EF=B7=90?=", "�", true),
+    ] {
+        let word = Word::recognize(black_box(input), Context::Text, Tick(1), &mut work)
+            .unwrap()
+            .unwrap();
+        let mut cursor = Cursor::new(word);
+        let mut expected = expected.chars();
+        let mut done = false;
+        for _ in 0..100 {
+            let checkpoint = cursor;
+            let first = cursor.poll(Tick(1), &mut work).unwrap();
+            cursor = checkpoint;
+            assert_eq!(cursor.poll(Tick(1), &mut work).unwrap(), first);
+            match first {
+                Status::Scalar(value) => assert_eq!(Some(value), expected.next()),
+                Status::Yield => {}
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(expected.next(), None);
+        assert_eq!(cursor.is_encoding_problem(), problem);
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "encoded-word decoding allocated");
+}
+
 fn unicode_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2459,6 +2512,7 @@ fn main() {
         unicode_lookups();
         unicode_nfc();
         encoded_word_candidates();
+        encoded_word_decoding();
         mime_input();
         mime_headers();
         body_value();
@@ -2555,6 +2609,7 @@ fn main() {
     unicode_lookups();
     unicode_nfc();
     encoded_word_candidates();
+    encoded_word_decoding();
     mime_input();
     mime_headers();
     body_value();

@@ -1305,6 +1305,14 @@ Initial independently landable increments:
   Lexical placement, payload decoding, adjacent whitespace suppression and
   normalized-header composition remain open.
 
+- **M06r — bounded encoded-word payload decoding:** compose Q/Base64 payload
+  recovery with independent per-word charset state, encoded-control removal
+  and I-JSON noncharacter replacement. Keep a fixed copied cursor, charge
+  payload/charset visits and replay, and latch work failures. Verify literal
+  malformed-input oracles, per-word separation, intermediate checkpoints,
+  deadline/exhaustion behavior and allocation-free polls. Header placement,
+  whitespace suppression and normalized-header composition remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

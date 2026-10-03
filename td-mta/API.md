@@ -1148,6 +1148,37 @@ propagate with the meter's sticky failure; no partial Word is returned.
 Callers bracket attempts with fresh clock/cancellation checks and retain
 aggregate header accounting when composing this helper with NFC.
 
+### 1.25 Encoded-word payload decoding
+
+M06r supplies `encoded_word::decode::Cursor` over one previously recognized
+Word. Its constructor creates independent charset state. Poll returns at
+most one Scalar, Yield or Complete. B and Q decoding follow POLICY.md's
+explicit replacement/recovery rules, then use the fixed charset decoder.
+Faults flush incomplete charset prefixes before replacement and resumption.
+Encoded controls are removed after charset conversion; I-JSON noncharacters
+become U+FFFD. `is_encoding_problem` accumulates transfer/charset/noncharacter
+errors and is final at completion. Control removal alone is not an error.
+
+The cursor is Copy and at most 128 bytes, including its borrowed Word,
+three-byte Base64 pending buffer and charset state. Each poll charges before
+work, at most three records and five byte visits: up to four payload bytes
+and one charset-byte visit, or Q escape/lookahead and charset visits.
+Checkpoint restoration repeats those charges; counters are never copied or
+refunded. Work errors latch on the cursor even with a replacement meter.
+An enclosing owner must retain failure retirement across cursor copies and
+all header projections. Cached Complete is inert. The owner brackets turns
+with clock/cancellation checks and charges UTF-8 output separately against
+the same live meter. Poll itself emits scalars without output-byte charges.
+
+No allocation, I/O, implicit locale or additional dependency is introduced.
+The state fits within the existing decoder/checkpoint reservations; this is
+not a composed-header memory or stack qualification. Lexical placement,
+adjacent-word whitespace suppression, unfolding, initial-SP removal, NFC
+and protocol output remain enclosing header responsibilities. In particular,
+a caller cannot treat candidate recognition as placement authorization or
+join charset bytes from separate words. Resident NFC composition with a
+replayable header source remains a subsequent increment.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

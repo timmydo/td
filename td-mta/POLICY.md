@@ -111,6 +111,19 @@ ansi_x3.4-1968 is a body alias only because its period is forbidden there.
 No blanket trim changes trailing spaces or an initial tab. All decoding is
 independent of chunk size.
 
+Within a recognized encoded word, Q underscores become spaces and a valid
+=HH pair becomes one byte. An invalid or short escape consumes only its =,
+emits U+FFFD and resumes with the following payload bytes. B decoding uses
+four-character groups: an invalid alphabet, misplaced/nonfinal padding,
+nonzero unused padding bits or a short final group replaces that group with
+one U+FFFD and resumes at the next group. A transfer fault first flushes any
+incomplete charset sequence with replacement, emits the transfer replacement,
+and starts fresh charset state. Thus fragments cannot join across faults.
+After charset conversion, discard encoded U+0000..001F and U+007F..009F;
+removing controls is not a decoding error. Malformed transfer/charset data
+and I-JSON noncharacters set the decoding diagnostic. These header recovery
+rules do not change body transfer decoding or versioned part locators.
+
 Supported charset labels (ASCII case insensitive) are utf-8, us-ascii,
 iso-8859-1 and windows-1252; aliases utf8, ascii, latin1 and cp1252 map to
 them. Also accept ansi_x3.4-1968 for ASCII and iso_8859-1 for Latin-1. This is

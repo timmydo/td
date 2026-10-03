@@ -817,6 +817,14 @@ NUL removal, malformed/noncharacter replacement, replay, completion and
 fresh-meter refusal without changing Rust allocation counters. Source
 collection and the complete projection worker stack remain unqualified.
 
+The encoded-word payload cursor fits 128 bytes including its borrowed Word,
+three pending transfer bytes and charset state. It uses the same decoder
+region and a future 256-byte cursor checkpoint. One poll visits at most four
+payload bytes and one charset byte and emits at most one scalar. Isolated
+Rust allocation intervals cover Q/Base64 success, malformed-unit recovery,
+control/noncharacter filtering and copied replay without counter changes.
+No complete header pipeline or worker-stack bound is claimed.
+
 Body charset prescan fits 64 bytes in the existing 2 KiB decoder/HTML/snippet
 state and future decoding cursor checkpoint. It borrows caller fragments
 and retains no source, body copy or output buffer. Its isolated allocation

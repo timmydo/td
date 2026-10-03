@@ -1,4 +1,6 @@
-//! Bounded encoded-word syntax; the caller owns lexical placement and decoding.
+//! Bounded encoded-word recognition/decoding; the caller owns lexical placement.
+pub mod decode;
+
 use crate::{
     admission::work::{Charge, Meter, Stop},
     mime_charset::Charset,
