@@ -888,6 +888,17 @@ intervals cover long names/addresses, routes, quoted folds, fallback names,
 malformed tails and nesting/work refusal. List/group recovery, text/NFC
 composition and complete worker stack qualification remain open.
 
+The address/group assembly cursor fits 768 bytes in the body parser
+reservation, including the 64-byte recovery boundary cursor and one active
+CFWS/phrase/mailbox child. First-colon metadata adds no copied token to the
+boundary cursor. Group names, pending mailbox results and raw fallbacks
+are offsets/scalars; there is no item/group collection. Each poll adds one
+parent record to at most one child turn, for 161 byte visits/35 records,
+with no output charge. Fallback edge trimming is charged one byte at a
+time. Allocation intervals cover groups, null slots, routes, long Unicode,
+raw recovery and resource refusal. Projection storage and the complete
+composed worker stack remain unqualified.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

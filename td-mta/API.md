@@ -1741,6 +1741,12 @@ and JMAP serialization remain with the enclosing owner. Tests and allocation
 intervals cover protected delimiters, escapes, empty items, unmatched tails,
 raw invalid bytes, long input, depth and sticky resource refusal.
 
+M06ai also retains the first unprotected colon offset in each boundary
+Item. Colons do not split items, and this metadata does not validate a group
+name. Protected route/quoted/comment/literal colons never become candidates.
+The added scalar state stays within the same 64-byte cursor ceiling and
+does not change byte/record charges.
+
 ### 1.38 Resident single addr-spec grammar
 
 M06af supplies `header_addr_spec::Cursor` over one admitted immutable
@@ -1866,6 +1872,54 @@ Complete is inert. Tests cover literal name/address extents, protected
 delimiters, route grammar, fallback precedence, invalid tails, long Unicode,
 exact work and sticky failures. Allocation intervals include success and
 malformed/nesting/work refusal. List/group recovery, text/NFC projection,
+response admission and complete worker qualification remain open.
+
+### 1.41 Resident address/group assembly
+
+M06ai supplies `header_addresses::Cursor` over one complete admitted field
+value. It emits provisional BeginGroup(optional raw phrase extent), Mailbox
+(Parsed mailbox or Raw fallback extent), EndGroup and Complete events.
+All extents use the original field's offsets. Named groups retain their
+names, including empty quoted phrases. Consecutive ordinary mailboxes share
+an unnamed group; empty/null slots and CFWS-only items produce no mailboxes.
+Addresses can flatten these events, while GroupedAddresses retains them.
+Every event is provisional until whole-field Complete; a later resource
+failure retires the entire result. This layer emits no JSON or strings.
+
+The boundary scanner retains the first colon outside comments, quotes,
+domain literals and angles. Outside a named group, a fully valid nonempty
+phrase before that colon starts a named group. Parse the suffix of that
+same item as its first mailbox, if nonempty. A following semicolon closes
+the group, including an empty group. Inside a named group, a further colon
+never starts a nested group. Invalid group-name syntax leaves the entire
+item for raw fallback. Work/nesting failures never select recovery.
+
+A missing named-group semicolon is recovered by an implicit close at EOF.
+A stray semicolon is a recovery boundary: process its preceding item, close
+any unnamed run and ignore an empty item. Start a later unnamed run only
+when another mailbox exists. This is deliberate best-effort recovery,
+not acceptance of those forms as RFC grammar. Commas/null slots do not
+split an existing unnamed run; explicit named groups and semicolons do.
+
+Complete single-mailbox parsing supplies Parsed offsets and names. Ordinary
+malformed items become Raw with no display name. Before emitting Raw, trim
+only leading/trailing ASCII SP, HTAB, CR and LF with charged bounded steps;
+a resulting empty span is ignored. Keep internal folds, invalid UTF-8,
+NUL and other bytes unchanged for later unfolded/filtered projection.
+Unclosed constructs consume the boundary scanner's remaining field tail.
+Raw or Parsed status never grants SMTP delivery authority. The enclosing
+owner must retain delimiter context before/after name extents for later
+encoded-word placement, then decode/normalize/project before publication.
+
+The non-Copy cursor fits 768 bytes including the 64-byte boundary cursor,
+one enum-held child, group state and pending extents/event. No growing item
+or group collection is stored. Each poll prepays one parent record and runs
+at most one child turn: at most 161 source-byte visits, 35 records and no
+output charge. Raw trimming charges one visited byte per active turn.
+Failures latch across fresh meters; cached Complete is inert. Tests and
+allocation intervals cover named/unnamed transitions, empty groups/null
+slots, routes, comments, invalid names/nesting, malformed and unclosed
+tails, long Unicode and sticky resource refusal. Text/NFC projection,
 response admission and complete worker qualification remain open.
 
 ## 2. Read views and change history

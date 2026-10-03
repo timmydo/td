@@ -1438,6 +1438,15 @@ Initial independently landable increments:
   long Unicode, precise work and allocation-free refusal. List/group
   recovery, display/address projection, NFC and publication remain open.
 
+- **M06ai — resident address/group assembly:** retain raw boundary colon
+  metadata and compose phrase/mailbox parsing with deterministic item
+  fallback. Preserve named groups and consecutive unnamed runs; ignore
+  empty slots, close missing semicolons at EOF and treat stray semicolons
+  as recovery boundaries. Keep all events provisional until field completion.
+  Cover group/name transitions, protected colons, malformed tails, long
+  input and allocation-free refusal. Text/NFC projection, JSON response
+  storage and composed worker qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

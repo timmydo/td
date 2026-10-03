@@ -15,6 +15,7 @@ pub struct Item {
     pub end: usize,
     pub separator: Separator,
     pub unclosed: bool,
+    pub colon: Option<usize>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
@@ -48,6 +49,7 @@ pub struct Cursor<'a> {
     source: &'a [u8],
     start: usize,
     position: usize,
+    colon: usize,
     comments: u8,
     angles: u8,
     quoted: bool,
@@ -62,6 +64,7 @@ impl<'a> Cursor<'a> {
             source,
             start: 0,
             position: 0,
+            colon: usize::MAX,
             comments: 0,
             angles: 0,
             quoted: false,
@@ -114,6 +117,7 @@ impl<'a> Cursor<'a> {
                     end: self.position,
                     separator: Separator::End,
                     unclosed: self.unclosed(),
+                    colon: (self.colon != usize::MAX).then_some(self.colon),
                 }));
             };
             let position = self.position;
@@ -152,6 +156,7 @@ impl<'a> Cursor<'a> {
                     b'>' if self.angles != 0 => {
                         self.angles = self.angles.checked_sub(1).ok_or(Error::InvalidState)?
                     }
+                    b':' if self.angles == 0 && self.colon == usize::MAX => self.colon = position,
                     b',' | b';' if self.angles == 0 => {
                         let item = Item {
                             start: self.start,
@@ -162,8 +167,10 @@ impl<'a> Cursor<'a> {
                                 Separator::Semicolon
                             },
                             unclosed: false,
+                            colon: (self.colon != usize::MAX).then_some(self.colon),
                         };
                         self.start = self.position;
+                        self.colon = usize::MAX;
                         return Ok(Status::Item(item));
                     }
                     _ => {}
@@ -219,6 +226,19 @@ mod tests {
             .into_iter()
             .map(|item| (&source[item.start..item.end], item.separator, item.unclosed))
             .collect()
+    }
+    #[test]
+    fn first_unprotected_colon_is_item_metadata_only() {
+        let source = b"G: a@b,H: I:c@d;\"q:r\" <@r:a@b>, a@[x:y], a(c:d)@b";
+        let items = scan(source).unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.colon).collect::<Vec<_>>(),
+            vec![Some(1), Some(8), None, None, None]
+        );
+        assert_eq!(
+            pieces(b"G: a@b"),
+            [(b"G: a@b".as_slice(), Separator::End, false)]
+        );
     }
     #[test]
     fn protected_commas_and_semicolons_are_never_recovery_boundaries() {
@@ -344,12 +364,14 @@ mod tests {
                             Separator::Semicolon
                         },
                         unclosed: false,
+                        colon: None,
                     },
                     Item {
                         start: 1,
                         end: 1,
                         separator: Separator::End,
                         unclosed: false,
+                        colon: None,
                     },
                 ]
             } else {
@@ -358,6 +380,7 @@ mod tests {
                     end: 1,
                     separator: Separator::End,
                     unclosed: matches!(byte, b'(' | b'[' | b'<' | b'"'),
+                    colon: (byte == b':').then_some(0),
                 }]
             };
             assert_eq!(scan(&[byte]), Ok(expected), "byte {byte}");
@@ -418,7 +441,8 @@ mod tests {
                     start: 0,
                     end: 1,
                     separator: Separator::Comma,
-                    unclosed: false
+                    unclosed: false,
+                    colon: None,
                 }))
             );
             assert_eq!(cursor.poll(Tick(1), &mut work), Err(Error::Work(expected)));

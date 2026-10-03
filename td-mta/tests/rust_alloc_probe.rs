@@ -2064,6 +2064,75 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_address_groups() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_addresses::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    fn drive(cursor: &mut Cursor<'_>, work: &mut Meter) -> Result<usize, Error> {
+        let mut events = 0;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1), work)? {
+                Status::Complete => return Ok(events),
+                Status::Yield => {}
+                event => {
+                    black_box(event);
+                    events += 1;
+                }
+            }
+        }
+        panic!("address group allocation probe did not finish");
+    }
+    let source = format!("{}: {}@b;", "🐈".repeat(1000), "é".repeat(1000));
+    let nested = format!("a@b,{}", "(".repeat(33));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, expected) in [
+        (source.as_bytes(), Ok(3)),
+        (b"a@b, G: <@route:c@d>;bad".as_slice(), Ok(9)),
+        (b"G:; H:(comment);;", Ok(4)),
+        (b"G: bad,Nested:c@d", Ok(4)),
+        (b"\"unclosed,tail", Ok(3)),
+        (b"a@b, (unclosed, tail", Ok(4)),
+        (b"(\xff) a@b", Ok(3)),
+        (b" ;,\r\n", Ok(0)),
+        (nested.as_bytes(), Err(Error::NestingLimit)),
+    ] {
+        assert_eq!(
+            drive(&mut Cursor::new(black_box(source)), &mut work),
+            expected
+        );
+    }
+    let mut cursor = Cursor::new(b"G: a@b;");
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 20,
+            records: 1000,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut limited),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut work),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "address group parsing allocated");
+}
+
 fn header_single_mailbox() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3563,6 +3632,7 @@ fn main() {
         header_message_id_text();
         header_url_text();
         header_address_boundaries();
+        header_address_groups();
         header_single_mailbox();
         header_phrase_tokens();
         header_single_addr_spec();
@@ -3675,6 +3745,7 @@ fn main() {
     header_message_id_text();
     header_url_text();
     header_address_boundaries();
+    header_address_groups();
     header_single_mailbox();
     header_phrase_tokens();
     header_single_addr_spec();

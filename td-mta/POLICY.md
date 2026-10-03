@@ -172,6 +172,20 @@ display names receive NFC; stored/rendered addresses never authorize SMTP
 recipients. The stricter outbound addr-spec/envelope validator rejects
 malformed recovered addresses and CR/LF/NUL rather than sending them.
 
+Address/group assembly recognizes a group only when the first unprotected
+colon outside an active named group follows a complete nonempty phrase.
+The suffix is that group's first mailbox item. Invalid group-name syntax
+leaves the whole item for fallback; a second colon inside a named group
+never creates a nested group. Close a missing final semicolon implicitly
+at EOF as best-effort recovery. A stray semicolon processes the preceding
+item and ends any unnamed run; empty/CFWS-only items create no mailbox or
+unnamed group. Commas/null slots keep consecutive ordinary mailboxes in one
+unnamed group. Raw fallback trims ASCII SP/HTAB/CR/LF at its edges before
+later unfolding, keeps internal bytes, and suppresses an empty result.
+Work and nesting limits retire the whole field instead of invoking raw
+fallback. All parsed group/mailbox events remain provisional until the
+entire field completes.
+
 MessageIds parses complete RFC 5322 msg-id lists, removes grammatical CFWS
 and outer angle brackets, and returns null for an invalid list. For
 References and In-Reply-To also accept their RFC 5322 section 4 obsolete
