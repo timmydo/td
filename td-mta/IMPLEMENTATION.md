@@ -1501,6 +1501,13 @@ Initial independently landable increments:
   allocation-free refusal. Whole-field/list assembly and publication remain
   open.
 
+- **M06aq — reusable private JSON framing:** extract the fixed framing state
+  behind a private scalar/charge seam while retaining the public borrowed API.
+  Let an owner retain parser/frame state by value and borrow disjoint fields
+  per poll; require stable source/meter identity and whole-property retirement.
+  Preserve bounds, exact charges, fragmentation and failure behavior. NFC
+  workspace ownership and complete field publication remain separate.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

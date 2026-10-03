@@ -962,6 +962,14 @@ fragmenting a staged JSON scalar adds no charge. Allocation intervals cover
 Raw, both address modes and malformed-source refusal. No complete
 response/worker claim follows.
 
+Private JSON Frame state fits 32 bytes and owns no source or work reference.
+The public borrowed adapter still fits 64 bytes; extraction does not introduce
+another simultaneous frame. A future coordinator may retain its parser and
+frame in separate fields and form short source borrows per poll. NFC's external
+workspace and existing reservation stay separate. Allocation intervals through
+the public adapter cover the same extracted framing actions; a movable test
+owner validates live-meter borrowing, not a complete worker memory bound.
+
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
 including the fixed one-byte handoff; public MessageIds state remains

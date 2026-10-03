@@ -2243,6 +2243,41 @@ a fresh meter or rewrap a copy. This differs from normalized output charging,
 which also retires the NFC source. Source-reported failures retain each
 source's existing latch.
 
+### 1.49 Reusable private JSON framing state
+
+M06aq separates the existing string serializer into a crate-private `Frame`
+and `ScalarSource` seam. The existing source adapter is also crate-visible, so
+coordinators reuse its error/status mapping. Sources must bound each poll and
+check the live deadline even for zero-byte output charges. Frame owns
+quote/source/closing phase, six pending bytes, offsets and the sticky failure
+latch, within 32 bytes. It retains no source, meter, scratch or replay credit.
+One `poll` takes a short mutable source borrow and performs the same bounded
+staging/source/drain action. The source supplies scalar polling and live
+output charging; semantic filtering and diagnostics stay with the selected
+projection.
+
+A containing coordinator must bind one unpolled source and its original job
+meter for the frame's whole lifetime, retain them across every short borrow,
+and abandon the complete property on drop/refusal. The private seam does not
+check source identity and cannot authorize a replacement source or meter. The
+public `json_string::Cursor` keeps its existing exclusive source borrow and
+delegates to Frame, with unchanged constructors, errors, diagnostics, output
+precharging, deadlines and 64-byte ceiling.
+
+An owner may now keep a Raw/address parser and Frame by value, borrowing its
+disjoint fields only during each poll, without self-references or allocation.
+This does not make NFC own the scratch, meter or budget that it borrows; those
+remain externally owned under its existing 4 KiB contract. Complete field
+admission and retained response publication are still separate work.
+
+Existing source-mode, fragmentation, exact-charge and failure fixtures run
+through the extracted frame. A movable Raw-owner fixture exercises repeated
+short borrows, output parity, exact live counters and refusal retirement. A
+non-latching fault source independently pins Frame refusal, untouched sinks
+and inert cached completion. Existing allocation intervals cover the
+delegating public paths. This is framing reuse, not a complete field
+coordinator or worker qualification.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
