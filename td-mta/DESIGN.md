@@ -280,8 +280,9 @@ The core may contain owned tables generated from the approved, checksummed
 Unicode 17.0 inputs in UNICODE.md. They add no Cargo dependency or runtime
 data fetch. The approved corpus and license now live in the checkout and are
 verified by the ordinary offline test suite and a cold tooling example. M06
-now has reproducible offline table generation and fixed runtime lookups.
-Official NFC conformance equations and bounded normalization remain open.
+now has reproducible offline table generation, fixed runtime lookups and
+bounded NFC over resident valid UTF-8, verified against the complete official
+NFC equations. Decoded-header adapters and protocol integration remain open.
 This is a named data dependency, not permission to import a Unicode or mail
 parsing library.
 

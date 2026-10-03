@@ -69,6 +69,13 @@ accessor code and mapped-page rounding are excluded from this payload count
 and also belong within that allowance. No new arena or RSS qualification
 follows from this payload count.
 
+Resident NFC uses the existing 4 KiB conversion reservation: 3072 bytes of
+caller-owned scratch plus at most 1024 bytes for cursor state and its shared
+header budget. Four private source checkpoints are included in that cursor
+bound. Tests pin these layouts and exercise fast/replay turns without Rust
+allocation. This does not measure compiler stack frames, allocator overhead,
+encoded-header adapters or combined service RSS.
+
 ## Slot composition and ownership
 
 - SMTP: bounded headers, 320 bytes per envelope recipient, 64 KiB I/O and

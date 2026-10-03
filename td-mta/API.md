@@ -1048,10 +1048,63 @@ keep mutable global state, sample a clock or change an admission meter. The
 enclosing cursor charges each bounded operation and checks its deadline.
 
 Sorted static tables bound binary searches independently of message length;
-one decomposition emits at most four scalars. The complete streaming NFC
-cursor, fast/replay storage, checkpoint ownership and interpretation limits
-remain open. The official corpus test here covers all 11172 Hangul syllables,
-not the complete NFC equations.
+one decomposition emits at most four scalars. The lookup-specific official
+corpus test covers all 11172 Hangul syllables; the resident NFC cursor below
+owns the complete NFC equations.
+
+### 1.23 Resident UTF-8 NFC
+
+M06p supplies `nfc::Cursor` over one borrowed immutable valid UTF-8 `&str`.
+It borrows one exclusive `Scratch`, the live admission `Meter` and an email's
+aggregate `HeaderBudget`; none is copied into replay checkpoints. `poll(Tick)`
+returns one normalized `Scalar`, `Yield` or `Complete`. It performs at most
+32 state transitions and charges at most 128 header-budget steps per turn.
+Callers supply fresh monotonic clock samples and bracket turns with
+cancellation checks. `charge_output(tick, bytes)` charges serialized bytes to
+the same borrowed meter before publication; a zero-byte charge checks the
+post-turn deadline. Refusal retires the cursor even after its final scalar.
+The cursor samples no clock and performs no I/O. Polling alone does not charge
+`output_bytes` for scalar results.
+
+Scratch is exactly 3072 bytes: 256 eight-byte scalar/class cells plus 256
+u32 class counts. The cursor and aggregate budget together fit within the
+remaining 1024-byte NFC checkpoint reservation. Each of four private source
+copies retains UTF-8 position and up to four pending decomposed scalars.
+Checkpoints compare identity and position without scanning source prefixes.
+All fixed storage is caller-owned or inline; no admitted heap growth occurs.
+The first 256 nonstarters use stable insertion ordering with one bounded
+move per step. Longer segments replay once per occupied class in ascending
+order, preserving source order within each class. Composition computes the
+starter first and repeats decisions to emit any remaining marks. Class-zero
+composition, including Hangul, continues across ordering boundaries.
+
+`HeaderBudget::new()` sets 16 MiB source visits and 16000000 steps.
+Reuse this one budget across all projections of an email's headers. Every
+source scalar decode charges its UTF-8 bytes and two steps; each decomposed
+scalar/class lookup charges one step; each state transition charges one.
+Replay repeats these charges. Cached pending decomposition needs no byte
+reread, but still charges each scalar step. Stable sorting, composition and
+checkpoint transitions are charged even without a source byte. These charges
+also debit the live meter's `io_bytes`. For its `records` counter, one
+precharged record admits at most 16 internal steps. This private cursor
+credit starts at zero and is never refunded or copied by checkpoints. Thus
+a turn charges at most eight job records while the header budget retains
+exact individual step accounting. A 1 MiB ASCII projection fits the default
+2000000-record foreground budget; a hostile replay reaches its aggregate
+interpretation limit under those defaults in the independent fixture.
+Other work can consume the enclosing budget first; neither cap is bypassed.
+A header-budget refusal is `InterpretationLimit` and
+retires that budget across later cursors. Enclosing meter refusals are
+`Work(Stop)`. Invalid private/table state returns a typed error. All cursor
+errors are sticky and invalidate the entire provisional property, including
+any scalar already returned. Cached completion does not recheck the clock.
+
+This entry point accepts valid UTF-8 only; NUL, noncharacters and unassigned
+scalars retain their Unicode normalization semantics. Decoded email-header
+cursors, malformed UTF-8 replacement, encoded words, I-JSON filtering and
+protocol integration remain separate. Callers must enforce the admitted
+source extent. The complete official NFC equations and adversarial resident
+replay tests do not establish those future adapters or whole-service memory.
 
 ## 2. Read views and change history
 

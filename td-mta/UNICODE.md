@@ -4,7 +4,8 @@ This is td-mta's approved upstream data dependency. It adds no Cargo crate,
 runtime file dependency, network fetch during a build, or Unicode library.
 M06m supplies committed inputs and cold verification tooling; M06n generates
 compact tables reproducibly. M06o adds fixed runtime lookups and algorithmic
-Hangul. The streaming normalizer remains open.
+Hangul. M06p supplies bounded NFC over resident valid UTF-8. Decoded-header
+integration remains open.
 
 ## Inputs
 
@@ -182,6 +183,43 @@ malformed-Unicode classification. M06 must measure actual steps with resumable
 chunks of at most 256 scalar/ decoder transitions. Raw download,
 header-independent projections and header-independent queries remain
 available. No runtime timing claim is made.
+
+## Current resident implementation
+
+M06p implements the ordering/composition algorithm above for immutable valid
+UTF-8 strings. Its fixed 3072-byte scratch and at most 1024 bytes of cursor
+plus aggregate budget fit the existing 4 KiB reservation. Private source
+checkpoints are at most 64 bytes; they retain pending canonical expansion.
+The API.md resident NFC section defines exact charging and ownership. A turn
+has at most 32 state transitions and 128 charged steps, within the 256-step
+ceiling. One job-meter record prepays 16 internal steps using private cursor
+credit; individual steps still debit the header budget. The cursor's output
+charge method lets the caller debit the same meter before serialization and
+check its deadline after a turn. External clock/cancellation checks belong
+to the caller. On any error the entire provisional property must be discarded.
+
+Ordinary tests run all five NFC equations for each of the 20034 official
+vectors, including idempotence, plus every scalar outside Part 1 as an
+identity case. Independent fixtures exercise 255/256/257-cell
+boundaries, long equal-class runs, all 55 occupied classes in descending
+order, pending decomposition restoration, leading marks and class-zero
+composition. A 1 MiB ASCII source fits the aggregate ceiling without replay;
+an exact source-byte oracle proves the long prefix is visited once even
+when its tail replays. The ASCII and hostile-replay fixtures use the default
+foreground job limits; hostile replay reaches InterpretationLimit with job
+records remaining. Deadline faults cover resumed scanning, insertion,
+composition replay and output replay. A supplied Tick is fixed throughout a
+pure poll: expiry during the turn is observed by the caller's post-turn
+zero-byte output charge or the next poll, not an internal clock sample.
+Source/step
+limits and aggregate retirement are checked. The isolated Rust allocation
+probe covers fast and replay paths using fixed scratch.
+
+This scope has no byte-fragment input: a valid `&str` is resident for the
+cursor's lifetime. Encoded-word/charset adapters, malformed-byte replacement,
+fragmented decoding, outer property failure handling and worker scheduling
+remain open. Those adapters must preserve the source and aggregate-meter
+ownership proved here; resident NFC conformance alone does not qualify them.
 
 ## Acceptance evidence owned by M06
 

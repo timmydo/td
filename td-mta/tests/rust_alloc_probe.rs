@@ -1902,6 +1902,55 @@ fn mime_qp_input() {
     assert_eq!(before, after, "owned QP source/text allocated");
 }
 
+fn unicode_nfc() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        nfc::{Cursor, HeaderBudget, Scratch, Status},
+        ports::{Deadline, Tick},
+    };
+    let input = format!("a{}z", "\u{315}\u{300}".repeat(300));
+    let expected = format!("à{}{}z", "\u{300}".repeat(299), "\u{315}".repeat(300));
+    let mut scratch = Scratch::new();
+    let before = COUNTERS.snapshot();
+    for (input, expected) in [("e\u{301}", "é"), (input.as_str(), expected.as_str())] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: td_mta::admission::WorkLimits::default().foreground_io_bytes,
+                records: td_mta::admission::WorkLimits::default().foreground_records,
+                output_bytes: expected.len() as u64,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(black_box(input), &mut scratch, &mut work, &mut budget);
+        let mut expected = expected.chars();
+        let mut complete = false;
+        for _ in 0..10000 {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Scalar(value) => {
+                    cursor
+                        .charge_output(Tick(1), value.len_utf8() as u64)
+                        .unwrap();
+                    assert_eq!(Some(value), expected.next());
+                }
+                Status::Yield => {}
+                Status::Complete => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete);
+        cursor.charge_output(Tick(1), 0).unwrap();
+        assert_eq!(expected.next(), None);
+        assert_eq!(work.remaining().output_bytes, 0);
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "NFC fast/replay paths allocated");
+}
+
 fn unicode_lookups() {
     use td_mta::unicode;
     let before = COUNTERS.snapshot();
@@ -2357,6 +2406,7 @@ fn main() {
         mime_qp();
         mime_qp_input();
         unicode_lookups();
+        unicode_nfc();
         mime_input();
         mime_headers();
         body_value();
@@ -2451,6 +2501,7 @@ fn main() {
     mime_qp();
     mime_qp_input();
     unicode_lookups();
+    unicode_nfc();
     mime_input();
     mime_headers();
     body_value();

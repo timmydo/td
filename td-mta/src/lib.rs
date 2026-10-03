@@ -25,6 +25,7 @@ pub mod mime_input;
 pub mod mime_qp;
 pub mod mime_text;
 pub mod mime_unfold;
+pub mod nfc;
 pub mod observability;
 pub mod overlay;
 pub mod ownership;

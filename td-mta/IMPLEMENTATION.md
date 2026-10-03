@@ -1278,22 +1278,33 @@ Initial independently landable increments:
   exclusions, class ranges and simple lowercase mappings. Emit licensed Rust
   tables with stable formatting and verify exact regeneration, malformed
   inputs, scalar/offset bounds and the 58720-byte compiled array payload.
-  M06o supplies runtime lookup and Hangul; complete NFC equations remain open.
+  M06o supplies runtime lookup and Hangul; M06p owns resident NFC equations.
 
 - **M06o — fixed Unicode lookups:** link the generated tables through checked
   searches, fixed canonical decomposition, combining classes, simple
   lowercase and pair composition. Implement algorithmic Hangul and verify
   every official Hangul syllable vector. Cover all table entries, boundaries,
-  exclusions and allocation-free copied results. Streaming NFC remains open.
+  exclusions and allocation-free copied results. M06p supplies resident NFC.
+
+- **M06p — bounded resident NFC:** normalize immutable valid UTF-8 with fixed
+  256-cell ordering, charged class replay, canonical/Hangul blocking and exact
+  private source checkpoints. Borrow scratch and both live work budgets;
+  retain failures across polls and aggregate interpretation-limit failures
+  across projections. Prepay job records in 16-step groups, retain exact
+  header-step accounting and charge streamed output through the same meter.
+  Verify all official NFC equations, idempotence,
+  occupied classes, fast/replay boundaries, pending decomposition, maximal
+  ASCII work, deadlines and allocation-free turns. Decoded-header adapters,
+  malformed-byte replacement and worker/protocol integration remain open.
 
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
 deterministic MIME serialization for structured outgoing email, including
 attachment streaming, boundary generation through Entropy, reply headers and
-Bcc separation. Run every official NFC equation through the streaming
-normalizer. Implement the fixed-memory fast/resident-replay algorithm with
-charged work. Search case mappings come from the same pin. No allocating
+Bcc separation. Connect decoded-header cursors to the resident NFC
+algorithm while retaining its fixed memory and charged replay contract.
+Search case mappings come from the same pin. No allocating
 library or ambient Unicode version may replace these contracts. Retain
 static table accounting within the process allowance.
 
