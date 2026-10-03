@@ -1283,16 +1283,16 @@ to the enclosing JMAP dispatcher. The parameterized grammar is
 `header:NAME[:asFORM][:all]`, with exact-case prefix/suffix tokens and
 printable ASCII field names excluding colon. No extra field-name length
 limit is imposed. Raw and the last occurrence are defaults; `:all` retains
-every occurrence in wire order when the future collector applies the
-selection. The original requested key and its field capitalization are
-preserved. Convenience aliases use the standard canonical field names, forms
-and last-occurrence behavior only in Email context. BodyPart context
-recognizes parameterized keys; an Email convenience alias returns None so
-the body-part dispatcher can reject unsupported properties. The future JSON
-parser decodes property keys in place in the admitted request arena before
-borrowing them here; unescaping cannot expand their UTF-8 byte length. It
-must validate JSON escapes and update token extents before sharing immutable
-keys. This selector neither decodes JSON nor owns a second key copy.
+every occurrence in wire order when section 1.29 applies the selection. The
+original requested key and its field capitalization are preserved.
+Convenience aliases use the standard canonical field names, forms and last-
+occurrence behavior only in Email context. BodyPart context recognizes
+parameterized keys; an Email convenience alias returns None so the body-part
+dispatcher can reject unsupported properties. The future JSON parser decodes
+property keys in place in the admitted request arena before borrowing them
+here; unescaping cannot expand their UTF-8 byte length. It must validate
+JSON escapes and update token extents before sharing immutable keys. This
+selector neither decodes JSON nor owns a second key copy.
 
 Raw is permitted for every field. Other forms enforce RFC 8621 sections
 4.1.2.2-7, including obsolete Resent-Reply-To and the RFC 2369 list fields.
@@ -1306,10 +1306,10 @@ their distinct resource/internal meanings.
 Authorization of Text form does not establish an unstructured field grammar
 or authorize encoded words inside parameters, quoted strings or addresses.
 This selector does not invoke the unstructured decoder. The future value
-parser must choose the correct field grammar. Header collection, last/all
-traversal, null/empty absence semantics, field-name comparisons, duplicate
-creation properties, creation placement restrictions and JSON publication
-remain enclosing responsibilities.
+parser must choose the correct field grammar. Section 1.29 supplies resident
+field matching and last/all traversal. Source capture, null/empty absence
+semantics, duplicate creation properties, creation placement restrictions
+and JSON publication remain enclosing responsibilities.
 
 The non-Copy cursor fits 128 bytes and a selected value fits 48 bytes; names
 borrow the source or static alias table. Name scans visit at most 32 bytes
@@ -1323,6 +1323,48 @@ clock and cancellation checks and charge subsequent scans/output separately.
 Allocation probes cover long names, convenience aliases, all-occurrence
 selection and syntax/form refusals. This does not qualify a complete worker
 stack.
+
+### 1.29 Resident header selection
+
+M06v supplies `header_select::Cursor` over immutable resident source, its
+absolute base offset, a header-byte allowance, a validated header Property
+and explicit SourceEnd. Use Prefix for a captured message prefix and Eof
+only when the owner has established actual entity EOF. A prefix ending
+before the scanner finds the header/body boundary fails with sticky
+Truncated. Source must contain the complete header section and separator, or
+end at actual entity EOF. A truncated collection is not EOF. It may contain
+body lookahead; traversal stops at the scanner's body boundary. Source
+capture/admission remains the caller's responsibility; this API does not
+read a file or allocate a header arena. The caller also retains aggregate
+structural admission across entity headers.
+
+The cursor composes the raw header scanner with bounded ASCII case-
+insensitive comparisons. Each Match yields the original absolute Field
+extents, without changing capitalization, folds, leading whitespace or value
+bytes. All-occurrence requests yield matches in wire order; last-occurrence
+requests retain only the most recent match and yield it after the scan ends.
+An absent field yields no Match in either mode. The enclosing projection
+maps that absence to null or an empty array and parses the requested form.
+No value is decoded or serialized by this traversal.
+
+Every Match remains provisional until Complete(End), including the last
+match. On any later error, discard the entire provisional result. Header
+limit/offset errors remain typed scanner failures; work refusals propagate
+unchanged and all errors latch across replacement meters. Cached Complete is
+inert. One poll performs either a scanner turn of at most 256 source visits,
+a comparison of at most 32 bytes per operand (64 charged visits), or a final
+delivery transition. At most one record and no output bytes are charged per
+poll. The caller brackets active turns with clock/cancellation checks and
+charges later value parsing and output independently.
+
+The non-Copy cursor fits 384 bytes, including scanner, selected-property
+references and two optional Field descriptors. It retains no list of fields
+or copied names/values. Existing body-job parser state covers this inline
+state; immutable source and request-name storage remain externally owned.
+Fixtures cover duplicate/absent fields, original spelling, obsolete name
+whitespace, folds, EOF/body boundaries, long-name comparisons, offset/work
+refusal and provisional result retirement. Allocation probes cover last/all,
+absence and long names. Whole-worker stack and source capture remain open.
 
 ## 2. Read views and change history
 

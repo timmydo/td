@@ -1336,6 +1336,13 @@ Initial independently landable increments:
   independence. Field collection, structured values and JMAP wiring remain
   open; a permitted Text form alone does not authorize unstructured decoding.
 
+- **M06v — resident header occurrence traversal:** combine the raw scanner
+  with bounded case-insensitive name comparison. Stream all occurrences or
+  retain only the last, returning unchanged absolute value extents. Require
+  complete source and provisional-result retirement. Verify duplicates,
+  absence, long names, malformed body boundaries, limits and allocation-free
+  traversal. Source capture, value projection and protocol wiring remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

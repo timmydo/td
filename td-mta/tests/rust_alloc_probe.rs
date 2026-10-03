@@ -2064,6 +2064,71 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_selection() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property,
+        header_select::{Cursor, SourceEnd, Status},
+        ports::{Deadline, Tick},
+    };
+    let name = "x".repeat(4096);
+    let long_key = format!("header:{name}:all");
+    let long_source = format!("{name}: one\n{}: two\n\n", name.to_uppercase());
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1_000_000,
+            records: 100_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (key, source, expected) in [
+        ("subject", b"Subject: a\nSUBJECT: b\n\n".as_slice(), 1),
+        ("header:Subject:all", b"Subject: a\nSUBJECT: b\n\n", 2),
+        ("header:Missing:all", b"Subject: a\n\n", 0),
+        (long_key.as_str(), long_source.as_bytes(), 2),
+    ] {
+        let mut selector = header_property::Cursor::new(key, header_property::Context::Email);
+        let mut selected = None;
+        for _ in 0..1000 {
+            if let header_property::Status::Complete(value) =
+                selector.poll(Tick(1), &mut work).unwrap()
+            {
+                selected = value;
+                break;
+            }
+        }
+        let mut cursor = Cursor::new(
+            black_box(source),
+            0,
+            source.len() as u64,
+            selected.unwrap(),
+            SourceEnd::Prefix,
+        );
+        let mut complete = false;
+        let mut count = 0;
+        for _ in 0..10_000 {
+            match cursor.poll(Tick(1), &mut work).unwrap() {
+                Status::Match(field) => {
+                    assert!(field.value_end <= source.len() as u64);
+                    count += 1;
+                }
+                Status::Yield => {}
+                Status::Complete(_) => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete);
+        assert_eq!(count, expected);
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "header occurrence traversal allocated");
+}
+
 fn header_properties() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2709,6 +2774,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        header_selection();
         header_properties();
         header_nfc();
         encoded_word_candidates();
@@ -2809,6 +2875,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    header_selection();
     header_properties();
     header_nfc();
     encoded_word_candidates();

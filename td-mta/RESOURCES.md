@@ -795,6 +795,14 @@ A dedicated allocation interval covers single-byte fragmentation, folded
 field emission, body detection and sticky limit refusal with unchanged Rust
 counters. This does not qualify a full parser stack or source collection.
 
+The resident header occurrence cursor fits 384 bytes in the body job's
+16 KiB parser/boundary/locator state, including the raw scanner, borrowed
+property and two optional field descriptors. Header bytes and requested
+names remain in their existing externally owned arenas; no name, value or
+match list is allocated. All matches stream provisionally; last selection
+retains one extent. Isolated allocation intervals cover last/all, absence
+and long matching names. Complete capture and worker stack remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No
