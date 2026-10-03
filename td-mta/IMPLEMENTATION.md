@@ -1405,6 +1405,15 @@ Initial independently landable increments:
   No URL fetching, scheme execution or response publication is authorized.
   JSON serialization and complete worker qualification remain open.
 
+- **M06ae — address recovery boundaries:** partition raw field values only
+  at commas/semicolons outside quotes, comments, angles and domain literals.
+  Retain empty items and separator identities for later group grammar;
+  unmatched constructs consume and flag the remaining field tail. Bound
+  nesting and byte steps without recursion or strings. Cover escapes,
+  raw invalid bytes, long input, exact charges and allocation-free refusal.
+  Address/group grammar, fallback projection and display-name NFC remain
+  follow-on work; boundary completion grants no SMTP or JMAP authority.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

@@ -1701,6 +1701,46 @@ remain external. Tests cover URI grammar, folds, special NO, long data,
 whole-field refusal, exact costs and allocation-free success/refusal. JMAP
 serialization and complete worker qualification remain open.
 
+### 1.37 Address recovery item boundaries
+
+M06ae supplies `header_address_items::Cursor` over an admitted immutable
+field value ending at scanner value_end. It partitions raw source at commas
+and semicolons outside quoted strings, comments, angle brackets and domain
+literals. Quoted pairs protect the next byte only inside quotes, comments
+or literals. Parentheses/quotes inside a literal are data; brackets/quotes
+inside a comment are data. Nested comments and malformed nested angles
+have separate 32-level counters. Colon stays in its raw item for the future
+group grammar to interpret. This primitive validates no address syntax,
+UTF-8, fold or escape, and grants no SMTP recipient authority.
+
+Item gives absolute start/end offsets excluding the separator, its Comma,
+Semicolon or End identity, and an unclosed flag. Every item preserves all
+raw whitespace and bytes. Empty input and trailing separators return a
+final empty End item once; consecutive separators retain empty items.
+Those are grammar inputs, never automatically recovered empty addresses.
+The future parser must track groups across items and distinguish group
+closing semicolons from recovery separators.
+
+An unclosed quote/comment/angle/literal consumes the remaining field item
+and marks its End item unclosed; later commas cannot reopen recovery inside
+that tail. A false unclosed flag does not prove valid address syntax. Stray
+closing delimiters and other malformed bytes remain available to the
+fallback parser. This bounded best-effort choice preserves POLICY's rule
+against searching without limit for a missing closer. Complete reports
+partition completion only. Item events can precede a later work/depth
+failure and confer no response publication permission.
+
+Each poll performs at most 32 byte/EOF steps, prepaid by one record and
+one source-byte visit when a byte exists. A complete scan of n bytes costs
+exactly n visits and n+1 records, including the final EOF item; offsets
+charge no output bytes. Work/depth failures remain sticky across fresh
+meters; cached Complete is inert. State is non-Copy and fits 64 bytes with
+no token/string/list allocation or recursive stack. Admission, fresh clock
+and cancellation checks, fallback decoding/NFC, group/name/mailbox parsing
+and JMAP serialization remain with the enclosing owner. Tests and allocation
+intervals cover protected delimiters, escapes, empty items, unmatched tails,
+raw invalid bytes, long input, depth and sticky resource refusal.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

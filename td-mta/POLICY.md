@@ -28,14 +28,15 @@ can check that root alone before later MIME work; this does not grant a
 second header arena or a second allowance. Each fresh attached-message parse
 applies the same aggregate bound. mime_depth counts the root as one;
 mime_parts includes containers and leaves. The six locator stages are a
-separate bound. Nesting in comments/quoted constructs is capped at 32; a
-parser uses explicit frames. Header field names have the RFC
-printable-ASCII-except-colon grammar; accept RFC 5322 obsolete SP/HTAB
-between the name and colon without including that whitespace in the reported
-field name. A line need not fit an I/O chunk. Boundary values follow RFC
-2046's 1..70 character grammar. Parameter/field/address/ID lists stream
-within header_bytes; there is no unbounded heap list and no silent prefix
-accepted as a complete property.
+separate bound. Nesting in comments/quoted constructs is capped at 32.
+Address recovery separately caps malformed nested angle brackets at 32.
+Parsers use explicit frames. Header field names have the RFC printable-
+ASCII-except-colon grammar; accept RFC 5322 obsolete SP/HTAB between the
+name and colon without including that whitespace in the reported field name.
+A line need not fit an I/O chunk. Boundary values follow RFC 2046's 1..70
+character grammar. Parameter/field/address/ID lists stream within
+header_bytes; there is no unbounded heap list and no silent prefix accepted
+as a complete property.
 
 Malformed input and resource failure are distinct. For raw reception, root
 headers exceeding header_bytes are a declared message-size refusal before
@@ -153,18 +154,20 @@ byte-exact. The standalone Unicode normalizer still follows Unicode's identity
 behavior for such scalars; JSON representability is a separate mail projection
 step.
 
-All seven header forms are supported only in their RFC 8621 sections 4.1.2.1-7
-allowed combinations. Forbidden combinations are invalidArguments on reads and
-invalidProperties on structured creation. Addresses and GroupedAddresses
-support quoted pairs, comments, groups, UTF-8 display names and RFC 2047
-placement; use an immediately trailing comment as a missing display name.
-Recovery splits only at commas/semicolons outside quotes, comments and angle
-brackets; an otherwise unparseable nonempty item becomes
-{name:null,email:unfolded trimmed item}. An unmatched construct consumes the
-remaining item, not an unbounded search for a closing token. Parsed display
-names receive NFC; stored/rendered addresses never authorize SMTP recipients.
-The stricter outbound addr-spec/envelope validator rejects malformed recovered
-addresses and CR/LF/NUL rather than sending them.
+All seven header forms are supported only in their RFC 8621 sections
+4.1.2.1-7 allowed combinations. Forbidden combinations are invalidArguments
+on reads and invalidProperties on structured creation. Addresses and
+GroupedAddresses support quoted pairs, comments, groups, UTF-8 display names
+and RFC 2047 placement; use an immediately trailing comment as a missing
+display name. Recovery splits only at commas/semicolons outside quotes,
+comments, angle brackets and domain literals; an otherwise unparseable
+nonempty item becomes {name:null,email:unfolded trimmed item}. An unmatched
+construct consumes the remaining item, not an unbounded search for a closing
+token. Boundary scanning retains empty items for group/separator
+interpretation; never invent a recovered empty email from them. Parsed
+display names receive NFC; stored/rendered addresses never authorize SMTP
+recipients. The stricter outbound addr-spec/envelope validator rejects
+malformed recovered addresses and CR/LF/NUL rather than sending them.
 
 MessageIds parses complete RFC 5322 msg-id lists, removes grammatical CFWS
 and outer angle brackets, and returns null for an invalid list. For

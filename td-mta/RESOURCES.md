@@ -852,6 +852,14 @@ intervals cover long URLs, IPv6 and IPvFuture, whitespace, malformed input
 and refusal. Complete JMAP response storage and worker composition remain
 unqualified.
 
+The address recovery boundary cursor fits 64 bytes in the body parser
+reservation, with fixed quote/literal/escape flags and separate 32-level
+comment/angle counters. Raw item offsets retain no text. A complete scan
+charges one record per byte plus EOF; no output is charged. Allocation
+intervals cover long quoted UTF-8, domain literals, unmatched tails, empty
+items, nesting limits and work failure. Complete address/group grammar,
+text/NFC composition and response storage remain unqualified.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

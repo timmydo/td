@@ -2064,6 +2064,73 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_address_boundaries() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_address_items::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    fn drive(cursor: &mut Cursor<'_>, work: &mut Meter) -> Result<usize, Error> {
+        let mut count = 0;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1), work)? {
+                Status::Complete => return Ok(count),
+                Status::Item(item) => {
+                    black_box(item);
+                    count += 1;
+                }
+                Status::Yield => {}
+            }
+        }
+        panic!("address boundary allocation probe did not finish");
+    }
+    let long = format!("\"{}\" <a@b>,c@d", "é,;".repeat(100_000));
+    let comments = "(".repeat(33);
+    let angles = "<".repeat(33);
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 10_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, expected) in [
+        (long.as_bytes(), Ok(2)),
+        (b"a@[x,y];b".as_slice(), Ok(2)),
+        (b"ok,\"a,b;c", Ok(2)),
+        (b";,,", Ok(4)),
+        (comments.as_bytes(), Err(Error::NestingLimit)),
+        (angles.as_bytes(), Err(Error::NestingLimit)),
+    ] {
+        assert_eq!(
+            drive(&mut Cursor::new(black_box(source)), &mut work),
+            expected
+        );
+    }
+    let mut cursor = Cursor::new(b"a,b");
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 2,
+            records: 100,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut limited),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut work),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "address boundary scan allocated");
+}
+
 fn header_url_text() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3303,6 +3370,7 @@ fn main() {
         header_message_id_lists();
         header_message_id_text();
         header_url_text();
+        header_address_boundaries();
         header_date_projection();
         header_dates();
         header_comments();
@@ -3411,6 +3479,7 @@ fn main() {
     header_message_id_lists();
     header_message_id_text();
     header_url_text();
+    header_address_boundaries();
     header_date_projection();
     header_dates();
     header_comments();
