@@ -2912,6 +2912,47 @@ refusal in both registered modes. Budgeted address text/normalization,
 property JSON, response-spool publication and complete worker/native/RSS
 qualification remain follow-on work.
 
+### 1.63 Budgeted resident address text
+
+M06be adds `header_address_text::Budgeted` for Parsed addr-spec and Fallback
+text. Private constructors reuse the existing budgeted MessageIds conversion
+engine with its original Meter/HeaderBudget borrows, private credit, sticky
+failure and 127-transition unfolding turn. Public MessageIds construction
+still selects only MessageIds semantics; no purpose selector is exposed. The
+address facade yields only Scalar/Yield/Complete and is not Clone.
+
+Parsed mode validates the complete addr-spec before any scalar, then replays
+its admitted grammar parts, discards grammatical CFWS and unfolds text.
+Fallback mode trims raw edge whitespace, unfolds and repairs invalid UTF-8.
+Both preserve case and decomposed spelling, avoid encoded-word
+interpretation and NFC, and replace noncharacters while reporting an
+encoding problem. Diagnostics become final only with Complete. No delivery
+authority is granted.
+
+The shared Conversion policy charges parser visits/records, trimming, EOF
+and conversion work to the aggregate budget. Intermediate unfolded bytes and
+emitted UTF-8 scalar bytes are separately charged as output; each output
+admission also consumes one aggregate step before job output admission. A
+later refusal retains earlier charges and retires all emitted text. Resource
+errors never become malformed or silently select fallback. Explicit final
+admission remains live after otherwise inert cached completion.
+
+The facade fits 448 bytes in the existing 16 KiB parser reservation,
+replacing standalone address text state. Turns admit at most 160 visits, 255
+steps, sixteen job records and four output bytes. There is no extra scratch
+or NFC arena. Empty fallback costs one step, no visits/output and one
+private job record; `a@b` costs 24/8 visits in Parsed/Fallback and six
+output bytes in both (three intermediate plus three scalar bytes).
+
+Tests compare plain/budgeted text, diagnostics, visits and output costs,
+including long inputs, folds, malformed syntax and repaired UTF-8. They
+exhaust partial aggregate byte/step budgets, every output cutoff for a short
+address, field-credit isolation and terminal job/nesting/deadline failures.
+Probe intervals cover long Parsed/Fallback text, noncharacters, encoding
+repair and refusals in both registered modes. Name normalization, complete
+address-property composition, unpublished response-spool retention and
+combined worker/native/RSS qualification remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

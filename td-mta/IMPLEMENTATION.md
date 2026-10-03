@@ -1598,6 +1598,12 @@ Initial independently landable increments:
   Pin EOF, private credit, partial cutoffs, late group refusal and fixed-state
   allocation evidence. Text conversion and property composition remain open.
 
+- **M06be — budgeted resident address text:** reuse private conversion
+  ownership for Parsed addr-spec and raw Fallback text. Charge validation,
+  replay, trimming, unfolding and scalar output to original budgets; preserve
+  identity spelling and selected encoding diagnostics. Cover partial limits,
+  private credit and allocation-free long input. Property JSON remains open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

@@ -1,9 +1,11 @@
 //! Provisional address text; no NFC, encoded-word interpretation or authority.
+mod budgeted;
 use crate::{
     admission::work::{Meter, Stop},
     header_message_ids,
     ports::Tick,
 };
+pub use budgeted::Budgeted;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Malformed,

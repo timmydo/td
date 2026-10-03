@@ -3202,6 +3202,70 @@ fn url_header_values() {
     assert_eq!(before, after, "URLs property assembly allocated");
 }
 
+fn budgeted_address_text() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_address_text::{Budgeted, Error, Mode, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("{}@b", "🐈".repeat(4096));
+    let fallback = format!(" \t{}\r\n ", "e\u{301}".repeat(4096));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for (source, mode, count, problem, malformed) in [
+        (long.as_bytes(), Mode::Parsed, 4098, false, false),
+        (fallback.as_bytes(), Mode::Fallback, 8192, false, false),
+        (b"\xffx\xe2\x82".as_slice(), Mode::Fallback, 3, true, false),
+        ("\u{fdd0}@b".as_bytes(), Mode::Parsed, 3, true, false),
+        (b"a@b bad", Mode::Parsed, 0, false, true),
+    ] {
+        let mut cursor = Budgeted::new(black_box(source), mode, &mut work, &mut budget);
+        let mut scalars = 0;
+        let mut finished = false;
+        for _ in 0..200_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Scalar(_)) => scalars += 1,
+                Ok(Status::Complete) => {
+                    assert!(!malformed);
+                    cursor.check_deadline(Tick(1)).unwrap();
+                    finished = true;
+                    break;
+                }
+                Err(Error::Malformed) => {
+                    assert!(malformed);
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Malformed));
+                    finished = true;
+                    break;
+                }
+                Ok(Status::Yield) => {}
+                Err(error) => panic!("unexpected budgeted address text failure: {error}"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(scalars, count);
+        assert_eq!(cursor.is_encoding_problem(), problem);
+    }
+    let mut cursor = Budgeted::new(b"a@b", Mode::Parsed, &mut work, &mut budget);
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted address text allocated");
+}
+
 fn budgeted_header_addresses() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -5206,6 +5270,7 @@ fn main() {
         budgeted_date_projection();
         header_dates();
         url_header_values();
+        budgeted_address_text();
         budgeted_header_addresses();
         budgeted_header_urls();
         message_id_header_values();
@@ -5339,6 +5404,7 @@ fn main() {
     budgeted_date_projection();
     header_dates();
     url_header_values();
+    budgeted_address_text();
     budgeted_header_addresses();
     budgeted_header_urls();
     message_id_header_values();

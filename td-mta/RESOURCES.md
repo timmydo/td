@@ -1121,6 +1121,15 @@ Allocation intervals cover long group/name input, routes, comments, malformed
 recovery and terminal refusal. Budgeted text/NFC composition and combined
 worker/native/RSS qualification remain open.
 
+The budgeted address text facade (M06be) fits 448 bytes in the existing
+16 KiB parser reservation, replacing standalone text state. It reuses the
+budgeted conversion engine, original budgets, private credit, one-byte handoff
+and 127-transition unfolding turn. No NFC scratch or new arena is needed.
+Per-turn ceilings are 160 visits, 255 aggregate steps, sixteen job records and
+four output bytes. Allocation intervals cover long Parsed/Fallback text,
+repair, noncharacters and refusals. Name/property composition and combined
+worker/native/RSS qualification remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

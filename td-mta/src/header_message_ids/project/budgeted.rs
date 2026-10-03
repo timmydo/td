@@ -26,8 +26,25 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
     ) -> Self {
+        Self::with_cursor(Cursor::new(source, mode), work, budget)
+    }
+    pub(crate) fn addr_spec(
+        source: &'a [u8],
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Self {
+        Self::with_cursor(Cursor::addr_spec(source), work, budget)
+    }
+    pub(crate) fn fallback(
+        source: &'a [u8],
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Self {
+        Self::with_cursor(Cursor::fallback(source), work, budget)
+    }
+    fn with_cursor(cursor: Cursor<'a>, work: &'w mut Meter, budget: &'w mut HeaderBudget) -> Self {
         Self {
-            cursor: Cursor::new(source, mode),
+            cursor,
             work,
             budget,
             credit: 0,
