@@ -438,7 +438,14 @@ of its own files may name each module.
   rectangle, the same highlight, dim and prefix, a marked row starred
   and an optional right-aligned `Item` column, empty rows below left
   chrome, and a scrollbar in a `SCROLL_GUTTER` (16)-pixel gutter at its
-  right; `reveal` keeps the selection shown, `reveal_within` keeps a
+  right, all inside a `BORDER` bezel a scaled pixel wide round the
+  rectangle, as a `Button`'s, so a list's bounds show against a field or
+  pane beside it. The bezel takes no row geometry: `rows`, `row`, `body`
+  and `hit` are the rectangle's as without it, and the rows and the thumb
+  paint clipped inside it, so a row's outermost pixels are the bezel's
+  and a thumb at the top of the track loses a scaled pixel, and at its
+  foot whatever of the bezel the remainder below the rows leaves over
+  it; `reveal` keeps the selection shown, `reveal_within` keeps a
   margin of rows shown on each side of it too where the list has them,
   the window stopping at the list's ends and the margin clamped to the
   whole number below half the rows, `(rows - 1) / 2`, so a large one
@@ -463,10 +470,13 @@ of its own files may name each module.
   and at most `STATUS_COLUMNS` (512), a control scalar blank and the last
   cell an ellipsis when the line is longer, under a top border; `frame`
   paints the row without a line for a consumer laying out its own status.
-  `TextEntry` is one `ROW`-tall paper field the caller drives with a
-  `Field`: the text from the first shown column, an optional selection
-  filled `SELECTED` focused or `INACTIVE_SELECTION` not with the ink
-  flipped over it, a one-pixel `INK` caret the caller blinks, a dim
+  `TextEntry` is one `ROW`-tall paper field inside a `BORDER` bezel a
+  scaled pixel wide, as a `Button`'s, so a field's bounds show against
+  the list or pane under it; the bezel lies in the text's cell inset, so
+  the columns, `hit` and `reveal` are as without it. The caller drives it
+  with a `Field`: the text from the first shown column, an optional
+  selection filled `SELECTED` focused or `INACTIVE_SELECTION` not with
+  the ink flipped over it, a one-pixel `INK` caret the caller blinks, a dim
   placeholder when empty, and a masked mode drawing a fixed mask glyph
   per character; `reveal` keeps the caret shown and `hit` maps a point to
   a caret column. Each streams its fills and glyphs inside a damage
@@ -1537,27 +1547,33 @@ row truncating a long line to an ellipsis in the last cell; and one
 whole-surface pixel oracle rasterizing the status band to confirm its
 border and fill land and the rows above stay untouched. The list adds
 its own: the selection highlight, disabled dim, star mark and
-right-aligned column, the whole rect painted chrome behind the rows, a
-selection off the window drawing no highlight, `reveal`'s least-move
-window and `reveal_within`'s margin kept on each side, stopped at the
-ends and clamped to the whole number below half the rows, the
-scrollbar thumb tracking it and a disabled bar's border thumb, `hit`
-mapping a point to a row, `new` refusing a rect the surface
-or the gutter cannot hold, all at more than one scale, and a
+right-aligned column, the four bezel bands round a chrome face behind
+the rows with the selection clipped inside them, a remainder row above
+the lower bezel, a selection off the window drawing no highlight,
+`reveal`'s least-move window and `reveal_within`'s margin kept on each
+side, stopped at the ends and clamped to the whole number below half
+the rows, the scrollbar thumb tracking it and a disabled bar's border
+thumb, `hit` mapping a point to a row, `new` refusing a rect the
+surface or the gutter cannot hold, all at more than one scale, and a
 whole-surface pixel oracle for its selection, its scrollbar and the
-pixels around it left untouched. The text entry adds its own: the paper
-ground, the one-pixel caret after the text, the mask glyph shown in
-place of each character, a selection filled and its ink flipped focused
-and unfocused, a dim placeholder only when empty, a scrolled window from
-a non-zero first with the caret and selection shifted, `reveal`'s
+pixels around it left untouched. The text entry adds its own: the four
+bezel bands round the paper face, the one-pixel caret after the text,
+the mask glyph shown in place of each character, a selection filled and
+its ink flipped focused and unfocused, a dim placeholder only when
+empty, a scrolled window from a non-zero first with the caret and
+selection shifted, `reveal`'s
 least-move window keeping the caret at the inset without a needless
 scroll, `hit`'s point-to-column clamped to the shown columns, `new`'s
 refusals, a stale first that cannot panic, the geometry, caret and `hit`
 at a second scale and an offset, and pixel oracles that show the
 selection ground focused and unfocused with the ink over it, a clean
 caret column, the mask glyph rasterized to exactly the bullet, and the
-pixels around the field left untouched. td-editor keeps its scene-level
-render, ui and menu oracles.
+pixels around the field left untouched. A field over a list whose items
+fill every row is painted at scales 1-4: each closed by its bezel on all
+four sides with the face a scaled pixel in, every bezel fill inside its
+rectangle and off the face and every other draw inside the face, and a
+repaint of a face alone streaming no `BORDER`. td-editor keeps its
+scene-level render, ui and menu oracles.
 
 `tests/messages.rs` holds the message list through a clipboard that
 records each copy or refuses as told: bodies wrapped at a word, or
@@ -2266,7 +2282,8 @@ wrapped rows. Insufficient width, height, label space or wrapping capacity
 refuses with `NoRoom`, without omitting an action or part of the request.
 A valid layout shows the complete title and action labels, at least one
 detail row, and every action. Title and actions stay visible while details
-scroll, separated from the fixed controls by visible rules. Resize
+scroll, separated from the fixed controls by the detail list's own bezel
+(`chrome::List`). Resize
 retains the selected detail and scroll anchor by entry and byte offset,
 then reflows fallibly; a refusal closes with `Unavailable` and never
 leaves an old invisible confirmation target active.

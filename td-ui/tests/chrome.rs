@@ -343,6 +343,48 @@ fn a_band_paints_its_pixels_and_leaves_the_rest_of_the_surface_alone() {
 
 // ---- the paged list ----
 
+/// The face inside a widget's bezel, `s` pixels wide.
+fn face(rect: Rect, s: u32) -> Rect {
+    Rect {
+        x: rect.x + i64::from(s),
+        y: rect.y + i64::from(s),
+        width: rect.width - 2 * s,
+        height: rect.height - 2 * s,
+    }
+}
+
+/// The fills a widget's bezel `s` pixels wide streams over the whole
+/// surface: its top, bottom, left and right bands, then the face.
+fn bezel(rect: Rect, s: u32, color: u32) -> [(Rect, u32); 5] {
+    let inner = face(rect, s);
+    let sides = Rect {
+        y: inner.y,
+        height: inner.height,
+        ..rect
+    };
+    [
+        (Rect { height: s, ..rect }, BORDER),
+        (
+            Rect {
+                y: inner.y + i64::from(inner.height),
+                height: s,
+                ..rect
+            },
+            BORDER,
+        ),
+        (Rect { width: s, ..sides }, BORDER),
+        (
+            Rect {
+                x: inner.x + i64::from(inner.width),
+                width: s,
+                ..sides
+            },
+            BORDER,
+        ),
+        (inner, color),
+    ]
+}
+
 fn items<'a>(specs: &'a [(&'a str, &'a str, bool, bool)]) -> Vec<Item<'a>> {
     specs
         .iter()
@@ -381,29 +423,32 @@ fn a_list_highlights_the_selection_dims_the_disabled_and_marks_and_right_aligns(
     });
     let filled = fills(&draws);
     let painted = glyphs(&draws);
-    // Row 1 is the selection; row 0 is ordinary chrome.
+    // Row 1 is the selection; row 0 is ordinary chrome. Both stop at the
+    // bezel, a pixel in from the rect's left and top.
     assert!(filled.contains(&(
         Rect {
-            x: 0,
+            x: 1,
             y: 24,
-            width: 304,
+            width: 303,
             height: 24
         },
         SELECTED_ROW
     )));
     assert!(filled.contains(&(
         Rect {
-            x: 0,
-            y: 0,
-            width: 304,
-            height: 24
+            x: 1,
+            y: 1,
+            width: 303,
+            height: 23
         },
         CHROME
     )));
-    // The whole rect is painted chrome first, covering the gutter and its
-    // margin; with nothing to scroll the thumb is a border block.
-    assert!(filled.contains(&(list.rect(), CHROME)));
-    assert!(filled.iter().any(|&(_, c)| c == BORDER));
+    // The whole rect is painted a bezel round chrome first, covering the
+    // gutter and its margin; with nothing to scroll the thumb is a border
+    // block inside the bezel.
+    assert_eq!(filled[..5], bezel(list.rect(), 1, CHROME));
+    let thumb = list.scrollbar(5, 0).thumb;
+    assert!(filled.contains(&(thumb.intersection(face(list.rect(), 1)).unwrap(), BORDER)));
     // The marked row is prefixed with a star at its first cell.
     assert!(painted
         .iter()
@@ -422,7 +467,7 @@ fn a_list_highlights_the_selection_dims_the_disabled_and_marks_and_right_aligns(
 }
 
 #[test]
-fn a_short_list_fills_the_whole_rect_with_chrome_behind_its_rows() {
+fn a_short_list_fills_its_face_with_chrome_behind_its_rows() {
     let surface = surface(320, 200, 1);
     let list = List::new(
         surface,
@@ -438,9 +483,9 @@ fn a_short_list_fills_the_whole_rect_with_chrome_behind_its_rows() {
     let draws = run(surface, |damage, sink| {
         list.emit(rows, 0, 0, 2, damage, sink)
     });
-    // The whole rect is one chrome fill, so the empty rows below the two
-    // items — and the gutter and its margin — show chrome.
-    assert!(fills(&draws).contains(&(list.rect(), CHROME)));
+    // The face inside the bezel is one chrome fill, so the empty rows
+    // below the two items — and the gutter and its margin — show chrome.
+    assert!(fills(&draws).contains(&(face(list.rect(), 1), CHROME)));
     // No glyph is painted below the last item.
     assert!(glyphs(&draws).iter().all(|&(_, y, _, _, _)| y < 48));
 }
@@ -663,13 +708,14 @@ fn a_list_at_scale_two_and_an_offset_places_its_rows_and_gutter() {
         list.emit(rows, 0, 1, 3, damage, sink)
     });
     let filled = fills(&draws);
-    // The whole rect is chrome; row 1 is the selection at the scaled offset.
-    assert!(filled.contains(&(rect, CHROME)));
+    // The rect is a two-pixel bezel round chrome; row 1 is the selection
+    // at the scaled offset, inside the bezel's left.
+    assert_eq!(filled[..5], bezel(rect, 2, CHROME));
     assert!(filled.contains(&(
         Rect {
-            x: 16,
+            x: 18,
             y: 64,
-            width: 288,
+            width: 286,
             height: 48
         },
         SELECTED_ROW
@@ -711,9 +757,9 @@ fn a_selection_off_the_window_draws_no_highlight() {
     });
     assert!(fills(&shown).contains(&(
         Rect {
-            x: 0,
+            x: 1,
             y: 24,
-            width: 304,
+            width: 303,
             height: 24
         },
         SELECTED_ROW
@@ -739,7 +785,8 @@ fn a_selection_off_the_window_draws_no_highlight() {
 #[test]
 fn a_list_with_a_remainder_fills_the_bottom_and_reports_exact_body() {
     let font = font::pinned().unwrap();
-    let (width, height) = (320usize, 121usize); // 5 rows of 24 plus a 1px remainder
+    // 5 rows of 24 plus a 2px remainder, the bezel its lower pixel.
+    let (width, height) = (320usize, 122usize);
     let surface = surface(width, height, 1);
     let list = List::new(
         surface,
@@ -747,7 +794,7 @@ fn a_list_with_a_remainder_fills_the_bottom_and_reports_exact_body() {
             x: 0,
             y: 0,
             width: 320,
-            height: 121,
+            height: 122,
         },
     )
     .unwrap();
@@ -777,9 +824,15 @@ fn a_list_with_a_remainder_fills_the_bottom_and_reports_exact_body() {
             pixels[base + 3],
         ])
     };
-    // The 1px remainder row at the bottom is chrome, not stale.
+    // The remainder row above the bezel is chrome, not stale, and the
+    // bezel closes the list on all four sides.
     assert_eq!(pixel(100, 120) & 0xff_ffff, CHROME);
     assert_eq!(pixel(318, 120) & 0xff_ffff, CHROME);
+    for (x, y) in [(100, 121), (100, 0), (0, 60), (319, 60)] {
+        assert_eq!(pixel(x, y) & 0xff_ffff, BORDER, "the bezel at {x},{y}");
+    }
+    // The selected first row's highlight begins inside the bezel.
+    assert_eq!(pixel(1, 1) & 0xff_ffff, SELECTED_ROW & 0xff_ffff);
 }
 
 #[test]
@@ -795,9 +848,12 @@ fn an_empty_list_paints_only_chrome_and_a_border_thumb() {
     let draws = run(surface, |damage, sink| {
         list.emit(items(&[]), 0, 0, 0, damage, sink)
     });
-    // The whole rect is chrome and the disabled bar shows a border thumb.
-    assert!(fills(&draws).contains(&(rect, CHROME)));
-    assert!(fills(&draws).iter().any(|&(_, c)| c == BORDER));
+    // The rect is a bezel round chrome and the disabled bar shows a border
+    // thumb inside it.
+    let filled = fills(&draws);
+    assert_eq!(filled[..5], bezel(rect, 1, CHROME));
+    let thumb = list.scrollbar(0, 0).thumb.intersection(face(rect, 1));
+    assert_eq!(filled[5..], [(thumb.unwrap(), BORDER)]);
     assert!(glyphs(&draws).is_empty());
     assert!(!list.scrollbar(0, 0).enabled());
 }
@@ -918,6 +974,116 @@ fn field(text: &str) -> Field<'_> {
     }
 }
 
+/// A field over a list, as td-pass and the finder stack them, painted
+/// whole at each scale: each is closed by its own bezel a scaled pixel
+/// wide, the faces stop inside them, and damage inside a face leaves the
+/// bezel alone.
+#[test]
+fn a_field_and_a_list_each_show_their_bounds_in_a_bezel() {
+    let font = font::pinned().unwrap();
+    for scale in 1..=4u8 {
+        let s = u32::from(scale);
+        let (width, height) = (200 * s as usize, 100 * s as usize);
+        let surface = surface(width, height, scale);
+        let row = 24 * s;
+        let field_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 160 * s,
+            height: row,
+        };
+        let list_rect = Rect {
+            y: i64::from(row),
+            height: 3 * row,
+            ..field_rect
+        };
+        let entry = TextEntry::new(surface, field_rect).unwrap();
+        let list = List::new(surface, list_rect).unwrap();
+        // Every row holds an item, so the last row's fill reaches the
+        // lower bezel and must stop at it.
+        let rows = items(&[
+            ("one", "", true, false),
+            ("two", "", true, false),
+            ("three", "", true, false),
+        ]);
+        let mut pixels = vec![0u8; width * height * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+        entry.emit(field("hi"), surface.bounds(), &mut |draw| raster.draw(draw));
+        list.emit(rows, 0, 0, 3, surface.bounds(), &mut |draw| {
+            raster.draw(draw)
+        });
+        let pixel = |x: u32, y: u32| -> u32 {
+            let base = (y as usize * width + x as usize) * 4;
+            u32::from_le_bytes([
+                pixels[base],
+                pixels[base + 1],
+                pixels[base + 2],
+                pixels[base + 3],
+            ]) & 0xff_ffff
+        };
+        for (rect, inside) in [(field_rect, PAPER), (list_rect, SELECTED_ROW)] {
+            let (left, top) = (rect.x as u32, rect.y as u32);
+            let (right, bottom) = (left + rect.width - 1, top + rect.height - 1);
+            for d in 0..s {
+                for (x, y) in [
+                    (left + d, top + s + 2),
+                    (right - d, top + s + 2),
+                    (left + s + 2, top + d),
+                    (left + s + 2, bottom - d),
+                ] {
+                    assert_eq!(pixel(x, y), BORDER, "scale {scale}: bezel at {x},{y}");
+                }
+            }
+            // The face begins a scaled pixel in: the field's paper, the
+            // list's selected first row.
+            assert_eq!(
+                pixel(left + s, top + s),
+                inside & 0xff_ffff,
+                "scale {scale}"
+            );
+        }
+        // Outside both, the surface is untouched.
+        assert_eq!(pixel(160 * s, 10), 0);
+        assert_eq!(pixel(10, 4 * row), 0);
+        // Whole, the bezel's fills lie off the face and everything else
+        // inside it; a repaint of the face alone streams no bezel. The
+        // list has more items than rows, so its thumb is not `BORDER`.
+        let field_draws = |damage| run(surface, |_, sink| entry.emit(field("hi"), damage, sink));
+        let list_draws = |damage| {
+            run(surface, |_, sink| {
+                let rows = items(&[("one", "", true, false), ("two", "", true, false)]);
+                list.emit(rows, 0, 0, 20, damage, sink)
+            })
+        };
+        for (rect, draws) in [
+            (field_rect, &field_draws as &dyn Fn(Rect) -> Vec<Draw>),
+            (list_rect, &list_draws),
+        ] {
+            let inner = face(rect, s);
+            for draw in draws(rect) {
+                let bezel =
+                    matches!(draw.primitive, Primitive::Fill { color, .. } if color == BORDER);
+                if bezel {
+                    assert_eq!(inner.intersection(draw.clip), None, "scale {scale}");
+                    assert_eq!(rect.intersection(draw.clip), Some(draw.clip));
+                } else {
+                    assert_eq!(
+                        inner.intersection(draw.clip),
+                        Some(draw.clip),
+                        "scale {scale}: {draw:?} leaves the face"
+                    );
+                }
+            }
+            let repaint = draws(inner);
+            assert!(!repaint.is_empty());
+            assert!(
+                fills(&repaint).iter().all(|&(_, color)| color != BORDER),
+                "scale {scale}: a face repaint streams the bezel"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_text_entry_paints_paper_the_text_and_a_one_pixel_caret() {
     let surface = surface(320, 200, 1);
@@ -937,8 +1103,9 @@ fn a_text_entry_paints_paper_the_text_and_a_one_pixel_caret() {
     });
     let filled = fills(&draws);
     let painted = glyphs(&draws);
-    // The paper ground fills the whole field.
-    assert!(filled.contains(&(entry.rect(), PAPER)));
+    // A one-pixel bezel round the paper ground marks the field's bounds,
+    // painted first so the text and caret lie over the paper.
+    assert_eq!(filled[..5], bezel(entry.rect(), 1, PAPER));
     // The caret is a one-pixel ink column after the last character.
     assert!(filled.contains(&(
         Rect {
@@ -1286,7 +1453,8 @@ fn a_text_entry_at_scale_two_and_an_offset_places_its_text_and_caret() {
     });
     let filled = fills(&draws);
     let painted = glyphs(&draws);
-    assert!(filled.contains(&(rect, PAPER)));
+    // The bezel is two scaled pixels wide.
+    assert_eq!(filled[..5], bezel(rect, 2, PAPER));
     // Text one scaled cell in (x=32), one scaled inset down (y=24).
     assert!(painted
         .iter()
@@ -1562,7 +1730,7 @@ fn a_stale_first_cannot_panic_the_field_and_keeps_the_caret() {
             sink,
         )
     });
-    assert!(fills(&stale).contains(&(entry.rect(), PAPER)));
+    assert!(fills(&stale).contains(&(face(entry.rect(), 1), PAPER)));
 }
 
 #[test]
@@ -1750,9 +1918,14 @@ fn a_button_strip_lays_bordered_buttons_from_cell_one_and_hits_only_whole_ones()
         });
         let painted = fills(&draws);
         assert_eq!(painted[0], (strip.rect(), CHROME));
+        let faces = [PAPER, SELECTED, PAPER, PAPER];
+        let colors: Vec<u32> = faces
+            .iter()
+            .flat_map(|&face| [BORDER, BORDER, BORDER, BORDER, face])
+            .collect();
         assert_eq!(
             painted[1..].iter().map(|f| f.1).collect::<Vec<u32>>(),
-            vec![BORDER, PAPER, BORDER, SELECTED, BORDER, PAPER, BORDER, PAPER]
+            colors
         );
         let lettered = glyphs(&draws);
         let text: String = lettered.iter().map(|g| g.2).collect();
@@ -1898,7 +2071,8 @@ fn a_button_strip_lays_bordered_buttons_from_cell_one_and_hits_only_whole_ones()
             strip.emit(std::iter::repeat((false, true)), damage, sink)
         });
         assert_eq!(fills(&draws)[0], (strip.rect(), CHROME));
-        assert_eq!(fills(&draws).len(), 1 + 2 * 4);
+        // The band, then each of four buttons' four bezel bands and face.
+        assert_eq!(fills(&draws).len(), 1 + 5 * 4);
         let text: String = glyphs(&draws).iter().map(|g| g.2).collect();
         assert_eq!(text, "AllPicksRejectsUnflagged");
         // A band given its own left and width lays from there; a button
@@ -1999,66 +2173,17 @@ fn a_hinted_button_lifts_its_caption_and_marks_the_hint_under_it() {
                 color,
             )
         };
-        assert_eq!(
-            painted[1..],
-            [
-                (rects[0], BORDER),
-                (
-                    Rect {
-                        x: rects[0].x + px(1),
-                        y: rects[0].y + px(1),
-                        width: rects[0].width - 2 * px(1) as u32,
-                        height: rects[0].height - 2 * px(1) as u32
-                    },
-                    PAPER
-                ),
-                band(rects[0], PAPER),
-                (rects[1], BORDER),
-                (
-                    Rect {
-                        x: rects[1].x + px(1),
-                        y: rects[1].y + px(1),
-                        width: rects[1].width - 2 * px(1) as u32,
-                        height: rects[1].height - 2 * px(1) as u32
-                    },
-                    SELECTED
-                ),
-                band(rects[1], SELECTED),
-                (rects[2], BORDER),
-                (
-                    Rect {
-                        x: rects[2].x + px(1),
-                        y: rects[2].y + px(1),
-                        width: rects[2].width - 2 * px(1) as u32,
-                        height: rects[2].height - 2 * px(1) as u32
-                    },
-                    PAPER
-                ),
-                band(rects[2], PAPER),
-                (rects[3], BORDER),
-                (
-                    Rect {
-                        x: rects[3].x + px(1),
-                        y: rects[3].y + px(1),
-                        width: rects[3].width - 2 * px(1) as u32,
-                        height: rects[3].height - 2 * px(1) as u32
-                    },
-                    PAPER
-                ),
-                band(rects[3], PAPER),
-                (rects[4], BORDER),
-                (
-                    Rect {
-                        x: rects[4].x + px(1),
-                        y: rects[4].y + px(1),
-                        width: rects[4].width - 2 * px(1) as u32,
-                        height: rects[4].height - 2 * px(1) as u32
-                    },
-                    PAPER
-                ),
-                band(rects[4], PAPER),
-            ]
-        );
+        let faces = [PAPER, SELECTED, PAPER, PAPER, PAPER];
+        let expected: Vec<(Rect, u32)> = rects
+            .iter()
+            .zip(faces)
+            .flat_map(|(&rect, face)| {
+                bezel(rect, s as u32, face)
+                    .into_iter()
+                    .chain([band(rect, face)])
+            })
+            .collect();
+        assert_eq!(painted[1..], expected[..]);
         // The marks: centred under the caption, `hint::ADVANCE` apart, on
         // the band's rows; the lighter ink, or the caption's when the
         // button is selected or disabled; from the face's left, the marks

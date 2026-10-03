@@ -61,6 +61,51 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
     }
 }
 
+/// Fills `rect` with a `BORDER` bezel one scaled pixel wide round a `face`
+/// and answers the face, the rectangle less the bezel; on a side shorter
+/// than two bezels each is at most half the side. The bezel is four bands
+/// and the face one fill, so damage inside the face streams no `BORDER`.
+fn bezel(rect: Rect, scale: Scale, face: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) -> Rect {
+    let s = scale.value() as u32;
+    let inset_x = s.min(rect.width / 2);
+    let inset_y = s.min(rect.height / 2);
+    let inner = Rect {
+        x: rect.x + i64::from(inset_x),
+        y: rect.y + i64::from(inset_y),
+        width: rect.width.saturating_sub(2 * inset_x),
+        height: rect.height.saturating_sub(2 * inset_y),
+    };
+    let sides = Rect {
+        y: inner.y,
+        height: inner.height,
+        ..rect
+    };
+    for band in [
+        Rect {
+            height: inset_y,
+            ..rect
+        },
+        Rect {
+            y: inner.y + i64::from(inner.height),
+            height: inset_y,
+            ..rect
+        },
+        Rect {
+            width: inset_x,
+            ..sides
+        },
+        Rect {
+            x: inner.x + i64::from(inner.width),
+            width: inset_x,
+            ..sides
+        },
+    ] {
+        fill(band, BORDER, damage, sink);
+    }
+    fill(inner, face, damage, sink);
+    inner
+}
+
 /// A bordered action with shared text, focus and disabled styling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Button {
@@ -110,17 +155,8 @@ impl Button {
         let hint = hint.filter(|hint| !hint.is_empty());
         let s = self.surface.scale.value() as u32;
         let outer = self.rect;
-        let inset_x = s.min(outer.width / 2);
-        let inset_y = s.min(outer.height / 2);
-        let inner = Rect {
-            x: outer.x + i64::from(inset_x),
-            y: outer.y + i64::from(inset_y),
-            width: outer.width.saturating_sub(2 * inset_x),
-            height: outer.height.saturating_sub(2 * inset_y),
-        };
         let background = if selected && enabled { SELECTED } else { PAPER };
-        fill(outer, BORDER, damage, sink);
-        fill(inner, background, damage, sink);
+        let inner = bezel(outer, self.surface.scale, background, damage, sink);
         // The text sits centred in the button's height: `INSET.1` down in
         // a `ROW`-tall one, nearer the top in a shorter one.
         let text_y = (i64::from(outer.height) - (CELL_HEIGHT * s as usize) as i64).max(0) / 2;
@@ -774,7 +810,9 @@ pub struct Item<'a> {
 
 /// A scrolling list filling a rectangle: `ROW`-tall rows painted by the
 /// panel's row painter, a marked row prefixed, an optional right-aligned
-/// column, and a scrollbar in the gutter at its right. The caller owns the
+/// column, and a scrollbar in the gutter at its right, all inside a
+/// `BORDER` bezel one scaled pixel wide that the rows' geometry keeps
+/// (a row's outermost pixels are the bezel's). The caller owns the
 /// selection and the first shown item; the list holds no state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct List {
@@ -810,7 +848,9 @@ impl List {
 
     /// The row area: the rect less the scrollbar gutter and any remainder
     /// below the last whole row, for a caller clipping its own content to
-    /// the rows.
+    /// the rows. It keeps the bezel's top and left pixels, and its bottom
+    /// ones under a remainder narrower than the bezel, where `emit` paints
+    /// the bezel and clips the rows.
     pub fn body(self) -> Rect {
         let s = self.scale.value();
         let gutter = (SCROLL_GUTTER * s) as u32;
@@ -907,10 +947,13 @@ impl List {
         damage: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
-        // The whole rect is chrome first, like the other bands, so the
-        // gutter, its margin and any remainder below the last row are
-        // painted; the rows and thumb draw over it.
-        fill(self.rect, CHROME, damage, sink);
+        // The whole rect is a bezel round chrome first, so the gutter, its
+        // margin and any remainder below the last row are painted; the
+        // rows and thumb draw over the chrome, clipped inside the bezel.
+        let face = bezel(self.rect, self.scale, CHROME, damage, sink);
+        let Some(damage) = damage.intersection(face) else {
+            return;
+        };
         for (i, item) in items.into_iter().enumerate() {
             let Some(rect) = self.row(i) else {
                 break;
@@ -969,7 +1012,8 @@ pub struct Field<'a> {
     pub caret_visible: bool,
 }
 
-/// A single-line text field over one chrome row: a paper ground, the text
+/// A single-line text field over one chrome row: a paper ground inside a
+/// `BORDER` bezel one scaled pixel wide, so the field's bounds show, the text
 /// from the first shown column, an optional selection and a one-pixel
 /// caret. The caller owns the text, the caret, the selection and the first
 /// shown column; the field holds no state.
@@ -1058,10 +1102,14 @@ impl TextEntry {
         Some(first.saturating_add(column.min(self.columns())).min(len))
     }
 
-    /// Paints the field: the paper ground, the selection, the visible text
-    /// or the placeholder, and the caret.
+    /// Paints the field: a bezel round the paper ground, the selection, the
+    /// visible text or the placeholder, and the caret, all inside the
+    /// bezel.
     pub fn emit(&self, field: Field, damage: Rect, sink: &mut dyn FnMut(Draw)) {
-        fill(self.rect, PAPER, damage, sink);
+        let face = bezel(self.rect, self.scale, PAPER, damage, sink);
+        let Some(damage) = damage.intersection(face) else {
+            return;
+        };
         let len = field.text.chars().count();
         // A stale caret, anchor or first is clamped to the text so the
         // field renders and cannot overflow; the caller drives `first`

@@ -654,11 +654,12 @@ fn the_draw_stream_stays_inside_the_rect_and_paints_each_band_at_every_scale() {
             "  notes.txt1 KiB"
         );
         assert_eq!(text_at(&all, f.status_rect().y + 4 * s), "6 entries");
-        // The selection's highlight is one list row wide.
+        // The selection's highlight is one list row tall, less the list's
+        // bezel above it.
         assert!(all.iter().any(|draw| matches!(
             draw.primitive,
             Primitive::Fill { rect, color }
-                if color == SELECTED_ROW && rect.y == list.y && rect.height == (ROW as u32) * u32::from(scale)
+                if color == SELECTED_ROW && rect.y == list.y + s && rect.height == (ROW as u32 - 1) * u32::from(scale)
         )));
         // The status rule under the list, one scaled pixel.
         let status = f.status_rect();
@@ -861,15 +862,19 @@ fn the_finder_rasterizes_to_pixels_and_leaves_the_rest_of_the_surface_alone() {
             let start = (y as usize * surface.width + x as usize) * 4;
             u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) & 0xffffff
         };
-        // The path row is chrome, the field paper, the selection its row
-        // colour, the second row chrome, the status row chrome under its
-        // border, and the surface outside untouched.
+        // The path row is chrome, the field paper inside its bezel, the
+        // selection its row colour inside the list's, the second row
+        // chrome, the status row chrome under its border, and the surface
+        // outside untouched.
         assert_eq!(color(rect.x + 2, rect.y + 2), CHROME);
         let filter = f.filter_rect();
-        assert_eq!(color(filter.x + 2, filter.y + 2), PAPER);
+        let bezel = s as i64;
+        assert_eq!(color(filter.x, filter.y + 2 * bezel), BORDER);
+        assert_eq!(color(filter.x + 2 * bezel, filter.y + 2 * bezel), PAPER);
         let list = f.list_rect();
+        assert_eq!(color(list.x + 200 * s as i64, list.y), BORDER);
         assert_eq!(
-            color(list.x + 200 * s as i64, list.y + 2),
+            color(list.x + 200 * s as i64, list.y + bezel),
             SELECTED_ROW & 0xffffff
         );
         assert_eq!(

@@ -3,7 +3,7 @@
 //! set.
 
 use crate::chrome::{Item, List, Panel, Row, ROW};
-use crate::raster::{Draw, Primitive, Rect, Surface, BORDER};
+use crate::raster::{Draw, Rect, Surface};
 use crate::CELL_WIDTH;
 
 pub const DETAILS: usize = 256;
@@ -628,23 +628,5 @@ impl<A: Copy, R: Copy + Eq, F: Copy> Controller<A, R, F> {
             damage,
             sink,
         );
-        let thickness = self.surface.scale.value() as u32;
-        for y in [self.details.rect().y, self.actions.rect().y] {
-            let rule = Rect {
-                x: self.rect.x,
-                y: y - i64::from(thickness),
-                width: self.rect.width,
-                height: thickness,
-            };
-            if let Some(clip) = rule.intersection(damage) {
-                sink(Draw {
-                    clip,
-                    primitive: Primitive::Fill {
-                        rect: rule,
-                        color: BORDER,
-                    },
-                });
-            }
-        }
     }
 }

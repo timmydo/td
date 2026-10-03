@@ -299,13 +299,11 @@ host lock and sleep evidence on the supported host, td mode, the
 foreign-host acceptance of the same executable, and increment 5's
 independent recovery, migration and hardware evidence.
 
-Not yet, in the window: the search field and the title field are not
-visibly separated from the title list and the editor pane below them.
-td-ui's `chrome::TextEntry` paints only a paper ground, so a field's
-bounds are not obvious. Each field, the list and the pane should carry
-an outline. That is td-ui chrome work shared with td-ui's other
-`TextEntry` and `List` consumers (td-agent, td-setup, td-mail), not a
-td-pass-only paint.
+The search, title and find fields and the title list each carry td-ui's
+one-scaled-pixel bezel (td-ui/DESIGN.md, `chrome`), so a field's bounds
+show against the list under it. Not yet, in the window: the editor pane
+under the title field has no outline of its own; it should carry the
+same bezel, laid by td-pass round the pane's rectangle.
 
 ## Delivery and proof
 
