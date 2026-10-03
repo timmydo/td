@@ -3104,6 +3104,53 @@ multiple fields, scratch reuse and late refusal with one-byte drains. Grouped
 Addresses, response-spool publication and worker/native/RSS qualification
 remain follow-on work.
 
+### 1.67 Provisional GroupedAddresses property values
+
+M06bi supplies `header_value::GroupedAddresses::new`, binding the
+GroupedAddresses form. It uses the same Input, original job/email budgets and
+NFC scratch as Addresses. Its array contains group objects with `name` and
+`addresses` keys, matching RFC 8621 section 4.1.2.4. Consecutive ordinary
+mailboxes share a null-name group; explicit groups retain decoded,
+NFC-normalized phrase names, including empty strings and groups containing no
+addresses. Empty fields remain empty arrays. Last/all occurrence and
+missing-header rules stay common to both forms. Group boundaries and malformed
+recovery follow section 1.41.
+
+A private static mode shares the existing Addresses coordinator. Preserve
+BeginGroup and EndGroup around mailbox conversion, retain the current group's
+name extent, flags and name-continuation phase, and consume the same name
+child for group and mailbox names. Both contribute selected-field encoding
+diagnostics; an unselected field contributes none. Flat Addresses continues to
+omit group names and their decoding work/diagnostics. Address spelling and
+mailbox-name selection are unchanged. Form choice cannot switch during a
+property. Encoded words retain their original-field boundary rules: one
+adjacent to the group colon without intervening whitespace remains literal and
+sets no decoding diagnostic.
+
+Prepay the group prefix, null literal, addresses key and closing brackets
+before staging. Name frames charge their exact JSON bytes as they stream.
+Split the fourteen-byte addresses key/opening-array literal across two turns
+so the existing nine-byte staging/output ceiling holds. Group transitions run
+separately from child conversion; parser credit and original budgets survive
+each handoff. The existing 2560-byte coordinator bound, 3072-byte borrowed NFC
+scratch, six-byte copy ceiling and other Addresses turn bounds are unchanged.
+No group/name/member list is retained.
+
+An emitted group, including a fully closed empty group, remains provisional
+through field and property completion. Late parsing, conversion, selection or
+budget failure retires all earlier chunks. Typed errors, consuming completion
+checks, inert cached completion and live final admission retain the Addresses
+contract. No response-spool publication is supplied here.
+
+Tests cover named/unnamed transitions, empty/null names, empty groups,
+malformed and missing-semicolon recovery, selected group diagnostics, NFC,
+short output and last/all/absence. Independently composed grammar and
+conversion costs include group-name work; partial aggregate/output budgets and
+late nesting/selection failure cannot return partial success. Allocation
+intervals cover long group/mailbox names, identities, multiple fields, scratch
+reuse and late refusal. Complete worker/native/RSS qualification and remaining
+Text grammars remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

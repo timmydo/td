@@ -3311,6 +3311,118 @@ fn address_header_values() {
     assert_eq!(before, after, "Addresses property assembly allocated");
 }
 
+fn grouped_header_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property::{self, Context},
+        header_select::SourceEnd,
+        header_value::{GroupedAddresses, Input, Status},
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let name = "e\u{301}".repeat(4096);
+    let address = format!("{name}@EXAMPLE");
+    let source = format!("To:{name}:{name} <{address}>,bad; Empty:;\nTo:a@b(Name)\n\n");
+    let expected = format!(
+        "[[{{\"name\":\"{}\",\"addresses\":[{{\"name\":\"{}\",\"email\":\"{address}\"}},{{\"name\":null,\"email\":\"bad\"}}]}},{{\"name\":\"Empty\",\"addresses\":[]}}],[{{\"name\":null,\"addresses\":[{{\"name\":\"Name\",\"email\":\"a@b\"}}]}}]]",
+        "é".repeat(4096), "é".repeat(4096),
+    );
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut property_cursor =
+        header_property::Cursor::new("header:To:asGroupedAddresses:all", Context::Email);
+    let property = loop {
+        if let header_property::Status::Complete(value) =
+            property_cursor.poll(Tick(1), &mut work).unwrap()
+        {
+            break value.unwrap();
+        }
+    };
+    let mut budget = HeaderBudget::new();
+    let mut scratch = Scratch::new();
+    let before = COUNTERS.snapshot();
+    let mut cursor = GroupedAddresses::new(
+        Input {
+            bytes: black_box(source.as_bytes()),
+            base: 0,
+            header_limit: source.len() as u64,
+            property,
+            source_end: SourceEnd::Eof,
+        },
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut offset = 0;
+    let mut complete = false;
+    for _ in 0..1_000_000 {
+        let mut output = [0; 1];
+        let progress = cursor.poll(Tick(1), &mut output).unwrap();
+        if progress.written == 1 {
+            assert_eq!(output.first(), expected.as_bytes().get(offset));
+        }
+        offset += progress.written;
+        if matches!(progress.status, Status::Complete(_)) {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(offset, expected.len());
+    cursor.check_deadline(Tick(1)).unwrap();
+    let source = b"To:a@b\nTo:c@d\n\n";
+    let mut cursor = GroupedAddresses::new(
+        Input {
+            bytes: source,
+            base: 0,
+            header_limit: b"To:a@b\n".len() as u64 + 1,
+            property,
+            source_end: SourceEnd::Eof,
+        },
+        &mut scratch,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut offset = 0;
+    let mut refused = false;
+    let expected = br#"[[{"name":null,"addresses":[{"name":null,"email":"a@b"}]}]"#;
+    for _ in 0..1000 {
+        let mut output = [0; 1];
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                if progress.written == 1 {
+                    assert_eq!(output.first(), expected.get(offset));
+                }
+                offset += progress.written;
+                assert!(!matches!(progress.status, Status::Complete(_)));
+            }
+            Err(error) => {
+                assert!(matches!(error, td_mta::header_value::Error::Selection(_)));
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(offset, expected.len());
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(
+        before, after,
+        "GroupedAddresses property assembly allocated"
+    );
+}
+
 fn budgeted_address_name_json() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -5590,6 +5702,7 @@ fn main() {
         header_dates();
         url_header_values();
         address_header_values();
+        grouped_header_values();
         budgeted_address_name_json();
         selected_header_names();
         budgeted_address_text();
@@ -5727,6 +5840,7 @@ fn main() {
     header_dates();
     url_header_values();
     address_header_values();
+    grouped_header_values();
     budgeted_address_name_json();
     selected_header_names();
     budgeted_address_text();

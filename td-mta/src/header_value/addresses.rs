@@ -9,11 +9,17 @@ use crate::{
     nfc::{HeaderBudget, Scratch},
     ports::Tick,
 };
-pub(super) struct AddressMode;
-impl<'a, 'w> Projection<'a, 'w> for AddressMode {
-    type Source = Source<'a, 'w>;
+pub(super) struct Mode<const GROUPED: bool>;
+pub(super) type AddressMode = Mode<false>;
+pub(super) type GroupedMode = Mode<true>;
+impl<'a, 'w, const GROUPED: bool> Projection<'a, 'w> for Mode<GROUPED> {
+    type Source = Source<'a, 'w, GROUPED>;
     type Workspace = &'w mut Scratch;
-    const FORM: Form = Form::Addresses;
+    const FORM: Form = if GROUPED {
+        Form::GroupedAddresses
+    } else {
+        Form::Addresses
+    };
     fn validate(
         _: &str,
         _: Tick,
@@ -36,6 +42,10 @@ impl<'a, 'w> Projection<'a, 'w> for AddressMode {
             phase: Phase::Open,
             next: Phase::Open,
             mailbox: None,
+            group_name: None,
+            group_open: false,
+            seen_group: false,
+            after_name: Phase::EmailKey,
             seen: false,
             problem: false,
             credit: 0,
@@ -87,6 +97,9 @@ enum Phase {
     Open,
     Parse,
     StartName,
+    StartGroupName,
+    GroupKey,
+    GroupKeyTail,
     Name,
     FinishName,
     EmailKey,
@@ -96,13 +109,17 @@ enum Phase {
     Drain,
     Done,
 }
-pub(super) struct Source<'a, 'w> {
+pub(super) struct Source<'a, 'w, const GROUPED: bool> {
     input: &'a [u8],
     parser: parse::Cursor<'a>,
     owner: Owner<'a, 'w>,
     phase: Phase,
     next: Phase,
     mailbox: Option<parse::Address>,
+    group_name: Option<parse::Extent>,
+    group_open: bool,
+    seen_group: bool,
+    after_name: Phase,
     seen: bool,
     problem: bool,
     credit: u8,
@@ -111,7 +128,7 @@ pub(super) struct Source<'a, 'w> {
     position: usize,
     failure: Option<Error>,
 }
-impl Source<'_, '_> {
+impl<const GROUPED: bool> Source<'_, '_, GROUPED> {
     #[cfg(test)]
     pub(super) fn remaining(&self) -> Option<(Charge, u64)> {
         match &self.owner {
@@ -166,6 +183,35 @@ impl Source<'_, '_> {
         self.phase = Phase::Drain;
         Ok(())
     }
+    fn begin_name(
+        &mut self,
+        frame: &mut Frame,
+        now: Tick,
+        name: Option<Name>,
+        after: Phase,
+    ) -> Result<(), Error> {
+        if let Some(name) = name {
+            let (extent, kind) = match name {
+                Name::Phrase(extent) => (extent, header_name::Kind::Phrase),
+                Name::Comment(extent) => (extent, header_name::Kind::Comment),
+            };
+            let Owner::Budgets(work, budget, scratch) =
+                std::mem::replace(&mut self.owner, Owner::Retired)
+            else {
+                return Err(Error::InvalidState);
+            };
+            self.owner = Owner::Name(
+                header_name::Cursor::new(self.input, extent, kind, work, budget, scratch)
+                    .map_err(Error::Name)?,
+            );
+            self.after_name = after;
+            *frame = Frame::new();
+            self.phase = Phase::Name;
+        } else {
+            self.stage(now, b"null", after)?;
+        }
+        Ok(())
+    }
     fn poll(&mut self, frame: &mut Frame, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
         if let Some(error) = self.failure {
             return Err(error);
@@ -201,10 +247,37 @@ impl Source<'_, '_> {
                     .poll_with_work(now, &mut Parsing::new(work, budget, &mut self.credit))
                     .map_err(Error::Addresses)?
                 {
-                    parse::Status::Yield
-                    | parse::Status::BeginGroup(_)
-                    | parse::Status::EndGroup => {}
+                    parse::Status::Yield => {}
+                    parse::Status::BeginGroup(name) => {
+                        if GROUPED {
+                            if self.group_open {
+                                return Err(Error::InvalidState);
+                            }
+                            self.group_open = true;
+                            self.group_name = name;
+                            self.seen = false;
+                            let bytes: &[u8] = if self.seen_group {
+                                b",{\"name\":"
+                            } else {
+                                b"{\"name\":"
+                            };
+                            self.stage(now, bytes, Phase::StartGroupName)?;
+                            self.seen_group = true;
+                        }
+                    }
+                    parse::Status::EndGroup => {
+                        if GROUPED {
+                            if !self.group_open {
+                                return Err(Error::InvalidState);
+                            }
+                            self.group_open = false;
+                            self.stage(now, b"]}", Phase::Parse)?;
+                        }
+                    }
                     parse::Status::Mailbox(mailbox) => {
+                        if GROUPED && !self.group_open {
+                            return Err(Error::InvalidState);
+                        }
                         self.mailbox = Some(mailbox);
                         let bytes: &[u8] = if self.seen {
                             b",{\"name\":"
@@ -214,7 +287,12 @@ impl Source<'_, '_> {
                         self.stage(now, bytes, Phase::StartName)?;
                         self.seen = true;
                     }
-                    parse::Status::Complete => self.stage(now, b"]", Phase::Done)?,
+                    parse::Status::Complete => {
+                        if self.group_open {
+                            return Err(Error::InvalidState);
+                        }
+                        self.stage(now, b"]", Phase::Done)?;
+                    }
                 }
             }
             Phase::StartName => {
@@ -222,26 +300,15 @@ impl Source<'_, '_> {
                     parse::Address::Parsed(mailbox) => mailbox.name,
                     parse::Address::Raw(_) => None,
                 };
-                if let Some(name) = name {
-                    let (extent, kind) = match name {
-                        Name::Phrase(extent) => (extent, header_name::Kind::Phrase),
-                        Name::Comment(extent) => (extent, header_name::Kind::Comment),
-                    };
-                    let Owner::Budgets(work, budget, scratch) =
-                        std::mem::replace(&mut self.owner, Owner::Retired)
-                    else {
-                        return Err(Error::InvalidState);
-                    };
-                    self.owner = Owner::Name(
-                        header_name::Cursor::new(self.input, extent, kind, work, budget, scratch)
-                            .map_err(Error::Name)?,
-                    );
-                    *frame = Frame::new();
-                    self.phase = Phase::Name;
-                } else {
-                    self.stage(now, b"null", Phase::EmailKey)?;
-                }
+                self.begin_name(frame, now, name, Phase::EmailKey)?;
             }
+            Phase::StartGroupName => {
+                let name = self.group_name.take().map(Name::Phrase);
+                self.begin_name(frame, now, name, Phase::GroupKey)?;
+            }
+            // Split the group key to retain the nine-byte staging ceiling.
+            Phase::GroupKey => self.stage(now, b",\"addres", Phase::GroupKeyTail)?,
+            Phase::GroupKeyTail => self.stage(now, b"ses\":[", Phase::Parse)?,
             Phase::Name => {
                 let Owner::Name(cursor) = &mut self.owner else {
                     return Err(Error::InvalidState);
@@ -262,7 +329,7 @@ impl Source<'_, '_> {
                 self.problem |= cursor.is_encoding_problem();
                 let (work, budget, scratch) = cursor.finish().map_err(Error::Name)?;
                 self.owner = Owner::Budgets(work, budget, scratch);
-                self.phase = Phase::EmailKey;
+                self.phase = self.after_name;
             }
             Phase::EmailKey => self.stage(now, b",\"email\":", Phase::StartAddress)?,
             Phase::StartAddress => {

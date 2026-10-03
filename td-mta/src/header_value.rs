@@ -11,7 +11,7 @@ use crate::{
 mod list;
 use list::{IdsMode, UrlsMode};
 mod addresses;
-use addresses::AddressMode;
+use addresses::{AddressMode, GroupedMode};
 mod date;
 use date::DateMode;
 mod projection;
@@ -231,6 +231,28 @@ impl<'a, 'w> URLs<'a, 'w> {
 /// Provisional flattened address objects; retain in an unpublished response tail.
 pub struct Addresses<'a, 'w>(Core<'a, 'w, AddressMode>);
 impl<'a, 'w> Addresses<'a, 'w> {
+    pub fn new(
+        input: Input<'a>,
+        scratch: &'w mut nfc::Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        Core::new(input, work, budget, scratch).map(Self)
+    }
+    /// Final only after property Complete.
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.0.is_encoding_problem()
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.0.check_deadline(now)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.0.poll(now, output)
+    }
+}
+/// Provisional grouped address objects; retain in an unpublished response tail.
+pub struct GroupedAddresses<'a, 'w>(Core<'a, 'w, GroupedMode>);
+impl<'a, 'w> GroupedAddresses<'a, 'w> {
     pub fn new(
         input: Input<'a>,
         scratch: &'w mut nfc::Scratch,
@@ -844,3 +866,6 @@ mod urls_tests;
 
 #[cfg(test)]
 mod addresses_tests;
+
+#[cfg(test)]
+mod grouped_tests;

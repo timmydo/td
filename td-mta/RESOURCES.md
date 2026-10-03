@@ -1165,6 +1165,17 @@ normalized names, identity addresses, raw recovery, multiple fields, scratch
 reuse and late selection refusal. Grouped values, unpublished retention and
 combined worker/native/RSS qualification remain open.
 
+GroupedAddresses (M06bi) shares the static Addresses coordinator, retaining
+the current group name extent, group/comma flags and name-continuation phase.
+It fits the same 2560-byte parser reservation and borrows the same 3072-byte
+NFC scratch; group and mailbox names reuse one inline normalization owner in
+turn. The fourteen-byte group addresses key/opening-array literal is split
+across two staging turns, preserving the nine-byte charge/staging ceiling and
+all other Addresses turn bounds. No group or member list grows. Allocation
+intervals cover long group/mailbox names, identities, multiple fields, scratch
+reuse and late selection refusal. Complete worker/native/RSS qualification and
+response-spool publication remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

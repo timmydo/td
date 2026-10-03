@@ -1624,6 +1624,13 @@ Initial independently landable increments:
   costs, partial limits, late failure and allocation-free one-byte drains.
   Grouped values and unpublished response retention remain open.
 
+- **M06bi — provisional GroupedAddresses property values:** share static
+  address composition while retaining named, empty and unnamed groups.
+  Normalize selected group names through the same reusable child/scratch;
+  preserve original budgets and flat-form semantics. Pin group transitions,
+  composed costs, partial limits, late failure and allocation-free drains.
+  Remaining Text grammars and unpublished response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
