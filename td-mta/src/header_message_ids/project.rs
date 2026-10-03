@@ -1,4 +1,4 @@
-//! Whole-field validation precedes identifier text; response publication is external.
+//! Shared conversion engine; public MessageIds construction validates the whole field.
 use super::{Cursor as Parser, Error, Extent, Mode, Status as Parsed};
 use crate::{
     admission::work::{Charge, Meter},
@@ -17,15 +17,23 @@ pub enum Status {
 #[derive(Clone, Copy)]
 enum Phase {
     Validate,
+    TrimStart,
+    TrimEnd,
     Replay,
     Unfold,
     Decode,
     Complete,
 }
-/// Non-Copy state retains both syntax passes and a fixed one-byte conversion slot.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Purpose {
+    MessageIds(Mode),
+    AddrSpec,
+    Fallback,
+}
+/// Non-Copy state retains syntax/replay progress and a fixed conversion byte.
 pub struct Cursor<'a> {
     source: &'a [u8],
-    mode: Mode,
+    purpose: Purpose,
     parser: Parser<'a>,
     phase: Phase,
     extent: Extent,
@@ -34,14 +42,14 @@ pub struct Cursor<'a> {
     decoder: CharsetDecoder,
     byte: Option<u8>,
     unfolded: bool,
-    noncharacter: bool,
+    encoding_problem: bool,
     failure: Option<Error>,
 }
 impl<'a> Cursor<'a> {
     pub fn new(source: &'a [u8], mode: Mode) -> Self {
         Self {
             source,
-            mode,
+            purpose: Purpose::MessageIds(mode),
             parser: Parser::new(source, mode),
             phase: Phase::Validate,
             extent: Extent { start: 0, end: 0 },
@@ -50,13 +58,29 @@ impl<'a> Cursor<'a> {
             decoder: CharsetDecoder::new(Charset::Utf8),
             byte: None,
             unfolded: false,
-            noncharacter: false,
+            encoding_problem: false,
             failure: None,
         }
     }
-    /// Final only after Complete; syntax/UTF-8 validity is established first.
+    pub(crate) fn addr_spec(source: &'a [u8]) -> Self {
+        let mut cursor = Self::new(source, Mode::Strict);
+        cursor.purpose = Purpose::AddrSpec;
+        cursor.parser = Parser::addr_spec(source);
+        cursor
+    }
+    pub(crate) fn fallback(source: &'a [u8]) -> Self {
+        let mut cursor = Self::new(source, Mode::Strict);
+        cursor.purpose = Purpose::Fallback;
+        cursor.extent = Extent {
+            start: 0,
+            end: source.len(),
+        };
+        cursor.phase = Phase::TrimStart;
+        cursor
+    }
+    /// Final only after Complete; fallback mode also diagnoses repaired UTF-8.
     pub const fn is_encoding_problem(&self) -> bool {
-        self.noncharacter
+        self.encoding_problem
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         if let Some(error) = self.failure {
@@ -82,11 +106,16 @@ impl<'a> Cursor<'a> {
         match self.phase {
             Phase::Validate => {
                 if self.parser.poll(now, work)? == Parsed::Complete {
-                    self.parser = Parser::new(self.source, self.mode);
+                    self.parser = match self.purpose {
+                        Purpose::MessageIds(mode) => Parser::new(self.source, mode),
+                        Purpose::AddrSpec => Parser::addr_spec(self.source),
+                        Purpose::Fallback => return Err(Error::InvalidState),
+                    };
                     self.phase = Phase::Replay;
                 }
                 Ok(Status::Yield)
             }
+            Phase::TrimStart | Phase::TrimEnd => self.trim(now, work),
             Phase::Replay => match self.parser.poll(now, work)? {
                 Parsed::Yield => Ok(Status::Yield),
                 Parsed::Begin => Ok(Status::Begin),
@@ -113,6 +142,50 @@ impl<'a> Cursor<'a> {
             Phase::Decode => self.decode(now, work),
             Phase::Complete => Ok(Status::Complete),
         }
+    }
+    fn trim(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        if self.extent.start > self.extent.end {
+            return Err(Error::InvalidState);
+        }
+        if self.extent.start == self.extent.end {
+            self.phase = Phase::Complete;
+            return Ok(Status::Complete);
+        }
+        let leading = matches!(self.phase, Phase::TrimStart);
+        let position = if leading {
+            self.extent.start
+        } else {
+            self.extent.end.checked_sub(1).ok_or(Error::InvalidState)?
+        };
+        work.charge(
+            now,
+            Charge {
+                io_bytes: 1,
+                ..Charge::default()
+            },
+        )?;
+        let byte = self
+            .source
+            .get(position)
+            .copied()
+            .ok_or(Error::InvalidState)?;
+        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+            if leading {
+                self.extent.start = self
+                    .extent
+                    .start
+                    .checked_add(1)
+                    .ok_or(Error::InvalidState)?;
+            } else {
+                self.extent.end = position;
+            }
+        } else if leading {
+            self.phase = Phase::TrimEnd;
+        } else {
+            self.position = self.extent.start;
+            self.phase = Phase::Unfold;
+        }
+        Ok(Status::Yield)
     }
     fn unfold(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         if self.byte.is_some() || self.unfolded {
@@ -158,8 +231,14 @@ impl<'a> Cursor<'a> {
                 mime_charset::Error::Work(stop) => Error::Work(stop),
                 mime_charset::Error::InvalidState => Error::InvalidState,
             })?;
-        if progress.consumed > input.len() || self.decoder.is_encoding_problem() {
+        if progress.consumed > input.len() {
             return Err(Error::InvalidState);
+        }
+        if self.decoder.is_encoding_problem() {
+            if self.purpose != Purpose::Fallback {
+                return Err(Error::InvalidState);
+            }
+            self.encoding_problem = true;
         }
         if progress.consumed == 1 {
             self.byte = None;
@@ -180,13 +259,18 @@ impl<'a> Cursor<'a> {
                 if self.byte.is_some() || !self.unfolded {
                     return Err(Error::InvalidState);
                 }
-                self.phase = Phase::Replay;
-                Ok(Status::Yield)
+                if self.purpose == Purpose::Fallback {
+                    self.phase = Phase::Complete;
+                    Ok(Status::Complete)
+                } else {
+                    self.phase = Phase::Replay;
+                    Ok(Status::Yield)
+                }
             }
             Decoded::Scalar(value) => {
                 let scalar = u32::from(value);
                 let value = if matches!(scalar, 0xfdd0..=0xfdef) || scalar & 0xffff >= 0xfffe {
-                    self.noncharacter = true;
+                    self.encoding_problem = true;
                     '\u{fffd}'
                 } else {
                     value
@@ -390,6 +474,37 @@ mod tests {
             let before = work.remaining();
             assert_eq!(cursor.poll(Tick(1), &mut work), Err(Error::Work(expected)));
             assert_eq!(before, work.remaining());
+        }
+    }
+    #[test]
+    fn both_trim_phases_latch_byte_record_and_deadline_refusal() {
+        for phase in [Phase::TrimStart, Phase::TrimEnd] {
+            for (io_bytes, records, now, expected) in [
+                (0, 1000, Tick(1), Stop::IoBytes),
+                (1000, 0, Tick(1), Stop::Records),
+                (1000, 1000, Tick(100), Stop::Deadline),
+            ] {
+                let mut cursor = Cursor::fallback(b" a@b ");
+                let mut admitted = work();
+                while std::mem::discriminant(&cursor.phase) != std::mem::discriminant(&phase) {
+                    assert_eq!(cursor.poll(Tick(1), &mut admitted), Ok(Status::Yield));
+                }
+                let mut limited = Meter::new(
+                    Deadline::after(Tick(0), 100).unwrap(),
+                    Charge {
+                        io_bytes,
+                        records,
+                        ..Charge::default()
+                    },
+                );
+                assert_eq!(cursor.poll(now, &mut limited), Err(Error::Work(expected)));
+                let before = admitted.remaining();
+                assert_eq!(
+                    cursor.poll(Tick(1), &mut admitted),
+                    Err(Error::Work(expected))
+                );
+                assert_eq!(admitted.remaining(), before);
+            }
         }
     }
     #[test]

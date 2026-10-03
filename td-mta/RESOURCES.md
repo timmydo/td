@@ -899,6 +899,16 @@ time. Allocation intervals cover groups, null slots, routes, long Unicode,
 raw recovery and resource refusal. Projection storage and the complete
 composed worker stack remain unqualified.
 
+The parsed/fallback address text facade fits 416 bytes in the body parser
+reservation. Private purposes reuse the MessageIds conversion engine,
+including the fixed one-byte handoff; public MessageIds state remains
+within 384 bytes. Fallback edge trimming uses scalar offsets, and charset
+replacement retains no malformed byte string. No new arena is allocated.
+Intermediate unfolding bytes and final UTF-8 scalar bytes both charge the
+same output budget. Allocation intervals cover long Unicode, malformed
+UTF-8, noncharacters, literal controls, empty values and refusal. Complete
+display-name/NFC, response storage and worker stack composition remain open.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

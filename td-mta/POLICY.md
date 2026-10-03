@@ -186,6 +186,14 @@ Work and nesting limits retire the whole field instead of invoking raw
 fallback. All parsed group/mailbox events remain provisional until the
 entire field completes.
 
+Address email projection removes grammatical CFWS from parsed addr-spec
+and unfolds it; raw fallback uses the edge trimming above, unfolds and
+repairs invalid UTF-8. Replace noncharacters and record encoding faults in
+both modes. Preserve address case, quotes, quoted pairs, domain brackets,
+literal controls and encoded-word-looking text without NFC or RFC 2047
+interpretation. Later JSON escapes controls; SMTP validation remains the
+separate authority boundary. Display-name decoding and NFC are distinct.
+
 MessageIds parses complete RFC 5322 msg-id lists, removes grammatical CFWS
 and outer angle brackets, and returns null for an invalid list. For
 References and In-Reply-To also accept their RFC 5322 section 4 obsolete

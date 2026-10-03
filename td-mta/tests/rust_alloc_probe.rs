@@ -2064,6 +2064,78 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_address_text() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_address_text::{Cursor, Error, Mode, Status},
+        ports::{Deadline, Tick},
+    };
+    fn drive(cursor: &mut Cursor<'_>, work: &mut Meter) -> Result<usize, Error> {
+        let mut bytes = 0;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1), work)? {
+                Status::Complete => return Ok(bytes),
+                Status::Yield => {}
+                Status::Scalar(value) => bytes += black_box(value).len_utf8(),
+            }
+        }
+        panic!("address text allocation probe did not finish");
+    }
+    let parsed = format!("{}@b", "🐈".repeat(1000));
+    let fallback = format!(" \t{}\r\n ", "🐈".repeat(1000));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 1_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, mode, expected, problem) in [
+        (parsed.as_bytes(), Mode::Parsed, Ok(4002), false),
+        (fallback.as_bytes(), Mode::Fallback, Ok(4000), false),
+        (
+            b"a@b bad".as_slice(),
+            Mode::Parsed,
+            Err(Error::Malformed),
+            false,
+        ),
+        (b"\xffx\xe2\x82", Mode::Fallback, Ok(7), true),
+        ("\u{fdd0}@b".as_bytes(), Mode::Parsed, Ok(5), true),
+        (b" \t\r\n", Mode::Fallback, Ok(0), false),
+        (b"\0a\r\n b", Mode::Fallback, Ok(4), false),
+    ] {
+        let mut cursor = Cursor::new(black_box(source), mode);
+        assert_eq!(drive(&mut cursor, &mut work), expected);
+        assert_eq!(cursor.is_encoding_problem(), problem);
+    }
+    for mode in [Mode::Parsed, Mode::Fallback] {
+        let mut cursor = Cursor::new(b"a@b", mode);
+        let mut limited = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 1000,
+                records: 1000,
+                output_bytes: 1,
+                ..Charge::default()
+            },
+        );
+        assert_eq!(
+            drive(&mut cursor, &mut limited),
+            Err(Error::Work(Stop::OutputBytes))
+        );
+        assert_eq!(
+            drive(&mut cursor, &mut work),
+            Err(Error::Work(Stop::OutputBytes))
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "address text projection allocated");
+}
+
 fn header_address_groups() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3632,6 +3704,7 @@ fn main() {
         header_message_id_text();
         header_url_text();
         header_address_boundaries();
+        header_address_text();
         header_address_groups();
         header_single_mailbox();
         header_phrase_tokens();
@@ -3745,6 +3818,7 @@ fn main() {
     header_message_id_text();
     header_url_text();
     header_address_boundaries();
+    header_address_text();
     header_address_groups();
     header_single_mailbox();
     header_phrase_tokens();

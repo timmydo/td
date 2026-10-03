@@ -1922,6 +1922,46 @@ slots, routes, comments, invalid names/nesting, malformed and unclosed
 tails, long Unicode and sticky resource refusal. Text/NFC projection,
 response admission and complete worker qualification remain open.
 
+### 1.42 Resident address text projection
+
+M06aj supplies `header_address_text::Cursor` with Parsed and Fallback modes
+for admitted immutable address slices. The modes reuse the MessageIds text
+engine through private purposes; public MessageIds behavior and work charges
+are unchanged. Return Yield, Scalar or Complete, with an encoding diagnostic
+that is final only after Complete. Scalars remain provisional response text;
+a later resource failure retires the result. No event grants SMTP authority.
+
+Parsed validates the entire bare addr-spec before emitting any scalar, then
+replays only its raw parts under the live meter. Remove grammatical CFWS,
+unfold quoted/literal folds and decode UTF-8, replacing noncharacters with
+U+FFFD and recording a diagnostic. Preserve quotes, quoted pairs, domain
+brackets, case and literal encoded-word-looking text. Invalid syntax emits
+no text; excessive nesting and work retain their resource meaning.
+
+Fallback bypasses address grammar, trims ASCII SP/HTAB/CR/LF at both raw
+edges with charged visits, then unfolds and UTF-8-decodes one whole extent.
+Malformed UTF-8 uses maximal-subpart replacement and sets the diagnostic;
+noncharacters also become U+FFFD. An empty trimmed input completes without
+any scalar or synthetic address. This independently enforces the same trim
+used by group assembly, so that caller need not supply already-trimmed data.
+Internal nonfolding CR/LF, NUL and other literal controls remain data. Both
+modes preserve literal controls; later JSON must escape them, and outgoing
+SMTP must apply its separate stricter validator. No NFC, case folding,
+unquoting or encoded-word decoding changes the email address in either mode.
+
+The non-Copy facade fits 416 bytes with shared syntax/replay progress,
+fixed unfolding/charset state, one conversion byte and an error latch. It
+uses no new arena or copied address. Each poll visits at most 256 source
+bytes and charges at most 33 records/four output bytes. Charge both raw
+conversion and decoded-byte visits, intermediate unfolding bytes and final
+UTF-8 scalar widths. Parsed a@b costs 24 visits/56 records/six output bytes;
+Fallback a@b costs eight visits/12 records/six output bytes. All failures
+latch across fresh meters; cached Complete is inert. Tests and allocation
+intervals cover spelling, folds, malformed UTF-8, controls, noncharacters,
+empty/long values, validation-before-output and all work dimensions.
+Display-name decoding/NFC, JSON serialization, response storage and complete
+worker qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

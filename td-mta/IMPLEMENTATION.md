@@ -1447,6 +1447,14 @@ Initial independently landable increments:
   input and allocation-free refusal. Text/NFC projection, JSON response
   storage and composed worker qualification remain open.
 
+- **M06aj — address text projection:** reuse the MessageIds conversion
+  engine through private parsed/fallback purposes. Validate parsed addr-spec
+  before output; trim/unfold/repair fallback text without address grammar.
+  Preserve spelling and literal controls without NFC or encoded-word
+  interpretation. Cover malformed tails, invalid UTF-8, noncharacters,
+  exact work, long input and allocation-free refusal. Display-name decoding,
+  NFC, JSON output and complete worker qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
