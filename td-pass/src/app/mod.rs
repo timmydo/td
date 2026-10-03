@@ -35,6 +35,22 @@ const FIELD_BYTES: usize = 512;
 /// The status row while the keys view is up and idle.
 const KEYS_HINT: &str =
     "Keys: Space or Shift+click marks keys; Insert adds a backup; Delete replaces";
+/// What the create question says, the risk of one key before the remedy
+/// of two.
+const CREATE_DETAILS: &[&str] = &[
+    "Only an enrolled security key and its PIN open the notebook. \
+     There is no password and no reset.",
+    "With one key, losing that key or blocking its PIN loses the \
+     notebook and everything in it for good.",
+    "With a primary and a backup, either key opens it alone, so \
+     losing one key, or blocking its PIN, loses nothing.",
+    "Keys can be added later from Keys (Ctrl+K).",
+];
+/// The status row while the keys view of a notebook with one key is up.
+const ONE_KEY_HINT: &str =
+    "Keys: this key alone opens the notebook; Insert adds a backup so losing it loses nothing";
+/// Appended when a notebook with one key opens.
+const ONE_KEY_NOTE: &str = ". One key opens it: Ctrl+K, then Insert, adds a backup";
 /// A PIN is at most 63 bytes.
 const PIN_BYTES: usize = 63;
 /// The caret's blink, as the editor pane's.
@@ -75,6 +91,8 @@ enum Act {
     Delete,
     Replace,
     AcceptSwap,
+    CreateWithBackup,
+    CreateOneKey,
 }
 
 /// What a decision about unsaved changes was asked for.
@@ -487,6 +505,10 @@ impl App {
                             (false, true) => ". The host's lock may have stopped a change",
                             (false, false) => "",
                         });
+                        // A host lock's note takes the row before this one.
+                        if self.one_key() && !interrupted.edits && !interrupted.write {
+                            status.push_str(ONE_KEY_NOTE);
+                        }
                         self.say(status);
                     }
                     Err(text) => {
@@ -624,7 +646,7 @@ impl App {
                 "{}: choose a key and press Unlock",
                 self.host_locked.map_or("Locked", HostCause::locked)
             ),
-            None => "No notebook yet: Create enrolls a primary and then a backup key".to_owned(),
+            None => "No notebook yet: Create enrolls a key, and a backup if you choose".to_owned(),
         };
         let parts: Vec<String> = note
             .into_iter()
@@ -1172,21 +1194,53 @@ impl App {
                 self.say("Unlocking");
             }
             (true, None) => self.say("Choose a key to unlock with"),
-            (false, _) => self.create(),
+            (false, _) => self.create(None),
         }
     }
 
-    fn create(&mut self) {
+    /// Asks which keys the notebook is created with: a primary and a
+    /// backup, or, as the person's explicit decision, the primary alone.
+    fn create(&mut self, opener: Option<(i64, i64)>) {
         if self.busy.is_some()
             || !matches!(self.phase, Phase::Locked { keys: None, .. })
             || self.awaiting_host()
         {
             return;
         }
+        self.dialog_revision += 1;
+        let revision = self.dialog_revision;
+        let model = move || {
+            Model::new(
+                "Create a notebook with which keys?",
+                "Primary and backup",
+                CREATE_DETAILS,
+                Act::CreateWithBackup,
+                revision,
+            )
+            .and_then(|model| model.with_alternate("One key only", Act::CreateOneKey))
+        };
+        if self.open_dialog(&model, None, opener) {
+            self.say("Create with a primary and a backup key, or with one key only");
+        }
+    }
+
+    fn create_now(&mut self, backup: bool) {
+        if self.busy.is_some() || !matches!(self.phase, Phase::Locked { keys: None, .. }) {
+            return;
+        }
         let op = self.op();
-        self.out.push(Out::Send(Command::Create { op }));
+        self.out.push(Out::Send(Command::Create { op, backup }));
         self.busy = Some(Busy::Create(op));
-        self.say("Creating the notebook");
+        self.say(if backup {
+            "Creating the notebook with a primary and a backup key"
+        } else {
+            "Creating the notebook with one key"
+        });
+    }
+
+    /// Whether the open notebook has a single key.
+    fn one_key(&self) -> bool {
+        matches!(&self.phase, Phase::Unlocked(notebook) if notebook.keys.keys.labels.len() == 1)
     }
 
     /// Asks about unsaved changes before `then`, or does it now.
@@ -1223,12 +1277,13 @@ impl App {
     }
 
     /// The rows of the question that is or would be open: in the swap
-    /// phase only the swap question can be.
+    /// phase only the swap question can be, and with no notebook only the
+    /// create question.
     fn dialog_rows(&self) -> i64 {
-        if matches!(self.phase, Phase::Swap(_)) {
-            layout::SWAP_ROWS
-        } else {
-            layout::DIALOG_ROWS
+        match self.phase {
+            Phase::Swap(_) => layout::SWAP_ROWS,
+            Phase::Locked { keys: None, .. } => layout::CREATE_ROWS,
+            _ => layout::DIALOG_ROWS,
         }
     }
 
@@ -1557,8 +1612,12 @@ impl App {
         self.set_focus(next);
         // The status row keeps what an operation reported.
         if showing && self.busy.is_none() {
-            self.say(KEYS_HINT);
-        } else if !showing && self.status == KEYS_HINT {
+            self.say(if self.one_key() {
+                ONE_KEY_HINT
+            } else {
+                KEYS_HINT
+            });
+        } else if !showing && (self.status == KEYS_HINT || self.status == ONE_KEY_HINT) {
             self.say("");
         }
         self.redraw = true;
@@ -1664,6 +1723,9 @@ impl App {
         let labels = &notebook.keys.keys.labels;
         if revoked.is_empty() {
             return self.say("Choose or mark the keys to replace");
+        }
+        if labels.len() == 1 {
+            return self.say("Add a backup first (Insert): a kept key authorizes the replacement");
         }
         if revoked.len() >= labels.len() {
             return self.say("Keep at least one key: the kept keys authorize the replacement");

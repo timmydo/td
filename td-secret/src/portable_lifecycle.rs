@@ -429,12 +429,15 @@ pub(super) struct Session {
     counters: Vec<(Vec<u8>, u32)>,
 }
 
-/// Enrolls a primary and a separately presented backup, proves both open
-/// the identical empty notebook, then publishes revision one.
+/// Enrolls a primary and, with `backup`, a separately presented backup,
+/// proves each opens the identical empty notebook, then publishes revision
+/// one. Without a backup the primary alone opens it: the person's explicit
+/// decision that losing that key loses the notebook.
 pub(super) fn create(
     directory: &Directory,
     tokens: &mut impl Tokens,
     random: &mut impl Read,
+    backup: bool,
 ) -> Result<Session, Error> {
     let place = directory.place()?;
     let snapshot = directory.snapshot()?;
@@ -449,24 +452,31 @@ pub(super) fn create(
         &[],
         random,
     )?;
-    let (backup, backup_counter) = enroll_proved(
-        tokens,
-        Purpose::CreateBackup,
-        Role::Backup,
-        b"",
-        &[&primary.credential],
-        random,
-    )?;
+    let backup = if backup {
+        Some(enroll_proved(
+            tokens,
+            Purpose::CreateBackup,
+            Role::Backup,
+            b"",
+            &[&primary.credential],
+            random,
+        )?)
+    } else {
+        None
+    };
     let empty = Notebook {
         entries: Vec::new(),
     };
-    let protectors = [primary, backup];
+    let (protectors, counters): (Vec<Protector>, Vec<u32>) =
+        std::iter::once((primary, primary_counter))
+            .chain(backup)
+            .unzip();
     let proposed = LockedVault::create(&empty, &protectors, random).map_err(Error::Refused)?;
-    // The backup was presented last and authorizes the opened session.
+    // The key presented last authorizes the opened session.
     let opened = prove_all(&proposed, &protectors, None)?;
     let counters = protectors
         .iter()
-        .zip([primary_counter, backup_counter])
+        .zip(counters)
         .map(|(protector, counter)| (protector.credential.clone(), counter))
         .collect();
     let credential = protectors
@@ -1207,7 +1217,7 @@ pub(in crate::portable) mod tests {
         random: &mut Random,
     ) -> Session {
         bench.present(&[0, 0, 1, 1]);
-        create(&place.1, bench, random).unwrap()
+        create(&place.1, bench, random, true).unwrap()
     }
 
     fn entry(title: &str, body: &[u8]) -> Notebook {
@@ -1268,6 +1278,56 @@ pub(in crate::portable) mod tests {
     }
 
     #[test]
+    fn the_primary_alone_creates_a_vault_that_takes_a_backup_later() {
+        let place = Place::new();
+        let mut bench = Bench::new(2);
+        let mut random = Random(0);
+        bench.present(&[0, 0]);
+        let mut session = create(&place.1, &mut bench, &mut random, false).unwrap();
+        assert_eq!(
+            bench.calls,
+            [
+                Call::Enroll(Purpose::CreatePrimary),
+                Call::Assert(Purpose::CreatePrimary),
+            ]
+        );
+        assert!(bench.present.is_empty());
+        assert_eq!(session.revision(), 1);
+        assert_eq!(session.credential(), id(&bench, 0));
+        let keys = session.keys();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].role, Role::Primary);
+        assert_eq!(super::keys(&place.1).unwrap().len(), 1);
+        // Nothing can be replaced while it is the only key.
+        let primary = id(&bench, 0);
+        assert_eq!(
+            session
+                .replace_keys(&place.1, &[&primary], &mut bench, &mut random)
+                .err(),
+            Some(Error::State(
+                "revoke at least one key and retain at least one"
+            ))
+        );
+        // A backup joins it through the ordinary addition.
+        bench.present(&[0, 1, 1]);
+        session.add_key(&place.1, &mut bench, &mut random).unwrap();
+        assert_eq!(bench.excluded.last().unwrap(), &vec![primary.clone()]);
+        assert_eq!(session.keys().len(), 2);
+        drop(session);
+        for token in [0, 1] {
+            let session = unlocked(&place, &mut bench, token);
+            assert!(session.notebook().entries.is_empty());
+        }
+        // The primary refused at enrollment publishes nothing.
+        let fresh = Place::new();
+        let mut bench = Bench::new(1);
+        bench.present(&[0, 0]);
+        bench.corrupt = Some(1);
+        assert!(create(&fresh.1, &mut bench, &mut Random(3), false).is_err());
+        assert_eq!(fresh.bytes(), None);
+    }
+
+    #[test]
     fn creation_publishes_nothing_after_any_refusal() {
         type Case = (&'static [usize], fn(&mut Bench));
         let cases: [Case; 6] = [
@@ -1289,7 +1349,7 @@ pub(in crate::portable) mod tests {
             let mut bench = Bench::new(2);
             bench.present(order);
             setup(&mut bench);
-            assert!(create(&place.1, &mut bench, &mut Random(0)).is_err());
+            assert!(create(&place.1, &mut bench, &mut Random(0), true).is_err());
             assert!(bench.present.is_empty(), "retried after {order:?}");
             assert_eq!(place.bytes(), None);
             assert_eq!(
@@ -1306,7 +1366,7 @@ pub(in crate::portable) mod tests {
         drop(created(&place, &mut bench, &mut Random(0)));
         let calls = bench.calls.len();
         assert_eq!(
-            create(&place.1, &mut bench, &mut Random(1)).err(),
+            create(&place.1, &mut bench, &mut Random(1), true).err(),
             Some(Error::State("a portable vault already exists"))
         );
         assert_eq!(bench.calls.len(), calls);
@@ -1399,7 +1459,7 @@ pub(in crate::portable) mod tests {
         bench.present(&[0, 0, 1, 1]);
         bench.revoked = true;
         assert_eq!(
-            create(&fresh.1, &mut bench, &mut random).err(),
+            create(&fresh.1, &mut bench, &mut random, true).err(),
             Some(cancelled())
         );
         assert!(!exists(&fresh.1).unwrap());

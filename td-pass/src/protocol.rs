@@ -102,8 +102,11 @@ pub enum Command {
     /// Open again, the person having accepted the swap the last `Swap`
     /// reply named, for this process.
     AcceptSwap,
+    /// Create a notebook, with a backup key or, when `backup` is false,
+    /// the primary alone, as the person chose.
     Create {
         op: Op,
+        backup: bool,
     },
     Unlock {
         op: Op,

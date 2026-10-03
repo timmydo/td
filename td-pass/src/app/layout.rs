@@ -218,6 +218,10 @@ pub fn prompt(surface: Surface, pin: bool, title_rows: usize, line_rows: usize) 
 
 /// A question's rows: a title, a few details and its actions.
 pub const DIALOG_ROWS: i64 = 7;
+/// The create question's rows: its title, every detail's wrapped rows at
+/// the dialog's widest and its three actions, so what one key risks shows
+/// without scrolling.
+pub const CREATE_ROWS: i64 = 13;
 /// The swap question's rows: at 800x600 the body's height, so all it says
 /// shows without scrolling.
 pub const SWAP_ROWS: i64 = 22;

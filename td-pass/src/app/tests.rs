@@ -80,7 +80,7 @@ fn op_of(out: &[Out]) -> Op {
         .find_map(|out| match out {
             Out::Send(
                 Command::Unlock { op, .. }
-                | Command::Create { op }
+                | Command::Create { op, .. }
                 | Command::Apply { op, .. }
                 | Command::UseKey { op, .. }
                 | Command::AddKey { op }
@@ -510,8 +510,15 @@ fn declining_the_prompt_answers_decline_and_a_cancel_reads_as_cancelled() {
     app.take_out();
     app.reply(Reply::Opened { keys: None });
     key(&mut app, &mut board, "Return");
+    // Cancel, One key only, Primary and backup.
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Return");
     let out = app.take_out();
-    assert!(matches!(out[..], [Out::Send(Command::Create { .. })]));
+    assert!(matches!(
+        out[..],
+        [Out::Send(Command::Create { backup: true, .. })]
+    ));
     let op = op_of(&out);
     app.reply(Reply::Ask {
         op,
@@ -1934,11 +1941,16 @@ fn unlocking_waits_until_the_host_s_lock_is_watched() {
     app.reply(Reply::Opened { keys: None });
     key(&mut app, &mut board, "Return");
     assert!(app.take_out().is_empty());
+    assert!(app.dialog.is_none());
     app.host(HostEvent::Undelayed);
+    key(&mut app, &mut board, "Return");
+    assert!(app.dialog.is_some());
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Tab");
     key(&mut app, &mut board, "Return");
     assert!(matches!(
         app.take_out()[..],
-        [Out::Send(Command::Create { .. })]
+        [Out::Send(Command::Create { backup: true, .. })]
     ));
 }
 
@@ -2413,4 +2425,80 @@ fn a_prompt_shows_its_words_and_keeps_its_field_and_buttons_on_the_window() {
     let mut rows = wrap("abcdefghijk", 4);
     shorten(&mut rows, 2, 4);
     assert_eq!(rows, ["abcd", "efg…"]);
+}
+
+#[test]
+fn create_asks_which_keys_and_one_key_is_an_explicit_choice() {
+    let mut board = Board::default();
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Opened { keys: None });
+    assert!(app
+        .status
+        .contains("Create enrolls a key, and a backup if you choose"));
+    // The question comes first, saying what one key risks; Cancel, the
+    // focus it opens on, creates nothing.
+    key(&mut app, &mut board, "Return");
+    assert!(app.take_out().is_empty());
+    let text = format!("{:?}", app.dialog.as_ref().map(|(dialog, _)| dialog));
+    for said in [
+        "Create a notebook with which keys?",
+        "no password and no reset",
+        "either key opens it alone",
+        "losing that key or blocking its PIN loses the notebook",
+        "added later from Keys",
+        "One key only",
+        "Primary and backup",
+    ] {
+        assert!(text.contains(said), "{said}: {text}");
+    }
+    // Every row shows in an 800x600 window, without scrolling.
+    let (dialog, _) = app.dialog.as_ref().unwrap();
+    let shown = i64::from(dialog.details_rect().height) / layout::row(app.surface);
+    assert!(
+        dialog.detail_rows() as i64 <= shown,
+        "{} rows in {shown}",
+        dialog.detail_rows()
+    );
+    assert_eq!(dialog.first(), 0);
+    let visible: String = (0..dialog.detail_rows())
+        .filter_map(|row| dialog.detail_text(row))
+        .collect();
+    assert!(visible.contains("loses the notebook and everything in it for good"));
+    key(&mut app, &mut board, "Return");
+    assert!(app.dialog.is_none());
+    assert!(app.take_out().is_empty());
+    assert!(app.busy.is_none());
+    // One key only is the alternate, after Cancel.
+    key(&mut app, &mut board, "Return");
+    key(&mut app, &mut board, "Tab");
+    key(&mut app, &mut board, "Return");
+    let out = app.take_out();
+    assert!(matches!(
+        out[..],
+        [Out::Send(Command::Create { backup: false, .. })]
+    ));
+    assert_eq!(app.status, "Creating the notebook with one key");
+    let op = op_of(&out);
+    app.reply(Reply::Unlocked {
+        op,
+        entries: Vec::new(),
+        keys: Keys {
+            labels: vec![label(Role::Primary, "40e3e41c")],
+            using: Some(0),
+        },
+    });
+    assert!(app.status.ends_with(ONE_KEY_NOTE), "{}", app.status);
+    key(&mut app, &mut board, "C-k");
+    assert_eq!(app.status, ONE_KEY_HINT);
+    key(&mut app, &mut board, "Escape");
+    assert_eq!(app.status, "");
+    // The sole key cannot be replaced; a backup comes first.
+    key(&mut app, &mut board, "C-k");
+    key(&mut app, &mut board, "Delete");
+    assert!(app.dialog.is_none());
+    assert_eq!(
+        app.status,
+        "Add a backup first (Insert): a kept key authorizes the replacement"
+    );
 }

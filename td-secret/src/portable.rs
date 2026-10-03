@@ -343,8 +343,8 @@ impl LockedVault {
     ) -> Result<Self> {
         // Complete cheap admission before entropy or cryptographic work.
         notebook.validate()?;
-        if !(2..=MAX_SLOTS).contains(&protectors.len()) {
-            return Err("portable vault requires two through eight keys".into());
+        if !(1..=MAX_SLOTS).contains(&protectors.len()) {
+            return Err("portable vault requires one through eight keys".into());
         }
         // Sort references so token secrets remain in their clearing owners.
         let mut ordered: Vec<&Protector> = protectors.iter().collect();
@@ -401,8 +401,8 @@ impl LockedVault {
             return Err("invalid portable vault revision".into());
         }
         let [count] = reader.array()?;
-        if !(2..=MAX_SLOTS).contains(&usize::from(count)) {
-            return Err("portable vault requires two through eight keys".into());
+        if !(1..=MAX_SLOTS).contains(&usize::from(count)) {
+            return Err("portable vault requires one through eight keys".into());
         }
         let mut slots = Vec::new();
         for _ in 0..count {
@@ -579,8 +579,8 @@ impl LockedVault {
         random: &mut impl Read,
     ) -> Result<Self> {
         let revision = self.current(opened)?;
-        if !(2..=MAX_SLOTS).contains(&protectors.len()) {
-            return Err("portable vault requires two through eight keys".into());
+        if !(1..=MAX_SLOTS).contains(&protectors.len()) {
+            return Err("portable vault requires one through eight keys".into());
         }
         let mut ordered: Vec<&Protector> = protectors.iter().collect();
         ordered.sort_by(|a, b| a.credential.cmp(&b.credential));
@@ -1093,11 +1093,37 @@ mod tests {
     }
 
     #[test]
+    fn the_primary_alone_is_a_vault_that_only_it_opens() {
+        let mut keys = protectors();
+        let backup = keys.pop().unwrap();
+        assert_eq!(keys[0].role, Role::Primary);
+        let locked = LockedVault::create(&notebook(), &keys, &mut random()).unwrap();
+        let bytes = locked.bytes().to_vec();
+        let decoded = LockedVault::decode(&bytes).unwrap();
+        assert_eq!(decoded.unlock_hints().count(), 1);
+        let opened = decoded.open(&keys[0].credential, &keys[0].secret).unwrap();
+        assert_eq!(opened.notebook.entries.len(), notebook().entries.len());
+        assert_eq!(
+            opened.notebook.entries[0].body(),
+            notebook().entries[0].body()
+        );
+        assert!(decoded.open(&backup.credential, &backup.secret).is_err());
+        // A backup may join it, keeping the vault key; nothing has no key.
+        let added = decoded
+            .add_protector(&opened, &backup, &mut random())
+            .unwrap();
+        assert_eq!(added.unlock_hints().count(), 2);
+        let mut none = bytes.clone();
+        none[48] = 0;
+        assert!(LockedVault::decode(&none).is_err());
+    }
+
+    #[test]
     fn invalid_key_tables_refuse_before_entropy() {
         let mut cases = vec![Vec::new()];
-        let mut single = protectors();
-        single.pop();
-        cases.push(single);
+        let mut lone_backup = protectors();
+        lone_backup.remove(0);
+        cases.push(lone_backup);
         let mut duplicate = protectors();
         duplicate[1].credential = b"primary".to_vec();
         cases.push(duplicate);

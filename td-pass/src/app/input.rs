@@ -638,6 +638,8 @@ impl App {
                     }
                     (Choice::Confirmed(Act::Delete), _) => self.delete_now(),
                     (Choice::Confirmed(Act::Replace), _) => self.replace_now(),
+                    (Choice::Confirmed(Act::CreateWithBackup), _) => self.create_now(true),
+                    (Choice::Confirmed(Act::CreateOneKey), _) => self.create_now(false),
                     (Choice::Confirmed(Act::Save), Some(then)) => self.save(Some(then)),
                     (Choice::Confirmed(Act::Discard), Some(then)) => {
                         self.discard();
@@ -785,7 +787,7 @@ impl App {
             Phase::Locked { .. } => {
                 match layout::strip(surface, &layout::LOCKED).hit(x, y) {
                     Some(0) => return self.unlock(),
-                    Some(1) => return self.create(),
+                    Some(1) => return self.create(opener),
                     Some(2) => return self.start_import(),
                     _ => {}
                 }

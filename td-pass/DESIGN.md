@@ -134,6 +134,16 @@ mode.
   only while that document is open, no save starts while another entry
   is being read, and a read answered after the open entry was edited
   leaves that entry open.
+- **Creation.** With no notebook yet, Create (Return) first asks which
+  keys to create it with, Cancel the focus it opens on. Primary and
+  backup enrolls both, either of which opens the notebook alone. One key
+  only is the explicit decision td-secret/PORTABLE.md names: the
+  question says that only an enrolled key and its PIN open the notebook,
+  with no password or reset, and that with one key losing it or blocking
+  its PIN loses the notebook for good; the question is tall enough that
+  all of it shows at 800x600 without scrolling. A notebook with one key
+  says so when it opens, and its keys view says Insert adds a backup;
+  Replace on the only key refuses and says to add a backup first.
 - **Keys.** Keys (Ctrl+K) shows the notebook's enrolled keys in place
   of the panes, naming the one that authorizes saves; the open entry
   and its unsaved edits stay as they were, a paste asked for a pane is

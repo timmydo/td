@@ -56,10 +56,19 @@ pub fn start() -> Result<Client, String> {
     })
 }
 
+/// The keys td-secret creates a notebook with, as the person chose.
+fn creation(backup: bool) -> pass::Creation {
+    if backup {
+        pass::Creation::PrimaryAndBackup
+    } else {
+        pass::Creation::PrimaryOnly
+    }
+}
+
 impl Client {
     pub fn send(&mut self, command: Command) {
         let cancel = pass::Cancel::new();
-        if let Command::Create { op }
+        if let Command::Create { op, .. }
         | Command::Unlock { op, .. }
         | Command::Apply { op, .. }
         | Command::UseKey { op, .. }
@@ -230,14 +239,14 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                 let accepted = risk.take();
                 open(accepted, &mut host, &mut keys, &mut risk)
             }
-            Command::Create { op } => {
+            Command::Create { op, backup } => {
                 let mut asker = Asker {
                     op,
                     replies,
                     answers,
                 };
                 match host.as_mut() {
-                    Some(host) => match host.create(&mut asker, &cancel) {
+                    Some(host) => match host.create(creation(backup), &mut asker, &cancel) {
                         Ok(created) => {
                             let entries = items(&created);
                             let keys = listing(&created, &mut enrolled);
@@ -615,6 +624,12 @@ impl pass::Prompt for Asker<'_> {
 mod tests {
     use super::*;
     use pass::Prompt;
+
+    #[test]
+    fn a_backup_is_enrolled_only_when_asked_for() {
+        assert_eq!(creation(true), pass::Creation::PrimaryAndBackup);
+        assert_eq!(creation(false), pass::Creation::PrimaryOnly);
+    }
 
     fn request() -> pass::Request {
         pass::Request {

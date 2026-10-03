@@ -434,6 +434,17 @@ impl SwapRisk {
     }
 }
 
+/// The keys a new vault is created with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Creation {
+    /// A primary and a separately presented backup, either of which opens
+    /// the vault alone.
+    PrimaryAndBackup,
+    /// The primary alone: the person's explicit decision that losing that
+    /// key, or blocking its PIN, loses the vault. Keys can be added later.
+    PrimaryOnly,
+}
+
 /// What `Host::open` found.
 pub enum Opening {
     Opened(Host),
@@ -486,18 +497,25 @@ impl Host {
         Ok(Some(keys.into_iter().map(Key::from).collect()))
     }
 
-    /// Creates the vault, enrolling the primary and then the backup key. A
-    /// cancel after publication began cannot stop it: the vault exists, and
-    /// the `Vault` returned is the caller's to drop when it has locked.
-    pub fn create(&mut self, prompt: &mut dyn Prompt, cancel: &Cancel) -> Result<Vault, Failure> {
+    /// Creates the vault, enrolling the primary and then, as `keys` asks,
+    /// the backup key. A cancel after publication began cannot stop it: the
+    /// vault exists, and the `Vault` returned is the caller's to drop when
+    /// it has locked.
+    pub fn create(
+        &mut self,
+        keys: Creation,
+        prompt: &mut dyn Prompt,
+        cancel: &Cancel,
+    ) -> Result<Vault, Failure> {
         let Self {
             protected,
             directory,
             random,
             tokens,
         } = self;
+        let backup = matches!(keys, Creation::PrimaryAndBackup);
         with_tokens(protected, tokens, prompt, cancel, |hardware| {
-            lifecycle::create(directory, hardware, &mut Random(random))
+            lifecycle::create(directory, hardware, &mut Random(random), backup)
         })
         .map(Vault)
     }

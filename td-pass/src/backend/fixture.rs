@@ -135,7 +135,7 @@ pub(super) fn serve(
                 Reply::Locked { keys: Some(keys()) }
             }
             Command::Apply { op, .. } => closed(op),
-            Command::Create { op }
+            Command::Create { op, .. }
             | Command::Unlock { op, .. }
             | Command::UseKey { op, .. }
             | Command::AddKey { op }

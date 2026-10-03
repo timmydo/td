@@ -86,13 +86,18 @@ derivation salt. The encrypted notebook authenticates the complete protector
 table, format version and revision as well as its contents. Unauthenticated metadata is only bounded input to an
 unlock attempt, never authority to add or replace a protector.
 
-Initial enrollment proves a primary and a separately presented backup before
-publishing anything. Both must independently unwrap the identical vault key,
+Initial enrollment proves a primary and, unless the person chooses the
+primary alone, a separately presented backup before publishing anything.
+Every enrolled key must independently unwrap the identical vault key,
 and the notebook must authenticate under it. Exclude existing credential
 IDs during new credential creation and require the operator to use a
-separate physical key;
-this cannot prove distinct malicious or cloned hardware. An explicit
-unrecoverability profile is not part of this first production target.
+separate physical key for the backup; this cannot prove distinct
+malicious or cloned hardware. Creating with the primary alone is the
+explicit unrecoverability decision AGENTS.md principle 7 names: td-pass
+asks for it at creation, saying that losing that key or blocking its PIN
+loses the notebook, and a backup can be added later through the ordinary
+addition. Nothing in the envelope records the choice; a one-slot table
+is the state it leaves.
 
 Adding a key requires fresh authorization by an existing enrolled key, then
 creation and proof on the new key. The complete new protector table and
@@ -102,7 +107,7 @@ An orphan credential on a token is possible after interrupted enrollment;
 it grants no access without a committed wrapped vault key. A lost success
 reply does not authorize replay of the operation.
 
-The backup is independently usable with the complete vault file on another
+Each backup is independently usable with the complete vault file on another
 machine, with the original primary and TPM absent. It may authorize a new
 primary. Do not remove the last working recovery path. Replacing a lost or
 revoked key rotates the vault key, re-encrypts the current notebook and
@@ -128,13 +133,14 @@ IDs are random, stable and independent of titles. Titles, contents and entry
 revisions are all encrypted. Exact text bytes, including line endings, are
 preserved; visual wrapping performs no data transformation.
 
-The envelope admits two through eight key slots with bounded credential IDs
-and fixed salt, nonce and wrapped-key lengths. There is exactly one primary
-and at least one backup. Slots have a canonical order and duplicate
-credentials are refused. All lengths, counts, versions and trailing bytes
-are checked before expensive operations or allocation proportional to input.
-Authentication precedes plaintext decoding. Every successful write uses a
-fresh random nonce and a checked increasing revision.
+The envelope admits one through eight key slots with bounded credential
+IDs and fixed salt, nonce and wrapped-key lengths. There is exactly one
+primary, and any other slot is a backup. Slots have a canonical order
+and duplicate credentials are refused. All lengths, counts, versions and
+trailing bytes are checked before expensive operations or allocation
+proportional to input. Authentication precedes plaintext decoding. Every
+successful write uses a fresh random nonce and a checked increasing
+revision.
 
 Filesystem publication must pin directories and files, reject symlinks,
 wrong owners, excessive permissions, nonregular files and unexpected links,
@@ -194,7 +200,7 @@ hardware vault was published by version 1. Version 2 is:
 | Magic | Eight bytes `TDVAULT2` |
 | Vault ID | 32 random bytes |
 | Vault revision | Nonzero u64 |
-| Slot count | u8, two through eight |
+| Slot count | u8, one through eight |
 | Slots | Repeated structure below, strictly sorted by credential bytes |
 | Notebook nonce | 12 fresh random bytes |
 | Sealed notebook length | u32, 20 through 4 MiB + 16 |
@@ -868,10 +874,12 @@ Each newly enrolled key is created and proved in one transaction, then
 asserted again on a new channel. The repeat must recover the identical
 secret with an advancing counter, except that two zero counters are
 accepted. Creation refuses an existing vault before contacting a token,
-enrolls the primary, then enrolls the backup with the primary excluded.
-Both must open the proposed envelope to the identical vault key before
+enrolls the primary, then, unless the caller asked for the primary
+alone, enrolls the backup with the primary excluded. Every enrolled key
+must open the proposed envelope to the identical vault key before
 revision one is published against the absent baseline. Six PIN prompts
-cover the complete ceremony. Any refusal publishes nothing.
+cover the two-key ceremony and three the primary alone. Any refusal
+publishes nothing.
 
 Unlock reads the committed envelope, uses the caller-selected credential's
 hint, and requires an assertion that opens the whole envelope. The caller
@@ -933,8 +941,10 @@ Revocation protects the current vault file only. Historical copies stay
 readable by the keys they enrolled. Nothing persists a revision floor:
 anyone able to write the vault directory can restore a pre-rotation copy.
 The retained keys still open it, unlock accepts it, and later saves would
-encrypt new contents under a vault key a revoked token can unwrap. The
-portable format provides no rollback protection, as stated above.
+encrypt new contents under a vault key a revoked token can unwrap. Restoring
+a copy from before a key was added likewise puts later saves under that
+copy's keys alone, perhaps a primary without a backup. The portable format
+provides no rollback protection, as stated above.
 
 Tests drive every operation through a simulated multi-token bench with
 real P-256 public keys and per-credential secrets. They cover:
@@ -1137,12 +1147,13 @@ both.
   `Prompt`. Before each token is opened, `present` names the operation
   label, the role and, for an enrolled key, its fingerprint; it returns
   once the person has connected that one key. Creation therefore asks
-  for the primary and then the separate backup. `pin` returns the PIN
-  for the presented key, as the transaction's PIN owner zeroes it; its
-  `PinUse` is `Authorize` for every enrolled-key assertion, which
-  `Request::operation` names. An error from either is the person
-  declining, and the operation ends as cancelled; a PIN outside the
-  profile is refused as such. Neither is retried.
+  for the primary and then, when the caller asked for one, the separate
+  backup. `pin` returns the PIN for the presented key, as the
+  transaction's PIN owner zeroes it; its `PinUse` is `Authorize` for
+  every enrolled-key assertion, which `Request::operation` names. An
+  error from either is the person declining, and the operation ends as
+  cancelled; a PIN outside the profile is refused as such. Neither is
+  retried.
 - **Cancel.** A `Cancel` ends an operation from another thread, as a
   lock, suspend or authority loss does: the token session in flight,
   including its startup, which reports cancellation, not a missing key;
