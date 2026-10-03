@@ -1362,8 +1362,8 @@ Initial independently landable increments:
   while preserving unknown -00:00. Bound month/year carries and output work;
   retain an explicit unverified outcome for leap-second input. Cover date
   boundaries, large/nonhour offsets, hostile components, capacity/work
-  refusals and allocation-free formatting. Leap-second qualification and
-  JMAP form publication remain open.
+  refusals and allocation-free formatting. M06ab qualifies pinned leap
+  insertions; JMAP form publication remains open.
 
 - **M06z — delimited structured tokens:** validate raw quoted strings and
   domain literals with fixed escape/fold/UTF-8 state. Preserve complete token
@@ -1379,6 +1379,14 @@ Initial independently landable increments:
   quoted data, long atoms, nesting/work refusal and allocation-free parsing.
   Unfolding, JSON-safe projection, response publication and method
   integration remain open.
+
+- **M06ab — pinned positive leap seconds:** add the operator-approved IANA
+  source with exact offline verification and deterministic static generation.
+  Qualify listed UTC 23:59:60 values after offset normalization with fixed
+  work and no allocation; retain explicit unverified outcomes for all other
+  leap components. Cover all insertions, source corruption, malformed rows,
+  numeric calendar conversion, search bounds and capacity/work refusal.
+  JSON/JMAP publication and complete worker composition remain open.
 
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement

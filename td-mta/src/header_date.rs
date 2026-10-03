@@ -1,4 +1,5 @@
 //! Complete resident RFC 5322 date-time parsing; output formatting is separate.
+mod leap_dates;
 pub mod project;
 
 use crate::{

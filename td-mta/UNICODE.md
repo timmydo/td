@@ -1,7 +1,8 @@
 # Unicode data and bounded normalization
 
-This is td-mta's approved upstream data dependency. It adds no Cargo crate,
-runtime file dependency, network fetch during a build, or Unicode library.
+This is an approved upstream data dependency for td-mta. It adds no Cargo
+crate, runtime file dependency, network fetch during a build, or Unicode
+library.
 M06m supplies committed inputs and cold verification tooling; M06n generates
 compact tables reproducibly. M06o adds fixed runtime lookups and algorithmic
 Hangul. M06p supplies bounded NFC over resident valid UTF-8; M06t adds

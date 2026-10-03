@@ -2265,6 +2265,41 @@ fn header_date_projection() {
         render(date, &mut [], Tick(1), &mut work),
         Err(Error::Capacity)
     );
+    let leap = Date {
+        year: 2016,
+        month: 12,
+        day: 31,
+        hour: 23,
+        minute: 59,
+        second: 60,
+        offset: Offset::Known(0),
+    };
+    for (offset, expected) in [
+        (Offset::Known(0), "2016-12-31T23:59:60Z"),
+        (Offset::Unknown, "2016-12-31T23:59:60-00:00"),
+    ] {
+        assert_eq!(
+            render(
+                black_box(Date { offset, ..leap }),
+                &mut output,
+                Tick(1),
+                &mut work
+            ),
+            Ok(Outcome::Date(expected))
+        );
+    }
+    let mut short = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            records: 13,
+            output_bytes: 100,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        render(leap, &mut output, Tick(1), &mut short),
+        Err(Error::Work(Stop::Records))
+    );
     let mut limited = Meter::new(
         Deadline::after(Tick(0), 100).unwrap(),
         Charge {

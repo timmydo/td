@@ -162,6 +162,7 @@ MIME-part locator codecs separately from the future protocol handlers.
 state codecs; [QUEUE.md](QUEUE.md) freezes future queue/restart/JMAP semantics.
 [POLICY.md](POLICY.md) freezes message interpretation, threading and queries;
 [UNICODE.md](UNICODE.md) pins approved Unicode data and bounded normalization;
+[leap-seconds/README.md](leap-seconds/README.md) pins approved IANA leap data;
 [CASES.md](CASES.md) names the protocol acceptance oracles still to implement.
 M04's `bounded` and `ownership` modules provide caller-owned buffer/queue/slot
 primitives. Its `admission` module validates disk/work settings and derived
@@ -286,8 +287,16 @@ NFC equations. M06t composes resident unstructured-header decoding with NFC
 and bounded charged replay. Structured headers and protocol integration
 remain open.
 
-This is a named data dependency, not permission to import a Unicode or mail
-parsing library.
+The core also contains 27 positive leap insertion dates generated from the
+approved, checksummed IANA input in leap-seconds/README.md. Offline tooling
+verifies the complete pin before generation; runtime Date projection uses
+the 108-byte static table without file access or allocation. Expiration is
+provenance metadata and does not invalidate historical insertions. Unlisted
+second-60 dates remain unverified. Updates require a reviewed source pin
+and regenerated table.
+
+These are named data dependencies, not permission to import a Unicode or
+mail parsing library.
 
 The backend admission and gate contract lives in td-crypto/DESIGN.md.
 Both packages stay in the test roster.

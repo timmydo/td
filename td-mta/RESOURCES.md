@@ -69,6 +69,14 @@ accessor code and mapped-page rounding are excluded from this payload count
 and also belong within that allowance. No new arena or RSS qualification
 follows from this payload count.
 
+The generated positive leap-date array has a checked 108-byte payload in
+the same process/allocator allowance. Cold input/generator files are not
+linked into the service. Date qualification uses scalar locals and at most
+five checked table comparisons, prepaid as six extra records. No runtime
+source read, allocation or new arena is introduced. Source metadata remains
+in the checked-in provenance; mapped pages and code are outside the array
+payload count and still belong within the process allowance.
+
 Resident NFC uses the existing 4 KiB conversion reservation: 3072 bytes of
 caller-owned scratch plus at most 1024 bytes for cursor state and its shared
 header budget. Four private source checkpoints are included in that cursor
@@ -834,8 +842,8 @@ into 20 or 25 caller bytes. Placement and exclusive lifetime of that output
 remain the enclosing owner's responsibility; no existing scratch partition
 is claimed by this helper. Its calendar shift is bounded to five days and
 uses scalar locals. It allocates no time-zone table or owned string. The
-complete Date form's output reservation, leap-second qualification and
-composed worker stack remain open.
+complete Date form's output reservation and composed worker stack remain
+open. Pinned leap qualification adds only the static payload above.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also

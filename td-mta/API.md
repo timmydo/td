@@ -1456,10 +1456,10 @@ are charged. The non-Copy cursor fits 192 bytes, including inline CFWS state,
 a three-byte word prefix and scalar counters. Long comments, zone names and
 zero-prefixed years use constant storage. Source capture and enclosing
 aggregate interpretation admission remain external. Section 1.32 projects
-ordinary dates; leap-second qualification, JSON output and the JMAP method
+ordinary dates and pinned leap insertions; JSON output and the JMAP method
 adapter remain follow-on work.
 
-### 1.32 Ordinary date projection
+### 1.32 Date projection
 
 M06y supplies `header_date::project::render` over copied Date components,
 caller output storage, a tick and the live job meter. It revalidates the
@@ -1477,23 +1477,34 @@ return OutOfRange without output. At most five day transitions are required
 by the supported signed-minute offset range. Arithmetic on these bounded
 components cannot wrap; year boundary transitions use checked operations.
 
-After raw component validation, second 60 returns LeapSecondUnverified
-before offset normalization, retaining the original parsed Date and emitting
-nothing, even at output year boundaries. Invalid raw components still return
-OutOfRange. The unverified outcome is distinct from OutOfRange and
-malformed/null.
-No leap-second announcement source is currently qualified, and placement at
-the end of a UTC month alone cannot certify that a leap actually occurred.
-An eventual JMAP Date adapter must resolve this outcome under a reviewed
-verification policy before claiming complete Date support; it must not
-silently clamp, roll forward or relabel it as malformed. Raw headers and
-parsed components remain available. This increment adds no upstream data.
+M06ab qualifies second 60 using the operator-approved IANA source pin in
+leap-seconds/README.md. Offline tooling verifies the exact source and derives
+27 positive insertion dates; only the generated 108-byte table enters the
+runtime. After validating raw components, normalize the offset without
+changing the second. Known offsets become UTC; unknown -0000/obsolete zones
+retain their UTC clock by RFC 5322 convention and the -00:00 marker. Only
+23:59:60 on a listed UTC date produces Date output. No clamping or rollover
+repairs an unqualified leap component.
+
+Unlisted second-60 values return LeapSecondUnverified with no output,
+including pre-1972/future dates, wrong UTC minutes and normalization outside
+the output year range. Invalid raw components still return OutOfRange. The
+unverified outcome is distinct from a malformed date; the eventual adapter
+uses POLICY.md's null/diagnostic mapping. Source update/expiration metadata
+is provenance, not runtime admission: expiration never invalidates a known
+historical insertion or proves absence of a future announcement. There is
+no runtime source file, timezone database, network lookup or automatic update.
+Negative/discontinuous transitions refuse cold generation until supported by
+a reviewed extension. Ordinary seconds retain their calendar/offset checks;
+this does not predict future negative leaps.
 
 Successful output occupies exactly 20 bytes for Z or 25 for -00:00 and
 borrows the caller buffer; it includes no JSON quotes or fractional seconds.
 The bounded TextBuffer formats only checked integer components and a static
 suffix. Eight records prepay component validation, up to five date steps,
-and fixed-width formatting. No source bytes are visited. Capacity is checked
+and fixed-width formatting. Valid raw second-60 components prepay another
+six records for key construction and at most five binary-search comparisons
+over at most 31 dates. No mail-source bytes are visited. Capacity is checked
 before charging the exact output byte count, and that charge precedes all
 writes. Capacity, work, OutOfRange and LeapSecondUnverified leave the buffer
 unchanged; an internal formatting/state failure requires discarding output.
@@ -1504,9 +1515,10 @@ meter. JSON framing/publication needs its own separately charged bytes.
 No string, timezone table or calendar object is allocated. Tests cover
 literal mail-to-RFC output, nonhour offsets, five-day shifts, leap-century
 boundaries, both four-digit year edges, malformed public components,
-capacity/work refusal and the explicit unverified leap outcome. The Rust
-allocation interval exercises successful formatting and refusal paths.
-The complete Date/JMAP adapter and worker stack remain unqualified.
+capacity/work refusal, all pinned insertions and the unverified leap
+outcome. The Rust allocation interval exercises successful formatting and
+refusal paths. The complete Date/JMAP adapter and worker stack remain
+unqualified.
 
 ### 1.33 Delimited structured-header tokens
 

@@ -166,18 +166,30 @@ names receive NFC; stored/rendered addresses never authorize SMTP recipients.
 The stricter outbound addr-spec/envelope validator rejects malformed recovered
 addresses and CR/LF/NUL rather than sending them.
 
-MessageIds parses complete RFC 5322 msg-id lists, removes grammatical CFWS and
-outer angle brackets, and returns null for an invalid list. For References and
-In-Reply-To also accept their RFC 5322 section 4 obsolete forms and discard
-obsolete phrases while retaining msg-ids. Whitespace inside quoted strings or
-domain literals is data, not grammatical CFWS. Other malformed text still
-invalidates the field rather than accepting a convenient prefix. Date uses RFC
-5322 date-time including its obsolete numeric/year/zone rules; malformed or
-out-of-range dates return null. Convert valid numeric offsets without local
-timezone dependence; -0000 retains the unknown-local-offset meaning. URLs
-parses RFC 2369 lists and returns null for invalid input. These forms never
-fetch a URL. RFC date/header parsing does not broaden SMTP envelope grammar.
-Header values unsupported by a form remain readable as Raw.
+MessageIds parses complete RFC 5322 msg-id lists, removes grammatical CFWS
+and outer angle brackets, and returns null for an invalid list. For
+References and In-Reply-To also accept their RFC 5322 section 4 obsolete
+forms and discard obsolete phrases while retaining msg-ids. Whitespace
+inside quoted strings or domain literals is data, not grammatical CFWS.
+Other malformed text still invalidates the field rather than accepting a
+convenient prefix. Date uses RFC 5322 date-time including its obsolete
+numeric/year/zone rules; malformed or out-of-range dates return null.
+Convert valid numeric offsets without local timezone dependence; -0000
+retains the unknown-local-offset meaning. Second 60 is emitted only at a
+positive insertion in the approved IANA pin after UTC normalization;
+unknown-zone forms retain their UTC clock by RFC 5322 convention. Unlisted
+or unrepresentable second-60 values remain unverified; the JMAP adapter
+returns null for that derived Date with an internal unverified-leap
+diagnostic, preserving raw headers and parsed components. No leap component
+is clamped or rolled into another minute. The pin's expiration does not
+erase historical insertions or establish future absence; updates are
+reviewed git changes. The exact input and cold validation contract are in
+leap-seconds/README.md.
+
+The URLs form parses RFC 2369 lists and returns null for invalid input.
+These forms never fetch a URL. RFC date/header parsing does not broaden SMTP
+envelope grammar. Header values unsupported by a form remain readable as
+Raw.
 
 RFC 2231 MIME parameters support percent decoding, charset/language prefixes,
 and numbered continuations beginning at zero without gaps. Duplicate segment

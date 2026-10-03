@@ -1,4 +1,4 @@
-//! Checked RFC 3339 projection of ordinary mail dates, without a time-zone DB.
+//! Checked RFC 3339 projection of mail dates, without a time-zone DB.
 use super::{month_days, Date, Offset};
 use crate::{
     admission::work::{Charge, Meter, Stop},
@@ -10,7 +10,7 @@ use crate::{
 pub enum Outcome<'a> {
     Date(&'a str),
     OutOfRange,
-    /// The mail grammar permits :60; no leap announcement source is qualified.
+    /// The pinned positive-insertion table cannot qualify this :60 component.
     LeapSecondUnverified,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,8 +31,8 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Returns 20-byte UTC or 25-byte unknown-offset text in caller storage.
-/// Revalidate public components; neither arbitrary Date values nor a parsed
-/// leap-second component certify an RFC 3339 instant.
+/// Revalidate public components; qualify a parsed leap second only through
+/// the pinned insertion table after applying the offset convention.
 pub fn render<'a>(
     date: Date,
     output: &'a mut [u8],
@@ -51,12 +51,28 @@ pub fn render<'a>(
     if !valid_components(date) {
         return Ok(Outcome::OutOfRange);
     }
-    if date.second == 60 {
-        return Ok(Outcome::LeapSecondUnverified);
+    let leap = date.second == 60;
+    if leap {
+        // Date-key construction and at most five table comparisons.
+        work.charge(
+            now,
+            Charge {
+                records: 6,
+                ..Charge::default()
+            },
+        )
+        .map_err(Error::Work)?;
     }
     let Some(date) = normalize(date) else {
-        return Ok(Outcome::OutOfRange);
+        return Ok(if leap {
+            Outcome::LeapSecondUnverified
+        } else {
+            Outcome::OutOfRange
+        });
     };
+    if leap && !listed_leap(date)? {
+        return Ok(Outcome::LeapSecondUnverified);
+    }
     let (suffix, length) = match date.offset {
         Offset::Known(0) => ("Z", 20),
         Offset::Unknown => ("-00:00", 25),
@@ -85,6 +101,33 @@ pub fn render<'a>(
     let text = std::str::from_utf8(output).map_err(|_| Error::InvalidState)?;
     Ok(Outcome::Date(text))
 }
+fn listed_leap(date: Date) -> Result<bool, Error> {
+    if date.hour != 23 || date.minute != 59 {
+        return Ok(false);
+    }
+    let key = u32::from(date.year) * 10000 + u32::from(date.month) * 100 + u32::from(date.day);
+    let dates = &super::leap_dates::POSITIVE_DATES;
+    let mut low = 0;
+    let mut high = dates.len();
+    if high > 31 {
+        return Err(Error::InvalidState);
+    }
+    for _ in 0..5 {
+        if low == high {
+            return Ok(false);
+        }
+        let middle = low + (high - low) / 2;
+        match key.cmp(dates.get(middle).ok_or(Error::InvalidState)?) {
+            std::cmp::Ordering::Less => high = middle,
+            std::cmp::Ordering::Equal => return Ok(true),
+            std::cmp::Ordering::Greater => low = middle + 1,
+        }
+    }
+    if low != high {
+        return Err(Error::InvalidState);
+    }
+    Ok(false)
+}
 fn valid_components(date: Date) -> bool {
     date.year <= 9999
         && (1..=12).contains(&date.month)
@@ -98,7 +141,7 @@ fn valid_components(date: Date) -> bool {
             Offset::Known(minutes) => (-5999..=5999).contains(&minutes),
         }
 }
-// Only render calls this, after validating components and ordinary seconds.
+// Only render calls this, after validating raw components.
 fn normalize(mut date: Date) -> Option<Date> {
     let offset = match date.offset {
         Offset::Unknown => return Some(date),
@@ -292,10 +335,13 @@ mod tests {
     #[test]
     fn leap_seconds_are_explicitly_unverified_without_repair_or_null() {
         for source in [
-            "31 Dec 2016 23:59:60 +0000",
-            "1 Jan 2017 00:59:60 +0100",
-            "31 Dec 2016 23:59:60 -0000",
             "1 Jan 2000 12:34:60 +0000",
+            "31 Dec 2016 23:58:60 +0000",
+            "31 Dec 2016 23:58:60 -0000",
+            "1 Jan 2017 00:59:60 -0000",
+            "31 Dec 2016 23:59:60 +0001",
+            "30 Jun 1971 23:59:60 +0000",
+            "31 Dec 2026 23:59:60 +0000",
             "31 Dec 9999 23:59:60 -9959",
         ] {
             let date = parse(source.as_bytes());
@@ -337,10 +383,91 @@ mod tests {
         assert_eq!(output, [0x5a; 25]);
     }
     #[test]
+    fn pinned_insertions_render_without_clamping_and_charge_fixed_lookup_work() {
+        for (source, expected) in [
+            ("30 Jun 1972 23:59:60 +0000", "1972-06-30T23:59:60Z"),
+            ("31 Dec 2016 23:59:60 +0000", "2016-12-31T23:59:60Z"),
+            ("1 Jan 2017 00:59:60 +0100", "2016-12-31T23:59:60Z"),
+            ("31 Dec 2016 18:29:60 -0530", "2016-12-31T23:59:60Z"),
+            ("5 Jan 2017 03:58:60 +9959", "2016-12-31T23:59:60Z"),
+            ("27 Dec 2016 20:00:60 -9959", "2016-12-31T23:59:60Z"),
+            ("31 Dec 2016 23:59:60 -0000", "2016-12-31T23:59:60-00:00"),
+            ("31 Dec 2016 23:59:60 Z", "2016-12-31T23:59:60-00:00"),
+        ] {
+            let date = parse(source.as_bytes());
+            let mut output = [0x5a; 26];
+            let mut work = work();
+            let before = work.remaining();
+            assert_eq!(
+                render(date, &mut output, Tick(1), &mut work),
+                Ok(Outcome::Date(expected)),
+                "{source}"
+            );
+            assert!(output[expected.len()..].iter().all(|&b| b == 0x5a));
+            assert_eq!(before.records - work.remaining().records, 14);
+            assert_eq!(before.io_bytes, work.remaining().io_bytes);
+            assert_eq!(
+                before.output_bytes - work.remaining().output_bytes,
+                expected.len() as u64
+            );
+        }
+        for &key in &super::super::leap_dates::POSITIVE_DATES {
+            let date = Date {
+                year: (key / 10000) as u16,
+                month: ((key / 100) % 100) as u8,
+                day: (key % 100) as u8,
+                hour: 23,
+                minute: 59,
+                second: 60,
+                offset: Offset::Known(0),
+            };
+            let mut output = [0; 25];
+            assert!(matches!(
+                render(date, &mut output, Tick(1), &mut work()),
+                Ok(Outcome::Date(_))
+            ));
+            assert_eq!(
+                render(
+                    Date {
+                        day: date.day - 1,
+                        ..date
+                    },
+                    &mut output,
+                    Tick(1),
+                    &mut work()
+                ),
+                Ok(Outcome::LeapSecondUnverified)
+            );
+        }
+        // Every civil day around the table exercises absent-key binary-search paths.
+        for year in 1971..=2018 {
+            for month in 1..=12 {
+                for day in 1..=month_days(year, month) {
+                    let date = Date {
+                        year,
+                        month,
+                        day,
+                        hour: 23,
+                        minute: 59,
+                        second: 60,
+                        offset: Offset::Known(0),
+                    };
+                    let key = u32::from(year) * 10000 + u32::from(month) * 100 + u32::from(day);
+                    assert_eq!(
+                        listed_leap(date).unwrap(),
+                        super::super::leap_dates::POSITIVE_DATES.contains(&key)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn output_capacity_and_work_refusal_are_atomic() {
         for source in [
             b"1 Jan 2000 00:00 +0000".as_slice(),
             b"1 Jan 2000 00:00 -0000",
+            b"31 Dec 2016 23:59:60 +0000",
+            b"31 Dec 2016 23:59:60 -0000",
         ] {
             let date = parse(source);
             let size = if date.offset == Offset::Unknown {
@@ -359,10 +486,11 @@ mod tests {
                 assert_eq!(output, [0x5a; 25]);
                 assert_eq!(before.output_bytes, work.remaining().output_bytes);
             }
+            let required = if date.second == 60 { 14 } else { 8 };
             for (records, output_bytes, now, expected) in [
-                (7, 100, 1, Stop::Records),
-                (8, size as u64 - 1, 1, Stop::OutputBytes),
-                (8, 100, 100, Stop::Deadline),
+                (required - 1, 100, 1, Stop::Records),
+                (required, size as u64 - 1, 1, Stop::OutputBytes),
+                (required, 100, 100, Stop::Deadline),
             ] {
                 let mut work = Meter::new(
                     Deadline::after(Tick(0), 100).unwrap(),
