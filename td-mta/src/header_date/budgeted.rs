@@ -2,8 +2,8 @@
 use super::{Cursor, Error, Status};
 use crate::{
     admission::work::{Charge, Meter},
-    decode_work::{Error as DecodeError, Work},
-    nfc::{self, HeaderBudget},
+    decode_work::{Error as DecodeError, Parsing},
+    nfc::HeaderBudget,
     ports::Tick,
 };
 /// Retains exclusive budget borrows and non-replayable prepaid work credit.
@@ -62,7 +62,7 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         let result = self
             .budget
             .charge(self.work, now, 0, 0, &mut self.credit)
-            .map_err(map_error)
+            .map_err(DecodeError::from)
             .map_err(Error::from);
         if let Err(error) = result {
             self.failure = Some(error);
@@ -79,11 +79,7 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         self.check_deadline(now)?;
         let result = self.cursor.poll_with_work(
             now,
-            &mut DateWork {
-                work: self.work,
-                budget: self.budget,
-                credit: &mut self.credit,
-            },
+            &mut Parsing::new(self.work, self.budget, &mut self.credit),
         );
         if let Err(error) = result {
             self.failure = Some(error);
@@ -91,34 +87,6 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         result
     }
 }
-struct DateWork<'w> {
-    work: &'w mut Meter,
-    budget: &'w mut HeaderBudget,
-    credit: &'w mut u8,
-}
-impl Work for DateWork<'_> {
-    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), DecodeError> {
-        if charge.output_bytes != 0 || charge.unlinks != 0 {
-            return Err(DecodeError::InvalidState);
-        }
-        let steps = charge
-            .io_bytes
-            .checked_add(charge.records)
-            .ok_or(DecodeError::InvalidState)?
-            .max(1);
-        self.budget
-            .charge(self.work, now, charge.io_bytes, steps, self.credit)
-            .map_err(map_error)
-    }
-}
-fn map_error(error: nfc::Error) -> DecodeError {
-    match error {
-        nfc::Error::Work(stop) => DecodeError::Work(stop),
-        nfc::Error::InterpretationLimit => DecodeError::InterpretationLimit,
-        nfc::Error::InvalidState | nfc::Error::InvalidTable => DecodeError::InvalidState,
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {

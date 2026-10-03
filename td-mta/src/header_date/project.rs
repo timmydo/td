@@ -4,7 +4,7 @@ use crate::{
     admission::work::{Charge, Meter, Stop},
     bounded::TextBuffer,
     decode_work::{Error as WorkError, Work},
-    nfc::{self, HeaderBudget},
+    nfc::HeaderBudget,
     ports::Tick,
 };
 
@@ -90,11 +90,7 @@ impl Work for RenderWork<'_> {
         }
         self.budget
             .charge(self.work, now, 0, charge.records, &mut self.credit)
-            .map_err(|error| match error {
-                nfc::Error::Work(stop) => WorkError::Work(stop),
-                nfc::Error::InterpretationLimit => WorkError::InterpretationLimit,
-                nfc::Error::InvalidState | nfc::Error::InvalidTable => WorkError::InvalidState,
-            })?;
+            .map_err(WorkError::from)?;
         self.work
             .charge(
                 now,

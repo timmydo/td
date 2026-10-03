@@ -249,6 +249,7 @@ impl<'a> Cursor<'a> {
                     header_delimited::Error::Malformed => Error::Malformed,
                     header_delimited::Error::Work(stop) => Error::Work(stop),
                     header_delimited::Error::InvalidState => Error::InvalidState,
+                    header_delimited::Error::InterpretationLimit => Error::InterpretationLimit,
                 })?;
                 if let header_delimited::Status::Complete(extent) = status {
                     self.position = extent.end;

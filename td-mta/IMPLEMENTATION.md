@@ -1558,6 +1558,13 @@ Initial independently landable increments:
   handoff guards and allocation-free output. Other structured forms and
   unpublished response retention remain open.
 
+- **M06ay — budgeted resident MessageIds parsing:** retain original job/email
+  budgets across CFWS, delimited tokens and shared identifier grammar. Share
+  Raw/Date parser charging without changing plain APIs; propagate typed
+  aggregate refusal. Cover exact costs, every partial budget, provisional
+  event retirement, field-credit isolation and allocation-free long input.
+  Aggregate conversion and complete MessageIds property JSON remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

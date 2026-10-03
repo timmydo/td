@@ -1,10 +1,13 @@
 //! Shared raw identifier grammar; public construction parses MessageIds lists.
+mod budgeted;
 pub mod project;
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::Work,
     header_cfws, header_delimited,
     ports::Tick,
 };
+pub use budgeted::Budgeted;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -45,6 +48,15 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            crate::decode_work::Error::InterpretationLimit => Self::InterpretationLimit,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 impl From<Stop> for Error {
     fn from(error: Stop) -> Self {
         Self::Work(error)
@@ -131,6 +143,13 @@ impl<'a> Cursor<'a> {
             .then_some(self.position)
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -143,19 +162,21 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         match self.phase {
             Phase::Cfws => {
                 let cursor = self
                     .cfws
                     .get_or_insert_with(|| header_cfws::Cursor::new(self.source, self.position));
-                let status = cursor.poll(now, work).map_err(|error| match error {
-                    header_cfws::Error::Malformed => Error::Malformed,
-                    header_cfws::Error::NestingLimit => Error::NestingLimit,
-                    header_cfws::Error::Work(error) => Error::Work(error),
-                    header_cfws::Error::InvalidState => Error::InvalidState,
-                    header_cfws::Error::InterpretationLimit => Error::InterpretationLimit,
-                })?;
+                let status = cursor
+                    .poll_with_work(now, work)
+                    .map_err(|error| match error {
+                        header_cfws::Error::Malformed => Error::Malformed,
+                        header_cfws::Error::NestingLimit => Error::NestingLimit,
+                        header_cfws::Error::Work(error) => Error::Work(error),
+                        header_cfws::Error::InvalidState => Error::InvalidState,
+                        header_cfws::Error::InterpretationLimit => Error::InterpretationLimit,
+                    })?;
                 if let header_cfws::Status::Complete(end) = status {
                     self.position = end.position;
                     self.cfws = None;
@@ -167,11 +188,14 @@ impl<'a> Cursor<'a> {
             Phase::Atom { start, emit } => self.atom(start, emit, now, work),
             Phase::Delimited { emit } => {
                 let cursor = self.delimited.as_mut().ok_or(Error::InvalidState)?;
-                let status = cursor.poll(now, work).map_err(|error| match error {
-                    header_delimited::Error::Malformed => Error::Malformed,
-                    header_delimited::Error::Work(error) => Error::Work(error),
-                    header_delimited::Error::InvalidState => Error::InvalidState,
-                })?;
+                let status = cursor
+                    .poll_with_work(now, work)
+                    .map_err(|error| match error {
+                        header_delimited::Error::Malformed => Error::Malformed,
+                        header_delimited::Error::Work(error) => Error::Work(error),
+                        header_delimited::Error::InvalidState => Error::InvalidState,
+                        header_delimited::Error::InterpretationLimit => Error::InterpretationLimit,
+                    })?;
                 match status {
                     header_delimited::Status::Yield => Ok(Status::Yield),
                     header_delimited::Status::Complete(extent) => {
@@ -192,7 +216,7 @@ impl<'a> Cursor<'a> {
             Phase::Complete => Ok(Status::Complete),
         }
     }
-    fn visit(&self, now: Tick, work: &mut Meter) -> Result<Option<u8>, Error> {
+    fn visit(&self, now: Tick, work: &mut impl Work) -> Result<Option<u8>, Error> {
         work.charge(
             now,
             Charge {
@@ -240,7 +264,7 @@ impl<'a> Cursor<'a> {
         }
         Status::Yield
     }
-    fn syntax(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn syntax(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         use header_delimited::Kind;
         let byte = self.visit(now, work)?;
         match (self.grammar, byte) {
@@ -331,7 +355,7 @@ impl<'a> Cursor<'a> {
         start: usize,
         emit: bool,
         now: Tick,
-        work: &mut Meter,
+        work: &mut impl Work,
     ) -> Result<Status, Error> {
         for _ in 0..32 {
             let byte = self.visit(now, work)?;

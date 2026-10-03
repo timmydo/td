@@ -3100,6 +3100,70 @@ fn header_date_projection() {
     assert_eq!(before, after, "header date projection allocated");
 }
 
+fn budgeted_message_ids() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_message_ids::{Budgeted, Error, Mode, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("({0})<{0}@b><\"{0}\"@[{0}]>", "🐈".repeat(4096));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for (source, expected_ids, malformed) in [
+        (long.as_bytes(), 2, false),
+        (b"old words <a@b> tail".as_slice(), 1, false),
+        (b"<a@b> (bad", 1, true),
+    ] {
+        let mut cursor = Budgeted::new(
+            black_box(source),
+            Mode::ObsoletePhrases,
+            &mut work,
+            &mut budget,
+        );
+        let mut ids = 0;
+        let mut finished = false;
+        for _ in 0..10000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::End) => ids += 1,
+                Ok(Status::Complete) => {
+                    assert!(!malformed);
+                    finished = true;
+                    cursor.check_deadline(Tick(1)).unwrap();
+                    break;
+                }
+                Err(Error::Malformed) => {
+                    assert!(malformed);
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Malformed));
+                    finished = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("unexpected MessageIds failure: {error}"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(ids, expected_ids);
+    }
+    let mut cursor = Budgeted::new(b"", Mode::ObsoletePhrases, &mut work, &mut budget);
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted MessageIds parsing allocated");
+}
+
 fn budgeted_header_dates() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -4692,6 +4756,7 @@ fn main() {
         header_date_projection();
         budgeted_date_projection();
         header_dates();
+        budgeted_message_ids();
         budgeted_header_dates();
         header_comments();
         header_selection();
@@ -4819,6 +4884,7 @@ fn main() {
     header_date_projection();
     budgeted_date_projection();
     header_dates();
+    budgeted_message_ids();
     budgeted_header_dates();
     header_comments();
     header_selection();

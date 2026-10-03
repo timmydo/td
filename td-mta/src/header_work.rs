@@ -2,7 +2,7 @@
 use crate::{
     admission::work::{Charge as JobCharge, Meter},
     decode_work::Error,
-    nfc::{self, HeaderBudget},
+    nfc::HeaderBudget,
     ports::Tick,
 };
 #[derive(Clone, Copy, Default)]
@@ -60,10 +60,6 @@ impl Work for Aggregate<'_> {
         }
         self.budget
             .charge(self.work, now, charge.visits, charge.steps, self.credit)
-            .map_err(|error| match error {
-                nfc::Error::Work(stop) => Error::Work(stop),
-                nfc::Error::InterpretationLimit => Error::InterpretationLimit,
-                nfc::Error::InvalidState | nfc::Error::InvalidTable => Error::InvalidState,
-            })
+            .map_err(Error::from)
     }
 }

@@ -1060,6 +1060,16 @@ records and six external output bytes. Allocation intervals cover long
 comments, multiple dates, leap outcomes and late selection refusal. Combined
 worker/native/RSS qualification remains open.
 
+The budgeted MessageIds grammar (M06ay) fits 288 bytes, including inline
+CFWS/delimited state, original budget references and private prepaid credit.
+It replaces its standalone grammar cursor in the existing 16 KiB parser
+reservation. The transient shared Parsing adapter consists of three
+references; no scratch region or process allowance grows. A turn charges at
+most 160 visits, 192 aggregate steps, 12 job records and zero output bytes.
+Allocation intervals cover long Unicode comments, atoms and delimited tokens,
+multiple fields, malformed tails and terminal refusal. Scalar conversion,
+property JSON and combined worker/native/RSS qualification remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

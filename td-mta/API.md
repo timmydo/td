@@ -2616,6 +2616,55 @@ Allocation intervals include long Unicode comments, multiple dates, leap
 outcomes, one-byte drains and late selection refusal in both registered modes.
 Other structured forms and unpublished response-spool retention remain open.
 
+### 1.57 Budgeted resident MessageIds grammar
+
+M06ay adds `header_message_ids::Budgeted` for one resident field value. It
+retains the original job Meter and per-email HeaderBudget exclusively, with
+private non-copyable prepaid credit. Strict and ObsoletePhrases preserve the
+plain parser's grammar and provisional Begin/Part/End events. Only Complete
+validates the whole field; malformed tails, nesting refusal or resource
+failure retire every prior event. The caller still authorizes ObsoletePhrases
+only for References or In-Reply-To. This parser does not classify field names,
+convert scalar output, or compose property JSON.
+
+The shared private Parsing adapter charges one aggregate step per source
+visit and grammar record, with at least one step per charge (including EOF).
+It prepays one job record per sixteen steps, preserves byte revisits and
+rejects output/unlink charges. Raw and Date use the same adapter with their
+existing owner-level charges unchanged. The private error mapping is shared
+with the other aggregate adapters; each retains its distinct charging policy.
+Plain Meter entry points retain their exact previous charges and results.
+Delimited-token aggregate failures propagate as InterpretationLimit through
+MessageIds; mailbox code handles the same typed variant explicitly.
+
+MessageIds child CFWS and delimited turns share the owner's original budgets
+and credit. One poll charges at most 160 source visits, 192 aggregate steps,
+12 job records and zero output bytes. Empty strict input costs zero visits
+and three steps before Malformed; the obsolete empty list has those same
+costs and completes. The list `<a@b>` costs fourteen visits and 31 steps.
+Unused credit is discarded with the field. Earlier successful charges remain
+when a later operation refuses. Aggregate exhaustion latches on the email
+budget; a job stop retains its own typed cause without exhausting that email
+budget. Refused operations do not consume source bytes.
+
+Cached Complete is inert. `check_deadline` performs live admission even after
+completion and latches failure, so callers must use it before retaining the
+result. The wrapper fits 288 bytes including its inline grammar/CFWS/delimited
+state and budget references, within the existing 16 KiB parser reservation.
+It replaces the standalone grammar cursor on this path and adds no arena,
+owned field copy or conversion scratch. The transient shared adapter fits
+three references. These component bounds do not qualify combined workers or
+native/process RSS.
+
+Tests compare plain and budgeted events, outcomes and visits across strict
+and obsolete modes, long Unicode input, folds, malformed tokens and nesting.
+They exhaust partial byte/step budgets, including refusal after End, and pin
+pre-access refusal, field-credit retirement, job limits and final deadlines.
+An allocation interval covers long comments/atoms/delimited tokens, repeated
+fields, malformed tails and terminal deadline refusal in both registered
+probe modes. Aggregate conversion and complete MessageIds property JSON remain
+follow-on work with unpublished response-spool retention.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

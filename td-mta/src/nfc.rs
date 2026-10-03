@@ -133,11 +133,7 @@ impl crate::decode_work::Work for DecodeWork<'_> {
         }
         self.budget
             .charge(self.work, now, charge.io_bytes, charge.records, self.credit)
-            .map_err(|error| match error {
-                Error::Work(stop) => DecodeError::Work(stop),
-                Error::InterpretationLimit => DecodeError::InterpretationLimit,
-                Error::InvalidState | Error::InvalidTable => DecodeError::InvalidState,
-            })
+            .map_err(DecodeError::from)
     }
 }
 impl From<crate::header_text::Error> for Error {
