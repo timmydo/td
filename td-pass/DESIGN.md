@@ -347,3 +347,9 @@ worker's. A recipe test walks every literal `#[path]`, `include!`,
 `include_str!` and `include_bytes!` the compiled crates name, and those
 the named files name in turn, and pins the staged trees to exactly the
 trees reached; a name built with `concat!` is not walked.
+
+On a host, `./install-apps` builds td-pass with the host's cargo, as it
+builds td-photo and td-editor, and installs it to run by name from
+`~/.local/bin`; that copy is a development build, not the recipe's
+static artifact, and it starts its token worker from its own executable
+as the image's does.
