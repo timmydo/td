@@ -4,6 +4,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use td_recipe::catalog;
+use td_recipe::types::CheckRunner;
+
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
 use crate::sha256::Sha256;
 
@@ -13,6 +16,10 @@ use crate::sha256::Sha256;
 // together on a compiler/libc bump (re #547).
 const GCC_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64-self";
 pub(super) const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
+
+/// The userland the `td shell` product proof builds and exercises, in the
+/// order `CheckRunner::RustToolchain` declares them.
+const PROVED_USERLAND: &[&str] = &["ripgrep", "fd", "uutils"];
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     runner.prepare_recipe_target("rust-toolchain")?;
@@ -181,7 +188,28 @@ fn prove_td_shell_userland(
 ) -> Result<(), String> {
     let root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let vendor_root = root.join(".td-build-cache/crate-vendor");
-    for package in ["ripgrep", "fd", "uutils"] {
+    // The packages are the runner's declared builds, so the key and reach
+    // that read them name exactly what is built here; their versions come
+    // from the recipes, so a bump needs no edit to this proof.
+    let packages = CheckRunner::RustToolchain.extra_builds();
+    // The script below exercises each package in its own role; a declared
+    // build it does not exercise, or a role it lost, is a drift to fix here.
+    if packages != PROVED_USERLAND {
+        return Err(format!(
+            "rust-toolchain declares the builds [{}] but its product proof exercises \
+             [{}]; change both together",
+            packages.join(" "),
+            PROVED_USERLAND.join(" ")
+        ));
+    }
+    let version = |stem: &str| {
+        catalog::lookup(stem)
+            .map(|r| r.version)
+            .ok_or_else(|| format!("no recipe `{stem}' for the td shell product proof"))
+    };
+    let (rg_version, fd_version, uutils_version) =
+        (version("ripgrep")?, version("fd")?, version("uutils")?);
+    for package in packages {
         let package_root = vendor_root.join(package);
         if !package_root.join("work").is_dir() || !package_root.join("vendor").is_dir() {
             return Err(format!(
@@ -223,15 +251,15 @@ fn prove_td_shell_userland(
          test ! -e /gnu/store\n\
          export PATH='{TD_STORE_DIR}/{busybox_base}/bin'\n\
          rg=''\n\
-         for p in {TD_STORE_DIR}/*-ripgrep-14.1.1/bin/rg; do\n\
+         for p in {TD_STORE_DIR}/*-ripgrep-{rg_version}/bin/rg; do\n\
            if test -x \"$p\"; then rg=$p; fi\n\
          done\n\
          fd=''\n\
-         for p in {TD_STORE_DIR}/*-fd-10.2.0/bin/fd; do\n\
+         for p in {TD_STORE_DIR}/*-fd-{fd_version}/bin/fd; do\n\
            if test -x \"$p\"; then fd=$p; fi\n\
          done\n\
          uutils=''\n\
-         for p in {TD_STORE_DIR}/*-uutils-0.9.0/bin/coreutils; do\n\
+         for p in {TD_STORE_DIR}/*-uutils-{uutils_version}/bin/coreutils; do\n\
            if test -x \"$p\"; then uutils=$p; fi\n\
          done\n\
          test -n \"$rg\"\n\
@@ -306,8 +334,12 @@ fn prove_td_shell_userland(
         .env("TD_SHELL_NATIVE_INCLUDE", format!("{glibc_path}/include"))
         .env("TD_SHELL_NATIVE_LOCK", lock_s)
         .env("TD_PERSIST_STORE", tdstore_s)
-        .env("TD_PERSIST_DB", persist_db_s)
-        .args(["shell", "ripgrep", "fd", "uutils", "--", store_ns_builder_s])
+        .env("TD_PERSIST_DB", persist_db_s);
+    // The shell asks this evaluator for each recipe it builds; the command
+    // carries the check's confinement, so it refuses any not declared.
+    cmd.arg("shell")
+        .args(packages)
+        .args(["--", store_ns_builder_s])
         .arg("store-ns")
         .arg(tdstore_s)
         .args(["--", busybox_path, "sh", "-c", &script]);
@@ -334,7 +366,7 @@ fn prove_td_shell_userland(
         ));
     }
     println!(
-        "   [product] td shell built ripgrep 14.1.1, fd 10.2.0, and uutils 0.9.0 with source-built stage2 and ran all three under own-root /td/store"
+        "   [product] td shell built ripgrep {rg_version}, fd {fd_version}, and uutils {uutils_version} with source-built stage2 and ran all three under own-root /td/store"
     );
     Ok(())
 }
@@ -556,5 +588,15 @@ mod tests {
 
         fs::remove_file(script).unwrap();
         fs::remove_file(elf).unwrap();
+    }
+
+    /// The proof exercises exactly the builds the runner declares, so the
+    /// verdict key reads what the proof builds and nothing is built unproved.
+    #[test]
+    fn the_proof_exercises_exactly_the_declared_builds() {
+        assert_eq!(
+            super::PROVED_USERLAND,
+            td_recipe::types::CheckRunner::RustToolchain.extra_builds()
+        );
     }
 }

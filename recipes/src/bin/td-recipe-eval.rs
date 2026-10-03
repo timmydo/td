@@ -282,6 +282,9 @@ fn main() {
         }
         Some("emit") => {
             let stem = args.get(2).unwrap_or_else(|| die("usage: emit STEM"));
+            if let Err(e) = check_runner::ensure_emit_allowed(stem) {
+                die(&e);
+            }
             println!("{}", lookup_or_die(stem).to_json().to_canonical());
         }
         Some("check-list") => {

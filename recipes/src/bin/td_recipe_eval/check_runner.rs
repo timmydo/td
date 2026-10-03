@@ -97,13 +97,31 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         return Err(usage());
     }
     let check_runner = selected_check_runner(stem, index)?;
+    let roots = check_roots(stem, Some(check_runner));
     // Provenance planning FIRST — before the runner exists, so a rejected
-    // graph spawns no subprocess at all (re #469).
-    ensure_targets_provenance(&[stem])?;
+    // graph spawns no subprocess at all (re #469). Over everything the check
+    // may build, its declared builds included.
+    ensure_targets_provenance(&roots)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("check", &[stem, &index.to_string()]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let allowed: BTreeSet<String> = recipe_closure(&roots)?
+        .into_iter()
+        .map(|node| node.stem)
+        .collect();
+    // What this check may build, and so what its key reads: the line that
+    // explains a surprising rerun or a refused build.
+    let extra = check_runner.extra_builds();
+    println!(
+        "   [reach] {stem}#{index} builds within {} recipes: the closure of {stem}{}",
+        allowed.len(),
+        if extra.is_empty() {
+            String::new()
+        } else {
+            format!(" and of its runner's declared builds {}", extra.join(" "))
+        }
+    );
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_allowed_builds(allowed);
     // The verdict memo is consulted BEFORE the ladder lock: a memoized pass
     // needs nothing the lock guards, and not queueing behind another
     // worktree's climb is part of what it saves.
@@ -2094,6 +2112,56 @@ fn is_plain_basename(b: &str) -> bool {
         && b != ".."
 }
 
+/// Carries a check's build confinement (`RecipeCheckRunner::allowed_builds`)
+/// into a nested evaluator: `emit` refuses any other stem while it is set.
+pub(crate) const CHECK_BUILDS_ENV: &str = "TD_CHECK_BUILDS";
+
+fn undeclared_build(target: &str) -> String {
+    format!(
+        "check builds `{target}', which neither its owner's closure nor its runner's \
+         declared builds hold — add it to `CheckRunner::extra_builds` (types.rs) so the \
+         verdict key and the check's reach read it"
+    )
+}
+
+/// `emit`'s side of the confinement: Err for a stem outside `TD_CHECK_BUILDS`
+/// when that is set.
+pub(crate) fn ensure_emit_allowed(stem: &str) -> Result<(), String> {
+    emit_allowed(stem, env::var(CHECK_BUILDS_ENV).ok().as_deref())
+}
+
+fn emit_allowed(stem: &str, allowed: Option<&str>) -> Result<(), String> {
+    match allowed {
+        Some(allowed) if !allowed.split(' ').any(|s| s == stem) => Err(undeclared_build(stem)),
+        _ => Ok(()),
+    }
+}
+
+/// The recipes check `index` of `stem` builds from: the owner, then what its
+/// runner declares it builds beside it.
+fn check_roots(stem: &str, runner: Option<CheckRunner>) -> Vec<&str> {
+    let mut roots = vec![stem];
+    for extra in runner.map_or(&[][..], CheckRunner::extra_builds) {
+        if !roots.contains(extra) {
+            roots.push(extra);
+        }
+    }
+    roots
+}
+
+/// The recipes a check-owning `stem` may build across all its checks.
+fn owner_roots(stem: &str, recipe: &Recipe) -> Vec<String> {
+    let mut roots = vec![stem.to_string()];
+    for check in recipe.checks.iter().flatten() {
+        for extra in check.runner.map_or(&[][..], CheckRunner::extra_builds) {
+            if !roots.iter().any(|r| r == extra) {
+                roots.push((*extra).to_string());
+            }
+        }
+    }
+    roots
+}
+
 fn selected_check_runner(stem: &str, index: usize) -> Result<CheckRunner, String> {
     let recipe = catalog::lookup(stem)
         .ok_or_else(|| format!("unknown recipe stem '{stem}' (try `list`)"))?;
@@ -2255,6 +2323,11 @@ pub(crate) struct RecipeCheckRunner {
     /// tells a peer's reaper that this tree is live (see `claim_scratch`). `None` only
     /// in tests, which construct the struct directly and share no ladder.
     _scratch_lock: Option<File>,
+    /// Under `check-run`, the recipes the check may build: the closure of
+    /// its owner and of its runner's declared `extra_builds`, which is what
+    /// its verdict key reads. `None` for the host-side commands, which build
+    /// what they are asked.
+    allowed_builds: Option<BTreeSet<String>>,
 }
 
 pub(crate) struct RecipeNode {
@@ -2422,7 +2495,41 @@ impl RecipeCheckRunner {
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
             _scratch_lock: Some(scratch_lock),
+            // A runner a confined check's build spawned (a nested
+            // `build-run`, `check-run`) holds to the same builds.
+            allowed_builds: env::var(CHECK_BUILDS_ENV)
+                .ok()
+                .map(|a| a.split_whitespace().map(str::to_string).collect()),
         })
+    }
+
+    /// Confine this runner's builds to `allowed` (see `allowed_builds`),
+    /// within any confinement it already holds.
+    pub(crate) fn with_allowed_builds(mut self, allowed: BTreeSet<String>) -> Self {
+        self.allowed_builds = Some(match self.allowed_builds.take() {
+            Some(outer) => allowed.intersection(&outer).cloned().collect(),
+            None => allowed,
+        });
+        self
+    }
+
+    /// The confinement as `TD_CHECK_BUILDS` carries it to a nested evaluator
+    /// (`emit`, asked by `td-builder shell`): space-separated stems, or None
+    /// when unconfined.
+    pub(crate) fn allowed_builds_env(&self) -> Option<String> {
+        self.allowed_builds
+            .as_ref()
+            .map(|a| a.iter().map(String::as_str).collect::<Vec<_>>().join(" "))
+    }
+
+    /// Err when a confined check asks to build `target` outside what its
+    /// verdict key reads: a stale pass would otherwise answer for a recipe
+    /// the key never saw.
+    fn ensure_build_allowed(&self, target: &str) -> Result<(), String> {
+        match &self.allowed_builds {
+            Some(allowed) if !allowed.contains(target) => Err(undeclared_build(target)),
+            _ => Ok(()),
+        }
     }
 
     /// Opt into live per-rung build progress: `build_plan` tees the build's stdout and
@@ -3260,6 +3367,7 @@ impl RecipeCheckRunner {
     }
 
     pub(crate) fn prepare_recipe_target(&self, target: &str) -> Result<(), String> {
+        self.ensure_build_allowed(target)?;
         let graph = recipe_closure(&[target])?;
         // ensure_graph_inputs re-derives, pin-verifies, interns, and STAGES every
         // seed in the current graph, and writes the fresh per-run auto-map from
@@ -3447,6 +3555,7 @@ impl RecipeCheckRunner {
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
+        self.ensure_build_allowed(target)?;
         // The auto map is the FRESH per-run map prepare_recipe_target wrote from this
         // graph's re-derived, pin-verified seeds (every non-owned input is an interned
         // seed source). There is no tools map — a host executable is not an admissible
@@ -3789,6 +3898,7 @@ impl RecipeCheckRunner {
         target: &str,
         outputs: &[&str],
     ) -> Result<Vec<PathBuf>, String> {
+        self.ensure_build_allowed(target)?;
         let fingerprint = self.evaluator_fingerprint(target)?;
         if let Some(staged) = self.reuse_build_run(target, &fingerprint, outputs)? {
             return Ok(staged);
@@ -3914,7 +4024,7 @@ impl RecipeCheckRunner {
                 None => b"none".as_slice(),
             },
         );
-        let closure = recipe_closure(&[stem])?;
+        let closure = recipe_closure(&check_roots(stem, check.runner))?;
         // In stem order, not walk order: the walk is deterministic today, and
         // the key should not depend on that staying so.
         let mut nodes: Vec<&RecipeNode> = closure.iter().collect();
@@ -4181,7 +4291,16 @@ impl RecipeCheckRunner {
             .env("TD_BUILDER_STORE", &self.builder_store)
             .env("TD_BUILDER_DB", &self.builder_db);
         forward_inherited_check_policy(&mut cmd);
+        self.forward_allowed_builds(&mut cmd);
         cmd
+    }
+
+    /// Hand a confined runner's builds to the builder it spawns, whose own
+    /// evaluator calls (`emit`, a nested runner) then hold to them too.
+    fn forward_allowed_builds(&self, cmd: &mut Command) {
+        if let Some(allowed) = self.allowed_builds_env() {
+            cmd.env(CHECK_BUILDS_ENV, allowed);
+        }
     }
 
     /// A host-environment-free control-plane command for product proofs. The
@@ -4196,6 +4315,7 @@ impl RecipeCheckRunner {
             .env("TD_BUILDER_STORE", &self.builder_store)
             .env("TD_BUILDER_DB", &self.builder_db);
         forward_inherited_check_policy(&mut cmd);
+        self.forward_allowed_builds(&mut cmd);
         if let Some(daemon_dir) = &self.daemon_dir {
             cmd.env("TD_DAEMON_DIR", daemon_dir);
         }
@@ -4283,13 +4403,10 @@ pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeSet<String>, String
             continue;
         }
         let mut closure = Vec::new();
-        visit_recipe(
-            stem,
-            &catalog,
-            &mut HashSet::new(),
-            &mut HashSet::new(),
-            &mut closure,
-        )?;
+        let (mut visiting, mut emitted) = (HashSet::new(), HashSet::new());
+        for root in owner_roots(stem, recipe) {
+            visit_recipe(&root, &catalog, &mut visiting, &mut emitted, &mut closure)?;
+        }
         if closure.iter().any(|n| reached.contains(n.stem.as_str())) {
             out.insert((*stem).to_string());
         }
@@ -8702,6 +8819,7 @@ chmod 755 '{}'
             vouched: std::sync::Mutex::new(None),
             // Not claimed: this runner shares no ladder with anything.
             _scratch_lock: None,
+            allowed_builds: None,
         }
     }
 
@@ -9681,6 +9799,7 @@ chmod 755 '{}'
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
             _scratch_lock: None,
+            allowed_builds: None,
         };
 
         let got = runner.ladder_out_from(&current, "rust-toolchain").unwrap();
@@ -9701,6 +9820,72 @@ chmod 755 '{}'
         assert!(!is_plain_basename("a\tb"));
         assert!(!is_plain_basename("a\\b"));
         assert!(!is_plain_basename("..\\etc"));
+    }
+
+    /// A check builds within the closure of its owner and its runner's
+    /// declared builds; the key's recipes and locks and the reach read that
+    /// same set, and a confined run refuses, in process and through `emit`,
+    /// to build anything else.
+    #[test]
+    fn a_runner_declared_build_joins_the_check_and_nothing_else_is_built() {
+        let roots = check_roots("rust-toolchain", Some(CheckRunner::RustToolchain));
+        assert_eq!(roots, ["rust-toolchain", "ripgrep", "fd", "uutils"]);
+        let closure = recipe_closure(&roots).unwrap();
+        let stems: BTreeSet<String> = closure.iter().map(|n| n.stem.clone()).collect();
+        // The key reads each declared build's recipe and its committed lock.
+        let (locks, _) = closure_repo_inputs(&closure);
+        for extra in CheckRunner::RustToolchain.extra_builds() {
+            assert!(
+                stems.contains(*extra),
+                "{extra} outside the check's closure"
+            );
+            let lock = catalog::lookup(extra).unwrap().cargo_lock.unwrap();
+            assert!(locks.contains(&lock), "{lock} outside the check's key");
+        }
+        let owner = catalog::lookup("rust-toolchain").unwrap();
+        assert_eq!(owner_roots("rust-toolchain", &owner), roots);
+        let hello = catalog::lookup("hello-test").unwrap();
+        assert_eq!(owner_roots("hello-test", &hello), ["hello-test"]);
+
+        let lw = env::temp_dir().join(format!("td-allowed-builds-{}", process::id()));
+        let free = shared_test_runner(&lw);
+        assert!(free.ensure_build_allowed("system-x86-64").is_ok());
+        assert_eq!(free.allowed_builds_env(), None);
+        let confined = shared_test_runner(&lw).with_allowed_builds(stems);
+        assert!(confined.ensure_build_allowed("uutils").is_ok());
+        let refused = confined.ensure_build_allowed("system-x86-64").unwrap_err();
+        assert!(refused.contains("extra_builds"), "{refused}");
+        // Each build entry asks first, before any I/O this inert runner
+        // could not do: the refusal is what comes back, not a missing tree.
+        for err in [
+            confined.prepare_recipe_target("system-x86-64").unwrap_err(),
+            confined.build_plan("system-x86-64").unwrap_err(),
+            confined.build_and_stage("system-x86-64", &[]).unwrap_err(),
+        ] {
+            assert_eq!(err, refused);
+        }
+        let env = confined.allowed_builds_env().unwrap();
+        // Every builder the confined runner spawns carries it on; a free
+        // runner's carries nothing.
+        let carried = |cmd: Command| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == CHECK_BUILDS_ENV)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(carried(confined.builder_command()), Some(env.clone()));
+        assert_eq!(carried(confined.clean_builder_command()), Some(env.clone()));
+        assert_eq!(carried(free.builder_command()), None);
+        assert_eq!(carried(free.clean_builder_command()), None);
+        // A runner confined again holds to both.
+        let set = |s: &[&str]| s.iter().map(|x| (*x).to_string()).collect::<BTreeSet<_>>();
+        let nested = shared_test_runner(&lw)
+            .with_allowed_builds(set(&["fd", "uutils"]))
+            .with_allowed_builds(set(&["uutils", "hello"]));
+        assert_eq!(nested.allowed_builds_env().as_deref(), Some("uutils"));
+        assert!(emit_allowed("uutils", Some(&env)).is_ok());
+        assert!(emit_allowed("system-x86-64", Some(&env)).is_err());
+        assert!(emit_allowed("system-x86-64", None).is_ok());
+        let _ = fs::remove_dir_all(&lw);
     }
 
     /// A compositor file the shared modules do not compile in reaches only

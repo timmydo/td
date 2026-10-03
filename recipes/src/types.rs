@@ -1228,6 +1228,21 @@ pub enum CheckRunner {
     Tzdata,
 }
 
+impl CheckRunner {
+    /// The recipes this runner builds beyond its owning recipe's closure.
+    /// A check's verdict key and its reach take their closures as well, and
+    /// a check run refuses to build any recipe outside the union, so a build
+    /// a runner gains without declaring it fails rather than escaping both.
+    pub fn extra_builds(self) -> &'static [&'static str] {
+        match self {
+            // The product proof `td shell`-builds the Rust userland with the
+            // toolchain it just made (checks/rust_toolchain.rs).
+            CheckRunner::RustToolchain => &["ripgrep", "fd", "uutils"],
+            CheckRunner::BuildOnly | CheckRunner::Codex | CheckRunner::Tzdata => &[],
+        }
+    }
+}
+
 impl RecipeCheck {
     pub fn new(script: &str) -> RecipeCheck {
         RecipeCheck {
