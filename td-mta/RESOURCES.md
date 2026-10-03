@@ -810,6 +810,13 @@ Returned extents describe the immutable source using offsets. Allocation
 intervals cover long UTF-8 comments, folding, nesting and malformed/depth
 refusal. The complete structured-form parser stack remains unqualified.
 
+The delimited-token cursor fits 64 bytes in that same parser reservation.
+An explicit kind and escape state handle either a quoted string or domain
+literal; returned raw extents borrow no new storage. No nesting stack or
+copied token is retained. Allocation intervals cover long UTF-8 values,
+escapes, malformed input and work refusal for both kinds. The complete
+address/MessageIds parser stack remains unqualified.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

@@ -2064,6 +2064,75 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_delimited_tokens() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_delimited::{Cursor, Error, Extent, Kind, Status},
+        ports::{Deadline, Tick},
+    };
+    let quoted = format!("\"{}\"", "🐈".repeat(10_000));
+    let literal = format!("[{}]", "🐈".repeat(10_000));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1_000_000,
+            records: 100_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, kind) in [
+        (quoted.as_bytes(), Kind::QuotedString),
+        (literal.as_bytes(), Kind::DomainLiteral),
+        (b"\"a\\\"b\"".as_slice(), Kind::QuotedString),
+        (b"[a\\]b]".as_slice(), Kind::DomainLiteral),
+    ] {
+        let mut cursor = Cursor::new(black_box(source), 0, kind);
+        let mut complete = false;
+        for _ in 0..10_000 {
+            if let Status::Complete(extent) = cursor.poll(Tick(1), &mut work).unwrap() {
+                assert_eq!(
+                    extent,
+                    Extent {
+                        start: 0,
+                        end: source.len()
+                    }
+                );
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+    }
+    for (source, kind) in [
+        (b"\"\\".as_slice(), Kind::QuotedString),
+        (b"[\\".as_slice(), Kind::DomainLiteral),
+    ] {
+        let mut cursor = Cursor::new(source, 0, kind);
+        assert_eq!(cursor.poll(Tick(1), &mut work), Err(Error::Malformed));
+    }
+    for (source, kind) in [
+        (quoted.as_bytes(), Kind::QuotedString),
+        (literal.as_bytes(), Kind::DomainLiteral),
+    ] {
+        let mut limited = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                records: 100,
+                ..Charge::default()
+            },
+        );
+        let mut cursor = Cursor::new(source, 0, kind);
+        assert_eq!(
+            cursor.poll(Tick(1), &mut limited),
+            Err(Error::Work(Stop::IoBytes))
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "delimited header token scanning allocated");
+}
+
 fn header_date_projection() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -2985,6 +3054,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        header_delimited_tokens();
         header_date_projection();
         header_dates();
         header_comments();
@@ -3089,6 +3159,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    header_delimited_tokens();
     header_date_projection();
     header_dates();
     header_comments();

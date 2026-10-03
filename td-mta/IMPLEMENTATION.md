@@ -1365,6 +1365,13 @@ Initial independently landable increments:
   refusals and allocation-free formatting. Leap-second qualification and
   JMAP form publication remain open.
 
+- **M06z — delimited structured tokens:** validate raw quoted strings and
+  domain literals with fixed escape/fold/UTF-8 state. Preserve complete token
+  extents, obey enclosing field boundaries and retain work failures. Cover
+  escaped delimiters, obsolete controls, long tokens, precise charges and
+  allocation-free polling. Unquoting/display decoding, complete address and
+  MessageIds forms, and publication remain follow-on work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

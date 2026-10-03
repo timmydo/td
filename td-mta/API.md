@@ -1508,6 +1508,44 @@ capacity/work refusal and the explicit unverified leap outcome. The Rust
 allocation interval exercises successful formatting and refusal paths.
 The complete Date/JMAP adapter and worker stack remain unqualified.
 
+### 1.33 Delimited structured-header tokens
+
+M06z supplies `header_delimited::Cursor` with explicit QuotedString or
+DomainLiteral kind, immutable field source and a starting offset at the
+opening delimiter. Source must end at the enclosing scanner value_end,
+excluding its final CRLF or bare LF. Optional surrounding CFWS is handled
+separately by the enclosing grammar. A successful token returns its original
+start/end offsets, including delimiters, and leaves all following bytes
+untouched. Complete means this token validated, not that its placement or
+the rest of the field is valid. Enclosing form results stay provisional.
+
+Quoted pairs suppress delimiter interpretation. Within strings, parentheses,
+brackets, commas and address punctuation are ordinary data. Within a domain
+literal, an unescaped opening bracket is malformed; escaped brackets and
+quotes are data. Both kinds accept RFC 5322 obsolete controls/quoted pairs
+and RFC 6532 UTF-8. SP/HTAB and accepted CRLF/bare-LF folds remain unchanged.
+Unescaped NUL, bare CR, nonfold LF/CRLF, invalid/truncated UTF-8, a missing
+opening delimiter, unterminated escape or missing close is Malformed.
+Noncharacters remain valid lexical scalars; JSON projection handles them.
+
+No unquoting, unfolding, encoded-word decoding, NFC, domain/IP validation
+or recipient authorization happens here. This primitive grants no SMTP
+syntax permission. A form parser maps malformed tokens to its strict null
+or documented recovery policy; work refusal retains its resource meaning.
+Failures latch across replacement meters. Cached completion is inert.
+
+Each poll executes at most 32 transitions, charging at most 32 records and
+160 source-byte visits before inspection. UTF-8 validation charges its lead
+reread; fold lookahead is charged even when malformed. No output bytes are
+charged. The non-Copy cursor fits 64 bytes in the existing body parser
+reservation, with no recursion, copied token or growing delimiter state.
+Callers retain field admission, aggregate work and fresh clock/cancellation
+checks around turns. Fixtures cover raw extents, escapes, obsolete controls,
+Unicode, exact charges, long inputs, scanner-delimited field boundaries and
+sticky failures. Allocation intervals cover both kinds, long input and
+malformed/work refusal. Complete address/MessageIds grammars and worker
+integration remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
