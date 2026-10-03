@@ -50,7 +50,7 @@ pub const MARGIN: usize = 2;
 pub const TITLE: &str = "Keys";
 /// How to close the list, at the title bar's right where it fits beside
 /// `TITLE`.
-pub const TITLE_HINT: &str = "F1, q or Escape closes";
+pub const TITLE_HINT: &str = "F1, q, Escape or a click closes";
 /// The narrowest description a wrapped row keeps: below it the
 /// description runs on and the list clips it.
 pub const MIN_WRAP: usize = 16;

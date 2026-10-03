@@ -78,7 +78,7 @@ impl ReviewPage {
         let end = start.saturating_add(BODY_ROWS).min(lines.len());
         let detail = lines.get(start..end)?.join("\n");
         let status = format!(
-            "Review \u{b7} step 4 of 6 \u{b7} detail {}/{} \u{b7} Enter to install",
+            "Review \u{b7} step 4 of 6 \u{b7} detail {}/{} \u{b7} Return to install",
             page + 1,
             pages
         );

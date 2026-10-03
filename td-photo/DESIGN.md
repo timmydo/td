@@ -226,7 +226,8 @@ window, all speaking the toolkit's one vocabulary.
   returns to the cull grid; `export` is the roll's export view (below),
   entered with `export-mode` (`E`) and left the same way. The mode strip
   (td-ui's `chrome::Buttons`, the window's first band: Roll Selection,
-  Culling, Single, Develop, Export)
+  Culling, Single, Develop, Export, then Help, `keys::BUTTON`, which is
+  the live window's way to its key list, see Window)
   shows which is in view (cull's grid or single view apart), the roll
   chooser while it is open and none before a roll,
   and a press on it is the one target every mode shares (`press_mode`):
@@ -238,7 +239,9 @@ window, all speaking the toolkit's one vocabulary.
   develops the cursor's photo, and Export closes the chooser and shows
   the export view. The
   one in view is `ignored`, as is a disabled button: Culling and Export
-  before a roll, Single and Develop before a photo (`mode_states`);
+  before a roll, Single and Develop before a photo (`mode_states`, Help
+  always enabled and never selected), and so is Help, whose press the
+  live window takes before the model hears it;
   `filter_states` disables
   the filter strip in develop, in the export view and under the chooser,
   where the filters are not the mode's, its buttons inert. The develop
@@ -740,8 +743,9 @@ window, all speaking the toolkit's one vocabulary.
   agent's (`open`; `choose`, `o`, is the person's way to one).
   `td-photo --help actions` prints the table so an agent can read it
   instead of guessing. The live window's `F1` key list shows the same
-  table's chorded rows, each chord with its help line
-  (`Controller::key_sections`), under the chooser's own keys while the
+  table's chorded rows, each chord with its help line, as one section
+  titled Actions (`Controller::key_sections`; the table has no grouping
+  of its own to split it by), under the chooser's own keys while the
   chooser owns the keyboard; `F1` and `F12` are the window's and bind
   no action (see Window).
 
@@ -1657,7 +1661,8 @@ refused before anything is read.
 
 The scene is `ui::Scene`, a td-ui `Composition` the controller builds over its
 model per request: the mode strip and the filter strip (each a td-ui
-`chrome::Buttons`, the first band Roll Selection, Culling, Single and Develop
+`chrome::Buttons`, the first band Roll Selection, Culling, Single, Develop,
+Export and Help
 with the one in view selected, the second All, Picks, Rejects and Unflagged
 with the
 active filter selected, a button the mode cannot use disabled, see Driving:
@@ -1718,7 +1723,8 @@ it.
 
 While Alt is held every button shows its chord under its caption in
 td-ui's hint face (`Buttons::emit_hinted`, `Button::emit_hinted`): the
-mode strip's `o`, `Escape`, `Return` and `d`, the filter strip's `1`
+mode strip's `o`, `Escape`, `Return`, `d` and `E` (Help, pressing no action,
+has none), the filter strip's `1`
 through `4`,
 the tool band's `c`, `C`, `z`, `0`, `-`, `=`, `f` and `Z`, the look band's `C-1`
 through `C-9` under the first nine looks (`None` has none, and a tenth
@@ -1738,12 +1744,20 @@ routed as td-ui/DESIGN.md "Key list" says every window routes it: the
 window takes it from the keyboard alone, after `F12`, and opens the list
 with `Controller::key_sections` as they are then (the chooser's keys, a
 `(keys, what)` slice beside `chooser_key`, first while it is open, then
-the action table's chorded rows) and the window's own `F1` and `F12`.
-A drag under way when it opens is ended as a leave ends one, by a
-release at the last point. While it is open every key but `F12` is the
-list's, the session hearing none; a held key repeats only while the list
-answers `Moved`, the repeat cancelled otherwise; a left-button press
-reaches nobody and the wheel's rows scroll it (its columns dropped). The
+the action table's chorded rows) and the window's own `F1` and `F12`;
+every variant passes `keys::check`. A left press on the mode strip's
+Help (`Controller::help_button`, where the surface holds it and the
+status row does not cover it) opens it the same way, the window taking
+the press from the live pointer before the session hears it and its
+release reaching nobody; the model, which the control socket and the
+replay drive, ignores a press there. A drag under way when it opens is
+ended as a leave ends one, by a release at the last point. While it is
+open every key but `F12` is the list's, the session hearing none; a held
+key repeats only while the list answers `Moved`, the repeat cancelled
+otherwise; a left-button press closes it (`Overlay::press`) and reaches
+nothing else, nor does the release after it, and it cancels any armed
+repeat, so a reading key held through the click does not run on into the
+session; the wheel's rows scroll it (its columns dropped). The
 list is laid out again for the current surface before it takes a key, a
 repeat or the wheel, and for the surface each frame is drawn at, so a
 configure or a socket's `resize` reflows it before the next key scores
@@ -2234,7 +2248,8 @@ a taken name and finishing its own interrupted move.
 
 `tests/ui.rs` holds the action table to `driven::check` and to its alignment
 with `Action`, its chorded rows to the key list's section (the chooser's
-keys first while it is open, `F1` and `F12` binding no action), and the
+keys first while it is open, `F1` and `F12` binding no action, each
+variant passing `keys::check`), and the
 error codes to the code grammar; drives `ui::Controller`
 in-process (the state before a roll and after, walking with every step and page,
 `select`, the filters and the cursor they keep or move, the single view and back
@@ -2245,9 +2260,11 @@ the single view and back by Single and Culling, the chooser over the grid,
 the single view and develop, and develop with its palette, crop-adjust or a
 marquee up, to the grid or the single view, the disabled buttons and the
 one in view ignored, a change bumping once and a chooser request never, the
-states it reports; on 400 wide the strip wraps to two rows, Export on the
-second, and the tests at that width lay the filter strip and the area under
-them), the export view (refused before a roll, shown by `E`, the strip and
+states it reports; on 400 wide the strip wraps to two rows, Export and
+Help on the second, and the tests at that width lay the filter strip and
+the area under them; Help where the strip holds it and none under the
+status row, and a press on it `ignored` in every mode, in-process and
+through the replay's `pointer`), the export view (refused before a roll, shown by `E`, the strip and
 the action, its mode word, status row, states, withheld boxes, disabled and
 inert filters, the grid's actions ignored, its text read back, left by
 Escape and every other mode button and entered from each, the chooser over
@@ -2504,7 +2521,12 @@ tile alone. A fourth presses F1 on the seat: the tile changes and holds
 the key list's title bar (`keys::Panel`'s, in the selection's colour),
 the state is unchanged, `p` then `End` leave the state alone while
 `End` scrolls the list, and `Escape` closes it, the tile the frame
-before `F1` again with the state unchanged. Every native case's process
+before `F1` again with the state unchanged; a click on the mode strip's
+Help then opens it (the title bar again) with the state unchanged, and
+with `Down` held, scrolling the list, a click on Roll Selection closes it,
+`Down` held on past the repeat's delay, the state unchanged (the roll
+has rows, so a repeat reaching the session would move the cursor) and
+the tile the frame before. Every native case's process
 has that private configuration home.
 
 The builder discovers the crate by existing; its gate runs `cargo test` and

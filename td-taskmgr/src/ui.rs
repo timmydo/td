@@ -17,8 +17,22 @@ use td_ui::keys::{self, Section};
 use td_ui::raster::{
     self, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK, PAPER, SELECTED,
 };
-use td_ui::{charts, chrome, split, tree_table as tree};
+use td_ui::{charts, chrome, split, tree_table as tree, CELL_WIDTH};
 const TABS: [&str; 5] = ["Overview", "CPU", "Memory", "Network", "Disk"];
+const LIVE: &str = "Live (C-l)";
+const RETURN_TO_LIVE: &str = "Return to Live (C-l)";
+const COMPARE_ALL: &str = "Compare all (C-a)";
+const DETAILS: &str = "Details (Return)";
+const BACK: &str = "Back (Escape)";
+/// `keys::BUTTON` and `keys::CHORD`: the button opens the window's key
+/// list.
+const HELP: &str = "Help (F1)";
+/// The toolbar's buttons in order, each by its widest caption: Live,
+/// Refresh, Compare all, Details or Back, and Help. A button is that
+/// caption and a cell either side wide.
+const TOOLBAR: &[&str] = &[RETURN_TO_LIVE, "Refresh: 0.5 s", COMPARE_ALL, DETAILS, HELP];
+/// Help's place in `TOOLBAR`, the last.
+const HELP_BUTTON: usize = TOOLBAR.len() - 1;
 /// What `State::key` does with each key, for the window's key list: in
 /// every focus after `control::BINDINGS`' chords, then in each focus, and
 /// in the process actions' menus and confirmation, which take keys first.
@@ -115,7 +129,7 @@ const UNDER_WAY_KEYS: &[(&str, &str)] = &[
     ("Escape", "Ask to cancel the process request."),
     ("C-q", "Cancel the request and close the task manager."),
     (
-        "Any other key",
+        "any other key",
         "Nothing, until the confirmation, the results or the cancellation arrives.",
     ),
 ];
@@ -141,6 +155,9 @@ pub enum Outcome {
     Ignored,
     Interval(Interval),
     Quit,
+    /// The Help button was clicked: the live window shows its key list.
+    /// The state changes nothing for it.
+    ShowKeys,
 }
 #[derive(Clone, Copy, Debug)]
 struct Slot {
@@ -197,6 +214,26 @@ pub struct State {
 }
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+/// The `index`th toolbar button's rect on `surface`, clipped to it; empty
+/// past the last button.
+pub fn toolbar(surface: Surface, index: usize) -> Rect {
+    let s = surface.scale.value();
+    let wide = |caption: &&str| (caption.chars().count() + 2) * CELL_WIDTH * s;
+    let x = TOOLBAR
+        .iter()
+        .take(index)
+        .map(wide)
+        .sum::<usize>()
+        .min(surface.width);
+    let width = TOOLBAR.get(index).map_or(0, wide);
+    let s = s as u32;
+    Rect {
+        x: x as i64,
+        y: i64::from((24 * s).min(surface.height as u32)),
+        width: width.min(surface.width - x) as u32,
+        height: (24 * s).min((surface.height as u32).saturating_sub(24 * s)),
+    }
 }
 fn region(surface: Surface) -> Rect {
     let s = surface.scale.value() as u32;
@@ -1308,9 +1345,9 @@ impl State {
             return;
         };
         let header = if ranking.metric == Metric::Cpu {
-            "CPU contributors at inspected time. Enter reveals. Esc returns to graphs."
+            "CPU contributors at inspected time. Return reveals. Escape returns to graphs."
         } else {
-            "RSS contributors (shared pages counted). Enter reveals. Esc returns to graphs."
+            "RSS contributors (shared pages counted). Return reveals. Escape returns to graphs."
         };
         label(
             self.surface,
@@ -1391,14 +1428,7 @@ impl State {
     }
 
     fn toolbar(&self, index: usize) -> Rect {
-        let s = self.surface.scale.value() as u32;
-        let x = (index as u32 * 176 * s).min(self.surface.width as u32);
-        Rect {
-            x: i64::from(x),
-            y: i64::from((24 * s).min(self.surface.height as u32)),
-            width: (176 * s).min((self.surface.width as u32).saturating_sub(x)),
-            height: (24 * s).min((self.surface.height as u32).saturating_sub(24 * s)),
-        }
+        toolbar(self.surface, index)
     }
     pub fn key(&mut self, key: &str, repeated: bool) -> Outcome {
         self.clicks.cancel();
@@ -1876,8 +1906,11 @@ impl State {
                     }
                     return Outcome::Changed;
                 }
-                for index in 0..4 {
+                for index in 0..TOOLBAR.len() {
                     if self.toolbar(index).contains(px, py) && self.toolbar(index).contains(x, y) {
+                        if index == HELP_BUTTON {
+                            return Outcome::ShowKeys;
+                        }
                         if index == 0 {
                             self.live();
                             return Outcome::Changed;
@@ -2051,9 +2084,9 @@ impl State {
             surface,
             self.toolbar(0),
             if self.model.historical() {
-                "Return to Live (C-L)"
+                RETURN_TO_LIVE
             } else {
-                "Live (C-L)"
+                LIVE
             },
             !self.model.historical(),
             damage,
@@ -2078,29 +2111,33 @@ impl State {
         button(
             surface,
             self.toolbar(2),
-            "Compare all (C-A)",
+            COMPARE_ALL,
             self.model.selected().is_none(),
             damage,
             sink,
         );
         if let Some(action) = chrome::Button::new(surface, self.toolbar(3)) {
             action.emit(
-                if self.detail.is_some() {
-                    "Back (Esc)"
-                } else {
-                    "Details (Enter)"
-                },
+                if self.detail.is_some() { BACK } else { DETAILS },
                 false,
                 self.detail.is_some() || self.model.selected().is_some(),
                 damage,
                 sink,
             );
         }
+        button(
+            surface,
+            self.toolbar(HELP_BUTTON),
+            HELP,
+            false,
+            damage,
+            sink,
+        );
         if let Some(layout) = self.split.layout() {
             let mut title = Text::<128>::new("Resource history");
             let _ = write!(
                 title,
-                "   {}/{}   PgUp/PgDn: more | Click plot/legend to inspect",
+                "   {}/{}   PageUp/PageDown: more | Click plot/legend to inspect",
                 self.graph_first + 1,
                 self.card_count()
             );
@@ -2108,7 +2145,7 @@ impl State {
                 title = Text::new("Details: ");
                 let _ = write!(
                     title,
-                    "{} [{}] | PgUp/PgDn: CPU / RSS",
+                    "{} [{}] | PageUp/PageDown: CPU / RSS",
                     Text::<60>::truncated(self.detail_name.as_str()).as_str(),
                     key.pid
                 );
@@ -3620,5 +3657,94 @@ mod tests {
         state.key("Escape", false);
         assert_ne!(state.actions.stage(), "preparing");
         assert_eq!(titles(&state)[0], "Process tree");
+    }
+    #[test]
+    fn every_key_list_is_spelled_as_the_keymap_spells_it() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        let checked = |state: &State, label: &str| {
+            let problems = keys::check(&state.key_sections());
+            assert!(problems.is_empty(), "{label}: {problems:#?}");
+        };
+        for focus in [
+            Focus::Tabs,
+            Focus::Graph,
+            Focus::Devices,
+            Focus::Divider,
+            Focus::Search,
+            Focus::Tree,
+            Focus::Actions,
+        ] {
+            state.focus = focus;
+            checked(&state, &format!("{focus:?}"));
+        }
+        state.focus = Focus::Tree;
+        state.action_update(crate::actions::Update::Available);
+        state.key("Home", false);
+        state.key("F10", false);
+        assert_eq!(state.actions.stage(), "menu");
+        checked(&state, "menu");
+        state.key("Right", false);
+        state.key("Return", false);
+        assert_eq!(state.actions.stage(), "preparing");
+        checked(&state, "preparing");
+    }
+    #[test]
+    fn the_help_button_asks_for_the_key_list_and_the_toolbar_fits_where_four_did() {
+        let budget = Budget::new(crate::budget::LIMIT).unwrap();
+        let mut state = State::new(
+            &budget,
+            Surface::new(1280, 960, Default::default()).unwrap(),
+        )
+        .unwrap();
+        observation(&mut state, &budget, 1_000_000_000);
+        assert_eq!(HELP, format!("{} ({})", keys::BUTTON, keys::CHORD));
+        assert_eq!(TOOLBAR.get(HELP_BUTTON), Some(&HELP));
+        let before = state.report();
+        let rect = state.toolbar(4);
+        assert_eq!(
+            state.pointer(Phase::Press, rect.x + 5, rect.y + 5),
+            Outcome::Ignored
+        );
+        assert_eq!(
+            state.pointer(Phase::Release, rect.x + 5, rect.y + 5),
+            Outcome::ShowKeys
+        );
+        assert_eq!(state.report(), before);
+        // A press on Help released elsewhere asks for nothing.
+        state.pointer(Phase::Press, rect.x + 5, rect.y + 5);
+        let away = state.pointer(Phase::Release, rect.x + 5, rect.y + 200);
+        assert_ne!(away, Outcome::ShowKeys);
+        // Each button holds its widest caption; the five end before the
+        // old four 176-pixel buttons did, so no window narrower than
+        // that loses a button it showed before.
+        for (slot, caption) in [
+            (0, LIVE),
+            (0, RETURN_TO_LIVE),
+            (2, COMPARE_ALL),
+            (3, DETAILS),
+            (3, BACK),
+            (4, HELP),
+        ] {
+            let rect = state.toolbar(slot);
+            assert!(
+                (caption.chars().count() + 2) * CELL_WIDTH <= rect.width as usize,
+                "{caption}"
+            );
+        }
+        for interval in ["0.5 s", "1 s", "2 s", "5 s"] {
+            assert!(("Refresh: ".len() + interval.len() + 2) * CELL_WIDTH <= 128);
+        }
+        assert_eq!(state.toolbar(1).width, 128);
+        let last = state.toolbar(4);
+        assert!(last.x + i64::from(last.width) <= 4 * 176);
+        let narrow = Surface::new(4 * 176, 600, Default::default()).unwrap();
+        assert_eq!(toolbar(narrow, 4), last);
+        assert_eq!(toolbar(narrow, 5).width, 0);
     }
 }

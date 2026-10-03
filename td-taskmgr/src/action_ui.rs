@@ -308,7 +308,7 @@ impl Controller {
                 self.result_memory =
                     error.contains("memory budget") || error.contains("allocation failed");
                 let mut message =
-                    Text::<256>::new("Results retained; Enter retries, Escape closes. ");
+                    Text::<256>::new("Results retained; Return retries, Escape closes. ");
                 let _ = message.write_str(&error);
                 self.note = Some(message);
             }

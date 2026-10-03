@@ -141,8 +141,9 @@ fn release(controller: &mut Controller, x: u32, y: u32) -> (Outcome, Vec<Effect>
 }
 
 /// The window's key list is the table's chorded rows, in its order and
-/// words, under the chooser's own while the chooser owns the keyboard;
-/// the window's `F1` and `F12` bind nothing of the session's.
+/// words, under the chooser's own while the chooser owns the keyboard,
+/// each variant spelled as td-ui's key list spells keys; the window's
+/// `F1` and `F12` bind nothing of the session's.
 #[test]
 fn the_key_list_is_the_table_under_the_chooser_while_it_is_open() {
     let chorded: Vec<td_ui::keys::Row> = BINDINGS
@@ -157,9 +158,11 @@ fn the_key_list_is_the_table_under_the_chooser_while_it_is_open() {
     let mut c = Controller::new(surface(800, 600));
     let sections = c.key_sections();
     let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
-    assert_eq!(titles, ["td-photo"]);
+    assert_eq!(titles, ["Actions"]);
     assert_eq!(sections[0].rows, chorded);
     assert_eq!(sections[0].rows.len(), 52);
+    let problems = td_ui::keys::check(&sections);
+    assert!(problems.is_empty(), "{problems:#?}");
     assert!(sections[0]
         .rows
         .iter()
@@ -175,8 +178,10 @@ fn the_key_list_is_the_table_under_the_chooser_while_it_is_open() {
         .unwrap();
     let sections = c.key_sections();
     let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
-    assert_eq!(titles, ["Roll chooser", "td-photo"]);
+    assert_eq!(titles, ["Roll chooser", "Actions"]);
     assert_eq!(sections[1].rows, chorded);
+    let problems = td_ui::keys::check(&sections);
+    assert!(problems.is_empty(), "{problems:#?}");
     let chooser: Vec<&str> = sections[0].rows.iter().map(|r| r.keys).collect();
     assert!(chooser.contains(&"C-Return") && chooser.contains(&"M-Up/^"));
     assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
@@ -1233,7 +1238,7 @@ fn the_scene_reads_back_as_text_and_paints_deterministically() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines[0].trim(),
-        "Roll Selection   Culling   Single   Develop   Export"
+        "Roll Selection   Culling   Single   Develop   Export   Help"
     );
     assert_eq!(lines[1].trim(), "All   Picks   Rejects   Unflagged");
     let strip = lines[1].to_string();
@@ -5507,14 +5512,15 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
             (false, false),
             (false, false),
             (false, false),
-            (false, false)
+            (false, false),
+            (false, true)
         ]
     );
     assert!(c.filter_states().iter().all(|state| state.1));
     let (_, _, text) = driven::text(&c.scene()).unwrap();
     assert_eq!(
         text.lines().next().unwrap().trim(),
-        "Roll Selection   Culling   Single   Develop   Export"
+        "Roll Selection   Culling   Single   Develop   Export   Help"
     );
     assert_eq!(press(&mut c, 150, 12), Outcome::Ignored);
     assert_eq!(press(&mut c, 250, 12), Outcome::Ignored);
@@ -5544,7 +5550,8 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
             (false, false),
             (false, false),
             (false, false),
-            (false, false)
+            (false, false),
+            (false, true)
         ]
     );
     assert!(c.filter_states().iter().all(|state| !state.1));
@@ -5564,6 +5571,7 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
             (true, true),
             (false, true),
             (false, true),
+            (false, true),
             (false, true)
         ]
     );
@@ -5578,6 +5586,7 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
             (false, true),
             (false, true),
             (true, true),
+            (false, true),
             (false, true),
             (false, true)
         ]
@@ -5598,6 +5607,7 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
             (false, true),
             (false, true),
             (true, true),
+            (false, true),
             (false, true)
         ]
     );
@@ -5647,6 +5657,7 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
             (false, true),
             (false, true),
             (false, true),
+            (false, true),
             (false, true)
         ]
     );
@@ -5666,6 +5677,68 @@ fn the_mode_strip_names_the_mode_in_view_and_changes_it() {
     // The gap between two buttons and the strip's margin are no targets.
     assert_eq!(press(&mut c, 140, 12), Outcome::Ignored);
     assert_eq!(press(&mut c, 20, 1), Outcome::Ignored);
+}
+
+/// The mode strip ends with Help, the live window's way to its key list:
+/// always enabled, never selected, at the strip's end on one row and on
+/// the second where the strip wraps, and none where the status row
+/// covers the strip. The model, which the control socket and the replay
+/// drive, ignores a press on it in every mode: the state does not move
+/// and no effect is asked for.
+#[test]
+fn the_mode_strip_ends_with_help_which_the_model_ignores() {
+    let mut c = Controller::new(surface(800, 600));
+    let help = c.help_button().unwrap();
+    assert_eq!((help.x, help.y, help.width), (448, 2, 48));
+    assert_eq!(c.mode_states().last(), Some(&(false, true)));
+    let (x, y) = (
+        u32::try_from(help.x + i64::from(help.width) / 2).unwrap(),
+        u32::try_from(help.y + i64::from(help.height) / 2).unwrap(),
+    );
+    let press_help = |c: &mut Controller| {
+        let before = c.state();
+        let pressed = c
+            .input(Input::Pointer {
+                phase: PointerPhase::Press,
+                x,
+                y,
+            })
+            .unwrap();
+        assert_eq!(pressed, (Outcome::Ignored, Vec::new()));
+        assert_eq!(c.state(), before);
+    };
+    press_help(&mut c);
+    c.open("roll", b"/r", photos(3)).unwrap();
+    press_help(&mut c);
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    press_help(&mut c);
+    assert_eq!(c.mode_states().last(), Some(&(false, true)));
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
+    press_help(&mut c);
+    let (outcome, _) = c.action("choose", &[]).unwrap();
+    assert_eq!(outcome, Outcome::Changed);
+    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+        .unwrap();
+    press_help(&mut c);
+    assert!(c.chooser().is_some());
+    // On 400 wide the strip wraps, Export and Help on the second row.
+    let help = Controller::new(surface(400, 300)).help_button().unwrap();
+    assert_eq!((help.x, help.y), (80, 26));
+    // On 800 by 40 the status row covers the strip's one row.
+    assert_eq!(Controller::new(surface(800, 40)).help_button(), None);
+    // The socket's pointer, as the replay serves it, is the model's.
+    let (px, py) = (x.to_string(), y.to_string());
+    let requests = [
+        request(1, &["state"]),
+        request(2, &["pointer", "press", &px, &py]),
+        request(3, &["pointer", "release", &px, &py]),
+        request(4, &["state"]),
+    ];
+    let (ok, replies, err) = replay(&["--size", "800x600"], &requests);
+    assert!(ok, "{err}");
+    assert_eq!(&replies[1][1..], ["ok", "ignored"]);
+    assert_eq!(&replies[2][1..], ["ok", "ignored"]);
+    assert_eq!(replies[3][1..], replies[0][1..]);
 }
 
 /// The mode strip's generations and its remaining transitions: a change
@@ -5694,6 +5767,7 @@ fn the_mode_strip_bumps_once_a_change_and_never_a_request() {
             (true, true),
             (false, false),
             (false, false),
+            (false, true),
             (false, true)
         ]
     );
@@ -8034,7 +8108,8 @@ fn the_export_view_is_a_mode_of_the_roll_with_the_strip_naming_it() {
             (false, true),
             (false, true),
             (false, true),
-            (true, true)
+            (true, true),
+            (false, true)
         ]
     );
     assert!(c.filter_states().iter().all(|state| !state.1));
@@ -8066,7 +8141,7 @@ fn the_export_view_is_a_mode_of_the_roll_with_the_strip_naming_it() {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     assert_eq!(
         lines[0],
-        "Roll Selection   Culling   Single   Develop   Export"
+        "Roll Selection   Culling   Single   Develop   Export   Help"
     );
     assert!(
         lines.contains(&"Export the 1 picked of 5 into roll/exported/, never replacing a name"),

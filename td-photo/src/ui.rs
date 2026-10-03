@@ -876,9 +876,22 @@ const FILTER_NAMES: [&str; 4] = [FILTERS[0].1, FILTERS[1].1, FILTERS[2].1, FILTE
 
 /// The mode strip's labels: the roll chooser, the cull grid, the cull
 /// single view, develop and the export view, in the order `mode_states`
-/// reports them.
-const MODES: [&str; 5] = ["Roll Selection", "Culling", "Single", "Develop", "Export"];
-const MODE_ACTIONS: [&str; 5] = ["choose", "grid", "view", "develop", "export-mode"];
+/// reports them, then the key list's button (`HELP`), the window's.
+const MODES: &[&str] = &[
+    "Roll Selection",
+    "Culling",
+    "Single",
+    "Develop",
+    "Export",
+    keys::BUTTON,
+];
+/// The actions the mode buttons press, whose chords are their hints;
+/// `HELP` presses none.
+const MODE_ACTIONS: &[&str] = &["choose", "grid", "view", "develop", "export-mode"];
+/// The mode strip's last button, which opens the window's key list: the
+/// live window takes a press on it (`Controller::help_button`), and the
+/// model, which the socket and the replay drive, ignores one.
+const HELP: usize = MODES.len() - 1;
 
 /// The export view's format buttons: `Format::ALL` in order, by name.
 const FORMAT_LABELS: [&str; Format::ALL.len()] = ["JPEG", "AVIF"];
@@ -1123,7 +1136,7 @@ pub struct Layout {
 
 /// The mode strip: `MODES` across the surface's top, wrapping.
 fn mode_strip(surface: Surface) -> Buttons<'static> {
-    Buttons::new(surface, 0, &MODES)
+    Buttons::new(surface, 0, MODES)
 }
 
 /// The filter strip: `FILTER_NAMES` across the surface under the mode
@@ -2421,14 +2434,16 @@ impl Controller {
 
     /// The window's key list (`F1`): the chooser's keys first while it
     /// owns the keyboard, then every chorded binding in `BINDINGS`, its
-    /// chord and help line, so the list cannot drift from the table.
+    /// chord and help line, under "Actions" (the table's name, as
+    /// `--help actions` prints it), so the list cannot drift from the
+    /// table.
     pub fn key_sections(&self) -> Vec<keys::Section> {
         let mut sections = Vec::new();
         if self.chooser.is_some() {
             sections.push(keys::Section::new("Roll chooser", Self::CHOOSER_KEYS));
         }
         sections.push(keys::Section {
-            title: "td-photo",
+            title: "Actions",
             rows: BINDINGS
                 .iter()
                 .filter_map(|binding| {
@@ -3052,8 +3067,9 @@ impl Controller {
     /// order: the one in view is selected (the chooser while it is open,
     /// else the mode, cull's grid or single view; nothing before a roll,
     /// when no mode is in view), Culling can be pressed once a roll is
-    /// open and Single and Develop once there is a photo under the cursor.
-    pub fn mode_states(&self) -> [(bool, bool); 5] {
+    /// open and Single and Develop once there is a photo under the cursor;
+    /// `HELP` always enabled and never selected.
+    pub fn mode_states(&self) -> [(bool, bool); MODES.len()] {
         let roll = self.roll.is_some();
         let photo = roll && self.cursor.is_some();
         let in_view = if self.chooser.is_some() {
@@ -3075,7 +3091,20 @@ impl Controller {
             (in_view == 2, photo),
             (in_view == 3, photo),
             (in_view == 4, roll),
+            (false, true),
         ]
+    }
+
+    /// The mode strip's `HELP` button, where the surface holds it and the
+    /// status row does not cover it (as it covers the strip on a surface
+    /// too short for the bands): the live window opens its key list on a
+    /// press there, before the model hears it.
+    pub fn help_button(&self) -> Option<Rect> {
+        let rect = self.mode_strip().button(HELP)?.rect();
+        let status = Status::new(self.surface).rect();
+        (rect.intersection(self.surface.bounds()) == Some(rect)
+            && rect.intersection(status).is_none())
+        .then_some(rect)
     }
 
     /// The filter strip's buttons as `(selected, enabled)`, in `FILTERS`
@@ -3099,7 +3128,9 @@ impl Controller {
     /// before a photo. Culling and Single leave develop whole (its
     /// palette, its crop-adjust and any drag with it) or the export view
     /// and close the chooser, to the grid or the single view of the
-    /// cursor's photo; Develop and Export close the chooser too.
+    /// cursor's photo; Develop and Export close the chooser too. `HELP`
+    /// is the live window's, which takes the press before the model: here,
+    /// where the socket and the replay press it, it is `ignored`.
     fn press_mode(&mut self, index: usize) -> Result<(Outcome, Vec<Effect>), Error> {
         let roll = self.roll.is_some();
         let photo = roll && self.cursor.is_some();
@@ -5877,7 +5908,7 @@ impl Composition for Scene<'_> {
         let layout = model.layout();
         model.mode_strip().emit_hinted(
             model.mode_states(),
-            MODE_ACTIONS.map(|action| model.hint(action)),
+            MODE_ACTIONS.iter().map(|action| model.hint(action)),
             damage,
             sink,
         );

@@ -66,7 +66,7 @@ and review detail pages and every progress outcome, without emitting image
 bytes. The connected and pure views share a 752x480 minimum extent, while
 welcome keeps its own content-dependent layout. The render data is synthetic
 and grants no authority. This establishes an image-eligible executable whose
-window presents welcome and, on Enter, connects to td-authd's setup intake
+window presents welcome and, on Return, connects to td-authd's setup intake
 (td-authd/DESIGN.md "Whole-disk installation intake") and asks the service
 it starts for destinations, showing a waiting notice until the answer, which
 the window takes at the end of every turn, idle or not. The service's list
@@ -77,12 +77,12 @@ once; otherwise a worker thread connects, requires the service's greeting
 within ten seconds and does the blocking exchange, one request at a time, so
 the window keeps drawing, and between requests it notices the service
 closing. A reply has no time limit. Up and Down move the list's navigation
-index, Page Up and Page Down page a disk's identity, and Escape returns to
+index, PageUp and PageDown page a disk's identity, and Escape returns to
 welcome. From the list Escape keeps the connection for the next request;
 while waiting it abandons the request and its connection, so a service that
 never answers cannot hold the window, and td-authd serves the next installer
 once it reaps that service. Disks the window stopped waiting for are
-dropped. With a disk selected, Enter continues to the settings step
+dropped. With a disk selected, Return continues to the settings step
 described below and Escape there goes back to the list, keeping the drafts.
 The live window paints in the td-ui theme its file names
 (`~/.config/td-setup/theme`, which on a live medium lasts the session) and
@@ -95,14 +95,25 @@ page's first (with the time zone row focused, its keys and then the
 rest of the form's) and the window's F1 and F12 last, each page's rows
 a table beside the code that binds them (the form's beside its drafts).
 While the list is open it takes every key but F12, its reading keys
-scrolling it and F1, `q` or Escape closing it, and no page hears one or
-asks the service anything; a resize lays it out again. The window
-ignores the pointer, so the list scrolls by its keys only, not the
-wheel. It is painted last over the live frame, never in a headless
+scrolling it and F1, `q` or Escape closing it, as a left click does, and
+no page hears one or asks the service anything; a resize lays it out
+again. The window
+ignores the pointer, but a click closes the key list: a left press
+while it is open closes it and repaints, as its title bar's td-ui hint
+says, and reaches no page. Nothing else from the pointer does anything,
+so only F1 opens the list (no page has a Help button, td-ui's
+`keys::BUTTON`), it scrolls by its keys only, not the wheel, and F1,
+`q`, Escape or that click close it. A window test sends it motion, the
+wheel, a right press and releases, which leave it open and paint
+nothing, then a left press, which closes it with the page unchanged.
+The list's rows are spelled as td-ui's keymap spells chords
+(`Return`, `PageUp`, `S-Tab`), and `keys::check` holds every page's
+sections to that spelling; `--help` and this document name the keys
+the same way. It is painted last over the live frame, never in a headless
 render, and the boot evidence still says the page under it, a frame
 repainted for the list saying nothing new. A native compositor case presses F1 on the seat
 and finds welcome around the panel and its title bar in the selection's
-colour, Enter reaching no page while it is open, and Escape painting
+colour, Return reaching no page while it is open, and Escape painting
 welcome whole again.
 Its library also has pure, unconnected progress and completion views. A
 live boot starts the window in the graphical session ("Live startup"); the
@@ -254,7 +265,7 @@ ASCII up to their token limits, edited with Left, Right, Home, End,
 Backspace and Delete; keyboard layout is fixed at `us`; time zone is a
 chooser over the catalog the service's time zones reply carries, asked for
 over the connection that listed the disks the first time the step is shown.
-Up, Down, Page Up, Page Down, Home and End move through the catalog, and
+Up, Down, PageUp, PageDown, Home and End move through the catalog, and
 typed characters seek the first zone beginning with them, ignoring case; a
 character that would match none is not taken, and a movement key starts the
 seek over. `Etc/UTC` is chosen when the catalog has it and nothing else was;
@@ -262,15 +273,15 @@ a later catalog keeps a choice it still has. Until the catalog arrives the
 row says it is being read, and a refusal is shown there in the installer's
 words and asked again when the step is next entered. A catalog that never
 comes holds no page: Escape leaves settings, and a disk list then asked
-waits behind it and is abandoned like any other. Tab and Shift+Tab move
-between fields; on the others Up, Down and Enter do. The drafts, and a
+waits behind it and is abandoned like any other. Tab and S-Tab move
+between fields; on the others Up, Down and Return do. The drafts, and a
 catalog already received, outlive a lost connection. The page displays
 bounded tokens and focus without treating wire admission as policy or
 catalog approval, and empty values may be shown before completion; the
-validation contract below applies before review. Enter on the time zone row
+validation contract below applies before review. Return on the time zone row
 proposes the selected disk with the drafts, or says on the page's notice row
 which field is still empty; while the service reviews, the notice says so
-and a second Enter proposes nothing. The service's review opens the review
+and a second Return proposes nothing. The service's review opens the review
 page, and its refusal is shown on the notice row in the installer's words
 until a key changes the form. The fields stay editable while the service
 reviews; the review shows what was proposed. A review answers only the
@@ -285,7 +296,7 @@ detail pages. The destructive-loss and unencrypted automatic-login notices
 remain visible on every page. It cannot authenticate the source, establish a
 disk claim or authorize execution; the service and compositor-owned trusted
 consent remain mandatory. In the live window it shows the service's review,
-never the drafts: Page Up and Page Down move between its detail pages, Enter
+never the drafts: PageUp and PageDown move between its detail pages, Return
 sends execute with the review exactly as the service returned it, once, and
 Escape returns to settings and sends withdraw with the review's nonce,
 releasing the review and its disk claim before anything else is asked; an

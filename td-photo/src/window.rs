@@ -1697,14 +1697,9 @@ impl Window {
                     }
                     return;
                 }
-                // `keys::CHORD` opens it with the keys as they are now; a
-                // drag under way ends first, as the list takes the
-                // pointer. The opening key arms no repeat.
+                // `keys::CHORD` opens it. The opening key arms no repeat.
                 if stroke.chord == keys::CHORD {
-                    self.abort_pointer_grab();
-                    let sections = self.session.ui.key_sections();
-                    self.key_list.open(sections, self.session.ui.surface());
-                    self.repaint();
+                    self.show_keys();
                     return;
                 }
                 let outcome = self.input(Input::Key {
@@ -1748,6 +1743,16 @@ impl Window {
     fn repaint(&mut self) {
         self.submitted = None;
         self.presented = None;
+    }
+
+    /// Opens the key list with the keys as they are now, from `keys::CHORD`
+    /// or a press on the mode strip's Help: a drag under way ends first, as
+    /// the list takes the pointer.
+    fn show_keys(&mut self) {
+        self.abort_pointer_grab();
+        let sections = self.session.ui.key_sections();
+        self.key_list.open(sections, self.session.ui.surface());
+        self.repaint();
     }
 
     /// A chord the open key list takes in the session's stead, a frame to
@@ -1803,18 +1808,39 @@ impl Window {
                 pressed: true,
                 ..
             } => {
-                // The key list over the frame takes a press; a release
-                // still ends a drag begun before it opened.
+                // The key list over the frame takes a press and closes;
+                // `pressed` stays unset, so the release after it reaches
+                // nobody either (opening ended any drag). A reading key
+                // held through the click stops, or its repeat would run on
+                // into the session.
                 if self.key_list.is_open() {
+                    if self.key_list.press() == keys::Step::Closed {
+                        self.client.cancel_repeat();
+                        self.repaint();
+                    }
                     return Ok(());
                 }
-                self.pressed = true;
                 // A press is a real on-surface location: one off the top-left
                 // (a left press while another button holds a cross-button grab)
                 // is rejected, not clamped, so it cannot land a spurious hit at
                 // a clamped zero (a strip's button, a cell).
                 let (x, y) = self.pointer;
-                if let (Ok(x), Ok(y)) = (u32::try_from(pixel(x)), u32::try_from(pixel(y))) {
+                let (x, y) = (pixel(x), pixel(y));
+                // The mode strip's Help is the window's key list, taken here
+                // from the live pointer alone: the model, which the socket
+                // and the replay press, ignores it. Its release, like the
+                // list's, reaches nobody.
+                if self
+                    .session
+                    .ui
+                    .help_button()
+                    .is_some_and(|rect| rect.contains(x, y))
+                {
+                    self.show_keys();
+                    return Ok(());
+                }
+                self.pressed = true;
+                if let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) {
                     self.input(Input::Pointer {
                         phase: PointerPhase::Press,
                         x,

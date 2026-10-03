@@ -598,16 +598,26 @@ impl Window {
                     self.pointer_action(td_ui::editor::PointerPhase::Move)?;
                 }
             }
+            // A left press closes the key list over the frame, whatever
+            // menu or prompt is under it, and reaches nothing else; the
+            // release after it ends nothing, as opening ended any drag.
+            P::Button {
+                button: 0x110,
+                pressed,
+                ..
+            } if self.client.entered().is_some() && self.key_list.is_open() => {
+                if pressed && self.key_list.press() == Step::Closed {
+                    // A reading key held under the click stops with the
+                    // list rather than repeating into the editor.
+                    self.client.cancel_repeat();
+                    self.frames.invalidate(true);
+                }
+            }
             P::Button {
                 button: 0x110,
                 pressed,
                 serial,
             } if self.client.entered().is_some() && !self.pointer_modal() => {
-                // The key list over the frame takes a press; a release
-                // ends nothing, as opening it ended any drag.
-                if pressed && self.key_list.is_open() {
-                    return Ok(());
-                }
                 if pressed != self.pointer.held {
                     self.pointer.held = pressed;
                     self.activation_serial = pressed.then_some(serial);
@@ -3428,6 +3438,17 @@ impl Window {
                 revision,
                 command: td_ui::editor_model::Command::FillParagraph,
             },
+            Item::Keys => {
+                // Only a physical key or pointer press opens the list, as
+                // F1 does: the control socket's keys and pointer carry no
+                // press serial.
+                if self.activation_serial.is_some() {
+                    self.show_keys();
+                } else {
+                    self.notify("The key list opens from the keyboard or pointer: press F1.");
+                }
+                return Ok(());
+            }
             Item::About => {
                 self.notify("td-editor: experimental Wayland text editor. Pure std Rust; bitmap Unifont, warm palette. UTF-8 clipboard needs data-device v3. F7 checks spelling with an explicit local word list. No crash recovery or mail integration. F10 opens menus.");
                 return Ok(());
@@ -5967,9 +5988,9 @@ mod tests {
     }
 
     /// F1 opens the key list over the frame, the menu under it included;
-    /// while it is open the keyboard's keys, a press and the wheel are
-    /// the list's, the editor and its menu hearing nothing, F12 still the
-    /// window's; Escape closes the list alone. Each step asks for the
+    /// while it is open the keyboard's keys and the wheel are the list's,
+    /// the editor and its menu hearing nothing, F12 still the window's; a
+    /// press, and Escape, close the list alone. Each step asks for the
     /// frame again.
     #[test]
     fn f1_shows_the_key_list_and_keeps_every_key_from_the_editor() {
@@ -6010,14 +6031,21 @@ mod tests {
         key(&mut w, keyboard, 36); // j
         assert_eq!(w.key_list.help().first(), 1);
         assert!(asked(&w));
-        // A press is the list's; the wheel scrolls it.
+        // A press closes the list and reaches neither the menu nor the
+        // document, nor does its release.
         pointer_enter(&mut w);
         pointer_move(&mut w, 400, 300);
         pointer_button(&mut w, true);
+        assert!(!w.key_list.is_open() && w.key_list.lines().is_empty());
+        assert!(w.menu.is_some(), "the menu under the list stays");
+        assert!(asked(&w));
         pointer_button(&mut w, false);
-        assert!(w.key_list.is_open() && w.menu.is_some());
+        assert!(w.menu.is_some());
         assert!(!w.pointer.held);
         assert_eq!(doc(&w), before);
+        // The wheel scrolls the list open again.
+        key(&mut w, keyboard, 59); // F1
+        assert!(w.key_list.is_open());
         asked(&w);
         let pointer = w.client.pointer().unwrap();
         w.event(message(pointer, 4, &[0, 0, 10000])).unwrap();
@@ -6118,6 +6146,105 @@ mod tests {
             assert_eq!(w.ui.editor().tabs().count(), 2, "{profile:?}");
             assert_eq!(w.ui.editor().document(1).unwrap().text(), " one two one");
         }
+    }
+
+    /// Help > Keys opens the key list, chosen with the pointer or from
+    /// F10 with the keyboard, in both profiles; a press closes it again
+    /// and neither it nor its release reaches the document or a menu.
+    #[test]
+    fn help_keys_opens_the_list_by_pointer_and_by_keyboard() {
+        use crate::menu::Group;
+        for profile in [Profile::Windows, Profile::Emacs] {
+            let (mut w, _peer, keyboard) = find_fixture(profile);
+            let doc = |w: &Window| {
+                let doc = w.ui.editor().document(1).unwrap();
+                (doc.text().to_string(), doc.selection().range(), doc.dirty())
+            };
+            let before = doc(&w);
+            pointer_enter(&mut w);
+            menu_click(&mut w, Group::Help, 2);
+            assert!(!w.pointer.held && w.activation_serial.is_none());
+            assert!(w.key_list.is_open(), "{profile:?}");
+            assert!(w.menu.is_none() && w.notice.is_none());
+            pointer_button(&mut w, true);
+            assert!(!w.key_list.is_open(), "{profile:?}");
+            pointer_button(&mut w, false);
+            assert!(w.menu.is_none() && !w.pointer.held);
+            assert_eq!(doc(&w), before);
+            key(&mut w, keyboard, 68); // F10
+            for _ in 0..3 {
+                key(&mut w, keyboard, 106); // Right
+            }
+            key(&mut w, keyboard, 108); // Down
+            key(&mut w, keyboard, 108);
+            let menu = w.menu.as_ref().unwrap();
+            assert_eq!(menu.group(), Group::Help);
+            assert_eq!(menu.selected(), 2);
+            key(&mut w, keyboard, 28); // Return
+            assert!(w.key_list.is_open() && w.menu.is_none(), "{profile:?}");
+            key(&mut w, keyboard, 1); // Escape
+            assert!(!w.key_list.is_open());
+            assert_eq!(doc(&w), before);
+        }
+    }
+
+    /// A reading key held under the click that closes the list stops
+    /// repeating with it, the editor hearing none of it; a press closes
+    /// the list over a prompt too, the prompt staying.
+    #[test]
+    fn a_press_closes_the_key_list_over_a_prompt_and_stops_its_repeat() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Windows);
+        pointer_enter(&mut w);
+        key(&mut w, keyboard, 59); // F1
+        w.event(message(keyboard, 3, &[3, 0, 36, 1])).unwrap(); // hold j
+        assert_eq!(w.key_list.help().first(), 1);
+        pointer_button(&mut w, true);
+        assert!(!w.key_list.is_open());
+        pointer_button(&mut w, false);
+        // The fixture's repeat is 25 a second after 600 ms.
+        let start = w.clock;
+        w.tick(start + 600, true).unwrap();
+        w.tick(start + 640, true).unwrap();
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "one two one");
+        w.event(message(keyboard, 3, &[4, 0, 36, 0])).unwrap();
+        key(&mut w, keyboard, 64); // F6, Go To Line
+        assert!(w.number.is_some());
+        key(&mut w, keyboard, 59); // F1
+        assert!(w.key_list.is_open());
+        pointer_button(&mut w, true);
+        assert!(!w.key_list.is_open());
+        pointer_button(&mut w, false);
+        assert!(w.number.is_some(), "the prompt under the list stays");
+        assert_eq!(w.ui.editor().document(1).unwrap().text(), "one two one");
+    }
+
+    /// The control socket's keys and pointer reach Help > Keys only to
+    /// be refused: the list opens from the physical keyboard or pointer
+    /// alone, and the socket's F1 opens nothing either.
+    #[test]
+    fn the_control_socket_cannot_open_the_key_list() {
+        let (mut w, _peer) = file_dialog_fixture();
+        configure(&mut w, 800, 600);
+        decoded_key(&mut w, "F1");
+        assert!(!w.key_list.is_open());
+        for chord in ["F10", "Right", "Right", "Right", "Down", "Down"] {
+            decoded_key(&mut w, chord);
+        }
+        assert_eq!(w.menu.as_ref().unwrap().selected(), 2);
+        decoded_key(&mut w, "Return");
+        assert!(!w.key_list.is_open() && w.menu.is_none());
+        assert!(w.notice.as_deref().unwrap().contains("press F1"));
+        w.notice = None;
+        pointer_enter(&mut w);
+        let header =
+            w.ui.geometry()
+                .menu(crate::menu::Group::Help.index())
+                .unwrap();
+        remote_pointer(&mut w, "press", header.x + 4, header.y + 4, false);
+        let row = w.menu.as_ref().unwrap().row(2).unwrap();
+        remote_pointer(&mut w, "press", row.x + 4, row.y + 4, false);
+        assert!(!w.key_list.is_open() && w.menu.is_none());
+        assert!(w.notice.as_deref().unwrap().contains("press F1"));
     }
 
     /// The list is painted last over the frame, its title bar in the

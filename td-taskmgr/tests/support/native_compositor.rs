@@ -536,8 +536,9 @@ fn physical_f12_moves_keeps_and_paints_the_theme() {
 
 /// F1 on the seat opens the window's key list: its title bar is painted
 /// over the frame in the selection's colour; Tab, a key the state binds,
-/// and a click on a tab reach nothing while it is open; Escape closes it,
-/// the frame is the state's again, and Tab then moves the focus.
+/// reaches nothing while it is open, and a click on a tab closes it and
+/// reaches nothing either; opened again, Escape closes it, the frame is
+/// the state's again, and Tab then moves the focus.
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn physical_f1_shows_the_key_list_until_escape_and_keeps_the_state() {
@@ -584,11 +585,13 @@ fn physical_f1_shows_the_key_list_until_escape_and_keeps_the_state() {
     tap(&mut compositor, 59);
     shown(&compositor, true, "the key list");
     tap(&mut compositor, 15);
-    compositor.click(place.x + 350, place.y + 10);
     // The cursor goes to the bottom corner, off the title bar.
     compositor.pointer(place.x + 2, place.y + place.height - 2, 0);
     std::thread::sleep(Duration::from_millis(200));
     assert!(listed(&compositor.tile(&place)), "the list stays open");
+    compositor.click(place.x + 350, place.y + 10);
+    compositor.pointer(place.x + 2, place.y + place.height - 2, 0);
+    shown(&compositor, false, "the click's frame");
     let after = state(&client);
     // The live counters move with the sampling; where the user is does not.
     for field in ["tab", "focus", "query", "live", "actions", "detail"] {
@@ -598,11 +601,91 @@ fn physical_f1_shows_the_key_list_until_escape_and_keeps_the_state() {
             "{field}: the list keeps the state's keys and clicks"
         );
     }
+    tap(&mut compositor, 59);
+    shown(&compositor, true, "the key list again");
     tap(&mut compositor, 1);
     shown(&compositor, false, "the frame again");
     assert_eq!(state(&client).get("focus"), before.get("focus"));
     tap(&mut compositor, 15);
     wait_state(&client, |s| s.get("focus") != before.get("focus"));
+    drop(client);
+    compositor.stop();
+}
+
+/// A click on the toolbar's Help button opens the key list, and a click
+/// over the list closes it, reaching nothing behind it; a reading key
+/// held through that click stops repeating with it, so the state behind
+/// hears none of its repeats.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn physical_help_click_shows_the_key_list_and_a_click_closes_it() {
+    use td_ui::raster::{Scale, Surface, SELECTED};
+    let server_directory = Directory::new();
+    let mut compositor = Compositor::start(&server_directory);
+    let client_directory = Directory::new();
+    let client = TaskProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-taskmgr") {
+            break place;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mapping deadline: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    wait_state(&client, |s| counter(s, "presentations") > 0);
+    // The tree's first row, from which a repeated Down would move.
+    tap(&mut compositor, 102);
+    let before = wait_state(&client, |s| s.get("selected").is_some_and(|s| s != "none"));
+    let surface = Surface::new(place.width, place.height, Scale::default()).unwrap();
+    // The whole Help button is on the tile.
+    let help = td_taskmgr::ui::toolbar(surface, 4);
+    assert!(help.width > 0 && help.x as usize + help.width as usize <= place.width);
+    let title = td_ui::keys::Panel::new(surface).unwrap().title;
+    let selected = &SELECTED.to_be_bytes()[1..];
+    let listed = |tile: &[u8]| {
+        let row = title.y as usize * place.width;
+        (title.x as usize..title.x as usize + title.width as usize)
+            .all(|x| &tile[(row + x) * 3..(row + x) * 3 + 3] == selected)
+    };
+    let shown = |compositor: &Compositor, open: bool, label: &str| {
+        let deadline = Instant::now() + TIMEOUT;
+        while listed(&compositor.tile(&place)) != open {
+            assert!(
+                Instant::now() < deadline,
+                "{label} deadline: {}",
+                client.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    shown(&compositor, false, "the state's frame");
+    compositor.click(place.x + help.x as usize + 8, place.y + help.y as usize + 8);
+    shown(&compositor, true, "the key list");
+    // Down, held past the 600 ms delay, repeats while it scrolls the list.
+    compositor.key(108, true);
+    std::thread::sleep(Duration::from_millis(900));
+    compositor.click(place.x + 2, place.y + place.height - 2);
+    shown(&compositor, false, "the frame again");
+    // At 25 a second, a repeat left armed would move the selection.
+    std::thread::sleep(Duration::from_millis(600));
+    let after = state(&client);
+    compositor.key(108, false);
+    for field in [
+        "tab", "focus", "query", "live", "actions", "detail", "selected",
+    ] {
+        assert_eq!(
+            after.get(field),
+            before.get(field),
+            "{field}: the clicks and the held key reached nothing behind the list"
+        );
+    }
+    // Down reaches the state now, so its repeats would have shown.
+    tap(&mut compositor, 108);
+    wait_state(&client, |s| s.get("selected") != before.get("selected"));
     drop(client);
     compositor.stop();
 }
@@ -839,7 +922,7 @@ fn physical_double_click_opens_history_and_back_restores_the_ranked_list() {
     let text = client.request(4, &["text"]);
     let text = String::from_utf8(td_ui::control::unhex(text.last().unwrap()).unwrap()).unwrap();
     assert!(text.contains("CPU time:"), "{text}");
-    assert!(text.contains("Back (Esc)"), "{text}");
+    assert!(text.contains("Back (Escape)"), "{text}");
     tap(&mut compositor, 1);
     let restored = wait_state(&client, |s| s.get("detail").is_some_and(|s| s == "none"));
     assert_eq!(restored.get("selected"), Some(&key));

@@ -66,7 +66,7 @@ impl Group {
                 PreviousMisspelling,
                 LineNumbers,
             ],
-            Self::Help => &[About, Command],
+            Self::Help => &[About, Command, Keys],
             Self::Directory => &[
                 CopyEntryPath,
                 SortName,
@@ -120,6 +120,7 @@ pub(crate) enum Item {
     Spell,
     About,
     Command,
+    Keys,
     Find,
     FindNext,
     FindPrevious,
@@ -170,11 +171,61 @@ impl Item {
             Self::PreviousMisspelling => "Previous Misspelling",
             Self::About => "About td-editor",
             Self::Command => "Command...",
+            Self::Keys => keys::ITEM,
             Self::Find => "Find...",
             Self::FindNext => "Find Next",
             Self::FindPrevious => "Find Previous",
             Self::Replace => "Replace...",
             Self::GoToLine => "Go To Line...",
+        }
+    }
+    /// What the item does, as the key list says it beside the item's
+    /// shortcut; the menu panel shows `label`.
+    pub(crate) fn what(self) -> &'static str {
+        match self {
+            Self::New => "open a new untitled tab",
+            Self::Open => "open a file",
+            Self::Save => "save the document",
+            Self::SaveAs => "save the document under a new name",
+            Self::Close => "close the tab, asking first about unsaved text",
+            Self::Quit => "quit, asking first about unsaved text",
+            Self::Undo => "undo the last edit",
+            Self::Redo => "redo the last undone edit",
+            Self::Cut => "cut the selection to the clipboard",
+            Self::Copy => "copy the selection to the clipboard",
+            Self::CopyPath => "copy the document's full file path",
+            Self::CopyEntryPath => "copy the entry's full path",
+            Self::RenameEntry => "rename or move the entry",
+            Self::MarkDelete => "mark the entry for deletion",
+            Self::UnmarkDelete => "unmark the entry for deletion",
+            Self::DeleteMarked => "delete the marked entries, asking first",
+            Self::NewDirectory => "make a new directory",
+            Self::CopyFile => "copy the file to a new name",
+            Self::SortName => "sort the listing by name",
+            Self::SortSize => "sort the listing by size",
+            Self::SortModified => "sort the listing by modification time",
+            Self::SortReverse => "reverse the listing's order",
+            Self::Paste => "paste the clipboard's text",
+            Self::SelectAll => "select the whole document",
+            Self::Windows => "use the Windows key bindings",
+            Self::Emacs => "use the Emacs key bindings",
+            Self::Wrap => "turn the tab's soft wrap on or off",
+            Self::LineNumbers => "show or hide line numbers",
+            Self::AutoFill => "turn the tab's Auto Fill on or off",
+            Self::Fill => "fill the paragraph to the fill column",
+            Self::FillColumn => "set the tab's fill column",
+            Self::Spell => "check the document's spelling",
+            Self::Dictionary => "load a word list for checking spelling",
+            Self::NextMisspelling => "select the next misspelled word",
+            Self::PreviousMisspelling => "select the previous misspelled word",
+            Self::About => "say what td-editor is",
+            Self::Command => "run a named command",
+            Self::Keys => "show this list of keys",
+            Self::Find => "search the document for text",
+            Self::FindNext => "find the next match",
+            Self::FindPrevious => "find the previous match",
+            Self::Replace => "replace text in the document",
+            Self::GoToLine => "go to a line by its number",
         }
     }
     pub(crate) fn shortcut(self, profile: Profile) -> &'static str {
@@ -188,6 +239,7 @@ impl Item {
             (Self::CopyFile, _) => "C",
             (Self::SortReverse, _) => "S",
             (Self::Command, Profile::Emacs) => "M-x",
+            (Self::Keys, _) => keys::CHORD,
             (Self::New, Profile::Windows) => "Ctrl+N",
             (Self::Open, Profile::Windows) => "Ctrl+O",
             (Self::Open, Profile::Emacs) => "C-x C-f",
@@ -214,7 +266,7 @@ impl Item {
             (Self::Fill, Profile::Emacs) => "M-q",
             (Self::Find, Profile::Windows) => "Ctrl+F",
             (Self::Replace, Profile::Windows) => "Ctrl+H",
-            (Self::Find, Profile::Emacs) => "C-s / C-r",
+            (Self::Find, Profile::Emacs) => "C-s/C-r",
             (Self::FindNext, Profile::Windows) => "F3",
             (Self::FindPrevious, Profile::Windows) => "Shift+F3",
             _ => "",
@@ -460,13 +512,13 @@ const WINDOWS_KEYS: &[(&str, &str)] = &[
     ("Escape", "cancel a menu, a prompt, a search or a notice"),
     ("Ctrl+Tab", "next tab"),
     ("Ctrl+Shift+Tab", "previous tab"),
-    ("Ctrl+Left/Right", "back or forward a word"),
+    ("Ctrl+Left/Ctrl+Right", "back or forward a word"),
     ("Home/End", "start or end of the line"),
-    ("Ctrl+Home/End", "start or end of the document"),
+    ("Ctrl+Home/Ctrl+End", "start or end of the document"),
     ("PageUp/PageDown", "up or down a page"),
     (
-        "Shift+arrows etc.",
-        "extend the selection: Shift with any key above that moves the caret",
+        "Shift+arrows",
+        "extend the selection; Shift extends it with every key above that moves the caret",
     ),
     ("Ctrl+L", "centre the caret's row in the view"),
     ("Ctrl+click", "follow the link under the pointer"),
@@ -480,22 +532,22 @@ const EMACS_KEYS: &[(&str, &str)] = &[
         "move the caret; in a menu, move, and RET or SPC chooses",
     ),
     (
-        "C-g",
-        "cancel a prefix, the mark, a menu, a prompt, a search or a notice; Escape too",
+        "C-g/Escape",
+        "cancel a prefix, the mark, a menu, a prompt, a search or a notice",
     ),
     ("C-SPC", "set the mark"),
-    ("C-a / C-e", "start or end of the line"),
-    ("C-b / C-f", "back or forward a character"),
-    ("C-p / C-n", "previous or next line"),
-    ("M-b / M-f", "back or forward a word"),
-    ("Home / End", "start or end of the line"),
-    ("C-Home / C-End", "start or end of the document"),
-    ("PageUp / PageDown", "up or down a page"),
+    ("C-a/C-e", "start or end of the line"),
+    ("C-b/C-f", "back or forward a character"),
+    ("C-p/C-n", "previous or next line"),
+    ("M-b/M-f", "back or forward a word"),
+    ("Home/End", "start or end of the line"),
+    ("C-Home/C-End", "start or end of the document"),
+    ("PageUp/PageDown", "up or down a page"),
     ("C-Tab", "next tab"),
     ("C-S-Tab", "previous tab"),
     (
-        "S-arrows etc.",
-        "extend the selection: Shift with an arrow, Home, End, a page key, C-Home or C-End",
+        "S-arrows",
+        "extend the selection; so does Shift with Home, End, a page key, C-Home or C-End",
     ),
     ("C-l", "centre the caret's row in the view"),
     ("C-click", "follow the link under the pointer"),
@@ -523,13 +575,14 @@ impl Group {
         MENU_LABELS.get(self.index()).copied().unwrap_or_default()
     }
 
-    /// The group's items that `profile` binds a key to, as the menu shows
-    /// them.
+    /// The group's items that `profile` binds a key to, the shortcut as
+    /// the menu shows it and what the item does. Help > Keys is left
+    /// out: its F1 is the window's own row, which td-ui adds.
     fn rows(self, profile: Profile) -> Vec<keys::Row> {
         self.items()
             .iter()
-            .filter(|item| !item.shortcut(profile).is_empty())
-            .map(|item| keys::row((item.shortcut(profile), item.label())))
+            .filter(|item| **item != Item::Keys && !item.shortcut(profile).is_empty())
+            .map(|item| keys::row((item.shortcut(profile), item.what())))
             .collect()
     }
 }
@@ -716,7 +769,8 @@ mod tests {
                 .clone()
         };
         let windows = key_sections(Profile::Windows, false, false);
-        // Windows binds no Help item, so Help has no section.
+        // Windows binds no Help item but Keys, whose F1 is the window's
+        // row, so Help has no section.
         assert_eq!(titles(&windows), ["File", "Edit", "Format", "Other keys"]);
         let emacs = key_sections(Profile::Emacs, true, false);
         assert_eq!(
@@ -733,10 +787,10 @@ mod tests {
                 let derived: Vec<keys::Row> = group
                     .items()
                     .iter()
-                    .filter(|item| !item.shortcut(profile).is_empty())
+                    .filter(|item| **item != Item::Keys && !item.shortcut(profile).is_empty())
                     .map(|item| keys::Row {
                         keys: item.shortcut(profile),
-                        what: item.label(),
+                        what: item.what(),
                     })
                     .collect();
                 assert_eq!(find(sections, group.title()).rows, derived);
@@ -744,17 +798,23 @@ mod tests {
         }
         let row = |keys, what| keys::Row { keys, what };
         let file = find(&windows, "File");
-        assert!(file.rows.contains(&row("Ctrl+S", "Save")));
-        assert!(!file.rows.iter().any(|r| r.what == "Quit"));
+        assert!(file.rows.contains(&row("Ctrl+S", "save the document")));
+        assert!(!file.rows.iter().any(|r| r.what == Item::Quit.what()));
         let file = find(&emacs, "File");
-        assert!(file.rows.contains(&row("C-x C-s", "Save")));
-        assert!(file.rows.contains(&row("C-x C-c", "Quit")));
-        assert_eq!(find(&emacs, "Help").rows, [row("M-x", "Command...")]);
-        assert!(!find(&emacs, "Edit").rows.iter().any(|r| r.what == "Redo"));
+        assert!(file.rows.contains(&row("C-x C-s", "save the document")));
+        assert!(file.rows.contains(&row("C-x C-c", Item::Quit.what())));
+        assert_eq!(
+            find(&emacs, "Help").rows,
+            [row("M-x", "run a named command")]
+        );
+        assert!(!find(&emacs, "Edit")
+            .rows
+            .iter()
+            .any(|r| r.what == Item::Redo.what()));
         let directory = find(&emacs, "Directory");
         assert_eq!(
             directory.rows.first(),
-            Some(&row("w", "Copy Entry Full Path"))
+            Some(&row("w", "copy the entry's full path"))
         );
         for keys in ["S", "R", "d", "u", "x", "+", "C", "RET", "s", "^", "g", "q"] {
             assert!(directory.rows.iter().any(|r| r.keys == keys), "{keys}");
@@ -768,7 +828,7 @@ mod tests {
         assert_eq!(other.rows.first().map(|r| r.keys), Some("F10"));
         assert!(other.rows.iter().any(|r| r.keys == "Ctrl+Shift+Tab"));
         let other = find(&emacs, "Other keys");
-        assert!(other.rows.iter().any(|r| r.keys == "C-g"));
+        assert!(other.rows.iter().any(|r| r.keys == "C-g/Escape"));
         assert!(other.rows.iter().any(|r| r.keys == "C-S-Tab"));
         // The window's own F1 and F12 are the overlay's to add.
         for sections in [&windows, &emacs] {
@@ -776,6 +836,43 @@ mod tests {
                 .iter()
                 .flat_map(|section| &section.rows)
                 .all(|r| r.keys != keys::CHORD && r.keys != td_ui::theme::CHORD));
+        }
+    }
+
+    /// Every list the window can show holds to td-ui's style: each
+    /// profile's own spelling, alternatives joined by an unspaced `/`,
+    /// a description on every row and titles starting with a capital.
+    #[test]
+    fn key_sections_hold_to_the_key_list_style() {
+        for profile in [Profile::Windows, Profile::Emacs] {
+            for (listings, in_listing) in [(false, false), (true, false), (true, true)] {
+                let problems = keys::check_style(&key_sections(profile, listings, in_listing));
+                assert!(
+                    problems.is_empty(),
+                    "{profile:?} listings={listings} in_listing={in_listing}:\n{}",
+                    problems.join("\n")
+                );
+            }
+        }
+    }
+
+    /// Help ends with Keys, td-ui's label for the item that opens the
+    /// key list, showing F1 in both profiles; every item says what it
+    /// does for the list.
+    #[test]
+    fn help_ends_with_the_key_list_item() {
+        assert_eq!(Group::Help.items().last(), Some(&Item::Keys));
+        assert_eq!(Group::Help.items().first(), Some(&Item::About));
+        assert_eq!(Item::Keys.label(), keys::ITEM);
+        assert_eq!(MENU_LABELS.get(Group::Help.index()), Some(&keys::BUTTON));
+        for profile in [Profile::Windows, Profile::Emacs] {
+            assert_eq!(Item::Keys.shortcut(profile), keys::CHORD);
+        }
+        for group in Group::ALL {
+            for item in group.items() {
+                assert!(!item.what().trim().is_empty(), "{item:?}");
+                assert_ne!(item.what(), item.label(), "{item:?}");
+            }
         }
     }
 }

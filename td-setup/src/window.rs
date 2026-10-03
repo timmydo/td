@@ -15,6 +15,7 @@ use td_install::installation_plan::{Destination, Plan, Settings};
 use td_ui::client::{run, App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
 use td_ui::keys::{self, Overlay, Section, Step};
+use td_ui::pointer;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Scale, Surface, CHROME};
 use td_ui::theme_file::Kept;
 use td_ui::wayland::{connect, endpoint};
@@ -101,6 +102,9 @@ enum Catalog {
     Listed,
     Refused(&'static str),
 }
+
+/// The evdev code of the left pointer button.
+const BUTTON_LEFT: u32 = 272;
 
 /// What a key asks of the window beyond the wizard's own state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -886,9 +890,12 @@ impl Window {
                 Some(chord) => self.chord(chord),
                 None => Ok(()),
             },
+            Handled::Pointer(event) => {
+                self.pointer(event);
+                Ok(())
+            }
             Handled::GlobalRemoved { .. }
             | Handled::Capabilities { .. }
-            | Handled::Pointer(_)
             | Handled::Clipboard(_)
             | Handled::Primary(_) => Ok(()),
             Handled::Unhandled => Err(format!(
@@ -902,6 +909,21 @@ impl Window {
     fn surface(&self) -> Result<Surface> {
         let (width, height) = self.size;
         Surface::new(width, height, Scale::new(1).map_err(error)?).map_err(error)
+    }
+
+    /// The pointer drives no page: a left press only closes an open key
+    /// list, as its title bar says, and repaints; the rest is ignored.
+    fn pointer(&mut self, event: pointer::Event) {
+        if let pointer::Event::Button {
+            button: BUTTON_LEFT,
+            pressed: true,
+            ..
+        } = event
+        {
+            if self.key_list.press() != Step::Kept {
+                self.dirty = true;
+            }
+        }
     }
 
     /// A chord from the seat's keyboard. The theme chord is the window's,
@@ -2196,6 +2218,39 @@ mod tests {
         assert_eq!(titles(&wizard), order);
     }
 
+    #[test]
+    fn every_page_key_list_is_spelled_as_the_keymap_spells_it() {
+        let checked = |wizard: &Wizard| {
+            let problems = keys::check(&wizard.key_sections());
+            assert!(problems.is_empty(), "{:?}: {problems:#?}", wizard.page);
+        };
+        let mut wizard = Wizard::new();
+        checked(&wizard);
+        wizard.key("Return");
+        checked(&wizard);
+        let mut wizard = listed();
+        checked(&wizard);
+        wizard.key("Down");
+        wizard.key("Return");
+        assert_eq!(wizard.page, Page::Settings);
+        checked(&wizard);
+        let wizard = filled();
+        assert_eq!(wizard.draft.focused(), TIME_ZONE);
+        checked(&wizard);
+        let mut wizard = on_review();
+        checked(&wizard);
+        wizard.key("Return");
+        send_execute(&mut wizard);
+        wizard.follow(Standing::Review {
+            nonce: wizard.executing.unwrap(),
+            stage: Stage::AwaitingConsent,
+        });
+        assert_eq!(wizard.page, Page::Progress(Progress::Consent));
+        checked(&wizard);
+        wizard.page = Page::Complete;
+        checked(&wizard);
+    }
+
     /// A window over one end of a socket pair: no compositor reads it.
     fn window() -> (Window, UnixStream) {
         let (ours, theirs) = UnixStream::pair().unwrap();
@@ -2243,5 +2298,45 @@ mod tests {
         // Closed, the page has its keys again.
         window.chord("Down".into()).unwrap();
         assert_eq!(window.front.wizard.selected, Some(0));
+    }
+
+    #[test]
+    fn a_left_press_closes_the_key_list_and_the_pointer_drives_nothing_else() {
+        let button = |button, pressed| pointer::Event::Button {
+            serial: 1,
+            button,
+            pressed,
+        };
+        let (mut window, _peer) = window();
+        window.front.wizard = listed();
+        // Closed, a press is nobody's.
+        window.dirty = false;
+        window.pointer(button(BUTTON_LEFT, true));
+        window.pointer(button(BUTTON_LEFT, false));
+        assert!(!window.dirty);
+        assert!(!window.key_list.is_open());
+        window.chord(keys::CHORD.into()).unwrap();
+        assert!(window.key_list.is_open());
+        // Motion, the wheel, a right press and a release leave it open.
+        window.dirty = false;
+        for event in [
+            pointer::Event::Motion(256, 256),
+            pointer::Event::Axis(0, 2560),
+            pointer::Event::Frame,
+            button(273, true),
+            button(273, false),
+            button(BUTTON_LEFT, false),
+        ] {
+            window.pointer(event);
+        }
+        assert!(window.key_list.is_open());
+        assert!(!window.dirty);
+        // A left press closes it and repaints; the page hears nothing.
+        window.pointer(button(BUTTON_LEFT, true));
+        assert!(!window.key_list.is_open());
+        assert!(window.dirty);
+        window.pointer(button(BUTTON_LEFT, false));
+        assert_eq!(window.front.wizard.page, Page::Destinations);
+        assert_eq!(window.front.wizard.selected, None);
     }
 }

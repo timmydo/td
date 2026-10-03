@@ -841,13 +841,16 @@ can end the window before reply delivery, under the existing EOF ambiguity.
 
 Copy/Cut cannot obtain clipboard ownership from a decoded key: their shared
 native path still requires a current physical press serial. Menu activation
-does not fabricate one either. Paste can request only an already advertised,
-supported compositor selection under the existing focused data-device policy;
-it revalidates its captured document/selection at completion. The private
-endpoint has the editor's existing authority, not a route to other windows
-or clipboard offers the compositor did not supply. No new clipboard RPC is
-added. Replay keeps its separate, controller-only `key TAB REV HEX_CHORD`
-grammar; its keys do not perform native file or clipboard I/O.
+does not fabricate one either. Help > Keys likewise opens the key list only
+under a physical serial: a decoded key choosing it leaves the list closed
+and says to press F1, and a decoded F1 opens nothing. Paste can request
+only an already advertised, supported compositor selection under the
+existing focused data-device policy; it revalidates its captured
+document/selection at completion. The private endpoint has the editor's
+existing authority, not a route to other windows or clipboard offers the
+compositor did not supply. No new clipboard RPC is added. Replay keeps its
+separate, controller-only `key TAB REV HEX_CHORD` grammar; its keys do not
+perform native file or clipboard I/O.
 
 ## Decoded pointer input
 
@@ -922,13 +925,14 @@ button-release acknowledgement. Activate a menu item with a single Press;
 omit redundant Move/Release phases after the menu consumes its click.
 Pointer and native input share menu hover, hit testing, selection/drag and
 close routing. Copy/Cut through a menu still requires an actual physical
-serial. Paste can use only an existing compositor offer under the ordinary
-focused data-device policy and remains live after the action that starts it.
-Post-action search/spelling/job observation does not cancel that new
-transfer. As with decoded keys, `1 ID ok` with a
-trailing empty field means delivery, not an effective click, file completion
-or presentation. Native adapter errors are fatal under the same contract;
-an error reply may be lost during shutdown. Native pointer-started file/scan
+serial, and so does Help > Keys: choosing it with a decoded press leaves
+the key list closed. Paste can use only an existing compositor offer under
+the ordinary focused data-device policy and remains live after the action
+that starts it. Post-action search/spelling/job observation does not cancel
+that new transfer. As with decoded keys, `1 ID ok` with a trailing empty
+field means delivery, not an effective click, file completion or
+presentation. Native adapter errors are fatal under the same contract; an
+error reply may be lost during shutdown. Native pointer-started file/scan
 actions create no remote job receipt. This is decoded editor input, not raw
 Wayland injection or control of another application.
 

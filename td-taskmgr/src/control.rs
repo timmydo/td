@@ -62,6 +62,11 @@ pub struct Remote<'a> {
 }
 impl Remote<'_> {
     fn outcome(&mut self, outcome: Outcome) -> driven::Outcome {
+        // The key list opens from the live pointer alone: a driven click
+        // on Help changes nothing and leaves the window no effect.
+        if outcome == Outcome::ShowKeys {
+            return driven::Outcome::Ignored;
+        }
         self.effect = Some(outcome);
         match outcome {
             Outcome::Ignored => driven::Outcome::Ignored,
@@ -183,6 +188,19 @@ mod tests {
             })
             .is_err());
         assert!(remote.action("live", &["unexpected"]).is_err());
+        // A driven click on Help never opens the key list: the window
+        // gets no effect from it.
+        let help = crate::ui::toolbar(remote.state.surface(), 4);
+        let (x, y) = (help.x as u32 + 5, help.y as u32 + 5);
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            remote.effect = None;
+            let outcome = remote.input(Input::Pointer { phase, x, y }).unwrap();
+            assert_ne!(remote.effect, Some(Outcome::ShowKeys));
+            if phase == PointerPhase::Release {
+                assert_eq!(outcome, driven::Outcome::Ignored);
+                assert_eq!(remote.effect, None);
+            }
+        }
         assert_eq!(
             driven::request(&mut remote, b"1\t3\taction\tquit"),
             "1\t3\tok\tquit"

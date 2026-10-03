@@ -18,14 +18,14 @@ const PLACEHOLDERS: [&str; 4] = [
     "Select a layout",
     "Select a time zone",
 ];
-const FOOTER: &str = "Account and region \u{b7} step 3 of 6 \u{b7} Enter on Time zone to review";
+const FOOTER: &str = "Account and region \u{b7} step 3 of 6 \u{b7} Return on Time zone to review";
 /// The row under the last field that says what became of a review.
 const NOTICE_ROW: usize = 18;
 /// The one keyboard layout the installer offers.
 pub const KEYBOARD: &str = "us";
 /// The time zone chosen when the catalog has it and nothing else was.
 const DEFAULT_ZONE: &str = "Etc/UTC";
-/// The rows Page Up and Page Down move a time zone selection.
+/// The rows PageUp and PageDown move a time zone selection.
 const ZONE_PAGE: usize = 16;
 /// The time zone field, the last.
 pub const TIME_ZONE: usize = 3;

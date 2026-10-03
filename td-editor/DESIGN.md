@@ -145,8 +145,9 @@ or an Emacs Lisp interface. Ctrl+Shift+Tab selects the previous tab in both
 profiles. M-q fills the current paragraph and C-l centers the caret's visual
 row in the viewport in both profiles, including an embedded mail draft pane.
 Common navigation keys and Shift-selection work in both profiles.
-F1 lists the profile's keys over the window and F12 moves it to the next
-colour theme; both are the window's, never the editor's.
+F1, or Help > Keys, lists the profile's keys over the window and F12
+moves it to the next colour theme; both are the window's, never the
+editor's.
 
 Find and Replace use literal, case-sensitive UTF-8 strings, without regular
 expressions. Search reports reaching the end before an explicit next search
@@ -2258,7 +2259,9 @@ Redo, Select All and the two key profiles, with clipboard commands enabled
 according to the data-device contract below. Format exposes Soft Wrap,
 Auto Fill, Fill Paragraph, Fill Column, Check Spelling, Dictionary and
 Next/Previous Misspelling under the native spelling contract above. Help
-shows an experimental-build About notice. A plus marks the active key profile
+shows an experimental-build About notice, opens the named command prompt
+(Command) and, last, the key list (Keys, td-ui's `keys::ITEM`, showing F1
+in both profiles; "Implemented key list"). A plus marks the active key profile
 or enabled format toggle. Undo/Redo availability reflects the captured
 history depth. Scratch mode disables Open/Save/Save As/Dictionary rather
 than pretending to persist its text. Only existing bindings are shown:
@@ -2325,7 +2328,13 @@ F1, td-ui's `keys::CHORD`, shows the window's keys over the frame in
 td-ui's `keys::Overlay` and hides them again, as the widget window does
 (td-ui/DESIGN.md "Key list"). The window takes it in the physical
 keyboard's key arm after F12, before the editor's chords, so the control
-socket's keys and a replay never open, move or close it. Opening ends a
+socket's keys and a replay never open, move or close it. Help > Keys
+(td-ui's `keys::ITEM`, last in Help, showing F1 in both profiles) opens
+it from the pointer or from the menus' keys. It opens only under a
+physical key or pointer press's serial, as the clipboard's items do: the
+control socket's keys and pointer can reach the item through the menus
+but carry no serial, so choosing it there leaves the list closed and
+says to press F1. Opening ends a
 pointer gesture under way through the ordinary pointer stop, leaving the
 document, its selection, a pending Emacs prefix and the mark as they
 were, and opens over whatever menu or prompt is showing. While it is
@@ -2334,10 +2343,12 @@ open every key but F12 is the list's: its reading keys scroll it, F1, q,
 menus and its prompts, which hear nothing until it closes; closing it
 leaves an open menu or prompt as it was. A held key repeats only while
 the list moves; a repeat that does not move it, one held at its end
-included, is cancelled. A
-left-button press is the list's, motion reaches neither the menu nor
-the document, and wheel rows scroll it, wherever the pointer is and
-whatever menu or prompt is under it; columns are dropped. A configure
+included, is cancelled. A left-button press closes the list
+(`Overlay::press`) and cancels a held key's repeat, and neither the press
+nor its release reaches the menu, the prompt or the document; motion
+reaches neither the menu nor the document, and wheel rows scroll it,
+wherever the pointer is and whatever menu or prompt is under it; columns
+are dropped. A configure
 lays the list out again for the new surface. It is painted last, after
 the scene, the prompt and the menu, in the window's theme; every open,
 move and close asks for a frame. `--preview`, the render checks and the
@@ -2345,31 +2356,54 @@ window preview's in-process cases never open it.
 
 The rows come from the menus: one section per menu group, titled as its
 header, with each item that has a shortcut in the profile in force, as
-`menu::Item::shortcut` shows it beside `Item::label`, so the list says
-what the menus say and cannot drift from them; a group with no bound
-item (Help, in the Windows profile) has none. The Directory section adds
+`menu::Item::shortcut` shows it, beside `Item::what`, the item's
+description, an exhaustive match beside `Item::label` so no item lacks
+one; the menu panel keeps the labels. So the list's keys are what the
+menus show and cannot drift from them. Help > Keys is left out: its F1
+is the window's row that td-ui adds. A group with no other bound item
+(Help, in the Windows profile) has no section. The Directory section adds
 a listing's keys that no item carries (`s`, `^`, `g`, `q`, and Return
 and Shift+Return as each profile spells them); it is shown in a file
 window, and first when the active tab is a listing. "Other keys" lists,
 in the profile's own spelling, what the window binds outside the menus:
 F10, the arrows, cancelling, tab switching, motion, Shift-selection, C-l
 and the Control-click that follows a link, and in the Emacs profile the
-mark and C-a/e/b/f/p/n and M-b/f. td-ui ends the list with F1 and F12.
+mark and C-a/C-e, C-b/C-f, C-p/C-n and M-b/M-f. td-ui ends the list with
+F1 and F12.
+
+Each profile keeps its menus' spelling (Windows `Ctrl+S`, `Enter`;
+Emacs `C-x C-s`, `RET`, `SPC`) rather than td-ui's keymap spelling, so
+the tests hold the rows to `keys::check_style`, not `keys::check`:
+alternatives are written out whole and joined by an unspaced `/`
+(`Ctrl+Home/Ctrl+End`, `C-s/C-r`), every row has a description, and
+every title starts with a capital. The list shows each description as a
+sentence.
 
 A pure test pins the sections in both profiles: their titles and order,
-the menu-derived rows equal to the items' shortcuts and labels, sample
-rows, the Directory section's place, and no row of F1 or F12. Seat
+the menu-derived rows equal to the items' shortcuts and descriptions,
+sample rows, the Directory section's place, and no row of F1 or F12.
+Another holds every sections variant (both profiles, with and without a
+listing, a listing first) to `check_style`, and another pins Help ending
+with Keys, its label `keys::ITEM` and shortcut F1, and a description on
+every item. Seat
 fixture tests pin F1 opening over an open menu with a frame asked for, a
 typed letter, Ctrl+A and F10 changing nothing while it is open, `j` and
-the wheel scrolling it, a press reaching neither the menu nor the
-document, F12 still moving the theme, Escape closing the list alone with
+the wheel scrolling it, a press closing it with the menu left open and
+neither press nor release reaching the menu or the document,
+F12 still moving the theme, Escape closing the list alone with
 the menu left open, the editor hearing keys again after it, the Emacs
 profile's spelling, the panel's title bar painted over the frame, a
 configure laying the lines out again, and closing painting the frame as
 it was. Another pins the repeat: a held `j` moving the list on each
 repeat with the document unchanged, a held key the list only keeps
 arming no repeat, and End or `j` held at the list's end cancelled on
-its first repeat. Space choosing File > New from F10 in both profiles,
+its first repeat; and another a `j` held under the closing press
+repeating nothing into the document, and a press closing the list over
+the Go To Line prompt with the prompt left open. Help > Keys opening the
+list, chosen by the pointer and from F10 with Right, Down and Return, in
+both profiles, is pinned, and the control socket's F1, its keys choosing
+Help > Keys and its pointer pressing it all leaving the list closed.
+Space choosing File > New from F10 in both profiles,
 and typing a space with no menu open, is pinned too.
 
 ### Implemented clipboard admission prerequisite
@@ -2713,8 +2747,8 @@ never enter, complete, cancel or run commands. No command runs while typing.
 The prompt shows the match count and at most the first three names in lexical
 order as hints. Type a prefix to narrow them. Like the other bitmap modals,
 it clips to six notice rows on narrow windows; resizing does not lose input.
-Help now needs 320 by 96 scaled pixels for its two complete rows, up from
-320 by 72 for About alone. M-x remains available without a fitting menu.
+Help needs 320 by 120 scaled pixels for its three complete rows (About,
+Command and Keys). M-x remains available without a fitting menu.
 
 The closed registry is exactly:
 

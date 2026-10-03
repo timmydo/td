@@ -136,6 +136,9 @@ impl Window {
                     }
                 }
             }
+            // Only the live pointer's Help button answers this: the
+            // control socket's `Remote` keeps it from the window.
+            Outcome::ShowKeys => self.show_keys(),
             _ => {}
         }
         Ok(())
@@ -166,13 +169,21 @@ impl Window {
             // The key list over the frame takes a press and the left
             // button's release after it; a release ending a press made
             // before it opened still reaches the state, whose drag the
-            // opening ended.
+            // opening ended. A left press closes it, and a reading key
+            // held through the click stops repeating rather than reach
+            // the state; a right press reaches nothing and leaves it open.
             pointer::Event::Button {
                 button,
                 pressed: true,
                 ..
             } if self.key_list.is_open() && matches!(button, 272 | 273) => {
-                self.list_press |= button == 272;
+                if button == 272 {
+                    self.list_press = true;
+                    if self.key_list.press() != Step::Kept {
+                        self.client.cancel_repeat();
+                        self.repaint = true;
+                    }
+                }
             }
             pointer::Event::Button {
                 button: 272,

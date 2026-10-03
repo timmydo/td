@@ -706,19 +706,26 @@ fn f12_on_the_seat_paints_and_keeps_the_next_theme() {
 /// F1 on the seat is the window's key list: the frame is painted again
 /// with the list's title bar over it while the session hears nothing; a
 /// key the session binds is the list's while it is open, a reading key
-/// scrolls it, and Escape closes it, the frame the session's again.
+/// scrolls it, and Escape closes it, the frame the session's again. A
+/// click on the mode strip's Help opens it as F1 does, and a click
+/// anywhere closes it, stopping a reading key's repeat with it.
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn f1_on_the_seat_shows_the_key_list_over_the_frame() {
     const KEY_ESCAPE: u32 = 1;
     const KEY_P: u32 = 25;
     const KEY_F1: u32 = 59;
+    const KEY_DOWN: u32 = 108;
     let compositor_directory = Directory::new();
     let mut compositor = Compositor::start(&compositor_directory);
     let client_directory = Directory::new();
     let roll = client_directory.0.join("roll");
     std::fs::create_dir(&roll).unwrap();
-    std::fs::write(roll.join("DSC_0001.NEF"), b"not really a nef").unwrap();
+    // Rows of photos, so a held Down that reached the session would move
+    // its cursor.
+    for n in 1..=12 {
+        std::fs::write(roll.join(format!("DSC_{n:04}.NEF")), b"not really a nef").unwrap();
+    }
     let client = PhotoProcess::start(
         &client_directory,
         &compositor.directory.join("wayland-0"),
@@ -760,13 +767,19 @@ fn f1_on_the_seat_shows_the_key_list_over_the_frame() {
     let selected = td_ui::raster::SELECTED.to_be_bytes();
     let (x0, y0) = (title.x as usize, title.y as usize);
     let (width, height) = (title.width as usize, title.height as usize);
-    let filled = (y0..y0 + height)
-        .flat_map(|y| (x0..x0 + width).map(move |x| (y * place.width + x) * 3))
-        .filter(|at| open[*at..*at + 3] == selected[1..])
-        .count();
+    // How much of the title bar is in the selection's colour: over half,
+    // the list's.
+    let filled = |tile: &[u8]| {
+        (y0..y0 + height)
+            .flat_map(|y| (x0..x0 + width).map(move |x| (y * place.width + x) * 3))
+            .filter(|at| tile[*at..*at + 3] == selected[1..])
+            .count()
+    };
+    let shown = |tile: &[u8]| filled(tile) > width * height / 2;
     assert!(
-        filled > width * height / 2,
-        "the title bar is not the list's: {filled} of {}",
+        shown(&open),
+        "the title bar is not the list's: {} of {}",
+        filled(&open),
         width * height
     );
     assert_eq!(
@@ -801,6 +814,67 @@ fn f1_on_the_seat_shows_the_key_list_over_the_frame() {
         state,
         "Escape is the list's, not the session's"
     );
+    // The mode strip's Help, pressed from the seat, opens the list too; a
+    // tile that changes is not proof, as the seat draws its cursor over
+    // it, so the title bar is waited for. The session hears neither the
+    // press nor its release.
+    let help = td_photo::ui::Controller::new(surface)
+        .help_button()
+        .expect("Help on the tile's mode strip");
+    compositor.click(
+        place.x + help.x as usize + help.width as usize / 2,
+        place.y + help.y as usize + help.height as usize / 2,
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while !shown(&compositor.tile(&place)) {
+        assert!(
+            Instant::now() < deadline,
+            "Help did not open: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    client.settle(9);
+    assert_eq!(
+        client.request(10, &["state"]),
+        state,
+        "Help is the window's, not the session's"
+    );
+    // Down held scrolls the list and repeats; a click then closes it,
+    // Roll Selection under it reached by neither the press nor its
+    // release, and the repeat stops with it, so Down held past the
+    // repeat's delay moves no cursor.
+    let scrolled = compositor.tile(&place);
+    compositor.key(KEY_DOWN, true);
+    changed(&compositor, &scrolled);
+    compositor.click(place.x + 40, place.y + 12);
+    compositor.pointer(0, 0, 0);
+    std::thread::sleep(Duration::from_millis(1500));
+    compositor.key(KEY_DOWN, false);
+    let deadline = Instant::now() + TIMEOUT;
+    while shown(&compositor.tile(&place)) {
+        assert!(
+            Instant::now() < deadline,
+            "a click did not close: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    client.settle(11);
+    assert_eq!(
+        client.request(12, &["state"]),
+        state,
+        "the click, its release or Down's repeat reached the session"
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while compositor.tile(&place) != frame {
+        assert!(
+            Instant::now() < deadline,
+            "not the frame before: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// The status row, the last line of `text`, is `full`, or, when the tile is

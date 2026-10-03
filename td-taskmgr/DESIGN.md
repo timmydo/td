@@ -93,14 +93,28 @@ C-q, Escape asks to cancel it and the rest do nothing until it settles.
 The rest of the rows are tables beside `State::key`, and the window's
 own F1 and F12 end it. While it is open the state hears no key, no
 press and no motion: the list's reading keys scroll it, repeating while
-they move it, and F1, `q` or Escape close it; a drag under way ends
-when it opens, a left or right press and the left release after it
-reach nothing, the pointer's position is only recorded, so a menu
+they move it, and F1, `q`, Escape or a left press close it; a drag
+under way ends when it opens, a left or right press and the left
+release after it reach nothing else, the left press also ending a key
+repeat under way, so a reading key held through the click does not go
+on into the state, the pointer's position is only recorded, so a menu
 behind the list keeps its hover and submenus, wheel rows scroll it and
 columns are dropped. Losing the seat or its pointer forgets a press
 the list took. A resize lays it out again; it is
 painted last, in the theme, and never in `--preview`. The control
 socket's input still reaches the state while it is open.
+
+The toolbar under the tabs holds Live (C-l), Refresh, Compare all
+(C-a), Details (Return) or Back (Escape), and Help (F1): each button its
+widest caption and a cell either side wide, so the five end at 688
+pixels, before the four 176-pixel buttons they replace did, and the
+native fixture's tile in its 800-pixel output shows them all. Help is the
+pointer's way to the key list (td-ui's `keys::BUTTON`): a press and
+release on it answer `Outcome::ShowKeys`, which changes nothing in the
+state and which the window answers by opening the list as F1 does. The
+control socket's `Remote` answers a driven click on Help as ignored and
+leaves the window no effect, so the list opens only from the live
+pointer or the physical keyboard.
 
 ```text
 +------------------------------------------------------------------+
@@ -131,18 +145,19 @@ The divider initially splits usable height equally and is draggable and
 keyboard adjustable. Dedicated resource tabs keep one row of cards as
 the divider moves, so
 adding height enlarges their graphs rather than adding rows and shrinking
-them. More cards remain reachable with Page Up/Down or the wheel. Overview
-uses up to two rows. Both panes retain useful minimum extents. Narrow
-windows reflow Overview and scroll graph content; the lower pane retains
-its search, column headings and at least one process row when space permits.
-At smaller extents show a resize message without losing state or extending
-hit regions outside the surface. The tree has horizontal and vertical
-scrolling; rendering visits visible rows rather than the whole tree.
+them. More cards remain reachable with PageUp/PageDown or the wheel.
+Overview uses up to two rows. Both panes retain useful minimum extents.
+Narrow windows reflow Overview and scroll graph content; the lower pane
+retains its search, column headings and at least one process row when
+space permits. At smaller extents show a resize message without losing
+state or extending hit regions outside the surface. The tree has
+horizontal and vertical scrolling; rendering visits visible rows rather
+than the whole tree.
 
 Tab moves focus among tabs, graph, divider, search, tree, and actions.
 Arrow keys navigate the focused control. Tree Left collapses or moves to
 the parent; Right expands or moves to the first child. Up/Down, Home/End,
-and Page Up/Down navigate visible rows. Ctrl+F focuses search; Shift+F10
+and PageUp/PageDown navigate visible rows. C-f focuses search; S-F10
 opens the selected row's context menu, and F10 opens the Process menu.
 Escape dismisses the innermost menu
 or confirmation before affecting other state. Graph timestamps and
@@ -162,7 +177,7 @@ CPU and Memory have system line plots and separate process line plots.
 Each process keeps its own gaps, so an unreadable or newly observed process
 cannot blank another process's history. Selecting a process filters these
 process plots to that identity; the system plots retain their machine-wide
-basis. Compare all (Ctrl+A outside search) clears the process selection
+basis. Compare all (C-a outside search) clears the process selection
 and any contributor list. Comparison series retain their palette slots
 while inspecting a selected process; names remain explicit. Selecting a
 series reveals
@@ -230,26 +245,27 @@ action interprets the visual indentation or a substring match as its target.
 
 ## Process detail view
 
-Double-clicking a process row or pressing Enter or Space (td-ui's
+Double-clicking a process row or pressing Return or Space (td-ui's
 default tree chords) opens a detail view for its exact process key.
-Details (Enter) provides the same toolbar action. Its CPU and RSS plots
-use retained history for that process, with one row of cards and Page
-Up/Down access when both do not fit side by side. The lower pane roots a
-parent/child tree at that process; unrelated branches and ancestors no
-longer consume its indentation. A Parent button and Alt+Up open its
-observed parent using the same key-bound view. An unavailable parent is
-informational, not an invented PID target.
+Details (Return) provides the same toolbar action. Its CPU and RSS plots
+use retained history for that process, with one row of cards and
+PageUp/PageDown access when both do not fit side by side. The lower pane
+roots a parent/child tree at that process; unrelated branches and
+ancestors no longer consume its indentation. A Parent button and M-Up open
+its observed parent using the same key-bound view. An unavailable parent
+is informational, not an invented PID target.
 
 The detail identity stays fixed while selecting related rows for ordinary
-process actions. Double-click/Enter on a related process opens its details.
-The view has its own subtree search and expansion state. Back or Escape
-restores the broader search, sort, expansion and first visible anchor when
-still available. If the saved selection is absent, Back clears it.
-Graph-tab changes and sorting a heading return to the broader view;
-a heading click toggles the visible detail sort, not the saved browse sort. Comparing all also exits details and clears the plot filter.
-A missing identity leaves an explicit unavailable detail view. PID reuse
-never redirects it, and historical details retain the existing prohibition
-on signals. Historical plots begin with retained observations; opening a
+process actions. Double-click or Return on a related process opens its
+details. The view has its own subtree search and expansion state. Back or
+Escape restores the broader search, sort, expansion and first visible
+anchor when still available. If the saved selection is absent, Back clears
+it. Graph-tab changes and sorting a heading return to the broader view; a
+heading click toggles the visible detail sort, not the saved browse sort.
+Comparing all also exits details and clears the plot filter. A missing
+identity leaves an explicit unavailable detail view. PID reuse never
+redirects it, and historical details retain the existing prohibition on
+signals. Historical plots begin with retained observations; opening a
 detail does not reconstruct past CPU/RSS samples.
 
 `pointer::DoubleClick` pairs completed semantic row clicks using explicit
@@ -616,7 +632,7 @@ still fails, it releases the old projection and retries once before painting;
 continuing pressure enters the bounded tick-recovery path. An unavailable
 view never presents old data as the newly selected sample. The status
 reports age, partial coverage, actual history duration, absent selections
-and inspections older than the plot. F10/Shift+F10 and the Process actions
+and inspections older than the plot. F10/S-F10 and the Process actions
 button open the selected process menu. Right-clicking a tree row first
 selects that captured row, then opens its menu.
 
@@ -638,35 +654,45 @@ endpoint; a remote quit allows a bounded reply-drain interval. Transport and
 surface buffers retain td-ui's separate ceilings.
 
 `--preview [WIDTHxHEIGHT]` emits a PPM from two actual observations.
-`--help` and `--font-license` require no display. Ctrl+L returns to
-Live, Ctrl+I cycles cadence, Ctrl+A outside search clears the process
-plot filter, and Ctrl+Q closes; graph Page Up/Down scrolls cards,
-Ctrl+Tab selects another visible graph and arrows inspect times/series.
+`--help` and `--font-license` require no display. C-l returns to
+Live, C-i cycles cadence, C-a outside search clears the process
+plot filter, and C-q closes; graph PageUp/PageDown scrolls cards,
+C-Tab selects another visible graph and arrows inspect times/series.
 Network/Disk add a device-list stop to the Tab focus cycle; Space
 toggles membership. Escape closes the ranked contributors before
-returning from process details or changing focus. Enter and double-click
+returning from process details or changing focus. Return and double-click
 open process details; F10 remains the explicit process-actions shortcut.
 
 The native fixture uses the repository trusted-root test wrapper so the
 private endpoint keeps its ordinary ancestor-ownership checks inside the
 check host. The native process fixture uses an explicitly built
-td-compositor, validates input receipts and correlates capture with client/commit/output counters. It
-drives a graph through ranked contributors into the persistent tree, proves
-search and tab retention, and checks continuing collection on another
-workspace. Its F1 case finds the key list's title bar painted in the
-selection's colour after F1 on the seat, the state's tab, focus, query,
-live, actions and detail unchanged by Tab and a click on a tab while it
-is open, and after Escape the state's frame again with Tab moving the
-focus; a unit test pins the sections' order for each focus, an open
+td-compositor, validates input receipts and correlates capture with
+client/commit/output counters. It drives a graph through ranked
+contributors into the persistent tree, proves search and tab retention,
+and checks continuing collection on another workspace. Its F1 case finds
+the key list's title bar painted in the selection's colour after F1 on the
+seat, the state's tab, focus, query, live, actions and detail unchanged by
+Tab while it is open and by the click on a tab that closes it, and, opened
+again, after Escape the state's frame again with Tab moving the focus. Its
+Help case selects the first row, opens the list with a click on Help,
+holds Down through the 600 ms repeat delay while the list scrolls, closes
+it with a click, and finds the selection unmoved after the repeats a live
+repeat would have sent, the rest of the state unchanged, and Down then
+reaching the state. Unit tests pin Help's `ShowKeys` with the state
+unchanged, the captions fitting their buttons and the toolbar ending where
+the four did, `keys::check` over every focus, an open menu and a preparing
+request, and the control socket answering a click on Help as ignored with
+no effect; a unit test pins the sections' order for each focus, an open
 menu and a preparing request, and the derived rows equal
-`control::BINDINGS`, `confirmations::KEYS` and the results' rows. td-compositor currently completes hidden-client callbacks, so
-that case bounds updates rather than assuming callbacks stop. The separately
-opt-in Weston fixture requires `TD_TEST_WESTON`, scopes protocol evidence to
-the client that set our app ID, and checks configure, repeated attachments,
+`control::BINDINGS`, `confirmations::KEYS` and the results' rows.
+td-compositor currently completes hidden-client callbacks, so that case
+bounds updates rather than assuming callbacks stop. The separately opt-in
+Weston fixture requires `TD_TEST_WESTON`, scopes protocol evidence to the
+client that set our app ID, and checks configure, repeated attachments,
 frame callbacks, buffer releases, navigation, continuing observations and
 clean remote quit. The host smoke passed with Guix Weston 10.0.2 on x86-64
-Linux 7.0.14. These are host compatibility observations, not td target-image
-evidence.
+Linux 7.0.14. These are host compatibility observations, not td
+target-image evidence.
 
 ## Implemented process controls
 
@@ -695,7 +721,7 @@ A same-size configure preserves the request. Pointer leave alone does not
 cancel keyboard focus. Confirm does not overlap the pointer position that
 opened the request. A completed report retains its details and per-member
 results if a small window or memory pressure prevents displaying it;
-Enter retries, resize reflows it, and Escape explicitly closes it. Budget
+Return retries, resize reflows it, and Escape explicitly closes it. Budget
 recovery evicts at most one old unpinned snapshot per tick, shared with the
 visible-view recovery policy, while preserving newest and inspected data.
 
