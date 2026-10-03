@@ -1517,10 +1517,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // ever a dev-dependency: no recipe stages, embeds or names it, and the
     // recipes compile its consumers' src/ with a direct rustc and no
     // `--test` (td-svc's `--test` build is tests/pair.rs, its own crate
-    // root), so no target artifact can change. The cargo-test preflight is everything that
-    // reads it: its own suite and lints, and through the reader closure every
-    // consumer's confinement tests. `source_scan_reaches_no_recipe` holds the
-    // premise.
+    // root), so no target artifact can change. The cargo-test preflight is
+    // everything that reads it: its own suite and lints, and through the
+    // reader closure every consumer's confinement tests.
+    // `source_scan_reaches_no_recipe` holds the premise.
     if p.starts_with("td-source-scan/") && !p.contains("..") {
         sel.add_preflight("cargo-test");
         return;
@@ -5882,7 +5882,7 @@ mod tests {
         // consumer's confinement tests.
         assert_eq!(
             readers_of("td-source-scan"),
-            ["td-init", "td-login", "td-svc", "td-util"]
+            ["td-init", "td-login", "td-sh", "td-svc", "td-util"]
         );
         // td-authd compiles td-install's consent codec by `#[path]`, and the
         // installation fixture its three protocol codecs.
@@ -8792,7 +8792,14 @@ mod tests {
             "td-source-scan/Cargo.lock",
         ] {
             let output = path_output(&root, path);
-            for krate in ["td-source-scan", "td-init", "td-login", "td-svc", "td-util"] {
+            for krate in [
+                "td-source-scan",
+                "td-init",
+                "td-login",
+                "td-sh",
+                "td-svc",
+                "td-util",
+            ] {
                 assert!(
                     output.contains(&format!("--manifest-path {krate}/Cargo.toml")),
                     "{path} selects no preflight over {krate}: {output}"

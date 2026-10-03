@@ -607,6 +607,8 @@ fn read_complete(editor: &mut line::Editor, sh: &mut Shell, buffer: &mut String)
 /// declaration pin is a plain literal that scans `funcs.rs` alone.
 #[cfg(test)]
 mod confinement {
+    use td_source_scan::{squeeze, strip_comments};
+
     /// Every file the recipe compiles. `covers_every_module` keeps it honest.
     const SOURCES: &[(&str, &str)] = &[
         ("main.rs", include_str!("main.rs")),
@@ -636,10 +638,6 @@ mod confinement {
             .map(|(_, t)| *t)
             .next()
             .unwrap_or("")
-    }
-
-    fn squeeze(text: &str) -> String {
-        text.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// The REPL must open the session's history. Everything about `HISTFILE`
@@ -698,142 +696,19 @@ mod confinement {
     /// not manage: `/* pub table */` between two tokens carries a
     /// declaration's text, so widening the declaration loses a match and the
     /// decoy pays it straight back -- a green tree over a broken rule.
-    fn code_only(text: &str) -> String {
-        uncommented(text)
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Comments out, literals through untouched.
     ///
     /// Literal-aware because it has to be: this crate writes shell globs as
     /// DATA -- `split("dir/*")` in `expand.rs`, `pat("*/")` in `pattern.rs` --
     /// so a scan that could not tell a literal from a comment would swallow
-    /// every line between one file's `/*` and the next file's `*/`. That is
-    /// the same failure as the decoy, arriving from the other side: text
-    /// removed is a match lost, and a lost match reds a count that should
-    /// hold. Newlines inside a comment are KEPT so line-shaped needles below
-    /// cannot straddle what was removed.
-    fn uncommented(text: &str) -> String {
-        let src: Vec<char> = text.chars().collect();
-        let at = |k: usize| src.get(k).copied();
-        let word = |k: usize| at(k).is_some_and(|c| c.is_alphanumeric() || c == '_');
-        let mut out = String::with_capacity(text.len());
-        let mut i = 0;
-        while let Some(c) = at(i) {
-            // A raw string ends at a quote followed by its OWN number of `#`.
-            // Only a LEADING `r` starts one: not the `r` ending a name, and
-            // not the `r` NAMING a lifetime -- `'r"x"` is a lifetime and a
-            // string, and reading it as a raw string swallowed whatever came
-            // after. `b` and `c` prefix one too.
-            let opener = !word(i.wrapping_sub(1)) && at(i.wrapping_sub(1)) != Some('\'');
-            let raw = match c {
-                'r' if opener => Some(i + 1),
-                'b' | 'c' if opener && at(i + 1) == Some('r') => Some(i + 2),
-                _ => None,
-            };
-            if let Some(mut h) = raw {
-                let opens = h;
-                while at(h) == Some('#') {
-                    h += 1;
-                }
-                if at(h) == Some('"') {
-                    let hashes = h - opens;
-                    for k in i..=h {
-                        if let Some(ch) = at(k) {
-                            out.push(ch);
-                        }
-                    }
-                    i = h + 1;
-                    while let Some(ch) = at(i) {
-                        out.push(ch);
-                        i += 1;
-                        if ch == '"' && (0..hashes).all(|k| at(i + k) == Some('#')) {
-                            for k in 0..hashes {
-                                if let Some(hc) = at(i + k) {
-                                    out.push(hc);
-                                }
-                            }
-                            i += hashes;
-                            break;
-                        }
-                    }
-                    continue;
-                }
-            }
-            match c {
-                '/' if at(i + 1) == Some('/') => {
-                    while at(i).is_some_and(|n| n != '\n') {
-                        i += 1;
-                    }
-                }
-                '/' if at(i + 1) == Some('*') => {
-                    // A comment SEPARATES tokens, so one leaves a space
-                    // behind: `Fun/**/cs` is two tokens and joining them
-                    // would synthesise an identifier the source never had.
-                    out.push(' ');
-                    // Rust's block comments NEST, so a depth and not a search
-                    // for the first `*/`.
-                    let mut depth = 1usize;
-                    i += 2;
-                    while depth > 0 && i < src.len() {
-                        if at(i) == Some('/') && at(i + 1) == Some('*') {
-                            depth += 1;
-                            i += 2;
-                        } else if at(i) == Some('*') && at(i + 1) == Some('/') {
-                            depth -= 1;
-                            i += 2;
-                        } else {
-                            if at(i) == Some('\n') {
-                                out.push('\n');
-                            }
-                            i += 1;
-                        }
-                    }
-                }
-                '"' => {
-                    out.push(c);
-                    i += 1;
-                    while let Some(ch) = at(i) {
-                        out.push(ch);
-                        i += 1;
-                        if ch == '\\' {
-                            if let Some(esc) = at(i) {
-                                out.push(esc);
-                                i += 1;
-                            }
-                        } else if ch == '"' {
-                            break;
-                        }
-                    }
-                }
-                // `'a'` is a literal and `'static` is a lifetime. The escape
-                // decides the first, a quote two characters along the second.
-                '\'' if at(i + 1) == Some('\\') || at(i + 2) == Some('\'') => {
-                    out.push(c);
-                    i += 1;
-                    while let Some(ch) = at(i) {
-                        out.push(ch);
-                        i += 1;
-                        if ch == '\\' {
-                            if let Some(esc) = at(i) {
-                                out.push(esc);
-                                i += 1;
-                            }
-                        } else if ch == '\'' {
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    out.push(c);
-                    i += 1;
-                }
-            }
-        }
-        out
+    /// every line between one file's `/*` and the next file's `*/`. The
+    /// strip is td-source-scan's, shared with the other confinement suites;
+    /// `comments_go_and_literals_stay` pins what this crate relies on.
+    fn code_only(text: &str) -> String {
+        strip_comments(text)
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// What `code_only` must and must not remove. A comment that carries a
@@ -1068,11 +943,12 @@ mod confinement {
     /// `sys.rs` carries no block comment at all. That used to be what made a
     /// LINE-based strip complete for the one file that may hold `unsafe`;
     /// `code_only` handles block comments now, so it is a backstop instead
-    /// and it stays as one. The strip is a hand-written scan of Rust's
-    /// literal grammar, and review found two spellings it had wrong -- a C
-    /// raw string, and a lifetime in front of a string -- each of which ended
-    /// a literal early and let the text after it read as a comment. Both are
-    /// fixed and pinned. A third would hide a construct from every scan here
+    /// and it stays as one. The strip (td-source-scan's) is a hand-written
+    /// scan of Rust's literal grammar, and review found spellings it had
+    /// wrong -- a C raw string, a lifetime in front of a string, a literal's
+    /// suffix, a non-alphabetic lifetime -- each of which ended a literal
+    /// early or late and let text read as the other kind. All are fixed and
+    /// pinned. A third would hide a construct from every scan here
     /// without changing what the compiler sees, and this file is the one
     /// where that costs the most, so a BLOCK comment there does not depend
     /// on the scan being right. Only that class: a mis-lexed literal can

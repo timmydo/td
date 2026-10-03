@@ -139,6 +139,10 @@ pub fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     let at = |i: usize| src.get(i).copied();
+    let word = |i: usize| at(i).is_some_and(|c| c.is_alphanumeric() || c == '_');
+    // Where the last literal ended: an `r` there is the literal's SUFFIX,
+    // as rustc reads `"x"r`, not a raw string opening.
+    let mut literal_end = usize::MAX;
     while i < src.len() {
         let c = at(i).unwrap_or(' ');
         if c == '/' && at(i + 1) == Some('/') {
@@ -175,9 +179,19 @@ pub fn strip_comments(text: &str) -> String {
         // followed by as many hashes as opened them. Modelling them is not
         // optional: a raw string containing an unbalanced `/*` would otherwise
         // open a block comment that swallows the rest of the file, hiding a
-        // real unsafe block from the count while it still compiles.
-        if c == 'r' || (c == 'b' && at(i + 1) == Some('r')) {
-            let mut k = if c == 'b' { i + 2 } else { i + 1 };
+        // real unsafe block from the count while it still compiles. Only a
+        // LEADING `r` starts one: not the `r` ending a name, and not the `r`
+        // NAMING a lifetime -- `'r"x"` is a lifetime and a string, and reading
+        // it as a raw string desyncs the scan -- and not a suffix straight
+        // after a literal. `b` and `c` prefix one too.
+        let opener =
+            !word(i.wrapping_sub(1)) && at(i.wrapping_sub(1)) != Some('\'') && i != literal_end;
+        let raw = match c {
+            'r' if opener => Some(i + 1),
+            'b' | 'c' if opener && at(i + 1) == Some('r') => Some(i + 2),
+            _ => None,
+        };
+        if let Some(mut k) = raw {
             let mut hashes = 0usize;
             while at(k) == Some('#') {
                 hashes += 1;
@@ -209,6 +223,7 @@ pub fn strip_comments(text: &str) -> String {
                     out.push(ch);
                     i += 1;
                 }
+                literal_end = i;
                 continue;
             }
         }
@@ -230,36 +245,31 @@ pub fn strip_comments(text: &str) -> String {
                     break;
                 }
             }
+            literal_end = i;
             continue;
         }
-        // A quote opens a char literal or a lifetime. A lifetime is a quote, an
-        // identifier, and NO closing quote; only a char literal can hold a
-        // comment marker, and it is copied whole so `'/'` cannot open one.
-        if c == '\'' {
-            let ident = at(i + 1).is_some_and(|n| n.is_alphabetic() || n == '_');
-            if !(ident && at(i + 2) != Some('\'')) {
-                let mut k = i + 1;
-                let mut close = None;
-                while let Some(ch) = at(k) {
-                    match ch {
-                        '\\' => k += 2,
-                        '\'' => {
-                            close = Some(k);
-                            break;
-                        }
-                        _ => k += 1,
+        // A quote opens a char literal or a lifetime. A char literal is an
+        // escape or ONE character and its closing quote; anything else is a
+        // lifetime, whatever its first character -- `'℘` is a lifetime, as an
+        // identifier is XID and not merely alphabetic. Only a char literal can
+        // hold a comment marker, and it is copied whole so `'/'` opens none.
+        if c == '\'' && (at(i + 1) == Some('\\') || at(i + 2) == Some('\'')) {
+            out.push(c);
+            i += 1;
+            while let Some(ch) = at(i) {
+                out.push(ch);
+                i += 1;
+                if ch == '\\' {
+                    if let Some(escaped) = at(i) {
+                        out.push(escaped);
+                        i += 1;
                     }
-                }
-                if let Some(end) = close {
-                    for j in i..=end {
-                        if let Some(ch) = at(j) {
-                            out.push(ch);
-                        }
-                    }
-                    i = end + 1;
-                    continue;
+                } else if ch == '\'' {
+                    break;
                 }
             }
+            literal_end = i;
+            continue;
         }
         out.push(c);
         i += 1;
@@ -402,6 +412,41 @@ mod tests {
         assert_eq!(strip_comments("br\"/*\" x"), "br\"/*\" x");
         // A lifetime is not a char literal, so the comment after it still goes.
         assert_eq!(strip_comments("fn f<'a>() {} // c"), "fn f<'a>() {} ");
+    }
+
+    /// Only a leading `r`, `br` or `cr` opens a raw string. A lifetime named
+    /// `r` abutting a string, read as a raw string, ends at the escaped quote
+    /// and the scan desyncs from there; that case reds under "any `r` opens
+    /// one". The prefixed forms pin that the rule still opens them.
+    #[test]
+    fn a_raw_string_opens_only_where_one_can() {
+        let out = strip_comments("m!('r\"a\\\"b\") /* gone */ after");
+        assert!(!out.contains("gone"), "comment survived a lifetime: {out}");
+        assert!(out.contains("after"), "code after it was eaten: {out}");
+        let craw = "let s = cr#\"x\"/*\"#; after";
+        assert_eq!(strip_comments(craw), craw);
+        let braw = "let s = br#\"x\"/*\"#; after";
+        assert_eq!(strip_comments(braw), braw);
+        // An `r` straight after a literal is its suffix, which rustc accepts
+        // inside `stringify!`: read as a raw string it would end at the `"#`
+        // and open a comment that hides the item below.
+        let suffix = "stringify!(\"x\"r#\"\\\"#/*\");\nunsafe fn f() {}\n// */";
+        let out = strip_comments(suffix);
+        assert!(out.contains("unsafe fn f()"), "a suffix hid an item: {out}");
+    }
+
+    /// A lifetime is an identifier, which is XID rather than alphabetic: read
+    /// as a char literal, `'℘` copies through the next quote and keeps the
+    /// comment between.
+    #[test]
+    fn a_lifetime_is_any_identifier() {
+        let text = "fn f<'℘ /* unsafe {} */>(x: &'℘ str) {}";
+        let out = strip_comments(text);
+        assert!(
+            !out.contains("unsafe"),
+            "a comment survived a lifetime: {out}"
+        );
+        assert_eq!(strip_comments("let c = '℘';"), "let c = '℘';");
     }
 
     #[test]

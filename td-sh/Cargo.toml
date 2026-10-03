@@ -30,11 +30,17 @@ path = "src/bin/spec_helpers.rs"
 name = "td_sh"
 path = "src/lib.rs"
 
+# The confinement tests strip comments through td-source-scan. Dev-only:
+# the recipe compiles this crate with a direct rustc and no `--test`.
+[dev-dependencies]
+td-source-scan = { path = "../td-source-scan" }
+
 # td-sh is a TARGET-built program, NOT part of the control-plane engine workspace.
-# It is standalone — its own workspace root — with its own one-self-entry lock, so
-# the engine's 3-package lock gate never inspects it. Zero external dependencies
-# (pure std) — a POSIX sh is a thin layer over exactly the OS services std wraps,
-# and std is the pinned toolchain, not a cargo dep (AGENTS.md "std, not no_std").
+# It is standalone — its own workspace root — with its own lock, so the engine's
+# 3-package lock gate never inspects it. Zero external dependencies (pure std,
+# and td-source-scan for its tests alone) — a POSIX sh is a thin layer over
+# exactly the OS services std wraps, and std is the pinned toolchain, not a
+# cargo dep (AGENTS.md "std, not no_std").
 #
 # The engine root carries no `exclude` list and never needed one: an `exclude`
 # stops cargo only at THAT manifest.

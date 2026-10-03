@@ -100,14 +100,15 @@ a transfer, and nothing else; reusing a module does not transfer its
 authorization to a raw boundary of the consumer's own, which gets its
 own entry.
 
-The confinement tests of `td-init`, `td-login`, `td-svc` and `td-util`
-read their `src/` through `td-source-scan`: one comment stripper, the
+The confinement tests of `td-init`, `td-login`, `td-sh`, `td-svc` and
+`td-util` read their sources through `td-source-scan`: its comment
+stripper and whitespace squeeze, and for the four that use them, the
 tokens after each `unsafe`, the allow and block counts, module coverage,
-and the constructs that would decouple the scanned text from the compiled
-crate. It is a dev-dependency only, absent from every recipe and shipped
-binary, and forbids `unsafe` itself. A change to how it reads comments,
-literals or tokens is a change to each consumer's confinement and is
-reviewed as one.
+and the constructs that would decouple the scanned text from the
+compiled crate. It is a dev-dependency only, absent from every recipe
+and shipped binary, and forbids `unsafe` itself. A change to how it
+reads comments, literals or tokens is a change to each consumer's
+confinement and is reviewed as one.
 
 ## Roster
 
@@ -1123,10 +1124,10 @@ syscall module, that `syscall4` has exactly one call site per syscall
 and that each passes the NAMED number rather than a bare literal (the
 number reaches the kernel as an argument, so pinning the declarations
 alone does not pin what is issued), that `sys.rs` carries no block
-comment — which is what makes the line-based comment strip complete for
-the one file that may hold `unsafe`, since a `/* */` between two tokens
-changes nothing the compiler sees — and that the scan COVERS every
-module `main.rs` declares, whatever its visibility, since a module
+comment — a backstop for the shared comment strip in the one file that
+may hold `unsafe`, since a `/* */` between two tokens changes nothing the
+compiler sees — and that the scan COVERS every module `main.rs`
+declares, whatever its visibility, since a module
 missing from that list is one no other assertion can see, and that the
 pollfd length is pinned in the SHIPPED build for the reason the termios
 and winsize lengths are. `sys.rs`'s own tests then issue three of the
