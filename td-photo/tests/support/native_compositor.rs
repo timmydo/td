@@ -380,6 +380,7 @@ impl PhotoProcess {
             .env("XDG_RUNTIME_DIR", &directory.0)
             .env("TMPDIR", &directory.0)
             .env("XDG_CACHE_HOME", directory.0.join("cache"))
+            .env("XDG_CONFIG_HOME", directory.0.join("config"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
@@ -632,6 +633,74 @@ fn the_window_presents_the_roll_and_answers_the_socket_over_the_native_composito
     assert!(client.finish(), "td-photo exited with a failure");
     assert!(!socket.exists(), "the control socket was left behind");
     compositor.stop();
+}
+
+/// F12 on the seat is the window's theme chord: the frame is painted
+/// again in the next theme and the choice kept in the program's file,
+/// while the session hears nothing; `wait-idle` waits for that frame.
+/// S-F12 is the session's, and keeps no theme.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn f12_on_the_seat_paints_and_keeps_the_next_theme() {
+    let compositor_directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let client_directory = Directory::new();
+    let roll = client_directory.0.join("roll");
+    std::fs::create_dir(&roll).unwrap();
+    std::fs::write(roll.join("DSC_0001.NEF"), b"not really a nef").unwrap();
+    let client = PhotoProcess::start(
+        &client_directory,
+        &compositor.directory.join("wayland-0"),
+        &roll,
+    );
+    let file = client_directory.0.join("config/td-photo/theme");
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-photo") {
+            break place;
+        }
+        assert!(Instant::now() < deadline, "unmapped: {}", client.stderr());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    client.settle(1);
+    let state = client.request(2, &["state"]);
+    let sand = compositor.tile(&place);
+    assert_eq!(
+        sand,
+        preview(&client_directory, place.width, place.height, &roll)
+    );
+    compositor.key(88, true);
+    compositor.key(88, false);
+    // The receipt says the compositor queued the press, not that the
+    // window took it: the kept file says it did, and only then does
+    // `wait-idle` speak for the frame after it.
+    let deadline = Instant::now() + TIMEOUT;
+    while std::fs::read_to_string(&file).ok().as_deref() != Some("harbor\n") {
+        assert!(Instant::now() < deadline, "unkept: {}", client.stderr());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    client.settle(3);
+    let harbor = compositor.tile(&place);
+    assert_ne!(harbor, sand);
+    let paper = td_ui::theme::HARBOR.map(td_ui::raster::PAPER).to_be_bytes();
+    assert!(harbor
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .any(|p| p[..] == paper[1..]));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "harbor\n");
+    assert_eq!(
+        client.request(4, &["state"]),
+        state,
+        "F12 is not the session's"
+    );
+    compositor.key(42, true);
+    compositor.key(88, true);
+    compositor.key(88, false);
+    compositor.key(42, false);
+    client.settle(5);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "harbor\n");
+    assert_eq!(compositor.tile(&place), harbor);
 }
 
 /// The status row, the last line of `text`, is `full`, or, when the tile is

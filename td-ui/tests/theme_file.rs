@@ -92,3 +92,30 @@ fn what_is_not_a_short_file_naming_a_theme_is_refused_with_its_path() {
     assert!(write(&dir.join("unknown/theme"), &DUSK).is_err());
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn kept_moves_on_writes_and_reports_what_it_could_not_keep() {
+    use td_ui::theme::{HARBOR, SAND};
+    use td_ui::theme_file::Kept;
+    let mut none = Kept::default();
+    assert_eq!(none.theme(), &SAND);
+    assert_eq!(none.advance(), Ok(()), "nothing kept is no failure");
+    assert_eq!(none.theme(), &HARBOR);
+    let dir = scratch("kept-struct");
+    let path = dir.join("an-app/theme");
+    let (mut kept, notice) = Kept::load(path.clone());
+    assert_eq!((kept.theme(), notice), (&SAND, None));
+    kept.advance().unwrap();
+    assert_eq!(read(&path), Ok(Some(&HARBOR)));
+    assert_eq!(Kept::load(path.clone()).0.theme(), &HARBOR);
+    fs::write(&path, "plaid").unwrap();
+    let (kept, notice) = Kept::load(path.clone());
+    assert_eq!(kept.theme(), &SAND);
+    assert!(notice.is_some_and(|n| n.contains("names no theme")));
+    // A write that fails still moves the theme, and says why.
+    // (A regular file stands where its directory would be.)
+    let (mut kept, _) = Kept::load(path.join("theme"));
+    assert!(kept.advance().unwrap_err().starts_with("theme not kept"));
+    assert_eq!(kept.theme(), &HARBOR);
+    fs::remove_dir_all(&dir).unwrap();
+}

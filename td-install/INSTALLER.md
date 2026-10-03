@@ -84,6 +84,11 @@ never answers cannot hold the window, and td-authd serves the next installer
 once it reaps that service. Disks the window stopped waiting for are
 dropped. With a disk selected, Enter continues to the settings step
 described below and Escape there goes back to the list, keeping the drafts.
+The live window paints in the td-ui theme its file names
+(`~/.config/td-setup/theme`, which on a live medium lasts the session) and
+F12, td-ui's theme chord, moves it to the next and keeps it
+(td-ui/DESIGN.md, "Themes"); the window takes F12 before any page does, so
+it asks the service nothing, and the headless renders paint in `SAND`.
 Its library also has pure, unconnected progress and completion views. A
 live boot starts the window in the graphical session ("Live startup"); the
 end-to-end installation evidence is in place for optical media, and USB

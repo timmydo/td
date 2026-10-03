@@ -213,6 +213,13 @@ td-review, td-agent, td-dua and td-pass each keep their own. td-review's
 three status inks moved here as `SUCCESS`, `WARNING` and `ACCENT`, so a
 theme recolours its diff lines too.
 
+Newly built (increment 34): `theme_file::Kept`, a window's theme with
+the file it is kept in, which the widget window now holds and the
+programs with windows of their own hold alike: td-editor, td-setup,
+td-photo and the task manager paint their live windows in their theme
+and move it on `F12`, each keeping its own file. td-term and the
+portal's chooser stay in `SAND` (see "Themes").
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -390,7 +397,11 @@ of its own files may name each module.
   configuration and home directories. Under "Themes" below.
 - `theme_file`: `host_path`, `theme::path` from the process's
   environment; `read`, the bounded read of the theme a file names, none
-  when there is no file; and `write`, its whole replacement.
+  when there is no file; `write`, its whole replacement; and `Kept`, a
+  window's theme and its file (`default`, `SAND` keeping nothing; `load`
+  from a path and `host` from a program id, each with the notice a bad
+  file gives; `theme`; `advance`, which moves the theme and writes it,
+  returning why it was not kept).
 - `pinned_face`: `load` from `host_places`, `load_in` given places and
   `load_from` a directory, the regular style through `face_file::read`;
   `SETTING`, re-exported; and `load_or_note` and `load_in_or_note` given
@@ -2049,6 +2060,21 @@ followed. The write is synchronous on the window's thread, one small
 file per press. A user may write the file by hand; there is no other
 configuration.
 
+A program with a window of its own keeps its theme in a `theme_file::Kept`
+as the widget window does: it loads its file with `Kept::host` for its app
+id when its live window opens, paints that window's rasters `with_theme`,
+and takes `theme::CHORD` from the keyboard's own key event, before its
+dispatch and never from its control socket or replay, moving the theme
+with `Kept::advance`, reporting a failed write as it reports any notice,
+and drawing the whole frame again. td-editor, td-setup, td-photo and the
+task manager do; their previews, render checks and in-process tests paint
+in `SAND`. Two programs do not. td-term draws its own fixed terminal
+palette, not the shared one, and the programs it runs own F1 and F12, so
+it has no theme. The portal's file chooser runs as the portal's service
+account, whose home is the portal's runtime directory, and reads raw key
+codes so no keymap can remap its keys; it keeps `SAND`, which the image's
+chooser proof pins.
+
 ## Shared action button
 
 `chrome::Button` paints a bordered paper action with selected and disabled
@@ -3541,7 +3567,9 @@ regressions. Those increments extend the original sequence below.
 33. Themes: `theme`'s six palettes over the shared palette's roles,
     `Raster::with_theme`, the widget window's `F12` and the per-program
     file `theme_file` keeps, with td-review's status inks moved into the
-    palette. The programs with their own windows (td-editor, td-setup,
-    the portal's chooser, td-photo, the task manager, td-term) still
-    paint in `SAND`; each may give its raster a theme in its own
-    landing. Landed.
+    palette. Landed.
+34. Themes in the programs with their own windows: `theme_file::Kept`,
+    held by the widget window and by td-editor, td-setup, td-photo and
+    the task manager, each painting its live window in its theme and
+    moving it on `F12`; td-term and the portal's chooser stay in `SAND`.
+    Landed.

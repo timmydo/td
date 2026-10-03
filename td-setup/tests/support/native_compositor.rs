@@ -290,6 +290,7 @@ impl SetupProcess {
             .env_clear()
             .env("WAYLAND_DISPLAY", display)
             .env("XDG_RUNTIME_DIR", &directory.0)
+            .env("XDG_CONFIG_HOME", directory.0.join("config"))
             .env("TMPDIR", &directory.0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -392,6 +393,73 @@ fn installer_navigation_presents_over_the_native_compositor() {
 
     drop(client);
     compositor.stop();
+}
+
+/// F12 on the seat is the window's theme chord: welcome is painted again
+/// in the next theme, pixel for pixel, the choice kept in the program's
+/// file, and no page moves; S-F12 keeps no theme.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn f12_on_the_seat_paints_welcome_in_the_next_theme_and_keeps_it() {
+    let compositor_directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let client_directory = Directory::new();
+    let client = SetupProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let file = client_directory.0.join("config/td-setup/theme");
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-setup") {
+            break place;
+        }
+        assert!(Instant::now() < deadline, "unmapped: {}", client.stderr());
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let sand = td_setup::preview(place.width, place.height, 1).unwrap();
+    assert_frame(&compositor, &place, &sand, &client, "welcome");
+    let mut action = 0;
+    let mut key = |compositor: &mut Compositor, code: u32, state: &str| {
+        action += 1;
+        let request = format!("key {} {action} {code} {state}", compositor.session);
+        let reply = compositor.request(&request, 1024);
+        assert_eq!(
+            reply,
+            format!(
+                "ok\ntd-action-v1 session={} action={action}\n",
+                compositor.session
+            )
+            .as_bytes(),
+            "key {code} {state}"
+        );
+    };
+    key(&mut compositor, 88, "down");
+    key(&mut compositor, 88, "up");
+    let harbor = welcome_pixels(place.width, place.height, &td_ui::theme::HARBOR);
+    assert_ne!(harbor, sand);
+    assert_frame(&compositor, &place, &harbor, &client, "welcome in harbor");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "harbor\n");
+    key(&mut compositor, 42, "down");
+    key(&mut compositor, 88, "down");
+    key(&mut compositor, 88, "up");
+    key(&mut compositor, 42, "up");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "harbor\n");
+    assert_frame(&compositor, &place, &harbor, &client, "still harbor");
+    drop(client);
+    compositor.stop();
+}
+
+fn welcome_pixels(width: usize, height: usize, theme: &'static td_ui::theme::Theme) -> Vec<u8> {
+    use td_ui::raster::{Raster, Scale, Surface};
+    let surface = Surface::new(width, height, Scale::new(1).unwrap()).unwrap();
+    let page = td_setup::welcome::Welcome::new(surface).unwrap();
+    let font = td_ui::font::pinned().unwrap();
+    let mut pixels = vec![0; width * height * 4];
+    Raster::new(&mut pixels, &font, surface, width * 4)
+        .unwrap()
+        .with_theme(theme)
+        .paint(&page, surface.bounds())
+        .unwrap();
+    pixels
 }
 
 fn unavailable_pixels(width: usize, height: usize) -> Vec<u8> {

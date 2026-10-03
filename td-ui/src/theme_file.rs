@@ -1,6 +1,8 @@
-//! The file a widget window keeps its program's theme in: `theme::path`
-//! from this process's environment, the bounded read of the theme it
-//! names, and its whole replacement when the chord moves the theme on.
+//! The file a program keeps its theme in: `theme::path` from this
+//! process's environment, the bounded read of the theme it names, its
+//! whole replacement when the chord moves the theme on, and `Kept`, a
+//! window's theme with the file it is kept in, which the widget window
+//! and the programs with windows of their own hold alike.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
@@ -12,6 +14,60 @@ use crate::theme::{self, Theme, MAX_FILE_BYTES};
 /// Linux's `O_NONBLOCK` on x86-64 and aarch64: opening a FIFO for reading
 /// returns at once rather than waiting for a writer.
 const O_NONBLOCK: i32 = 0o4000;
+
+/// A window's theme and the file it is kept in. `default` is `SAND`
+/// with no file, which keeps nothing.
+#[derive(Clone, Debug, Default)]
+pub struct Kept {
+    theme: Option<&'static Theme>,
+    path: Option<PathBuf>,
+}
+
+impl Kept {
+    /// The theme the file at `path` names, kept there from now on. No
+    /// file is `SAND`; a file that cannot be read or names no theme is
+    /// `SAND` too, with the reason to report, and the next choice
+    /// replaces it.
+    pub fn load(path: PathBuf) -> (Self, Option<String>) {
+        let (theme, notice) = match read(&path) {
+            Ok(theme) => (theme, None),
+            Err(why) => (None, Some(format!("theme: {why}"))),
+        };
+        (
+            Self {
+                theme,
+                path: Some(path),
+            },
+            notice,
+        )
+    }
+
+    /// `load` from program `app_id`'s file under this process's
+    /// configuration home, or nothing kept when there is no such path.
+    pub fn host(app_id: &str) -> (Self, Option<String>) {
+        match host_path(app_id) {
+            Some(path) => Self::load(path),
+            None => (Self::default(), None),
+        }
+    }
+
+    /// The theme to paint in: `SAND` until a file or a press names another.
+    pub fn theme(&self) -> &'static Theme {
+        self.theme.unwrap_or(&theme::SAND)
+    }
+
+    /// Moves to the next theme and writes it to the file, if any. The
+    /// theme moves even when the write fails, whose reason is returned
+    /// to report.
+    pub fn advance(&mut self) -> Result<(), String> {
+        let next = self.theme().next();
+        self.theme = Some(next);
+        match &self.path {
+            Some(path) => write(path, next).map_err(|why| format!("theme not kept: {why}")),
+            None => Ok(()),
+        }
+    }
+}
 
 /// `theme::path` for `app_id` from this process's environment.
 pub fn host_path(app_id: &str) -> Option<PathBuf> {

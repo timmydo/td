@@ -975,6 +975,15 @@ The library is folders of originals; there is no database.
   opened, with the window between that check and the open the one above; a
   directory that cannot be resolved or read is reported on stderr and the
   built-in set is what there is.
+- **Theme**: `$XDG_CONFIG_HOME/td-photo/theme` (`~/.config/td-photo/theme`
+  when that variable is not absolute), the td-ui theme the live window
+  paints in, read when the window opens and replaced when F12, td-ui's
+  theme chord, moves it on; td-ui's `theme_file` reads and writes it
+  (td-ui/DESIGN.md, "Themes"), and a failure is said on stderr. The
+  window takes F12 from the keyboard alone, before the session, so
+  neither the session nor the control socket sees it. Photo pixels and
+  the placeholder are content and keep their colours; `--preview` paints
+  in `SAND`.
 
 ## Decoding
 
@@ -1958,19 +1967,20 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
 
 ## Test contract
 
-`tests/confinement.rs` pins the source inventory, that the crate root forbids
-`unsafe`, that the manifest declares td-ui as its one dependency, the native
-case and the trusted test root (the window binds its control socket under the
-harness's directory in `/tmp`, and td-ui's socket refuses an ancestor the gate's
-rootless namespace shows as owned by no one, so the gate's cargo-test runs take
-the builder's caller-owned sticky root, as td-editor's do), no build script and
-no `include!`, that the pure modules name no
-`std::fs`, `std::env`, `std::time`, `std::net` or `std::process` path and the
-window no file, which files name which toolkit modules, that photo pixels reach
-a frame through `ui::blit` alone and the verb and the window share one thumbnail
-rule, that export develops in bands into the encoder through a temporary of
-its own name and the encoder spreads its transform through `develop`'s
-bands, and the budgets by value.
+`tests/confinement.rs` pins the source inventory, that the crate root
+forbids `unsafe`, that the manifest declares td-ui as its one dependency,
+the native case and the trusted test root (the window binds its control
+socket under the harness's directory in `/tmp`, and td-ui's socket refuses
+an ancestor the gate's rootless namespace shows as owned by no one, so the
+gate's cargo-test runs take the builder's caller-owned sticky root, as
+td-editor's do), no build script and no `include!`, that the pure modules
+name no `std::fs`, `std::env`, `std::time`, `std::net` or `std::process`
+path and the window no file of its own (the theme's is td-ui's
+`theme_file`), which files name which toolkit modules, that photo pixels
+reach a frame through `ui::blit` alone and the verb and the window share
+one thumbnail rule, that export develops in bands into the encoder through
+a temporary of its own name and the encoder spreads its transform through
+`develop`'s bands, and the budgets by value.
 
 `tests/nef.rs` carries a synthetic NEF writer and a Nikon Huffman encoder
 for all six trees, and pins: round trips of random and edge-valued frames
@@ -2457,7 +2467,13 @@ an export asked for and quit at once is written, numbered, by the time the
 process has exited; a headless case (no compositor) holds `--preview
 --develop` to a develop box that carries a developed image and changes with the
 sidecar's exposure, and `--preview --single` to the single view's box the
-same way (`--zoom` refused there, and the two flags together).
+same way (`--zoom` refused there, and the two flags together). A third
+native case presses F12 on the seat: once the theme file under the
+process's private `XDG_CONFIG_HOME` reads `harbor`, `wait-idle` answers
+for a tile no longer `--preview`'s sand one and holding harbor's paper,
+the state is unchanged, and S-F12 from the seat leaves the file and the
+tile alone. Every native case's process has that private configuration
+home.
 
 The builder discovers the crate by existing; its gate runs `cargo test` and
 all-target Clippy.

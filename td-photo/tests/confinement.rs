@@ -257,7 +257,8 @@ fn pure_modules_reach_no_file_environment_clock_network_or_process() {
 /// surface): the controller the pure seam, raster, chrome and control;
 /// `main` the seam, the replay runner, the raster's surface and control;
 /// `window` the client, the wire, the display, the font, the pointer, the
-/// socket and its worker, the seam, the raster and control. A braced group
+/// socket and its worker, the seam, the raster, control, and the theme
+/// with the file it is kept in. A braced group
 /// after the crate's path would read as no name, so the scanner refuses
 /// one: name one item per line.
 #[test]
@@ -312,6 +313,8 @@ fn the_toolkit_is_named_only_where_the_design_says() {
             "pinned_face",
             "pointer",
             "raster",
+            "theme",
+            "theme_file",
             "typeface",
             "wayland",
             "wire",

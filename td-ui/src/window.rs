@@ -21,8 +21,8 @@ pub use crate::driven::PointerPhase;
 use crate::font::Font;
 use crate::pointer::{self, Wheel};
 use crate::raster::{Raster, Scale, Surface};
-use crate::theme::{self, Theme, SAND};
-use crate::theme_file;
+use crate::theme::{self, Theme};
+use crate::theme_file::Kept;
 use crate::typeface::Typeface;
 use crate::wire::Message;
 use std::os::unix::net::UnixStream;
@@ -357,10 +357,9 @@ pub struct Window<'h, H: Handler> {
     /// The outline face glyphs are executed through, when the window was
     /// given one; else the bitmap face draws them.
     typeface: Option<Typeface>,
-    /// The theme every frame is painted in.
-    theme: &'static Theme,
-    /// Where the theme is kept, when the window was given a file.
-    theme_file: Option<PathBuf>,
+    /// The theme every frame is painted in, and the file it is kept in
+    /// when the window was given one.
+    theme: Kept,
     clock: u64,
     surface: Surface,
     /// The configured extent; a refused one is put back to the surface's.
@@ -390,8 +389,7 @@ impl<'h, H: Handler> Window<'h, H> {
             handler,
             font: crate::font::pinned()?,
             typeface: None,
-            theme: &SAND,
-            theme_file: None,
+            theme: Kept::default(),
             clock: 0,
             surface,
             size: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
@@ -418,16 +416,16 @@ impl<'h, H: Handler> Window<'h, H> {
     /// read or names no theme is the default too, with a notice, and the
     /// chord's next choice replaces it.
     pub fn with_theme_file(mut self, path: PathBuf) -> Self {
-        match theme_file::read(&path) {
-            Ok(theme) => self.theme = theme.unwrap_or(&SAND),
-            Err(why) => self.handler.notice(&format!("theme: {why}")),
+        let (theme, notice) = Kept::load(path);
+        if let Some(notice) = notice {
+            self.handler.notice(&notice);
         }
-        self.theme_file = Some(path);
+        self.theme = theme;
         self
     }
 
     pub fn theme(&self) -> &'static Theme {
-        self.theme
+        self.theme.theme()
     }
 
     pub fn handler(&self) -> &H {
@@ -557,12 +555,9 @@ impl<'h, H: Handler> Window<'h, H> {
     }
 
     fn next_theme(&mut self) {
-        self.theme = self.theme.next();
         self.dirty = true;
-        if let Some(path) = &self.theme_file {
-            if let Err(why) = theme_file::write(path, self.theme) {
-                self.handler.notice(&format!("theme not kept: {why}"));
-            }
+        if let Err(why) = self.theme.advance() {
+            self.handler.notice(&why);
         }
     }
 
@@ -938,7 +933,7 @@ impl<H: Handler> App for Window<'_, H> {
             let mut raster = Raster::new(pixels, font, surface, surface.width * 4)
                 .map_err(|why| why.to_string())?
                 .with_typeface(typeface.as_mut())
-                .with_theme(theme);
+                .with_theme(theme.theme());
             handler.paint(&mut raster, surface)
         })?;
         if presented {
@@ -959,7 +954,7 @@ pub fn run<H: Handler>(
     temporary: PathBuf,
     typeface: Option<Typeface>,
 ) -> Result<()> {
-    let theme_path = theme_file::host_path(handler.app_id());
+    let theme_path = crate::theme_file::host_path(handler.app_id());
     let mut window = Window::new(handler, stream, temporary)?;
     if let Some(typeface) = typeface {
         window = window.with_typeface(typeface);

@@ -15,6 +15,7 @@ use td_install::installation_plan::{Destination, Plan, Settings};
 use td_ui::client::{run, App, Client, Handled, KeyboardEvent, Tag};
 use td_ui::font::Font;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Scale, Surface, CHROME};
+use td_ui::theme_file::Kept;
 use td_ui::wayland::{connect, endpoint};
 use td_ui::wire::Message;
 
@@ -51,6 +52,8 @@ struct Window {
     font: Font,
     /// The outline face the live window draws its text in.
     typeface: Option<td_ui::typeface::Typeface>,
+    /// The theme the live window paints in and the file it is kept in.
+    theme: Kept,
     size: (usize, usize),
     dirty: bool,
     front: Front,
@@ -721,6 +724,7 @@ impl Window {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
             typeface: None,
+            theme: Kept::default(),
             size: DEFAULT_SIZE,
             dirty: true,
             front: Front::new(),
@@ -804,7 +808,15 @@ impl Window {
             // Only translated keyboard presses navigate the live pages.
             Handled::Keyboard(event) => {
                 if let Some(chord) = keyboard_chord(event)? {
-                    self.front.key(&chord, Path::new(SOCKET));
+                    // The toolkit's theme chord is the window's, never a
+                    // page's, and asks the service for nothing.
+                    if chord == td_ui::theme::CHORD {
+                        if let Err(why) = self.theme.advance() {
+                            let _ = writeln!(std::io::stderr(), "td-setup: {why}");
+                        }
+                    } else {
+                        self.front.key(&chord, Path::new(SOCKET));
+                    }
                     self.dirty = true;
                 }
                 Ok(())
@@ -888,6 +900,7 @@ impl Window {
             client,
             font,
             typeface,
+            theme,
             ..
         } = self;
         // Whether the frame shows the page, not the too-small ground.
@@ -895,7 +908,8 @@ impl Window {
         let presented = client.present(width, height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, surface, width * 4)
                 .map_err(error)?
-                .with_typeface(typeface.as_mut());
+                .with_typeface(typeface.as_mut())
+                .with_theme(theme.theme());
             let painted = match (&outcome, &settings, &review, &destination) {
                 (Some(view), _, _, _) => view
                     .as_ref()
@@ -1005,6 +1019,11 @@ pub fn run_window() -> std::io::Result<()> {
             "td-setup",
             std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
         );
+        let (theme, notice) = Kept::host("td-setup");
+        window.theme = theme;
+        if let Some(notice) = notice {
+            let _ = writeln!(std::io::stderr(), "td-setup: {notice}");
+        }
         run(&mut window)
     };
     work().map_err(std::io::Error::other)

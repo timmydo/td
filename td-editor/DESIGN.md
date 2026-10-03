@@ -1147,14 +1147,20 @@ tabs are td-ui's `chrome::Strip` and the status row its `chrome::Status`
 (`td-ui/DESIGN.md`): the tabs with their close mark and the active one kept
 in view, and the status line's whole-cell truncation. Tiny
 surfaces may have no document cells; the status paints last and wins any
-chrome overlap. The default palette is warm
-#eee8dc paper, #48453f charcoal ink, #e1dbcf chrome, #b5ada0 borders,
-#536b73 focused selection with paper-colored ink, and #c8c4bb unfocused
-selection with ordinary ink. It avoids white backgrounds and near-black
-text, including in the menu, tabs and status bar. These are fixed defaults,
-td-ui's `raster` palette, not an OS theme lookup or a user-configurable
-theme system. The caret is one logical pixel wide; an upstream soft-wrap
-caret remains inside the row's right edge.
+chrome overlap. The default palette is warm #eee8dc paper, #48453f
+charcoal ink, #e1dbcf chrome, #b5ada0 borders, #536b73 focused selection
+with paper-colored ink, and #c8c4bb unfocused selection with ordinary ink.
+It avoids white backgrounds and near-black text, including in the menu,
+tabs and status bar. These are td-ui's `raster` palette, `SAND`, the
+default of td-ui's fixed themes, not an OS theme lookup or a user-defined
+theme. A live window paints in the theme its file names
+(`~/.config/td-editor/theme`, td-ui/DESIGN.md "Themes") and F12, td-ui's
+theme chord, moves it to the next and keeps it there: the window takes F12
+from the keyboard before the editor's own chords, so neither the editor
+nor the control socket's keys ever see it, and a modified F12 is the
+editor's. Tests, `--preview` and the window preview's in-process cases
+paint in `SAND`. The caret is one logical pixel wide; an upstream
+soft-wrap caret remains inside the row's right edge.
 
 Every glyph draw carries a `GlyphStyle`: ink, the already-painted background
 and `Regular` or `Medium` weight. Scene text uses Medium. Regular paints
@@ -1328,10 +1334,11 @@ Ordinary no-option/filename invocation uses this same experimental window;
 GPU integration remains a separate milestone, and of the td-mail jail
 integration only the in-jail acceptance test does.
 
-The file window reuses the preview's transport, input dispatcher and bitmap
-renderer, with the warm palette and medium weight. It requires a v5+ seat
-advertisement (unlike the presentation-only scratch exception); absent or
-unsupported input capability/map still produces a retained-text warning.
+The file window reuses the preview's transport, input dispatcher and
+bitmap renderer, with the window's theme and medium weight. It requires a
+v5+ seat advertisement (unlike the presentation-only scratch exception);
+absent or unsupported input capability/map still produces a retained-text
+warning.
 Its title says experimental file window, not NO SAVE. Filename labels are
 bounded escaped leaf names; arbitrary Unix bytes passed by CLI are preserved,
 not reconstructed from lossy labels. The original two-tab scratch fixture

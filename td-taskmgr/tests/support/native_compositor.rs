@@ -357,6 +357,7 @@ impl TaskProcess {
             .env_clear()
             .env("WAYLAND_DISPLAY", display)
             .env("XDG_RUNTIME_DIR", &directory.0)
+            .env("XDG_CONFIG_HOME", directory.0.join("config"))
             .env("TMPDIR", &directory.0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -471,6 +472,66 @@ pub(super) fn chord(client: &TaskProcess, key: &str) {
 fn tap(compositor: &mut Compositor, key: u32) {
     compositor.key(key, true);
     compositor.key(key, false);
+}
+
+/// F12 on the seat is the window's theme chord: it moves the theme,
+/// keeps it in the program's file and paints the frame again in it, the
+/// state hearing nothing; S-F12 is the state's, and keeps no theme.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn physical_f12_moves_keeps_and_paints_the_theme() {
+    let server_directory = Directory::new();
+    let mut compositor = Compositor::start(&server_directory);
+    let client_directory = Directory::new();
+    let client = TaskProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let file = client_directory.0.join("config/td-taskmgr/theme");
+    let deadline = Instant::now() + TIMEOUT;
+    let place = loop {
+        if let Some(place) = compositor.placement("td-taskmgr") {
+            break place;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mapping deadline: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let before = wait_state(&client, |s| counter(s, "presentations") > 0);
+    let chrome = td_ui::theme::HARBOR
+        .map(td_ui::raster::CHROME)
+        .to_be_bytes();
+    tap(&mut compositor, 88);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let tile = compositor.tile(&place);
+        if std::fs::read_to_string(&file).is_ok_and(|text| text == "harbor\n")
+            && tile.as_chunks::<3>().0.iter().any(|p| p[..] == chrome[1..])
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "theme deadline: {}",
+            client.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let after = state(&client);
+    assert!(counter(&after, "presentations") > counter(&before, "presentations"));
+    // The live counters move with the sampling; where the user is does not.
+    for field in ["tab", "focus", "query", "live", "actions", "detail"] {
+        assert_eq!(
+            after.get(field),
+            before.get(field),
+            "{field}: F12 is not the state's"
+        );
+    }
+    compositor.key(42, true);
+    tap(&mut compositor, 88);
+    compositor.key(42, false);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "harbor\n");
 }
 
 #[test]

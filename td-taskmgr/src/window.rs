@@ -28,6 +28,10 @@ struct Window {
     font: Font,
     /// The outline face the live window draws its text in.
     typeface: Option<td_ui::typeface::Typeface>,
+    /// The theme the live window paints in and the file it is kept in.
+    theme: td_ui::theme_file::Kept,
+    /// The theme changed since the last frame, which the state cannot see.
+    repaint: bool,
     state: State,
     worker: Option<Worker>,
     actions: Option<td_taskmgr::action_worker::Worker>,
@@ -69,6 +73,8 @@ impl Window {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
             typeface: None,
+            theme: td_ui::theme_file::Kept::default(),
+            repaint: false,
             state,
             worker,
             actions,
@@ -219,6 +225,15 @@ impl App for Window {
             }
             Handled::CloseRequested => self.client.close(),
             Handled::Keyboard(event) => match event {
+                // The toolkit's theme chord is the window's, taken from the
+                // keyboard alone: neither the state nor the control socket
+                // hears it.
+                KeyboardEvent::Key { stroke, .. } if stroke.chord == td_ui::theme::CHORD => {
+                    if let Err(why) = self.theme.advance() {
+                        let _ = writeln!(io::stderr().lock(), "td-taskmgr: {why}");
+                    }
+                    self.repaint = true;
+                }
                 KeyboardEvent::Key { key, stroke, .. } => {
                     let outcome = self.key(&stroke.chord, false)?;
                     if stroke.repeat
@@ -328,24 +343,27 @@ impl App for Window {
         Ok(())
     }
     fn draw(&mut self) -> Result<()> {
-        if !self.state.dirty() || !self.client.can_present() {
+        if !(self.state.dirty() || self.repaint) || !self.client.can_present() {
             return Ok(());
         }
         let surface = self.state.surface();
         let state = &self.state;
         let font = &self.font;
         let typeface = &mut self.typeface;
+        let theme = self.theme.theme();
         if self
             .client
             .present(surface.width, surface.height, &mut |pixels| {
                 let mut raster = Raster::new(pixels, font, surface, surface.width * 4)
                     .map_err(error)?
-                    .with_typeface(typeface.as_mut());
+                    .with_typeface(typeface.as_mut())
+                    .with_theme(theme);
                 state.emit(surface.bounds(), &mut |draw| raster.draw(draw));
                 Ok(())
             })?
         {
             self.state.painted();
+            self.repaint = false;
             self.presentations = self.presentations.saturating_add(1);
         }
         Ok(())
@@ -372,6 +390,11 @@ pub fn open(control_path: Option<PathBuf>) -> io::Result<()> {
             "td-taskmgr",
             std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
         );
+        let (theme, notice) = td_ui::theme_file::Kept::host("td-taskmgr");
+        window.theme = theme;
+        if let Some(notice) = notice {
+            let _ = writeln!(io::stderr().lock(), "td-taskmgr: {notice}");
+        }
         td_ui::client::run(&mut window)
     };
     work().map_err(io::Error::other)

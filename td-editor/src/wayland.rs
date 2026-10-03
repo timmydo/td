@@ -68,6 +68,13 @@ struct Window {
     /// The outline face a live window draws its text in; `None` draws the
     /// bitmap face, as every test and preview does.
     typeface: Option<td_ui::typeface::Typeface>,
+    /// The theme a live window paints in and the file it is kept in;
+    /// `SAND` with no file, as every test and preview paints.
+    theme: td_ui::theme_file::Kept,
+    /// Why the theme file was not read, said with the keymap's readiness
+    /// or its failure, since the keymap's own notices replace any said
+    /// before them; a window that never hears its keymap never says it.
+    theme_notice: Option<String>,
     labels: Vec<(td_ui::editor_model::TabId, &'static str)>,
     pointer: Pointer,
     control_pointer: Option<td_ui::editor_model::RevisionPoint>,
@@ -307,6 +314,8 @@ impl Window {
             ui,
             font: crate::font::pinned()?,
             typeface: None,
+            theme: td_ui::theme_file::Kept::default(),
+            theme_notice: None,
             labels: vec![(first, "Scratch (no save)"), (second, "Second tab")],
             pointer: Pointer::default(),
             control_pointer: None,
@@ -838,7 +847,10 @@ impl Window {
                              Tap and release Shift if needed.",
                         );
                     }
-                    Err(detail) => self.notify(format!("Keyboard disabled: {detail}")),
+                    Err(detail) => match self.theme_notice.take() {
+                        Some(theme) => self.notify(format!("Keyboard disabled: {detail} {theme}")),
+                        None => self.notify(format!("Keyboard disabled: {detail}")),
+                    },
                 }
                 self.frames.invalidate(true);
             }
@@ -855,16 +867,32 @@ impl Window {
                 self.ui.dispatch(Event::Focus(false)).map_err(error)?;
                 self.frames.invalidate(true);
             }
-            KeyboardEvent::Ready => self.notify(if self.files.is_some() {
-                "Keymap ready. Experimental file window."
-            } else {
-                "Keymap ready. Scratch only: no Save."
-            }),
+            KeyboardEvent::Ready => {
+                let ready = if self.files.is_some() {
+                    "Keymap ready. Experimental file window."
+                } else {
+                    "Keymap ready. Scratch only: no Save."
+                };
+                match self.theme_notice.take() {
+                    Some(theme) => self.notify(format!("{ready} {theme}")),
+                    None => self.notify(ready),
+                }
+            }
             KeyboardEvent::Key {
                 serial,
                 key,
                 stroke,
             } => {
+                // The toolkit's theme chord is the window's, taken from the
+                // keyboard alone: neither the editor nor the control
+                // socket's keys reach it.
+                if stroke.chord == td_ui::theme::CHORD {
+                    if let Err(why) = self.theme.advance() {
+                        self.notify(why);
+                    }
+                    self.frames.invalidate(true);
+                    return Ok(());
+                }
                 self.activation_serial = Some(serial);
                 if self.chord(&stroke.chord, false)? && stroke.repeat {
                     self.client.arm(key, self.clock);
@@ -2949,6 +2977,7 @@ impl Window {
             ui,
             font,
             typeface,
+            theme,
             spelling,
             menu,
             ..
@@ -2957,7 +2986,8 @@ impl Window {
         let presented = client.present(width, height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, geometry.surface(), width * 4)
                 .map_err(error)?
-                .with_typeface(typeface.as_mut());
+                .with_typeface(typeface.as_mut())
+                .with_theme(theme.theme());
             raster
                 .paint(
                     &ui.scene(&labels)
@@ -5109,6 +5139,7 @@ pub fn preview_with_profile(profile: Profile) -> io::Result<()> {
             "td-editor",
             std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
         );
+        (window.theme, window.theme_notice) = td_ui::theme_file::Kept::host("td-editor");
         window.ui.dispatch(Event::Profile(profile)).map_err(error)?;
         run(&mut window)
     };
@@ -5179,6 +5210,7 @@ pub fn file_window(options: FileWindowOptions) -> io::Result<()> {
             "td-editor",
             std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
         );
+        (window.theme, window.theme_notice) = td_ui::theme_file::Kept::host("td-editor");
         window.ui = ui;
         window.labels.clear();
         let dictionary_notice = spelling.dictionary_entries().map_or_else(
@@ -5824,6 +5856,46 @@ mod tests {
         focus(&mut w, keyboard);
         w.notice = None;
         (w, peer, keyboard)
+    }
+
+    /// F12 is the toolkit's theme chord: the window moves its theme and
+    /// paints the whole frame again, the editor never hearing it; a
+    /// modified F12 is the editor's, as any other chord.
+    #[test]
+    fn f12_moves_the_window_theme_and_reaches_no_editor_key() {
+        let (mut w, _peer, keyboard) = find_fixture(Profile::Windows);
+        let before = w.ui.editor().document(1).unwrap().selection().range();
+        let input = w.frames.input_generation().unwrap();
+        key(&mut w, keyboard, 88);
+        assert_eq!(w.theme.theme(), &td_ui::theme::HARBOR);
+        // The whole frame is asked for again, as any input asks it.
+        assert!(w.frames.input_generation().unwrap() > input);
+        assert!(w.search.is_none() && w.notice.is_none());
+        assert_eq!(
+            w.ui.editor().document(1).unwrap().selection().range(),
+            before
+        );
+        w.event(message(keyboard, 4, &[0, 1, 0, 0, 0])).unwrap();
+        key(&mut w, keyboard, 88);
+        assert_eq!(w.theme.theme(), &td_ui::theme::HARBOR, "S-F12 is no theme");
+        w.event(message(keyboard, 4, &[0, 0, 0, 0, 0])).unwrap();
+        key(&mut w, keyboard, 88);
+        assert_eq!(w.theme.theme(), &td_ui::theme::MOSS);
+    }
+
+    /// A theme file that could not be read is said with the keymap's
+    /// readiness, which replaces whatever was said before it, and only
+    /// once.
+    #[test]
+    fn a_theme_notice_survives_the_keymaps_own_notices() {
+        let (mut w, peer, keyboard) = seat_fixture();
+        w.theme_notice = Some("theme: /c/td-editor/theme: names no theme".into());
+        send_map(&mut w, &peer, keyboard, &map_file());
+        focus(&mut w, keyboard);
+        let notice = w.notice.clone().unwrap_or_default();
+        assert!(notice.starts_with("Keymap ready."), "{notice}");
+        assert!(notice.ends_with("names no theme"), "{notice}");
+        assert!(w.theme_notice.is_none());
     }
 
     #[test]

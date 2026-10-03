@@ -5,8 +5,9 @@
 //! them, serves the seam's vocabulary on `--control-socket` and holds
 //! `wait-idle` until nothing is outstanding and the frame the compositor
 //! acknowledged is the model's; `--preview` is the same frame without a
-//! display. Nothing here opens a file: the thumbnail rule and its cache are
-//! `main`'s, called from the pool's threads.
+//! display. Nothing here opens a file but the theme's, through td-ui's
+//! `theme_file`: the thumbnail rule and its cache are `main`'s, called
+//! from the pool's threads.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -28,6 +29,7 @@ use td_ui::font::Font;
 use td_ui::keyboard::Held;
 use td_ui::pointer::{self, Wheel};
 use td_ui::raster::{Raster, Scale, Surface, MAX_FRAME_BYTES};
+use td_ui::theme_file::Kept;
 use td_ui::wayland::{connect, endpoint, Endpoint};
 use td_ui::wire::Message;
 
@@ -104,6 +106,11 @@ pub fn open(rest: &[OsString]) -> Result<()> {
         "td-photo",
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
     );
+    let (theme, notice) = Kept::host("td-photo");
+    window.theme = theme;
+    if let Some(notice) = notice {
+        note(&notice);
+    }
     let result = run(&mut window);
     window.finish(result)
 }
@@ -1451,6 +1458,8 @@ struct Window {
     font: Font,
     /// The outline face the live window draws its text in.
     typeface: Option<td_ui::typeface::Typeface>,
+    /// The theme the live window paints in and the file it is kept in.
+    theme: Kept,
     session: Session,
     pool: Pool,
     /// The roll and the scale the held thumbnails are for: another roll's,
@@ -1548,6 +1557,7 @@ impl Window {
             client: Client::new(stream, temporary)?,
             font: td_ui::font::pinned()?,
             typeface: None,
+            theme: Kept::default(),
             session,
             pool: Pool::start(threads())?,
             held: None,
@@ -1661,6 +1671,19 @@ impl Window {
     fn keyboard(&mut self, event: KeyboardEvent) {
         match event {
             KeyboardEvent::Key { key, stroke, .. } => {
+                // The toolkit's theme chord is the window's, taken from the
+                // keyboard alone: neither the session nor the control
+                // socket hears it. The frame is drawn again in the theme.
+                if stroke.chord == td_ui::theme::CHORD {
+                    if let Err(why) = self.theme.advance() {
+                        note(&why);
+                    }
+                    // Neither drawn nor shown in the theme yet, so a
+                    // `wait-idle` waits for the frame that is.
+                    self.submitted = None;
+                    self.presented = None;
+                    return;
+                }
                 let outcome = self.input(Input::Key {
                     chord: &stroke.chord,
                 });
@@ -2460,12 +2483,14 @@ impl Window {
             client,
             font,
             typeface,
+            theme,
             session,
             thumbs,
             developed,
             clock,
             ..
         } = self;
+        let theme = theme.theme();
         let ui = &session.ui;
         let area = ui.layout().area;
         let visible = ui.visible();
@@ -2490,6 +2515,7 @@ impl Window {
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
                 .with_typeface(typeface.as_mut())
+                .with_theme(theme)
                 .paint(&scene, surface.bounds())
                 .map_err(error)?;
             for (index, r#box) in &visible {
@@ -2522,6 +2548,7 @@ impl Window {
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
                 .with_typeface(typeface.as_mut())
+                .with_theme(theme)
                 .paint(&badges, area)
                 .map_err(error)?;
             // The crop marquee over the develop image, as the badges are
@@ -2529,6 +2556,7 @@ impl Window {
             Raster::new(pixels, font, surface, stride)
                 .map_err(error)?
                 .with_typeface(typeface.as_mut())
+                .with_theme(theme)
                 .paint(&marquee, area)
                 .map_err(error)
         })?;

@@ -1,7 +1,7 @@
 //! The colour themes a raster paints in: six fixed palettes over the roles
 //! the shared palette names (`raster`'s constants and status inks, and the
 //! panel's selected row and disabled ink), each giving every one of those
-//! colours its own; the chord a widget window cycles them with; and the
+//! colours its own; the chord a window cycles them with; and the
 //! path and text of the file a program's choice is kept in. A colour that
 //! is not one of the palette's passes through, so a document's or a
 //! chart's own colours are left as they are. `theme_file` reads and writes
@@ -37,7 +37,7 @@ pub const KEYS: [u32; ROLES] = [
     ACCENT,
 ];
 
-/// The chord that moves a widget window to the next theme. No consumer
+/// The chord that moves a window to the next theme. No consumer
 /// and no editor key profile binds it, so the window keeps it; the editor
 /// core's `F3` and `F7` and the consumers' `F2` and `F6` stay theirs.
 pub const CHORD: &str = "F12";

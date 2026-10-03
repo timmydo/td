@@ -22,12 +22,15 @@ section records the completed delivery and the scope of its evidence.
 Version 1 is one self-contained Rust executable for Linux x86-64
 Wayland, on td and other distributions, including Guix. It uses std and
 the sibling td-ui crate, with a standalone Cargo.lock and no registry or
-git crates. The bitmap font and toolkit are compiled in. Its one runtime
-asset is optional: the live window reads td-ui's pinned outline face
+git crates. The bitmap font and toolkit are compiled in. Its runtime
+assets are optional. The live window reads td-ui's pinned outline face
 from `/etc/fonts/jetbrains-mono-nerd` or, on a distribution that does
 not ship it, from the user's or the host's font directories (where
 `./install-fonts` puts it), and where none has it or
-`TD_UI_FACE=bitmap`, draws with the compiled font. It requires no td
+`TD_UI_FACE=bitmap`, draws with the compiled font; and it reads, and on
+F12 replaces, the one-line theme file td-ui keeps for it,
+`td-taskmgr/theme` under the configuration home, painting in `SAND`
+without one. It requires no td
 daemon, systemd, external commands, libwayland, shell, or fixed store
 prefix. A host build uses the host Rust toolchain and declared linker; a
 shipped td build follows the source-built target graph. Self-contained
@@ -46,7 +49,8 @@ font trees. The installed executable does not need that checkout. The
 application reads WAYLAND_SOCKET, WAYLAND_DISPLAY and XDG_RUNTIME_DIR and
 passes their values to td-ui's endpoint resolver, and TD_UI_FACE and passes
 its value to td-ui's `pinned_face`; td-ui's face search itself reads
-HOME, XDG_DATA_HOME and XDG_DATA_DIRS, to find the outline face.
+HOME, XDG_DATA_HOME and XDG_DATA_DIRS, to find the outline face, and
+XDG_CONFIG_HOME and HOME, to find the theme file.
 The user runs the program
 as their desktop identity. Missing display support produces a useful startup
 diagnostic; unavailable metrics leave a usable window with field-level
@@ -67,7 +71,13 @@ affinity editing, persistent recordings, and a profiler integration.
 ## Window and navigation
 
 The window title is Task Manager and the application ID is td-taskmgr.
-It uses td-ui's palette, font, input handling, and software draw stream.
+It uses td-ui's palette, font, input handling, and software draw stream,
+the live window in its theme: `~/.config/td-taskmgr/theme` names it and
+F12, td-ui's theme chord, moves to the next and keeps it
+(td-ui/DESIGN.md, "Themes"). The window takes F12 from the keyboard
+alone, so the state and the control socket never see it; the plots'
+series colours are data and keep their values in every theme.
+`--preview` paints in `SAND`.
 
 ```text
 +------------------------------------------------------------------+
