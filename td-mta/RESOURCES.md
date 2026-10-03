@@ -817,6 +817,13 @@ copied token is retained. Allocation intervals cover long UTF-8 values,
 escapes, malformed input and work refusal for both kinds. The complete
 address/MessageIds parser stack remains unqualified.
 
+The MessageIds list cursor fits 256 bytes in the body parser reservation,
+including its CFWS/delimited child states and raw source offsets. Long atoms,
+phrases and lists do not grow state. Allocation intervals cover Unicode and
+quoted data, obsolete phrases, malformed tails, nesting and work refusal.
+Returned byte extents allocate no output. The enclosing response owner must
+reserve its own projection storage and qualify complete worker composition.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

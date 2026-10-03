@@ -1372,6 +1372,14 @@ Initial independently landable increments:
   allocation-free polling. Unquoting/display decoding, complete address and
   MessageIds forms, and publication remain follow-on work.
 
+- **M06aa — resident MessageIds lists:** compose CFWS and delimited tokens
+  with bounded atom/grammar state. Return provisional raw segments omitting
+  grammatical CFWS and outer angles; authorize obsolete discarded phrases
+  only for References/In-Reply-To. Cover complete-field rejection, Unicode,
+  quoted data, long atoms, nesting/work refusal and allocation-free parsing.
+  Unfolding, JSON-safe projection, response publication and method
+  integration remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

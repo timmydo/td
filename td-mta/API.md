@@ -1546,6 +1546,54 @@ sticky failures. Allocation intervals cover both kinds, long input and
 malformed/work refusal. Complete address/MessageIds grammars and worker
 integration remain open.
 
+### 1.34 Resident MessageIds list grammar
+
+M06aa supplies `header_message_ids::Cursor` over an admitted immutable field
+value ending at scanner value_end, excluding its final line ending. Strict
+mode parses a nonempty list of RFC 5322 msg-id values including their obsolete
+local-part/domain grammar. ObsoletePhrases additionally accepts and discards
+obsolete phrases for References and In-Reply-To. The enclosing header owner
+must authorize that mode; it is not a recovery switch for other fields.
+Phrase-only and truly empty obsolete fields yield an empty list; Strict
+requires at least one msg-id. CFWS-only fields remain malformed in both modes
+because the obsolete phrase grammar still requires an initial word. A leading
+dot cannot begin an obsolete phrase. This is the JMAP read form's list grammar:
+a malformed multi-ID Message-ID can still expose multiple parsed IDs, as
+RFC 8621 section 4.1.3 permits. Outgoing field cardinality is separate.
+
+Begin and End delimit one provisional message-id. Part returns an absolute
+byte extent in the supplied field slice. Concatenating those parts produces
+raw identifier source preserving local/domain spelling, dots, the at sign,
+quoted strings and domain literals while omitting grammatical CFWS and the
+outer angle brackets. Quoted pairs, interior whitespace/folds and obsolete
+controls are retained as source bytes. Before identifier comparison or JMAP
+projection, the owner must unfold CRLF or bare LF followed by SP/HTAB inside
+parts, preserving the following whitespace as data. The existing mime_unfold
+decoder supplies this byte-preserving stage; folded and unfolded forms must
+compare equally. Valid RFC 6532 UTF-8 is accepted in atoms and delimited text.
+Comments use the existing 32-level bound. There is no case folding, encoded-
+word decoding, NFC, semantic unquoting or DNS/domain/IP validation.
+
+All events remain provisional until Complete validates the entire field.
+Malformed trailing values or comments invalidate every previously yielded
+message-id. Malformed means the eventual MessageIds form is null; nesting
+and work limits retain their resource-failure meaning. The eventual response
+owner must validate before publishing and charge any replay against the same
+live job. Raw extents still need unfolding, JSON-safe scalar projection and
+separately charged copying/serialization; they are not publishable JSON or
+SMTP recipients. A completed field is inert; every error remains sticky even
+if a caller supplies a replacement meter.
+
+A poll performs one CFWS or delimited-token turn, one grammar transition, or
+at most 32 atom visits. The maximum is 160 source-byte visits and 32 records,
+including UTF-8 lead rereads, delimiters and CFWS reinspection. No output
+bytes are charged because only source offsets are returned. State is non-
+Copy and fits 256 bytes; no string, token list or recursion is allocated.
+Whole-field admission, response lifetime, JSON framing and service integration
+remain external. Fixtures pin literal projected byte segments, obsolete
+phrases, Unicode, comments, malformed tails, exact charges, long atoms,
+nesting/work refusals and allocation-free success/refusal paths.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
