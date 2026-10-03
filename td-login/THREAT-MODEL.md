@@ -293,7 +293,7 @@ Consequences worth stating plainly:
   account passwordless to satisfy ordinary `exec-as` would therefore red both
   the image contract and the credential policy.
 
-  The shipped image has six infrastructure service identities plus four
+  The shipped image has seven infrastructure service identities plus four
   locked application identities. OpenSSH's `sshd`
   privilege-separation account and `td-profiler`'s `profiler` account are not
   td-svc `exec-as` targets; each daemon performs its own fixed-purpose drop.
@@ -306,8 +306,10 @@ Consequences worth stating plainly:
   has UID/GID 992, a `/bin/false` shell and `/run/td-bus/1000` home, and
   also uses `exec-service-as`. The portal `tdp1000` has UID/GID 991, a
   `/bin/false` shell and private `/run/td-portal/1000` home, and uses the
-  same service path. None can be entered through
-  td-login's human forced modes or an interactive login.
+  same service path. The live installer wizard's `tdi1000` has UID/GID 990,
+  a `/bin/false` shell and a `/run/td-setup` home nothing creates, and is
+  entered through `exec-service-as` on live boots only. None can be entered
+  through td-login's human forced modes or an interactive login.
 - **A class is a property of a name; the uid is what the kernel
   enforces.** `classify` reads one account's shadow field, so
   `!td-service` says that the NAME `audio` is refused by every human

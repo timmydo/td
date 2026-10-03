@@ -20,6 +20,9 @@ pub(crate) fn application_policy() -> Result<&'static crate::app_policy::Policy,
 }
 
 pub(crate) const HUMAN_UID: u32 = 1000;
+/// The live installer wizard's service identity (td-install/INSTALLER.md):
+/// a display client like an application's, never the human.
+pub(crate) const INSTALLER_UID: u32 = 990;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SocketPolicy {
@@ -48,9 +51,21 @@ impl SocketPolicy {
         if self == Self::Private {
             return Ok(());
         }
-        let uid = sys::peer_uid(stream)?;
+        self.admit_uid(sys::peer_uid(stream)?, application_policy)
+    }
+
+    /// The decision on a kernel peer UID. The application policy is asked
+    /// for only by a peer neither the human nor the installer.
+    fn admit_uid(
+        self,
+        uid: u32,
+        policy: impl FnOnce() -> Result<&'static crate::app_policy::Policy, String>,
+    ) -> Result<(), String> {
+        if self == Self::ApplicationSession && uid == INSTALLER_UID {
+            return Ok(());
+        }
         if self == Self::ApplicationSession && uid != HUMAN_UID {
-            return require_application(uid, application_policy()?);
+            return require_application(uid, policy()?);
         }
         require_human(uid)
     }
@@ -351,10 +366,36 @@ mod tests {
             assert!(require_application(uid, &policy).is_ok());
             assert!(require_human(uid).is_err());
         }
-        for uid in [0, 991, 992, 993, 994, 1000, 1001, 65538, u32::MAX] {
+        for uid in [0, 990, 991, 992, 993, 994, 1000, 1001, 65538, u32::MAX] {
             assert!(require_application(uid, &policy).is_err());
         }
         assert_eq!(SocketPolicy::ApplicationSession.mode(), 0o666);
+    }
+
+    /// The wizard is admitted where an application is, by its own fixed
+    /// identity rather than the application table, and is never the human:
+    /// no control, readiness or authority socket admits it.
+    #[test]
+    fn the_installer_is_a_display_client_only() {
+        assert_eq!(INSTALLER_UID, 990);
+        let table: &'static crate::app_policy::Policy = Box::leak(Box::new(
+            crate::app_policy::Policy::parse(
+                "td-bus-applications-v1\t1000\n65536\tfirefox\torg.mozilla.firefox\n",
+            )
+            .unwrap(),
+        ));
+        let unasked = || Err("the table is not asked".to_string());
+        let display = SocketPolicy::ApplicationSession;
+        assert!(display.admit_uid(INSTALLER_UID, unasked).is_ok());
+        assert!(display.admit_uid(HUMAN_UID, unasked).is_ok());
+        assert!(display.admit_uid(65536, || Ok(table)).is_ok());
+        for uid in [0, 989, 991, 992, 993, 994, 1001, 65537, u32::MAX] {
+            assert!(display.admit_uid(uid, || Ok(table)).is_err(), "{uid}");
+        }
+        let human = SocketPolicy::HumanSession;
+        assert!(human.admit_uid(HUMAN_UID, unasked).is_ok());
+        assert!(human.admit_uid(INSTALLER_UID, || Ok(table)).is_err());
+        assert!(human.admit_uid(65536, || Ok(table)).is_err());
     }
 
     #[test]
@@ -404,7 +445,7 @@ mod tests {
         assert_eq!(SocketPolicy::Private.mode(), 0o600);
         assert_eq!(SocketPolicy::HumanSession.mode(), 0o666);
         assert!(require_human(1000).is_ok());
-        for uid in [0, 991, 992, 993, 994, 1001, 65534, 65536, u32::MAX] {
+        for uid in [0, 990, 991, 992, 993, 994, 1001, 65534, 65536, u32::MAX] {
             assert!(require_human(uid).is_err());
         }
     }

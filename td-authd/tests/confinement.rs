@@ -184,7 +184,10 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(disk.contains(
         "\"serve\",\n                \"/bin/td-boot\",\n                \"/run/td-media\",\n                TRUSTED_KEY,\n                \"/\",\n                \"/bin/td-firstboot\","
     ));
-    assert!(disk.contains("sys::peer_uid(&installer).is_ok_and(|uid| uid == self.owner)"));
+    assert!(disk.contains("sys::peer_uid(peer).is_ok_and(|uid| uid == self.installer)"));
+    assert!(disk.contains("if self.admits(&installer) {"));
+    assert!(disk.contains("bind_intake(SOCKET, INSTALLER_UID)"));
+    assert_eq!(disk.matches("self.installer").count(), 1);
     for forbidden in [
         "send_descriptor(",
         "sys::receive(",
@@ -514,6 +517,6 @@ const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
 const WRITE_REQUEST_FINGERPRINT: u64 = 0x188c619caba6ceb8;
 
-const INSTALLATION_FINGERPRINT: u64 = 0x2a5bd0095530413b;
-const DISK_INSTALL_FINGERPRINT: u64 = 0x9774acfc388054e7;
+const INSTALLATION_FINGERPRINT: u64 = 0xbfb1c59262269fa1;
+const DISK_INSTALL_FINGERPRINT: u64 = 0x9f45f991c1867e1a;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x301196fb4b04f347;

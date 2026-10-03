@@ -75,6 +75,11 @@ pub const TD_BUS_RUNTIME_PATH: &str = "/run/td-bus/1000";
 /// Protected host endpoint, bound at the existing private path inside jails.
 pub const TD_BUS_SOCKET_PATH: &str = "/run/td-bus/1000/bus";
 
+/// The live installer wizard's service identity, mirrored by td-compositor's
+/// public display admission and td-authd's setup intake and pinned by the
+/// image recipe.
+pub const TD_INSTALLER_UID: u32 = 990;
+
 /// Fixed target-side audio service and the path presented to applications.
 /// td-jail includes this module directly, while the image recipe links the
 /// engine crate, so the two sides cannot drift onto different sockets.

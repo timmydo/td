@@ -46,11 +46,11 @@ UNSAFE.md authorization. No browser, webview or HTTP service is required.
 The UI runs without disk-writing privileges. A root-owned installation
 service admits only typed installation operations over a private local
 channel. The UI cannot select executables, shell commands, arbitrary paths,
-mount options or a different deployment source. The live profile is to grant
-only the paired installer session access to this service; today td-authd
-admits any peer of the session's user, the wizard among them
-(td-authd/DESIGN.md "Whole-disk installation intake"). This authority does
-not depend on `su`, empty passwords, or a reusable elevation grant.
+mount options or a different deployment source. Only the live wizard
+reaches this service: it runs as its own service identity, `tdi1000`
+(UID/GID 990), and td-authd's setup intake admits that kernel peer UID
+alone (td-authd/DESIGN.md "Whole-disk installation intake"). This authority
+does not depend on `su`, empty passwords, or a reusable elevation grant.
 Compositor-owned trusted consent must bind destructive execution to the
 exact reviewed request under the existing elevation contract; ordinary
 client pixels or synthetic input are not authorization evidence. The typed
@@ -84,11 +84,11 @@ never answers cannot hold the window, and td-authd serves the next installer
 once it reaps that service. Disks the window stopped waiting for are
 dropped. With a disk selected, Return continues to the settings step
 described below and Escape there goes back to the list, keeping the drafts.
-The live window paints in the td-ui theme its file names
-(`~/.config/td-setup/theme`, which on a live medium lasts the session) and
-F12, td-ui's theme chord, moves it to the next and keeps it
-(td-ui/DESIGN.md, "Themes"); the window takes F12 before any page does, so
-it asks the service nothing, and the headless renders paint in `SAND`.
+The live window paints in td-ui's first theme, `SAND`, and F12, td-ui's
+theme chord, moves it to the next for the wizard's run (td-ui/DESIGN.md,
+"Themes"): it runs without a home, so it reads and keeps no theme file.
+The window takes F12 before any page does, so it asks the service nothing,
+and the headless renders paint in `SAND`.
 F1, td-ui's key list chord, is the window's too (td-ui/DESIGN.md, "Key
 list"): it opens the list of the pages' keys over the page, the shown
 page's first (with the time zone row focused, its keys and then the
@@ -127,23 +127,24 @@ only the live selector's handoff sets; td-install/MEDIA.md "Live boot") the
 session's `[setup]` td-svc unit starts it once the compositor runs, the
 session's own windows are placed and Firefox's window has mapped (on a live
 boot Firefox is ready only then, unless its readiness times out first): as
-the human user, unjailed and without disk authority, on the compositor's
-socket by `WAYLAND_DISPLAY`. A Firefox slow enough to time out its
-readiness can still map after the wizard, as can a restarted Firefox,
-terminal or application, on the wizard's workspace and with the keyboard,
-since the compositor focuses what it maps; keeping a late window from
-taking the wizard's place and keys is a follow-up. The unit
-first makes the empty third workspace active, so the wizard maps there
-alone, with the whole output and the keyboard; a third tile beside the
-shell and Firefox would be smaller than its smallest page. A window that
-maps later, such as a restarted terminal or Firefox, still maps on the
-active workspace and shares it. The unit is ready when the compositor's
-layout report names a window with td-setup's app id; it is never restarted,
-so a wizard that exits is not relaunched behind the person, and an
-installed boot's unit exits at once. Under the autotest token a live boot
-prints `TD-SETUP-LIVE-READY` once td-setup's is the one window with its app
-id, visible, focused and at least 752x480, and td-authd's setup intake
-exists.
+`tdi1000` through td-login's checked service path, in its own service
+cgroup, unjailed and without disk authority, on the compositor's socket by
+`WAYLAND_DISPLAY`. The compositor admits that identity as a display client
+only, never as the human. A Firefox slow enough to time out its readiness
+can still map after the wizard, as can a restarted Firefox, terminal or
+application, on the wizard's workspace and with the keyboard, since the
+compositor focuses what it maps; keeping a late window from taking the
+wizard's place and keys is a follow-up. The unit first makes the empty
+third workspace active, so the wizard maps there alone, with the whole
+output and the keyboard; a third tile beside the shell and Firefox would be
+smaller than its smallest page. A window that maps later, such as a
+restarted terminal or Firefox, still maps on the active workspace and
+shares it. The unit is ready when the compositor's layout report names a
+window with td-setup's app id; it is never restarted, so a wizard that
+exits is not relaunched behind the person, and an installed boot's unit
+exits at once. Under the autotest token a live boot prints
+`TD-SETUP-LIVE-READY` once td-setup's is the one window with its app id,
+visible, focused and at least 752x480, and td-authd's setup intake exists.
 
 When the command line also holds `td.setup-input=1`, td-setup says on
 standard error, which the unit leaves on the console, one
@@ -231,13 +232,25 @@ and each boot reports the file's contents and the home's inode from
 `ls -di .`, the second boot the same token and inode as the first.
 `./test-iso` boots a medium through firmware by hand, with no tokens.
 
-Starting the wizard grants it nothing a session program lacked: td-authd
-admits any UID-1000 peer at the intake, and on a live boot those include
-the session's shell, its fetch service and the VM guest helper. The intake
-serves one installation service per session generation, so a peer that
-reaches it first turns the wizard away and can drive its own review as far
-as the compositor's consent prompt, which names the disk it would erase.
-Restricting the intake to the wizard is a later increment.
+The intake admits only the wizard's identity. The session's own programs,
+its shell and the VM guest helper among them, run as UID 1000: the socket's
+permissions (mode 0600, owned by `tdi1000`) refuse their connect, and
+td-authd's peer check closes any other peer that reaches it unanswered, so
+none can take the one installation service a session generation serves or
+drive a review to the consent prompt. Nothing unprivileged becomes
+`tdi1000`: it is a service-only account, and td-login, never installed
+setuid, switches credentials only for root. Root is outside this boundary
+and could write a disk without the installer (the stock image leaves its
+password field empty, but nothing in the live session enters it); through
+the installation service, erasure still needs the person's physical
+consent. Programs of the session can still disturb the wizard without
+driving it, among them: the compositor's control socket moves, regroups and
+resizes its window and changes its workspace, a late window takes its focus
+(above), a window with td-setup's app id satisfies the unit's diagnostic
+readiness probe, the session's clients can fill the compositor's public
+client slots or `/tmp` first, and files squatting td-ui's predictable
+buffer names in `/tmp` can leave it unable to draw. Synthetic input is
+refused while trusted attention is enabled, so none can type into it.
 
 The destination page is a pure view over `Destination` values supplied by
 the service. It shows capacity, model, kernel name, device number, sequence,
@@ -476,8 +489,8 @@ trusted consent bound to that whole value and revalidates the selected disk
 under a retained exclusive claim. Neither matching plan bytes nor possession
 of the nonce grants consent. No public request, reconnect or service restart
 may silently retry erasure. A live boot starts the wizard ("Live startup"),
-but td-authd admits any UID-1000 peer as its installer, not only the wizard;
-erasure still needs the person's physical consent.
+and td-authd admits only the wizard's identity as its installer; erasure
+still needs the person's physical consent.
 
 ## Installation service protocol
 
@@ -901,9 +914,10 @@ rollback does not repair malformed shared state.
 `td-firstboot check-primary-name ROOT NAME` is a read-only preflight for a
 proposed name against an already verified, staged deployment. It shares the
 primary-account grammar: 1–32 lowercase ASCII letters, digits, underscores
-or hyphens, beginning with a letter. Names formed from `tda`, `tdb`, `tdc`
-or `tdp` followed only by digits are reserved even before that principal
-is enrolled, so later enrollment cannot collide with the installed name.
+or hyphens, beginning with a letter. Names formed from `tda`, `tdb`, `tdc`,
+`tdi` or `tdp` followed only by digits are reserved even before that
+principal is enrolled, so later enrollment cannot collide with the installed
+name.
 Rechecking the deployment's current primary name is allowed when it passes
 these checks. It requires regular, consistently owned
 account tables (passwd/group 0644, shadow 0600, principal reservations 0444),

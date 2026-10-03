@@ -217,6 +217,11 @@ const BROKER_RUNTIME: &str = td_engine::permissions::TD_BUS_RUNTIME_PATH;
 const PORTAL_RESERVED_UID: u32 = 991;
 const PORTAL_USER: &str = "tdp1000";
 const PORTAL_RUNTIME: &str = "/run/td-portal/1000";
+/// The live installer wizard's identity: only it reaches td-authd's setup
+/// intake. No home is created for it, and the wizard runs without `HOME`.
+const INSTALLER_UID: u32 = td_engine::permissions::TD_INSTALLER_UID;
+const INSTALLER_USER: &str = "tdi1000";
+const INSTALLER_HOME: &str = "/run/td-setup";
 const PROFILER_USER: &str = "profiler";
 const PROFILER_UID: u32 = 997;
 const PROFILER_GID: u32 = 997;
@@ -477,6 +482,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
     if uid == COMPOSITOR_RESERVED_UID {
         return home == COMPOSITOR_RUNTIME;
     }
+    if uid == INSTALLER_UID {
+        return home == INSTALLER_HOME;
+    }
     home.strip_prefix("/home/").is_some_and(|name| {
         name != "."
             && name != ".."
@@ -564,6 +572,17 @@ const SYSTEM: SystemDef = SystemDef {
             gid: AUDIO_GID,
             gecos: "System Audio",
             home: AUDIO_RUNTIME,
+            shell: "/bin/false",
+            groups: &[],
+            passwordless: false,
+            service_only: true,
+        },
+        User {
+            name: INSTALLER_USER,
+            uid: INSTALLER_UID,
+            gid: INSTALLER_UID,
+            gecos: "Live Installer",
+            home: INSTALLER_HOME,
             shell: "/bin/false",
             groups: &[],
             passwordless: false,
@@ -1836,16 +1855,17 @@ fn build_td_svc_conf() -> String {
          # times out; under the setup-input token the wizard waits for the\n\
          # window itself),\n\
          # the view moves to an empty workspace and the wizard maps there\n\
-         # alone, whole-output and holding the keyboard. It runs as the human\n\
-         # user, unjailed and without disk authority, and reaches root's\n\
-         # installation service only through td-authd's setup intake. An\n\
+         # alone, whole-output and holding the keyboard. It runs as its own\n\
+         # service identity, unjailed and without disk authority, and reaches\n\
+         # root's installation service only through td-authd's setup intake,\n\
+         # which admits that identity alone. An\n\
          # installed boot's exec exits 0 at once and its probe passes.\n\
          # restart=never: a wizard that exits is not relaunched behind the\n\
          # person mid-installation.\n\
          [setup]\n\
          type=daemon\n\
-         cgroup=session\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) case \" $(/bin/cat /proc/cmdline) \" in *\" {setup_input_cmdline_token} \"*) start=$(/bin/date +%s) || exit 1; while :; do layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{firefox_app_id} title=\" && break; now=$(/bin/date +%s) || exit 1; if [ $((now - start)) -ge {setup_firefox_wait} ]; then /bin/echo \"td-setup: the autotest Firefox window did not map in {setup_firefox_wait}s; not starting the wizard it would take the keyboard from\"; exit 1; fi; /bin/td-util sleep 1; done;; esac; /bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {setup_workspace} || exit 1; exec /bin/td-login exec-primary -- /bin/env WAYLAND_DISPLAY={wayland_socket} /bin/td-setup;; *) exit 0;; esac'\n\
+         cgroup=service\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) case \" $(/bin/cat /proc/cmdline) \" in *\" {setup_input_cmdline_token} \"*) start=$(/bin/date +%s) || exit 1; while :; do layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{firefox_app_id} title=\" && break; now=$(/bin/date +%s) || exit 1; if [ $((now - start)) -ge {setup_firefox_wait} ]; then /bin/echo \"td-setup: the autotest Firefox window did not map in {setup_firefox_wait}s; not starting the wizard it would take the keyboard from\"; exit 1; fi; /bin/td-util sleep 1; done;; esac; /bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {setup_workspace} || exit 1; exec /bin/td-login exec-service-as {installer_user} -- /bin/env -u HOME WAYLAND_DISPLAY={wayland_socket} /bin/td-setup;; *) exit 0;; esac'\n\
          after=wayland,placement-evidence,firefox\n\
          requires=wayland\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{setup_app_id} title=\"'\n\
@@ -2100,6 +2120,7 @@ fn build_td_svc_conf() -> String {
         live_cmdline_token = td_boot_protocol::LIVE_CMDLINE_TOKEN,
         setup_app_id = SETUP_APP_ID,
         setup_intake = SETUP_INTAKE_SOCKET,
+        installer_user = INSTALLER_USER,
         setup_marker = TD_SETUP_LIVE_MARKER,
         setup_input_cmdline_token = SETUP_INPUT_CMDLINE_TOKEN,
         setup_min_height = SETUP_MIN_HEIGHT,
@@ -7318,15 +7339,21 @@ mod tests {
             unit_after("seat-access-evidence"),
             vec!["wayland", "firefox-tls-setup"]
         );
-        let private_runtime_accounts: Vec<_> = SYSTEM
+        let service_accounts: Vec<_> = SYSTEM
             .users
             .iter()
             .filter(|user| user.service_only)
             .map(|user| user.name)
             .collect();
         assert_eq!(
-            private_runtime_accounts,
-            [PORTAL_USER, BROKER_USER, COMPOSITOR_USER, AUDIO_USER]
+            service_accounts,
+            [
+                PORTAL_USER,
+                BROKER_USER,
+                COMPOSITOR_USER,
+                AUDIO_USER,
+                INSTALLER_USER
+            ]
         );
         assert_eq!(
             unit_key("wayland", "exec"),
@@ -7761,10 +7788,36 @@ mod tests {
                  not starting the wizard it would take the keyboard from\"; exit 1; fi; \
                  /bin/td-util sleep 1; done;; esac; /bin/td-login exec-primary -- \
                  /bin/td-ctl --socket {CONTROL_SOCKET} workspace {SETUP_WORKSPACE} || exit 1; \
-                 exec /bin/td-login exec-primary -- /bin/env \
+                 exec /bin/td-login exec-service-as {INSTALLER_USER} -- /bin/env -u HOME \
                  WAYLAND_DISPLAY={WAYLAND_SOCKET} /bin/td-setup;; *) exit 0;; esac'"
             )
         );
+        // The wizard's identity is the one the compositor admits to the
+        // display beside the human and the one td-authd's setup intake admits
+        // alone; td-login gives it no session cgroup.
+        let installer = SYSTEM
+            .users
+            .iter()
+            .find(|user| user.name == INSTALLER_USER)
+            .unwrap();
+        assert_eq!(
+            (installer.uid, installer.gid),
+            (INSTALLER_UID, INSTALLER_UID)
+        );
+        assert!(installer.service_only && !installer.passwordless);
+        assert_eq!(installer.shell, "/bin/false");
+        assert!(installer.groups.is_empty());
+        assert!(SYSTEM
+            .users
+            .iter()
+            .all(|user| user.name == INSTALLER_USER || user.uid != INSTALLER_UID));
+        assert!(
+            include_str!("../../../td-compositor/src/session.rs").contains(&format!(
+                "pub(crate) const INSTALLER_UID: u32 = {INSTALLER_UID};"
+            ))
+        );
+        assert!(include_str!("../../../td-authd/src/disk_install.rs")
+            .contains(&format!("const INSTALLER_UID: u32 = {INSTALLER_UID};")));
         assert_eq!(
             unit_key("setup", "ready-timeout").as_deref(),
             Some(SETUP_READY_TIMEOUT_SECS.to_string().as_str())
@@ -7788,7 +7841,7 @@ mod tests {
         assert!(ready.contains(&format!("{WINDOW_RECORD}{SETUP_APP_ID} title=")));
         for (key, value) in [
             ("type", "daemon"),
-            ("cgroup", "session"),
+            ("cgroup", "service"),
             ("restart", "never"),
             ("requires", "wayland"),
         ] {

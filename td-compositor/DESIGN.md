@@ -42,9 +42,10 @@ require a separately reviewed descriptor-based syscall surface.
 and evdev nodes, renders software pixels, and reads Linux input events. Its
 Wayland, private portal, optional control and application-readiness sockets
 live beneath the compositor-owned runtime directory. Stock sockets permit
-cross-UID connection. Public Wayland admits the human and application UIDs
-from the immutable deployment table; control/readiness admit only human
-UID 1000 and the private portal listener only UID 991. Root is refused;
+cross-UID connection. Public Wayland admits the human, the live installer
+wizard's fixed UID 990 and application UIDs from the immutable deployment
+table; control/readiness admit only human UID 1000 and the private portal
+listener only UID 991. Root is refused;
 diagnostics use the appropriate checked identity.
 Mode 0666 avoids giving shared supplementary groups authority over service
 state or devices; unrelated local UIDs can reach only accept-and-refuse.
@@ -5441,10 +5442,16 @@ root-owned parent. Human runtime `/run/user/1000` remains mode 0700.
 A human-identity boot probe requires permission denial opening every input
 node and the framebuffer. No existing descriptor survives deployment reboot.
 
-Authority-mode public Wayland admits kernel peer UID 1000 and the exact
-application UIDs in the root-owned immutable deployment policy, loaded
-once at startup before accepting clients. Control and
-application-readiness sockets admit only kernel peer UID 1000. Socket
+Authority-mode public Wayland admits kernel peer UID 1000, the live
+installer wizard's service UID 990 (td-install/INSTALLER.md "Live
+startup") and the exact application UIDs in the root-owned immutable
+deployment policy, loaded once at startup before accepting clients. The
+wizard is a display client like an application, never the human. Its
+account exists on installed systems too, where nothing runs as it: only
+root can enter a service account, so admitting it on every boot keeps the
+compositor free of boot-profile parsing and grants no one else anything.
+Control and application-readiness sockets admit only kernel peer UID
+1000. Socket
 mode 0666 permits cross-UID connection, while the peer check supplies
 session admission. The private portal listener instead admits only the
 dedicated portal UID 991; it does not apply human-session admission

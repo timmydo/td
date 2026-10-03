@@ -925,7 +925,8 @@ the broker, jail, portal, compositor and audio daemon. Broker registration
 requires the assigned external UID; human UID registration is removed.
 The portal validates broker-reported UID plus app name against its loaded
 policy for both credential retrieval and FileChooser. Public Wayland admits
-the human and assigned application UIDs; audio admits the human, its own
+the human, the live installer wizard's UID 990 and assigned application
+UIDs; audio admits the human, its own
 service and the assigned Firefox UID. Compositor control and
 readiness remain human-only, and the private portal channel remains UID 991.
 
@@ -1491,14 +1492,18 @@ fails Prepare, as does a live boot whose handed-off trust root
 group or other write. A live boot binds `disk_install.rs`'s setup intake at
 `/run/td-authd/1000/setup` in place of the update intake; an installed
 system binds only the update intake. Both use one binder: protected
-root-owned parents, a stale socket of root or the owner replaced, mode 0600,
-owned by UID 1000, nonblocking, and on failure or teardown the inode this
-generation created removed and no other.
+root-owned parents, a stale socket of root or of the socket's owner
+replaced, mode 0600, owned by that owner, nonblocking, and on failure or
+teardown the inode this generation created removed and no other. The update
+socket's owner is the session owner, UID 1000; the setup socket's is the
+live wizard's service identity, `tdi1000` (UID/GID 990).
 
 The setup intake accepts one connection per heartbeat. While no service runs
 or awaits reaping and no installation has completed this generation, a peer
-of UID 1000 (the fixed peer-UID query) gets a service; any other connection
-is closed unanswered. The service is `/bin/td-install serve /bin/td-boot
+of UID 990, the wizard's (the fixed peer-UID query), gets a service; any
+other connection is closed unanswered. A peer of the session owner cannot
+connect at all, the socket being mode 0600 and the wizard's. The service is
+`/bin/td-install serve /bin/td-boot
 /run/td-media /run/td-volume/td/trusted.pub / /bin/td-firstboot`, with an
 empty environment, cwd `/`, the accepted socket as stdin, one end of a new
 socketpair as stdout and authority stderr: td-install/INSTALLER.md

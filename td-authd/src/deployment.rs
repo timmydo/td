@@ -278,7 +278,10 @@ pub(crate) fn bind_intake(path: &str, owner: u32) -> Result<(UnixListener, (u64,
         }
     }
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() && matches!(metadata.uid(), 0 | 1000) => {
+        Ok(metadata)
+            if metadata.file_type().is_socket()
+                && (metadata.uid() == 0 || metadata.uid() == owner) =>
+        {
             fs::remove_file(path).map_err(|e| e.to_string())?;
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => (),

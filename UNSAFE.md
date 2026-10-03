@@ -491,8 +491,10 @@ fixed to x86-64 `SO_PEERCRED=17`, and an exact 12-byte `[u32; 3]` result. The
 wrapper refuses a different returned length and exposes only the uid word;
 `server.rs` has one pinned caller and accepts only portal UID 991 before
 allocating a private client slot. The dedicated compositor admits the compiled
-human UID 1000 on its public Wayland, control and readiness sockets through
-one pinned `session.rs` caller of the same peer-uid wrapper. The private
+human UID 1000 on its public Wayland, control and readiness sockets, and on
+public Wayland also the compiled live installer UID 990 and the deployment's
+application UIDs, through one pinned `session.rs` caller of the same peer-uid
+wrapper. The private
 portal listener uses its separate UID-991 check, not that human admission.
 These sockets use mode 0666 under compositor-owned directories; the
 credential check precedes protocol reads, writes and slot admission. Host development retains private

@@ -298,7 +298,7 @@ impl Registry {
         primary_account::validate_name(name).map_err(|error| error.to_string())?;
         let primary = primary_account::parse(passwd).map_err(|error| error.to_string())?;
         self.verify_retained_accounts(self, passwd, group, shadow)?;
-        if ["tda", "tdb", "tdc", "tdp"].iter().any(|prefix| {
+        if ["tda", "tdb", "tdc", "tdi", "tdp"].iter().any(|prefix| {
             name.strip_prefix(prefix).is_some_and(|suffix| {
                 !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
             })

@@ -243,6 +243,8 @@ fn primary_names_preserve_numeric_reservations_and_reject_identity_collisions() 
         "tdc1000",
         "tdb1001",
         "tdp1000",
+        "tdi1000",
+        "tdi7",
         "tda65536",
         "tdc1002",
         "tda99999",

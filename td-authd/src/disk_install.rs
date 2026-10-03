@@ -15,6 +15,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const SOCKET: &str = "/run/td-authd/1000/setup";
+/// The live wizard's service identity (td-install/INSTALLER.md), owner of
+/// the socket and the only peer admitted; a review's consent still names
+/// the session owner.
+const INSTALLER_UID: u32 = 990;
 const CMDLINE: &str = "/proc/cmdline";
 /// The key the live selector handed to the live system (td-install/MEDIA.md).
 const TRUSTED_KEY: &str = "/run/td-volume/td/trusted.pub";
@@ -313,6 +317,7 @@ fn summary(review: &wire::Review, owner: u32) -> Result<Request, String> {
 pub(crate) struct Intake {
     listener: UnixListener,
     owner: u32,
+    installer: u32,
     identity: (u64, u64),
     service: Option<Service>,
     /// A retired service, reaped without blocking before another starts.
@@ -327,15 +332,25 @@ impl Intake {
         if owner != 1000 {
             return Err("unsupported setup requester".into());
         }
-        let (listener, identity) = crate::deployment::bind_intake(SOCKET, owner)?;
+        let (listener, identity) = crate::deployment::bind_intake(SOCKET, INSTALLER_UID)?;
         Ok(Self {
             listener,
             owner,
+            installer: INSTALLER_UID,
             identity,
             service: None,
             stopping: None,
             complete: false,
         })
+    }
+
+    /// Whether a new peer gets a service: none runs or awaits reaping, this
+    /// generation has not installed, and the peer is the wizard's identity.
+    fn admits(&self, peer: &UnixStream) -> bool {
+        self.service.is_none()
+            && self.stopping.is_none()
+            && !self.complete
+            && sys::peer_uid(peer).is_ok_and(|uid| uid == self.installer)
     }
 
     /// Starts a service for a new installer, and returns the fates of
@@ -346,12 +361,8 @@ impl Intake {
             self.stopping = None;
         }
         if let Ok((installer, _)) = self.listener.accept() {
-            // Busy or done: the installer sees its channel close.
-            if self.service.is_none()
-                && self.stopping.is_none()
-                && !self.complete
-                && sys::peer_uid(&installer).is_ok_and(|uid| uid == self.owner)
-            {
+            // Busy, done or not the wizard: the peer sees its channel close.
+            if self.admits(&installer) {
                 match Service::start(installer) {
                     Ok(service) => self.service = Some(service),
                     Err(why) => {

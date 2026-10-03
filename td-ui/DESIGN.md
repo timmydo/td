@@ -217,8 +217,9 @@ Newly built (increment 34): `theme_file::Kept`, a window's theme with
 the file it is kept in, which the widget window now holds and the
 programs with windows of their own hold alike: td-editor, td-setup,
 td-photo and the task manager paint their live windows in their theme
-and move it on `F12`, each keeping its own file. td-term and the
-portal's chooser stay in `SAND` (see "Themes").
+and move it on `F12`, each keeping its own file; the live installer
+wizard runs without a home and keeps none. td-term and the portal's
+chooser stay in `SAND` (see "Themes").
 
 Newly built (increment 35): the key list `keys`, a program's keys and
 the window's own shown over the frame on `F1`, under "Key list" below.
@@ -2282,8 +2283,9 @@ and takes `theme::CHORD` from the keyboard's own key event, before its
 dispatch and never from its control socket or replay, moving the theme
 with `Kept::advance`, reporting a failed write as it reports any notice,
 and drawing the whole frame again. td-editor, td-setup, td-photo and the
-task manager do; their previews, render checks and in-process tests paint
-in `SAND`. Two programs do not. td-term draws its own fixed terminal
+task manager do; the live installer wizard runs without a home, so its
+`Kept::host` finds no file and F12 keeps none. Their previews, render
+checks and in-process tests paint in `SAND`. Two programs do not. td-term draws its own fixed terminal
 palette, not the shared one, and the programs it runs own F1 and F12, so
 it has no theme. The portal's file chooser runs as the portal's service
 account, whose home is the portal's runtime directory, and reads raw key

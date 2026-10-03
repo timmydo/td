@@ -54,6 +54,7 @@ fn served_in() -> (Intake, UnixStream, std::path::PathBuf) {
     let intake = Intake {
         listener,
         owner: 1000,
+        installer: INSTALLER_UID,
         identity: (0, 0),
         service: Some(Service::over(idle_child(), ours).unwrap()),
         stopping: None,
@@ -353,10 +354,29 @@ fn a_finished_report_survives_the_service_closing_or_exiting() {
     }
 }
 
+/// Only the wizard's identity is served: a peer of the session owner, the
+/// requester its consent names, is not, even when the intake is idle.
+#[test]
+fn only_the_installer_identity_is_served() {
+    let (mut intake, _service, directory) = served_in();
+    let _ = fs::remove_dir_all(&directory);
+    let uid = fs::metadata("/proc/self").unwrap().uid();
+    let (peer, _) = UnixStream::pair().unwrap();
+    // Busy.
+    intake.installer = uid;
+    assert!(!intake.admits(&peer));
+    intake.service = None;
+    assert!(intake.admits(&peer));
+    intake.owner = uid;
+    intake.installer = uid.wrapping_add(1);
+    assert!(!intake.admits(&peer));
+    assert_eq!(INSTALLER_UID, 990);
+}
+
 #[test]
 fn another_installer_is_refused_while_one_is_served_or_after_completion() {
     let (mut intake, _service, directory) = served_in();
-    intake.owner = fs::metadata("/proc/self").unwrap().uid();
+    intake.installer = fs::metadata("/proc/self").unwrap().uid();
     let refused = |intake: &mut Intake| {
         let mut installer = UnixStream::connect(directory.join("setup")).unwrap();
         intake.tick();
