@@ -4654,7 +4654,7 @@ enum BootSource<'a> {
         attachment: FirmwareAttachment,
         installation_target: Option<&'a install::TargetDisk>,
     },
-    /// A live medium booted through firmware as optical media, its tokens
+    /// A live medium booted through firmware as USB mass storage, its tokens
     /// in a boot entry written into the boot's own copy of the `vars`
     /// template; a disposable target disk follows it and `script` drives
     /// the wizard.
@@ -5014,17 +5014,22 @@ fn boot_source(
             BootSource::Firmware {
                 attachment: FirmwareAttachment::Optical,
                 ..
-            }
-            | BootSource::LiveSetup { .. } => {
+            } => {
                 cmd.arg("-drive").arg(media::optical_drive_arg(disk.path));
             }
             BootSource::Firmware {
-                attachment:
-                    attachment @ (FirmwareAttachment::Usb | FirmwareAttachment::WritableUsbFixture),
+                attachment: FirmwareAttachment::Usb | FirmwareAttachment::WritableUsbFixture,
                 ..
-            } => {
+            }
+            | BootSource::LiveSetup { .. } => {
                 cmd.args(["-device", "qemu-xhci,id=media-xhci"]);
-                let read_only = matches!(attachment, FirmwareAttachment::Usb) || disk.read_only;
+                let read_only = match source {
+                    BootSource::Firmware {
+                        attachment: FirmwareAttachment::WritableUsbFixture,
+                        ..
+                    } => disk.read_only,
+                    _ => true,
+                };
                 cmd.arg("-drive").arg(drive_arg(disk.path, read_only));
                 cmd.arg("-device").arg(format!(
                     "usb-storage,bus=media-xhci.0,drive={},removable=on",
@@ -5070,8 +5075,8 @@ fn boot_source(
         cmd.arg("-drive").arg(install::target_drive_arg(target));
         target.attach(&mut cmd, install::protocol::TARGET_SERIAL, None)?;
     }
-    // After the medium, so the medium is the first disk and the target the
-    // second.
+    // After the medium, which is USB storage: the target is the only virtio
+    // disk.
     if let BootSource::LiveSetup { target, .. } = source {
         cmd.arg("-drive").arg(install::target_drive_arg(target));
         target.attach(&mut cmd, setup_input::TARGET_SERIAL, None)?;

@@ -91,8 +91,8 @@ F12, td-ui's theme chord, moves it to the next and keeps it
 it asks the service nothing, and the headless renders paint in `SAND`.
 Its library also has pure, unconnected progress and completion views. A
 live boot starts the window in the graphical session ("Live startup"); the
-end-to-end installation evidence is in place for optical media, and USB
-media and activating the release profile remain (increment 7).
+end-to-end installation evidence is in place with the medium booted as
+USB mass storage; activating the release profile remains (increment 7).
 
 ### Live startup
 
@@ -137,7 +137,10 @@ command line td-setup cannot read leaves it off.
 
 `td-recipe-eval qemu-boot-live` boots the medium `build-iso` composes, from
 the same verified deployment and with a key made for the run, through UEFI
-firmware as optical media, with an empty sparse disk after it. Firmware
+firmware as USB mass storage behind an xHCI controller, read-only, with an
+empty sparse virtio disk after it. This oracle boots the medium only as
+USB; optical media stay supported, and `qemu-install-system` and
+`qemu-boot-media` boot media both ways. Firmware
 passes no command line on the removable-media path, so the run's private
 copy of the firmware's variables holds one boot entry, `Boot0000` first in
 `BootOrder`, naming only `\EFI\BOOT\BOOTX64.EFI`, which firmware loads from
@@ -1200,15 +1203,15 @@ not discover `/etc/zoneinfo` automatically.
    host and home reported, the zone named by the compositor's clock and
    shown on it, and the account's login shell keeping a file in the same
    home across both boots, and `qemu-boot-live` boots the ISO itself
-   through firmware as optical media. Booting the live medium as USB mass
-   storage in that oracle, and activating the profile, remain.
+   through firmware as USB mass storage. Activating the profile remains.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media
-attachments, wrong deployment signatures, insufficient capacity and scratch,
-interrupted installation, changed disk ordering and a second installed boot.
-Require actual rendered/input and installed-session evidence, not only
-serial markers printed before the relevant operation completes.
+attachments (`qemu-boot-live` alone boots only USB), wrong deployment
+signatures, insufficient capacity and scratch, interrupted installation,
+changed disk ordering and a second installed boot. Require actual
+rendered/input and installed-session evidence, not only serial markers
+printed before the relevant operation completes.
 
 ## Read-only block inventory diagnostic
 

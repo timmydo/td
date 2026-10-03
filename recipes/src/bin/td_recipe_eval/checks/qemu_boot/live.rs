@@ -7,7 +7,7 @@
 //!
 //! The medium is `build-iso`'s, composed by the same function from the same
 //! verified store deployment and signed with a key made for this run, and
-//! firmware boots it as optical media: the run's private copy of the
+//! firmware boots it as USB mass storage: the run's private copy of the
 //! firmware's variables holds one boot entry, the medium's removable
 //! loader with the autotest and wizard-evidence tokens as its load options,
 //! which the kernel appends to its built-in command line and the live
@@ -52,8 +52,9 @@ use super::*;
 const TD_SETUP_LIVE_MARKER: &str = td_recipe::ladder::TD_SETUP_LIVE_MARKER;
 /// The live volume is half of RAM and the stock session runs on the rest.
 const LIVE_MEMORY_MIB: &str = "4096";
-/// The destination the wizard should list: the only virtio disk, the
-/// medium being optical.
+/// The destination the wizard should list: the only virtio disk. The
+/// medium, USB storage attached read-only, is excluded twice: as the
+/// source's disk and as unwritable.
 const TARGET_KERNEL_NAME: &str = "vda";
 const USERNAME: &str = "dana";
 const HOSTNAME: &str = "td-wizard";
@@ -193,7 +194,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         },
     )?;
     println!(
-        "PASS: the live medium, booted through firmware as optical media, \
+        "PASS: the live medium, booted through firmware as USB mass storage, \
          booted its signed deployment into the graphical \
          session; the installer wizard, focused with td-authd's setup intake \
          bound, took physical keys through the destination and settings pages \
