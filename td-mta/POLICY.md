@@ -95,14 +95,21 @@ never joins broken byte sequences. Text form unfolds an accepted line ending
 followed by SP/HTAB, removes initial SP, decodes only properly placed RFC
 2047 encoded words with known charsets, removes their encoded NUL/control
 characters, then applies NFC. Whitespace between adjacent valid encoded
-words is ignored as RFC 2047 requires. Bad placement or unknown charset
-leaves the encoded word literal; malformed payload of an otherwise decodable
-word uses replacement and resumes. Unfolding removes the accepted line
-ending, not the following whitespace. Encoded words longer than RFC 2047's
-75-character ceiling remain literal. Decode adjacent words separately; do
-not join invalid split multibyte sequences across words. Their invalid
-fragments produce replacement. No blanket trim changes trailing spaces or an
-initial tab. All decoding is independent of chunk size.
+words is ignored as RFC 2047 requires. Bad placement, context-forbidden Q
+characters or an unknown charset leaves the encoded word literal; malformed
+payload of an otherwise decodable word uses replacement and resumes.
+Unfolding removes the accepted line ending, not the following whitespace.
+Encoded words longer than RFC 2047's 75-character ceiling remain literal.
+Decode adjacent words separately; do not join invalid split multibyte
+sequences across words. Their invalid fragments produce replacement. An RFC
+2231 charset*language qualifier uses the same known charset set; retain its
+language as passive metadata without changing decoding. Accept a 1..8-letter
+primary tag and optional hyphenated 1..8-letter/digit subtags; malformed
+qualifiers remain literal. This is lexical validation, not a language-
+registry lookup. Encoded-word token syntax still applies to charset aliases;
+ansi_x3.4-1968 is a body alias only because its period is forbidden there.
+No blanket trim changes trailing spaces or an initial tab. All decoding is
+independent of chunk size.
 
 Supported charset labels (ASCII case insensitive) are utf-8, us-ascii,
 iso-8859-1 and windows-1252; aliases utf8, ascii, latin1 and cp1252 map to

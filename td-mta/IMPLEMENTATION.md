@@ -1297,6 +1297,14 @@ Initial independently landable increments:
   ASCII work, deadlines and allocation-free turns. Decoded-header adapters,
   malformed-byte replacement and worker/protocol integration remain open.
 
+- **M06q — bounded encoded-word candidate syntax:** recognize whole admitted
+  tokens with known charsets, B/Q encoding, a 75-byte ceiling and Text/Phrase/
+  Comment grammar. Retain optional language qualifiers without allocation.
+  Precharge bounded scans; distinguish nonwords from recognized malformed
+  payloads. Verify exact boundaries, context restrictions and meter failures.
+  Lexical placement, payload decoding, adjacent whitespace suppression and
+  normalized-header composition remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

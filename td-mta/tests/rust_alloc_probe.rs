@@ -1902,6 +1902,57 @@ fn mime_qp_input() {
     assert_eq!(before, after, "owned QP source/text allocated");
 }
 
+fn encoded_word_candidates() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        encoded_word::{Context, Encoding, Word},
+        mime_charset::Charset,
+        ports::{Deadline, Tick},
+    };
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10000,
+            records: 10000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    let word = Word::recognize(
+        black_box(b"=?UTF-8*en?Q?hello_world?="),
+        Context::Phrase,
+        Tick(1),
+        &mut work,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(word.payload(), b"hello_world");
+    assert_eq!(word.language(), Some(b"en".as_slice()));
+    assert_eq!(word.charset(), Charset::Utf8);
+    assert_eq!(word.encoding(), Encoding::Q);
+    assert_eq!(
+        Word::recognize(
+            black_box(b"=?utf-8?Q?(a)?="),
+            Context::Comment,
+            Tick(1),
+            &mut work
+        )
+        .unwrap(),
+        None
+    );
+    assert!(Word::recognize(
+        black_box(b"=?utf-8?B?--?="),
+        Context::Text,
+        Tick(1),
+        &mut work
+    )
+    .unwrap()
+    .is_some());
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "encoded-word recognition allocated");
+}
+
 fn unicode_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2407,6 +2458,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        encoded_word_candidates();
         mime_input();
         mime_headers();
         body_value();
@@ -2502,6 +2554,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    encoded_word_candidates();
     mime_input();
     mime_headers();
     body_value();

@@ -1106,6 +1106,48 @@ protocol integration remain separate. Callers must enforce the admitted
 source extent. The complete official NFC equations and adversarial resident
 replay tests do not establish those future adapters or whole-service memory.
 
+### 1.24 Encoded-word candidate syntax
+
+M06q supplies `encoded_word::Word::recognize(token, context, tick, meter)`.
+The caller must first identify a complete token in a permitted lexical
+position. `Context::{Text,Phrase,Comment}` selects the RFC 2047 payload
+restrictions; it neither authorizes that position nor parses a whole header.
+In particular, addr-specs, quoted strings and forbidden header fields cannot
+be authorized by choosing a context. The future header cursor must enforce
+placement, both surrounding whitespace boundaries and the header-form
+whitelist before decoding. No convenient prefix of a token is accepted.
+
+The recognizer accepts at most 75 ASCII bytes, exact delimiters, a known
+charset and case-insensitive B/Q encoding. It requires nonempty printable
+encoded text without whitespace or question marks. Q payloads apply the
+additional phrase/comment character restrictions. Token and comment rules
+include verified RFC 2047 errata
+[504](https://www.rfc-editor.org/errata/eid504) and
+[506](https://www.rfc-editor.org/errata/eid506). A supported charset's
+optional RFC 2231 language qualifier is retained as a borrowed slice; its
+lexical shape is a 1..8-letter primary tag followed by optional 1..8-letter/
+digit subtags. No language registry, locale or language negotiation is used.
+Ordinary charset labels still obey encoded-word token syntax: the known body
+alias ansi_x3.4-1968 contains a forbidden period and remains literal here.
+
+`Ok(None)` means retain the complete literal token. `Some(Word)` exposes only
+borrowed payload/language and copied charset/encoding enums, at most 48 bytes.
+It establishes candidate syntax, not payload decodability: bad Base64 or Q
+escapes remain available to a separate replacement decoder. The recognizer
+performs no decoding, control removal, whitespace suppression, NFC or output.
+Those next layers must keep adjacent words' charset state separate.
+
+Every attempt charges one record before the length guard. Candidates within
+9 through 75 bytes additionally precharge three conservative candidate scans:
+3 * length source bytes and records, even if syntax later fails. This bounds
+an attempt to 226 charged records and two fixed slices plus enum state, with
+no growing buffer or admitted allocation. One record covers bounded charset
+lookup; the scan allowance covers delimiters, grammar and language shape.
+Oversized candidates are rejected without reading their bytes. Work errors
+propagate with the meter's sticky failure; no partial Word is returned.
+Callers bracket attempts with fresh clock/cancellation checks and retain
+aggregate header accounting when composing this helper with NFC.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
