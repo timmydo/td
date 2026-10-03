@@ -152,15 +152,23 @@ pub fn civil_to_unix_utc(c: &Civil) -> Option<i64> {
 
 /// `%Y-%m-%d %H:%M:%S`.
 pub fn format_ymd_hms(c: &Civil) -> String {
+    format!("{} {}", format_ymd(c), format_hms(c))
+}
+
+/// `%Y-%m-%d`, a negative year as `-0044`.
+pub fn format_ymd(c: &Civil) -> String {
     let year = if c.year < 0 {
         format!("-{:04}", i64::from(c.year).unsigned_abs())
     } else {
         format!("{:04}", c.year)
     };
-    format!(
-        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year, c.month, c.day, c.hour, c.minute, c.second
-    )
+    format!("{}-{:02}-{:02}", year, c.month, c.day)
+}
+
+/// `%Y-%m-%dT%H:%M:%SZ`: RFC 3339 in UTC to the second.
+pub fn format_rfc3339_utc(unix: i64) -> String {
+    let c = unix_to_civil_utc(unix);
+    format!("{}T{}Z", format_ymd(&c), format_hms(&c))
 }
 
 /// `%H:%M:%S`.
@@ -1036,6 +1044,16 @@ fn tz_file_path(tz: Option<&str>) -> String {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_formats_render_the_date_and_the_rfc3339_instant() {
+        assert_eq!(format_ymd(&civil(2024, 1, 2, 3, 4, 5)), "2024-01-02");
+        assert_eq!(format_ymd(&civil(-1, 12, 31, 0, 0, 0)), "-0001-12-31");
+        assert_eq!(format_rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339_utc(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(format_rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(format_rfc3339_utc(4_107_542_399), "2100-02-28T23:59:59Z");
+    }
 
     fn civil(y: i32, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> Civil {
         Civil::new(y, mo, d, h, mi, s)

@@ -2678,8 +2678,8 @@ fn settle_lost_send(
 ) -> Result<Option<SentDraft>, String> {
     let asking = |e: JmapError| format!("asking the server whether the last send went: {e}");
     const SLACK: i64 = 24 * 3600;
-    let since = submit::rfc3339_utc(lost.since.saturating_sub(SLACK));
-    let until = submit::rfc3339_utc(lost.since.saturating_add(SLACK));
+    let since = td_civil::format_rfc3339_utc(lost.since.saturating_sub(SLACK));
+    let until = td_civil::format_rfc3339_utc(lost.since.saturating_add(SLACK));
     let identity_id = lost.identity_id.as_str();
     let carries = |email: &Email| {
         email
@@ -3311,10 +3311,10 @@ fn collect_retention_candidates(
                 if !seen_email_ids.insert(email.id.clone()) {
                     continue;
                 }
-                let Some(received_days) = email_received_days(&email) else {
+                let Some(days) = email.received_at.as_deref().and_then(received_days) else {
                     continue;
                 };
-                if received_days >= cutoff_days {
+                if days >= cutoff_days {
                     continue;
                 }
 
@@ -3369,26 +3369,20 @@ fn current_days_since_epoch() -> Result<i64, String> {
     Ok((now.as_secs() / 86_400) as i64)
 }
 
-fn email_received_days(email: &Email) -> Option<i64> {
-    let received = email.received_at.as_deref()?;
-    let y = received.get(0..4)?.parse::<i32>().ok()?;
-    let m = received.get(5..7)?.parse::<u32>().ok()?;
-    let d = received.get(8..10)?.parse::<u32>().ok()?;
-    ymd_to_days_since_epoch(y, m, d)
-}
-
-// Convert calendar date to day index since Unix epoch.
-fn ymd_to_days_since_epoch(year: i32, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+/// The day index since the Unix epoch of the `YYYY-MM-DD` a `receivedAt`
+/// opens with (RFC 8620's UTCDate), or `None` for any other shape or a
+/// date that is not real: such an email is no retention candidate.
+fn received_days(received: &str) -> Option<i64> {
+    let date = received.get(..10)?;
+    let shaped = date.bytes().enumerate().all(|(index, byte)| match index {
+        4 | 7 => byte == b'-',
+        _ => byte.is_ascii_digit(),
+    });
+    if !shaped {
         return None;
     }
-    let y = year as i64 - if month <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = month as i64 + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
+    let day = td_civil::parse_ymd(date)?;
+    Some(td_civil::civil_to_unix_utc(&day)?.div_euclid(td_civil::SECS_PER_DAY))
 }
 
 #[cfg(test)]
@@ -3765,6 +3759,28 @@ mod tests {
         assert_eq!(move_targets.len(), 2);
         assert!(move_targets.contains(&"archive".to_string()));
         assert!(move_targets.contains(&"trash".to_string()));
+    }
+
+    /// A real date is its day index; an impossible one (the old arithmetic
+    /// took 02-31 as a day in March) or a short one is no date at all.
+    #[test]
+    fn received_dates_are_day_indices_or_nothing() {
+        assert_eq!(received_days("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(received_days("2024-02-29T23:59:59Z"), Some(19_782));
+        assert_eq!(received_days("1969-12-31T12:00:00Z"), Some(-1));
+        assert_eq!(received_days("2023-02-29T00:00:00Z"), None);
+        assert_eq!(received_days("2024-02-31T00:00:00Z"), None);
+        assert_eq!(received_days("2024-02"), None);
+        // Exactly the UTCDate shape: no padding, sign or other separator.
+        for bad in [
+            "2024-1-5  T",
+            " 2024-1-05",
+            "2024x01x05",
+            "+024-01-05",
+            "-001-01-01",
+        ] {
+            assert_eq!(received_days(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -11,11 +11,7 @@ use td_json::ObjectBuilder;
 /// Now as JMAP's `UTCDate`, so what the mock makes is inside the window
 /// a client asks about.
 fn now_rfc3339() -> String {
-    let c = td_civil::unix_to_civil_utc(td_civil::now_unix());
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        c.year, c.month, c.day, c.hour, c.minute, c.second
-    )
+    td_civil::format_rfc3339_utc(td_civil::now_unix())
 }
 
 #[derive(Clone)]

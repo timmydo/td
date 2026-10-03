@@ -539,15 +539,6 @@ pub fn sent_dir_for(draft: &Path) -> Option<PathBuf> {
     Some(drafts.parent()?.join("sent"))
 }
 
-/// A Unix time as JMAP's `UTCDate`, RFC 3339 in UTC to the second.
-pub fn rfc3339_utc(unix: i64) -> String {
-    let c = td_civil::unix_to_civil_utc(unix);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        c.year, c.month, c.day, c.hour, c.minute, c.second
-    )
-}
-
 /// A Message-ID for one send, without its angle brackets as JMAP carries
 /// it: the time in nanoseconds, the process and a count within it, so
 /// two sends in one clock tick differ, at the From's domain. It is made
@@ -585,7 +576,7 @@ pub fn email_json(
     if from.name.as_deref().is_none_or(str::is_empty) && !identity.name.is_empty() {
         from.name = Some(identity.name.clone());
     }
-    let sent_at = rfc3339_utc(now);
+    let sent_at = td_civil::format_rfc3339_utc(now);
     let mut email = ObjectBuilder::new()
         .set("from", &vec![from])
         .set("subject", &outgoing.subject)
