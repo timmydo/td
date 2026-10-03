@@ -1,7 +1,10 @@
 //! Strict resident RFC 2369 lists; complete validation precedes URL bytes.
+mod budgeted;
+pub use budgeted::Budgeted;
 mod uri;
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     header_cfws,
     ports::Tick,
 };
@@ -25,6 +28,15 @@ pub enum Error {
     Work(Stop),
     InterpretationLimit,
     InvalidState,
+}
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Work(stop) => Self::Work(stop),
+            DecodeError::InterpretationLimit => Self::InterpretationLimit,
+            DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
 }
 impl From<Stop> for Error {
     fn from(value: Stop) -> Self {
@@ -90,6 +102,13 @@ impl<'a> Cursor<'a> {
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -102,20 +121,19 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn peek(&self, offset: usize, now: Tick, work: &mut Meter) -> Result<Option<u8>, Error> {
+    fn peek(&self, offset: usize, now: Tick, work: &mut impl Work) -> Result<Option<u8>, Error> {
         let position = self
             .position
             .checked_add(offset)
             .ok_or(Error::InvalidState)?;
-        let byte = self.source.get(position);
         work.charge(
             now,
             Charge {
-                io_bytes: u64::from(byte.is_some()),
+                io_bytes: u64::from(position < self.source.len()),
                 ..Charge::default()
             },
         )?;
-        Ok(byte.copied())
+        Ok(self.source.get(position).copied())
     }
     fn advance(&mut self, count: usize) -> Result<(), Error> {
         self.position = self
@@ -149,7 +167,7 @@ impl<'a> Cursor<'a> {
             Status::Yield
         }
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         work.charge(
             now,
             Charge {
@@ -158,7 +176,7 @@ impl<'a> Cursor<'a> {
             },
         )?;
         if let Some(cursor) = &mut self.cfws {
-            if let header_cfws::Status::Complete(end) = cursor.poll(now, work)? {
+            if let header_cfws::Status::Complete(end) = cursor.poll_with_work(now, work)? {
                 if end.position < self.position || end.position > self.source.len() {
                     return Err(Error::InvalidState);
                 }

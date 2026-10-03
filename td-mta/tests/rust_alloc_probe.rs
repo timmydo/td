@@ -3100,6 +3100,76 @@ fn header_date_projection() {
     assert_eq!(before, after, "header date projection allocated");
 }
 
+fn budgeted_header_urls() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_urls::{Budgeted, Error, Mode, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        "({})<https://example.test/{}>",
+        "🐈".repeat(4096),
+        "path/".repeat(4096)
+    );
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for (source, count, malformed) in [
+        (
+            long.as_bytes(),
+            b"https://example.test/".len() + 4096 * 5,
+            false,
+        ),
+        (b"<x://[::1]>".as_slice(), 9, false),
+        (b"<x://[v1.a:b]>", 12, false),
+        (b"NO", 0, false),
+        (b"<x:a> (bad", 0, true),
+    ] {
+        let mut cursor = Budgeted::new(black_box(source), Mode::ListPost, &mut work, &mut budget);
+        let mut bytes = 0;
+        let mut finished = false;
+        for _ in 0..200_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Byte(_)) => bytes += 1,
+                Ok(Status::Complete) => {
+                    assert!(!malformed);
+                    cursor.check_deadline(Tick(1)).unwrap();
+                    finished = true;
+                    break;
+                }
+                Err(Error::Malformed) => {
+                    assert!(malformed);
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Malformed));
+                    finished = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("unexpected budgeted URL failure: {error}"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(bytes, count);
+    }
+    let mut cursor = Budgeted::new(b"NO", Mode::ListPost, &mut work, &mut budget);
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted URLs allocated");
+}
+
 fn message_id_header_values() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4926,6 +4996,7 @@ fn main() {
         header_date_projection();
         budgeted_date_projection();
         header_dates();
+        budgeted_header_urls();
         message_id_header_values();
         budgeted_message_id_text();
         budgeted_message_ids();
@@ -5056,6 +5127,7 @@ fn main() {
     header_date_projection();
     budgeted_date_projection();
     header_dates();
+    budgeted_header_urls();
     message_id_header_values();
     budgeted_message_id_text();
     budgeted_message_ids();

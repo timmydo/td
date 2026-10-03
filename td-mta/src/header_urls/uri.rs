@@ -1,9 +1,6 @@
 //! Generic RFC 3986 URI syntax; no scheme-specific interpretation.
 use super::Error;
-use crate::{
-    admission::work::{Charge, Meter},
-    ports::Tick,
-};
+use crate::{admission::work::Charge, decode_work::Work, ports::Tick};
 fn unreserved(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
 }
@@ -68,7 +65,7 @@ impl Validator {
             length: 0,
         }
     }
-    pub(super) fn push(&mut self, b: u8, now: Tick, work: &mut Meter) -> Result<(), Error> {
+    pub(super) fn push(&mut self, b: u8, now: Tick, work: &mut impl Work) -> Result<(), Error> {
         if self.percent != 0 {
             if !b.is_ascii_hexdigit() {
                 return Err(Error::Malformed);
@@ -138,7 +135,7 @@ impl Validator {
         }
         Ok(())
     }
-    fn authority(&mut self, b: u8, now: Tick, work: &mut Meter) -> Result<(), Error> {
+    fn authority(&mut self, b: u8, now: Tick, work: &mut impl Work) -> Result<(), Error> {
         if matches!(self.host, Host::Literal) {
             return self.literal(b, now, work);
         }
@@ -196,7 +193,7 @@ impl Validator {
         }
         Ok(())
     }
-    fn literal(&mut self, b: u8, now: Tick, work: &mut Meter) -> Result<(), Error> {
+    fn literal(&mut self, b: u8, now: Tick, work: &mut impl Work) -> Result<(), Error> {
         if b == b']' {
             match self.literal {
                 Literal::V6 => {

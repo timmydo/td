@@ -1092,6 +1092,14 @@ eight bytes per poll. Probe intervals cover long arrays, malformed fields,
 repaired scalars, one-byte drains and late refusal. Combined worker/native/RSS
 qualification remains open.
 
+The budgeted URLs cursor (M06bb) fits 288 bytes in the existing 16 KiB parser
+reservation, replacing standalone URL state. It retains CFWS/URI state, the
+45-byte IPv6 array and original budgets; a shared transient Conversion adapter
+uses three references. No scratch or process allowance grows. A turn charges
+at most 160 visits, 193 aggregate steps, thirteen job records and one output
+byte. Probe intervals cover long comments/URLs, literals, NO and refusals.
+URL property JSON and combined worker/native/RSS qualification remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

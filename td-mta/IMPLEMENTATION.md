@@ -1579,6 +1579,12 @@ Initial independently landable increments:
   charges, handoff guards, late refusal and allocation-free short drains.
   Other structured forms and unpublished response retention remain open.
 
+- **M06bb — budgeted resident URLs:** retain original job/email budgets across
+  whole-field validation, URI parsing and replay. Share the MessageIds
+  conversion charging policy; admit lookahead before access. Pin exact
+  two-pass/IPv6 costs, partial cutoffs, field credit and allocation-free long
+  input. URL property JSON and unpublished response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

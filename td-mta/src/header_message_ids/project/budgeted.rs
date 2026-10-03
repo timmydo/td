@@ -2,7 +2,7 @@
 use super::{Cursor, Error, Mode, Phase, Status};
 use crate::{
     admission::work::{Charge, Meter},
-    decode_work::{Error as DecodeError, Parsing, Work},
+    decode_work::{Conversion, Error as DecodeError},
     nfc::HeaderBudget,
     ports::Tick,
 };
@@ -99,11 +99,7 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         self.check_deadline(now)?;
         let result = self.cursor.poll_with_work::<UNFOLD_TRANSITIONS>(
             now,
-            &mut Conversion {
-                work: self.work,
-                budget: self.budget,
-                credit: &mut self.credit,
-            },
+            &mut Conversion::new(self.work, self.budget, &mut self.credit),
         );
         if let Err(error) = result {
             self.failure = Some(error);
@@ -111,31 +107,12 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         result
     }
 }
-struct Conversion<'w> {
-    work: &'w mut Meter,
-    budget: &'w mut HeaderBudget,
-    credit: &'w mut u8,
-}
-impl Work for Conversion<'_> {
-    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), DecodeError> {
-        if charge.output_bytes == 0 {
-            return Parsing::new(self.work, self.budget, self.credit).charge(now, charge);
-        }
-        if charge.io_bytes != 0 || charge.records != 0 || charge.unlinks != 0 {
-            return Err(DecodeError::InvalidState);
-        }
-        self.budget
-            .charge(self.work, now, 0, 1, self.credit)
-            .map_err(DecodeError::from)?;
-        self.work.charge(now, charge).map_err(DecodeError::Work)
-    }
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::{admission::work::Stop, ports::Deadline};
+    use crate::{admission::work::Stop, decode_work::Work, ports::Deadline};
     fn work() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
@@ -363,24 +340,14 @@ mod tests {
         };
         let before = work.remaining();
         assert_eq!(
-            Conversion {
-                work: &mut work,
-                budget: &mut budget,
-                credit: &mut credit
-            }
-            .charge(Tick(1), invalid),
+            Conversion::new(&mut work, &mut budget, &mut credit).charge(Tick(1), invalid),
             Err(DecodeError::InvalidState)
         );
         assert_eq!(work.remaining(), before);
         assert_eq!(budget.steps_remaining(), 16_000_000);
         assert_eq!(credit, 0);
         assert_eq!(
-            Conversion {
-                work: &mut work,
-                budget: &mut budget,
-                credit: &mut credit
-            }
-            .charge(
+            Conversion::new(&mut work, &mut budget, &mut credit).charge(
                 Tick(1),
                 Charge {
                     output_bytes: 1,
@@ -433,11 +400,7 @@ mod tests {
                     &mut output[..capacity],
                     last,
                     Tick(1),
-                    &mut Conversion {
-                        work: &mut work,
-                        budget: &mut budget,
-                        credit: &mut credit,
-                    },
+                    &mut Conversion::new(&mut work, &mut budget, &mut credit),
                 )
                 .unwrap();
             assert_eq!(

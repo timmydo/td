@@ -62,3 +62,37 @@ impl Work for Parsing<'_> {
             .map_err(Error::from)
     }
 }
+
+/// Parsing admission plus separately charged conversion output.
+pub(crate) struct Conversion<'w> {
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: &'w mut u8,
+}
+impl<'w> Conversion<'w> {
+    pub(crate) fn new(
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+        credit: &'w mut u8,
+    ) -> Self {
+        Self {
+            work,
+            budget,
+            credit,
+        }
+    }
+}
+impl Work for Conversion<'_> {
+    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), Error> {
+        if charge.output_bytes == 0 {
+            return Parsing::new(self.work, self.budget, self.credit).charge(now, charge);
+        }
+        if charge.io_bytes != 0 || charge.records != 0 || charge.unlinks != 0 {
+            return Err(Error::InvalidState);
+        }
+        self.budget
+            .charge(self.work, now, 0, 1, self.credit)
+            .map_err(Error::from)?;
+        self.work.charge(now, charge).map_err(Error::Work)
+    }
+}

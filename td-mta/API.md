@@ -2776,6 +2776,48 @@ handoffs. Allocation intervals cover long values, malformed fields, repairs,
 one-byte drains and late refusal in both registered modes. Other structured
 forms and unpublished response-spool retention remain follow-on work.
 
+### 1.60 Budgeted resident URLs
+
+M06bb adds `header_urls::Budgeted` over one admitted immutable field slice,
+retaining the original job/email budgets and non-copyable private credit.
+It preserves URLs/ListPost grammar, whole-field validation before replay,
+ASCII Byte events, exact spelling and NO as an empty ListPost list. Only the
+List-Post field may authorize that mode. No URL is fetched or resolved.
+Malformed/nesting outcomes precede all events; later resource refusal retires
+all provisional replay output. No property JSON is emitted here.
+
+The shared private Conversion adapter now serves MessageIds text and URLs.
+Non-output work uses Parsing's source-visits-plus-records rule with at least
+one step per charge, including EOF. Output-only work first charges one step,
+then job output; prior admitted work remains if the latter refuses. Mixed
+output/input/record/unlink requests refuse before counters change. Moving
+this adapter does not change MessageIds costs. URL, CFWS and URI validation
+share the same original budgets and field-local credit. Source lookahead is
+charged before reading; the plain Meter entry point keeps its exact costs.
+
+A poll charges at most 160 source visits, 193 aggregate steps, thirteen job
+records and one output byte. The fixed IPv6 parse prepays 64 aggregate steps
+before parsing at most 45 retained bytes with std. `<x:>` costs ten visits,
+34 steps and two output bytes; ListPost NO costs six visits, 24 steps and no
+output; `<x://[::1]>` costs 24 visits, 197 steps and nine output bytes across
+both passes. Unused credit is discarded between fields. Aggregate exhaustion
+latches on the email budget, while job stops retain their own typed cause.
+Cached completion is inert; explicit final admission remains live and can
+retire it. No resource failure becomes malformed or a successful prefix.
+
+The wrapper fits 288 bytes including inline CFWS, URI state, the 45-byte IPv6
+array, budget references and private credit. It replaces the standalone URL
+cursor in the existing 16 KiB parser reservation. The transient adapter uses
+three references, with no arena, retained URL/list or conversion scratch.
+Combined worker/native/RSS qualification remains open.
+
+Tests compare plain/budgeted events, visits and output; pin exact two-pass and
+IPv6 costs; exhaust every partial budget through validation/replay; and cover
+pre-access refusal, field-credit isolation, job stops and final admission.
+Probe intervals cover long comments/URLs, literal parsing, malformed tails,
+NO and terminal refusal in both registered modes. URL property JSON and
+unpublished response-spool retention remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
