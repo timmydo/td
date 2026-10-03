@@ -29,6 +29,7 @@
 //! `json!`) is bounded by the program's own source, and the recursive writer
 //! and `PartialEq` inherit that bound.
 
+#![forbid(unsafe_code)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,

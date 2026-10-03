@@ -10,6 +10,8 @@
 //! Coverage is TOML 1.0 minus dates and times, which no td application
 //! reads; a date or time value is refused by name rather than mis-parsed.
 
+#![forbid(unsafe_code)]
+
 use std::fmt;
 
 /// Nesting accepted before the parser gives up. Bounds recursion in
