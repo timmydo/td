@@ -13,8 +13,9 @@
 use td_ui::font::{self, Font};
 use td_ui::raster::{
     hint_run, text_run, Composition, Draw, Error, GlyphStyle, Primitive, Raster, Rect, Scale,
-    Scrollbar, Surface, Weight, INK, PAPER,
+    Scrollbar, Surface, Weight, CHROME, INK, PAPER,
 };
+use td_ui::theme::{DUSK, SAND, THEMES};
 
 fn surface(width: usize, height: usize, scale: u8) -> Surface {
     Surface::new(width, height, Scale::new(scale).unwrap()).unwrap()
@@ -26,6 +27,81 @@ fn inside(rect: Rect, x: usize, y: usize) -> bool {
         && y as i128 >= i128::from(rect.y)
         && (x as i128) < i128::from(rect.x) + i128::from(rect.width)
         && (y as i128) < i128::from(rect.y) + i128::from(rect.height)
+}
+
+#[test]
+fn a_theme_paints_the_palette_in_its_colours_and_passes_others() {
+    let font = font::pinned().unwrap();
+    let surface = surface(48, 32, 2);
+    let draws = [
+        Primitive::Fill {
+            rect: surface.bounds(),
+            color: PAPER,
+        },
+        Primitive::Fill {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 6,
+                height: 6,
+            },
+            color: 0x0033aa,
+        },
+        Primitive::Glyph {
+            x: 8,
+            y: 0,
+            scalar: 'W',
+            style: GlyphStyle::medium(INK, PAPER),
+        },
+        Primitive::Glyph {
+            x: 24,
+            y: 0,
+            scalar: 'k',
+            style: GlyphStyle::medium(0x0033aa, CHROME),
+        },
+        Primitive::Mark {
+            x: 2,
+            y: 20,
+            scalar: 'q',
+            ink: INK,
+        },
+    ];
+    let paint = |theme: Option<&'static td_ui::theme::Theme>, premapped: bool| {
+        let mut pixels = vec![0; 48 * 32 * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, 48 * 4).unwrap();
+        if let Some(theme) = theme {
+            raster = raster.with_theme(theme);
+        }
+        for primitive in draws {
+            let primitive = if premapped {
+                DUSK.primitive(primitive)
+            } else {
+                primitive
+            };
+            raster.draw(Draw {
+                clip: surface.bounds(),
+                primitive,
+            });
+        }
+        pixels
+    };
+    let plain = paint(None, false);
+    assert_eq!(paint(Some(&SAND), false), plain, "sand is the palette");
+    let themed = paint(Some(&DUSK), false);
+    // The fringe and every pixel come from the mapped colours, exactly as
+    // a raster given the mapped draws paints them.
+    assert_eq!(themed, paint(None, true));
+    assert_ne!(themed, plain);
+    let at = |pixels: &[u8], x: usize, y: usize| {
+        let i = (y * 48 + x) * 4;
+        u32::from_le_bytes(pixels[i..i + 4].try_into().unwrap()) & 0xff_ffff
+    };
+    assert_eq!(at(&themed, 47, 31), DUSK.map(PAPER));
+    assert_eq!(at(&themed, 3, 3), 0x0033aa, "another colour passes");
+    assert!(themed
+        .chunks(4)
+        .any(|p| u32::from_le_bytes(p.try_into().unwrap()) & 0xff_ffff == DUSK.map(INK)));
+    assert_eq!(THEMES.len(), 6);
 }
 
 #[test]

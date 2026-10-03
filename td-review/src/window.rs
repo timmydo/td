@@ -48,7 +48,7 @@ use td_ui::editor_model::TabId;
 use td_ui::pointer::DoubleClick;
 use td_ui::raster::{
     self, Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scrollbar, Surface, Weight,
-    CHROME, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
+    ACCENT, CHROME, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED, SUCCESS, WARNING,
 };
 #[cfg(test)]
 use td_ui::window::NoClipboard;
@@ -143,15 +143,14 @@ fn scroll_of(key: Key, page: usize) -> Option<isize> {
 }
 
 /// The ink a palette slot is drawn in on the toolkit's paper. The slots name
-/// what a line means (a failure, a success, a warning, a heading); these are
-/// the warm palette's legible on its ground, the amber darkened as far as it
-/// takes to read as text.
+/// what a line means (a failure, a success, a warning, a heading), so each
+/// is the toolkit's ink for that meaning, which its themes recolour.
 fn ink(code: u8) -> u32 {
     match code {
         RED => MISSPELLED,
-        GREEN => 0x4d6b3c,
-        YELLOW => 0x86601a,
-        MAGENTA => 0x7a4d74,
+        GREEN => SUCCESS,
+        YELLOW => WARNING,
+        MAGENTA => ACCENT,
         CYAN => SELECTED,
         _ => INK,
     }

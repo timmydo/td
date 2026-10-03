@@ -26,6 +26,7 @@ use td_ui::client::{App, DISPLAY, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, XDG_SU
 use td_ui::clipboard::MAX_BYTES;
 use td_ui::data::{PLAIN, UTF8};
 use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight, PAPER};
+use td_ui::theme::{HARBOR, MOSS, SAND};
 use td_ui::typeface::Typeface;
 use td_ui::wayland::{backing_file, peer, Connection, IDLE_WAIT};
 use td_ui::window::{
@@ -623,6 +624,75 @@ fn presses_arrive_as_chords_repeat_at_the_turn_and_focus_follows_the_keyboard() 
     w.handler_mut().quit_on = Some(Record::Key("q".into(), false));
     press(&mut w, keyboard, 23, 16);
     assert!(w.client().closed());
+}
+
+#[test]
+fn the_theme_chord_repaints_in_the_next_theme_keeps_it_and_is_not_delivered() {
+    let dir = std::env::temp_dir().join(format!("td-ui-window-theme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("td-recorder/theme");
+    let mut handler = Recorder::new();
+    let (w, peer, keyboard, _) = fixture(&mut handler);
+    let mut w = w.with_theme_file(path.clone());
+    assert_eq!(w.theme(), &SAND, "no file is the default");
+    assert!(w.handler().notices.is_empty());
+    focus_with_map(&mut w, &peer, keyboard);
+    configure(&mut w, 40, 20);
+    w.draw().unwrap();
+    done(&mut w);
+    let buffer = w.client().buffers()[0].id();
+    w.event(message(buffer, 0, &[])).unwrap();
+    // The one buffer's pool, which the repaint below reuses.
+    let (_, mut files) = drain(&peer);
+    let file = files.pop().unwrap();
+    let seen = w.handler().inputs.len();
+    // F12, no modifier held.
+    w.event(message(keyboard, 4, &[30, 0, 0, 0, 0])).unwrap();
+    press(&mut w, keyboard, 31, 88);
+    release(&mut w, keyboard, 32, 88);
+    assert_eq!(w.handler().inputs.len(), seen, "the window keeps the chord");
+    assert_eq!(w.theme(), &HARBOR);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "harbor\n");
+    // Painted at once, in the theme's paper, though the handler asked
+    // for nothing.
+    w.draw().unwrap();
+    assert_eq!(w.handler().paints(), 2);
+    let mut bytes = vec![0; 40 * 20 * 4];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(pixel(&bytes, 40, 39, 19), HARBOR.map(PAPER));
+    assert_eq!(pixel(&bytes, 40, 3, 3), BLUE, "the handler's own colour");
+    // A second press moves on again, once: held past the repeat delay,
+    // the key is no repeat and the handler still hears nothing.
+    w.tick(10_000).unwrap();
+    press(&mut w, keyboard, 33, 88);
+    assert_eq!(w.theme(), &MOSS);
+    w.end_turn(11_000, true).unwrap();
+    w.end_turn(12_000, true).unwrap();
+    assert_eq!(w.theme(), &MOSS);
+    assert_eq!(w.handler().inputs.len(), seen);
+    release(&mut w, keyboard, 34, 88);
+    // With a modifier held it is another chord, the handler's.
+    w.event(message(keyboard, 4, &[35, 1, 0, 0, 0])).unwrap();
+    press(&mut w, keyboard, 36, 88);
+    assert_eq!(last(&w), Some(&Record::Key("S-F12".into(), false)));
+    assert_eq!(w.theme(), &MOSS);
+    release(&mut w, keyboard, 37, 88);
+    // A window given the kept file starts in its theme.
+    drop(w);
+    let mut handler = Recorder::new();
+    let (w, _peer, _, _) = fixture(&mut handler);
+    let w = w.with_theme_file(path.clone());
+    assert_eq!(w.theme(), &MOSS);
+    // A file naming no theme is the default, with a notice.
+    std::fs::write(&path, "plaid").unwrap();
+    let mut handler = Recorder::new();
+    let (w, _peer, _, _) = fixture(&mut handler);
+    let w = w.with_theme_file(path.clone());
+    assert_eq!(w.theme(), &SAND);
+    assert_eq!(w.handler().notices.len(), 1);
+    assert!(w.handler().notices[0].contains("names no theme"));
+    drop(w);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

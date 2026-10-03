@@ -23,7 +23,7 @@ fn compact(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-const PURE: [&str; 44] = [
+const PURE: [&str; 45] = [
     "atlas.rs",
     "charts.rs",
     "chrome.rs",
@@ -57,6 +57,7 @@ const PURE: [&str; 44] = [
     "repeat.rs",
     "sfnt.rs",
     "split.rs",
+    "theme.rs",
     "tree_table.rs",
     "tree_table_geometry.rs",
     "tree_table_model.rs",
@@ -110,6 +111,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "pty.rs",
                 "replay.rs",
                 "sys.rs",
+                "theme_file.rs",
                 "wayland.rs",
                 "window.rs",
             ]
@@ -332,6 +334,53 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 assert!(!compact.contains(absent), "{absent} in face_file.rs");
             }
         }
+        if name == "theme_file.rs" {
+            // Two environment values for the path; one file opened,
+            // checked and bounded before it is read; one directory made
+            // and locked, and one private sibling renamed over the file it
+            // replaces.
+            assert_eq!(compact.matches("env::").count(), 2);
+            for read in ["XDG_CONFIG_HOME", "HOME"] {
+                assert_eq!(
+                    compact
+                        .matches(&format!("std::env::var_os(\"{read}\")"))
+                        .count(),
+                    1,
+                    "{read}"
+                );
+            }
+            assert!(compact
+                .contains("OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(path)"));
+            assert!(text.contains("const O_NONBLOCK: i32 = 0o4000;"));
+            assert!(compact.contains(".take(MAX_FILE_BYTESasu64+1)"));
+            assert!(compact.contains(
+                "OpenOptions::new().write(true).create_new(true).mode(0o600).open(&sibling)"
+            ));
+            assert!(compact.contains("DirBuilder::new().recursive(true).mode(0o700).create(dir)"));
+            // The read, the sibling, and the directory locked around the
+            // replacement.
+            assert_eq!(compact.matches(".open(").count(), 3);
+            assert!(compact.contains("OpenOptions::new().read(true).open(dir)"));
+            assert_eq!(compact.matches("lock.try_lock()").count(), 1);
+            assert!(!compact.contains(".lock()"), "a write never waits");
+            assert_eq!(compact.matches("fs::rename(&sibling,path)").count(), 1);
+            assert_eq!(compact.matches("fs::remove_file(&sibling)").count(), 2);
+            for absent in [
+                "canonicalize",
+                "eprintln!",
+                "File::open(",
+                "File::create",
+                ".append(",
+                ".truncate(",
+                "fs::write",
+                "fs::read",
+                "remove_dir",
+                "set_var",
+                "set_permissions",
+            ] {
+                assert!(!compact.contains(absent), "{absent} in theme_file.rs");
+            }
+        }
         if name == "pinned_face.rs" {
             // Reads only through face_file.
             for absent in ["File", "fs::", "env::", "eprintln!", "OpenOptions"] {
@@ -438,15 +487,16 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 );
             }
         }
-        // Outside tests the environment is read in two places: the
-        // opener's `BROWSER`, and the face search's three directory
-        // values and their list's split, pinned above.
+        // Outside tests the environment is read in three places: the
+        // opener's `BROWSER`, the face search's three directory values
+        // and their list's split, and the theme file's two, pinned above.
         let production = text.split("#[cfg(test)]").next().unwrap_or_default();
         assert_eq!(
             production.matches("std::env").count(),
             match name.as_str() {
                 "open.rs" => 1,
                 "face_file.rs" => 4,
+                "theme_file.rs" => 2,
                 _ => 0,
             },
             "environment access in {name}"

@@ -34,13 +34,14 @@
 //! terminal (td-term/DESIGN.md): the VT model (`vt`), its renderer
 //! (`vt_render`), the chord encoder and scrollback viewport (`vt_keys`),
 //! the terminfo compiler (`vt_terminfo`) and the PTY with its threads
-//! (`pty`).
+//! (`pty`), and the colour themes a raster paints in (`theme`) with the
+//! file a program's choice is kept in (`theme_file`).
 //! Outside `wayland`, `client`, `clipboard`, `pty`, the private raw module
 //! beneath them, the driving adapters
-//! `control_socket`, `control_worker` and `replay`, and the widget window
-//! `window`, nothing reads the environment, a clock, a descriptor or the
-//! filesystem: adapters supply explicit inputs, and `notices` embeds the
-//! face's licence texts at compile time.
+//! `control_socket`, `control_worker` and `replay`, the widget window
+//! `window`, and the face and theme files, nothing reads the environment,
+//! a clock, a descriptor or the filesystem: adapters supply explicit
+//! inputs, and `notices` embeds the face's licence texts at compile time.
 
 /// The bitmap cell every consumer lays text out on. The pinned Unifont face
 /// is 8x16 and `font::pinned` is held to these by a test, so pointer hit
@@ -102,6 +103,8 @@ pub mod reportable;
 pub mod sfnt;
 pub mod split;
 mod sys;
+pub mod theme;
+pub mod theme_file;
 pub mod tree_table;
 mod tree_table_geometry;
 mod tree_table_model;

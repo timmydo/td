@@ -203,12 +203,23 @@ transcript with selectable text and whole-message copy, under "Shared
 message list" below. td-agent (`td-agent/DESIGN.md` §4) is its planned
 first consumer; nothing draws it yet.
 
+Newly built (increment 33): the colour themes under "Themes" below.
+`theme` holds six fixed palettes over the shared palette's roles, and
+`Raster::with_theme` paints a draw stream's palette colours in one of
+them. The widget window paints in its program's theme, moves to the
+next on `F12` and keeps the choice in `theme_file`'s one-line file
+under the program's configuration directory, so td-news, td-mail,
+td-review, td-agent, td-dua and td-pass each keep their own. td-review's
+three status inks moved here as `SUCCESS`, `WARNING` and `ACCENT`, so a
+theme recolours its diff lines too.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
 it, as a Cargo path dependency resolved offline from the checkout. It is not
-a runtime library, a plugin host, a theme system or a general Wayland
-toolkit, and it does not claim third-party toolkit compatibility. It carries
+a runtime library, a plugin host or a general Wayland toolkit, and it does
+not claim third-party toolkit compatibility. Its themes are palettes
+compiled in, chosen by name; a user cannot define one. It carries
 no foreign payload and no external crate; its lock lists exactly its own
 package, and its confinement tests pin that its manifest declares no
 dependency at all.
@@ -304,7 +315,8 @@ of its own files may name each module.
   (`Fill`, `Glyph`, and `Mark`, a scalar of the hint face in one ink),
   `Draw`, `Surface`, the `Composition` trait, `Scrollbar`, `text_run`,
   `hint_run`, `Raster`, `Error`, the axis and frame-byte ceilings, the
-  palette constants, and `rgb` and `ppm`, a painted frame as tight RGB rows
+  palette constants with the status inks `SUCCESS`, `WARNING` and
+  `ACCENT`, and `rgb` and `ppm`, a painted frame as tight RGB rows
   and as a binary PPM. A
   composition reports the surface it was laid out for and streams the draws
   inside a damage rectangle; `Raster::new` validates surface, font, stride and
@@ -313,6 +325,9 @@ of its own files may name each module.
   `face::Face`, through which it executes every `Glyph` from then on;
   `Raster::with_typeface` lends it a `typeface::Typeface`'s face at the
   raster's scale, or leaves the bitmap face when it has none.
+  `Raster::with_theme` paints every draw's palette colours in a
+  `theme::Theme`'s; a raster given none paints in `SAND`, the palette as
+  it is.
   The behavioural contract (clipping, the medium fringe,
   scrollbar proportions and drag rounding) is the one td-editor/DESIGN.md
   records under "Implemented reference-renderer contract"; that text moves here
@@ -364,6 +379,17 @@ of its own files may name each module.
   (`SEARCH_DEPTH`, `SEARCH_ENTRIES`); `INSTALL_HINT`, what a program
   without the face says to do; and `read`, the bounded read of one file.
   td-term reads the four styles through it.
+- `theme`: `Theme` (`name`, `colors` in `KEYS` order; `map`, a colour
+  as the theme draws it; `primitive`, a draw's colours mapped; `next`),
+  `ROLES` and `KEYS`, the shared palette's colour for each role; the six
+  themes `SAND`, `HARBOR`, `MOSS`, `ROSE`, `DUSK` and `EMBER`, and
+  `THEMES`, their order; `named`; `CHORD`, the widget window's key;
+  `FILE`, `MAX_FILE_BYTES`, `parse` and `text`, the file's name and
+  contents; `MAX_APP_ID` and `path`, where a program's file is given the
+  configuration and home directories. Under "Themes" below.
+- `theme_file`: `host_path`, `theme::path` from the process's
+  environment; `read`, the bounded read of the theme a file names, none
+  when there is no file; and `write`, its whole replacement.
 - `pinned_face`: `load` from `host_places`, `load_in` given places and
   `load_from` a directory, the regular style through `face_file::read`;
   `SETTING`, re-exported; and `load_or_note` and `load_in_or_note` given
@@ -622,9 +648,10 @@ of its own files may name each module.
   the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
   `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`,
   `take_withdrawal`, `take_scrub`); `Object`, the empty tag;
-  `Window<'h, H>` (`new`, `with_typeface`, `handler`, `handler_mut`,
-  `surface`), the `App` over a handler it borrows; and `run` with an
-  optional `Typeface`, under "Widget window" below.
+  `Window<'h, H>` (`new`, `with_typeface`, `with_theme_file`, `theme`,
+  `handler`, `handler_mut`, `surface`), the `App` over a handler it
+  borrows; and `run` with an optional `Typeface`, which reads the
+  program's theme file, under "Widget window" below.
 - The editor core, under "Editor core" below: `editor_text`, the text
   bounds and lossless codec; `editor_model`, the `Editor` with its
   documents, transactions and `RevisionPoint`s; `editor_fill`, the fill
@@ -1115,33 +1142,38 @@ not frames, and stays its own).
 
 - Pure modules read no environment, clock, descriptor or filesystem.
   Adapters pass explicit ticks in milliseconds and explicit byte inputs.
-  Outside the pure set are `notices` (three `include_str!` constants, one
-  literal, and nothing else), the transport pair `wayland` and `sys`, which
-  own the
-  stream, its deadlines and the pool files in the directory a consumer
-  names, `client`, whose `run` reads the monotonic clock for the
-  consumer's ticks and whose buffers are those pool files, and the three
-  driving adapters: `control_socket`, which owns the listener it binds
-  and reads procfs for the caller's identity; `control_worker`, which
-  owns its thread and reads the monotonic clock for its deadlines; and
-  `replay`, which reads and writes only the streams it is handed; the
-  widget window `window`, whose `Window::new` reads the embedded face and
-  whose loop is `client::run`; `open`, which reads `BROWSER`, starts
-  the browser as a child process with its streams closed and reaps it on
-  a thread of its own; `face_file`, which reads `HOME`, `XDG_DATA_HOME`
-  and `XDG_DATA_DIRS` for the places it searches, lists directories
-  within its depth and entry bounds to find the outline face, and reads
-  one of its files, a regular file within the reader's bound, checked
-  before it is opened and again on the open file, which it opens without
-  waiting, writing nothing; `pinned_face`, which reads only
-  through it; and `pty`, which opens `/dev/ptmx`, spawns the caller's
-  command and owns the threads around it. Apart from `open`'s `BROWSER`
-  and `face_file`'s three directory values they read no environment
-  variable, taking the display values, the socket path, the face setting
-  and a child's whole environment as explicit arguments. The terminal's
-  pure modules are `vt`, `vt_render`, `vt_terminfo` and `vt_keys`: bytes,
-  sizes, chords and snapshots in; cells, replies, pixels and byte
-  sequences out.
+  Outside the pure set are `notices` (three `include_str!` constants,
+  one literal, and nothing else), the transport pair `wayland` and
+  `sys`, which own the stream, its deadlines and the pool files in the
+  directory a consumer names, `client`, whose `run` reads the monotonic
+  clock for the consumer's ticks and whose buffers are those pool files,
+  and the three driving adapters: `control_socket`, which owns the
+  listener it binds and reads procfs for the caller's identity;
+  `control_worker`, which owns its thread and reads the monotonic clock
+  for its deadlines; and `replay`, which reads and writes only the
+  streams it is handed; the widget window `window`, whose `Window::new`
+  reads the embedded face, whose loop is `client::run`, and whose `run`
+  reads and, on its chord, writes the program's theme file through
+  `theme_file`; `open`, which reads `BROWSER`, starts the browser as a
+  child process with its streams closed and reaps it on a thread of its
+  own; `face_file`, which reads `HOME`, `XDG_DATA_HOME` and
+  `XDG_DATA_DIRS` for the places it searches, lists directories within
+  its depth and entry bounds to find the outline face, and reads one of
+  its files, a regular file within the reader's bound, checked before it
+  is opened and again on the open file, which it opens without waiting,
+  writing nothing; `pinned_face`, which reads only through it;
+  `theme_file`, which reads `XDG_CONFIG_HOME` and `HOME` for the theme
+  file's path, reads that one file under the same checks to
+  `MAX_FILE_BYTES`, and replaces it by making its directory (0700),
+  try-locking it and renaming a private (0600) sibling over the file;
+  and `pty`, which opens `/dev/ptmx`, spawns the caller's command and
+  owns the threads around it. Apart from `open`'s `BROWSER`,
+  `face_file`'s three directory values and `theme_file`'s two they read
+  no environment variable, taking the display values, the socket path,
+  the face setting and a child's whole environment as explicit
+  arguments. The terminal's pure modules are `vt`, `vt_render`,
+  `vt_terminfo` and `vt_keys`: bytes, sizes, chords and snapshots in;
+  cells, replies, pixels and byte sequences out.
 - `control` and `driven` are pure: the frame, envelope and codecs touch
   no descriptor, and the seam reads only the composition it is handed
   and the embedded face. The decoder allocates at most one frame, after
@@ -1666,7 +1698,11 @@ shared sources bind no input interface, that `face_file` opens one file
 after checking it and bounding the read, lists directories in one place,
 builds its paths from its own names alone, reads exactly its three
 directory values from the environment and writes nothing, and that
-`pinned_face` reads only through it, and the raw layer: the complete
+`pinned_face` reads only through it; that `theme` is pure and
+`theme_file` reads exactly its two configuration values, opens its file
+nonblocking under its bound, makes and locks its directory and writes
+only a private `create_new` sibling it renames over the file; and the
+raw layer: the complete
 fingerprint of `sys.rs`, its syscall and flag values, its three
 function-only allowances, the single instruction and adoption sites, that
 the crate root denies `unsafe` and declares the module private, that
@@ -1932,6 +1968,85 @@ released buffer zeroed at the request, an attached one only at its
 release, the pixels zeroed, nothing done unasked, a request made by an
 input as well as by a poll, a pending buffer zeroed when the window
 closes, and a closed window not asked.
+
+The window paints in a theme (see "Themes" below). `with_theme_file`
+reads the theme a file names and keeps the window's choice there; `run`
+gives it the program's file under the configuration home
+(`theme_file::host_path` for the handler's `app_id`), and a window made
+with `new` alone paints in `SAND` and keeps nothing. A file that cannot
+be read, or names no theme, is `SAND` with a notice. `theme::CHORD`,
+`F12` with no modifier, is the window's own: the press moves it to the
+next theme, marks it dirty so the next frame is painted in that theme,
+and writes the file, a failed write being a notice; the handler hears
+neither the press nor a repeat of it, as no repeat is armed, and `S-F12`
+or any other modified press is the handler's. No consumer binds the
+chord and no editor key profile does; td-agent's `C-S-t`, the key first
+proposed, is why it is a function key. The tests pin the chord kept from
+the handler, the frame repainted in the next theme's paper with the
+handler's own colour passed through, the file written and read back by a
+later window, a held key not repeating, `S-F12` delivered, and a file
+naming no theme starting the default with a notice.
+
+## Themes
+
+A theme gives each role the shared palette names its own colour: paper,
+ink, chrome, border, the selection and the unfocused one, line numbers,
+the misspelling ink, the panel's selected row and disabled ink, and the
+three status inks. `KEYS` lists the palette's colour for each role and
+`Theme::colors` the theme's, in that order. A raster given a theme maps
+every draw before executing it: a colour equal to a key, its top byte
+ignored, becomes the theme's for that role with its top byte kept, and
+any other colour passes through, so an article's or a chart's colours,
+td-dua's treemap and a handler's own fills are left as given. The map is
+by value: a handler's own colour that happened to equal a key would be
+recoloured, so one that must stay as given avoids the thirteen keys;
+none in the tree does today. `SAND`'s colours are the keys, and a theme
+whose colours are passes every draw through unmapped. A glyph's
+ink and background are mapped before the raster derives the medium
+fringe or blends an outline's coverage between them, so the fringe is
+the theme's. No widget derives a colour of its own from the palette;
+one that did would escape the map, and the map's tests would not see
+it.
+
+The themes are `SAND`, the palette as it is and the default; the light
+`HARBOR` (blue-grey), `MOSS` (green) and `ROSE` (blush); and the dark
+`DUSK` (blue-slate) and `EMBER` (warm brown). A dark theme's selection
+and status inks are light, since selected text and a banded status row
+are drawn in paper over them. Each theme is held, by test, to WCAG
+contrast floors at or under the default's own for the pairs the widgets
+draw: ink on paper (7:1), on chrome (6:1), on the panel's selected row
+and on an unfocused selection (5:1); paper on the selection and each
+status ink on paper (4.5:1); line numbers on paper (3:1) and on chrome,
+and disabled ink on chrome (2.8:1); borders on paper (1.6:1) and chrome
+(1.4:1); disabled ink on paper (3.4:1), the panel's disabled button,
+and on the selected row (2.3:1); and the message list's tone inks, the
+selection and the misspelling ink on chrome (4:1, 3.9:1) and on the
+selected row (3.1:1, 3:1), and line numbers on the selected row
+(2.3:1).
+
+A program's theme is kept in `FILE`, `theme`, in its own directory under
+the configuration home: `$XDG_CONFIG_HOME/<app_id>/theme`, else
+`$HOME/.config/<app_id>/theme`, a relative or empty value ignored, which
+for td-news and td-mail is beside their `config.toml` whenever
+`XDG_CONFIG_HOME` is unset or absolute (they take an empty or relative
+value as given). Under the application jail that home is the
+application's own private configuration directory (APPLICATIONS.md
+§B.4), so a jailed program's choice stays in its state. An `app_id` that
+is not one plain name of ASCII letters, digits, `-`, `_` and `.` up to
+`MAX_APP_ID`, not beginning with `.`, has no file. The file holds the
+theme's name and a newline; a reader takes at most `MAX_FILE_BYTES` of a
+regular file, checked before the nonblocking open and again once open,
+and ignores surrounding ASCII whitespace, so a hand-edited name is read.
+A write makes the directory (0700, as the base directory specification
+asks of a directory it makes) when missing, locks it, and renames a
+flushed private sibling (0600, the file's name and `.new`, a crash's
+stale one removed first) over the file, so two instances of one program
+never share the sibling and either choice is whole; the lock is tried,
+not waited for, so a write while another holds it is a notice and the
+next press tries again. A link at the file's path is replaced, not
+followed. The write is synchronous on the window's thread, one small
+file per press. A user may write the file by hand; there is no other
+configuration.
 
 ## Shared action button
 
@@ -2462,9 +2577,9 @@ started, or why none was, in its status. A `WAYLAND_SOCKET` descriptor
 the program inherited without close-on-exec is still inherited by the
 browser, as by any child: the client duplicates it and leaves the
 original alone. td's launchers pass `WAYLAND_DISPLAY`. The pins in
-`tests/confinement.rs` hold `BROWSER` as the one environment read
-outside tests, the `WAYLAND_SOCKET` removal and the named
-`WAYLAND_DISPLAY`.
+`tests/confinement.rs` hold `BROWSER` as the opener's one environment
+read outside tests (the face and theme files' reads are pinned with
+them), the `WAYLAND_SOCKET` removal and the named `WAYLAND_DISPLAY`.
 
 ## Shared tree table
 
@@ -3422,3 +3537,10 @@ regressions. Those increments extend the original sequence below.
     and whole-message and tool-result copy through the window's
     clipboard, with its oracles; td-agent's transcript is its first
     consumer, in that program's own increment.
+33. Themes: `theme`'s six palettes over the shared palette's roles,
+    `Raster::with_theme`, the widget window's `F12` and the per-program
+    file `theme_file` keeps, with td-review's status inks moved into the
+    palette. The programs with their own windows (td-editor, td-setup,
+    the portal's chooser, td-photo, the task manager, td-term) still
+    paint in `SAND`; each may give its raster a theme in its own
+    landing. Landed.

@@ -12,6 +12,7 @@ use crate::atlas::{Entry, Slot, Style, PAGE_WIDTH};
 use crate::face::Face;
 use crate::font::Font;
 use crate::hint;
+use crate::theme::{Theme, SAND};
 use crate::typeface::Typeface;
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 
@@ -26,6 +27,11 @@ pub const SELECTED: u32 = 0x536b73;
 pub const INACTIVE_SELECTION: u32 = 0xc8c4bb;
 pub const LINE_NUMBER: u32 = 0x817a6f;
 pub const MISSPELLED: u32 = 0x9c5548;
+/// Status inks a line is drawn in for what it means, legible on paper and
+/// as a band under paper ink.
+pub const SUCCESS: u32 = 0x4d6b3c;
+pub const WARNING: u32 = 0x86601a;
+pub const ACCENT: u32 = 0x7a4d74;
 
 /// What the raster refuses: an argument outside its contract, or a size
 /// past a ceiling. Validation precedes every write.
@@ -459,6 +465,7 @@ pub struct Raster<'pixels, 'font> {
     pixels: &'pixels mut [u8],
     font: &'font Font,
     face: Option<&'font mut Face>,
+    theme: &'static Theme,
     surface: Surface,
     stride: usize,
 }
@@ -489,6 +496,7 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
             pixels,
             font,
             face: None,
+            theme: &SAND,
             surface,
             stride,
         })
@@ -521,6 +529,13 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         }
     }
 
+    /// Draws every colour of the shared palette in `theme`'s from here on
+    /// (`Theme::map`); other colours are drawn as they are given.
+    pub fn with_theme(mut self, theme: &'static Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
     /// Paints a composition laid out for this exact surface; a mismatch is
     /// refused before anything is written.
     pub fn paint(
@@ -538,6 +553,10 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
     pub fn draw(&mut self, draw: Draw) {
         let Some(clip) = draw.clip.intersection(self.surface.bounds()) else {
             return;
+        };
+        let draw = Draw {
+            primitive: self.theme.primitive(draw.primitive),
+            ..draw
         };
         let Primitive::Glyph {
             x,

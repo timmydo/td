@@ -8,7 +8,9 @@
 //! polls it each turn under the wait it asks for, so a program whose work
 //! arrives on a channel from another thread is served without a
 //! descriptor of its own in the loop. The window owns the client, the
-//! pinned face, the pointer and the clipboard's transfers; the handler
+//! pinned face, the pointer, the clipboard's transfers and the theme it
+//! paints in, which `theme::CHORD` moves on and the program's theme file
+//! keeps; the handler
 //! owns everything else, its widgets and their compositions included,
 //! and copies and pastes through the [`Clipboard`] handed it with each
 //! input.
@@ -19,6 +21,8 @@ pub use crate::driven::PointerPhase;
 use crate::font::Font;
 use crate::pointer::{self, Wheel};
 use crate::raster::{Raster, Scale, Surface};
+use crate::theme::{self, Theme, SAND};
+use crate::theme_file;
 use crate::typeface::Typeface;
 use crate::wire::Message;
 use std::os::unix::net::UnixStream;
@@ -353,6 +357,10 @@ pub struct Window<'h, H: Handler> {
     /// The outline face glyphs are executed through, when the window was
     /// given one; else the bitmap face draws them.
     typeface: Option<Typeface>,
+    /// The theme every frame is painted in.
+    theme: &'static Theme,
+    /// Where the theme is kept, when the window was given a file.
+    theme_file: Option<PathBuf>,
     clock: u64,
     surface: Surface,
     /// The configured extent; a refused one is put back to the surface's.
@@ -382,6 +390,8 @@ impl<'h, H: Handler> Window<'h, H> {
             handler,
             font: crate::font::pinned()?,
             typeface: None,
+            theme: &SAND,
+            theme_file: None,
             clock: 0,
             surface,
             size: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
@@ -401,6 +411,23 @@ impl<'h, H: Handler> Window<'h, H> {
     pub fn with_typeface(mut self, typeface: Typeface) -> Self {
         self.typeface = Some(typeface);
         self
+    }
+
+    /// Paints in the theme the file at `path` names and keeps the chord's
+    /// choice there. No file is the default theme; a file that cannot be
+    /// read or names no theme is the default too, with a notice, and the
+    /// chord's next choice replaces it.
+    pub fn with_theme_file(mut self, path: PathBuf) -> Self {
+        match theme_file::read(&path) {
+            Ok(theme) => self.theme = theme.unwrap_or(&SAND),
+            Err(why) => self.handler.notice(&format!("theme: {why}")),
+        }
+        self.theme_file = Some(path);
+        self
+    }
+
+    pub fn theme(&self) -> &'static Theme {
+        self.theme
     }
 
     pub fn handler(&self) -> &H {
@@ -529,6 +556,16 @@ impl<'h, H: Handler> Window<'h, H> {
         self.deliver(Input::Resize(surface))
     }
 
+    fn next_theme(&mut self) {
+        self.theme = self.theme.next();
+        self.dirty = true;
+        if let Some(path) = &self.theme_file {
+            if let Err(why) = theme_file::write(path, self.theme) {
+                self.handler.notice(&format!("theme not kept: {why}"));
+            }
+        }
+    }
+
     fn keyboard(&mut self, event: KeyboardEvent) -> Result<()> {
         match event {
             KeyboardEvent::Key {
@@ -536,6 +573,12 @@ impl<'h, H: Handler> Window<'h, H> {
                 key,
                 stroke,
             } => {
+                // The window's own chord: the next theme, painted at once
+                // and kept, the handler never hearing the press.
+                if stroke.chord == theme::CHORD {
+                    self.next_theme();
+                    return Ok(());
+                }
                 self.deliver_at(
                     serial,
                     Input::Key {
@@ -888,12 +931,14 @@ impl<H: Handler> App for Window<'_, H> {
             handler,
             font,
             typeface,
+            theme,
             ..
         } = self;
         let presented = client.present(surface.width, surface.height, &mut |pixels| {
             let mut raster = Raster::new(pixels, font, surface, surface.width * 4)
                 .map_err(|why| why.to_string())?
-                .with_typeface(typeface.as_mut());
+                .with_typeface(typeface.as_mut())
+                .with_theme(theme);
             handler.paint(&mut raster, surface)
         })?;
         if presented {
@@ -905,16 +950,22 @@ impl<H: Handler> App for Window<'_, H> {
 
 /// Runs `handler` in a window over `stream`, its pool files under
 /// `temporary`, until the window closes, its text in `typeface` when given
-/// one; the handler stays the caller's whichever way the loop ends.
+/// one and its colours in the theme its program's file under the
+/// configuration home names (`theme_file::host_path`); the handler stays
+/// the caller's whichever way the loop ends.
 pub fn run<H: Handler>(
     handler: &mut H,
     stream: UnixStream,
     temporary: PathBuf,
     typeface: Option<Typeface>,
 ) -> Result<()> {
+    let theme_path = theme_file::host_path(handler.app_id());
     let mut window = Window::new(handler, stream, temporary)?;
     if let Some(typeface) = typeface {
         window = window.with_typeface(typeface);
+    }
+    if let Some(path) = theme_path {
+        window = window.with_theme_file(path);
     }
     crate::client::run(&mut window)
 }
