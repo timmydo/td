@@ -1866,8 +1866,8 @@ stronger claim than it is:
   `current`/`previous` selectors, which is already transactional. A/B
   partitioning solves a problem td does not have.
 - **The disk is not encrypted.** [ENCRYPTION.md](ENCRYPTION.md) specifies the
-  lost-laptop workstream, authentication policy and activation gates. It
-  changes no current boot or installation behavior.
+  device-bound default, the lost-laptop tier, authentication policy and
+  activation gates. It changes no current boot or installation behavior.
 
 ## 10. Sequence
 
