@@ -28,6 +28,7 @@ pub mod config;
 pub mod control;
 pub mod conversation;
 pub mod cost;
+pub mod diagnostics;
 pub mod frame;
 pub mod history;
 pub mod key;

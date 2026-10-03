@@ -37,8 +37,8 @@ impl ErrorCode for Refusal {
     }
 }
 
-/// The window's actions, each its default chord; `set-key` has none, and
-/// is the File menu's item.
+/// The window's actions, each its default chord; `set-key`, `model` and
+/// `export-diagnostics` have none, and are menu items.
 pub const BINDINGS: &[Binding] = &[
     Binding {
         name: "new",
@@ -124,6 +124,12 @@ pub const BINDINGS: &[Binding] = &[
         arguments: "",
         help: "Conversation > Model...: open the picker of the open conversation's model: type to filter, Return chooses, Escape cancels.",
     },
+    Binding {
+        name: "export-diagnostics",
+        chord: None,
+        arguments: "",
+        help: "File > Export diagnostics: write td-agent's state and configuration, never the key file, to an archive in ~/Downloads, else the home directory.",
+    },
 ];
 
 /// The window as the seam drives it. A copy has no press to be offered
@@ -162,12 +168,12 @@ impl Controller for Remote<'_> {
             return Err(Refusal::Protocol);
         }
         // Through the menu's own paths, as a choice of its item.
-        if name == "set-key" || name == "model" {
+        if matches!(name, "set-key" | "model" | "export-diagnostics") {
             let before = self.app.generation();
-            if name == "set-key" {
-                self.app.open_key_dialog();
-            } else {
-                self.app.open_picker();
+            match name {
+                "set-key" => self.app.open_key_dialog(),
+                "model" => self.app.open_picker(),
+                _ => self.app.export_diagnostics(),
             }
             return Ok(self.outcome(before));
         }
@@ -372,6 +378,11 @@ mod tests {
             format!("1\t71\tkey\t{}", hex("Escape")).as_bytes(),
         );
         assert!(remote.state().unwrap().contains("dialog=none"));
+        // `export-diagnostics` asks the session for the archive.
+        assert!(
+            driven::request(&mut remote, b"1\t72\taction\texport-diagnostics").ends_with("changed")
+        );
+        assert_eq!(remote.app.take_requests(), [Request::Export]);
     }
 
     /// `model` opens the picker, whose selection and filter the state

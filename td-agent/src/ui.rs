@@ -200,6 +200,8 @@ pub enum Request {
     /// one only when `replace` says so; the session answers through
     /// `key_saved`, `key_exists` or `key_refused`.
     SaveKey { secret: Secret, replace: bool },
+    /// Write the diagnostics archive, from File → Export diagnostics.
+    Export,
     /// Close the window, from File → Quit.
     Quit,
     /// The open conversation's model and effort as the human chose them,
@@ -2108,6 +2110,7 @@ impl App {
         match action {
             menu::Action::New => self.requests.push(Request::New),
             menu::Action::SetKey => self.open_key_dialog(),
+            menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
             menu::Action::Model => self.open_picker(),
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
@@ -2215,6 +2218,12 @@ impl App {
                 self.choose(Some(model), self.wanted().1);
             }
         }
+    }
+
+    /// Asks for the diagnostics archive, as File → Export diagnostics does.
+    pub fn export_diagnostics(&mut self) {
+        self.requests.push(Request::Export);
+        self.touch();
     }
 
     /// Opens the key dialog, modal over the window.
@@ -2878,7 +2887,7 @@ pub mod tests {
             })
             .collect();
         assert_eq!(sections[0].rows, chorded);
-        assert_eq!(sections[0].rows.len(), crate::control::BINDINGS.len() - 2);
+        assert_eq!(sections[0].rows.len(), crate::control::BINDINGS.len() - 3);
         assert!(sections[0].rows.iter().any(|r| r.keys == "C-n"));
         assert!(sections[1].rows.iter().any(|r| r.keys == "C-v/S-Insert"));
         key(&mut app, "F6");
@@ -4051,12 +4060,15 @@ pub mod tests {
         // The chord the item shows, with the menu closed, does the same.
         key(&mut app, "C-n");
         assert_eq!(app.take_requests(), [Request::New]);
-        // A press on the header opens it, and one on the third row quits.
-        press(&mut app, CELL_WIDTH as i64 + 4, 4);
-        assert!(app.menu_open());
-        let panel = app.menu.panel(0).unwrap();
-        press(&mut app, panel.x + 8, panel.y + (2 * ROW) as i64 + 4);
-        assert_eq!(app.take_requests(), [Request::Quit]);
+        // A press on the header opens it; one on the third row exports,
+        // and one on the fourth quits.
+        for (row, request) in [(2, Request::Export), (3, Request::Quit)] {
+            press(&mut app, CELL_WIDTH as i64 + 4, 4);
+            assert!(app.menu_open());
+            let panel = app.menu.panel(0).unwrap();
+            press(&mut app, panel.x + 8, panel.y + (row * ROW) as i64 + 4);
+            assert_eq!(app.take_requests(), [request]);
+        }
         // Escape and F10 close it, and a press outside closes it and
         // goes no further.
         for chord in ["Escape", "F10"] {

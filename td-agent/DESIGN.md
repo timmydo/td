@@ -26,8 +26,9 @@ the todo list, `history_search` and `history_read`, `conversations`,
 them came the window's File menu and the dialog that stores the
 OpenRouter key from it (§4, §6), then the Conversation menu, which
 chooses each conversation's model, from a picker over the models list,
-and its reasoning effort (§4), and the system context, shown folded at
-the head of the transcript (§4). Where building them
+and its reasoning effort (§4), the system context, shown folded at
+the head of the transcript, and the diagnostics export (§4). Where
+building them
 settled a point the design left open, the section says so under "As
 built". No recipe names td-agent yet. The decisions below that were the
 user's to make were made on 2026-10-01 and 2026-10-02:
@@ -725,6 +726,8 @@ or a resize closes it. It is painted after the window's frame. Its items are:
 - `New conversation`, shown with `C-n`, which does what `C-n` does;
 - `Set OpenRouter key…`, which opens the key dialog below; it has no
   chord;
+- `Export diagnostics`, the diagnostics export (below, "As built (the
+  diagnostics export)"); it has no chord;
 - `Quit`, which closes the window as the compositor's close does; it has
   no chord.
 
@@ -789,8 +792,9 @@ it was stored and that every conversation uses it from now on.
 **As built (the key list).** `F1` shows td-ui's key list over the
 window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
 of the driven action table, `control::BINDINGS`, with its help line, so
-the list and the table an agent reads are one source; `set-key` and
-`model`, which have no chord, are the File and Conversation menus'. Then
+the list and the table an agent reads are one source; `set-key`,
+`model` and `export-diagnostics`, which have no chord, are the File and
+Conversation menus'. Then
 come the focused widget's keys (the conversation list's, the
 transcript's or the composer's) and the other two's, listed beside
 `ui::App::key`. The control socket delivers its keys to the window's
@@ -886,6 +890,64 @@ full (the log keeps them all), so in a long conversation the system
 message goes before any other, and opening the conversation again
 shows it again. A prefix of more messages than a message holds
 sections shows the first fourteen and says how many more there are.
+
+**As built (the diagnostics export).** File → `Export diagnostics`
+writes one archive a human can attach to a report: everything td-agent
+keeps that bears on what it did, and never the key file.
+
+- **What it holds.** Every regular file beneath the state directory
+  (§6): each conversation's `meta`, `prefix` and `log`, the outbox, the
+  models cache, `spend` and `layout`, a crash's leftover temporaries,
+  under `td-agent-diagnostics/state/`; the configuration file as
+  `td-agent-diagnostics/config`, copied as written, so the notice and
+  the manifest say to read it before sharing; and a generated
+  `MANIFEST` naming the version, the time, the kernel, the two
+  directories, how the key was kept out, every file taken with its
+  size, and every file left out with why, in order of name. td-agent
+  writes no log of its own beyond the conversations' (its standard
+  error is the launcher's), so nothing else is collected.
+- **The key.** Three things keep it out, each enough alone. The key
+  file, its temporary (a crash during a replacement leaves the new key
+  there) and the directory holding them are never taken: a file of
+  either name is left out wherever it is, a file that is either under
+  another name (a hard link, or the configuration linked to it) is
+  known by its device and inode, and so is the directory, should the
+  state directory be it or hold it. Every key the window has held, the
+  one it started with and each the dialog stored, and the stored one
+  read again through §6's checks, are looked for: a file holding one,
+  as written or as a JSON string escapes it, is left out. A stored key
+  that cannot be read again stops the export when the window holds no
+  key either; otherwise the manifest says it was not looked for. A key
+  replaced in an earlier run is not looked for.
+- **What else is left out.** A link (the configuration is followed, as
+  §15 reads it), a file that is not regular (each is opened without
+  waiting and checked by its descriptor, so a FIFO swapped in never
+  blocks the export), one past the log's 256 MiB bound, one deeper than
+  four directories, and anything past 1 GiB in all; the walk considers
+  at most 100,000 names, and the manifest counts the rest.
+- **The archive** is ustar, written by td-agent itself, members mode
+  0600 with uid and gid 0, a name past ustar's 100 bytes split into its
+  prefix field. A file that cannot be written into it ends the export,
+  since what follows would not be an archive. It is written as
+  `td-agent-diagnostics-<UTC time>.tar.part`, made new with mode 0600,
+  synced and then linked to its name without the `.part`, which
+  replaces nothing (renamed, once the name is free, on a file system
+  with no hard links), in `~/Downloads` when that is a directory, else in
+  the home directory. A name already taken, finished or not, gets a
+  `-1`, `-2` and so on, so a quit mid-export leaves only a `.part`.
+- **Compression** is the host's, not td-agent's: `zstd -q -c`, else
+  `gzip -q -c`, found on `PATH`, run directly with no shell, the archive
+  its standard input and its standard output a second `.part` file
+  td-agent makes new with mode 0600, synced and linked into place as the
+  archive is, after which the archive is removed. A program the host
+  lacks is passed over, and one that fails gives way to the next, its
+  first line of standard error kept; with none that works the plain
+  archive stays and the notice says why.
+- **The window** runs the export on a thread of its own, says
+  `exporting diagnostics…` and, when it ends, where the archive is,
+  how many files it took and left out, and to read it before sharing.
+  One runs at a time. The driven actions gain `export-diagnostics`,
+  which has no chord.
 
 ## 5. Model client
 
@@ -1325,8 +1387,10 @@ still held when the window closes is written whole to standard error.
 
 **As built (increment 5).**
 
-- **The key file** is read once, by the window process at start, with
-  std alone and no `unsafe`. The path is walked a component at a time,
+- **The key file** is read once, by the window process at start (and
+  again, through the same checks, only by the diagnostics export of §4,
+  which reads it to leave out any file holding it), with std alone and
+  no `unsafe`. The path is walked a component at a time,
   each opened `O_PATH | O_NOFOLLOW` beneath the descriptor of the one
   before it (through `/proc/self/fd`), so no component can be swapped
   between its check and its use. A symbolic link met on the way is read

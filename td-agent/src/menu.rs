@@ -27,6 +27,8 @@ pub enum Action {
     New,
     /// Open the dialog that stores the OpenRouter key.
     SetKey,
+    /// Write the diagnostics archive (DESIGN.md §4).
+    Export,
     /// Close the window, as the compositor's close does.
     Quit,
     /// Open the picker of the open conversation's model.
@@ -40,6 +42,7 @@ pub enum Action {
 pub const FILE: &[(&str, &str, Action)] = &[
     ("New conversation", "C-n", Action::New),
     ("Set OpenRouter key\u{2026}", "", Action::SetKey),
+    ("Export diagnostics", "", Action::Export),
     ("Quit", "", Action::Quit),
 ];
 

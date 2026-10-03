@@ -13,7 +13,7 @@
 //! list and the key's credit, fetched on a thread of their own
 //! (`Fetcher`) so the window never waits on the network.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -26,6 +26,7 @@ use td_ui::window::{Clipboard, Flow, Handler, Input};
 use crate::accounts::Ledger;
 use crate::config::{Client, Config};
 use crate::control::Remote;
+use crate::diagnostics::{self, Exported};
 use crate::key::{self, Secret, Unwritten};
 use crate::models::{Credit, Models, MAX_LIST};
 use crate::picker::Offer;
@@ -173,6 +174,10 @@ pub struct Session {
     key_path: Option<PathBuf>,
     /// File → Quit was chosen: the window closes.
     quit: bool,
+    /// The diagnostics export under way, on a thread of its own.
+    export: Option<Receiver<Result<Exported, String>>>,
+    /// Every key this window has held, which the export looks for.
+    keys: Vec<Secret>,
 }
 
 impl Session {
@@ -218,6 +223,7 @@ impl Session {
                     }
                 }
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
+                Request::Export => self.export(),
                 Request::Quit => self.quit = true,
             }
         }
@@ -236,6 +242,9 @@ impl Session {
         };
         match key::write(&path, secret, replace) {
             Ok(stored) => {
+                if !self.keys.contains(&stored) {
+                    self.keys.push(stored.clone());
+                }
                 self.supervisor.rekey(stored.clone());
                 if let Some(fetcher) = self.fetcher.as_mut() {
                     fetcher.rekey(stored, Instant::now());
@@ -371,6 +380,98 @@ impl Session {
         let today = self.ledger.today(now);
         self.app.set_today(today);
         self.fetched();
+        self.exported();
+    }
+
+    /// Starts the diagnostics export (DESIGN.md §4) on a thread, into
+    /// `~/Downloads`, else the home directory.
+    fn export(&mut self) {
+        if self.export.is_some() {
+            return self.app.note("a diagnostics export is already under way");
+        }
+        let Some(home) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+        else {
+            return self
+                .app
+                .note("no diagnostics: HOME is not an absolute path to write them under");
+        };
+        let downloads = home.join("Downloads");
+        let into = if downloads.is_dir() { downloads } else { home };
+        let config = self
+            .key_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("config"));
+        // Every key this window has held, and the stored one, only to
+        // look for: no file holding one is taken.
+        let mut keys = self.keys.clone();
+        let mut key_problem = None;
+        if let Some(path) = self.key_path.as_deref() {
+            match key::read(path) {
+                Ok(stored) if !keys.contains(&stored) => keys.push(stored),
+                Ok(_) | Err(key::Problem::Missing(_)) => {}
+                Err(problem) if keys.is_empty() => {
+                    return self.app.note(format!(
+                        "no diagnostics: the stored key cannot be read to keep it out of them: {problem}"
+                    ));
+                }
+                Err(problem) => key_problem = Some(problem.to_string()),
+            }
+        }
+        let sources = diagnostics::Sources {
+            state: self.state.root().to_path_buf(),
+            config,
+            key_file: self.key_path.clone(),
+            keys,
+            key_problem,
+        };
+        let (send, receive) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("td-agent-export".into())
+            .spawn(move || {
+                let exported =
+                    diagnostics::export(&sources, &into, store::now(), diagnostics::COMPRESSORS);
+                let _ = send.send(exported);
+            });
+        match spawned {
+            Ok(_) => {
+                self.export = Some(receive);
+                self.app.note("exporting diagnostics\u{2026}");
+            }
+            Err(e) => self.app.note(format!("the diagnostics export: {e}")),
+        }
+    }
+
+    /// What the diagnostics export made, once it is done.
+    fn exported(&mut self) {
+        let Some(receive) = self.export.as_ref() else {
+            return;
+        };
+        let result = match receive.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err("its thread ended".into()),
+        };
+        self.export = None;
+        let note = match result {
+            Ok(exported) => {
+                let mut note = format!(
+                    "diagnostics written to {} ({} files, {} left out, as its MANIFEST lists); it holds your conversations and configuration, never the key file: read it before sharing",
+                    exported.path.display(),
+                    exported.files,
+                    exported.left_out,
+                );
+                if let Some(remark) = exported.remark {
+                    note.push_str(&format!("; {remark}"));
+                }
+                note
+            }
+            Err(e) => format!("the diagnostics export: {e}"),
+        };
+        eprintln!("td-agent: {note}");
+        self.app.note(note);
     }
 
     /// What the fetcher brought.
@@ -585,7 +686,7 @@ pub fn run(
     let supervisor = Supervisor::new(program, state.root().to_path_buf(), setup);
     let fetcher = match Fetcher::start(
         client.base_url.clone(),
-        key.ok(),
+        key.as_ref().ok().cloned(),
         state.root().to_path_buf(),
     ) {
         Ok(fetcher) => Some(fetcher),
@@ -613,6 +714,8 @@ pub fn run(
         post: Post::new(outbox),
         key_path,
         quit: false,
+        export: None,
+        keys: key.iter().cloned().collect(),
     };
     // A cached list serves until the provider's comes.
     match Models::load(session.state.root()) {
