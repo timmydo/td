@@ -35,6 +35,12 @@ impl<'a, 'w> Budgeted<'a, 'w> {
     pub const fn is_encoding_problem(&self) -> bool {
         self.inner.is_encoding_problem()
     }
+    pub(crate) fn finish(self) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        self.inner.finish().map_err(Error::from)
+    }
     pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);

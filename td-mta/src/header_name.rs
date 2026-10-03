@@ -115,6 +115,20 @@ impl<'a, 'w> Cursor<'a, 'w> {
             _ => false,
         }
     }
+    pub(crate) fn finish(
+        self,
+    ) -> Result<(&'w mut Meter, &'w mut HeaderBudget, &'w mut Scratch), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !self.complete {
+            return Err(Error::InvalidState);
+        }
+        let Owner::Normalize(cursor) = self.owner else {
+            return Err(Error::InvalidState);
+        };
+        cursor.finish().map_err(Error::Normalize)
+    }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         self.charge_output(now, 0)
     }

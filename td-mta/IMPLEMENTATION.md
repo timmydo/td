@@ -1617,6 +1617,13 @@ Initial independently landable increments:
   typed refusal. Cover composed costs, short drains, partial resources and
   allocation-free long input. Complete address properties remain open.
 
+- **M06bh — provisional Addresses property values:** flatten groups into
+  name/email objects while retaining one mailbox and the suspended parser.
+  Consume completed name/address children back into original budgets and
+  scratch, preserving field credit and selected diagnostics. Pin composed
+  costs, partial limits, late failure and allocation-free one-byte drains.
+  Grouped values and unpublished response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

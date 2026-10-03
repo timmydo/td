@@ -1152,6 +1152,19 @@ interpretation steps. Allocation intervals cover long inputs, original
 budgets/scratch, one-byte drains and output refusal. Complete property
 assembly and worker/native/RSS qualification remain open.
 
+The Addresses property owner (M06bh) fits 2560 bytes of the existing 16 KiB
+parser reservation, including selection, suspended address grammar, active
+conversion, frame and nine-byte literal staging. It borrows the existing
+3072-byte NFC scratch and replaces that region's standalone NFC cursor with
+its inline normalization state. It retains one mailbox extent, not a list of
+names, addresses or groups. Original job/email budgets and the suspended
+parser's previously funded credit survive each checked child handoff.
+Per-turn ceilings are 255 visits, 256 steps, sixteen job records, nine charged
+output bytes and six externally copied bytes. Allocation intervals cover long
+normalized names, identity addresses, raw recovery, multiple fields, scratch
+reuse and late selection refusal. Grouped values, unpublished retention and
+combined worker/native/RSS qualification remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

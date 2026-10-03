@@ -10,6 +10,8 @@ use crate::{
 };
 mod list;
 use list::{IdsMode, UrlsMode};
+mod addresses;
+use addresses::AddressMode;
 mod date;
 use date::DateMode;
 mod projection;
@@ -21,6 +23,9 @@ pub enum Error {
     UnsupportedGrammar,
     Selection(header_select::Error),
     Raw(header_raw::Error),
+    Addresses(crate::header_addresses::Error),
+    AddressText(crate::header_address_text::Error),
+    Name(crate::header_name::Error),
     Text(nfc::Error),
     MessageIds(crate::header_message_ids::Error),
     URLs(crate::header_urls::Error),
@@ -37,6 +42,9 @@ impl std::fmt::Display for Error {
             Self::UnsupportedGrammar => f.write_str("unsupported header value grammar"),
             Self::UnsupportedForm => f.write_str("unsupported header value form"),
             Self::Selection(error) => write!(f, "header value selection: {error}"),
+            Self::Addresses(error) => write!(f, "header value addresses: {error}"),
+            Self::AddressText(error) => write!(f, "header value address text: {error}"),
+            Self::Name(error) => write!(f, "header value display name: {error}"),
             Self::Raw(error) => write!(f, "header value Raw: {error}"),
             Self::URLs(error) => write!(f, "header value URLs: {error}"),
             Self::MessageIds(error) => write!(f, "header value MessageIds: {error}"),
@@ -212,6 +220,28 @@ impl<'a, 'w> URLs<'a, 'w> {
         budget: &'w mut HeaderBudget,
     ) -> Result<Self, Error> {
         Core::new(input, work, budget, crate::header_urls::Mode::URLs).map(Self)
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.0.check_deadline(now)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.0.poll(now, output)
+    }
+}
+/// Provisional flattened address objects; retain in an unpublished response tail.
+pub struct Addresses<'a, 'w>(Core<'a, 'w, AddressMode>);
+impl<'a, 'w> Addresses<'a, 'w> {
+    pub fn new(
+        input: Input<'a>,
+        scratch: &'w mut nfc::Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        Core::new(input, work, budget, scratch).map(Self)
+    }
+    /// Final only after property Complete.
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.0.is_encoding_problem()
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         self.0.check_deadline(now)
@@ -811,3 +841,6 @@ mod message_ids_tests;
 
 #[cfg(test)]
 mod urls_tests;
+
+#[cfg(test)]
+mod addresses_tests;

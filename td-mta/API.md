@@ -3048,6 +3048,62 @@ one-byte drains and output refusal in both registered modes. Full
 address-property assembly, response-spool publication and complete
 worker/native/RSS qualification remain follow-on work.
 
+### 1.66 Provisional Addresses property values
+
+M06bh supplies `header_value::Addresses::new`, accepting the same immutable
+selection Input, original job/email budgets and caller-owned NFC scratch. It
+binds only Form::Addresses and inherits last/all occurrence selection,
+source-end handling and missing-header null/empty-array rules from the common
+owner. Each selected field yields an array of objects with `name` and `email`
+keys; `:all` wraps those field arrays in wire order. Group members are
+flattened; empty groups contribute no objects. Group names are
+grammar-validated but are not decoded and do not contribute encoding
+diagnostics to this form.
+
+Parsed mailbox names use the selected phrase or first eligible trailing
+comment, decoded and NFC-normalized; absent names are null and valid empty
+names are empty strings. Address identities use Parsed conversion, preserving
+case and decomposition while removing validated CFWS/routes and unfolding.
+Recoverable malformed items use null names and Fallback address text. UTF-8
+repair/noncharacter diagnostics come only from projected names/addresses in
+selected fields. Resource errors never become raw recovery or successful
+partial results. These read-only values grant no SMTP delivery authority.
+
+Suspend the field parser around one mailbox at a time. Transfer the original
+Meter/HeaderBudget and scratch into the name owner, consume it only after
+actual Complete, then reuse the same budgets for address conversion. Retain
+the suspended field parser's own previously funded interpretation credit;
+name and address children keep their separate private credit. Return the
+original budgets to selection only after the field array has fully drained.
+No object list, decoded name, address string or group array is retained.
+
+Objects, array delimiters, keys and null literals are prepaid before staging;
+string frames charge their exact JSON bytes in addition to existing address
+conversion output. One turn emits at most six bytes and charges at most nine
+output bytes, 255 source visits, 256 aggregate steps and sixteen job records.
+The coordinator fits 2560 bytes in the existing 16 KiB parser reservation,
+including its selector, suspended parser, active child, frame and literals.
+It borrows the existing 3072-byte NFC scratch; its inline normalization state
+replaces the standalone NFC cursor slot. No memory partition grows.
+
+All chunks and encoding diagnostics are provisional through complete field
+parsing and selection. A later malformed-nesting/resource failure can retire
+already emitted objects; a later selection failure can retire an earlier
+whole field array. The future response owner must retain these chunks in an
+unpublished spool tail and discard the entire property on failure. Cached
+completion is inert, but explicit final admission remains live. Typed errors
+retain selection, address grammar, name/text conversion and JSON causes.
+
+Tests cover widths one through eight, last/all/absence, group flattening, raw
+recovery, selected diagnostics, identity versus NFC, and absent/empty names.
+Independent parsing/conversion plus wire-length accounting pins original
+budget use and suspended parser credit. Every partial byte/step/output limit,
+late nesting/selection failure, exact completion, handoff and deadline checks
+retain no successful prefix. Allocation intervals cover long names/addresses,
+multiple fields, scratch reuse and late refusal with one-byte drains. Grouped
+Addresses, response-spool publication and worker/native/RSS qualification
+remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
