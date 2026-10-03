@@ -20,9 +20,10 @@ fetch service: run it as ./agent from a td checkout, which serves that.\n\
 Keys: C-Return sends the composer (Return is a newline); C-r asks a\n\
 failed turn again; C-n starts a conversation; C-PageUp and C-PageDown\n\
 open the one above or below; F6 and S-F6 move the focus between the\n\
-list, the transcript and the composer; F10 opens the File menu, whose\n\
-Set OpenRouter key... stores the key. The control socket speaks td-ui's\n\
-driven protocol.\n\
+list, the transcript and the composer; F10 opens the menus: File's\n\
+Set OpenRouter key... stores the key, and Conversation's Model... and\n\
+Effort choose the open conversation's model and reasoning effort. The\n\
+control socket speaks td-ui's driven protocol.\n\
 \n\
 State: $XDG_STATE_HOME/td-agent. Configuration:\n\
 $XDG_CONFIG_HOME/td-agent/config (TOML; unknown keys are refused). The\n\

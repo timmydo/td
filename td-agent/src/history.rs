@@ -138,6 +138,7 @@ fn kind(event: &Event) -> &'static str {
         Kind::ToolResult { .. } => "tool_result",
         Kind::Todo { .. } => "todo",
         Kind::Pause { .. } => "pause",
+        Kind::Choice { .. } => "choice",
         Kind::Approval { .. } => "approval",
     }
 }
@@ -226,6 +227,11 @@ pub fn render(event: &Event) -> String {
         Kind::Todo { items, .. } => crate::tools::todo_text(items),
         Kind::Pause { paused: true } => "the person paused this conversation".into(),
         Kind::Pause { paused: false } => "the person resumed this conversation".into(),
+        Kind::Choice { model, effort } => format!(
+            "the person chose the model {} and the reasoning effort {}",
+            model.as_deref().unwrap_or("of the configuration"),
+            effort.as_deref().unwrap_or("of the configuration")
+        ),
         Kind::Approval { outcome, by, .. } => approval(outcome, by),
     };
     format!(

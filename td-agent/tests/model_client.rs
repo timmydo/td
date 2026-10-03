@@ -368,6 +368,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::ToolResult { .. } => "tool_result",
             Kind::Todo { .. } => "todo",
             Kind::Pause { .. } => "pause",
+            Kind::Choice { .. } => "choice",
             Kind::Approval { .. } => "approval",
         })
         .collect()
@@ -673,6 +674,63 @@ fn a_prefix_with_the_members_once_sent_is_replaced_before_the_next_request() {
         .and_then(|t| t.strip_suffix("]}"))
         .unwrap();
     assert!(body.contains(members), "{body}");
+}
+
+/// The human's choice of model and effort for a conversation is logged,
+/// kept in `meta`, and what its next request sends; a chosen model the
+/// list does not have is refused naming where it was chosen.
+#[test]
+fn a_chosen_model_and_effort_are_what_the_next_request_sends() {
+    let mut h = Harness::new(
+        "choose",
+        Role::Conversation,
+        vec![Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")],
+    );
+    h.setup(Client::default());
+    h.down(&Down::Choose {
+        model: Some("anthropic/claude-haiku-4.5".into()),
+        effort: Some("high".into()),
+    });
+    h.say("hello");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let logged = kinds(&events);
+    let choice = logged.iter().position(|k| *k == "choice").unwrap();
+    let request = logged.iter().position(|k| *k == "request").unwrap();
+    assert!(choice < request, "{logged:?}");
+    let body = flat(&h.mock.requests()[0].text());
+    assert_eq!(body["model"], "anthropic/claude-haiku-4.5");
+    assert_eq!(body["reasoning.effort"], "high");
+    let (conversation, mut h) = h.close();
+    assert_eq!(
+        (
+            conversation.meta().model.as_deref(),
+            conversation.meta().effort.as_deref()
+        ),
+        (Some("anthropic/claude-haiku-4.5"), Some("high"))
+    );
+    drop(conversation);
+    // A model the list does not have, chosen: refused, naming the choice.
+    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    h.child = child;
+    h.window = window;
+    assert!(matches!(h.next(), Up::Hello { .. }));
+    // The log as the reopened process replays it, its turn first.
+    assert_eq!(h.turn().1, "replied");
+    h.setup(Client::default());
+    h.down(&Down::Choose {
+        model: Some("example/not-listed".into()),
+        effort: None,
+    });
+    h.say("again");
+    let (_, outcome, _) = h.turn();
+    assert!(
+        outcome.contains("example/not-listed is not in the provider's models list")
+            && outcome
+                .contains("set the conversation's model (Conversation \u{2192} Model\u{2026})"),
+        "{outcome}"
+    );
+    assert_eq!(h.mock.requests().len(), 2, "nothing more was sent");
 }
 
 #[test]

@@ -24,7 +24,9 @@ by `Escape`; and the conversation tools, the first a model is given:
 the todo list, `history_search` and `history_read`, `conversations`,
 `send_message` and `report`, with the wake budget and pausing. After
 them came the window's File menu and the dialog that stores the
-OpenRouter key from it (§4, §6). Where building them
+OpenRouter key from it (§4, §6), then the Conversation menu, which
+chooses each conversation's model, from a picker over the models list,
+and its reasoning effort (§4). Where building them
 settled a point the design left open, the section says so under "As
 built". No recipe names td-agent yet. The decisions below that were the
 user's to make were made on 2026-10-01 and 2026-10-02:
@@ -337,7 +339,8 @@ which comes after the start of any turn the resumption begins.
 first: a conversation process takes it between turns, as it takes any
 frame that comes while a turn runs, so the turn under way finishes with
 the settings it began with. Of the frames queued meanwhile it is taken
-first, so the next turn has it whatever came before it, and a pause
+first, with any `choose` (the Conversation menu, below) in the order
+they came, so the next turn has it whatever came before it, and a pause
 behind it still goes ahead of the messages before it (§3). The window
 sends one carrying the key the
 human stored from its key dialog (§6) to every conversation process
@@ -784,12 +787,77 @@ it was stored and that every conversation uses it from now on.
 **As built (the key list).** `F1` shows td-ui's key list over the
 window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
 of the driven action table, `control::BINDINGS`, with its help line, so
-the list and the table an agent reads are one source; `set-key`, which
-has no chord, is the File menu's. Then come the focused widget's keys
-(the conversation list's, the transcript's or the composer's) and the
-other two's, listed beside `ui::App::key`. The control socket delivers
-its keys to the window's state, not through td-ui's window, so an `F1`
-sent there opens nothing.
+the list and the table an agent reads are one source; `set-key` and
+`model`, which have no chord, are the File and Conversation menus'. Then
+come the focused widget's keys (the conversation list's, the
+transcript's or the composer's) and the other two's, listed beside
+`ui::App::key`. The control socket delivers its keys to the window's
+state, not through td-ui's window, so an `F1` sent there opens nothing.
+
+**As built (the Conversation menu).** Each conversation has its own
+model and reasoning effort. The configuration's `model` (or
+`orchestrator_model`) and `reasoning_effort` (§15) are what a
+conversation starts with and keeps until the human chooses otherwise,
+and a choice is the open conversation's alone: it moves to no other,
+and the configuration file is never written.
+
+- **The menu.** The bar gains a second header, `Conversation`, after
+  `File`. Its items are `Model…`, which opens the picker below, and
+  `Effort`, a submenu of every effort §15 admits (`none`, `minimal`,
+  `low`, `medium`, `high`, `xhigh`), the open conversation's checked.
+  Choosing one asks for it at once. Both items are off with no
+  conversation open, and `Effort` is off for a model whose cached
+  `supported_parameters` lacks `reasoning`, since it would not be sent
+  (§5). The menu shows state, so the window builds it again, at a new
+  revision, from the state of the moment each time it opens, by `F10`
+  or a press on a header; while it is open nothing rebuilds it.
+- **The picker** is td-ui's finder (td-ui/DESIGN.md) over the cached
+  models list, modal over the window's body as td-mail's attach chooser
+  is: a title row saying what it is for, a filter entry, the list and a
+  status row. Its entries are every model of the list, sorted by id,
+  each with its price in dollars per million prompt and completion
+  tokens as its meta (`$3/$15`, `free`, or nothing where that would not
+  fit a row's 16 bytes). A model that does not list `tools` or
+  `max_tokens`, which every request sends (§5), is shown greyed and
+  cannot be chosen, and the status row says why. The conversation's
+  model is marked and selected when it opens. Typed characters filter by
+  the words of an id, as the finder filters; `Up`, `Down`, `PageUp`,
+  `PageDown`, `Home` and `End` move; `Return` or `C-Return` chooses the
+  selected model, as does a second press on the same row within 400 ms,
+  with no other input between; `Escape` closes it with nothing chosen,
+  and every other chord is consumed. While it is open it has every key
+  and the pointer, no widget under it shows focus, and a paste is
+  dropped with a notice. It keeps the chosen effort. With no models list
+  yet it does not open, and a notice says the list has not been fetched;
+  a window too small for it closes it with a notice; opening another
+  conversation, or the key dialog, closes it.
+- **The choice** goes to the open conversation's process as a `choose`
+  frame carrying the whole choice, a model and an effort each or null
+  for the configuration's, both checked as §15 checks those keys. The
+  window builds each choice on the last it asked for, so choosing a
+  model and then an effort before the first is logged asks for both.
+  The process takes it between turns as a setting, as it takes a key:
+  before queued messages and pauses, in the order settings came. It
+  logs it as a `choice` event, writes it to `meta` (§6) and syncs; its
+  next request uses it. A choice made while a turn runs applies from the
+  turn after.
+  The log is the record: `meta` follows it, and a process that died
+  between the two is put right on the next open, as pausing is. The
+  window shows the choice when it hears the event, with a notice in the
+  transcript naming the model and effort (or `no reasoning`) `from the
+  next request`; the
+  history tools show the event to a model as the person's choice.
+- **Refusals** that name where a model was set (§5) say `the
+  conversation's model (Conversation → Model…)` for a chosen one, and
+  the configuration key otherwise.
+- **The status row** names the open conversation's model and then its
+  effort (`anthropic/claude-sonnet-5.5 medium`), or `no reasoning` for
+  a model that does not take one, and its context length is looked up
+  for whichever model that is.
+- **Driven.** The actions gain `model`, which has no chord and opens
+  the picker through the item's own path; the state gains `picker` (the
+  selected model, `nothing`, or `none` when closed), `query` (the
+  filter), `model` and `effort`.
 
 ## 5. Model client
 
@@ -808,7 +876,8 @@ and the attribution pair `http-referer` and `x-openrouter-title: td-agent`.
 
 **Request.** `model`, `messages`, `tools` (on every request, follow-ups
 included, since OpenRouter requires them), `max_tokens`, `reasoning`
-with an effort from configuration, and `provider: {require_parameters:
+with an effort from configuration or the conversation's own choice
+(§4), and `provider: {require_parameters:
 true}` so a request is never routed to a provider that would silently
 drop `tools` or `reasoning`. That routing is why every member a request
 carries, but `model`, `messages`, `stream`, `provider` and
@@ -1174,6 +1243,7 @@ sees it. Each conversation is a directory named by a random id, holding:
     returned one was cut;
   - a step snapshot (§12);
   - a todo list as written (§12);
+  - the human's choice of the conversation's model and effort (§4);
   - a background process started, exited, killed or lost (§12);
   - a notification or notice delivered to the conversation (§3, §7, §12);
   - usage and cost;
@@ -1295,6 +1365,13 @@ interrupted it and its effect is unknown, and is reported as
 interrupted; one never started is answered as not run. Neither runs
 again. A message logged without its turn's start, and not held, is
 given one, as a user message is.
+
+**As built (the Conversation menu).** `meta`'s `model` holds the model
+the human chose for the conversation, and a new member `effort` the
+effort, each null for the configuration's and in older ones. A new
+event, `choice`, holds both, whole, each null for the configuration's;
+the last one is the record, and `meta` is put right from it on load
+(§4).
 
 **As built (the File menu).** The key file can also be written, by the
 window process, from the key dialog of §4. Nothing else writes it.
@@ -2529,7 +2606,10 @@ conversation models, `anthropic/claude-haiku-4.5` for titles, and
 fragment or space, so the key is never sent in the clear; a trailing
 `/` is dropped. A model id is printable ASCII. `reasoning_effort` is one
 of `none`, `minimal`, `low`, `medium`, `high` and `xhigh`. A limit is a
-non-negative number of credits, or `none`. The key file is not a key of
+non-negative number of credits, or `none`. `model`, `orchestrator_model`
+and `reasoning_effort` are what a conversation starts with; the
+Conversation menu chooses another for one conversation (§4), which this
+file never records. The key file is not a key of
 this file (§6).
 
 ## 16. Prior art: opencode
@@ -2849,11 +2929,11 @@ holds that the key is in no text drawn, status line, notice or `Debug`.
 `src/control.rs` drives the menu and the dialog through the seam,
 holding that `state` and `text` never carry the key; and
 `src/conversation.rs` holds that a later `setup` gives a conversation
-its key between turns and that its log never holds it, and that a
-queued `setup` is taken first while a pause still goes ahead of the
-messages before it. A umask that takes the owner's read access is not
-covered: std cannot set one without a foreign call, and it is the
-whole process's, which would race the other tests.
+its key between turns and that its log never holds it, and that a queued
+`setup` or `choose` is taken first, in the order they came, while a
+pause still goes ahead of the messages before it. A umask that takes the
+owner's read access is not covered: std cannot set one without a foreign
+call, and it is the whole process's, which would race the other tests.
 
 `tests/control_process.rs` gains two native cases. In the default build,
 `F10` through the seat opens the File menu, `Down` and `Return` open the

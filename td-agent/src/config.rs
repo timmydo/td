@@ -147,7 +147,7 @@ fn base_url(text: &str) -> Result<String, String> {
 }
 
 /// A model id: visible ASCII, as the provider's ids are.
-fn model_id(key: &str, text: &str) -> Result<String, String> {
+pub(crate) fn model_id(key: &str, text: &str) -> Result<String, String> {
     if text.is_empty() || text.len() > MAX_NAME || !text.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(format!(
             "`{key}` must be a model id such as {DEFAULT_MODEL:?}; not {text:?}"
@@ -156,7 +156,7 @@ fn model_id(key: &str, text: &str) -> Result<String, String> {
     Ok(text.to_string())
 }
 
-fn effort(text: &str) -> Result<String, String> {
+pub(crate) fn effort(text: &str) -> Result<String, String> {
     if EFFORTS.contains(&text) {
         Ok(text.to_string())
     } else {

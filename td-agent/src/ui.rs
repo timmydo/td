@@ -21,9 +21,12 @@
 //! shows the whole list and `C-S-t` clears it. `C-S-p` pauses or resumes
 //! the open conversation (§3).
 //!
-//! A menu bar holds the File menu (`menu`), which `F10` or a press on its
-//! header opens, and File → Set OpenRouter key… opens the key dialog
-//! (`keydialog`), modal over the window until it closes.
+//! A menu bar holds the File and Conversation menus (`menu`), which `F10`
+//! or a press on a header opens. File → Set OpenRouter key… opens the key
+//! dialog (`keydialog`) and Conversation → Model… the model picker
+//! (`picker`), each modal over the window until it closes.
+
+use std::collections::VecDeque;
 
 use td_ui::chrome::ROW;
 use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
@@ -45,6 +48,7 @@ use crate::cost;
 use crate::key::Secret;
 use crate::keydialog::{KeyDialog, Reply};
 use crate::menu;
+use crate::picker::{Offer, Picker};
 use crate::post::Entry;
 use crate::protocol::{Up, MAX_TEXT};
 use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TodoItem};
@@ -195,6 +199,12 @@ pub enum Request {
     SaveKey { secret: Secret, replace: bool },
     /// Close the window, from File → Quit.
     Quit,
+    /// The open conversation's model and effort as the human chose them,
+    /// whole; none is the configuration's.
+    Choose {
+        model: Option<String>,
+        effort: Option<String>,
+    },
 }
 
 /// What has the keyboard.
@@ -452,6 +462,21 @@ pub struct App {
     models: (String, String),
     /// Each model's context length, as the models list gives it.
     contexts: Vec<(String, u64)>,
+    /// The configuration's reasoning effort.
+    effort: String,
+    /// The models list as the picker offers it.
+    offers: Vec<Offer>,
+    /// The open conversation's model and effort as the human chose them,
+    /// from its log; none is the configuration's.
+    choice: (Option<String>, Option<String>),
+    /// The choices asked for and not yet heard logged, oldest first: the
+    /// next one builds on the last, though the process has not taken it.
+    asked: VecDeque<(Option<String>, Option<String>)>,
+    /// The model picker while it is open, modal over the window.
+    picker: Option<Picker>,
+    /// The menu's revision: it is built again, from the state of the
+    /// moment, each time it opens.
+    menu_revision: u64,
     credit: Option<String>,
     today: Option<u64>,
     limits: cost::Limits,
@@ -525,6 +550,12 @@ impl App {
             undrawn: None,
             models: (String::new(), String::new()),
             contexts: Vec::new(),
+            effort: String::new(),
+            offers: Vec::new(),
+            choice: (None, None),
+            asked: VecDeque::new(),
+            picker: None,
+            menu_revision: 1,
             credit: None,
             today: None,
             limits: cost::Limits {
@@ -533,7 +564,8 @@ impl App {
                 day: None,
             },
             requests: Vec::new(),
-            menu: menu::menu(surface).map_err(|e| format!("the menu: {e}"))?,
+            menu: menu::menu(surface, menu::State::default(), 1)
+                .map_err(|e| format!("the menu: {e}"))?,
             dialog: None,
             key_path: None,
             keyed: true,
@@ -646,9 +678,11 @@ impl App {
         } else {
             " | no key: File \u{2192} Set OpenRouter key\u{2026} (F10)"
         };
-        let model = match row.map(|r| r.role) {
-            Some(Role::Orchestrator) => self.models.1.as_str(),
-            _ => self.models.0.as_str(),
+        let model = self.model();
+        let effort = if self.reasoning(model) {
+            self.effort()
+        } else {
+            "no reasoning"
         };
         let length = self
             .contexts
@@ -676,10 +710,54 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{retry}{keyless}{notice} | {model} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
+            "{state}{retry}{keyless}{notice} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
             of(self.meter.spent, self.limits.conversation),
             self.mode.word()
         )
+    }
+
+    /// The open conversation's model: the human's choice, else the
+    /// configuration's for its role.
+    pub fn model(&self) -> &str {
+        if let Some(model) = &self.choice.0 {
+            return model;
+        }
+        let row = self
+            .active
+            .as_ref()
+            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
+        match row.map(|r| r.role) {
+            Some(Role::Orchestrator) => &self.models.1,
+            _ => &self.models.0,
+        }
+    }
+
+    /// The open conversation's reasoning effort: the human's choice, else
+    /// the configuration's.
+    pub fn effort(&self) -> &str {
+        self.choice.1.as_deref().unwrap_or(&self.effort)
+    }
+
+    /// Whether `model` takes a reasoning effort, as far as the models list
+    /// says; one it does not name may.
+    fn reasoning(&self, model: &str) -> bool {
+        self.offers
+            .iter()
+            .find(|o| o.id == model)
+            .is_none_or(|o| o.reasoning)
+    }
+
+    /// The models list as the picker offers it, and the configuration's
+    /// reasoning effort.
+    pub fn set_offers(&mut self, offers: Vec<Offer>, effort: &str) {
+        self.offers = offers;
+        self.effort = effort.to_string();
+        self.touch();
+    }
+
+    /// The model picker, while it is open.
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
     }
 
     /// The models the status row names, and their context lengths.
@@ -761,6 +839,10 @@ impl App {
     /// Shows conversation `id`, its transcript empty until its process
     /// replays its log, and every other conversation closed.
     pub fn set_active(&mut self, id: Id) {
+        // A model is chosen for the conversation the picker opened over.
+        if self.picker.take().is_some() {
+            self.apply_focus();
+        }
         // The conversation left goes on in the background while its turn
         // runs (its process is kept); the others keep what they showed.
         let running = self.turns.last().map(|(turn, _)| *turn).filter(|_| {
@@ -795,6 +877,8 @@ impl App {
         self.turns.clear();
         self.last_seq = 0;
         self.meter = Meter::default();
+        self.choice = (None, None);
+        self.asked.clear();
         self.streaming = None;
         self.undrawn = None;
         if !self.todo.is_empty() {
@@ -1256,6 +1340,21 @@ impl App {
                     self.place();
                 }
             }
+            Kind::Choice { model, effort } => {
+                self.choice = (model, effort);
+                // The process logs choices in the order they were asked.
+                if self.asked.front() == Some(&self.choice) {
+                    self.asked.pop_front();
+                }
+                let effort = if self.reasoning(self.model()) {
+                    format!("reasoning effort {}", self.effort())
+                } else {
+                    "no reasoning".to_string()
+                };
+                let said = format!("model {}, {effort}, from the next request", self.model());
+                self.notice_message(&said);
+                self.touch();
+            }
             Kind::Pause { paused } => {
                 if let Some(row) = self.active_row() {
                     row.paused = paused;
@@ -1599,9 +1698,16 @@ impl App {
             surface: self.surface,
             rect: body(self.surface),
         });
-        let _ = self
-            .menu
-            .event(menu::revision(), td_ui::menus::Event::Resize(self.surface));
+        let _ = self.menu.event(
+            Some(self.menu_revision),
+            td_ui::menus::Event::Resize(self.surface),
+        );
+        if let Some(picker) = self.picker.as_mut() {
+            if !picker.resize(self.surface, body(self.surface)) {
+                self.close_picker();
+                self.note("the window is now too small for the model picker, which is closed");
+            }
+        }
         if let Some(dialog) = self.dialog.as_mut() {
             if !dialog.resize(self.surface) {
                 self.close_dialog();
@@ -1671,7 +1777,9 @@ impl App {
     /// the others, so exactly one shows a focused caret or selection.
     fn apply_focus(&mut self) {
         // A modal dialog has the keyboard: no widget under it shows focus.
-        let on = |f: Focus| self.focused && self.dialog.is_none() && self.focus == f;
+        let on = |f: Focus| {
+            self.focused && self.dialog.is_none() && self.picker.is_none() && self.focus == f
+        };
         let list_focus = if on(Focus::List) {
             tree_table::Focus::Rows
         } else {
@@ -1790,6 +1898,9 @@ impl App {
         if self.dialog.is_some() {
             return self.dialog_input(input, clipboard);
         }
+        if self.picker.is_some() {
+            return self.picker_input(input);
+        }
         if self.menu.is_open() && self.menu_input(&input) {
             return;
         }
@@ -1855,6 +1966,9 @@ impl App {
         if self.dialog.is_some() {
             return self.note("a paste that came while the key dialog was open is dropped");
         }
+        if self.picker.is_some() {
+            return self.note("a paste that came while the model picker was open is dropped");
+        }
         if self.focus == Focus::Composer {
             match self.composer.insert(text) {
                 Ok(true) => self.touch(),
@@ -1889,6 +2003,7 @@ impl App {
     /// Opens the File menu.
     fn open_menu(&mut self) {
         self.cancel_pointer();
+        self.refresh_menu();
         match self.menu.open_bar(0) {
             Ok(()) => self.touch(),
             Err(e) => self.note(format!("the menu: {e}")),
@@ -1942,7 +2057,7 @@ impl App {
 
     fn menu_event(&mut self, event: td_ui::menus::Event) {
         use td_ui::menus::Outcome;
-        match self.menu.event(menu::revision(), event) {
+        match self.menu.event(Some(self.menu_revision), event) {
             Ok(Outcome::Activated(action)) => {
                 self.touch();
                 self.menu_action(action);
@@ -1963,6 +2078,111 @@ impl App {
             menu::Action::New => self.requests.push(Request::New),
             menu::Action::SetKey => self.open_key_dialog(),
             menu::Action::Quit => self.requests.push(Request::Quit),
+            menu::Action::Model => self.open_picker(),
+            menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
+        }
+    }
+
+    /// Builds the menu again, closed, from the state of the moment and at
+    /// a new revision: the open conversation's effort is checked, and its
+    /// items are off with no conversation open.
+    fn refresh_menu(&mut self) {
+        if self.menu.is_open() {
+            return;
+        }
+        let revision = self.menu_revision.wrapping_add(1);
+        let model = self.model();
+        let state = menu::State {
+            open: self.active.is_some(),
+            effort: self.effort(),
+            reasoning: self.reasoning(model),
+        };
+        match menu::menu(self.surface, state, revision) {
+            Ok(menu) => {
+                self.menu = menu;
+                self.menu_revision = revision;
+            }
+            Err(e) => self.note(format!("the menu: {e}")),
+        }
+    }
+
+    /// The choice the next one starts from: the last asked for, else the
+    /// one logged.
+    fn wanted(&self) -> (Option<String>, Option<String>) {
+        self.asked
+            .back()
+            .cloned()
+            .unwrap_or_else(|| self.choice.clone())
+    }
+
+    /// Asks for the open conversation's model and effort to be these.
+    fn choose(&mut self, model: Option<String>, effort: Option<String>) {
+        if self.active.is_none() {
+            return self.note("no conversation is open to choose for");
+        }
+        self.asked.push_back((model.clone(), effort.clone()));
+        self.requests.push(Request::Choose { model, effort });
+        self.touch();
+    }
+
+    /// Opens the model picker for the open conversation, modal over the
+    /// window's body.
+    pub fn open_picker(&mut self) {
+        if self.picker.is_some() || self.dialog.is_some() {
+            return;
+        }
+        if self.active.is_none() {
+            return self.note("no conversation is open to choose a model for");
+        }
+        self.cancel_pointer();
+        self.menu.dismiss();
+        let wanted = self.wanted().0;
+        let current = wanted.as_deref().unwrap_or_else(|| self.model());
+        match Picker::open(self.surface, body(self.surface), &self.offers, current) {
+            Ok(picker) => {
+                self.picker = Some(picker);
+                self.apply_focus();
+                self.touch();
+            }
+            Err(e) => self.note(e),
+        }
+    }
+
+    fn close_picker(&mut self) {
+        self.picker = None;
+        self.apply_focus();
+        self.touch();
+    }
+
+    /// An input while the picker is open, which is the picker's: every
+    /// key and the pointer. A resize and the window's focus are the
+    /// window's too.
+    fn picker_input(&mut self, input: Input<'_>) {
+        match input {
+            Input::Resize(surface) => return self.resize(surface),
+            Input::Focus(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.cancel_pointer();
+                }
+                return self.apply_focus();
+            }
+            _ => {}
+        }
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match picker.input(&input) {
+            crate::picker::Reply::Stay(changed) => {
+                if changed {
+                    self.touch();
+                }
+            }
+            crate::picker::Reply::Closed => self.close_picker(),
+            crate::picker::Reply::Chosen(model) => {
+                self.close_picker();
+                self.choose(Some(model), self.wanted().1);
+            }
         }
     }
 
@@ -1981,6 +2201,8 @@ impl App {
         self.press = None;
         match KeyDialog::open(self.surface, &path) {
             Ok(dialog) => {
+                // One modal at a time: the dialog replaces the picker.
+                self.picker = None;
                 self.dialog = Some(dialog);
                 self.apply_focus();
             }
@@ -2126,9 +2348,12 @@ impl App {
     /// A key, by its chord: the window's own first, then the focused
     /// widget's.
     pub fn key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
-        // An open dialog or menu has every key.
+        // An open dialog, picker or menu has every key.
         if self.dialog.is_some() {
             return self.dialog_input(Input::Key { chord, repeat }, clipboard);
+        }
+        if self.picker.is_some() {
+            return self.picker_input(Input::Key { chord, repeat });
         }
         if self.menu.is_open() {
             return self.menu_event(menu::event(chord, repeat));
@@ -2286,6 +2511,7 @@ impl App {
         let capture = match phase {
             PointerPhase::Press => {
                 if menu::bar(self.surface).rect().contains(x, y) {
+                    self.refresh_menu();
                     self.menu_event(td_ui::menus::Event::Press { x, y });
                     return;
                 }
@@ -2522,6 +2748,9 @@ impl Composition for App {
         self.emit_status(regions.status, damage, sink);
         menu::bar(self.surface).emit(damage, sink);
         self.menu.emit(damage, sink);
+        if let Some(picker) = &self.picker {
+            picker.emit(damage, sink);
+        }
         if let Some(dialog) = &self.dialog {
             dialog.emit(self.focused, damage, sink);
         }
@@ -2568,6 +2797,7 @@ pub mod tests {
         let surface = Surface::new(1024, 640, Scale::default()).unwrap();
         let mut app = App::new(surface, None, Mode::Auto).unwrap();
         app.set_models("m/conv", "m/orch", vec![("m/orch".into(), 200_000)]);
+        app.set_offers(Vec::new(), "medium");
         app.set_rows(vec![
             row(2, Role::Conversation, 50),
             row(1, Role::Orchestrator, 10),
@@ -2606,7 +2836,7 @@ pub mod tests {
             ["td-agent", "Composer", "Conversation list", "Transcript"]
         );
         // Every chord the driven table binds, in its order and words; the
-        // chordless menu item is no key.
+        // chordless menu items, `set-key` and `model`, are no key.
         let chorded: Vec<keys::Row> = crate::control::BINDINGS
             .iter()
             .filter_map(|b| {
@@ -2617,7 +2847,7 @@ pub mod tests {
             })
             .collect();
         assert_eq!(sections[0].rows, chorded);
-        assert_eq!(sections[0].rows.len(), crate::control::BINDINGS.len() - 1);
+        assert_eq!(sections[0].rows.len(), crate::control::BINDINGS.len() - 2);
         assert!(sections[0].rows.iter().any(|r| r.keys == "C-n"));
         assert!(sections[1].rows.iter().any(|r| r.keys == "C-v/S-Insert"));
         key(&mut app, "F6");
@@ -2644,7 +2874,7 @@ pub mod tests {
         let mut app = app();
         assert_eq!(
             app.status_line(),
-            "starting | m/orch | ctx 0/200k | cost $0.0000 | mode auto | no limits | 0 background"
+            "starting | m/orch medium | ctx 0/200k | cost $0.0000 | mode auto | no limits | 0 background"
         );
         app.update(
             Update::Up(Up::Hello {
@@ -2660,7 +2890,7 @@ pub mod tests {
         app.set_credit(Some("credit $7.5000".into()));
         assert_eq!(
             app.status_line(),
-            "idle | dropped a torn final log line of 7 bytes | m/orch | ctx 0/200k | cost $0.0000 \
+            "idle | dropped a torn final log line of 7 bytes | m/orch medium | ctx 0/200k | cost $0.0000 \
              | today $0.2500 | credit $7.5000 | mode auto | no limits | 0 background"
         );
         // Each total against its limit, where one is set.
@@ -2674,11 +2904,15 @@ pub mod tests {
         // A conversation's own model, and none known of its length.
         key(&mut app, "C-PageDown");
         assert!(
-            app.status_line().contains("| m/conv | ctx - |"),
+            app.status_line().contains("| m/conv medium | ctx - |"),
             "{}",
             app.status_line()
         );
-        assert!(text(&app).contains("| m/conv | ctx - |"), "{}", text(&app));
+        assert!(
+            text(&app).contains("| m/conv medium | ctx - |"),
+            "{}",
+            text(&app)
+        );
     }
 
     #[test]
@@ -3897,5 +4131,217 @@ pub mod tests {
         key(&mut app, "Return");
         assert!(app.dialog().is_none());
         assert!(app.notice().unwrap().contains("nowhere to store a key"));
+    }
+
+    fn offers() -> Vec<Offer> {
+        let offer = |id: &str, reasoning: bool| Offer {
+            id: id.into(),
+            price: "$1/$2".into(),
+            usable: true,
+            reasoning,
+        };
+        vec![
+            offer("m/orch", true),
+            offer("m/conv", true),
+            offer("m/plain", false),
+        ]
+    }
+
+    #[test]
+    fn the_conversation_menu_chooses_the_effort_and_the_picker_the_model() {
+        let mut app = app();
+        app.set_offers(offers(), "medium");
+        // Conversation > Effort > high, by the keys, from the menu built
+        // as it opened.
+        key(&mut app, menu::OPEN);
+        for chord in ["Right", "Down", "Right", "Down", "Down", "Down", "Down"] {
+            key(&mut app, chord);
+        }
+        key(&mut app, "Return");
+        assert!(!app.menu_open());
+        assert_eq!(
+            app.take_requests(),
+            [Request::Choose {
+                model: None,
+                effort: Some("high".into())
+            }]
+        );
+        // The conversation logs it, and the window shows it.
+        app.update(
+            at(
+                1,
+                Kind::Choice {
+                    model: None,
+                    effort: Some("high".into()),
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.effort(), "high");
+        assert!(
+            app.status_line().contains("| m/orch high |"),
+            "{}",
+            app.status_line()
+        );
+        assert!(text(&app).contains("reasoning effort high, from the next request"));
+        // The menu opened again checks it.
+        key(&mut app, menu::OPEN);
+        let checked: Vec<&str> = (0..)
+            .map_while(|n| app.menu.model().node(n).copied())
+            .filter(|n| n.row.checked)
+            .map(|n| n.row.label)
+            .collect();
+        assert_eq!(checked, ["high"]);
+        key(&mut app, "Escape");
+        // Conversation > Model... opens the picker on the conversation's
+        // model; typing filters and Return chooses, the effort kept.
+        app.menu_action(menu::Action::Model);
+        let picker = app.picker().unwrap();
+        assert_eq!(picker.selected(), Some("m/orch"));
+        for c in ["p", "l", "a"] {
+            key(&mut app, c);
+        }
+        assert_eq!(app.picker().unwrap().selected(), Some("m/plain"));
+        key(&mut app, "Return");
+        assert!(app.picker().is_none());
+        assert_eq!(
+            app.take_requests(),
+            [Request::Choose {
+                model: Some("m/plain".into()),
+                effort: Some("high".into())
+            }]
+        );
+        app.update(
+            at(
+                2,
+                Kind::Choice {
+                    model: Some("m/plain".into()),
+                    effort: Some("high".into()),
+                },
+            ),
+            0,
+        );
+        // A model that takes no effort says so, and its Effort is off.
+        assert!(
+            app.status_line().contains("| m/plain no reasoning |"),
+            "{}",
+            app.status_line()
+        );
+        app.refresh_menu();
+        let effort = (0..)
+            .map_while(|n| app.menu.model().node(n).copied())
+            .find(|n| n.row.label == menu::EFFORT)
+            .unwrap();
+        assert!(!effort.row.enabled);
+        // Escape closes the picker with nothing chosen; opening another
+        // conversation closes it too, and shows that one's choice.
+        app.open_picker();
+        key(&mut app, "Escape");
+        assert!(app.picker().is_none() && app.take_requests().is_empty());
+        app.open_picker();
+        assert!(app.picker().is_some());
+        app.set_active(id(2));
+        assert!(app.picker().is_none());
+        assert_eq!((app.model(), app.effort()), ("m/conv", "medium"));
+    }
+
+    /// Two choices made before the conversation logs the first: the
+    /// second keeps what the first chose.
+    #[test]
+    fn a_choice_made_before_the_last_is_logged_builds_on_it() {
+        let mut app = app();
+        app.set_offers(offers(), "medium");
+        app.menu_action(menu::Action::Model);
+        for c in ["p", "l", "a"] {
+            key(&mut app, c);
+        }
+        key(&mut app, "Return");
+        app.menu_action(menu::Action::Effort("high"));
+        let plain = Some("m/plain".to_string());
+        assert_eq!(
+            app.take_requests(),
+            [
+                Request::Choose {
+                    model: plain.clone(),
+                    effort: None
+                },
+                Request::Choose {
+                    model: plain.clone(),
+                    effort: Some("high".into())
+                }
+            ]
+        );
+        // The first logged leaves the second still asked for.
+        app.update(
+            at(
+                1,
+                Kind::Choice {
+                    model: plain.clone(),
+                    effort: None,
+                },
+            ),
+            0,
+        );
+        // A model that takes no effort is said to have none.
+        assert!(text(&app).contains("m/plain, no reasoning, from"));
+        app.menu_action(menu::Action::Effort("low"));
+        assert_eq!(
+            app.take_requests(),
+            [Request::Choose {
+                model: plain,
+                effort: Some("low".into())
+            }]
+        );
+    }
+
+    /// A, then B, then A again, asked during one turn: the logged B does
+    /// not hide the A asked after it.
+    #[test]
+    fn choices_asked_are_matched_to_their_events_in_order() {
+        let mut app = app();
+        app.set_offers(offers(), "medium");
+        let pick = |model: &str| (Some(model.to_string()), None);
+        for model in ["m/conv", "m/plain", "m/conv"] {
+            let (model, effort) = pick(model);
+            app.choose(model, effort);
+        }
+        app.take_requests();
+        for (seq, model) in [(1, "m/conv"), (2, "m/plain")] {
+            let (model, effort) = pick(model);
+            app.update(at(seq, Kind::Choice { model, effort }), 0);
+        }
+        app.menu_action(menu::Action::Effort("high"));
+        assert_eq!(
+            app.take_requests(),
+            [Request::Choose {
+                model: Some("m/conv".into()),
+                effort: Some("high".into())
+            }]
+        );
+        // The picker opens on the model asked for last.
+        app.open_picker();
+        assert_eq!(app.picker().unwrap().selected(), Some("m/conv"));
+    }
+
+    #[test]
+    fn the_key_dialog_replaces_the_picker() {
+        let mut app = app();
+        app.set_offers(offers(), "medium");
+        app.open_picker();
+        assert!(app.picker().is_some());
+        // With nowhere to store a key, no dialog, and the picker stays.
+        app.open_key_dialog();
+        assert!(app.picker().is_some() && app.dialog().is_none());
+        app.set_key_path(Some(PATH.into()));
+        app.open_key_dialog();
+        assert!(app.picker().is_none() && app.dialog().is_some());
+    }
+
+    #[test]
+    fn with_no_models_known_the_picker_says_so() {
+        let mut app = app();
+        app.open_picker();
+        assert!(app.picker().is_none());
+        assert!(app.notice().unwrap().contains("no models are known yet"));
     }
 }

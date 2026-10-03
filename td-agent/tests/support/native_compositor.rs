@@ -7,7 +7,9 @@
 //! through a real keyboard, the window starts a conversation process per
 //! open conversation, and each message lands in that conversation's log;
 //! F10 opens the File menu, whose Set OpenRouter key… opens a masked
-//! dialog that never shows what is typed; and, in the `test-key-root`
+//! dialog that never shows what is typed; its Conversation menu's
+//! Model… opens the picker over the models list, and the model chosen
+//! there is logged by the open conversation; and, in the `test-key-root`
 //! build (`fixture`), a key typed there and saved is stored mode 0600 and
 //! handed to the running conversation, and appears nowhere else.
 
@@ -41,6 +43,8 @@ const KEY_N: u32 = 49;
 const KEY_F10: u32 = 68;
 const KEY_PAGEUP: u32 = 104;
 const KEY_DOWN: u32 = 108;
+const KEY_RIGHT: u32 = 106;
+const KEY_U: u32 = 22;
 
 /// The key the cases type, and its keys on the seat.
 const SECRET: &str = "sk-or-v1-abc";
@@ -245,8 +249,9 @@ impl AgentProcess {
     }
 
     fn launch(directory: &Directory, display: &Path, control: bool, env: &[(&str, &Path)]) -> Self {
+        // A case may have put state there first.
         let home = directory.0.join("home");
-        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
         let stderr = directory.0.join("stderr");
         let socket = control.then(|| directory.0.join("control"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_td-agent"));
@@ -532,6 +537,82 @@ fn the_file_menu_opens_a_masked_key_dialog() {
     assert!(!agent.home.join("config/td-agent/openrouter.key").exists());
     assert!(!agent.said().contains(SECRET));
     assert!(holding(&client_directory.0, SECRET.as_bytes()).is_empty());
+    drop(agent);
+    compositor.stop();
+}
+
+/// Conversation → Model… opens the picker over the cached models list;
+/// typed into and chosen, the model is logged by the open conversation.
+#[test]
+#[ignore = "ready supplies the disposable native compositor"]
+fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
+    let compositor_directory = Directory::new();
+    let mut compositor = Compositor::start(&compositor_directory);
+    let client_directory = Directory::new();
+    // The models list as the window would have cached it.
+    let state = td_agent::store::StateDir::at(client_directory.0.join("home/state/td-agent"));
+    state.ensure().unwrap();
+    td_agent::models::Models::from_provider(include_bytes!("../fixtures/openrouter/models.json"))
+        .unwrap()
+        .save(state.root())
+        .unwrap();
+    let agent = AgentProcess::launch(
+        &client_directory,
+        &compositor.directory.join("wayland-0"),
+        true,
+        &[],
+    );
+    wait(&agent, "the td-agent window maps with the keyboard", || {
+        compositor.focused("td-agent").then_some(())
+    });
+    wait(&agent, "the orchestrator is open", || {
+        let state = agent.state();
+        (!state.contains("active=none") && state.contains("model=anthropic/claude-sonnet-5.5"))
+            .then_some(())
+    });
+    compositor.chord(&[], KEY_F10);
+    compositor.chord(&[], KEY_RIGHT);
+    wait(&agent, "Right moves to the Conversation menu", || {
+        agent.text().contains("Model\u{2026}").then_some(())
+    });
+    compositor.chord(&[], KEY_ENTER);
+    wait(
+        &agent,
+        "Model… opens the picker on the conversation's model",
+        || {
+            agent
+                .state()
+                .contains("picker=anthropic/claude-sonnet-5.5")
+                .then_some(())
+        },
+    );
+    for key in [KEY_H, KEY_A, KEY_I, KEY_K, KEY_U] {
+        compositor.chord(&[], key);
+    }
+    wait(&agent, "typing filters to the model", || {
+        agent
+            .state()
+            .contains("picker=anthropic/claude-haiku-4.5\tquery=haiku")
+            .then_some(())
+    });
+    compositor.chord(&[], KEY_ENTER);
+    wait(&agent, "the conversation logs the choice", || {
+        agent
+            .state()
+            .contains("model=anthropic/claude-haiku-4.5")
+            .then_some(())
+    });
+    let chosen = std::fs::read_dir(&agent.conversations)
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path().join("log")).ok())
+        .flat_map(|log| parse_log(&log).unwrap().0)
+        .find_map(|event| match event.kind {
+            Kind::Choice { model, .. } => Some(model),
+            _ => None,
+        });
+    assert_eq!(chosen, Some(Some("anthropic/claude-haiku-4.5".to_string())));
+    assert!(agent.state().contains("picker=none"));
     drop(agent);
     compositor.stop();
 }

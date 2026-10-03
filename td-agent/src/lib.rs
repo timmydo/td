@@ -34,6 +34,7 @@ pub mod key;
 pub mod keydialog;
 pub mod menu;
 pub mod models;
+pub mod picker;
 pub mod post;
 pub mod prompt;
 pub mod protocol;

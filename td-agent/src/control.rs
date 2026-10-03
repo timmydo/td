@@ -39,7 +39,7 @@ impl ErrorCode for Refusal {
 
 /// The window's actions, each its default chord; `set-key` has none, and
 /// is the File menu's item.
-pub const BINDINGS: [Binding; 13] = [
+pub const BINDINGS: &[Binding] = &[
     Binding {
         name: "new",
         chord: Some("C-n"),
@@ -118,6 +118,12 @@ pub const BINDINGS: [Binding; 13] = [
         arguments: "",
         help: "File > Set OpenRouter key...: open the dialog that stores the OpenRouter API key.",
     },
+    Binding {
+        name: "model",
+        chord: None,
+        arguments: "",
+        help: "Conversation > Model...: open the picker of the open conversation's model: type to filter, Return chooses, Escape cancels.",
+    },
 ];
 
 /// The window as the seam drives it. A copy has no press to be offered
@@ -148,17 +154,21 @@ impl Controller for Remote<'_> {
     type Error = Refusal;
 
     fn bindings(&self) -> &'static [Binding] {
-        &BINDINGS
+        BINDINGS
     }
 
     fn action(&mut self, name: &str, arguments: &[&str]) -> Result<driven::Outcome, Refusal> {
         if !arguments.is_empty() {
             return Err(Refusal::Protocol);
         }
-        if name == "set-key" {
-            // Through the menu's own path, as a choice of its item.
+        // Through the menu's own paths, as a choice of its item.
+        if name == "set-key" || name == "model" {
             let before = self.app.generation();
-            self.app.open_key_dialog();
+            if name == "set-key" {
+                self.app.open_key_dialog();
+            } else {
+                self.app.open_picker();
+            }
             return Ok(self.outcome(before));
         }
         let chord = BINDINGS
@@ -224,14 +234,21 @@ impl Controller for Remote<'_> {
         let (dialog, entry) = app
             .dialog()
             .map_or(("none", 0), |dialog| (dialog.part(), dialog.length()));
+        // The picker's selection and filter: model names, which hold no
+        // secret, unlike the dialog's entry.
+        let (picker, query) = app.picker().map_or(("none", ""), |picker| {
+            (picker.selected().unwrap_or("nothing"), picker.query())
+        });
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tquery={query}\tmodel={}\teffort={}\tstatus={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
             app.transcript().len(),
             app.composed().len(),
             if app.menu_open() { "open" } else { "closed" },
+            app.model(),
+            app.effort(),
             app.status_line().replace(['\t', '\n'], " "),
         ))
     }
@@ -248,7 +265,7 @@ mod tests {
 
     #[test]
     fn the_action_table_is_well_formed_and_drives_the_window() {
-        driven::check(&BINDINGS).unwrap();
+        driven::check(BINDINGS).unwrap();
         let mut app = crate::ui::tests::app();
         let mut remote = Remote { app: &mut app };
         assert_eq!(
@@ -355,5 +372,45 @@ mod tests {
             format!("1\t71\tkey\t{}", hex("Escape")).as_bytes(),
         );
         assert!(remote.state().unwrap().contains("dialog=none"));
+    }
+
+    /// `model` opens the picker, whose selection and filter the state
+    /// says; typed into and chosen, it asks for the conversation's model.
+    #[test]
+    fn the_model_picker_is_driven() {
+        let mut app = crate::ui::tests::app();
+        let offer = |id: &str| crate::picker::Offer {
+            id: id.into(),
+            price: String::new(),
+            usable: true,
+            reasoning: true,
+        };
+        app.set_offers(vec![offer("m/orch"), offer("m/conv")], "medium");
+        let mut remote = Remote { app: &mut app };
+        let state = remote.state().unwrap();
+        assert!(
+            state.contains("picker=none\tquery=\tmodel=m/orch\teffort=medium"),
+            "{state}"
+        );
+        assert!(driven::request(&mut remote, b"1\t1\taction\tmodel").ends_with("changed"));
+        assert!(remote.state().unwrap().contains("picker=m/orch\tquery="));
+        for (n, c) in ["c", "o", "n", "v"].iter().enumerate() {
+            let line = format!("1\t{}\tkey\t{}", 10 + n, hex(c));
+            assert!(driven::request(&mut remote, line.as_bytes()).ends_with("changed"));
+        }
+        let state = remote.state().unwrap();
+        assert!(state.contains("picker=m/conv\tquery=conv"), "{state}");
+        driven::request(
+            &mut remote,
+            format!("1\t20\tkey\t{}", hex("Return")).as_bytes(),
+        );
+        assert!(remote.state().unwrap().contains("picker=none"));
+        assert_eq!(
+            remote.app.take_requests(),
+            [Request::Choose {
+                model: Some("m/conv".into()),
+                effort: None
+            }]
+        );
     }
 }

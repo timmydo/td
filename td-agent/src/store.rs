@@ -300,7 +300,7 @@ pub(crate) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String
     })
 }
 
-/// A conversation's `meta` (DESIGN.md §6). The workspace, model and
+/// A conversation's `meta` (DESIGN.md §6). The workspace, mode and
 /// parent are null until the increments that give them values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Meta {
@@ -312,6 +312,11 @@ pub struct Meta {
     /// until resumed. The log's `Pause` events are the record; this is
     /// the list's copy, absent and false in a meta written before.
     pub paused: bool,
+    /// The model and effort the human chose for it, none being the
+    /// configuration's: the list's copy of the log's last `Choice`, null
+    /// in a meta written before.
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 impl Meta {
@@ -322,11 +327,12 @@ impl Meta {
             ("role".into(), Json::Str(self.role.word().into())),
             ("title".into(), Json::Str(self.title.clone())),
             ("workspace".into(), Json::Null),
-            ("model".into(), Json::Null),
+            ("model".into(), or_null(&self.model)),
             ("mode".into(), Json::Null),
             ("parent".into(), Json::Null),
             ("created".into(), Json::from(self.created)),
             ("paused".into(), Json::Bool(self.paused)),
+            ("effort".into(), or_null(&self.effort)),
         ])
     }
 
@@ -349,7 +355,24 @@ impl Meta {
                 None => false,
                 Some(paused) => paused.as_bool().ok_or("meta's paused is not a boolean")?,
             },
+            model: optional_str(value, "model").ok_or("meta's model is not a string")?,
+            effort: optional_str(value, "effort").ok_or("meta's effort is not a string")?,
         })
+    }
+}
+
+/// A string member, or null, as `None`.
+fn or_null(value: &Option<String>) -> Json {
+    value.clone().map_or(Json::Null, Json::Str)
+}
+
+/// A member that is a string, absent or null; none when it is anything
+/// else.
+fn optional_str(value: &Json, name: &str) -> Option<Option<String>> {
+    match value.get(name) {
+        None | Some(Json::Null) => Some(None),
+        Some(Json::Str(text)) => Some(Some(text.clone())),
+        Some(_) => None,
     }
 }
 
@@ -653,6 +676,12 @@ pub enum Kind {
     Todo { items: Vec<TodoItem>, cleared: bool },
     /// The human paused or resumed the conversation (DESIGN.md §3).
     Pause { paused: bool },
+    /// The human chose the conversation's model and reasoning effort
+    /// (DESIGN.md §4, §5), whole: none is the configuration's.
+    Choice {
+        model: Option<String>,
+        effort: Option<String>,
+    },
     /// An approval decision (DESIGN.md §6, §11): the `ToolCall` it
     /// decided, its outcome, who decided it (a rule, a classifier stage or
     /// the human), Jev's probabilities where it gave them, and the reason.
@@ -844,6 +873,11 @@ impl Event {
                 put("kind", Json::Str("pause".into()));
                 put("paused", Json::Bool(*paused));
             }
+            Kind::Choice { model, effort } => {
+                put("kind", Json::Str("choice".into()));
+                put("model", or_null(model));
+                put("effort", or_null(effort));
+            }
             Kind::Approval {
                 call,
                 outcome,
@@ -1027,6 +1061,10 @@ impl Event {
                     .and_then(Json::as_bool)
                     .ok_or("no paused")?,
             },
+            Some("choice") => Kind::Choice {
+                model: optional("model")?,
+                effort: optional("effort")?,
+            },
             Some("approval") => Kind::Approval {
                 call: number("call")?,
                 outcome: string("outcome")?,
@@ -1097,6 +1135,8 @@ impl Conversation {
                     title: role.first_title().to_string(),
                     created: now(),
                     paused: false,
+                    model: None,
+                    effort: None,
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
@@ -1206,6 +1246,16 @@ impl Conversation {
         if let Some(paused) = paused.filter(|p| *p != conversation.meta.paused) {
             conversation.set_paused(paused)?;
         }
+        // So is the human's choice of model and effort.
+        let chosen = conversation.choice();
+        if chosen
+            != (
+                conversation.meta.model.clone(),
+                conversation.meta.effort.clone(),
+            )
+        {
+            conversation.set_choice(chosen.0, chosen.1)?;
+        }
         Ok((conversation, load))
     }
 
@@ -1298,6 +1348,34 @@ impl Conversation {
     pub fn set_paused(&mut self, paused: bool) -> Result<(), String> {
         let mut meta = self.meta.clone();
         meta.paused = paused;
+        replace(&self.dir, "meta", meta.to_json().to_string().as_bytes())?;
+        self.meta = meta;
+        Ok(())
+    }
+
+    /// The model and effort the log's last `Choice` holds, none being the
+    /// configuration's.
+    pub fn choice(&self) -> (Option<String>, Option<String>) {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.kind {
+                Kind::Choice { model, effort } => Some((model.clone(), effort.clone())),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Records the human's choice in `meta`, the list's copy of the log's
+    /// `Choice` events.
+    pub fn set_choice(
+        &mut self,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<(), String> {
+        let mut meta = self.meta.clone();
+        meta.model = model;
+        meta.effort = effort;
         replace(&self.dir, "meta", meta.to_json().to_string().as_bytes())?;
         self.meta = meta;
         Ok(())
@@ -1775,6 +1853,70 @@ pub mod tests {
         drop(conversation);
         let (metas, _) = state.list();
         assert!(metas.iter().all(|m| !m.paused), "and `meta` is written");
+    }
+
+    #[test]
+    fn a_choice_of_model_and_effort_replays_and_is_kept_in_meta() {
+        let scratch = Scratch::new("choice");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let chosen = Kind::Choice {
+            model: Some("openai/gpt-6".into()),
+            effort: Some("high".into()),
+        };
+        let (mut conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        assert_eq!(conversation.choice(), (None, None));
+        assert_eq!(
+            (
+                conversation.meta().model.clone(),
+                conversation.meta().effort.clone()
+            ),
+            (None, None)
+        );
+        conversation.append(chosen.clone()).unwrap();
+        conversation
+            .set_choice(Some("openai/gpt-6".into()), Some("high".into()))
+            .unwrap();
+        conversation.sync().unwrap();
+        let written = conversation.events().to_vec();
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.events(), written.as_slice());
+        assert_eq!(written.last().map(|e| &e.kind), Some(&chosen));
+        let both = (Some("openai/gpt-6".to_string()), Some("high".to_string()));
+        assert_eq!(conversation.choice(), both);
+        assert_eq!(
+            (
+                conversation.meta().model.clone(),
+                conversation.meta().effort.clone()
+            ),
+            both
+        );
+        // Back to the configuration's, logged by a process that died
+        // before writing `meta`: the log wins at the next open.
+        let mut conversation = conversation;
+        conversation
+            .append(Kind::Choice {
+                model: None,
+                effort: Some("low".into()),
+            })
+            .unwrap();
+        conversation.sync().unwrap();
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.choice(), (None, Some("low".into())));
+        drop(conversation);
+        let (metas, _) = state.list();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(
+            metas
+                .iter()
+                .map(|m| (m.model.clone(), m.effort.clone()))
+                .next(),
+            Some((None, Some("low".into()))),
+            "and `meta` is written"
+        );
     }
 
     #[test]

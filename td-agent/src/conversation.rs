@@ -65,6 +65,9 @@ use crate::wake;
 /// request with: the window sends them first, so only a harness that
 /// does not sees this.
 pub const NO_SETTINGS: &str = "no settings from the window";
+
+/// Where a refusal says the human chose the conversation's model.
+const CHOSEN: &str = "the conversation's model (Conversation \u{2192} Model\u{2026})";
 /// How long a request waits for the window to answer: a reservation, a
 /// message queued, the conversations' states.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
@@ -446,6 +449,7 @@ impl Session {
                 Down::Retry => self.retry()?,
                 Down::Pause { paused } => self.pause(paused)?,
                 Down::ClearTodo => self.clear_todo()?,
+                Down::Choose { model, effort } => self.choose(model, effort)?,
                 // A reservation granted after its request gave up waiting:
                 // nothing was sent, so the window's hold is released.
                 Down::Reservation { id, refusal: None } => self.spent(id, 0),
@@ -643,14 +647,15 @@ impl Session {
         replied == [turn]
     }
 
-    /// The models cache and the entry for `model`, the configuration's
-    /// `key`; a refusal says why a request cannot be made with them.
+    /// The models cache and the entry for `model`, which `key` names (a
+    /// configuration key in backquotes, or `CHOSEN`); a refusal says why a
+    /// request cannot be made with them.
     fn model(&self, key: &str, model: &str, client: &Client) -> Result<Option<Model>, String> {
         let models = Models::load(&self.state)?;
         let entry = models.as_ref().and_then(|m| m.find(model)).cloned();
         if models.is_some() && entry.is_none() {
             return Err(format!(
-                "{model} is not in the provider's models list; set `{key}` to one that is"
+                "{model} is not in the provider's models list; set {key} to one that is"
             ));
         }
         if client.limits.any() && entry.as_ref().and_then(|m| m.pricing).is_none() {
@@ -770,11 +775,17 @@ impl Session {
             Err(why) => return Ok(Outcome::stop(why)),
         };
         let role = self.conversation.meta().role;
-        let name = client.model_for(role).to_string();
-        let setting = match role {
-            Role::Orchestrator => "orchestrator_model",
-            Role::Conversation => "model",
+        // The human's choice for this conversation, else the
+        // configuration's (§4, §5).
+        let meta = self.conversation.meta();
+        let (chosen, chosen_effort) = (meta.model.clone(), meta.effort.clone());
+        let setting = match (&chosen, role) {
+            (Some(_), _) => CHOSEN,
+            (None, Role::Orchestrator) => "`orchestrator_model`",
+            (None, Role::Conversation) => "`model`",
         };
+        let name = chosen.unwrap_or_else(|| client.model_for(role).to_string());
+        let reasoning_effort = chosen_effort.unwrap_or_else(|| client.reasoning_effort.clone());
         let model = match self.model(setting, &name, &client) {
             Ok(model) => model,
             Err(why) => return Ok(Outcome::stop(why)),
@@ -787,7 +798,7 @@ impl Session {
             .and_then(|m| ["tools", "max_tokens"].into_iter().find(|p| !m.supports(p)))
         {
             return Ok(Outcome::stop(format!(
-                "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set `{setting}` to a model that does"
+                "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set {setting} to a model that does"
             )));
         }
         let pricing = model.as_ref().and_then(|m| m.pricing);
@@ -814,7 +825,7 @@ impl Session {
             let effort = model
                 .as_ref()
                 .is_none_or(|m| m.supports("reasoning"))
-                .then_some(client.reasoning_effort.as_str());
+                .then_some(reasoning_effort.as_str());
             let build = |max_tokens: u64| -> Result<(String, String), String> {
                 let head = client::head(&Params {
                     model: &name,
@@ -1363,6 +1374,17 @@ impl Session {
         }
     }
 
+    /// The human chose the conversation's model and effort, which apply
+    /// from its next request: logged, then kept in `meta`.
+    fn choose(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), String> {
+        self.log(Kind::Choice {
+            model: model.clone(),
+            effort: effort.clone(),
+        })?;
+        self.conversation.set_choice(model, effort)?;
+        self.sync()
+    }
+
     /// The human paused or resumed the conversation, which is logged even
     /// when it already was: the window keeps a resuming process until it
     /// hears the resumption. Resumed, the newest message held since the
@@ -1655,7 +1677,7 @@ impl Session {
         let (Some(first), Some(reply)) = (first, reply) else {
             return Ok(());
         };
-        let model = match self.model("title_model", &client.title_model, &client) {
+        let model = match self.model("`title_model`", &client.title_model, &client) {
             Ok(model) => model,
             Err(why) => {
                 self.log(Kind::Notice {
@@ -1792,15 +1814,16 @@ fn pieces(text: &str, most: usize) -> Vec<&str> {
 }
 
 /// The frame the serve loop takes next of those that came while a turn
-/// ran. Settings come first: a key the human stored applies to the next
-/// turn whatever was queued before it (DESIGN.md §2). Then a pause goes
+/// ran. Settings come first: a key the human stored, and the model and
+/// effort they chose, apply to the next turn whatever was queued before
+/// them (DESIGN.md §2, §4), each kind in its order. Then a pause goes
 /// ahead of the messages from other conversations before it, and holds
 /// them (§3), though not of the human's own message or retry; else the
 /// first in order.
 fn take(queue: &mut VecDeque<Down>) -> Option<Down> {
     let at = queue
         .iter()
-        .position(|down| matches!(down, Down::Setup { .. }))
+        .position(|down| matches!(down, Down::Setup { .. } | Down::Choose { .. }))
         .or_else(|| {
             queue
                 .iter()
@@ -1992,8 +2015,23 @@ mod tests {
             client: Client::default(),
         };
         let pause = Down::Pause { paused: true };
-        let mut queue: VecDeque<Down> = [message.clone(), setup.clone(), pause.clone()].into();
+        let choose = |effort: &str| Down::Choose {
+            model: None,
+            effort: Some(effort.into()),
+        };
+        let mut queue: VecDeque<Down> = [
+            message.clone(),
+            choose("low"),
+            setup.clone(),
+            pause.clone(),
+            choose("high"),
+        ]
+        .into();
+        // Settings in the order they came, so the later choice is the one
+        // the next turn keeps.
+        assert_eq!(take(&mut queue), Some(choose("low")));
         assert_eq!(take(&mut queue), Some(setup));
+        assert_eq!(take(&mut queue), Some(choose("high")));
         assert_eq!(take(&mut queue), Some(pause));
         assert_eq!(take(&mut queue), Some(message.clone()));
         assert_eq!(take(&mut queue), None);

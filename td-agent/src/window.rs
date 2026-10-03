@@ -28,6 +28,7 @@ use crate::config::{Client, Config};
 use crate::control::Remote;
 use crate::key::{self, Secret, Unwritten};
 use crate::models::{Credit, Models, MAX_LIST};
+use crate::picker::Offer;
 use crate::post::{Outbox, Post};
 use crate::protocol::{Down, Up};
 use crate::store::{self, Event, Id, Kind, Role, StateDir};
@@ -203,6 +204,11 @@ impl Session {
                 }
                 Request::ClearTodo => {
                     if let Err(e) = self.supervisor.tell(&Down::ClearTodo) {
+                        self.app.note(e);
+                    }
+                }
+                Request::Choose { model, effort } => {
+                    if let Err(e) = self.supervisor.tell(&Down::Choose { model, effort }) {
                         self.app.note(e);
                     }
                 }
@@ -386,18 +392,19 @@ impl Session {
     }
 
     fn show_models(&mut self, models: &Models) {
-        let contexts = [&self.client.model, &self.client.orchestrator_model]
+        // Every model's, since a conversation may be given any.
+        let contexts = models
+            .models
             .iter()
-            .filter_map(|id| {
-                let length = models.find(id)?.context_length?;
-                Some((id.to_string(), length))
-            })
+            .filter_map(|m| Some((m.id.clone(), m.context_length?)))
             .collect();
         self.app.set_models(
             &self.client.model,
             &self.client.orchestrator_model,
             contexts,
         );
+        let offers = models.models.iter().map(Offer::of).collect();
+        self.app.set_offers(offers, &self.client.reasoning_effort);
     }
 
     /// Answers what the control socket asked, through the same paths the
@@ -565,6 +572,7 @@ pub fn run(
     app.set_rows(rows);
     let client = config.client.clone();
     app.set_models(&client.model, &client.orchestrator_model, Vec::new());
+    app.set_offers(Vec::new(), &client.reasoning_effort);
     app.set_limits(client.limits);
     let setup = Down::Setup {
         key: key.clone(),

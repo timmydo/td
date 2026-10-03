@@ -51,6 +51,12 @@ pub enum Down {
     Pause { paused: bool },
     /// The human cleared the todo list.
     ClearTodo,
+    /// The human chose the conversation's model and reasoning effort,
+    /// whole; none is the configuration's.
+    Choose {
+        model: Option<String>,
+        effort: Option<String>,
+    },
 }
 
 /// From a conversation to the window.
@@ -229,6 +235,13 @@ impl Down {
             ),
             Self::Pause { paused } => typed("pause", vec![("paused".into(), Json::Bool(*paused))]),
             Self::ClearTodo => typed("clear_todo", Vec::new()),
+            Self::Choose { model, effort } => typed(
+                "choose",
+                vec![
+                    ("model".into(), optional(model)),
+                    ("effort".into(), optional(effort)),
+                ],
+            ),
         }
     }
 
@@ -299,6 +312,17 @@ impl Down {
                     .ok_or("no paused")?,
             }),
             Some("clear_todo") => Ok(Self::ClearTodo),
+            Some("choose") => {
+                let model = maybe(&value, "model")?;
+                let effort = maybe(&value, "effort")?;
+                if let Some(model) = &model {
+                    crate::config::model_id("model", model)?;
+                }
+                if let Some(effort) = &effort {
+                    crate::config::effort(effort)?;
+                }
+                Ok(Self::Choose { model, effort })
+            }
             Some("user") => {
                 let delivery = string(&value, "delivery")?;
                 if !delivery_ok(&delivery) {
@@ -580,6 +604,14 @@ mod tests {
             },
             Down::Pause { paused: true },
             Down::ClearTodo,
+            Down::Choose {
+                model: Some("openai/gpt-6".into()),
+                effort: Some("high".into()),
+            },
+            Down::Choose {
+                model: None,
+                effort: None,
+            },
         ] {
             assert!(down.encode().len() <= crate::frame::MAX_FRAME);
             assert_eq!(Down::decode(&down.encode()).unwrap(), down);
