@@ -2269,6 +2269,56 @@ fn header_single_mailbox() {
     assert_eq!(before, after, "mailbox parsing allocated");
 }
 
+fn header_phrase_replay() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_phrase::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    let source = format!("{} (x)\"name\\\"tail\". (last)", "🐈".repeat(10_000));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for source in [source.as_bytes(), b"a\r\n \"b\\\"c\" (x(y))".as_slice()] {
+        let mut parser = Cursor::new(black_box(source));
+        while !matches!(
+            parser.poll(Tick(1), &mut work).unwrap(),
+            Status::Complete(_)
+        ) {}
+        let proof = parser.into_validated().unwrap();
+        let mut replay = proof.replay();
+        loop {
+            let checkpoint = replay;
+            let status = replay.poll(Tick(1), &mut work).unwrap();
+            let mut copy = black_box(checkpoint);
+            assert_eq!(copy.poll(Tick(1), &mut work).unwrap(), status);
+            if matches!(status, Status::Complete(_)) {
+                break;
+            }
+        }
+        let mut replay = proof.replay();
+        let mut limited = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+        assert_eq!(
+            replay.poll(Tick(1), &mut limited),
+            Err(Error::Work(Stop::IoBytes))
+        );
+        let mut copy = replay;
+        assert_eq!(
+            copy.poll(Tick(1), &mut work),
+            Err(Error::Work(Stop::IoBytes))
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "phrase replay allocated");
+}
+
 fn header_phrase_tokens() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3708,6 +3758,7 @@ fn main() {
         header_address_groups();
         header_single_mailbox();
         header_phrase_tokens();
+        header_phrase_replay();
         header_single_addr_spec();
         header_date_projection();
         header_dates();
@@ -3822,6 +3873,7 @@ fn main() {
     header_address_groups();
     header_single_mailbox();
     header_phrase_tokens();
+    header_phrase_replay();
     header_single_addr_spec();
     header_date_projection();
     header_dates();

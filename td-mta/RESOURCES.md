@@ -899,6 +899,16 @@ time. Allocation intervals cover groups, null slots, routes, long Unicode,
 raw recovery and resource refusal. Projection storage and the complete
 composed worker stack remain unqualified.
 
+Validated phrase proofs hold a borrowed slice within 16 bytes. Their Copy
+replay cursors fit 80 bytes with scalar offsets, lexical/nesting/escape state
+and an error latch; they hold no meter or output arena. Each poll prepays at
+most 32 source-byte visits and 32 records. Every repeated traversal charges
+the live meter again, including peeks and EOF; offset events spend no output
+budget. Cached completion is inert and failure survives copying. Allocation
+intervals cover proof creation, Unicode/quotes/comments, checkpoint copies,
+replay and sticky refusal. Integration into the fixed NFC Source allowance
+and the complete worker remains unqualified.
+
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
 including the fixed one-byte handoff; public MessageIds state remains

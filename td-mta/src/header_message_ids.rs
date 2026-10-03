@@ -387,7 +387,7 @@ impl<'a> Cursor<'a> {
         Ok(Status::Yield)
     }
 }
-fn atext(byte: u8) -> bool {
+pub(crate) fn atext(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || byte >= 128
         || matches!(

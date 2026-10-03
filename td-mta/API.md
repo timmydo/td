@@ -1962,6 +1962,40 @@ empty/long values, validation-before-output and all work dimensions.
 Display-name decoding/NFC, JSON serialization, response storage and complete
 worker qualification remain open.
 
+### 1.43 Validated phrase replay
+
+M06ak adds a consuming `header_phrase::Cursor::into_validated` transition
+that succeeds only after whole-phrase Complete. An incomplete parser returns
+InvalidState; a failed parser retains its error. The opaque Copy `Validated`
+proof holds only the immutable source slice, with no public constructor.
+It proves phrase grammar, including UTF-8 and bounded comment nesting; it
+does not authorize encoded-word interpretation or response publication.
+
+`Validated::replay` creates a Copy `header_phrase::replay::Cursor` with
+source, scalar offsets, one lexical phase, nesting/escape state and a sticky
+error. Return the same raw Token events and trailing CFWS extent as the
+validator; Yield cadence and work charges differ. Traverse prevalidated
+comments/quotes bytewise, using the same atext predicate as validation.
+Keep quotes, pairs, folds and exact gaps in their original extents. Copying
+retains progress, including errors, but no work meter or output authority.
+Every resumed or repeated traversal spends the caller's live meter again.
+
+The proof fits 16 bytes and replay state fits 80 bytes. Each poll charges at
+most 32 records and 32 source-byte visits; charge peeks and EOF records before
+inspection. No output bytes are charged because events contain only offsets.
+Replaying `a` costs two visits/four records, `""` two/three, and `a.` four/five,
+in addition to validation. All work errors latch across fresh meters and
+copies; cached Complete is inert. Earlier events remain provisional until
+replay Complete because a later work refusal can retire the traversal.
+
+Tests compare validation/replay events and exact extents over grammar
+products, nested comments, quoted pairs, folds, Unicode and long input.
+Checkpoint tests compare every resumed suffix and charge repeated traversal;
+phase-specific work/deadline refusal and the allocation probe cover copies.
+Display-name decoding, external delimiter placement, NFC source integration,
+JSON publication and composed worker qualification remain open. A proof does
+not supply comma, angle or group-colon context outside its slice.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

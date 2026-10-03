@@ -1455,6 +1455,13 @@ Initial independently landable increments:
   exact work, long input and allocation-free refusal. Display-name decoding,
   NFC, JSON output and complete worker qualification remain open.
 
+- **M06ak — validated phrase replay:** consume whole-phrase success into
+  an opaque source-bound proof, then provide a small Copy token replayer.
+  Preserve exact token/gap extents; every replay charges the live external
+  meter without copying budgets. Cover grammar agreement, checkpoint suffixes,
+  work refusal and allocation-free traversal. Encoded-word placement, name
+  scalar projection, NFC integration and publication remain follow-on work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

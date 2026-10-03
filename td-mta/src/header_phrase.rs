@@ -1,4 +1,5 @@
 //! Raw phrase tokens and exact CFWS context; decoding and publication are external.
+pub mod replay;
 pub use crate::header_message_ids::Extent;
 use crate::{
     admission::work::{Charge, Meter, Stop},
@@ -51,6 +52,20 @@ pub enum Status {
     Token(Token),
     Complete(Extent),
 }
+/// A completed grammar check bound to one immutable source, not decoding authority.
+///
+/// ```compile_fail
+/// let _ = td_mta::header_phrase::Validated { source: b"word" };
+/// ```
+#[derive(Clone, Copy)]
+pub struct Validated<'a> {
+    source: &'a [u8],
+}
+impl<'a> Validated<'a> {
+    pub const fn replay(self) -> replay::Cursor<'a> {
+        replay::Cursor::new(self)
+    }
+}
 /// Each raw token is provisional until Complete validates the whole phrase.
 pub struct Cursor<'a> {
     source: &'a [u8],
@@ -68,6 +83,18 @@ impl<'a> Cursor<'a> {
             complete: false,
             failure: None,
         }
+    }
+    /// Consume only a completed parser; an earlier token is not a proof.
+    pub fn into_validated(self) -> Result<Validated<'a>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !self.complete {
+            return Err(Error::InvalidState);
+        }
+        Ok(Validated {
+            source: self.source,
+        })
     }
     fn trailing(&self) -> Extent {
         Extent {
