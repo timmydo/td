@@ -278,9 +278,11 @@ it is not described as dependency-free once they are added.
 
 The core may contain owned tables generated from the approved, checksummed
 Unicode 17.0 inputs in UNICODE.md. They add no Cargo dependency or runtime data
-fetch. M06 owns reproducible offline generation, the complete license notice,
-official conformance vectors and bounded NFC implementation. This is a named
-data dependency, not permission to import a Unicode or mail parsing library.
+fetch. The approved corpus and license now live in the checkout and are
+verified by the ordinary offline test suite and a cold tooling example. M06
+owns reproducible generation, official conformance vectors and bounded NFC
+implementation. This is a named data dependency, not permission to import a
+Unicode or mail parsing library.
 
 The backend admission and gate contract lives in td-crypto/DESIGN.md.
 Both packages stay in the test roster.

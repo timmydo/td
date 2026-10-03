@@ -1,0 +1,6 @@
+# Immutable approved upstream corpora are reviewed by exact size/SHA-256 pins.
+# Keep Git summaries compact; verification reads and checks every source byte.
+17.0.0/UnicodeData.txt -text -diff
+17.0.0/DerivedNormalizationProps.txt -text -diff
+17.0.0/NormalizationTest.txt -text -diff
+17.0.0/license.txt -text

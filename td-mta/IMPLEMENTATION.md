@@ -1266,17 +1266,24 @@ Initial independently landable increments:
   Cover exact ranges, small buffers, every-turn checkpoints, rewind I/O and
   clock failures and allocation. Nested decoded-source chains remain open.
 
-Implement other header-form composition, encoded words, address/date parsing,
-multipart scanning, transfer decoding and part offsets. Implement documented
-charset coverage and error/opaque-body representation. Add deterministic MIME
-serialization for structured outgoing email, including attachment streaming,
-boundary generation through Entropy, reply headers and Bcc separation.
-Provision UNICODE.md's approved checksummed sources before offline tests; add
-the std-only generator, committed compact tables, complete Unicode license,
-reproducibility gate and every official NFC vector. Implement the fixed-memory
-fast/resident-replay algorithm with charged work. Search case mappings
-come from the same pin. No allocating library or ambient Unicode version may
-replace these contracts. Record static table size within process headroom.
+- **M06m — checked offline Unicode inputs:** provision the four previously
+  approved exact source/license files in the checkout. Cold std-based tooling
+  verifies every size/hash/type and UTF-8 before returning a complete corpus.
+  Ordinary tests verify the actual data and reject missing/tampered inputs;
+  a built example provides explicit verification. No runtime data or new
+  Cargo dependency is added. Generation and normalization remain open.
+
+Implement other header-form composition, encoded words, address/date
+parsing, multipart scanning, transfer decoding and part offsets. Implement
+documented charset coverage and error/opaque-body representation. Add
+deterministic MIME serialization for structured outgoing email, including
+attachment streaming, boundary generation through Entropy, reply headers and
+Bcc separation. Add the std-only generator, committed compact tables,
+reproducibility gate and every official NFC vector from UNICODE.md's
+verified offline corpus. Implement the fixed-memory fast/resident-replay
+algorithm with charged work. Search case mappings come from the same pin. No
+allocating library or ambient Unicode version may replace these contracts.
+Record static table size within process headroom.
 
 **Acceptance:** fragmented input, nested multiparts, malformed encodings, huge
 headers, cyclic-looking boundary data and unsupported charsets do not panic or

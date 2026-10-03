@@ -1,9 +1,9 @@
 # Unicode data and bounded normalization
 
 This is td-mta's approved upstream data dependency. It adds no Cargo crate,
-runtime file dependency, network fetch during a build, or Unicode library. M06
-owns the std-only generator, generated Rust tables and normalizer. This
-contract pins their inputs; none of that implementation is claimed here.
+runtime file dependency, network fetch during a build, or Unicode library.
+M06m supplies committed inputs and cold verification tooling. The std-only
+generator, generated Rust tables and normalizer remain separate M06 work.
 
 ## Inputs
 
@@ -23,11 +23,33 @@ notice.
 
 Retain the complete Unicode License V3 notice with generated tables and test
 material, including in distributed documentation. Its copyright line is
-`Copyright © 1991-2026 Unicode, Inc.`; this is separate from td's MIT license.
-M06 must add checked provisioning and regeneration commands plus offline gate
-inputs. A developer's ambient cache, Python Unicode version, or network access
-is not a substitute for those pinned inputs. Until that integration exists,
-these are frozen source declarations, not an executable provisioning claim.
+`Copyright © 1991-2026 Unicode, Inc.`; this is separate from td's MIT
+license. The reviewed checkout provisions exact copies under unicode/17.0.0.
+The ordinary td-mta test suite checks every file's regular type, exact size,
+complete SHA-256 and UTF-8 before returning any corpus. The license is
+verified against its full approved digest. Tests do not consume Markdown;
+review checks this pin table against the compiled declarations. Final input
+symlinks are refused; ordinary parent-path resolution remains operator
+controlled. No ambient cache or network fallback is used. The three large
+upstream corpora use compact Git binary summaries; their approved pins and
+byte-verifying tests are the review boundary. The license remains a normal
+text diff. No data is edited or normalized in transit.
+
+The cold examples/unicode_inputs.rs tool uses the same verifier. After the
+normal crypto-cargo test command builds examples, the current x86-64 GNU host
+with the default target directory can independently verify a supplied folder:
+
+```text
+.td-build-cache/crypto-target/x86_64-unknown-linux-gnu/debug/examples/unicode_inputs td-mta/unicode/17.0.0
+```
+
+Verification failure exits unsuccessfully before printing any results. On
+success it reports each filename, byte count and digest; output errors also
+fail the command and may leave partial output. It writes no source files.
+These source copies and tool are outside the service executable and its
+memory plan.
+Regeneration commands, generated tables, official NFC equations and the
+normalizer are still unimplemented; input verification is not conformance.
 
 ## Generated tables
 
@@ -145,8 +167,8 @@ not evidence of those tests.
 
 The complete notice is retained here so offline provisioning remains possible
 if the upstream license URL changes. The fenced UTF-8 text, with LF line
-endings and one final LF, has the license digest above. M06 may extract it as
-license.txt and must retain it alongside generated material.
+endings and one final LF, has the license digest above. The committed
+license.txt copy matches those bytes. Retain it alongside generated material.
 
 ```text
 UNICODE LICENSE V3
