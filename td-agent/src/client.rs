@@ -20,10 +20,10 @@ use std::time::Duration;
 
 use crate::config::Client;
 use crate::cost::{self, Tokens};
-use crate::json::Json;
 use crate::span::{self, Step};
 use crate::store::{Call, Event, Kind, Purpose, Role};
 use crate::td_fetch;
+use td_json::Json;
 
 /// The attribution pair's values (DESIGN.md §5).
 pub const REFERER: &str = "https://github.com/timmydo/td";
@@ -597,7 +597,7 @@ pub fn classify(
             })
         }
     };
-    let value = crate::json::parse_slice(&response.body);
+    let value = td_json::parse_slice(&response.body);
     if response.status != 200 {
         // The status decides; the body's error object only says why.
         let message = match value.as_ref().ok().and_then(|v| v.get("error")) {
@@ -953,8 +953,8 @@ mod tests {
                  {{\"role\":\"user\",\"content\":\"again\"}}]}}"
             )
         );
-        crate::json::parse(&first).unwrap();
-        crate::json::parse(&second).unwrap();
+        td_json::parse(&first).unwrap();
+        td_json::parse(&second).unwrap();
         assert_eq!(body(&events, 4, &prefix).unwrap(), "{\"model\":\"t\"}");
         assert!(body(&events, 0, &prefix).is_err());
         assert_eq!(current_prefix(&events, &prefix), (8, "[]"));
@@ -1056,7 +1056,7 @@ mod tests {
             },
         };
         let line = logged.to_json().to_string();
-        let back = Event::from_json(&crate::json::parse(&line).unwrap()).unwrap();
+        let back = Event::from_json(&td_json::parse(&line).unwrap()).unwrap();
         let request = event(
             1,
             Kind::Request {
@@ -1492,7 +1492,7 @@ mod tests {
         assert_eq!(title(""), None);
         assert_eq!(title("\"\""), None);
         let head = title_head(&Client::default(), &"é".repeat(3000), "reply");
-        let value = crate::json::parse(&format!("{{{head}}}")).unwrap();
+        let value = td_json::parse(&format!("{{{head}}}")).unwrap();
         let quoted = value.get_path(&["messages"]).unwrap().index(1).unwrap();
         let text = quoted.get("content").unwrap().as_str().unwrap();
         assert!(text.len() < TITLE_QUOTE + 100, "{}", text.len());

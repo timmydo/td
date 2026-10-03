@@ -2,13 +2,13 @@ use crate::backend::{self, BackendCommand, BackendResponse};
 use crate::compose;
 use crate::config::Config;
 use crate::jmap::types::{Email, Mailbox};
-use crate::json::{self, Json as Value, ObjectBuilder};
 use crate::keybindings;
 use crate::regex::UserRegex;
 use crate::rules::{self, CompiledRule};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::{mpsc, Arc};
+use td_json::{json, Json as Value, ObjectBuilder};
 
 #[derive(Clone, Copy)]
 enum TriageTarget {
@@ -126,7 +126,7 @@ impl CliState {
 }
 
 fn ok_response(data: Value) -> Value {
-    let mut obj = json::ObjectBuilder::new().set("ok", true);
+    let mut obj = td_json::ObjectBuilder::new().set("ok", true);
     match data {
         Value::Obj(pairs) => {
             for (key, value) in pairs {
@@ -481,7 +481,7 @@ fn cmd_query_emails(state: &mut CliState, input: &Value) -> Value {
                 .map(|e| serialize_email(e, headers_only, max_body_chars))
                 .collect();
 
-            let mut tc = json::ObjectBuilder::with_capacity(thread_counts.len());
+            let mut tc = td_json::ObjectBuilder::with_capacity(thread_counts.len());
             for (tid, (unread, total)) in thread_counts.iter() {
                 tc.insert(tid.clone(), json!({"unread": unread, "total": total}));
             }
@@ -1690,7 +1690,7 @@ pub fn run_cli(
             continue;
         }
 
-        let input = match json::parse(trimmed) {
+        let input = match td_json::parse(trimmed) {
             Ok(v) => v,
             Err(e) => {
                 let resp = err_response(&format!("JSON parse error: {}", e));

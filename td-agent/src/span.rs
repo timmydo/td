@@ -100,7 +100,7 @@ fn member(text: &[u8], at: usize, key: &str) -> Option<usize> {
     loop {
         let end = skip_string(text, at)?;
         // A key is compared as it decodes: the text may escape it.
-        let name = crate::json::parse_slice(text.get(at..end)?).ok()?;
+        let name = td_json::parse_slice(text.get(at..end)?).ok()?;
         at = skip_ws(text, end);
         if byte(text, at)? != b':' {
             return None;
@@ -142,7 +142,7 @@ mod tests {
     use super::*;
 
     fn at<'t>(text: &'t str, path: &[Step<'_>]) -> Option<&'t str> {
-        crate::json::parse(text).unwrap();
+        td_json::parse(text).unwrap();
         find(text.as_bytes(), path).map(|range| &text[range])
     }
 

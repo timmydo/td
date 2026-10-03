@@ -16,11 +16,11 @@ use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 
-use crate::json::Json;
 use crate::protocol::{Down, Up};
 use crate::store::{self, Id, Role, StateDir};
 use crate::supervisor::{Supervisor, Update};
 use crate::tools::{self, Op};
+use td_json::Json;
 
 /// The longest message file read back: a message at its longest, escaped.
 const MAX_FILE: u64 = 256 * 1024;
@@ -182,7 +182,7 @@ fn read(to: &Id, name: &str, path: &std::path::Path) -> Result<Queued, String> {
         return Err("not a message's name".into());
     }
     let bytes = store::read_bounded(path, MAX_FILE).map_err(|e| e.to_string())?;
-    let value = crate::json::parse_slice(&bytes).map_err(|e| e.to_string())?;
+    let value = td_json::parse_slice(&bytes).map_err(|e| e.to_string())?;
     let text = |name: &str| value.get(name).and_then(Json::as_str);
     Ok(Queued {
         to: to.clone(),

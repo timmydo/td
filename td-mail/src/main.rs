@@ -5,9 +5,6 @@
 
 #[macro_use]
 mod log;
-// Before the modules that use `json!`, as `log`'s macros are.
-#[macro_use]
-mod json;
 
 mod attach;
 mod b64;
@@ -35,9 +32,6 @@ mod submit;
 mod td_fetch;
 #[cfg(test)]
 mod testing;
-// The shared module carries more of TOML than td-mail's two files need.
-#[allow(dead_code)]
-mod toml;
 mod ui;
 
 use config::{AccountConfig, Config, PasswordSource};

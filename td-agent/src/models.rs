@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::cost::{self, Pricing};
-use crate::json::Json;
+use td_json::Json;
 
 /// The cache's file in the state directory.
 pub const CACHE: &str = "models";
@@ -164,7 +164,7 @@ impl Model {
 impl Models {
     /// The provider's `GET /models` body: `data`, each with an `id`.
     pub fn from_provider(body: &[u8]) -> Result<Self, String> {
-        let value = crate::json::parse_slice(body).map_err(|e| format!("the models list: {e}"))?;
+        let value = td_json::parse_slice(body).map_err(|e| format!("the models list: {e}"))?;
         let data = value
             .get("data")
             .and_then(Json::as_arr)
@@ -193,7 +193,7 @@ impl Models {
     }
 
     pub fn from_cache(body: &[u8]) -> Result<Self, String> {
-        let value = crate::json::parse_slice(body).map_err(|e| format!("the models cache: {e}"))?;
+        let value = td_json::parse_slice(body).map_err(|e| format!("the models cache: {e}"))?;
         let list = value.as_arr().ok_or("the models cache is not a list")?;
         let mut models = Vec::new();
         for entry in list {
@@ -243,7 +243,7 @@ pub struct Credit {
 
 impl Credit {
     pub fn from_provider(body: &[u8]) -> Result<Self, String> {
-        let value = crate::json::parse_slice(body).map_err(|e| format!("the key's record: {e}"))?;
+        let value = td_json::parse_slice(body).map_err(|e| format!("the key's record: {e}"))?;
         let data = value.get("data").ok_or("the key's record has no `data`")?;
         let amount = |name: &str| -> Result<Option<u64>, String> {
             match data.get(name) {

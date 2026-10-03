@@ -74,17 +74,19 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's source-built stage2 toolchain. Its manifest declares one dependency,
-`td-ui = { path = "../td-ui" }`, and its lock lists exactly td-agent and
-td-ui. It carries no TLS, resolves no names and opens no network
+td's source-built stage2 toolchain. Its manifest declares three
+dependencies, all td crates by path: `td-json`, `td-toml` and `td-ui`, and
+its lock lists exactly those and td-agent. It carries no TLS, resolves no
+names and opens no network
 connection itself: every request to a model provider goes through the td
 fetch service (APPLICATIONS.md §W.8), as td-news and td-mail do, so it
-needs no dependency sign-off and no td-crypto admission. It becomes the
-third carrier of three of the modules td-news and td-mail share byte for
-byte: `json`, the TOML reader `toml` and `td_fetch`. td-agent's own test
-suite holds its copies identical to td-news's; the recipe test that holds
-td-news's and td-mail's (`recipes/src/recipes/td-mail.rs`) gains td-agent
-only with the packaging increment, for the reason §17 gives. Its `grep`
+needs no dependency sign-off and no td-crypto admission. JSON and TOML
+are the td-json and td-toml crates td-news and td-mail also depend on.
+It is the third carrier of one module td-news and td-mail share byte for
+byte, `td_fetch`. td-agent's own test suite holds its copy identical to
+td-news's; the recipe test that holds td-news's and td-mail's
+(`recipes/src/recipes/td-mail.rs`) gains td-agent only with the packaging
+increment, for the reason §17 gives. Its `grep`
 and `sed` tools are td-txt, the same multicall the image
 ships as `/bin/grep` and `/bin/sed`, run as a program rather than
 reimplemented (§12). It is zone-one source: not a foreign payload, not a
@@ -2416,8 +2418,9 @@ design.
 
 ## 15. Configuration
 
-`$XDG_CONFIG_HOME/td-agent/config` is TOML, read by the module td-news
-and td-mail share (TOML 1.0 without dates and times). Every key has a
+`$XDG_CONFIG_HOME/td-agent/config` is TOML, read by td-toml, the crate
+td-news and td-mail also read theirs with (TOML 1.0 without dates and
+times). Every key has a
 default, except `jev_threshold` until it is calibrated (§11):
 
 - `base_url`
@@ -2624,12 +2627,14 @@ follows:
 - no crate depends on it, so a td-agent change selects td-agent alone; a
   change to a crate it reads selects td-agent as well, as it should;
 - no recipe, recipe test or seed roster names it until packaging. Its
-  copies of the shared modules are held identical by its own test reading
+  copy of the shared module is held identical by its own test reading
   td-news's, not by the recipe test;
-- its outgoing edges are pinned: exactly `td-compositor`, `td-news` (that
-  test) and `td-ui` (its dependency). `td-compositor` joined with the
-  window increment, which declared `native-compositor-tests`, since that
-  opt-in adds the edge.
+- its outgoing edges are pinned: exactly `td-compositor`, `td-json`,
+  `td-news` (that test), `td-toml` and `td-ui` (its dependencies).
+  `td-compositor` joined with the window increment, which declared
+  `native-compositor-tests`, since that opt-in adds the edge; `td-json`
+  and `td-toml` joined when JSON and TOML left the copied modules for
+  crates of their own.
   The pinned set lives in `affected.rs` beside td-mta's, and a diff whose
   edges differ from it takes the workspace pass, because the builder's
   reader-set assertions name td-agent once it reads td-ui;
@@ -2686,7 +2691,8 @@ resent; no key; and the key absent from the log, `meta`, `prefix` and
 standard error. `tests/processes.rs` adds a message sent just before
 switching away, whose turn still runs in the background. The shared
 `td_fetch.rs` joins `json.rs` and `toml.rs` in
-`tests/shared_modules.rs`.
+`tests/shared_modules.rs`; those two have since left for the td-json and
+td-toml crates, and `td_fetch.rs` is the test's one module.
 
 **As built (increment 7).** Pure units cover the SSE reader in
 `src/sse.rs`: comment lines, `[DONE]` and nothing read after it, an

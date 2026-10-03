@@ -1,9 +1,9 @@
 //! td-agent: td's agent harness (DESIGN.md).
 //!
-//! The crate is `std` and td-ui. Three modules, `json`, `toml` and
-//! `td_fetch`, are td's shared std modules, copied whole from td-news and
-//! never edited here; `tests/shared_modules.rs` holds them byte-identical
-//! to td-news's. What td-agent does not call of them stays, allowed on its
+//! The crate is `std`, td-ui, td-json and td-toml. One module,
+//! `td_fetch`, is td's shared std module, copied whole from td-news and
+//! never edited here; `tests/shared_modules.rs` holds it byte-identical
+//! to td-news's. What td-agent does not call of it stays, allowed on its
 //! `mod` line rather than trimmed.
 //!
 //! The binary is two personalities of one program (DESIGN.md §2): the
@@ -33,8 +33,6 @@ pub mod conversation;
 pub mod cost;
 pub mod frame;
 pub mod history;
-#[allow(dead_code)]
-mod json;
 pub mod key;
 pub mod keydialog;
 pub mod menu;
@@ -56,15 +54,6 @@ pub mod supervisor;
 pub mod td_fetch;
 #[cfg(test)]
 mod testing;
-// td-news lints only its shipped targets; td-agent lints its tests too
-// (`clippy-all-targets`), and the module's own tests unwrap and index as
-// test code may. Its production code is still linted in the library.
-#[allow(dead_code)]
-#[cfg_attr(
-    test,
-    allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)
-)]
-mod toml;
 pub mod tools;
 pub mod ui;
 pub mod wake;

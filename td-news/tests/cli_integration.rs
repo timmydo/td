@@ -1,11 +1,9 @@
 //! The CLI protocol end to end: a seeded cache, the binary, and the NDJSON
 //! frames it writes back. The cache is seeded and the replies are read
-//! with the same `json` and `kv` modules the program uses, included here
-//! rather than linked, because `td-news` is a binary crate.
+//! with the same td-json crate the program links and the same `kv` module
+//! it carries, included here rather than linked, because `td-news` is a
+//! binary crate.
 
-#[path = "../src/json.rs"]
-#[allow(dead_code)]
-mod json;
 #[path = "../src/kv.rs"]
 #[allow(dead_code)]
 mod kv;
@@ -13,10 +11,10 @@ mod kv;
 #[allow(dead_code)]
 mod testing;
 
-use json::Json;
 use kv::{Key, Store};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use td_json::Json;
 use testing::tempdir;
 
 const ARTICLES: &str = "articles";
@@ -73,7 +71,7 @@ fn cli_mode_reads_json_commands_and_returns_json_lines() {
 
     let responses: Vec<Json> = lines
         .iter()
-        .map(|line| json::parse(line).expect("valid json line"))
+        .map(|line| td_json::parse(line).expect("valid json line"))
         .collect();
 
     assert_eq!(responses[0]["ok"], Json::Bool(true));
@@ -126,7 +124,7 @@ fn seed_cache(path: &std::path::Path) {
     txn.insert(ARTICLES, &Key::from_str("a1"), &a1.to_vec());
     txn.insert(ARTICLES, &Key::from_str("a2"), &a2.to_vec());
 
-    let feed_meta = crate::json!({
+    let feed_meta = td_json::json!({
         "url": "https://example.com/feed",
         "title": "Example Feed",
         "last_fetched": "2025-01-03 10:00:00",
@@ -137,7 +135,7 @@ fn seed_cache(path: &std::path::Path) {
         &feed_meta.to_vec(),
     );
 
-    let hashes = crate::json!(["a1", "a2"]);
+    let hashes = td_json::json!(["a1", "a2"]);
     txn.insert(
         FEED_INDEX,
         &Key::from_str("https://example.com/feed"),
@@ -155,7 +153,7 @@ fn article(
     published: &str,
     read: bool,
 ) -> Json {
-    crate::json!({
+    td_json::json!({
         "hash": hash,
         "title": title,
         "link": format!("https://example.com/{}", hash.trim_start_matches('a')),

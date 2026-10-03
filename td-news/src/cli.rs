@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::cache::Cache;
 use crate::feed::{datetime_sort_key, Article};
-use crate::json::{self, Json};
+use td_json::Json;
 
 const MAX_LIMIT: usize = 1000;
 
@@ -160,7 +160,7 @@ pub fn run(cache: &Cache) -> Result<(), String> {
             continue;
         }
 
-        let command = match json::parse(&line)
+        let command = match td_json::parse(&line)
             .map_err(|e| e.to_string())
             .and_then(|value| Command::from_json(&value))
         {
@@ -168,7 +168,7 @@ pub fn run(cache: &Cache) -> Result<(), String> {
             Err(e) => {
                 write_json_line(
                     &mut stdout,
-                    &crate::json!({
+                    &td_json::json!({
                         "ok": false,
                         "error": format!("invalid command JSON: {}", e),
                     }),
@@ -204,14 +204,14 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
             let all = sort_articles(cache.list_all_articles());
             let unread_count = all.iter().filter(|a| !a.read).count();
 
-            folders.push(crate::json!({
+            folders.push(td_json::json!({
                 "id": "all",
                 "name": "All",
                 "total": all.len(),
                 "unread": unread_count,
                 "virtual": true,
             }));
-            folders.push(crate::json!({
+            folders.push(td_json::json!({
                 "id": "unread",
                 "name": "Unread",
                 "total": unread_count,
@@ -229,7 +229,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                     .map(|m| m.title.clone())
                     .or_else(|| articles.first().map(|a| a.feed_name.clone()))
                     .unwrap_or_else(|| url.clone());
-                folders.push(crate::json!({
+                folders.push(td_json::json!({
                     "id": url,
                     "name": name,
                     "url": meta.as_ref().map(|m| m.url.clone()),
@@ -240,7 +240,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                 }));
             }
 
-            crate::json!({
+            td_json::json!({
                 "ok": true,
                 "folders": folders,
             })
@@ -254,7 +254,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
             let articles = match folder_articles(cache, &folder) {
                 Ok(articles) => sort_articles(articles),
                 Err(error) => {
-                    return crate::json!({
+                    return td_json::json!({
                         "ok": false,
                         "error": error,
                     })
@@ -267,7 +267,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                 .skip(offset)
                 .take(limit)
                 .map(|a| {
-                    crate::json!({
+                    td_json::json!({
                         "hash": a.hash,
                         "title": a.title,
                         "link": a.link,
@@ -278,7 +278,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                 })
                 .collect();
 
-            crate::json!({
+            td_json::json!({
                 "ok": true,
                 "folder": folder,
                 "offset": offset,
@@ -288,24 +288,24 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
             })
         }
         Command::GetArticle { hash } => match cache.get_article(&hash) {
-            Some(article) => crate::json!({
+            Some(article) => td_json::json!({
                 "ok": true,
                 "article": article,
             }),
-            None => crate::json!({
+            None => td_json::json!({
                 "ok": false,
                 "error": format!("article not found: {}", hash),
             }),
         },
         Command::MarkRead { hash, read } => {
             if cache.get_article(&hash).is_none() {
-                crate::json!({
+                td_json::json!({
                     "ok": false,
                     "error": format!("article not found: {}", hash),
                 })
             } else {
                 cache.mark_read(&hash, read);
-                crate::json!({
+                td_json::json!({
                     "ok": true,
                     "hash": hash,
                     "read": read,
@@ -316,7 +316,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
             let hashes = match folder_articles(cache, &folder) {
                 Ok(articles) => articles.into_iter().map(|a| a.hash).collect::<Vec<_>>(),
                 Err(error) => {
-                    return crate::json!({
+                    return td_json::json!({
                         "ok": false,
                         "error": error,
                     })
@@ -325,7 +325,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
             for hash in &hashes {
                 cache.mark_read(hash, true);
             }
-            crate::json!({
+            td_json::json!({
                 "ok": true,
                 "folder": folder,
                 "updated": hashes.len(),
@@ -341,7 +341,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
             let articles = match folder_articles(cache, &folder) {
                 Ok(articles) => sort_articles(articles),
                 Err(error) => {
-                    return crate::json!({
+                    return td_json::json!({
                         "ok": false,
                         "error": error,
                     })
@@ -368,7 +368,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                 .skip(offset)
                 .take(limit)
                 .map(|a| {
-                    crate::json!({
+                    td_json::json!({
                         "hash": a.hash,
                         "title": a.title,
                         "link": a.link,
@@ -379,7 +379,7 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                 })
                 .collect();
 
-            crate::json!({
+            td_json::json!({
                 "ok": true,
                 "query": query,
                 "folder": folder,
@@ -389,11 +389,11 @@ fn handle_command(cache: &Cache, command: Command) -> Json {
                 "articles": items,
             })
         }
-        Command::Help => crate::json!({
+        Command::Help => td_json::json!({
             "ok": true,
             "help": help_text(),
         }),
-        Command::Quit => crate::json!({
+        Command::Quit => td_json::json!({
             "ok": true,
             "quit": true,
         }),

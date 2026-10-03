@@ -11,11 +11,11 @@ path = "src/main.rs"
 
 # td-news is a TARGET-built application, NOT part of td's control-plane engine
 # workspace. It is standalone — its own workspace root — with a lock that
-# names itself and the one sibling it draws through. Its closure is `std`
-# and td-ui (td's AGENTS.md "std, not no_std", and
-# APPLICATIONS.md §W.8):
-# what ten crates used to supply is six shared td modules under `src/`,
-# copied whole and never edited, plus one unix socket to td's fetch service.
+# names itself and the td siblings it draws through. Its closure is `std`,
+# td-json, td-toml and td-ui (td's AGENTS.md "std, not no_std", and
+# APPLICATIONS.md §W.8): what ten crates used to supply is those two crates,
+# four shared td modules under `src/`, copied whole and never edited, and
+# one unix socket to td's fetch service.
 #
 # From a nested checkout (a worktree that lives physically under another
 # checkout) cargo walks past this manifest and is captured by the OUTER
@@ -33,9 +33,12 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shared UI toolkit, by the one sibling-dependency spelling the lock
-# guard admits (AGENTS.md 'Rust code'): the window, the lists and the
-# read-only editor pane an article is read in reach this crate only
-# through `td_ui::`.
+# td's own crates, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): JSON for the cache and the CLI, TOML for
+# the configuration, and the shared UI toolkit, through which alone the
+# window, the lists and the read-only editor pane an article is read in
+# reach this crate.
 [dependencies]
+td-json = { path = "../td-json" }
+td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }

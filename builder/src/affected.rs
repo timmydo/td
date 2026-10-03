@@ -1563,6 +1563,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The JSON and TOML crates the applications share are staged into their
+    // recipes beside the toolkit, so an edit reaches the same consumers.
+    if (p.starts_with("td-json/") || p.starts_with("td-toml/")) && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
     // td-setup is a static target recipe with a realized-output check; a
     // source edit changes the eventual live installer binary as well as the
     // host-tested window.
@@ -2636,6 +2645,17 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("td-mail/src/main.rs", "local-source-roster");
     assert_no_preflight!("td-mail/README.md", "local-source-roster");
     assert_no_preflight!("td-mail/Cargo.lock", "local-source-roster");
+    for path in [
+        "td-json/src/lib.rs",
+        "td-toml/src/lib.rs",
+        "td-json/Cargo.toml",
+        "td-toml/Cargo.toml",
+    ] {
+        assert_target!(path, "check");
+        assert_target!(path, "recipe-checks");
+        assert_preflight!(path, "cargo-test");
+        assert_no_preflight!(path, "local-source-roster");
+    }
 
     // td-install-qemu-test: a standalone std-only crate staged as its own
     // seed, re-derived live: retained paths — the sources, the manifest and
@@ -4702,11 +4722,14 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads
 /// td-crypto, its one dependency. td-agent reads td-news, whose shared
-/// modules its test holds identical, td-ui, its one dependency, and
-/// td-compositor, the test tool its `native-compositor-tests` opt-in builds
-/// (td-agent/DESIGN.md §17).
+/// `td_fetch` module its test holds identical, td-json, td-toml and td-ui,
+/// its dependencies, and td-compositor, the test tool its
+/// `native-compositor-tests` opt-in builds (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
-    ("td-agent", &["td-compositor", "td-news", "td-ui"]),
+    (
+        "td-agent",
+        &["td-compositor", "td-json", "td-news", "td-toml", "td-ui"],
+    ),
     ("td-mta", &["td-crypto"]),
 ];
 
@@ -8827,20 +8850,29 @@ mod tests {
             Fixture(std::env::temp_dir().join(format!("td-agent-graph-{}", std::process::id())));
         let root = fixture.0.clone();
         std::fs::remove_dir_all(&root).ok();
-        for name in ["td-agent", "td-compositor", "td-news", "td-ui", "td-mail"] {
+        for name in [
+            "td-agent",
+            "td-compositor",
+            "td-json",
+            "td-news",
+            "td-toml",
+            "td-ui",
+            "td-mail",
+        ] {
             let base = root.join(name);
             std::fs::create_dir_all(base.join("src")).unwrap();
             let mut manifest = format!("[package]\nname = \"{name}\"\n");
             if name == "td-agent" {
                 manifest.push_str(
                     "\n[package.metadata.td-gate]\nnative-compositor-tests = true\n\n\
-                     [dependencies]\ntd-ui = { path = \"../td-ui\" }\n",
+                     [dependencies]\ntd-json = { path = \"../td-json\" }\n\
+                     td-toml = { path = \"../td-toml\" }\ntd-ui = { path = \"../td-ui\" }\n",
                 );
             }
             std::fs::write(base.join("Cargo.toml"), manifest).unwrap();
             std::fs::write(base.join("src/lib.rs"), "").unwrap();
         }
-        let shared = "const SHARED: &str = \"../td-news/src/json.rs\";\n";
+        let shared = "const SHARED: &str = \"../td-news/src/td_fetch.rs\";\n";
         std::fs::write(root.join("td-agent/src/lib.rs"), shared).unwrap();
         let changed = ["td-agent/src/lib.rs".to_string()];
         let all = cargo_test_cmds_all(&root).unwrap();
@@ -8850,10 +8882,10 @@ mod tests {
         assert!(narrowed
             .iter()
             .all(|c| is_format_check(c) || cmd_manifest_crate(c) == Some("td-agent")));
-        // A third crate read: the workspace's assertions would name it.
+        // Another crate read: the workspace's assertions would name it.
         std::fs::write(
             root.join("td-agent/src/lib.rs"),
-            format!("{shared}const MAIL: &str = \"../td-mail/src/json.rs\";\n"),
+            format!("{shared}const MAIL: &str = \"../td-mail/src/td_fetch.rs\";\n"),
         )
         .unwrap();
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);

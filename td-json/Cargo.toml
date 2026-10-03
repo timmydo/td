@@ -1,0 +1,31 @@
+[package]
+name = "td-json"
+version = "0.1.0"
+edition = "2021"
+description = "td's dependency-free JSON value, parser, writer and json! macro, shared by td's applications"
+license = "MIT"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from
+# a worktree nested under it (see the root Cargo.toml). A consumer names this
+# crate as `td-json = { path = "../td-json" }`, the one sibling-dependency
+# spelling the lock guard admits (AGENTS.md 'Rust code'); this crate itself
+# depends on nothing but `std`.
+[workspace]
+
+# No doc tests: the `json!` example never ran as one in any former carrier
+# (two binaries and td-agent's library, doctests off), the unit tests cover
+# the same call, and rustdoc links with a `cc` a td host need not have.
+[lib]
+doctest = false
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

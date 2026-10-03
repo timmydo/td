@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::toml::{self, Toml};
+use td_toml::Toml;
 
 #[derive(Debug)]
 pub struct Config {
@@ -47,7 +47,7 @@ pub struct FeedConfig {
 impl UiConfig {
     /// `[ui]`. Every key has a default, so an absent table is the default
     /// table and an absent key is its own default.
-    fn from_toml(table: &Toml) -> Result<UiConfig, toml::Error> {
+    fn from_toml(table: &Toml) -> Result<UiConfig, td_toml::Error> {
         Ok(UiConfig {
             mouse: table.optional_bool("mouse")?.unwrap_or_else(default_true),
             sync_interval_secs: table
@@ -63,11 +63,11 @@ impl FeedConfig {
     /// One `[[feed]]`. Both keys are required, and a key present but empty
     /// names nothing and reaches nothing, so it is refused here rather than
     /// at the first fetch.
-    fn from_toml(table: &Toml) -> Result<FeedConfig, toml::Error> {
-        let field = |key: &str| -> Result<String, toml::Error> {
+    fn from_toml(table: &Toml) -> Result<FeedConfig, td_toml::Error> {
+        let field = |key: &str| -> Result<String, td_toml::Error> {
             let value = table.require_str(key)?;
             if value.is_empty() {
-                return Err(toml::Error::new(format!("empty field `{}`", key)));
+                return Err(td_toml::Error::new(format!("empty field `{}`", key)));
             }
             Ok(value.to_string())
         };
@@ -81,7 +81,7 @@ impl FeedConfig {
 impl Config {
     /// Map a configuration document. Tables and the `feed` array are all
     /// optional here; `load` is what refuses a document with no feed.
-    fn from_toml(doc: &Toml) -> Result<Config, toml::Error> {
+    fn from_toml(doc: &Toml) -> Result<Config, td_toml::Error> {
         let empty = Toml::Table(Vec::new());
         let ui = UiConfig::from_toml(doc.optional_table("ui")?.unwrap_or(&empty))?;
         let mut feeds = Vec::new();
@@ -93,7 +93,7 @@ impl Config {
 
     /// Parse and map one configuration document.
     pub fn parse(contents: &str) -> Result<Config, String> {
-        let doc = toml::parse(contents).map_err(|e| format!("config parse error: {}", e))?;
+        let doc = td_toml::parse(contents).map_err(|e| format!("config parse error: {}", e))?;
         Config::from_toml(&doc).map_err(|e| format!("config parse error: {}", e))
     }
 
@@ -219,7 +219,7 @@ url = \"https://blog.rust-lang.org/feed.xml\"
             refused("[[feed]]\nurl = \"https://example.com/rss\"\n"),
             format!(
                 "config parse error: {}",
-                toml::missing_field_message("name")
+                td_toml::missing_field_message("name")
             )
         );
         assert_eq!(

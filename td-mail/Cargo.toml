@@ -5,8 +5,7 @@ edition = "2021"
 description = "td's JMAP mail client in a td-ui window: mailbox/thread reading, triage rules, retention, spam scoring, and an NDJSON CLI"
 license = "MIT"
 # `tests/mock_jmap.rs` and `tests/mock_fetch.rs` are helper modules of the one
-# integration test, not test binaries of their own: the first includes
-# `src/json.rs`, whose `#[macro_export]` macros may appear once per crate.
+# integration test, not test binaries of their own.
 autotests = false
 
 [[bin]]
@@ -32,9 +31,10 @@ native-compositor-tests = true
 
 # td-mail is a TARGET-built application, NOT part of the control-plane engine
 # workspace. It is standalone — its own workspace root — with a lock that
-# names itself and the one sibling it draws through. No external
-# dependencies: `std`, td's shared modules, and td-ui, and std is
-# the pinned toolchain rather than a cargo dep (AGENTS.md "std, not no_std").
+# names itself and the td siblings it draws through. No external
+# dependencies (AGENTS.md principle 2): `std`, td's shared modules, td-json,
+# td-toml and td-ui, and std is the pinned toolchain rather than a cargo dep
+# (AGENTS.md "std, not no_std").
 #
 # From a nested checkout (.claude/worktrees/* lives physically under the main
 # checkout) cargo walks past this repo's root manifest and is captured by the
@@ -53,9 +53,12 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shared UI toolkit, by the one sibling-dependency spelling the lock
-# guard admits (AGENTS.md 'Rust code'): the widget window the client draws
-# in and the editor pane it reads and composes a message in reach this
-# crate only through `td_ui::`.
+# td's own crates, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): JSON for JMAP and the CLI, TOML for the
+# configuration and rules files, and the shared UI toolkit, through which
+# alone the widget window the client draws in and the editor pane it reads
+# and composes a message in reach this crate.
 [dependencies]
+td-json = { path = "../td-json" }
+td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }

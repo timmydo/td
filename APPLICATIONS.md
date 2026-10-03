@@ -10002,11 +10002,13 @@ subtree-added from the `td` branches of the two repositories, which are
 frozen at the commits the import names. Each is a std-only root crate
 under td's deny lints, its shared modules (`json`, `toml`, `html`,
 `civil`, `kv`, `term_sys`, `td_fetch`, and `xml`, `regex`, `b64` where
-used) copied byte for byte between the two and held so by a recipe
-test, and each is built by
-`ladder::static_local_source_program`: a direct static rustc over the
-tree interned as its `<crate>-source` seed with the local-source
-exclusions specified in `DEVELOPMENT.md`. Each crate's identity is
+used) landed copied byte for byte between the two and held so by a
+recipe test; `json` and `toml` have since become the td-json and
+td-toml crates both depend on by path (AGENTS.md principle 2). Each is
+built by a static Cargo recipe over the tree interned as its
+`<crate>-source` seed, its td sibling trees staged beside it
+(`local_source_trees`), with the local-source exclusions specified in
+`DEVELOPMENT.md`. Each crate's identity is
 declaration-pinned by `seed/local-source-roster.txt` and re-derived live
 from the checkout on every run; a change to a retained input moves no
 committed row (that is the whole point — see `DEVELOPMENT.md` "Ready").

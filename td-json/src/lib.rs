@@ -1,12 +1,13 @@
 //! A dependency-free JSON value, parser, writer, and `json!` macro — the
-//! `serde_json` replacement for td's terminal applications.
+//! `serde_json` replacement for td's applications, one crate they all
+//! depend on by path (AGENTS.md principle 2).
 //!
 //! The value shape is td's engine `Json` (`engine/src/json.rs`): numbers are
 //! kept as their raw lexeme (`Num(String)`) so re-serialisation is exact with
 //! no f64 round-trip, and objects are an order-preserving `Vec<(String, Json)>`
 //! rather than a map, so `to_string` reproduces the order keys were written in
-//! and `to_canonical` sorts them for comparison. This copy needs none of the
-//! engine copy's grandfathered `unwrap`/indexing allowances: the module-level
+//! and `to_canonical` sorts them for comparison. This crate needs none of the
+//! engine copy's grandfathered `unwrap`/indexing allowances: the crate-level
 //! `deny` block below is the proof.
 //!
 //! Differences from `serde_json` a caller must know about:
@@ -1060,15 +1061,13 @@ fn valid_json_number(lex: &str) -> bool {
 // expressions (bare identifiers included), and values that are either `json!`
 // syntax or any Rust expression whose type implements `ToJson`.
 //
-// Every path is `$crate::…`, so the macro works the same whether it is used
-// from another crate (`use tdstd::json;`) or from the crate that defines it
-// (`crate::json`) — as long as the module stays at the crate root as `json`.
+// Every path is `$crate::…`, so a consumer needs only `use td_json::json;`.
 // ---------------------------------------------------------------------------
 
 /// Build a [`Json`] from JSON-shaped Rust syntax.
 ///
 /// ```
-/// use tdstd::json;
+/// use td_json::json;
 /// let name = "ada";
 /// let v = json!({ "ok": true, "user": { "name": name }, "tags": ["a", "b"] });
 /// assert_eq!(v.to_string(), r#"{"ok":true,"user":{"name":"ada"},"tags":["a","b"]}"#);
@@ -1227,32 +1226,32 @@ macro_rules! __json_internal {
     //////////////////////////////////////////////////////////////////////////
 
     (null) => {
-        $crate::json::Json::Null
+        $crate::Json::Null
     };
 
     (true) => {
-        $crate::json::Json::Bool(true)
+        $crate::Json::Bool(true)
     };
 
     (false) => {
-        $crate::json::Json::Bool(false)
+        $crate::Json::Bool(false)
     };
 
     ([]) => {
-        $crate::json::Json::Arr(::std::vec::Vec::new())
+        $crate::Json::Arr(::std::vec::Vec::new())
     };
 
     ([ $($tt:tt)+ ]) => {
-        $crate::json::Json::Arr($crate::__json_internal!(@array [] $($tt)+))
+        $crate::Json::Arr($crate::__json_internal!(@array [] $($tt)+))
     };
 
     ({}) => {
-        $crate::json::Json::Obj(::std::vec::Vec::new())
+        $crate::Json::Obj(::std::vec::Vec::new())
     };
 
     ({ $($tt:tt)+ }) => {
         {
-            let mut object = $crate::json::ObjectBuilder::new();
+            let mut object = $crate::ObjectBuilder::new();
             $crate::__json_internal!(@object object () ($($tt)+) ($($tt)+));
             object.build()
         }
@@ -1260,7 +1259,7 @@ macro_rules! __json_internal {
 
     // Any other expression, borrowed (never moved) through `ToJson`.
     ($other:expr) => {
-        $crate::json::Json::from(&$other)
+        $crate::Json::from(&$other)
     };
 }
 

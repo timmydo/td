@@ -8,8 +8,8 @@
 //! creation. There is no environment block and no project instructions
 //! yet, which later increments add to it.
 
-use crate::json::Json;
 use crate::store::Role;
+use td_json::Json;
 
 pub const CONVERSATION: &str = include_str!("../prompt/conversation.txt");
 pub const ORCHESTRATOR: &str = include_str!("../prompt/orchestrator.txt");
@@ -44,7 +44,7 @@ mod tests {
     fn a_prefix_holds_the_tools_and_one_system_message() {
         for role in [Role::Orchestrator, Role::Conversation] {
             let prefix = prefix(role);
-            let value = crate::json::parse(&prefix).unwrap();
+            let value = td_json::parse(&prefix).unwrap();
             assert!(value.get("tools").is_some());
             let messages = value.get("messages").unwrap().as_arr().unwrap();
             assert_eq!(messages.len(), 1);

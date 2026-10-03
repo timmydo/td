@@ -1,5 +1,5 @@
-use crate::json::{Json, ObjectBuilder, ToJson};
 use std::collections::HashMap;
+use td_json::{Json, ObjectBuilder, ToJson};
 
 /// A JSON document did not have the shape a type needs. The text follows
 /// serde's, so a diagnostic a user has seen before still reads the same.
@@ -851,6 +851,7 @@ impl ThreadGetResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use td_json::json;
 
     #[test]
     fn test_deserialize_minimal_jmap_session() {

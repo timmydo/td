@@ -1,4 +1,4 @@
-use crate::json::{self, Json, ObjectBuilder, ToJson};
+use td_json::{json, Json, ObjectBuilder, ToJson};
 
 /// The whole of td-mail's transport is td's fetch service. It holds the TLS
 /// trust, the resolver, the timeouts and the body caps; this side holds a
@@ -311,7 +311,7 @@ impl JmapClient {
 
         log_debug!("[JMAP] Session response received, parsing...");
 
-        let session = json::parse(&response_text)
+        let session = td_json::parse(&response_text)
             .map_err(|e| e.to_string())
             .and_then(|value| JmapSession::from_json(&value))
             .map_err(|e| {
@@ -401,7 +401,7 @@ impl JmapClient {
             truncate_str(&response_text, 1000)
         );
 
-        let parsed = json::parse(&response_text)
+        let parsed = td_json::parse(&response_text)
             .map_err(|e| e.to_string())
             .and_then(|value| JmapResponse::from_json(&value))
             .map_err(|e| JmapError::Parse(format!("Failed to parse response: {}", e)))?;
@@ -871,7 +871,7 @@ impl JmapClient {
         // Batch into chunks to avoid requestTooLarge errors from the server
         const BATCH_SIZE: usize = 500;
         for chunk in ids.chunks(BATCH_SIZE) {
-            let mut update = json::ObjectBuilder::with_capacity(chunk.len());
+            let mut update = td_json::ObjectBuilder::with_capacity(chunk.len());
             for id in chunk {
                 update.insert(id.clone(), json!({ "keywords/$seen": true }));
             }
@@ -1202,7 +1202,7 @@ impl JmapClient {
         }
         let text = String::from_utf8(response.body)
             .map_err(|e| JmapError::Parse(format!("Failed to read the upload's reply: {e}")))?;
-        let value = json::parse(&text)
+        let value = td_json::parse(&text)
             .map_err(|e| JmapError::Parse(format!("Failed to parse the upload's reply: {e}")))?;
         value
             .get("blobId")

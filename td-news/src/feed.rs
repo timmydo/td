@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::civil::{self, Zone};
-use crate::json::{Json, ToJson};
 use crate::xml::{Event, Reader};
+use td_json::{Json, ToJson};
 
 /// A normalized article parsed from an RSS or Atom feed.
 #[derive(Debug, Clone)]
@@ -42,7 +42,7 @@ fn optional_string_field(value: &Json, key: &str) -> Option<Option<String>> {
 impl ToJson for Article {
     /// Members in declaration order, which is what `to_string` writes.
     fn to_json(&self) -> Json {
-        crate::json!({
+        td_json::json!({
             "hash": self.hash,
             "title": self.title,
             "link": self.link,
@@ -75,7 +75,7 @@ impl Article {
 
 impl ToJson for FeedMeta {
     fn to_json(&self) -> Json {
-        crate::json!({
+        td_json::json!({
             "url": self.url,
             "title": self.title,
             "last_fetched": self.last_fetched,
@@ -632,22 +632,22 @@ mod tests {
                 r#""published":"2026-01-02 03:04:05","feed_name":"F","read":true}"#
             )
         );
-        let back = Article::from_json(&crate::json::parse(&text).unwrap()).unwrap();
+        let back = Article::from_json(&td_json::parse(&text).unwrap()).unwrap();
         assert_eq!(back.to_json().to_string(), text);
 
         // An absent or null `published` reads as none, as serde's
         // `Option<String>` did.
-        let mut without = crate::json::parse(&text).unwrap();
+        let mut without = td_json::parse(&text).unwrap();
         assert!(without.remove("published").is_some());
         assert!(Article::from_json(&without).unwrap().published.is_none());
-        let null = crate::json::parse(&text.replace(r#""2026-01-02 03:04:05""#, "null")).unwrap();
+        let null = td_json::parse(&text.replace(r#""2026-01-02 03:04:05""#, "null")).unwrap();
         assert!(Article::from_json(&null).unwrap().published.is_none());
 
         // A missing member, or one of the wrong type, is not an article.
-        let mut short = crate::json::parse(&text).unwrap();
+        let mut short = td_json::parse(&text).unwrap();
         assert!(short.remove("title").is_some());
         assert!(Article::from_json(&short).is_none());
-        let wrong = crate::json::parse(&text.replace(r#""read":true"#, r#""read":"yes""#)).unwrap();
+        let wrong = td_json::parse(&text.replace(r#""read":true"#, r#""read":"yes""#)).unwrap();
         assert!(Article::from_json(&wrong).is_none());
 
         let meta = FeedMeta {
@@ -660,7 +660,7 @@ mod tests {
             text,
             r#"{"url":"https://example.com/feed","title":"F","last_fetched":"2026-01-02 03:04:05"}"#
         );
-        let back = FeedMeta::from_json(&crate::json::parse(&text).unwrap()).unwrap();
+        let back = FeedMeta::from_json(&td_json::parse(&text).unwrap()).unwrap();
         assert_eq!(back.to_json().to_string(), text);
     }
 

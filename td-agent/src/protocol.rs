@@ -5,9 +5,9 @@
 //! or a file; `Debug` never shows it.
 
 use crate::config::Client;
-use crate::json::Json;
 use crate::key::Secret;
 use crate::store::{Event, Id, Role};
+use td_json::Json;
 
 /// The longest message a human sends in one go. JSON escaping can make it
 /// six times longer on the wire, which `frame::MAX_FRAME` holds.
@@ -233,7 +233,7 @@ impl Down {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let value = crate::json::parse_slice(bytes).map_err(|e| e.to_string())?;
+        let value = td_json::parse_slice(bytes).map_err(|e| e.to_string())?;
         match value.get("type").and_then(Json::as_str) {
             Some("setup") => {
                 let key = match (value.get("key"), value.get("no_key")) {
@@ -396,7 +396,7 @@ impl Up {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let value = crate::json::parse_slice(bytes).map_err(|e| e.to_string())?;
+        let value = td_json::parse_slice(bytes).map_err(|e| e.to_string())?;
         Ok(match value.get("type").and_then(Json::as_str) {
             Some("hello") => Self::Hello {
                 role: value

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cost::Tokens;
-use crate::json::Json;
+use td_json::Json;
 
 /// `O_NOFOLLOW` on x86-64, as td-ui's control socket spells it.
 const O_NOFOLLOW: i32 = 0o400000;
@@ -355,7 +355,7 @@ impl Meta {
 
 fn read_meta(dir: &Path) -> Result<Meta, String> {
     let bytes = read_named(&dir.join("meta"), MAX_META)?;
-    let value = crate::json::parse_slice(&bytes).map_err(|e| format!("meta: {e}"))?;
+    let value = td_json::parse_slice(&bytes).map_err(|e| format!("meta: {e}"))?;
     Meta::from_json(&value)
 }
 
@@ -1436,7 +1436,7 @@ pub fn parse_log(bytes: &[u8]) -> Result<(Vec<Event>, usize), String> {
         if body.len() > MAX_LINE {
             return Err(format!("line {} is past the bound", number + 1));
         }
-        let value = crate::json::parse_slice(body)
+        let value = td_json::parse_slice(body)
             .map_err(|e| format!("line {} is not an event: {e}", number + 1))?;
         let event = Event::from_json(&value).map_err(|e| format!("line {}: {e}", number + 1))?;
         let expected = events.last().map_or(1, |last| last.seq.saturating_add(1));

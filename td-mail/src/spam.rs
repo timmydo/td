@@ -10,9 +10,9 @@
 //! `X-Tmc-Spam-Verdict` header so that the existing rules engine (rules.toml)
 //! decides what to do with the message.
 
-use crate::json::{self, Json, ObjectBuilder, ToJson};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use td_json::{Json, ObjectBuilder, ToJson};
 
 /// Maximum number of most-significant tokens fed into the combiner. Bounds work
 /// and keeps a few extreme tokens from being diluted by a long body.
@@ -264,7 +264,7 @@ impl SpamModel {
     /// cannot be parsed (training data is rebuildable, so we never hard-fail).
     pub fn load(path: &Path) -> Self {
         match std::fs::read(path) {
-            Ok(bytes) => json::parse_slice(&bytes)
+            Ok(bytes) => td_json::parse_slice(&bytes)
                 .map_err(|e| e.to_string())
                 .and_then(|value| SpamModel::from_json(&value))
                 .unwrap_or_else(|e| {

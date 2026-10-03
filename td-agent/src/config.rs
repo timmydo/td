@@ -7,8 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::cost::{self, Limits};
-use crate::json::Json;
-use crate::toml::Toml;
+use td_json::Json;
+use td_toml::Toml;
 
 /// Where models are asked for (DESIGN.md §5).
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -319,7 +319,7 @@ pub fn load(path: Option<&Path>) -> Result<Config, String> {
 
 /// The configuration a file's text gives.
 pub fn parse(text: &str) -> Result<Config, String> {
-    let table = crate::toml::parse(text).map_err(|e| e.to_string())?;
+    let table = td_toml::parse(text).map_err(|e| e.to_string())?;
     let mut config = Config::default();
     for key in table.table_keys() {
         if let Some((_, why)) = REFUSED.iter().find(|(name, _)| *name == key) {

@@ -1,4 +1,5 @@
-//! A TOML 1.0 reader and writer with no dependencies outside `std`.
+//! A TOML 1.0 reader and writer with no dependencies outside `std`, one
+//! crate td's applications depend on by path (AGENTS.md principle 2).
 //!
 //! The parser is a single pass over the input that builds [`Toml`], an
 //! insertion-ordered tree. It is written for configuration files a person
@@ -1539,6 +1540,7 @@ fn decimal_value(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

@@ -19,8 +19,8 @@
 //! conversation messages the orchestrator, and nothing else crosses.
 
 use crate::history::Searchable;
-use crate::json::Json;
 use crate::store::{Id, Role, Status, TodoItem};
+use td_json::Json;
 
 /// The most a call's arguments may run to, as the model wrote them.
 pub const MAX_ARGUMENTS: usize = 256 * 1024;
@@ -485,7 +485,7 @@ pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
         arguments
     };
     let value =
-        crate::json::parse(arguments).map_err(|e| format!("the arguments are not JSON: {e}"))?;
+        td_json::parse(arguments).map_err(|e| format!("the arguments are not JSON: {e}"))?;
     let tool_name = tool.name();
     Ok(match tool {
         Tool::TodoWrite => Args::Todo(todo(members(tool_name, &value, &["items"])?)?),
@@ -710,7 +710,7 @@ mod tests {
         for role in [Role::Orchestrator, Role::Conversation] {
             let text = prefix(role, "system text");
             assert!(text.ends_with("]}"), "{text}");
-            let value = crate::json::parse(&text).unwrap();
+            let value = td_json::parse(&text).unwrap();
             let names: Vec<&str> = value
                 .get("tools")
                 .unwrap()

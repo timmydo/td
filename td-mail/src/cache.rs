@@ -1,7 +1,7 @@
 use crate::jmap::types::{Email, Mailbox};
-use crate::json::{self, ToJson};
 use crate::kv::{Error as KvError, Key, Store};
 use std::path::PathBuf;
+use td_json::ToJson;
 
 /// The five tables. `op_queue` is keyed by a big-endian `u64`, so iteration
 /// order is numeric order and replay is FIFO; the rest are keyed by text.
@@ -21,11 +21,11 @@ fn encode<T: ToJson + ?Sized>(value: &T) -> Vec<u8> {
 }
 
 fn decode_email(bytes: &[u8]) -> Option<Email> {
-    Email::from_json(&json::parse_slice(bytes).ok()?).ok()
+    Email::from_json(&td_json::parse_slice(bytes).ok()?).ok()
 }
 
 fn decode_mailboxes(bytes: &[u8]) -> Option<Vec<Mailbox>> {
-    let value = json::parse_slice(bytes).ok()?;
+    let value = td_json::parse_slice(bytes).ok()?;
     value
         .as_arr()?
         .iter()
@@ -34,7 +34,7 @@ fn decode_mailboxes(bytes: &[u8]) -> Option<Vec<Mailbox>> {
 }
 
 fn decode_ids(bytes: &[u8]) -> Option<Vec<String>> {
-    let value = json::parse_slice(bytes).ok()?;
+    let value = td_json::parse_slice(bytes).ok()?;
     value
         .as_arr()?
         .iter()

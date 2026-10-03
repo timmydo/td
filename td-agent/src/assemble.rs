@@ -31,8 +31,8 @@
 //! it, escaped, so it fits one.
 
 use crate::client::{self, Completion, Failure, Usage, MAX_REPLY};
-use crate::json::Json;
 use crate::store::Call;
+use td_json::Json;
 
 /// The most reasoning-details entries, and tool calls, one reply holds.
 pub const MAX_ENTRIES: usize = 256;
@@ -92,7 +92,7 @@ fn failed(message: impl Into<String>, usage: Option<Usage>) -> Failure {
 impl Assembly {
     /// One event's text, a chunk of the completion.
     pub fn event(&mut self, data: &str) -> Result<(), Failure> {
-        let chunk = crate::json::parse(data)
+        let chunk = td_json::parse(data)
             .map_err(|e| failed(format!("a stream event is not JSON: {e}"), self.usage))?;
         if let Some(usage) = client::usage(&chunk) {
             self.usage = Some(usage);
@@ -459,7 +459,7 @@ mod tests {
         // A finish never given reads as unknown.
         assert_eq!(completion.finish, "unknown");
         // The serialized array is what the log stores and sends back.
-        crate::json::parse(completion.details.as_deref().unwrap()).unwrap();
+        td_json::parse(completion.details.as_deref().unwrap()).unwrap();
     }
 
     /// Providers reuse an index for distinct blocks: consecutive text or
@@ -565,7 +565,7 @@ mod tests {
             ]
         );
         for call in reply.calls() {
-            crate::json::parse(&call.arguments).unwrap();
+            td_json::parse(&call.arguments).unwrap();
         }
         assert_eq!(reply.completion().finish, "tool_calls");
         assert_eq!(reply.completion().content, None);

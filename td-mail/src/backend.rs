@@ -3,7 +3,6 @@ use crate::civil;
 use crate::config::{RetentionPolicyConfig, SpamConfig};
 use crate::jmap::client::{JmapClient, JmapError};
 use crate::jmap::types::{Email, Identity, Mailbox};
-use crate::json::{self, Json, ObjectBuilder, ToJson};
 use crate::regex::UserRegex;
 use crate::rules::{self, CompiledRule};
 use crate::spam::{self, SpamModel};
@@ -14,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use td_json::{Json, ObjectBuilder, ToJson};
 
 /// Commands sent from the UI thread to the backend thread.
 pub enum BackendCommand {
@@ -1305,7 +1305,7 @@ fn replay_queued_mutations(
     );
 
     for (seq, payload) in queued {
-        let parsed = json::parse_slice(&payload)
+        let parsed = td_json::parse_slice(&payload)
             .map_err(|e| e.to_string())
             .and_then(|value| QueuedMutation::from_json(&value));
         let op = match parsed {

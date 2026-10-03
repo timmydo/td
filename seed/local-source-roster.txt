@@ -12,9 +12,9 @@
 # an ordinary edit inside a staged tree does not move a row.
 td-editor-source td-editor td-ui,td-compositor
 td-install-qemu-test-source td-install-qemu-test
-td-mail-source td-mail td-ui,td-compositor
+td-mail-source td-mail td-json,td-toml,td-ui,td-compositor
 td-net-source net engine,td-boot
-td-news-source td-news td-ui,td-compositor
+td-news-source td-news td-json,td-toml,td-ui,td-compositor
 td-open-source td-open td-busd,td-secret
 td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine
 td-photo-source td-photo td-ui,td-compositor

@@ -1,15 +1,16 @@
-//! td-agent carries td-news's `json`, `toml` and `td_fetch` modules byte
-//! for byte (DESIGN.md §1). The recipe test that holds td-news's and td-mail's
-//! copies identical gains td-agent only with packaging (DESIGN.md §17), so
-//! until then this test is the one that holds td-agent's: an edit to either
-//! side without the other reds here.
+//! td-agent carries td-news's `td_fetch` module byte for byte (DESIGN.md
+//! §1); JSON and TOML are the td-json and td-toml crates it depends on. The
+//! recipe test that holds td-news's and td-mail's copies identical gains
+//! td-agent only with packaging (DESIGN.md §17), so until then this test is
+//! the one that holds td-agent's: an edit to either side without the other
+//! reds here.
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used)]
 
 use std::path::Path;
 
 /// Every module td-agent shares with td-news.
-const SHARED: [&str; 3] = ["json.rs", "td_fetch.rs", "toml.rs"];
+const SHARED: [&str; 1] = ["td_fetch.rs"];
 
 #[test]
 fn the_shared_modules_are_td_news_copies_byte_for_byte() {

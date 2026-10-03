@@ -1,11 +1,12 @@
-use crate::json::Json as Value;
-use crate::json::ObjectBuilder;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use td_json::json;
+use td_json::Json as Value;
+use td_json::ObjectBuilder;
 
 /// Now as JMAP's `UTCDate`, so what the mock makes is inside the window
 /// a client asks about.
@@ -885,7 +886,7 @@ impl MockJmapServer {
     }
 
     fn handle_api(body: &str, state: &Arc<Mutex<MockState>>) -> (String, String) {
-        let request = match crate::json::parse(body) {
+        let request = match td_json::parse(body) {
             Ok(v) => v,
             Err(_) => {
                 return (

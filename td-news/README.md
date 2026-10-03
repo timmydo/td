@@ -8,9 +8,10 @@ td-ui's lists, and an article in td-ui's editor pane, read-only.
 ## Dependencies
 
 td-ui, td's dependency-free UI toolkit, whose editor pane shows an article,
-by path, and the Rust standard library: JSON, TOML, XML, HTML rendering,
-the cache and dates are td's shared `std` modules under `src/`, copied whole
-from one master each, and the window is td-ui's widget window. Fetching
+td-json and td-toml, td's JSON and TOML crates, all by path, and the Rust
+standard library: XML, HTML rendering, the cache and dates are td's shared
+`std` modules under `src/`, copied whole from one master each, and the
+window is td-ui's widget window. Fetching
 is not done here at all — `td-news` asks td's fetch service over the
 unix socket at `$XDG_RUNTIME_DIR/td-fetch/socket`, which holds the TLS, the
 resolver and the timeouts, and without it no feed can be fetched. The window

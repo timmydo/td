@@ -7,7 +7,7 @@ license = "MIT"
 
 # td-agent is a TARGET-built application, not part of the control-plane
 # engine workspace: standalone, its own workspace root, with a lock that
-# names itself and the one sibling it draws on (DESIGN.md §1). An explicit
+# names itself and the td siblings it draws on (DESIGN.md §1). An explicit
 # empty `[workspace]` keeps cargo from walking up to an outer checkout's
 # manifest from a nested worktree, as td-news's does.
 [workspace]
@@ -28,15 +28,15 @@ trusted-test-root = true
 # The window is a live Wayland client; its native cases launch it under
 # the real headless compositor (tests/control_process.rs). This
 # opt-in builds that binary for the gate and adds it as a test-only edge,
-# which builder/src/affected.rs pins beside td-news and td-ui.
+# which builder/src/affected.rs pins beside its other edges.
 native-compositor-tests = true
 # Those cases build td-agent again with the feature, in a target of their
 # own, and run as `native_compositor::fixture::`.
 native-compositor-fixture-feature = "test-key-root"
 
 # The library is the program's modules, so the process tests can drive
-# them. It has no doc tests: the shared json module's example names the
-# crate it was copied from.
+# them. It has no doc tests: none of its modules carries an example, and
+# rustdoc links with a `cc` a td host need not have (see td-json's manifest).
 [lib]
 doctest = false
 
@@ -49,7 +49,9 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-# The shared UI toolkit, by the one sibling-dependency spelling the lock
-# guard admits (AGENTS.md 'Rust code').
+# td's own crates, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): JSON, TOML and the shared UI toolkit.
 [dependencies]
+td-json = { path = "../td-json" }
+td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }

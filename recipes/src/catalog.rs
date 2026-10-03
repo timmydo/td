@@ -442,6 +442,7 @@ mod tests {
                 "td-editor",
                 "td-firstboot",
                 "td-install",
+                "td-json",
                 "td-mail",
                 "td-news",
                 "td-open",
@@ -453,6 +454,7 @@ mod tests {
                 "td-setup",
                 "td-taskmgr",
                 "td-term",
+                "td-toml",
                 "td-ui"
             ]
         );

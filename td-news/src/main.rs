@@ -1,12 +1,13 @@
 //! td-news: an RSS and Atom reader in a td-ui window.
 //!
-//! The crate is `std` and td-ui, the shared toolkit whose widget window
-//! it draws in. Six modules — `civil`, `html`, `json`, `kv`, `toml`, `xml` —
-//! are td's shared std modules, copied in whole from one master each and
-//! never edited here, so the import into td can diff them byte for byte
-//! against td-mail's copies. What td-news does not call therefore stays,
-//! allowed on its `mod` line rather than trimmed: a binary crate exports
-//! nothing, so `dead_code` fires here and not in the module's own crate.
+//! The crate is `std`, td-json, td-toml and td-ui, the shared toolkit
+//! whose widget window it draws in. Four modules — `civil`, `html`, `kv`,
+//! `xml` — are td's shared std modules, copied in whole from one master
+//! each and never edited here, so the import into td can diff them byte
+//! for byte against td-mail's copies. What td-news does not call
+//! therefore stays, allowed on its `mod` line rather than trimmed: a
+//! binary crate exports nothing, so `dead_code` fires here and not in the
+//! module's own crate.
 //!
 //! `unsafe` is forbidden for the whole crate: the terminal surface the
 //! reader once carried (UNSAFE.md §18) went with the terminal, and the
@@ -25,8 +26,6 @@ mod config;
 mod feed;
 #[allow(dead_code)]
 mod html;
-#[allow(dead_code)]
-mod json;
 mod keybindings;
 #[allow(dead_code)]
 mod kv;
@@ -38,8 +37,6 @@ mod td_fetch;
 /// tests through a `#[path]` include.
 #[cfg(test)]
 mod testing;
-#[allow(dead_code)]
-mod toml;
 mod ui;
 #[allow(dead_code)]
 mod xml;

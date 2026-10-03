@@ -215,7 +215,9 @@ dependency at all.
 
 A consumer names it as `td-ui = { path = "../td-ui" }`. That is the one
 sibling-dependency spelling `builder/src/affected.rs` admits, and the
-consumer's lock then lists exactly its own package plus td-ui. A program
+consumer's lock then lists exactly its own package, td-ui, and any other
+td crate it names the same way (td-news, td-mail and td-agent also name
+td-json and td-toml). A program
 that depends on td-ui is built by a cargo recipe that stages sibling source
 trees (`local_source_trees`, the td-net shape); a flat-staged direct-rustc
 recipe cannot link a second crate. td-portal, td-taskmgr, td-editor,

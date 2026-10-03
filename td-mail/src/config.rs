@@ -1,7 +1,7 @@
 use crate::regex::UserRegex;
-use crate::toml::{self, Error as TomlError, Toml};
 use std::fs;
 use std::path::Path;
+use td_toml::{Error as TomlError, Toml};
 
 #[derive(Debug, Clone)]
 pub struct AccountConfig {
@@ -497,7 +497,7 @@ impl Config {
     }
 
     fn parse(contents: &str) -> Result<Self, ConfigError> {
-        let document = toml::parse(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let document = td_toml::parse(contents).map_err(|e| ConfigError::Parse(e.to_string()))?;
         let raw = RawConfig::from_toml(&document).map_err(|e| ConfigError::Parse(e.to_string()))?;
 
         // Compiled here, and carried compiled: a refused pattern is a

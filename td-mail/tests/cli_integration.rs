@@ -1,10 +1,3 @@
-// Declared first, and with `#[macro_use]`, so `json!` reaches `mock_jmap`
-// too — one copy of the module per test crate, or its `#[macro_export]`
-// macros collide.
-#[macro_use]
-#[allow(dead_code)]
-#[path = "../src/json.rs"]
-mod json;
 #[allow(dead_code)]
 #[path = "../src/civil.rs"]
 mod civil;
@@ -15,12 +8,13 @@ mod mock_jmap;
 #[path = "../src/testing.rs"]
 mod testing;
 
-use json::Json as Value;
 use mock_fetch::MockFetchSocket;
 use mock_jmap::MockJmapServer;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use td_json::json;
+use td_json::Json as Value;
 
 struct CliHarness {
     child: Child,
@@ -146,7 +140,7 @@ password_command = "echo test"
         self.reader
             .read_line(&mut response_line)
             .expect("read response");
-        json::parse(response_line.trim()).expect("parse response JSON")
+        td_json::parse(response_line.trim()).expect("parse response JSON")
     }
 }
 
@@ -533,7 +527,7 @@ fn test_train_spam_and_ham() {
     // The model is persisted under $XDG_DATA_HOME/td-mail/spam-model.json.
     let model_path = data_dir.path().join("td-mail").join("spam-model.json");
     let bytes = std::fs::read(&model_path).expect("model file should exist after training");
-    let model = json::parse_slice(&bytes).expect("parse model JSON");
+    let model = td_json::parse_slice(&bytes).expect("parse model JSON");
     assert_eq!(number(&model["spam_messages"]), 1, "model: {}", model);
     assert_eq!(number(&model["ham_messages"]), 1, "model: {}", model);
     assert!(
@@ -595,7 +589,7 @@ fn test_connect_without_fetch_service_names_the_socket() {
     let _ = child.kill();
     let _ = child.wait();
 
-    let resp = json::parse(line.trim()).expect("parse response JSON");
+    let resp = td_json::parse(line.trim()).expect("parse response JSON");
     assert!(!resp["ok"].is_true(), "connect should fail: {}", resp);
     let error = resp["error"].as_str().unwrap_or("");
     let expected = format!(

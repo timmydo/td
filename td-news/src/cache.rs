@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::feed::{Article, FeedMeta};
-use crate::json::{self, Json, ToJson};
 use crate::kv::{self, Key, Store, WriteTxn};
+use td_json::{Json, ToJson};
 
 const ARTICLES: &str = "articles";
 const FEEDS: &str = "feeds";
@@ -98,7 +98,7 @@ impl Cache {
         let txn = self.store.read();
         let table = txn.table(ARTICLES)?;
         let value = table.get(&Key::from_str(hash))?;
-        Article::from_json(&json::parse_slice(value).ok()?)
+        Article::from_json(&td_json::parse_slice(value).ok()?)
     }
 
     pub fn put_articles(&self, articles: &[Article]) {
@@ -113,7 +113,7 @@ impl Cache {
         let txn = self.store.read();
         let table = txn.table(FEEDS)?;
         let value = table.get(&Key::from_str(url))?;
-        FeedMeta::from_json(&json::parse_slice(value).ok()?)
+        FeedMeta::from_json(&td_json::parse_slice(value).ok()?)
     }
 
     #[cfg(test)]
@@ -127,7 +127,7 @@ impl Cache {
         let txn = self.store.read();
         let table = txn.table(FEED_INDEX)?;
         let value = table.get(&Key::from_str(feed_url))?;
-        hashes_from_json(&json::parse_slice(value).ok()?)
+        hashes_from_json(&td_json::parse_slice(value).ok()?)
     }
 
     #[cfg(test)]
@@ -177,7 +177,7 @@ impl Cache {
         for refresh in refreshes {
             let mut hashes: Vec<String> = txn
                 .get(FEED_INDEX, &Key::from_str(&refresh.url))
-                .and_then(|value| json::parse_slice(value).ok())
+                .and_then(|value| td_json::parse_slice(value).ok())
                 .and_then(|value| hashes_from_json(&value))
                 .unwrap_or_default();
 
@@ -200,7 +200,7 @@ impl Cache {
                 .iter()
                 .filter(|hash| {
                     txn.get(ARTICLES, &Key::from_str(hash))
-                        .and_then(|value| json::parse_slice(value).ok())
+                        .and_then(|value| td_json::parse_slice(value).ok())
                         .and_then(|value| Article::from_json(&value))
                         .map(|article| !article.read)
                         .unwrap_or(false)

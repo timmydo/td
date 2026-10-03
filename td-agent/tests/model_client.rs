@@ -18,11 +18,6 @@
 #[allow(dead_code)]
 mod mock_fetch;
 
-// The shared JSON module, to read the bodies the client sent.
-#[path = "../src/json.rs"]
-#[allow(dead_code, unused_macros, unused_imports)]
-mod json;
-
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -321,7 +316,7 @@ fn wait(child: &mut Child) {
 /// A JSON text's leaves by dotted path; strings bare, the rest as
 /// written.
 fn flat(text: &str) -> BTreeMap<String, String> {
-    fn walk(prefix: &str, value: &json::Json, out: &mut BTreeMap<String, String>) {
+    fn walk(prefix: &str, value: &td_json::Json, out: &mut BTreeMap<String, String>) {
         let join = |key: &str| {
             if prefix.is_empty() {
                 key.to_string()
@@ -330,17 +325,17 @@ fn flat(text: &str) -> BTreeMap<String, String> {
             }
         };
         match value {
-            json::Json::Obj(members) => {
+            td_json::Json::Obj(members) => {
                 for (key, value) in members {
                     walk(&join(key), value, out);
                 }
             }
-            json::Json::Arr(items) => {
+            td_json::Json::Arr(items) => {
                 for (i, value) in items.iter().enumerate() {
                     walk(&join(&i.to_string()), value, out);
                 }
             }
-            json::Json::Str(text) => {
+            td_json::Json::Str(text) => {
                 out.insert(prefix.to_string(), text.clone());
             }
             other => {
@@ -348,7 +343,7 @@ fn flat(text: &str) -> BTreeMap<String, String> {
             }
         }
     }
-    let value = json::parse(text).unwrap_or_else(|e| panic!("{e}: {text}"));
+    let value = td_json::parse(text).unwrap_or_else(|e| panic!("{e}: {text}"));
     let mut out = BTreeMap::new();
     walk("", &value, &mut out);
     out

@@ -1,9 +1,9 @@
 use crate::jmap::client::JmapClient;
 use crate::jmap::types::{Email, EmailAddress, Mailbox};
 use crate::regex::UserRegex;
-use crate::toml::{self, Error as TomlError, Toml};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use td_toml::{Error as TomlError, Toml};
 
 // --- TOML mapping types ---
 
@@ -16,7 +16,7 @@ impl RulesConfig {
     /// Read a rules file. Unknown keys are ignored, as serde's default was;
     /// a missing required key reads with serde's own wording.
     pub fn parse(contents: &str) -> Result<Self, String> {
-        let document = toml::parse(contents).map_err(|e| e.to_string())?;
+        let document = td_toml::parse(contents).map_err(|e| e.to_string())?;
         RulesConfig::from_toml(&document).map_err(|e| e.to_string())
     }
 
@@ -1392,7 +1392,7 @@ flag = true
         let mut email = make_email("e1");
         email.extra.insert(
             "header:X-Spam-Score:asText".to_string(),
-            crate::json::Json::Str("5.5".to_string()),
+            td_json::Json::Str("5.5".to_string()),
         );
 
         let toml_str = r#"

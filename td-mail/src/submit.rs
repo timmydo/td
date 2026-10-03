@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::civil;
 use crate::jmap::types::{EmailAddress, Identity};
-use crate::json::{Json, ObjectBuilder};
+use td_json::{json, Json, ObjectBuilder};
 
 /// message-mode's line between the headers and the body.
 pub const SEPARATOR: &str = "--text follows this line--";
