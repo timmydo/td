@@ -663,6 +663,32 @@ mod named_dirs_tests {
         assert!(named_dirs("no-such-recipe").is_empty());
     }
 
+    /// Every check's verdict key holds the evaluator fingerprint, so what
+    /// every recipe compiles in belongs to it: the shared modules, every
+    /// recipe file, and each shared embed, a directory by its sources.
+    #[test]
+    fn the_fingerprint_holds_the_shared_embeds() {
+        let files = registry::evaluator_fingerprint_files();
+        for kept in [
+            "recipes/src/types.rs",
+            "recipes/src/catalog.rs",
+            "recipes/src/recipes/hello.rs",
+            "engine/src/sha256.rs",
+        ] {
+            assert!(files.contains(&kept), "{kept} not fingerprinted");
+        }
+        assert!(!shared_embeds().is_empty());
+        for embed in shared_embeds() {
+            let found = if embed.contains('/') {
+                files.contains(embed)
+            } else {
+                let src = format!("{embed}/src/");
+                files.iter().any(|f| f.starts_with(&src))
+            };
+            assert!(found, "shared embed {embed} not fingerprinted");
+        }
+    }
+
     /// The evaluator's own sources under `src/bin/` are outside the shared
     /// scan, on the ground that they embed crate files only in their test
     /// modules: a runtime include there would change a check's assertions

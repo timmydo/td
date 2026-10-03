@@ -80,16 +80,20 @@ passing as it is made.
 
 The recipe-checks gate answers a check from its verdict memo when that check
 passed on this host before and nothing it reads has changed since: the
-closure's recipe definitions with the sources they embed, the seed patches,
-committed cargo locks and local-source trees, the builder's engine sources
-— what a build can execute, with the seed digest table AND the local-source
-roster it compiles in, and not its routing, check loop or gates, which no
-check runs — and the
-evaluator's own sources, with the script that builds it for the gate, each
-as fingerprinted when its binary was built (`td-builder engine-fingerprint`
-prints the builder's). The repo's cargo config is in that key; the host
-toolchain that compiles either binary is not. The gate says how many checks
-it answered that way and counts them apart from the ones it ran.
+closure's recipe definitions with the sources they embed, the seed
+patches, committed cargo locks and local-source trees, the builder's
+engine sources — what a build can execute, with the seed digest table AND
+the local-source roster it compiles in, and not its routing, check loop
+or gates, which no check runs — and the evaluator's own sources, with the
+script that builds it for the gate and the crate files its shared modules
+compile in (`catalog::shared_embeds`), each as fingerprinted when its
+binary was built (`td-builder engine-fingerprint` prints the builder's).
+Every recipe file is in that fingerprint, so an edit to one re-keys every
+check: a check's code can build recipes outside its closure (the Rust
+toolchain check builds ripgrep, fd and uutils through `td-builder
+shell`). The repo's cargo config is in that key; the host toolchain that
+compiles either binary is not. The gate says how many checks it answered
+that way and counts them apart from the ones it ran.
 The memo does not see the host — its qemu, kernel, or toolchain — so after
 such a change, or when a recorded pass is in doubt, run everything:
 

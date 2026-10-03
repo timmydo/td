@@ -238,10 +238,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(out, "    &[{}]", list.join(", "))?;
     writeln!(out, "}}")?;
 
+    let (fingerprint, fingerprinted) =
+        evaluator_source_fingerprint(Path::new(&manifest_dir), &shared_files)?;
+    writeln!(
+        out,
+        "/// The repository-relative files `TD_EVALUATOR_SOURCE_FINGERPRINT` covers."
+    )?;
+    writeln!(out, "#[cfg(test)]")?;
+    writeln!(
+        out,
+        "pub fn evaluator_fingerprint_files() -> &'static [&'static str] {{"
+    )?;
+    let list: Vec<String> = fingerprinted.iter().map(|f| format!("{f:?}")).collect();
+    writeln!(out, "    &[{}]", list.join(", "))?;
+    writeln!(out, "}}")?;
+
     let out_path = PathBuf::from(env::var("OUT_DIR")?).join("registry.rs");
     fs::write(&out_path, out)?;
 
-    let fingerprint = evaluator_source_fingerprint(Path::new(&manifest_dir))?;
     println!("cargo:rustc-env=TD_EVALUATOR_SOURCE_FINGERPRINT={fingerprint}");
     Ok(())
 }
@@ -272,18 +286,22 @@ fn shared_file_entry(repo: &Path, file: &str) -> Result<String, Box<dyn Error>> 
 
 /// sha256 over the evaluator's own sources — everything under this crate's
 /// `src/`, its `build.rs` and manifest, the engine's `src/` and manifest, the
-/// workspace manifest and lock, plus the builder preparation implementation
-/// and its script entry point — as (path, file digest) pairs in path order.
-/// The check verdict key holds it in place of reading those trees at run
-/// time: a key read from the tree names the tree at that moment, and a check
-/// whose assertions were compiled from older sources could record a pass
-/// under a newer key. Every file is declared to cargo, and every directory
-/// for its adds and removes, so an edit reruns this script and re-keys. A
-/// hidden entry — an editor's swap file, its lock link, a scratch directory —
-/// is skipped, file or directory alike; any other symlink is an error, since
-/// the walk does not follow one and skipping it would fingerprint less than
-/// the compiler reads.
-fn evaluator_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn Error>> {
+/// workspace manifest and lock, the builder preparation implementation and
+/// its script entry point, and the crate files the shared modules compile in
+/// (a whole-directory entry by its `src/`) — as (path, file digest) pairs in
+/// path order, returned with those paths. The check verdict key holds it in
+/// place of reading those trees at run time: a key read from the tree names
+/// the tree at that moment, and a check whose assertions were compiled from
+/// older sources could record a pass under a newer key. Every file is
+/// declared to cargo, and every directory for its adds and removes, so an
+/// edit reruns this script and re-keys. A hidden entry — an editor's swap
+/// file, its lock link, a scratch directory — is skipped, file or directory
+/// alike; any other symlink is an error, since the walk does not follow one
+/// and skipping it would fingerprint less than the compiler reads.
+fn evaluator_source_fingerprint(
+    manifest_dir: &Path,
+    shared_embeds: &[String],
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let root = manifest_dir
         .parent()
         .ok_or("recipes crate has no parent directory")?;
@@ -311,8 +329,19 @@ fn evaluator_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn E
     for dir in ["recipes/src", "engine/src"] {
         walk_sources(&root.join(dir), &mut files)?;
     }
+    // An entry is a file path, or a bare crate directory whose sources an
+    // embedded file reads further (`shared_file_entry`).
+    for entry in shared_embeds {
+        if entry.contains('/') {
+            files.push(root.join(entry));
+        } else {
+            walk_sources(&root.join(entry).join("src"), &mut files)?;
+        }
+    }
     files.sort();
+    files.dedup();
     let mut h = sha256::Sha256::new();
+    let mut listed = Vec::with_capacity(files.len());
     for file in &files {
         let rel = file
             .strip_prefix(root)?
@@ -325,8 +354,9 @@ fn evaluator_source_fingerprint(manifest_dir: &Path) -> Result<String, Box<dyn E
         h.update(b"\0");
         h.update(digest.as_bytes());
         h.update(b"\n");
+        listed.push(rel.to_string());
     }
-    Ok(sha256::to_base16(&h.finalize()))
+    Ok((sha256::to_base16(&h.finalize()), listed))
 }
 
 fn walk_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {

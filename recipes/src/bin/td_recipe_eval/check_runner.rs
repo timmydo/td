@@ -3884,10 +3884,11 @@ impl RecipeCheckRunner {
     /// evaluator's OWN sources, as `build.rs` fingerprinted them when this
     /// binary was compiled, so the key names the assertions that run and not
     /// the tree at the moment of asking, and so an edit anywhere under
-    /// `recipes/src` or `engine/src` re-keys every check. NOT the evaluator
-    /// binary: it embeds every target crate's sources, so it changes with
-    /// any of them, and a key that held it would miss on every change to a
-    /// crate the closure never reads, which is the case the memo exists for.
+    /// `recipes/src` or `engine/src`, or to a crate file the shared modules
+    /// compile in, re-keys every check. NOT the evaluator binary: it embeds
+    /// every target crate's sources, so it changes with any of them, and a
+    /// key that held it would miss on every change to a crate the closure
+    /// never reads, which is the case the memo exists for.
     ///
     /// What the key does not hold is the host: its qemu, its kernel, the
     /// toolchain that built the evaluator. A check that passed under one and
