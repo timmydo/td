@@ -399,6 +399,10 @@ mod tests {
         assert_eq!(strip_comments("a /* x /* y */ z */ b"), "a   b");
         // Unterminated: the rest of the file was a comment.
         assert_eq!(strip_comments("a /* b"), "a  ");
+        // A `//` inside a block comment does not end the block early.
+        assert_eq!(strip_comments("x/*\n// y\n*/z"), "x \n\nz");
+        // A `*/` with nothing open is not a comment and is left alone.
+        assert_eq!(strip_comments("a*/b"), "a*/b");
     }
 
     #[test]

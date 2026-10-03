@@ -172,6 +172,8 @@ fn main() -> ExitCode {
 mod confinement {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
+    use td_source_scan::strip_comments;
+
     const AUTHORITY: &str = include_str!("authority.rs");
     const BUS: &str = include_str!("bus.rs");
     const CGROUP: &str = include_str!("cgroup.rs");
@@ -245,73 +247,6 @@ mod confinement {
     /// A failed completion must kill the jail. An application the broker has
     /// no record of resolves `Unconfined` — full portal access for the one
     /// process on the system that is certainly confined.
-    /// Rust source with its block comments removed, nesting included.
-    ///
-    /// Nesting matters because Rust allows it and because the naive version —
-    /// stop at the first `*/` — leaves the tail of an outer comment behind,
-    /// which is where commented-out code would reappear. An unterminated `/*`
-    /// swallows the rest, which is what the compiler does with it too.
-    fn without_block_comments(source: &str) -> String {
-        let mut out = String::with_capacity(source.len());
-        let mut rest = source;
-        let mut depth = 0_usize;
-        loop {
-            let open = rest.find("/*");
-            let close = rest.find("*/");
-            match (depth, open, close) {
-                (0, None, _) => {
-                    out.push_str(rest);
-                    return out;
-                }
-                (0, Some(at), _) => {
-                    out.push_str(rest.get(..at).unwrap_or(""));
-                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
-                    depth = 1;
-                }
-                (_, Some(at), Some(shut)) if at < shut => {
-                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
-                    depth = depth.saturating_add(1);
-                }
-                (_, _, Some(shut)) => {
-                    rest = rest.get(shut.saturating_add(2)..).unwrap_or("");
-                    depth = depth.saturating_sub(1);
-                }
-                (_, _, None) => return out,
-            }
-        }
-    }
-
-    /// And its line comments.
-    fn without_line_comments(source: &str) -> String {
-        source
-            .lines()
-            .map(|line| match line.split_once("//") {
-                Some((code, _)) => code,
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The stripper is the thing standing between a commented-out phase two
-    /// and a green suite, so it is tested rather than assumed.
-    #[test]
-    fn comments_are_stripped_including_nested_and_unterminated_blocks() {
-        assert_eq!(without_block_comments("a/*b*/c"), "ac");
-        assert_eq!(without_block_comments("a/*b/*c*/d*/e"), "ae");
-        assert_eq!(without_block_comments("a/*b\nc*/d"), "ad");
-        assert_eq!(without_block_comments("a/*b"), "a");
-        assert_eq!(without_block_comments("plain"), "plain");
-        // A `*/` with nothing open is not a comment and is left alone.
-        assert_eq!(without_block_comments("a*/b"), "a*/b");
-        assert_eq!(without_line_comments("keep // drop\nkeep2"), "keep \nkeep2");
-        // The combination is what the test below uses, and the order matters:
-        // a `//` inside a block comment must not end the block early.
-        let both = without_line_comments(&without_block_comments("x/*\n// y\n*/z"));
-        assert!(!both.contains('y'), "{both:?}");
-        assert!(both.contains('x') && both.contains('z'), "{both:?}");
-    }
-
     #[test]
     fn the_registration_brackets_the_launch() {
         let body = TRANSITION
@@ -331,7 +266,7 @@ mod confinement {
         // to comment out a multi-line block, and phase two is a multi-line
         // block — and every test stayed green while the jail released an
         // application it had never registered.
-        let launch = without_line_comments(&without_block_comments(body));
+        let launch = strip_comments(body);
         let at = |needle: &str| {
             launch
                 .find(needle)
@@ -444,7 +379,7 @@ mod confinement {
     /// to it was not, so the mutation that survived was not in the rule.
     #[test]
     fn a_launch_plan_carries_the_permission_files_own_entries() {
-        let resolve = without_line_comments(&without_block_comments(AUTHORITY))
+        let resolve = strip_comments(AUTHORITY)
             .split_once("pub(crate) fn resolve")
             .unwrap()
             .1
@@ -494,7 +429,7 @@ mod confinement {
 
     #[test]
     fn a_launch_plan_derives_network_isolation_from_the_permission_file() {
-        let resolve = without_line_comments(&without_block_comments(AUTHORITY))
+        let resolve = strip_comments(AUTHORITY)
             .split_once("pub(crate) fn resolve")
             .unwrap()
             .1
@@ -551,7 +486,7 @@ mod confinement {
         // file that is not TZif as UTC and says nothing. Bounded and
         // comment-stripped like every half above — an assertion satisfied by
         // a mention in a comment or a test proves the mention, not the check.
-        let authority = without_line_comments(&without_block_comments(AUTHORITY));
+        let authority = strip_comments(AUTHORITY);
         let resolve_zone = authority
             .split_once("fn resolve_zoneinfo_file(")
             .unwrap()
@@ -560,7 +495,7 @@ mod confinement {
             .unwrap()
             .0;
         assert!(resolve_zone.contains("require_tzif(&file.path)?;"));
-        let transition = without_line_comments(&without_block_comments(TRANSITION));
+        let transition = strip_comments(TRANSITION);
         let bound_zone = transition
             .split_once("fn require_bound_zone_at(")
             .unwrap()

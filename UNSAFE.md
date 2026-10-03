@@ -100,15 +100,17 @@ a transfer, and nothing else; reusing a module does not transfer its
 authorization to a raw boundary of the consumer's own, which gets its
 own entry.
 
-The confinement tests of `td-init`, `td-login`, `td-sh`, `td-svc` and
-`td-util` read their sources through `td-source-scan`: its comment
-stripper and whitespace squeeze, and for the four that use them, the
-tokens after each `unsafe`, the allow and block counts, module coverage,
-and the constructs that would decouple the scanned text from the
-compiled crate. It is a dev-dependency only, absent from every recipe
-and shipped binary, and forbids `unsafe` itself. A change to how it
-reads comments, literals or tokens is a change to each consumer's
-confinement and is reviewed as one.
+The confinement tests of `td-busd`, `td-init`, `td-jail`, `td-login`,
+`td-sh`, `td-svc` and `td-util` read their sources through
+`td-source-scan`. All seven take its comment stripper; `td-init`,
+`td-login`, `td-sh`, `td-svc` and `td-util` also its whitespace squeeze,
+and the four other than `td-sh` also the tokens after each `unsafe`, the
+allow and block counts, module coverage, and the constructs that would
+decouple the scanned text from the compiled crate. It is a
+dev-dependency only, absent from every recipe and shipped binary, and
+forbids `unsafe` itself. A change to how it reads comments, literals or
+tokens is a change to each consumer's confinement and is reviewed as
+one.
 
 ## Roster
 

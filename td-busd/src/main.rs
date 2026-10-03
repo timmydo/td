@@ -352,6 +352,8 @@ fn source(module: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use td_source_scan::strip_comments;
+
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {
@@ -758,7 +760,7 @@ mod tests {
         // still there to be counted while the behaviour was gone, and all 236
         // tests passed. td-jail's confinement module learnt this the same way
         // and its comment says so; this is the same stripper.
-        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let transport = strip_comments(source("transport"));
         let Some(from) = transport.find("fn jail_register(") else {
             panic!("the registration arm is gone");
         };
@@ -811,7 +813,7 @@ mod tests {
     /// is that `publish` is the LAST thing `say_hello` does.
     #[test]
     fn a_name_is_published_after_its_hello_is_answered() {
-        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let transport = strip_comments(source("transport"));
         let Some(from) = transport.find("fn say_hello(") else {
             panic!("say_hello is gone");
         };
@@ -844,7 +846,7 @@ mod tests {
     /// survived the whole suite.
     #[test]
     fn the_send_path_asks_the_policy_before_the_directory() {
-        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let transport = strip_comments(source("transport"));
         let Some(from) = transport.find("fn route(") else {
             panic!("the routing arm is gone");
         };
@@ -888,7 +890,7 @@ mod tests {
     /// every test in the suite.
     #[test]
     fn a_reply_is_decided_by_ownership_and_not_by_the_talk_set() {
-        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let transport = strip_comments(source("transport"));
         let Some(from) = transport.find("fn route(") else {
             panic!("the routing arm is gone");
         };
@@ -938,7 +940,7 @@ mod tests {
     /// one shape that sentence has. That is worth having and is not proof.
     #[test]
     fn the_reservation_is_one_gate_before_may_own_dispatches() {
-        let policy = without_line_comments(&without_block_comments(source("policy")));
+        let policy = strip_comments(source("policy"));
         let Some(from) = policy.find("pub fn may_own(") else {
             panic!("may_own is gone");
         };
@@ -998,7 +1000,7 @@ mod tests {
     /// in this crate, which is exactly why the rule is stated here.
     #[test]
     fn a_holder_is_told_about_itself_and_not_about_the_name() {
-        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let transport = strip_comments(source("transport"));
         let Some(from) = transport.find("fn askable(") else {
             panic!(
                 "askable is gone, so the holder exemption moved somewhere \
@@ -1032,7 +1034,7 @@ mod tests {
     /// is no third way out.
     #[test]
     fn a_host_pid_leaves_only_through_pid_to_tell() {
-        let transport = without_line_comments(&without_block_comments(source("transport")));
+        let transport = strip_comments(source("transport"));
         let production = transport.split("\nmod tests {").next().unwrap_or("");
         let Some(from) = production.find("fn pid_to_tell(") else {
             panic!(
@@ -1058,67 +1060,6 @@ mod tests {
             "a host pid is read somewhere other than pid_to_tell, which the \
              policy does not guard"
         );
-    }
-
-    /// Comments out, so that commenting a check out is not a way to pass the
-    /// test that pins it. Lifted from `td-jail/src/main.rs`, which arrived at
-    /// it the same way; the two crates were separate one-package locks when
-    /// this was written and could not share the helper (the gate now admits a
-    /// sibling roster crate by path; folding the copy is its own reviewed
-    /// change).
-    fn without_block_comments(source: &str) -> String {
-        let mut out = String::with_capacity(source.len());
-        let mut rest = source;
-        let mut depth = 0_usize;
-        loop {
-            let open = rest.find("/*");
-            let close = rest.find("*/");
-            match (depth, open, close) {
-                (0, None, _) => {
-                    out.push_str(rest);
-                    return out;
-                }
-                (0, Some(at), _) => {
-                    out.push_str(rest.get(..at).unwrap_or(""));
-                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
-                    depth = 1;
-                }
-                (_, Some(at), Some(shut)) if at < shut => {
-                    rest = rest.get(at.saturating_add(2)..).unwrap_or("");
-                    depth = depth.saturating_add(1);
-                }
-                (_, _, Some(shut)) => {
-                    rest = rest.get(shut.saturating_add(2)..).unwrap_or("");
-                    depth = depth.saturating_sub(1);
-                }
-                (_, _, None) => return out,
-            }
-        }
-    }
-
-    fn without_line_comments(source: &str) -> String {
-        source
-            .lines()
-            .map(|line| match line.split_once("//") {
-                Some((code, _)) => code,
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The stripper stands between a commented-out guard and a green suite, so
-    /// it is tested rather than assumed.
-    #[test]
-    fn comments_are_stripped_including_nested_and_unterminated_blocks() {
-        assert_eq!(without_block_comments("a/*b*/c"), "ac");
-        assert_eq!(without_block_comments("a/*b/*c*/d*/e"), "ae");
-        assert_eq!(without_block_comments("a/*b\nc*/d"), "ad");
-        assert_eq!(without_block_comments("a/*b"), "a");
-        assert_eq!(without_block_comments("plain"), "plain");
-        // A `*/` with nothing open is not a comment and is left alone.
-        assert_eq!(without_block_comments("a*/b"), "a*/b");
-        assert_eq!(without_line_comments("keep // drop\nkeep2"), "keep \nkeep2");
     }
 
     /// The adoption's ORDERING in `peer_pidfd`, which is the INVERSE of

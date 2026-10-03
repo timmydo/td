@@ -9,6 +9,12 @@ license = "GPL-3.0-or-later"
 [package.metadata.td-gate]
 clippy-all-targets = true
 
+# The source-pinning tests strip comments through td-source-scan.
+# Dev-only: the recipe compiles src/main.rs with a direct rustc and no
+# `--test`, so the shipped binary never sees it.
+[dev-dependencies]
+td-source-scan = { path = "../td-source-scan" }
+
 [workspace]
 
 [[bin]]
