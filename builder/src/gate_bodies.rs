@@ -1815,21 +1815,60 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
     let mut failures = 0usize;
     let mut memoized = 0usize;
     let mut skipped: Vec<String> = Vec::new();
-    for ((spec, index), outcome) in work.iter().zip(results) {
+    let mut timed: Vec<(String, std::time::Duration)> = Vec::new();
+    for ((spec, index), (outcome, took)) in work.iter().zip(results) {
         ran += 1;
         match outcome {
-            CheckOutcome::Passed => {}
+            CheckOutcome::Passed => timed.push((format!("{spec}#{index}"), took)),
             CheckOutcome::Memoized => memoized += 1,
             CheckOutcome::HostGap => skipped.push(format!("{spec}#{index}")),
-            CheckOutcome::Failed => failures += 1,
+            CheckOutcome::Failed => {
+                failures += 1;
+                timed.push((format!("{spec}#{index}"), took));
+            }
         }
     }
 
+    if let Some(line) = slowest_checks(&timed, SLOWEST_SHOWN) {
+        println!("{line}");
+    }
     let (report, verdict) = recipe_checks_verdict(ran, failures, &skipped, memoized, &unreached);
     for line in report {
         println!("{line}");
     }
     verdict
+}
+
+/// How many of a run's slowest checks the summary names.
+const SLOWEST_SHOWN: usize = 8;
+
+/// The `shown` longest of the checks that executed, longest first with their
+/// wall time, so the summary says what held the gate up without reading
+/// every block, and the sum over all of them. Memo answers and host skips are
+/// left out by the caller: they say nothing about what a check costs. None
+/// when nothing executed.
+fn slowest_checks(timed: &[(String, std::time::Duration)], shown: usize) -> Option<String> {
+    let mut by_time: Vec<&(String, std::time::Duration)> = timed.iter().collect();
+    by_time.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let named: Vec<String> = by_time
+        .into_iter()
+        .take(shown)
+        .map(|(name, took)| format!("{name} {:.1}s", took.as_secs_f64()))
+        .collect();
+    let total = timed.iter().fold(std::time::Duration::ZERO, |sum, (_, t)| {
+        sum.saturating_add(*t)
+    });
+    (!named.is_empty()).then(|| {
+        format!(
+            ">> recipe-checks: slowest {} of {} executed: {} (all {} sum {:.1}s; \
+             checks overlap, so not wall)",
+            named.len(),
+            timed.len(),
+            named.join(", "),
+            timed.len(),
+            total.as_secs_f64()
+        )
+    })
 }
 
 /// The gate's verdict, split out so the three endings are testable without
@@ -2044,10 +2083,18 @@ fn capture_check_output(
     }
 }
 
-/// Print one check's block: banner, its captured output verbatim, verdict. The
-/// caller holds the print lock, which is what keeps the three contiguous.
-fn report_finished_check(spec: &str, index: usize, done: Result<&FinishedCheck, &String>) {
+/// Print one check's block: banner, its captured output verbatim, verdict
+/// and wall time. The caller holds the print lock, which is what keeps the
+/// three contiguous. The time is what says which checks hold a gate up, and
+/// the log kept no other record of it.
+fn report_finished_check(
+    spec: &str,
+    index: usize,
+    done: Result<&FinishedCheck, &String>,
+    took: std::time::Duration,
+) {
     use std::io::Write;
+    let took = format!("{:.1}s", took.as_secs_f64());
     println!("================ recipe-check {spec}#{index} ================");
     // stdout first, so the banner cannot land after the body it introduces when
     // the two streams are captured into one file.
@@ -2062,27 +2109,27 @@ fn report_finished_check(spec: &str, index: usize, done: Result<&FinishedCheck, 
             let _ = std::io::stderr().write_all(&done.output);
             let _ = std::io::stderr().flush();
             match done.outcome {
-                CheckOutcome::Passed => {
-                    println!("================ recipe-check {spec}#{index}: PASS ================")
-                }
+                CheckOutcome::Passed => println!(
+                    "================ recipe-check {spec}#{index}: PASS ({took}) ================"
+                ),
                 CheckOutcome::Memoized => println!(
                     "================ recipe-check {spec}#{index}: PASS (memoized: unchanged \
-                     since it last passed here) ================"
+                     since it last passed here; {took}) ================"
                 ),
                 CheckOutcome::HostGap => println!(
                     "================ recipe-check {spec}#{index}: SKIPPED (unprovisioned \
-                     — nothing on this host can run it) ================"
+                     — nothing on this host can run it; {took}) ================"
                 ),
-                CheckOutcome::Failed => {
-                    eprintln!("================ recipe-check {spec}#{index}: FAIL ================")
-                }
+                CheckOutcome::Failed => eprintln!(
+                    "================ recipe-check {spec}#{index}: FAIL ({took}) ================"
+                ),
             }
         }
         // A check that could not be RUN at all (spawn/wait failed). The run is
         // about to fail on it; say which one here so the log names it in place.
-        Err(e) => {
-            eprintln!("================ recipe-check {spec}#{index}: ERROR {e} ================")
-        }
+        Err(e) => eprintln!(
+            "================ recipe-check {spec}#{index}: ERROR {e} ({took}) ================"
+        ),
     }
     let _ = std::io::stdout().flush();
 }
@@ -2118,9 +2165,10 @@ fn run_recipe_checks_concurrently(
     eval: &Path,
     eval_s: &str,
     stage0_base: &str,
-) -> Result<Vec<CheckOutcome>, String> {
+) -> Result<Vec<(CheckOutcome, std::time::Duration)>, String> {
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<Result<CheckOutcome, String>>>> =
+    type Slot = Option<Result<(CheckOutcome, std::time::Duration), String>>;
+    let slots: Vec<std::sync::Mutex<Slot>> =
         work.iter().map(|_| std::sync::Mutex::new(None)).collect();
     // Serializes the REPORTING, not the work: a block is printed whole while this
     // is held, so four builds' output cannot interleave line by line.
@@ -2137,7 +2185,9 @@ fn run_recipe_checks_concurrently(
                 let Some((spec, index)) = work.get(i) else {
                     return;
                 };
+                let started = std::time::Instant::now();
                 let done = run_recipe_check(eval, spec, *index, eval_s, stage0_base, worker_budget);
+                let took = started.elapsed();
                 // Printed HERE, as each check lands, rather than after the whole
                 // set: a gate that shows nothing for ten minutes is one nobody can
                 // tell from a hung one, and the run this replaced streamed. The
@@ -2151,13 +2201,13 @@ fn run_recipe_checks_concurrently(
                 // is reachable rather than theoretical.
                 {
                     let _held = pen.lock().unwrap_or_else(|e| e.into_inner());
-                    report_finished_check(spec, *index, done.as_ref());
+                    report_finished_check(spec, *index, done.as_ref(), took);
                 }
-                // Only the VERDICT is kept. The output has been printed, and 26
-                // checks' captured logs held to the end of the gate is exactly the
-                // memory the slot pool's admission is trying to bound — a noisy
-                // failure can emit a great deal of it.
-                let verdict = done.map(|d| d.outcome);
+                // Only the VERDICT and its wall time are kept. The output has
+                // been printed, and 26 checks' captured logs held to the end of
+                // the gate is exactly the memory the slot pool's admission is
+                // trying to bound — a noisy failure can emit a great deal of it.
+                let verdict = done.map(|d| (d.outcome, took));
                 if let Some(cell) = slots.get(i) {
                     if let Ok(mut g) = cell.lock() {
                         *g = Some(verdict);
@@ -4078,6 +4128,27 @@ mod tests {
         );
     }
 
+    /// The summary names the longest checks first, breaks ties by name, stops
+    /// at the cap, sums every executed check, and says nothing when none ran.
+    #[test]
+    fn the_slowest_checks_are_named_longest_first() {
+        let t = |name: &str, ms: u64| (name.to_string(), std::time::Duration::from_millis(ms));
+        let timed = vec![
+            t("a#1", 1_000),
+            t("c#1", 30_000),
+            t("b#1", 30_000),
+            t("d#1", 500),
+        ];
+        assert_eq!(
+            slowest_checks(&timed, 3).as_deref(),
+            Some(
+                ">> recipe-checks: slowest 3 of 4 executed: b#1 30.0s, c#1 30.0s, \
+                 a#1 1.0s (all 4 sum 61.5s; checks overlap, so not wall)"
+            )
+        );
+        assert_eq!(slowest_checks(&[], 3), None);
+    }
+
     #[test]
     fn recipe_check_output_keeps_a_bounded_tail_and_finds_split_sentinels() {
         let mut input = vec![b'x'; 8190];
@@ -4127,7 +4198,7 @@ mod tests {
         let got = run_recipe_checks_concurrently(&work, 4, &script, "e", "s").unwrap();
 
         assert_eq!(got.len(), work.len(), "one result per work item");
-        for (i, outcome) in got.iter().enumerate() {
+        for (i, (outcome, _took)) in got.iter().enumerate() {
             let index = i + 1;
             let want = match index % 3 {
                 1 => CheckOutcome::Passed,
@@ -4143,8 +4214,12 @@ mod tests {
         // And the verdict is width-INDEPENDENT: the same work at width 1 gives
         // the same answers in the same places.
         let serial = run_recipe_checks_concurrently(&work, 1, &script, "e", "s").unwrap();
+        let verdicts = |r: &[(CheckOutcome, std::time::Duration)]| {
+            r.iter().map(|(o, _)| *o).collect::<Vec<_>>()
+        };
         assert_eq!(
-            got, serial,
+            verdicts(&got),
+            verdicts(&serial),
             "width must not change any check's verdict or its position"
         );
         let _ = std::fs::remove_dir_all(&dir);
