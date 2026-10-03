@@ -1874,10 +1874,10 @@ fn format_output(
         }
         if !sel.targets.is_empty() {
             o.push_str(&format!("  {}\n", check_command(&sel.targets)));
-            if let Some(dirs) = check_scope(root, changed, &sel.targets) {
+            if let Some(scope) = check_scope(root, changed, &sel.targets) {
                 o.push_str(&format!(
                     "  recipe-checks scope: {} ({} on the command above)\n",
-                    dirs.join(" "),
+                    scope.join(" "),
                     crate::check_loop::CHECK_SCOPE_ENV
                 ));
             }
@@ -3309,8 +3309,8 @@ fn run_self_check(root: &Path, targets: &[String], changed: &[String]) -> i32 {
     // The child's scope is this run's or none: one exported by the caller's
     // shell must not outlive a change that has left the roster.
     cmd.env_remove(crate::check_loop::CHECK_SCOPE_ENV);
-    if let Some(dirs) = check_scope(root, changed, targets) {
-        cmd.env(crate::check_loop::CHECK_SCOPE_ENV, dirs.join(" "));
+    if let Some(scope) = check_scope(root, changed, targets) {
+        cmd.env(crate::check_loop::CHECK_SCOPE_ENV, scope.join(" "));
     }
     cmd.status().ok().and_then(|s| s.code()).unwrap_or(1)
 }
@@ -4830,24 +4830,45 @@ fn close_over_readers(selected: &mut Vec<String>, readers: &[(String, Vec<String
     }
 }
 
-/// The recipe-checks scope of a change: the roster crates it is confined
-/// to, sorted, when the targets run the recipe-checks gate at all; None
-/// otherwise, which runs every check. The cargo narrowing's confinement
-/// without its reader closure: the evaluator turns the crates into checks
-/// from its own table of what each recipe stages, and a recipe whose crate
-/// reads another builds only if it stages that one too, so the table
-/// already follows every read a recipe build makes.
+/// The recipe-checks scope of a change confined to roster crates: its
+/// changed paths, sorted, when the targets run the recipe-checks gate at
+/// all; None otherwise, which runs every check. The cargo narrowing's
+/// confinement without its reader closure: the evaluator turns the scope
+/// into checks from its own table of what each recipe stages, and a recipe
+/// whose crate reads another builds only if it stages that one too, so the
+/// table already follows every read a recipe build makes. Paths rather than
+/// crates, because a few single files are compiled into every recipe and
+/// the rest of their crates are not. The crates stand in for the paths
+/// where a path holds whitespace, which the space-separated variable cannot
+/// carry, or the list would outgrow `SCOPE_PATHS_MAX`: a crate covers every
+/// path under it.
 fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Vec<String>> {
     let runs_recipe_checks = targets.iter().any(|t| t == "check" || t == "recipe-checks");
     if !runs_recipe_checks {
         return None;
     }
     let roster = discover_gate_crates(root).ok()?;
-    let mut selected = changed_roster_crates(&roster, changed)?;
-    selected.sort();
-    selected.dedup();
-    Some(selected)
+    let mut crates = changed_roster_crates(&roster, changed)?;
+    let mut paths: Vec<String> = changed.to_vec();
+    paths.sort();
+    paths.dedup();
+    let size = paths
+        .iter()
+        .map(|p| p.len().saturating_add(1))
+        .sum::<usize>();
+    if size <= SCOPE_PATHS_MAX && !paths.iter().any(|p| p.contains(char::is_whitespace)) {
+        return Some(paths);
+    }
+    crates.sort();
+    crates.dedup();
+    Some(crates)
 }
+
+/// The most bytes of changed paths the recipe-checks scope carries before
+/// it falls back to crate names: well inside one argument's and one
+/// environment string's kernel limit (128 KiB each), which the scope
+/// travels as both.
+const SCOPE_PATHS_MAX: usize = 32 * 1024;
 
 /// The crate a `--manifest-path <crate>/Cargo.toml` command names; None for the
 /// `--workspace` ones, which belong to no single crate.
@@ -5843,11 +5864,13 @@ mod tests {
     }
 
     /// The recipe-checks scope follows the cargo narrowing's confinement
-    /// without its reader closure: a td-compositor change scopes to
-    /// td-compositor alone, though many crates read it, a change that leaves
-    /// the roster has none, `..` has none, and targets without the
-    /// recipe-checks gate have none. The dry run prints the scope on its own
-    /// line under the check command, and only then.
+    /// without its reader closure: a td-compositor change scopes to its own
+    /// changed path, though many crates read td-compositor; paths travel
+    /// sorted and deduplicated; a path with whitespace, or more paths than
+    /// the bound, sends the crates instead; a change that leaves the roster
+    /// has none, `..` has none, and targets without the recipe-checks gate
+    /// have none. The dry run prints the scope on its own line under the
+    /// check command, and only then.
     #[test]
     fn the_check_scope_is_the_confinement_the_cargo_narrowing_uses() {
         let root = repo_root();
@@ -5859,25 +5882,40 @@ mod tests {
         let paths = |ps: &[&str]| ps.iter().map(|p| (*p).to_string()).collect::<Vec<_>>();
         assert_eq!(
             check_scope(&root, &paths(&["td-compositor/src/main.rs"]), &check),
-            Some(paths(&["td-compositor"]))
+            Some(paths(&["td-compositor/src/main.rs"]))
         );
-        // Sorted, deduplicated, and still without readers when several
-        // crates change at once.
         assert_eq!(
             check_scope(
                 &root,
                 &paths(&[
                     "td-ui/src/lib.rs",
                     "td-compositor/src/main.rs",
-                    "td-ui/src/face.rs"
+                    "td-ui/src/face.rs",
+                    "td-ui/src/lib.rs"
                 ]),
                 &check
             ),
-            Some(paths(&["td-compositor", "td-ui"]))
+            Some(paths(&[
+                "td-compositor/src/main.rs",
+                "td-ui/src/face.rs",
+                "td-ui/src/lib.rs"
+            ]))
         );
         assert_eq!(
+            check_scope(
+                &root,
+                &paths(&["td-ui/src/lib.rs", "td-sh/spec/a b.txt"]),
+                &check
+            ),
+            Some(paths(&["td-sh", "td-ui"]))
+        );
+        let many: Vec<String> = (0..SCOPE_PATHS_MAX / 16)
+            .map(|i| format!("td-sh/tests/f{i:08}.rs"))
+            .collect();
+        assert_eq!(check_scope(&root, &many, &check), Some(paths(&["td-sh"])));
+        assert_eq!(
             check_scope(&root, &paths(&["td-sh/src/lib.rs"]), &check),
-            Some(paths(&["td-sh"]))
+            Some(paths(&["td-sh/src/lib.rs"]))
         );
         assert_eq!(
             check_scope(
@@ -5902,7 +5940,7 @@ mod tests {
         );
         let out = path_output(&root, "td-sh/src/lib.rs");
         assert!(
-            out.contains("  td-builder check check recipe-checks\n  recipe-checks scope: td-sh (TD_CHECK_SCOPE on the command above)\n"),
+            out.contains("  td-builder check check recipe-checks\n  recipe-checks scope: td-sh/src/lib.rs (TD_CHECK_SCOPE on the command above)\n"),
             "{out}"
         );
         assert!(!path_output(&root, "check.sh").contains("recipe-checks scope"));
@@ -10454,7 +10492,7 @@ mod tests {
                 "Selected checks:",
                 "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check recipe-checks",
-                "  recipe-checks scope: td-review (TD_CHECK_SCOPE on the command above)",
+                "  recipe-checks scope: td-review/src/land.rs (TD_CHECK_SCOPE on the command above)",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",

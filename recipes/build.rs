@@ -33,7 +33,10 @@ mod sha256;
 // cover them: a build script has no tests of its own.
 #[path = "src/embed_scan.rs"]
 mod embed_scan;
-use embed_scan::{strip_comments, td_dirs_embedded, td_dirs_named};
+use embed_scan::{
+    declares_out_of_line_module, has_embed_marker, strip_comments, td_dirs_embedded, td_dirs_named,
+    td_dirs_named_beside_embeds, td_files_embedded,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // The directory path retriggers on file ADDS/REMOVES (dir mtime); an EDIT to
@@ -115,6 +118,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // code without embedding it is an error here, not a narrowed scope: it
     // is a read the embed scan would miss, or prose that belongs in a
     // comment.
+    //
+    // What a shared module embeds is kept by FILE, apart from the per-recipe
+    // directories: a change elsewhere in td-compositor does not touch the one
+    // timezone file every recipe compiles in. An embed in a `#[cfg(test)]`
+    // module is not compiled into the evaluator at all and is left out. An
+    // embedded file holding any embed marker or an out-of-line module reads
+    // more than its own bytes, so it stands for its whole crate directory, as
+    // does one that is not a file here, and so does a crate the module names
+    // in production code outside an embed literal it resolved.
     let repo = PathBuf::from(&manifest_dir);
     let repo = repo
         .parent()
@@ -127,7 +139,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             crate_dirs.push(name);
         }
     }
-    let mut shared: Vec<String> = Vec::new();
+    let mut shared_files: Vec<String> = Vec::new();
     let src = PathBuf::from(&manifest_dir).join("src");
     let mut pending = vec![src.clone()];
     while let Some(dir) = pending.pop() {
@@ -157,14 +169,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .into());
                     }
                 }
-                for d in embedded {
-                    if !shared.contains(&d) {
-                        shared.push(d);
+                let module_dir = path
+                    .parent()
+                    .and_then(|p| p.strip_prefix(repo).ok())
+                    .and_then(Path::to_str)
+                    .ok_or("a shared module outside the repository or with a non-UTF-8 path")?;
+                for file in td_files_embedded(module_dir, &text) {
+                    let entry = shared_file_entry(repo, &file)?;
+                    if !shared_files.contains(&entry) {
+                        shared_files.push(entry);
+                    }
+                }
+                for dir in td_dirs_named_beside_embeds(&text) {
+                    if crate_dirs.contains(&dir) && !shared_files.contains(&dir) {
+                        shared_files.push(dir);
                     }
                 }
             }
         }
     }
+    shared_files.sort();
 
     let mut out = String::new();
     writeln!(
@@ -188,11 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(out, "}}")?;
     writeln!(
         out,
-        "/// The `td-*` directories each recipe may read: those its own file"
-    )?;
-    writeln!(
-        out,
-        "/// names, and those a shared module of this crate names. Sorted."
+        "/// The `td-*` directories each recipe's own file names. Sorted."
     )?;
     writeln!(
         out,
@@ -200,13 +220,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     writeln!(out, "    &[")?;
     for (stem, _, dirs) in &recipes {
-        let mut every: Vec<&String> = dirs.iter().chain(shared.iter()).collect();
-        every.sort();
-        every.dedup();
-        let list: Vec<String> = every.iter().map(|d| format!("{d:?}")).collect();
+        let list: Vec<String> = dirs.iter().map(|d| format!("{d:?}")).collect();
         writeln!(out, "        ({stem:?}, &[{}]),", list.join(", "))?;
     }
     writeln!(out, "    ]")?;
+    writeln!(out, "}}")?;
+    writeln!(
+        out,
+        "/// What the shared modules compile in from `td-*` crates, which every"
+    )?;
+    writeln!(
+        out,
+        "/// recipe reads: repository-relative files, or a whole crate directory. Sorted."
+    )?;
+    writeln!(out, "pub fn shared_embeds() -> &'static [&'static str] {{")?;
+    let list: Vec<String> = shared_files.iter().map(|f| format!("{f:?}")).collect();
+    writeln!(out, "    &[{}]", list.join(", "))?;
     writeln!(out, "}}")?;
 
     let out_path = PathBuf::from(env::var("OUT_DIR")?).join("registry.rs");
@@ -215,6 +244,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     let fingerprint = evaluator_source_fingerprint(Path::new(&manifest_dir))?;
     println!("cargo:rustc-env=TD_EVALUATOR_SOURCE_FINGERPRINT={fingerprint}");
     Ok(())
+}
+
+/// The `shared_embeds` entry for `file`, a repository-relative path a shared
+/// module embeds: the file itself where it is a file here whose text holds
+/// no embed marker, literal or not, and declares no out-of-line module, and
+/// its `td-*` crate directory otherwise. Watched, so an edit that adds such
+/// a read re-runs this script.
+fn shared_file_entry(repo: &Path, file: &str) -> Result<String, Box<dyn Error>> {
+    let top = file.split('/').next().unwrap_or(file).to_string();
+    let path = repo.join(file);
+    if !path.is_file() {
+        return Ok(top);
+    }
+    println!("cargo:rerun-if-changed={}", path.display());
+    // Bytes that are not text (an `include_bytes!` payload) read nothing
+    // further; any text may be Rust an `include!` compiles.
+    let Ok(text) = String::from_utf8(fs::read(&path)?) else {
+        return Ok(file.to_string());
+    };
+    let code = strip_comments(&text);
+    if has_embed_marker(&code) || declares_out_of_line_module(&code) {
+        return Ok(top);
+    }
+    Ok(file.to_string())
 }
 
 /// sha256 over the evaluator's own sources — everything under this crate's

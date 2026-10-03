@@ -4216,33 +4216,52 @@ pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String
     Ok(out)
 }
 
-/// The check-owning recipes a change under `dirs` can reach: each whose
-/// closure holds a recipe that may read one of them — by the catalog's
-/// named-directory table (`catalog::named_dirs`), or a `local_source` or
-/// sibling tree under it. A scope none of whose directories any recipe reads is an error
-/// rather than an empty reach: a scope that missed a read would skip every
-/// check, so the caller lists them all instead. One unread directory beside
-/// a read one contributes nothing: the dispatcher sends every changed crate
-/// and not its readers, since a recipe that builds a reader stages what it
-/// reads. `dirs` are top-level directory names.
-pub(crate) fn checks_reaching(dirs: &[&str]) -> Result<BTreeSet<String>, String> {
-    if dirs.is_empty() {
+/// The check-owning recipes a change under `scope` can reach: each whose
+/// closure holds a recipe that may read one of its entries — by the
+/// catalog's named-directory table (`catalog::named_dirs`), or a
+/// `local_source` or sibling tree under it, each matched by the entry's
+/// top-level directory — and every one when an entry is, or holds, or lies
+/// in one of `catalog::shared_embeds`, which every recipe compiles in. A
+/// scope none of whose entries any recipe reads is an error rather than an
+/// empty reach: a scope that missed a read would skip every check, so the
+/// caller lists them all instead. One unread entry beside a read one
+/// contributes nothing: the dispatcher sends every changed path and not its
+/// readers, since a recipe that builds a reader stages what it reads.
+/// `scope` entries are top-level directory names or repository-relative
+/// paths under one.
+pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeSet<String>, String> {
+    if scope.is_empty() {
         return Err("empty scope".to_string());
     }
     let all = catalog::all();
     let mut reached: BTreeSet<&str> = BTreeSet::new();
-    for dir in dirs {
-        let dir = dir.trim_end_matches('/');
-        if dir.is_empty() || dir.contains('/') || dir.contains("..") {
-            return Err(format!("scope `{dir}` is not a top-level directory name"));
+    for entry in scope {
+        let entry = entry.trim_end_matches('/');
+        if entry.is_empty()
+            || entry.starts_with('/')
+            || entry
+                .split('/')
+                .any(|p| p.is_empty() || p == "." || p == "..")
+        {
+            return Err(format!(
+                "scope `{entry}` is not a top-level directory or a path under one"
+            ));
         }
+        let dir = entry.split('/').next().unwrap_or(entry);
         let under = format!("{dir}/");
+        let within = |a: &str, b: &str| {
+            a == b
+                || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'))
+                || b.strip_prefix(a).is_some_and(|r| r.starts_with('/'))
+        };
+        let shared = catalog::shared_embeds().iter().any(|e| within(entry, e));
         for (stem, recipe) in &all {
             let local = recipe
                 .local_source
                 .as_deref()
                 .map(|s| s.trim_start_matches("./"));
-            let reads = catalog::named_dirs(stem).contains(&dir)
+            let reads = shared
+                || catalog::named_dirs(stem).contains(&dir)
                 || local.is_some_and(|s| s == dir || s.starts_with(&under))
                 || recipe.local_source_trees.iter().flatten().any(|s| {
                     let s = s.trim_start_matches("./");
@@ -4254,7 +4273,7 @@ pub(crate) fn checks_reaching(dirs: &[&str]) -> Result<BTreeSet<String>, String>
         }
     }
     if reached.is_empty() {
-        return Err(format!("no recipe reads any of {}", dirs.join(" ")));
+        return Err(format!("no recipe reads any of {}", scope.join(" ")));
     }
     let catalog: BTreeMap<&str, Recipe> = all.iter().map(|(s, r)| (*s, r.clone())).collect();
     let mut out = BTreeSet::new();
@@ -9683,13 +9702,15 @@ chmod 755 '{}'
         assert!(!is_plain_basename("..\\etc"));
     }
 
-    /// Shared compositor clock rules and boot protocol reach every recipe;
-    /// toolkit siblings retain a narrower closure. A scope nothing reads or
-    /// one that is not a directory name refuses, while adding an unread
-    /// directory beside a read one changes nothing.
+    /// A compositor file the shared modules do not compile in reaches only
+    /// the checks whose closure stages or embeds the compositor; its shared
+    /// clock rules, its whole directory, and the boot protocol reach every
+    /// check; toolkit siblings retain a narrower closure. A scope nothing
+    /// reads, or an entry that is not a clean relative path, refuses, while
+    /// adding an unread entry beside a read one changes nothing.
     #[test]
     fn checks_reaching_follows_the_embeds_through_the_closure() {
-        let reached = checks_reaching(&["td-compositor"]).expect("reach");
+        let reached = checks_reaching(&["td-compositor/src/main.rs"]).expect("reach");
         assert!(reached.contains("td-taskmgr-test"));
         assert!(reached.contains("td-portal-test"));
         assert!(reached.contains("td-photo-test"));
@@ -9730,18 +9751,35 @@ chmod 755 '{}'
                 reached.contains(*stem)
             );
         }
-        // Shared clock rules and boot protocol conservatively reach every
-        // recipe; the toolkit sibling still proves narrower selection.
         assert!(!toolkit.contains("curl-x86-64-test"), "{toolkit:?}");
-        let every = checks_reaching(&["td-boot"]).expect("reach");
-        assert_eq!(every, reached);
+        assert!(!reached.contains("curl-x86-64-test"), "{reached:?}");
+        // What the shared modules compile in reaches every check, by its
+        // file, by the directory holding it, or by a directory inside it.
+        let every: BTreeSet<String> = all
+            .iter()
+            .filter(|(_, r)| r.checks.as_ref().is_some_and(|c| !c.is_empty()))
+            .map(|(s, _)| (*s).to_string())
+            .collect();
+        for scope in [
+            "td-compositor/src/timezone.rs",
+            "td-compositor",
+            "td-compositor/src",
+            "td-boot/src/protocol.rs",
+            "td-boot",
+        ] {
+            assert_eq!(checks_reaching(&[scope]).expect(scope), every, "{scope}");
+        }
+        assert!(every.len() > reached.len(), "{every:?}");
         assert!(every.len() > toolkit.len(), "{every:?}");
         assert!(checks_reaching(&["no-such-dir"]).is_err());
         assert_eq!(
-            checks_reaching(&["td-compositor", "no-such-dir"]).expect("reach beside an unread dir"),
+            checks_reaching(&["td-compositor/src/main.rs", "no-such-dir"])
+                .expect("reach beside an unread dir"),
             reached
         );
-        assert!(checks_reaching(&["td-sh/src"]).is_err());
+        for bad in ["td-sh/../x", "/td-sh", "td-sh//x", "./td-sh"] {
+            assert!(checks_reaching(&[bad]).is_err(), "{bad}");
+        }
         assert!(checks_reaching(&[]).is_err());
     }
 

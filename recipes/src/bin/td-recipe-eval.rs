@@ -285,18 +285,18 @@ fn main() {
             println!("{}", lookup_or_die(stem).to_json().to_canonical());
         }
         Some("check-list") => {
-            // `--reaching DIR...` lists only the checks a change under those
-            // directories can reach. A scope nothing reads lists every check
-            // and says so first, as a `# ` line on stdout, which the gate
-            // prints and a reader of the list skips: narrowing on a miss is
-            // the failure that hides, listing everything the one that only
-            // costs time, and the gate keeps the evaluator's stderr only on
-            // failure.
+            // `--reaching ENTRY...` lists only the checks a change to those
+            // top-level directories or paths can reach. A scope nothing
+            // reads lists every check and says so first, as a `# ` line on
+            // stdout, which the gate prints and a reader of the list skips:
+            // narrowing on a miss is the failure that hides, listing
+            // everything the one that only costs time, and the gate keeps
+            // the evaluator's stderr only on failure.
             let reach = match args.get(2).map(String::as_str) {
                 None => None,
                 Some("--reaching") => {
-                    let dirs: Vec<&str> = args.iter().skip(3).map(String::as_str).collect();
-                    match check_runner::checks_reaching(&dirs) {
+                    let scope: Vec<&str> = args.iter().skip(3).map(String::as_str).collect();
+                    match check_runner::checks_reaching(&scope) {
                         Ok(set) => Some(set),
                         Err(e) => {
                             println!("# scope miss: {e}; listing every check");
@@ -306,7 +306,7 @@ fn main() {
                 }
                 Some(other) => die(&format!(
                     "check-list: unexpected argument `{other}` (usage: check-list \
-                     [--reaching DIR...])"
+                     [--reaching DIR|PATH...])"
                 )),
             };
             for (stem, r) in catalog::all() {

@@ -46,13 +46,14 @@ fn fatal(msg: &str) -> String {
 /// Defined in td-engine so td-recipe-eval speaks the identical contract.
 pub use td_engine::exit::EXIT_UNPROVISIONED;
 
-/// The crates a change is confined to, space-separated, set by
+/// The changed paths of a change confined to roster crates, or those crates
+/// where the paths cannot travel, space-separated, set by
 /// `affected-checks --run` on the `td-builder check` it spawns and forwarded
 /// into the gate sandbox: the recipe-checks gate runs only the checks a
-/// change under them can reach. `TD_CHECK_FULL` overrides it.
+/// change to them can reach. `TD_CHECK_FULL` overrides it.
 pub const CHECK_SCOPE_ENV: &str = "TD_CHECK_SCOPE";
 
-/// The recipe-checks scope: the space-separated directory names in
+/// The recipe-checks scope: the space-separated paths or directory names in
 /// `TD_CHECK_SCOPE`, unless `TD_CHECK_FULL` is set or the value is empty,
 /// which both mean every check. Read here by the loop for the journal key
 /// and by the gate for its list, through this one function.
@@ -1502,8 +1503,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // TD_CHECK_FULL is forwarded as well: inside the sandbox it is what makes
     // a recipe check run in full rather than answer from its verdict memo
     // (check_runner.rs), the same knob that ignores --resume below. So is
-    // TD_CHECK_SCOPE, the crates a change is confined to, which the
-    // recipe-checks gate narrows its list by (gate_bodies.rs).
+    // TD_CHECK_SCOPE, the paths (or crates) a change is confined to, which
+    // the recipe-checks gate narrows its list by (gate_bodies.rs).
     for k in ["TD_CHECK_DISABLE", "TD_CHECK_FULL", CHECK_SCOPE_ENV] {
         if let Ok(v) = std::env::var(k) {
             child_envs.push((k.to_string(), v));

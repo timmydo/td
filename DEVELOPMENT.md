@@ -204,12 +204,17 @@ alone selects no checks; the profiler design is the exception and retains
 its runtime-contract checks.
 
 When every changed path lies under `td-*` crates, `ready` also scopes the
-recipe-checks gate: the changed crates travel to the gate in
+recipe-checks gate: the changed paths travel to the gate in
 `TD_CHECK_SCOPE`, and the gate runs only the checks whose closure builds a
-recipe that embeds or stages one of them, naming the checks it did not run.
-That can be none: a crate some recipe embeds or stages but no recipe
+recipe that embeds or stages their crates, naming the checks it did not
+run. That can be none: a crate some recipe embeds or stages but no recipe
 check's closure builds passes the gate with every check named as
-unreached. The crates that read a changed crate are not added: a recipe
+unreached. The few crate files the recipes crate's shared modules compile
+in (`catalog::shared_embeds`, such as td-boot's protocol and
+td-compositor's timezone rules) reach every check, and only those files
+do: the rest of their crates reach what stages them. A path with
+whitespace, or a diff too large for one variable, sends its crates
+instead. The crates that read a changed crate are not added: a recipe
 can build a reader only by staging what it reads, so the evaluator's own
 closure walk already reaches its checks, while the cargo narrowing's
 readers also include test-only and prose readers, and readers no recipe

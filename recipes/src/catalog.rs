@@ -24,17 +24,25 @@ pub fn all() -> Vec<(&'static str, Recipe)> {
     registry::all()
 }
 
-/// The `td-*` directories recipe `stem` may read: the crate sources its own
-/// file embeds, and those the crate's shared modules embed, which any recipe
-/// may use. A change under one of them can change what the recipe builds;
-/// no other change to a crate can, short of the evaluator itself. Read from
-/// the sources at build time by `build.rs`, so it is the table of the binary
-/// that answers. Empty for an unknown stem.
+/// The `td-*` directories recipe `stem`'s own file names, which is how it
+/// embeds crate sources. A change under one of them can change what the
+/// recipe builds; so can a change to one of `shared_embeds`, which every
+/// recipe reads, and no other change to a crate can, short of the evaluator
+/// itself. Read from the sources at build time by `build.rs`, so it is the
+/// table of the binary that answers. Empty for an unknown stem.
 pub fn named_dirs(stem: &str) -> &'static [&'static str] {
     registry::named_dirs()
         .iter()
         .find(|(s, _)| *s == stem)
         .map_or(&[][..], |(_, dirs)| dirs)
+}
+
+/// What this crate's shared modules compile in from `td-*` crates outside
+/// their tests, which any recipe may use: repository-relative files, or a
+/// whole crate directory where an embedded file reads further files of its
+/// own. Sorted.
+pub fn shared_embeds() -> &'static [&'static str] {
+    registry::shared_embeds()
 }
 
 /// The outline face's recipe, whose install plan `install-fonts-plan`
@@ -607,10 +615,12 @@ mod tests {
 mod named_dirs_tests {
     use super::*;
 
-    /// Recipe spellings and shared-module embeds both participate in the
-    /// conservative reader map. Portal's local-source siblings do not create
-    /// embed edges, but the shared native timezone reader now embeds the
-    /// compositor in every recipe, like the bus policy and boot protocol.
+    /// A recipe's own spellings make its directories; portal's local-source
+    /// siblings do not create embed edges. What the shared modules compile
+    /// in is kept apart, by file, and leaves out the test-only mounts of
+    /// td-busd's app policy and td-authd's primary account: those are in no
+    /// evaluator binary. Paths are assembled here, since this file is under
+    /// the build script's own scan.
     #[test]
     fn named_dirs_carry_the_embeds_the_recipes_spell() {
         let portal = named_dirs("td-portal");
@@ -621,20 +631,26 @@ mod named_dirs_tests {
             !portal.contains(&"td-secret"),
             "local-source sibling is not an embed"
         );
-        assert!(
-            portal.contains(&"td-compositor"),
-            "shared timezone reader: {portal:?}"
-        );
-        assert!(
-            named_dirs("td-sh").contains(&"td-busd"),
-            "lib.rs embeds td-busd everywhere"
-        );
         assert!(named_dirs("td-sh").contains(&"td-sh"));
-        assert!(named_dirs("td-sh").contains(&"td-compositor"));
+        let file = |dir: &str, rest: &str| [dir, "/", rest].concat();
+        assert_eq!(
+            shared_embeds(),
+            [
+                file("td-boot", "src/protocol.rs"),
+                file("td-boot", "src/realfile.rs"),
+                file("td-compositor", "src/timezone.rs"),
+                file("td-install-qemu-test", "src/protocol.rs"),
+                file("td-install", "src/timezones.rs"),
+                file("td-profiler", "src/contract.rs"),
+                file("td-update", "src/upstream.rs"),
+            ],
+            "the shared modules' production embeds, by file"
+        );
+        assert!(shared_embeds()
+            .iter()
+            .all(|e| !e.starts_with("td-busd") && !e.starts_with("td-authd")));
         for (stem, _) in all() {
             let dirs = named_dirs(stem);
-            assert!(dirs.contains(&"td-boot"), "{stem}: {dirs:?}");
-            assert!(dirs.contains(&"td-profiler"), "{stem}: {dirs:?}");
             assert!(
                 dirs.iter().zip(dirs.iter().skip(1)).all(|(a, b)| a < b),
                 "{stem}: {dirs:?}"
