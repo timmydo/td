@@ -49,7 +49,7 @@ impl HeaderBudget {
     pub const fn steps_remaining(&self) -> u64 {
         self.steps
     }
-    fn charge(
+    pub(crate) fn charge(
         &mut self,
         work: &mut Meter,
         now: Tick,

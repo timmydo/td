@@ -3184,6 +3184,94 @@ fn header_selection() {
     assert_eq!(before, after, "header occurrence traversal allocated");
 }
 
+fn header_selection_budget() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property,
+        header_select::{Cursor, Error, SourceEnd, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let name = "x".repeat(4096);
+    let key = format!("header:{name}:all");
+    let source = format!("{name}: one\n{name}: two\n\n");
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 4_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut property = header_property::Cursor::new(&key, header_property::Context::Email);
+    let mut selected = None;
+    for _ in 0..1000 {
+        if let header_property::Status::Complete(value) = property.poll(Tick(1), &mut work).unwrap()
+        {
+            selected = value;
+            break;
+        }
+    }
+    let selected = selected.unwrap();
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    let mut refused = false;
+    let mut completions = 0;
+    for _ in 0..2000 {
+        let mut cursor = Cursor::new(
+            black_box(source.as_bytes()),
+            0,
+            source.len() as u64,
+            selected,
+            SourceEnd::Prefix,
+        );
+        let mut count = 0;
+        let mut complete = false;
+        for _ in 0..10_000 {
+            match cursor.poll_with_budget(Tick(1), &mut work, &mut budget) {
+                Ok(Status::Match(_)) => count += 1,
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete(_)) => {
+                    assert_eq!(count, 2);
+                    complete = true;
+                    completions += 1;
+                    break;
+                }
+                Err(Error::InterpretationLimit) => {
+                    let remaining = work.remaining();
+                    assert_eq!(
+                        cursor.poll_with_budget(Tick(1), &mut work, &mut budget),
+                        Err(Error::InterpretationLimit)
+                    );
+                    assert_eq!(work.remaining(), remaining);
+                    refused = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected selection refusal: {error}"),
+            }
+        }
+        assert!(complete || refused);
+        if refused {
+            break;
+        }
+    }
+    assert!(refused && completions > 0);
+    let mut next = Cursor::new(
+        source.as_bytes(),
+        0,
+        source.len() as u64,
+        selected,
+        SourceEnd::Prefix,
+    );
+    assert_eq!(
+        next.poll_with_budget(Tick(1), &mut work, &mut budget),
+        Err(Error::InterpretationLimit)
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "aggregate header traversal allocated");
+}
+
 fn header_properties() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4101,6 +4189,7 @@ fn main() {
         header_dates();
         header_comments();
         header_selection();
+        header_selection_budget();
         header_properties();
         header_nfc();
         phrase_nfc();
@@ -4221,6 +4310,7 @@ fn main() {
     header_dates();
     header_comments();
     header_selection();
+    header_selection_budget();
     header_properties();
     header_nfc();
     phrase_nfc();

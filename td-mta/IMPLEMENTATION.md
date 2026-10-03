@@ -1508,6 +1508,13 @@ Initial independently landable increments:
   Preserve bounds, exact charges, fragmentation and failure behavior. NFC
   workspace ownership and complete field publication remain separate.
 
+- **M06ar — aggregate header selection:** thread typed live email budget
+  charging through raw scanning and field-name comparison. Precharge actual
+  visits and bounded transitions, retain private step credit, and preserve
+  ordinary job-only entry points. Cover exact charges, long fields, refusal
+  before child work, repeated projections and allocation-free aggregate
+  exhaustion. Remaining form grammar/conversion and publication stay open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

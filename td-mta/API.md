@@ -2278,6 +2278,57 @@ and inert cached completion. Existing allocation intervals cover the
 delegating public paths. This is framing reuse, not a complete field
 coordinator or worker qualification.
 
+### 1.50 Aggregate header selection admission
+
+M06ar adds `header_select::Cursor::poll_with_budget` with one live job meter
+and the existing email `nfc::HeaderBudget`. An admitted owner uses this entry
+point from the first poll and never interleaves ordinary `poll`, replaces its
+meter or renews the email budget. A mode latch rejects interleaving with
+`InvalidState`; stable meter/budget identity remains the owner's obligation.
+Share the same budget across field selection, repeated requested properties
+and subsequent normalized projections. Request property-key parsing remains
+job-metered separately; it does not inspect mail. The existing plain
+selector/scanner APIs retain their job charging for callers that have not yet
+composed aggregate admission.
+
+A private scan work adapter propagates typed budget refusal through the raw
+scanner and selector. Before each scanner byte lookup, charge one step and one
+visit if a byte is present. Repeated lookahead charges again. EOF/NeedInput
+transitions cost a step without a byte; field emission costs another step.
+Field-name comparisons visit both operands in chunks of at most 32 pairs and
+charge one step per pair before comparing every pair, including after a
+mismatch. Length-only rejection and each final Match/Complete event cost one
+step. Name comparisons also debit the request-side operand as bounded work.
+Body bytes beyond the scanner's required boundary lookahead are not visited.
+
+The aggregate budget debits those exact visits and steps. Its existing 16-step
+job-record precharge is retained: private non-copyable selector credit starts
+at zero, survives yields and is never refunded or restored by replay. Field
+events are included in step accounting. Aggregate scanning admits at most 255
+lookups per turn, reserving one step for emission to retain the 256-step
+fairness ceiling. Ordinary scanning retains its 256 lookups. Ordinary non-
+aggregate callers retain their original per-event job records; aggregate calls
+use the step precharge instead. At most 255 source visits, 256 steps and 16
+job records are charged per selector poll. Output bytes and unlink counters
+are untouched. The selector still fits 384 bytes and its scanner 128 bytes; no
+buffer, heap allocation or new worker reservation is introduced.
+
+An aggregate refusal returns `InterpretationLimit` and retires that budget for
+later selections and NFC cursors. Job refusal remains `Work(Stop)`; invalid
+private accounting is `InvalidState`. Refused charges change no remaining
+counters and no corresponding source/comparison state. Earlier successful work
+in the same turn stays charged; all prior matches remain provisional and must
+be discarded. The selector latches failures even if a caller later supplies a
+different meter. Cached completion is inert; its owner still performs the
+existing final clock/cancellation checks before publication.
+
+Tests pin exact small-field accounting, long-field turn bounds, legacy parity,
+scanner/comparison precharge refusal, repeated-property exhaustion and refusal
+shared with normalization. The allocation probe repeats long field names until
+the real aggregate cap refuses. Other form grammar/conversion stages still
+need aggregate integration; this increment does not enable JMAP publication or
+claim complete worker memory qualification.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -1,8 +1,10 @@
 //! Resident header traversal with bounded case-insensitive field matching.
 use crate::{
-    admission::work::{Charge, Meter, Stop},
+    admission::work::{Meter, Stop},
     header_property::{Occurrence, Property},
+    header_work::{Aggregate, Charge, Work},
     mime_headers::{self, End, Field, Scanner},
+    nfc::HeaderBudget,
     ports::Tick,
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +24,7 @@ pub enum Error {
     Truncated,
     Headers(mime_headers::Error),
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl std::fmt::Display for Error {
@@ -30,6 +33,7 @@ impl std::fmt::Display for Error {
             Self::Truncated => f.write_str("incomplete resident headers"),
             Self::Headers(error) => write!(f, "header selection: {error}"),
             Self::Work(error) => write!(f, "header selection work: {error}"),
+            Self::InterpretationLimit => f.write_str("header selection interpretation limit"),
             Self::InvalidState => f.write_str("invalid header selection state"),
         }
     }
@@ -40,13 +44,29 @@ impl From<Stop> for Error {
         Self::Work(error)
     }
 }
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            crate::decode_work::Error::InterpretationLimit => Self::InterpretationLimit,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 impl From<mime_headers::Error> for Error {
     fn from(error: mime_headers::Error) -> Self {
         match error {
             mime_headers::Error::Work(stop) => Self::Work(stop),
+            mime_headers::Error::InterpretationLimit => Self::InterpretationLimit,
+            mime_headers::Error::InvalidState => Self::InvalidState,
             other => Self::Headers(other),
         }
     }
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Mode {
+    Job,
+    Aggregate,
 }
 /// Source must include the complete header section and its separator, or actual EOF.
 /// It may include body lookahead; the scanner stops at the header/body boundary.
@@ -63,6 +83,8 @@ pub struct Cursor<'a> {
     end: Option<End>,
     complete: bool,
     failure: Option<Error>,
+    credit: u8,
+    mode: Option<Mode>,
 }
 impl<'a> Cursor<'a> {
     pub const fn new(
@@ -85,9 +107,40 @@ impl<'a> Cursor<'a> {
             end: None,
             complete: false,
             failure: None,
+            credit: 0,
+            mode: None,
         }
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.bind_mode(Mode::Job)?;
+        self.poll_with_work(now, work)
+    }
+    /// Use from the first poll, without interleaving plain `poll` calls.
+    /// Retain the same live job meter and email budget across every projection.
+    pub fn poll_with_budget(
+        &mut self,
+        now: Tick,
+        work: &mut Meter,
+        budget: &mut HeaderBudget,
+    ) -> Result<Status, Error> {
+        self.bind_mode(Mode::Aggregate)?;
+        let mut credit = self.credit;
+        let result = self.poll_with_work(now, &mut Aggregate::new(work, budget, &mut credit));
+        self.credit = credit;
+        result
+    }
+    fn bind_mode(&mut self, mode: Mode) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.mode.is_some_and(|previous| previous != mode) {
+            self.failure = Some(Error::InvalidState);
+            return Err(Error::InvalidState);
+        }
+        self.mode = Some(mode);
+        Ok(())
+    }
+    fn poll_with_work(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -100,11 +153,12 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         if let Some(end) = self.end {
             work.charge(
                 now,
                 Charge {
+                    steps: 1,
                     records: 1,
                     ..Charge::default()
                 },
@@ -122,9 +176,9 @@ impl<'a> Cursor<'a> {
             .source
             .get(self.consumed..)
             .ok_or(Error::InvalidState)?;
-        let progress = self
-            .scanner
-            .poll(input, self.source_end == SourceEnd::Eof, now, work)?;
+        let progress =
+            self.scanner
+                .poll_with_work(input, self.source_end == SourceEnd::Eof, now, work)?;
         self.consumed = self
             .consumed
             .checked_add(progress.consumed)
@@ -142,7 +196,7 @@ impl<'a> Cursor<'a> {
         }
         Ok(Status::Yield)
     }
-    fn compare(&mut self, field: Field, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn compare(&mut self, field: Field, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         let start = usize::try_from(
             field
                 .name_start
@@ -163,6 +217,7 @@ impl<'a> Cursor<'a> {
             work.charge(
                 now,
                 Charge {
+                    steps: 1,
                     records: 1,
                     ..Charge::default()
                 },
@@ -178,9 +233,9 @@ impl<'a> Cursor<'a> {
         work.charge(
             now,
             Charge {
-                io_bytes: (count as u64) * 2,
+                visits: (count as u64) * 2,
+                steps: (count as u64).max(1),
                 records: 1,
-                ..Charge::default()
             },
         )?;
         let end = self
@@ -189,7 +244,11 @@ impl<'a> Cursor<'a> {
             .ok_or(Error::InvalidState)?;
         let left = name.get(self.compared..end).ok_or(Error::InvalidState)?;
         let right = wanted.get(self.compared..end).ok_or(Error::InvalidState)?;
-        if !left.eq_ignore_ascii_case(right) {
+        let mut matches = true;
+        for (left, right) in left.iter().zip(right) {
+            matches &= left.eq_ignore_ascii_case(right);
+        }
+        if !matches {
             self.candidate = None;
             return Ok(Status::Yield);
         }
@@ -210,7 +269,7 @@ impl<'a> Cursor<'a> {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::{header_property, ports::Deadline};
+    use crate::{admission::work::Charge, header_property, ports::Deadline};
     fn work() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
@@ -262,6 +321,329 @@ mod tests {
             }
         }
         panic!("selection did not finish");
+    }
+    fn budget_with(bytes: u64, steps: u64) -> HeaderBudget {
+        let mut budget = HeaderBudget::new();
+        let mut setup = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: u64::MAX,
+                records: u64::MAX,
+                ..Charge::default()
+            },
+        );
+        let mut credit = 0;
+        budget
+            .charge(
+                &mut setup,
+                Tick(1),
+                budget.source_bytes_remaining() - bytes,
+                budget.steps_remaining() - steps,
+                &mut credit,
+            )
+            .unwrap();
+        budget
+    }
+    #[test]
+    fn aggregate_and_plain_selection_keep_their_distinct_record_accounting() {
+        for (key, steps, records) in [("header:X:all", 9, 3), ("header:X", 10, 4)] {
+            let mut cursor = Cursor::new(b"X:a\n\n", 0, 100, property(key), SourceEnd::Eof);
+            assert!(std::mem::size_of_val(&cursor) <= 384);
+            let mut work = work();
+            let before = work.remaining();
+            let mut budget = budget_with(8, steps);
+            let mut found = 0;
+            let mut complete = None;
+            for _ in 0..100 {
+                match cursor
+                    .poll_with_budget(Tick(1), &mut work, &mut budget)
+                    .unwrap()
+                {
+                    Status::Match(field) => {
+                        assert_eq!((field.value_start, field.value_end), (2, 3));
+                        found += 1;
+                    }
+                    Status::Yield => {}
+                    Status::Complete(end) => {
+                        complete = Some(end);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(found, 1);
+            let end = complete.unwrap();
+            assert_eq!(budget.source_bytes_remaining(), 0);
+            assert_eq!(budget.steps_remaining(), 0);
+            assert_eq!(before.io_bytes - work.remaining().io_bytes, 8);
+            assert_eq!(before.records - work.remaining().records, 1);
+            let after = work.remaining();
+            assert_eq!(
+                cursor.poll_with_budget(Tick(100), &mut work, &mut budget),
+                Ok(Status::Complete(end))
+            );
+            assert_eq!(work.remaining(), after);
+            let mut legacy = Cursor::new(b"X:a\n\n", 0, 100, property(key), SourceEnd::Eof);
+            let mut legacy_work = self::work();
+            for _ in 0..100 {
+                if matches!(
+                    legacy.poll(Tick(1), &mut legacy_work).unwrap(),
+                    Status::Complete(_)
+                ) {
+                    break;
+                }
+            }
+            assert!(legacy.complete);
+            assert_eq!(before.io_bytes - legacy_work.remaining().io_bytes, 8);
+            assert_eq!(before.records - legacy_work.remaining().records, records);
+        }
+    }
+    #[test]
+    fn aggregate_refusals_precede_scanning_comparison_and_cross_projection_work() {
+        for (bytes, steps, scanned) in [
+            (0, 100, false),
+            (100, 0, false),
+            (6, 100, true),
+            (100, 6, true),
+        ] {
+            let mut budget = budget_with(bytes, steps);
+            let mut work = work();
+            let mut cursor =
+                Cursor::new(b"X:a\n\n", 0, 100, property("header:X:all"), SourceEnd::Eof);
+            if scanned {
+                assert_eq!(
+                    cursor.poll_with_budget(Tick(1), &mut work, &mut budget),
+                    Ok(Status::Yield)
+                );
+                assert!(cursor.candidate.is_some());
+            }
+            let before = work.remaining();
+            let remaining = (budget.source_bytes_remaining(), budget.steps_remaining());
+            let consumed = cursor.consumed;
+            let error = Error::InterpretationLimit;
+            assert_eq!(
+                cursor.poll_with_budget(Tick(1), &mut work, &mut budget),
+                Err(error)
+            );
+            assert_eq!(cursor.consumed, consumed);
+            assert_eq!(cursor.compared, 0);
+            assert_eq!(work.remaining(), before);
+            assert_eq!(
+                (budget.source_bytes_remaining(), budget.steps_remaining()),
+                remaining
+            );
+            assert_eq!(cursor.poll(Tick(1), &mut self::work()), Err(error));
+            let mut next =
+                Cursor::new(b"X:b\n\n", 0, 100, property("header:X:all"), SourceEnd::Eof);
+            assert_eq!(
+                next.poll_with_budget(Tick(1), &mut work, &mut budget),
+                Err(error)
+            );
+            let mut scratch = crate::nfc::Scratch::new();
+            let mut nfc = crate::nfc::Cursor::new("a", &mut scratch, &mut work, &mut budget);
+            assert_eq!(
+                nfc.poll(Tick(1)),
+                Err(crate::nfc::Error::InterpretationLimit)
+            );
+            assert_eq!(work.remaining(), before);
+        }
+        let mut budget = budget_with(8, 9);
+        let mut work = work();
+        for attempt in 0..2 {
+            let mut cursor =
+                Cursor::new(b"X:a\n\n", 0, 100, property("header:X:all"), SourceEnd::Eof);
+            let mut ended = false;
+            for _ in 0..100 {
+                match cursor.poll_with_budget(Tick(1), &mut work, &mut budget) {
+                    Ok(Status::Complete(_)) => {
+                        assert_eq!(attempt, 0);
+                        ended = true;
+                        break;
+                    }
+                    Err(Error::InterpretationLimit) => {
+                        assert_eq!(attempt, 1);
+                        ended = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("unexpected {error}"),
+                }
+            }
+            assert!(ended);
+        }
+    }
+    #[test]
+    fn aggregate_long_values_remain_bounded_and_job_refusals_are_distinct() {
+        let mut source = b"X:".to_vec();
+        source.extend(std::iter::repeat_n(b'a', 1024 * 1024));
+        source.extend_from_slice(b"\n\n");
+        let mut budget = HeaderBudget::new();
+        let mut work = work();
+        let before = work.remaining();
+        let initial = (budget.source_bytes_remaining(), budget.steps_remaining());
+        let mut cursor = Cursor::new(
+            &source,
+            0,
+            source.len() as u64,
+            property("header:X:all"),
+            SourceEnd::Eof,
+        );
+        let mut completed = false;
+        for _ in 0..10_000 {
+            let b = work.remaining();
+            let steps = budget.steps_remaining();
+            let status = cursor
+                .poll_with_budget(Tick(1), &mut work, &mut budget)
+                .unwrap();
+            assert!(b.io_bytes - work.remaining().io_bytes <= 256);
+            assert!(b.records - work.remaining().records <= 16);
+            assert!(steps - budget.steps_remaining() <= 256);
+            if matches!(status, Status::Complete(_)) {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        let visits = source.len() as u64 + 3;
+        let steps = source.len() as u64 + 4;
+        assert_eq!(initial.0 - budget.source_bytes_remaining(), visits);
+        assert_eq!(initial.1 - budget.steps_remaining(), steps);
+        assert_eq!(before.io_bytes - work.remaining().io_bytes, visits);
+        assert_eq!(
+            before.records - work.remaining().records,
+            steps.div_ceil(16)
+        );
+        for (io_bytes, records, now, stop) in [
+            (0, 100, Tick(1), Stop::IoBytes),
+            (100, 0, Tick(1), Stop::Records),
+            (100, 100, Tick(100), Stop::Deadline),
+        ] {
+            let mut limited = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes,
+                    records,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let initial = (budget.source_bytes_remaining(), budget.steps_remaining());
+            let mut cursor = Cursor::new(b"X:a", 0, 100, property("header:X:all"), SourceEnd::Eof);
+            assert_eq!(
+                cursor.poll_with_budget(now, &mut limited, &mut budget),
+                Err(Error::Work(stop))
+            );
+            assert_eq!(cursor.consumed, 0);
+            assert_eq!(
+                (budget.source_bytes_remaining(), budget.steps_remaining()),
+                initial
+            );
+            assert_eq!(
+                cursor.poll_with_budget(Tick(1), &mut self::work(), &mut HeaderBudget::new()),
+                Err(Error::Work(stop))
+            );
+        }
+    }
+    #[test]
+    fn comparison_chunks_charge_every_pair_and_reset_between_candidates() {
+        let name = "x".repeat(40);
+        let key = format!("header:{name}:all");
+        let source = format!(
+            "{}{}: a\n{}{}: b\nshort: c\n{name}: d\n\n",
+            "x".repeat(32),
+            "y".repeat(8),
+            "y".repeat(32),
+            "x".repeat(8)
+        );
+        let mut cursor = Cursor::new(source.as_bytes(), 0, 1000, property(&key), SourceEnd::Eof);
+        let mut budget = HeaderBudget::new();
+        let mut work = work();
+        let mut comparisons = Vec::new();
+        let mut matches = 0;
+        let mut complete = false;
+        for _ in 0..100 {
+            let candidate = cursor.candidate;
+            let compared = cursor.compared;
+            let before = (budget.source_bytes_remaining(), budget.steps_remaining());
+            let status = cursor
+                .poll_with_budget(Tick(1), &mut work, &mut budget)
+                .unwrap();
+            if candidate.is_some() {
+                comparisons.push((
+                    compared,
+                    before.0 - budget.source_bytes_remaining(),
+                    before.1 - budget.steps_remaining(),
+                ));
+            } else if cursor.candidate.is_some() {
+                assert_eq!(cursor.compared, 0);
+            }
+            match status {
+                Status::Match(field) => {
+                    matches += 1;
+                    assert_eq!(
+                        &source.as_bytes()[field.value_start as usize..field.value_end as usize],
+                        b" d"
+                    );
+                }
+                Status::Complete(_) => {
+                    complete = true;
+                    break;
+                }
+                Status::Yield => {}
+            }
+        }
+        assert!(complete);
+        assert_eq!(matches, 1);
+        assert_eq!(
+            comparisons,
+            [
+                (0, 64, 32),
+                (32, 16, 8),
+                (0, 64, 32),
+                (0, 0, 1),
+                (0, 64, 32),
+                (32, 16, 8)
+            ]
+        );
+    }
+    #[test]
+    fn switching_admission_modes_retires_without_debiting_either_budget() {
+        for aggregate_first in [false, true] {
+            let mut cursor =
+                Cursor::new(b"X:a\n\n", 0, 100, property("header:X:all"), SourceEnd::Eof);
+            let mut budget = HeaderBudget::new();
+            let mut work = work();
+            if aggregate_first {
+                cursor
+                    .poll_with_budget(Tick(1), &mut work, &mut budget)
+                    .unwrap();
+            } else {
+                cursor.poll(Tick(1), &mut work).unwrap();
+            }
+            let before = (
+                work.remaining(),
+                budget.steps_remaining(),
+                budget.source_bytes_remaining(),
+            );
+            let result = if aggregate_first {
+                cursor.poll(Tick(1), &mut work)
+            } else {
+                cursor.poll_with_budget(Tick(1), &mut work, &mut budget)
+            };
+            assert_eq!(result, Err(Error::InvalidState));
+            assert_eq!(cursor.poll(Tick(1), &mut work), Err(Error::InvalidState));
+            assert_eq!(
+                cursor.poll_with_budget(Tick(1), &mut work, &mut budget),
+                Err(Error::InvalidState)
+            );
+            assert_eq!(
+                (
+                    work.remaining(),
+                    budget.steps_remaining(),
+                    budget.source_bytes_remaining()
+                ),
+                before
+            );
+        }
     }
     #[test]
     fn occurrences_preserve_wire_order_offsets_and_raw_values() {

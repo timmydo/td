@@ -811,6 +811,16 @@ match list is allocated. All matches stream provisionally; last selection
 retains one extent. Isolated allocation intervals cover last/all, absence
 and long matching names. Complete capture and worker stack remain open.
 
+Aggregate header selection (M06ar) reuses the 384-byte selector and 128-byte
+scanner ceilings, with one private byte of prepaid step credit and a temporary
+borrow of the existing email budget and job meter. It allocates no backing.
+Each turn charges at most 255 source visits, 256 aggregate steps and 16 job
+records. Repeated lookahead and both name-comparison operands count; transitions
+without input still charge steps. Credit is never copied into checkpoints or
+refunded. The allocation probe covers repeated long-name selection through
+aggregate refusal. Other interpretation stages still need shared-budget
+composition.
+
 The structured CFWS cursor fits 64 bytes in the body job's 16 KiB
 parser/boundary/locator state. A depth counter enforces the 32-level comment
 nesting limit; no recursive stack or comment collection is allocated.

@@ -1,6 +1,7 @@
 //! Bounded raw header extents; no value normalization or source ownership.
 use crate::{
-    admission::work::{Charge, Meter, Stop},
+    admission::work::{Meter, Stop},
+    header_work::{Charge, Work},
     ports::Tick,
 };
 
@@ -35,6 +36,8 @@ pub enum Error {
     HeaderLimit,
     Offset,
     Work(Stop),
+    InterpretationLimit,
+    InvalidState,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,10 +45,21 @@ impl std::fmt::Display for Error {
             Self::HeaderLimit => "header byte limit exceeded",
             Self::Offset => "header source offset overflow",
             Self::Work(_) => "header work budget exhausted",
+            Self::InterpretationLimit => "header interpretation limit",
+            Self::InvalidState => "invalid header scanner state",
         })
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            crate::decode_work::Error::InterpretationLimit => Self::InterpretationLimit,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum State {
     Line,
@@ -113,16 +127,15 @@ impl Scanner {
         self.complete = Some(end);
         Status::Complete(end)
     }
-    fn emit(&mut self, now: Tick, meter: &mut Meter) -> Result<Status, Error> {
-        meter
-            .charge(
-                now,
-                Charge {
-                    records: 1,
-                    ..Charge::default()
-                },
-            )
-            .map_err(Error::Work)?;
+    fn emit(&mut self, now: Tick, meter: &mut impl Work) -> Result<Status, Error> {
+        meter.charge(
+            now,
+            Charge {
+                steps: 1,
+                records: 1,
+                ..Charge::default()
+            },
+        )?;
         self.active = false;
         Ok(Status::Field(self.field))
     }
@@ -134,6 +147,15 @@ impl Scanner {
         last: bool,
         now: Tick,
         meter: &mut Meter,
+    ) -> Result<Progress, Error> {
+        self.poll_with_work(input, last, now, meter)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        input: &[u8],
+        last: bool,
+        now: Tick,
+        meter: &mut impl Work,
     ) -> Result<Progress, Error> {
         if let Some(error) = self.failure {
             return Err(error);
@@ -155,27 +177,32 @@ impl Scanner {
         input: &[u8],
         last: bool,
         now: Tick,
-        meter: &mut Meter,
+        meter: &mut impl Work,
     ) -> Result<Progress, Error> {
         let mut consumed = 0;
         if self.eof {
-            meter.charge(now, Charge::default()).map_err(Error::Work)?;
+            meter.charge(
+                now,
+                Charge {
+                    steps: 1,
+                    ..Charge::default()
+                },
+            )?;
             return Ok(Progress {
                 consumed,
                 status: self.end(self.position),
             });
         }
-        for _ in 0..STEP_TRANSITIONS {
+        for _ in 0..meter.scan_limit() {
+            meter.charge(
+                now,
+                Charge {
+                    visits: u64::from(consumed < input.len()),
+                    steps: 1,
+                    ..Charge::default()
+                },
+            )?;
             let byte = input.get(consumed).copied();
-            meter
-                .charge(
-                    now,
-                    Charge {
-                        io_bytes: u64::from(byte.is_some()),
-                        ..Charge::default()
-                    },
-                )
-                .map_err(Error::Work)?;
             let Some(byte) = byte else {
                 if last {
                     self.eof = true;
@@ -303,7 +330,7 @@ fn ftext(byte: u8) -> bool {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::ports::Deadline;
+    use crate::{admission::work::Charge, ports::Deadline};
     fn meter() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
@@ -347,6 +374,71 @@ mod tests {
             }
         }
         panic!("scanner did not finish");
+    }
+    #[test]
+    fn aggregate_refuses_before_scanner_state_changes_and_reserves_emission() {
+        use crate::{header_work::Aggregate, nfc::HeaderBudget};
+        for (bytes, steps) in [(0, 100), (100, 0)] {
+            let mut budget = HeaderBudget::new();
+            let mut setup = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: u64::MAX,
+                    records: u64::MAX,
+                    ..Charge::default()
+                },
+            );
+            budget
+                .charge(
+                    &mut setup,
+                    Tick(1),
+                    budget.source_bytes_remaining() - bytes,
+                    budget.steps_remaining() - steps,
+                    &mut 0,
+                )
+                .unwrap();
+            let mut scanner = Scanner::new(0, 100);
+            let mut work = meter();
+            let before = work.remaining();
+            let mut credit = 0;
+            assert_eq!(
+                scanner.poll_with_work(
+                    b"X:a",
+                    true,
+                    Tick(1),
+                    &mut Aggregate::new(&mut work, &mut budget, &mut credit)
+                ),
+                Err(Error::InterpretationLimit)
+            );
+            assert_eq!(scanner.position, 0);
+            assert_eq!(scanner.header_bytes, 0);
+            assert_eq!(scanner.field.name_end, 0);
+            assert!(scanner.state == State::Line);
+            assert!(!scanner.active);
+            assert_eq!(credit, 0);
+            assert_eq!(work.remaining(), before);
+        }
+        let mut input = b"X:".to_vec();
+        input.extend(std::iter::repeat_n(b'a', 251));
+        input.extend_from_slice(b"\nY:b");
+        let mut scanner = Scanner::new(0, 1000);
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut credit = 0;
+        let steps = budget.steps_remaining();
+        let records = work.remaining().records;
+        let progress = scanner
+            .poll_with_work(
+                &input,
+                true,
+                Tick(1),
+                &mut Aggregate::new(&mut work, &mut budget, &mut credit),
+            )
+            .unwrap();
+        assert!(matches!(progress.status, Status::Field(_)));
+        assert_eq!(progress.consumed, 254);
+        assert_eq!(steps - budget.steps_remaining(), 256);
+        assert_eq!(records - work.remaining().records, 16);
     }
     #[test]
     fn raw_fields_folds_and_body_start_survive_every_split() {
