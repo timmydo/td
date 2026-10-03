@@ -488,11 +488,33 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert_eq!(body["messages.0.role"], "system");
     assert_eq!(body["messages.1.content"], "What is a sparse checkout?");
     // Every request carries the conversation's tools.
-    assert_eq!(body["tool_choice"], "auto");
-    assert_eq!(body["parallel_tool_calls"], "true");
+    assert!(!body.contains_key("tool_choice"));
+    assert!(!body.contains_key("parallel_tool_calls"));
     assert_eq!(body["tools.0.type"], "function");
     assert_eq!(body["tools.0.function.name"], "todo_write");
     assert_eq!(body["tools.5.function.name"], "report");
+    // `require_parameters` routes only to an endpoint that lists every
+    // parameter sent, so each member, but those it does not route on, is
+    // one the model lists; the title's as well.
+    let models = Models::from_provider(&fixture("models.json")).unwrap();
+    for (request, model) in [
+        (turn, "anthropic/claude-sonnet-5.5"),
+        (&requests[1], "anthropic/claude-haiku-4.5"),
+    ] {
+        let model = models.find(model).unwrap();
+        let td_json::Json::Obj(members) = td_json::parse(&request.text()).unwrap() else {
+            panic!("the body is not an object")
+        };
+        for (name, _) in &members {
+            let routed = !["model", "messages", "stream", "provider", "cache_control"]
+                .contains(&name.as_str());
+            assert!(
+                !routed || model.supports(name),
+                "{name} is not among {}'s supported_parameters",
+                model.id
+            );
+        }
+    }
     // The title comes from the title model, quoting the first exchange.
     let title = flat(&requests[1].text());
     assert_eq!(title["model"], "anthropic/claude-haiku-4.5");
@@ -608,6 +630,49 @@ fn the_next_request_replays_the_log_and_the_reasoning_byte_for_byte() {
         )
     );
     assert_eq!(usage(&events), [(2_150_000_000, Basis::Reported)]);
+}
+
+/// A conversation begun when the prefix carried `tool_choice` and
+/// `parallel_tool_calls` takes this program's prefix as an event before
+/// its next request, which carries neither.
+#[test]
+fn a_prefix_with_the_members_once_sent_is_replaced_before_the_next_request() {
+    let h = Harness::new(
+        "old-prefix",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    let (_, mut h) = h.close();
+    let file = h.state.conversation(&h.id).join("prefix");
+    let current = std::fs::read_to_string(&file).unwrap();
+    let old = current.replacen(
+        ",\"messages\":",
+        ",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"messages\":",
+        1,
+    );
+    assert_ne!(old, current);
+    std::fs::write(&file, &old).unwrap();
+    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    h.child = child;
+    h.window = window;
+    assert!(matches!(h.next(), Up::Hello { .. }));
+    h.setup(Client::default());
+    h.say("hello");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let logged = kinds(&events);
+    let prefix = logged.iter().position(|k| *k == "prefix").unwrap();
+    let request = logged.iter().position(|k| *k == "request").unwrap();
+    assert!(prefix < request, "{logged:?}");
+    let body = h.mock.requests()[0].text();
+    let sent = flat(&body);
+    assert!(!sent.contains_key("tool_choice") && !sent.contains_key("parallel_tool_calls"));
+    // The body holds this program's prefix, its `messages` left open.
+    let members = current
+        .strip_prefix('{')
+        .and_then(|t| t.strip_suffix("]}"))
+        .unwrap();
+    assert!(body.contains(members), "{body}");
 }
 
 #[test]
@@ -1278,6 +1343,47 @@ fn a_model_without_tools_is_refused_by_name() {
     assert!(outcome.contains("orchestrator_model"), "{outcome}");
     assert!(!kinds(&events).contains(&"request"));
     assert!(h.mock.requests().is_empty());
+    // `max_tokens` bounds what a request may cost, so it is sent always,
+    // and a model that does not list it is refused the same way.
+    let mut h = Harness::new("no-max-tokens", Role::Conversation, Vec::new());
+    h.setup(Client {
+        model: "example/no-max-tokens".into(),
+        ..Client::default()
+    });
+    h.say("hello");
+    let (events, outcome, _) = h.turn();
+    assert!(
+        outcome.starts_with("example/no-max-tokens takes no max_tokens"),
+        "{outcome}"
+    );
+    assert!(outcome.contains("set `model`"), "{outcome}");
+    assert!(!kinds(&events).contains(&"request"));
+    assert!(h.mock.requests().is_empty());
+    // A title model that does not list it gets no title request.
+    let mut h = Harness::new(
+        "title-no-max-tokens",
+        Role::Conversation,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.setup(Client {
+        title_model: "example/no-max-tokens".into(),
+        ..Client::default()
+    });
+    h.say("hello");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let notice = events.iter().find_map(|e| match &e.kind {
+        Kind::Notice { text } if text.starts_with("no title:") => Some(text.clone()),
+        _ => None,
+    });
+    assert!(
+        notice.as_deref().is_some_and(|n| n
+            .starts_with("no title: example/no-max-tokens takes no max_tokens")
+            && n.contains("set `title_model`")),
+        "{notice:?}"
+    );
+    assert!(!kinds(&events).contains(&"title"));
+    assert_eq!(h.mock.requests().len(), 1, "no title request");
 }
 
 /// A message from another conversation, as the window hands it on.

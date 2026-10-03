@@ -268,8 +268,6 @@ pub fn prefix(role: Role, system: &str) -> String {
         .collect();
     Json::Obj(vec![
         ("tools".into(), Json::Arr(tools)),
-        ("tool_choice".into(), Json::Str("auto".into())),
-        ("parallel_tool_calls".into(), Json::Bool(true)),
         (
             "messages".into(),
             Json::Arr(vec![Json::Obj(vec![
@@ -721,11 +719,11 @@ mod tests {
                 .collect();
             let expected: Vec<&str> = Tool::of(role).iter().map(|t| t.name()).collect();
             assert_eq!(names, expected);
-            assert_eq!(value.get("tool_choice").unwrap().as_str(), Some("auto"));
-            assert_eq!(
-                value.get("parallel_tool_calls").unwrap().as_bool(),
-                Some(true)
-            );
+            // `require_parameters` would route a request carrying either
+            // to no endpoint of a model that does not list it; `auto` is
+            // the default, and parallel calls need no asking.
+            assert!(value.get("tool_choice").is_none());
+            assert!(value.get("parallel_tool_calls").is_none());
             let Json::Obj(members) = &value else {
                 panic!("not an object")
             };

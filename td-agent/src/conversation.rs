@@ -779,11 +779,15 @@ impl Session {
             Ok(model) => model,
             Err(why) => return Ok(Outcome::stop(why)),
         };
-        // Every request carries the tools, and `require_parameters` would
-        // route one to no provider of a model that takes none (§5).
-        if model.as_ref().is_some_and(|m| !m.supports("tools")) {
+        // Every request carries the tools and `max_tokens`, which bounds
+        // what it may cost, and `require_parameters` would route one to no
+        // provider of a model that does not list both (§5).
+        if let Some(missing) = model
+            .as_ref()
+            .and_then(|m| ["tools", "max_tokens"].into_iter().find(|p| !m.supports(p)))
+        {
             return Ok(Outcome::stop(format!(
-                "{name} takes no tools (the provider's models list gives it no `tools` parameter); set `{setting}` to a model that does"
+                "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set `{setting}` to a model that does"
             )));
         }
         let pricing = model.as_ref().and_then(|m| m.pricing);
@@ -1660,6 +1664,16 @@ impl Session {
                 return Ok(());
             }
         };
+        // A title request carries `max_tokens` too (§5).
+        if model.as_ref().is_some_and(|m| !m.supports("max_tokens")) {
+            self.log(Kind::Notice {
+                text: format!(
+                    "no title: {} takes no max_tokens (the provider's models list gives it no `max_tokens` parameter); set `title_model` to a model that does",
+                    client.title_model
+                ),
+            })?;
+            return Ok(());
+        }
         let pricing = model.as_ref().and_then(|m| m.pricing);
         let head = client::title_head(&client, &first, &reply);
         let bytes = head.len() as u64 + 2;

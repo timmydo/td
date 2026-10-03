@@ -807,12 +807,26 @@ classifier's first stage uses OpenRouter's decision endpoint instead
 and the attribution pair `http-referer` and `x-openrouter-title: td-agent`.
 
 **Request.** `model`, `messages`, `tools` (on every request, follow-ups
-included, since OpenRouter requires them), `tool_choice: "auto"`,
-`parallel_tool_calls: true`, `max_tokens`, `reasoning` with an effort from
-configuration, and `provider: {require_parameters: true}` so a request is
-never routed to a provider that would silently drop `tools` or
-`reasoning`. `provider.data_collection` is configuration (§15); the
-shipped default is `deny`.
+included, since OpenRouter requires them), `max_tokens`, `reasoning`
+with an effort from configuration, and `provider: {require_parameters:
+true}` so a request is never routed to a provider that would silently
+drop `tools` or `reasoning`. That routing is why every member a request
+carries, but `model`, `messages`, `stream`, `provider` and
+`cache_control`, which OpenRouter does not route on, must be one the
+model's `supported_parameters` lists: a member no endpoint lists routes
+the request nowhere, and OpenRouter answers 404, "No endpoints found
+that can handle the requested parameters". So `reasoning` is sent only
+to a model that lists it; a conversation's model that does not list
+`tools` or `max_tokens`, which bounds what a request may cost, is
+refused by name before any request, and a title model that does not
+list `max_tokens` is asked for no title, with a notice saying why; and
+nothing optional is sent. There is no
+`parallel_tool_calls`, which few models list (none of Anthropic's,
+OpenAI's or Google's), and no `tool_choice`, which some do not
+(Amazon's Nova, for one) and whose `auto` is the default when `tools`
+are sent. A model that runs calls in parallel does so unasked.
+`provider.data_collection` is configuration (§15); the shipped default
+is `deny`.
 
 **Responses.** `finish_reason` is one of `tool_calls`, `stop`, `length`,
 `content_filter` or `error`. Each `tool_calls[i].function.arguments` is a
@@ -844,8 +858,8 @@ and its workspaces. `GET /api/v1/key` supplies the remaining credit for the
 status row. `GET /api/v1/models` is fetched at startup and cached in the
 state directory. It supplies `context_length`,
 `top_provider.max_completion_tokens`, `pricing`, and
-`supported_parameters`; a model lacking `tools` is refused for a
-workspace or the orchestrator with that reason.
+`supported_parameters`; a model lacking `tools` or `max_tokens` is
+refused for a workspace or the orchestrator with that reason.
 
 **Spending limits.** Cost is known only after a response, so limits are
 enforced by reservation. Before every request (acting, classifier,
@@ -899,8 +913,8 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   prefix's messages come from §6's prefix. `MESSAGES` are the user
   messages and turn replies logged before the request, a reply as
   `{"role":"assistant","content":…,"reasoning_details":…}` with the
-  stored bytes spliced in. With no tools there is no `tools`,
-  `tool_choice` or `parallel_tool_calls` yet, and the refusal of a model
+  stored bytes spliced in. With no tools there is no `tools` yet, and
+  the refusal of a model
   lacking `tools` waits for the first tools (§18 increment 8).
   `reasoning` is left out for a model whose cached `supported_parameters`
   lacks it, since `require_parameters` would otherwise route it nowhere.
@@ -1060,14 +1074,16 @@ now the td-fetch-client crate.
 
 **As built (increment 8).** Every request carries the conversation's
 tools. They live in the prefix (§6, §13), which is now a JSON object
-`{"tools":[…],"tool_choice":"auto","parallel_tool_calls":true,"messages":[{system}]}`,
+`{"tools":[…],"messages":[{system}]}`,
 `messages` its last member, so a body is `{HEAD,` then the object's
 members with its `messages` array left open, the log's messages, and
 `]}`. A prefix written as increment 7 wrote it, an array of messages,
 still rebuilds its requests byte for byte, and such a conversation gets
-the object as a `prefix` event before its next request. A model whose
-cached `supported_parameters` lacks `tools` is refused before any
-request, naming the setting that chose it.
+the object as a `prefix` event before its next request, as does one
+whose prefix still carries the `tool_choice` and `parallel_tool_calls`
+this increment first sent. A model whose cached
+`supported_parameters` lacks `tools` or `max_tokens` is refused before
+any request, naming the setting that chose it.
 
 - **A turn** is a loop of steps, each one request reserved against the
   limits as any other. A whole reply's calls, whatever its
