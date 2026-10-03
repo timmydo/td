@@ -163,6 +163,14 @@ str op    \E[39;49m  color/bright-and-reset
 str setaf \E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m  color/indexed-and-rgb
 str setab \E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m  color/indexed-palette-background
 
+# The window title as the status line, OSC 2 opened by `tsl` and closed by
+# ST, which ncurses programs (tmux's set-titles among them) look for before
+# titling a window; `dsl` sets it empty, which is no title.
+bool hs    parser/osc-title
+str tsl   \E]2;      parser/osc-title
+str fsl   \E\\       parser/osc-title
+str dsl   \E]2;\E\\  parser/osc-title
+
 # Private modes.
 str smcup \E[?1049h  libvterm/60screen-ascii/altscreen
 str rmcup \E[?1049l  libvterm/60screen-ascii/altscreen
@@ -694,7 +702,14 @@ mod tests {
         // Deliberately truncated one past `setab`; see the table's comment.
         assert_eq!(STRINGS.len(), 361);
 
-        for (name, index) in [("bw", 0), ("am", 1), ("xenl", 4), ("bce", 28), ("OTxr", 43)] {
+        for (name, index) in [
+            ("bw", 0),
+            ("am", 1),
+            ("xenl", 4),
+            ("hs", 9),
+            ("bce", 28),
+            ("OTxr", 43),
+        ] {
             assert_eq!(index_of(BOOLEANS, name), Some(index), "boolean {name}");
         }
         for (name, index) in [
@@ -709,7 +724,9 @@ mod tests {
         for (name, index) in [
             ("cbt", 0),
             ("cup", 10),
+            ("dsl", 23),
             ("sgr0", 39),
+            ("fsl", 47),
             ("kf0", 65),
             ("kf1", 66),
             ("kf10", 67),
@@ -717,6 +734,7 @@ mod tests {
             ("kf9", 75),
             ("smkx", 89),
             ("rep", 121),
+            ("tsl", 135),
             ("acsc", 146),
             ("kcbt", 148),
             ("kend", 164),
@@ -1074,6 +1092,30 @@ mod effects {
 
     const EFFECTS: &[Effect] = &[
         Effect {
+            capability: "tsl",
+            grid: (1, 4),
+            setup: b"",
+            concrete: b"\x1b]2;",
+            then: b"td\x1b\\",
+            expect: |t| t.title() == Some("td"),
+        },
+        Effect {
+            capability: "fsl",
+            grid: (1, 4),
+            setup: b"\x1b]2;td",
+            concrete: b"\x1b\\",
+            then: b"",
+            expect: |t| t.title() == Some("td"),
+        },
+        Effect {
+            capability: "dsl",
+            grid: (1, 4),
+            setup: b"\x1b]2;td\x07",
+            concrete: b"\x1b]2;\x1b\\",
+            then: b"",
+            expect: |t| t.title().is_none(),
+        },
+        Effect {
             capability: "cuu",
             grid: (3, 4),
             setup: b"\x1b[3;1H",
@@ -1365,16 +1407,16 @@ mod effects {
             capability: "smacs",
             grid: (3, 4),
             setup: b"",
-            concrete: b"\x1b(0q",
-            then: b"",
+            concrete: b"\x1b(0",
+            then: b"q",
             expect: |t| t.cell(0, 0).map(|c| c.scalar) == Some('\u{2500}'),
         },
         Effect {
             capability: "rmacs",
             grid: (3, 4),
             setup: b"\x1b(0",
-            concrete: b"\x1b(Bq",
-            then: b"",
+            concrete: b"\x1b(B",
+            then: b"q",
             expect: |t| t.cell(0, 0).map(|c| c.scalar) == Some('q'),
         },
         Effect {
@@ -1681,10 +1723,12 @@ mod effects {
         for effect in EFFECTS {
             let spelled = declared(effect.capability);
             match shape(&spelled) {
+                // Exactly, not as a prefix: `fsl` cut to `\E` still ends a
+                // title in the model, and leaves the parser in an escape.
                 None => assert_eq!(
-                    effect.concrete.get(..spelled.len()),
-                    Some(spelled.as_slice()),
-                    "{} is not a CSI, so its concrete form must start with it",
+                    effect.concrete,
+                    spelled.as_slice(),
+                    "{} is not a CSI, so its concrete form must be its spelling",
                     effect.capability
                 ),
                 Some((want_private, want_parameters, want_final)) => {

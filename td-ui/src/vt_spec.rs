@@ -352,6 +352,8 @@ enum Expectation {
         rows: usize,
         columns: usize,
     },
+    /// The window title OSC 0 or 2 set, `None` while there is none.
+    Title(Option<String>),
 }
 
 struct CaseBuilder {
@@ -460,7 +462,8 @@ fn validate_expectation_bounds(
         | Expectation::Mode { .. }
         | Expectation::Reply(_)
         | Expectation::Viewport(_)
-        | Expectation::Size { .. } => {}
+        | Expectation::Size { .. }
+        | Expectation::Title(_) => {}
     }
     Ok(())
 }
@@ -893,6 +896,12 @@ fn parse_expectation(file: &str, line: usize, input: &str) -> Result<Expectation
             let (rows, columns) = parse_pair(file, line, rest, "size expectation")?;
             Ok(Expectation::Size { rows, columns })
         }
+        // An empty title is no title, so it has one spelling, `none`.
+        "title" if rest == "none" => Ok(Expectation::Title(None)),
+        "title" => match text_literal(file, line, rest)? {
+            text if text.is_empty() => Err(at(file, line, "an empty title is `title none`")),
+            text => Ok(Expectation::Title(Some(text))),
+        },
         _ => Err(at(
             file,
             line,
@@ -1237,6 +1246,14 @@ fn check_expectation(
                     "size: expected {rows}x{columns}, got {}x{}",
                     terminal.rows(),
                     terminal.columns()
+                )));
+            }
+        }
+        Expectation::Title(expected) => {
+            if terminal.title() != expected.as_deref() {
+                return Err(failure(format!(
+                    "title: expected {expected:?}, got {:?}",
+                    terminal.title()
                 )));
             }
         }
@@ -1975,6 +1992,16 @@ fn corpus_parser_rejects_silent_coverage_loss() {
         .unwrap_err()
         .contains("has 1 cells for a 2-column grid"));
 
+    // An empty title is spelled `none`, and a bare word is neither.
+    let empty_title =
+        "case parser/title\nsource td\ntags core\nsize 1 1\nwrite b\"x\"\nexpect title \"\"\nend\n";
+    assert!(parse_file("bad.term", empty_title)
+        .unwrap_err()
+        .contains("an empty title is `title none`"));
+    let bare_title =
+        "case parser/title\nsource td\ntags core\nsize 1 1\nwrite b\"x\"\nexpect title x\nend\n";
+    assert!(parse_file("bad.term", bare_title).is_err());
+
     // The key vocabulary is the adapter's own table; an unknown key or a
     // second key in one chord is a corpus error, not a silent no-op.
     let unknown_key =
@@ -2007,6 +2034,25 @@ fn corpus_parser_rejects_silent_coverage_loss() {
     let parsed = parse_file("good.term", keys_only).unwrap();
     assert_eq!(parsed.len(), 1);
     assert!(matches!(parsed[0].steps.first(), Some(Step::Key(30, 0))));
+}
+
+/// A title expectation fails on any other title, so `parser/osc-title`,
+/// which the terminfo status line names, is not a claim that passes
+/// whatever the model does.
+#[test]
+fn a_title_expectation_fails_on_another_title() {
+    for (write, wrong) in [
+        ("\\e]2;t\\x07", "expect title \"other\""),
+        ("\\e]2;t\\x07", "expect title none"),
+        ("x", "expect title \"t\""),
+    ] {
+        let case = format!(
+            "case parser/title\nsource td\ntags core\nsize 1 1\nwrite b\"{write}\"\n{wrong}\nend\n"
+        );
+        let cases = parse_file("title.term", &case).unwrap();
+        let run = run_case(&cases[0], Chunking::Whole).unwrap();
+        assert_eq!(run.mismatches.len(), 1, "{wrong}");
+    }
 }
 
 #[test]

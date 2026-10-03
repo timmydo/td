@@ -150,7 +150,10 @@ characters, td's compositor's own bound, and each character the shared
 report-text predicate (`td_ui::reportable`) would not print in a title is
 a space, so text of nothing else is a title of spaces. Empty text clears
 it. The number is read exactly: `OSC 02` is not OSC 2. A reset keeps the
-title, as xterm's does: it is the window's, not the screen's.
+title, as xterm's does: it is the window's, not the screen's. The terminfo
+entry offers the title as the status line, `hs` with `tsl` (`OSC 2 ;`),
+`fsl` (ST) and `dsl` (an empty title), for programs that ask for one
+before titling a window, as tmux's set-titles does.
 
 `OSC 8 ; params ; URI` makes the cells written after it the link's, until
 an OSC 8 with an empty URI ends it, as does one whose URI is longer than
@@ -276,13 +279,14 @@ ships an entry that moves the cursor the wrong way -- as do exchanging
 `il1`/`dl1`, `ich`/`dch`, `indn`/`rin`, or any two of the nine renditions that
 share a case. Each such capability is therefore pinned twice more: its
 declared spelling must be the same operation as a concrete form written
-beside it, and feeding that concrete form to the model must produce the
-effect its name promises. A capability that shares a case with another and
-has no such check is refused, so the coverage cannot quietly lapse as the
-entry grows. The colour capabilities are pinned by expansion instead -- every
-branch of `setaf`/`setab` is instantiated and driven through the model --
-because a redirected branch still emits a well-formed SGR, just for the wrong
-channel.
+beside it -- for one that is not a CSI, the very bytes, since a truncated
+`fsl` or `dsl` would leave the parser mid-sequence -- and feeding that
+concrete form to the model must produce the effect its name promises. A
+capability that shares a case with another and has no such check is
+refused, so the coverage cannot quietly lapse as the entry grows. The
+colour capabilities are pinned by expansion instead -- every branch of
+`setaf`/`setab` is instantiated and driven through the model -- because a
+redirected branch still emits a well-formed SGR, just for the wrong channel.
 
 The entry is reachable at runtime. The child is given
 `TERMINFO=/etc/terminfo`, the image's immutable `/etc/terminfo` resolves to
@@ -1472,7 +1476,11 @@ later landing does not rewrite it: the imported libvterm pointer cases
 still read "mouse input is outside the first profile", as its selection
 cases still read that selection is, because the importer does not convert
 libvterm's pointer calls to the `pointer` operation. td-authored `mouse`
-cases carry the pointer claim instead. A generated
+cases carry the pointer claim instead. Likewise its title cases still read
+"cursor blink, cursor shape, and title properties are outside the first
+profile" and "screen term-property callbacks await title support",
+because the importer converts no title property, and td's
+`parser/osc-title` carries the title claim through `expect title`. A generated
 `expectations.txt` records in-profile known failures by case and expectation,
 so another observation cannot regress behind an existing failure. Every
 in-profile case still runs. An unlisted failure, unexpected pass, stale entry,
@@ -1480,7 +1488,7 @@ unmatched case, unknown tag, or malformed corpus reds the gate.
 
 Every byte-stream case runs as one write, one byte per write, at every
 two-piece split, and under deterministic pseudorandom chunkings. All forms
-must produce identical cells, cursor, modes, history, and replies.
+must produce identical cells, cursor, modes, history, replies, and title.
 Deterministic arbitrary-byte cases additionally enforce total parsing,
 resource ceilings, valid cursor/grid relationships, and absence of panics.
 

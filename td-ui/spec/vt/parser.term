@@ -116,3 +116,19 @@ write b"A\e\x087XBC\e[\x08qY"
 expect row 0 "XBY   "
 expect cursor 0 3
 end
+
+case parser/osc-title
+source td
+tags core
+size 1 5
+expect title none
+write b"\e]2;make\e\\A"
+expect title "make"
+expect row 0 "A    "
+write b"\e]0;~/src\x07"
+expect title "~/src"
+write b"\e]2;\e\\"
+expect title none
+expect row 0 "A    "
+expect cursor 0 1
+end

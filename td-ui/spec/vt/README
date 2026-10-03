@@ -21,6 +21,10 @@ terminal generates the other, and the PTY writer merges them only later. A key
 this profile deliberately does not translate contributes no bytes rather than
 being a corpus error.
 
+`expect title` names the window title OSC 0 or 2 set, as a text literal, or
+`none` while there is none; an empty title is no title, so `none` is its one
+spelling.
+
 `expect viewport` names how many lines back the scrollback viewport sits,
 which no byte stream reports: a key routed to the viewport reaches neither
 the child nor the terminal, so its whole effect is that number. What the
