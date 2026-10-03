@@ -943,6 +943,15 @@ compose validation, scalar conversion, normalization fast/replay paths and
 refusal. Whole-worker memory, native allocations and service RSS remain
 unqualified.
 
+The normalized scalar JSON adapter fits 64 bytes of framing state and
+exclusively borrows NFC's separate 4 KiB conversion reservation. It retains
+six pending escaped bytes and uses a four-byte UTF-8 local; response storage
+is supplied by its owner. Each turn performs one source poll or one fixed
+framing/drain action, copying at most six bytes. Escaped output is precharged
+once even with one-byte slices. Allocation intervals compose normalization,
+fragmented serialization and refusal; retained response storage and combined
+worker stack/RSS are not qualified by this helper.
+
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
 including the fixed one-byte handoff; public MessageIds state remains

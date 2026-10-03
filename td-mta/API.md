@@ -2138,6 +2138,58 @@ Allocation intervals cover validation plus decoding/NFC and refusal. Complete
 header-form aggregate admission, field assembly, JMAP publication and worker
 stack/RSS qualification remain open.
 
+### 1.47 JSON output from normalized scalar sources
+
+M06ao adds `json_string::Cursor::new(&mut nfc_cursor)`. It exclusively borrows
+an already constructed NFC cursor and retains at most six escaped bytes; no
+full string is copied. Field/form authorization, source selection, and
+semantic scalar filtering stay with the selected source's owner. This adapter
+serializes exactly one quoted JSON string. It is not a complete header-form or
+JMAP response publisher. The source must be unpolled when wrapped. Dropping
+the adapter before Complete abandons the whole property, including any emitted
+prefix and staged bytes; do not rewrap that advanced source. A retry
+constructs a fresh source from the original input and spends the remaining
+live work budget without refunding earlier charges.
+
+`poll(tick, output)` returns a written-byte count and Yield, NeedOutput or
+Complete. One turn either stages one opening/closing quote, polls the source
+once, or drains at most six pending bytes. Even a one-byte output slice
+progresses. An empty slice returns NeedOutput without advancing or charging,
+but checks the live deadline. Bytes beyond the reported written prefix remain
+untouched. Complete is returned only after the closing quote is copied.
+
+Escape quote/backslash and U+0000..U+001F per RFC 8259 section 7. Use short
+escapes for backspace, form feed, LF, CR and HTAB, and lowercase hexadecimal
+`\u00xx` for other controls. Other scalars retain UTF-8, including solidus,
+supplementary characters and U+2028/U+2029. This is JSON output, not HTML or
+JavaScript embedding; no embedding-specific escaping is promised. Scalar
+filtering and encoding diagnostics come from the chosen NFC source. I-JSON
+character compliance is likewise the source owner's responsibility (RFC 7493
+section 2.1): the decoded header/name constructors repair noncharacters, but
+plain `nfc::Cursor::new(&str)` preserves them and cannot by itself qualify
+JMAP output.
+
+Precharge each entire escaped scalar or quote to that source's same live
+output meter before copying any of it. Fragmenting output never charges a
+pending byte again. Normalization source visits/steps keep their existing
+aggregate accounting. Check the deadline on active entry, including pending
+output drains. `check_deadline(tick)` provides an explicit post-turn/final
+check and retires even a completed cursor on refusal. Cached completion is
+otherwise inert. Any refusal is sticky and invalidates the entire provisional
+property, including earlier output. The containing response owner must retain
+those bytes until its own complete-field checks succeed.
+
+The adapter fits 64 bytes of framing state and borrows NFC's separate 4 KiB
+reservation. Six pending bytes and four local UTF-8 bytes bound escaping. A
+turn does one NFC poll or one fixed output action, with no heap growth. Tests
+pin literal JSON, all Unicode scalar encodings, every output width from one
+through eight, hostile NFC replay, source diagnostics, output charges, and
+empty/output/deadline refusal. Allocation intervals cover normalization plus
+one-byte JSON drains and sticky refusal. Aggregate field admission, retained
+response ownership and complete worker qualification remain open.
+
+Source: [RFC 8259 sections 7 and 8.1](https://www.rfc-editor.org/rfc/rfc8259.html#section-7).
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -3248,6 +3248,49 @@ fn header_properties() {
     assert_eq!(before, after, "header property selection allocated");
 }
 
+fn json_string_output() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        json_string::{Cursor, Status},
+        nfc::{self, HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let long = format!("a{}", "\u{315}\u{300}".repeat(257));
+    let mut scratch = Scratch::new();
+    let mut meter = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 16 * 1024 * 1024,
+            records: 2_000_000,
+            output_bytes: 1024 * 1024,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut output = [0; 1];
+    let before = COUNTERS.snapshot();
+    for input in ["", "\"\\\n\0é🐈", long.as_str()] {
+        let mut source = nfc::Cursor::new(black_box(input), &mut scratch, &mut meter, &mut budget);
+        let mut cursor = Cursor::new(&mut source);
+        loop {
+            let progress = cursor.poll(Tick(1), &mut output).unwrap();
+            black_box(output);
+            if progress.status == Status::Complete {
+                break;
+            }
+        }
+        cursor.check_deadline(Tick(1)).unwrap();
+    }
+    let mut limited = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+    let mut source = nfc::Cursor::new("", &mut scratch, &mut limited, &mut budget);
+    let mut refused = Cursor::new(&mut source);
+    assert!(refused.poll(Tick(100), &mut output).is_err());
+    assert!(refused.poll(Tick(1), &mut output).is_err());
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "JSON string serialization allocated");
+}
+
 fn phrase_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -3989,6 +4032,7 @@ fn main() {
         header_nfc();
         phrase_nfc();
         comment_nfc();
+        json_string_output();
         encoded_word_candidates();
         encoded_word_decoding();
         header_text();
@@ -4107,6 +4151,7 @@ fn main() {
     header_nfc();
     phrase_nfc();
     comment_nfc();
+    json_string_output();
     encoded_word_candidates();
     encoded_word_decoding();
     header_text();

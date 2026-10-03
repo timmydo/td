@@ -31,6 +31,7 @@ pub mod header_select;
 pub mod header_text;
 pub mod header_urls;
 pub mod ids;
+pub mod json_string;
 pub mod limits;
 pub mod mailbox_parents;
 pub mod mailbox_sweep;

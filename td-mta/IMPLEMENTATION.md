@@ -1487,6 +1487,13 @@ Initial independently landable increments:
   replay, terminal refusal and allocation-free composition. Whole-field
   admission/publication and worker resource qualification remain open.
 
+- **M06ao — normalized scalar JSON output:** borrow the selected NFC cursor
+  and serialize one quoted JSON string using fixed escaped-byte staging.
+  Precharge output once before fragmentable copying, retain sticky refusal
+  and final deadline checks, and expose only provisional output. Cover all
+  scalars, one-byte sinks, exact charges, replay and allocation-free operation.
+  Field admission, retained response ownership and publication remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
