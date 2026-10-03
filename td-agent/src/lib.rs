@@ -1,10 +1,7 @@
 //! td-agent: td's agent harness (DESIGN.md).
 //!
-//! The crate is `std`, td-ui, td-json and td-toml. One module,
-//! `td_fetch`, is td's shared std module, copied whole from td-news and
-//! never edited here; `tests/shared_modules.rs` holds it byte-identical
-//! to td-news's. What td-agent does not call of it stays, allowed on its
-//! `mod` line rather than trimmed.
+//! The crate is `std` and td's own crates: td-ui, td-json, td-toml and
+//! td-fetch-client, the fetch service's client.
 //!
 //! The binary is two personalities of one program (DESIGN.md §2): the
 //! window process (`window`, over `ui`, `control` and `supervisor`) and a
@@ -44,16 +41,6 @@ pub mod span;
 pub mod sse;
 pub mod store;
 pub mod supervisor;
-// The fetch service's client: td-agent posts titles and streams turns,
-// and gets nothing streamed.
-#[allow(dead_code)]
-#[cfg_attr(
-    test,
-    allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)
-)]
-pub mod td_fetch;
-#[cfg(test)]
-mod testing;
 pub mod tools;
 pub mod ui;
 pub mod wake;

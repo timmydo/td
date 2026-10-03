@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::civil::{self, Zone};
 use crate::xml::{Event, Reader};
+use td_civil::Zone;
 use td_json::{Json, ToJson};
 
 /// A normalized article parsed from an RSS or Atom feed.
@@ -126,7 +126,7 @@ fn no_fetch_service() -> String {
 /// Fetch and parse an RSS/Atom feed from the given URL.
 /// Returns the feed title and a list of articles.
 pub fn fetch_feed(url: &str, feed_name: &str) -> Result<(String, Vec<Article>), String> {
-    if !crate::td_fetch::available() {
+    if !td_fetch_client::available() {
         return Err(format!("fetch {}: {}", url, no_fetch_service()));
     }
     // Inside a td jail that carries `sockets=fetch`: the fetch service
@@ -134,7 +134,7 @@ pub fn fetch_feed(url: &str, feed_name: &str) -> Result<(String, Vec<Article>), 
     // APPLICATIONS.md §W.8). The service names its refusals, and a
     // status is an answer to be shown, not a transport error.
     let response =
-        crate::td_fetch::get(url, &[], None, None).map_err(|e| format!("fetch {}: {}", url, e))?;
+        td_fetch_client::get(url, &[], None, None).map_err(|e| format!("fetch {}: {}", url, e))?;
     if !(200..300).contains(&response.status) {
         return Err(format!("fetch {}: HTTP {}", url, response.status));
     }
@@ -400,11 +400,11 @@ pub fn local_zone() -> &'static Zone {
 /// stores and every view shows.
 pub fn format_local(unix: i64) -> String {
     let (wall, _) = local_zone().to_local(unix);
-    civil::format_ymd_hms(&wall)
+    td_civil::format_ymd_hms(&wall)
 }
 
 pub fn now_local_datetime_string() -> String {
-    format_local(civil::now_unix())
+    format_local(td_civil::now_unix())
 }
 
 pub fn normalize_datetime_to_local(input: &str) -> Option<String> {
@@ -434,18 +434,18 @@ fn parse_datetime_to_unix(input: &str) -> Option<i64> {
         return None;
     }
 
-    if let Some(unix) = civil::parse_rfc3339(s) {
+    if let Some(unix) = td_civil::parse_rfc3339(s) {
         return Some(unix);
     }
-    if let Some(unix) = civil::parse_rfc2822(s) {
+    if let Some(unix) = td_civil::parse_rfc2822(s) {
         return Some(unix);
     }
 
     let zone = local_zone();
     for wall in [
-        civil::parse_ymd_hms(s),
-        civil::parse_ymd_hm(s),
-        civil::parse_ymd(s),
+        td_civil::parse_ymd_hms(s),
+        td_civil::parse_ymd_hm(s),
+        td_civil::parse_ymd(s),
     ]
     .into_iter()
     .flatten()
@@ -470,7 +470,7 @@ mod tests {
     /// and says where it belongs, rather than reading as a network fault.
     #[test]
     fn without_the_fetch_service_a_feed_says_what_is_missing() {
-        if crate::td_fetch::available() {
+        if td_fetch_client::available() {
             // A td session, or a host someone has served a socket on:
             // there is nothing to be missing.
             return;

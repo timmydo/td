@@ -10003,9 +10003,10 @@ frozen at the commits the import names. Each is a std-only root crate
 under td's deny lints, its shared modules (`json`, `toml`, `html`,
 `civil`, `kv`, `term_sys`, `td_fetch`, and `xml`, `regex`, `b64` where
 used) landed copied byte for byte between the two and held so by a
-recipe test; `json` and `toml` have since become the td-json and
-td-toml crates both depend on by path (AGENTS.md principle 2). Each is
-built by a static Cargo recipe over the tree interned as its
+recipe test; `json`, `toml`, `html`, `civil`, `kv` and `td_fetch` have
+since become the td-json, td-toml, td-html, td-civil, td-kv and
+td-fetch-client crates both depend on by path (AGENTS.md principle 2).
+Each is built by a static Cargo recipe over the tree interned as its
 `<crate>-source` seed, its td sibling trees staged beside it
 (`local_source_trees`), with the local-source exclusions specified in
 `DEVELOPMENT.md`. Each crate's identity is

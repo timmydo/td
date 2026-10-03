@@ -1,20 +1,15 @@
 //! The CLI protocol end to end: a seeded cache, the binary, and the NDJSON
 //! frames it writes back. The cache is seeded and the replies are read
-//! with the same td-json crate the program links and the same `kv` module
-//! it carries, included here rather than linked, because `td-news` is a
-//! binary crate.
+//! with the same td-json and td-kv crates the program links.
 
-#[path = "../src/kv.rs"]
-#[allow(dead_code)]
-mod kv;
 #[path = "../src/testing.rs"]
 #[allow(dead_code)]
 mod testing;
 
-use kv::{Key, Store};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use td_json::Json;
+use td_kv::{Key, Store};
 use testing::tempdir;
 
 const ARTICLES: &str = "articles";

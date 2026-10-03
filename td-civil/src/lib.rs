@@ -6,7 +6,10 @@
 //! Date/time conversion follows Howard Hinnant's `days_from_civil` /
 //! `civil_from_days`; the zone reads `/etc/localtime` (RFC 8536 TZif v1, v2
 //! and v3) including the POSIX TZ footer, which modern "slim" files rely on
-//! for every instant after their last recorded transition.
+//! for every instant after their last recorded transition. It is
+//! one crate td's applications depend on by path (AGENTS.md principle 2).
+
+#![forbid(unsafe_code)]
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1025,6 +1028,12 @@ fn tz_file_path(tz: Option<&str>) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

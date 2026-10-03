@@ -7,13 +7,16 @@
 //! rich output) so a reader sees the same page.
 //!
 //! Input is untrusted: the tokenizer never fails, element nesting is bounded,
-//! and every pass is linear in the input size.
+//! and every pass is linear in the input size. It is one crate td's
+//! applications depend on by path (AGENTS.md principle 2).
 //!
 //! [`to_text`] renders the plain form (the equivalent of `from_read`) and
 //! [`to_rich`] the tagged form (the equivalent of `from_read_coloured`'s input
 //! lines). Both run the same parse, measure and layout; they differ only in
 //! the decoration a renderer applies, exactly as html2text's `PlainDecorator`
 //! and `RichDecorator` do.
+
+#![forbid(unsafe_code)]
 
 /// An RGB colour carried by [`Tag::Colour`] and [`Tag::BgColour`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2691,6 +2694,12 @@ fn border(widths: &[usize], join: char) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 

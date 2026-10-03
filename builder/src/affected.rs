@@ -1578,9 +1578,17 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // The JSON and TOML crates the applications share are staged into their
+    // The library crates the applications share are staged into their
     // recipes beside the toolkit, so an edit reaches the same consumers.
-    if (p.starts_with("td-json/") || p.starts_with("td-toml/")) && !p.contains("..") {
+    const SHARED_LIBRARIES: [&str; 6] = [
+        "td-civil/",
+        "td-fetch-client/",
+        "td-html/",
+        "td-json/",
+        "td-kv/",
+        "td-toml/",
+    ];
+    if SHARED_LIBRARIES.iter().any(|dir| p.starts_with(dir)) && !p.contains("..") {
         sel.add_preflight("cargo-test");
         sel.add_target("check");
         sel.add_target("recipe-checks");
@@ -2661,10 +2669,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("td-mail/README.md", "local-source-roster");
     assert_no_preflight!("td-mail/Cargo.lock", "local-source-roster");
     for path in [
+        "td-civil/src/lib.rs",
+        "td-fetch-client/src/lib.rs",
+        "td-html/src/lib.rs",
         "td-json/src/lib.rs",
+        "td-kv/src/lib.rs",
         "td-toml/src/lib.rs",
         "td-json/Cargo.toml",
         "td-toml/Cargo.toml",
+        "td-kv/Cargo.lock",
     ] {
         assert_target!(path, "check");
         assert_target!(path, "recipe-checks");
@@ -4736,14 +4749,19 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads
-/// td-crypto, its one dependency. td-agent reads td-news, whose shared
-/// `td_fetch` module its test holds identical, td-json, td-toml and td-ui,
-/// its dependencies, and td-compositor, the test tool its
+/// td-crypto, its one dependency. td-agent reads td-fetch-client, td-json,
+/// td-toml and td-ui, its dependencies, and td-compositor, the test tool its
 /// `native-compositor-tests` opt-in builds (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
     (
         "td-agent",
-        &["td-compositor", "td-json", "td-news", "td-toml", "td-ui"],
+        &[
+            "td-compositor",
+            "td-fetch-client",
+            "td-json",
+            "td-toml",
+            "td-ui",
+        ],
     ),
     ("td-mta", &["td-crypto"]),
 ];
@@ -8863,7 +8881,7 @@ mod tests {
         for path in [
             "td-agent/src/x.rs",
             "td-agent/src/main.rs",
-            "td-agent/tests/shared_modules.rs",
+            "td-agent/tests/model_client.rs",
             "td-agent/Cargo.toml",
             "td-agent/Cargo.lock",
         ] {
@@ -8937,30 +8955,37 @@ mod tests {
             Fixture(std::env::temp_dir().join(format!("td-agent-graph-{}", std::process::id())));
         let root = fixture.0.clone();
         std::fs::remove_dir_all(&root).ok();
+        let deps = |names: &[&str]| -> String {
+            let mut manifest = String::from(
+                "[package]\nname = \"td-agent\"\n\n\
+                 [package.metadata.td-gate]\nnative-compositor-tests = true\n\n\
+                 [dependencies]\n",
+            );
+            for name in names {
+                manifest.push_str(&format!("{name} = {{ path = \"../{name}\" }}\n"));
+            }
+            manifest
+        };
+        let all_deps = ["td-fetch-client", "td-json", "td-toml", "td-ui"];
         for name in [
             "td-agent",
             "td-compositor",
+            "td-fetch-client",
             "td-json",
             "td-news",
             "td-toml",
             "td-ui",
-            "td-mail",
         ] {
             let base = root.join(name);
             std::fs::create_dir_all(base.join("src")).unwrap();
-            let mut manifest = format!("[package]\nname = \"{name}\"\n");
-            if name == "td-agent" {
-                manifest.push_str(
-                    "\n[package.metadata.td-gate]\nnative-compositor-tests = true\n\n\
-                     [dependencies]\ntd-json = { path = \"../td-json\" }\n\
-                     td-toml = { path = \"../td-toml\" }\ntd-ui = { path = \"../td-ui\" }\n",
-                );
-            }
+            let manifest = if name == "td-agent" {
+                deps(&all_deps)
+            } else {
+                format!("[package]\nname = \"{name}\"\n")
+            };
             std::fs::write(base.join("Cargo.toml"), manifest).unwrap();
             std::fs::write(base.join("src/lib.rs"), "").unwrap();
         }
-        let shared = "const SHARED: &str = \"../td-news/src/td_fetch.rs\";\n";
-        std::fs::write(root.join("td-agent/src/lib.rs"), shared).unwrap();
         let changed = ["td-agent/src/lib.rs".to_string()];
         let all = cargo_test_cmds_all(&root).unwrap();
         let narrowed = cargo_test_cmds(&root, &changed).unwrap();
@@ -8972,12 +8997,13 @@ mod tests {
         // Another crate read: the workspace's assertions would name it.
         std::fs::write(
             root.join("td-agent/src/lib.rs"),
-            format!("{shared}const MAIL: &str = \"../td-mail/src/td_fetch.rs\";\n"),
+            "const NEWS: &str = \"../td-news/src/main.rs\";\n",
         )
         .unwrap();
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
         // An edge lost is a changed set too.
         std::fs::write(root.join("td-agent/src/lib.rs"), "").unwrap();
+        std::fs::write(root.join("td-agent/Cargo.toml"), deps(&all_deps[..3])).unwrap();
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
     }
 

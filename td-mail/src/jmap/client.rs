@@ -42,11 +42,11 @@ struct Fetched {
 /// way, and the loops below follow with it or without it as the origin
 /// rule says.
 fn get_with_auth(url: &str, auth: Option<&str>) -> Result<Fetched, JmapError> {
-    if !crate::td_fetch::available() {
+    if !td_fetch_client::available() {
         return Err(no_fetch_service());
     }
     let headers: Vec<(&str, &str)> = auth.map(|a| ("authorization", a)).into_iter().collect();
-    let response = crate::td_fetch::get(url, &headers, RESPONSE_LIMIT, Some(0))
+    let response = td_fetch_client::get(url, &headers, RESPONSE_LIMIT, Some(0))
         .map_err(|e| JmapError::Http(e.to_string()))?;
     Ok(Fetched {
         status: response.status,
@@ -361,7 +361,7 @@ impl JmapClient {
     }
 
     fn call(&self, request: JmapRequest) -> Result<JmapResponse, JmapError> {
-        if !crate::td_fetch::available() {
+        if !td_fetch_client::available() {
             return Err(no_fetch_service());
         }
         let auth = Self::auth_header(&self.username, &self.password);
@@ -372,7 +372,7 @@ impl JmapClient {
 
         // The fetch service carries the request; a status of 400 or more is
         // an error here rather than a reply, as it was before.
-        let response = crate::td_fetch::post(
+        let response = td_fetch_client::post(
             &self.api_url,
             &[
                 ("authorization", auth.as_str()),
@@ -1122,8 +1122,8 @@ impl JmapClient {
     /// session names one, and the fetch service's request bound always.
     pub fn upload_ceiling(&self) -> u64 {
         self.max_size_upload
-            .map_or(crate::td_fetch::MAX_REQUEST_BODY, |max| {
-                max.min(crate::td_fetch::MAX_REQUEST_BODY)
+            .map_or(td_fetch_client::MAX_REQUEST_BODY, |max| {
+                max.min(td_fetch_client::MAX_REQUEST_BODY)
             })
     }
 
@@ -1168,7 +1168,7 @@ impl JmapClient {
     /// Uploads `bytes` as a blob of `content_type` at the session's upload
     /// URL and answers its blob id.
     pub fn upload_blob(&self, bytes: &[u8], content_type: &str) -> Result<String, JmapError> {
-        if !crate::td_fetch::available() {
+        if !td_fetch_client::available() {
             return Err(no_fetch_service());
         }
         let Some(upload_url) = &self.upload_url else {
@@ -1184,7 +1184,7 @@ impl JmapClient {
             url
         );
         let auth = Self::auth_header(&self.username, &self.password);
-        let response = crate::td_fetch::post(
+        let response = td_fetch_client::post(
             &url,
             &[
                 ("authorization", auth.as_str()),

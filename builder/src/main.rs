@@ -16026,8 +16026,8 @@ daemon build START (2/2 active)
     // `verify_local_source_roster_basename` is what both `auto_seed_provenance`
     // and `authenticate_seed_db` call to re-derive a roster key's identity: it
     // must accept the checkout's OWN current basename and refuse any other one,
-    // naming the key. `td-mail-source` is the cheapest roster entry to stage (no
-    // sibling trees).
+    // naming the key. `td-mail-source` is a real roster entry, staged with its
+    // sibling trees.
     #[test]
     fn verify_local_source_roster_basename_accepts_the_real_checkout_and_rejects_a_forged_one() {
         with_repo_root_env(|root| {

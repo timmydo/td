@@ -17,7 +17,7 @@ use td_ui::finder;
 /// The most a file attached here may hold: the fetch service's request
 /// bound, which an upload cannot pass; the server's own `maxSizeUpload`
 /// is checked when the draft is sent.
-pub const CEILING: u64 = crate::td_fetch::MAX_REQUEST_BODY;
+pub const CEILING: u64 = td_fetch_client::MAX_REQUEST_BODY;
 
 /// The folder the finder opens on when none was chosen from before:
 /// `$HOME` when it is an absolute folder, else the root.

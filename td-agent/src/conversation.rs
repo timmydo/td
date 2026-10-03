@@ -58,7 +58,6 @@ use crate::store::{
     self, Basis, Call, Conversation, Effect, Event, Held, Id, Kind, Purpose, Role, StateDir,
     Status, TodoItem, LOCK_WAIT,
 };
-use crate::td_fetch;
 use crate::tools::{self, Args, Listed, Op, Target};
 use crate::wake;
 
@@ -124,7 +123,7 @@ enum Fetched {
     /// The service said the body is whole.
     End,
     /// The request, or the stream, failed.
-    Failed(td_fetch::Error),
+    Failed(td_fetch_client::Error),
 }
 
 /// What a streamed request came to.
@@ -268,13 +267,14 @@ fn fetch(
 ) {
     let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
     let hand = |item: Fetched| send.send(Inbound::Fetch { request, item }).is_ok();
-    let mut stream = match td_fetch::post_stream(url, &headers, body, Some(client::MAX_STREAM)) {
-        Ok(stream) => stream,
-        Err(e) => {
-            hand(Fetched::Failed(e));
-            return;
-        }
-    };
+    let mut stream =
+        match td_fetch_client::post_stream(url, &headers, body, Some(client::MAX_STREAM)) {
+            Ok(stream) => stream,
+            Err(e) => {
+                hand(Fetched::Failed(e));
+                return;
+            }
+        };
     let head = Fetched::Head {
         status: stream.status,
         headers: stream.headers.clone(),
@@ -1800,7 +1800,7 @@ fn take(queue: &mut VecDeque<Down>) -> Option<Down> {
 /// A streamed request's reply that came as one body: as a counted reply
 /// is read.
 fn whole(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Streamed {
-    let response = td_fetch::Response {
+    let response = td_fetch_client::Response {
         status,
         headers,
         body,
@@ -1815,10 +1815,14 @@ fn whole(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Streamed
 }
 
 /// A title request through the fetch service, counted.
-fn post(client: &Client, key: &Secret, body: &str) -> Result<td_fetch::Response, td_fetch::Error> {
+fn post(
+    client: &Client,
+    key: &Secret,
+    body: &str,
+) -> Result<td_fetch_client::Response, td_fetch_client::Error> {
     let headers = client::headers(key.expose());
     let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
-    td_fetch::post(
+    td_fetch_client::post(
         &format!("{}/chat/completions", client.base_url),
         &headers,
         body.as_bytes(),

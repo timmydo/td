@@ -10,26 +10,17 @@ mod attach;
 mod b64;
 mod backend;
 mod cache;
-// The shared module carries more of the calendar than td-mail's clock needs, and
-// its `Zone::from_local_*` are conversions from a local time, not constructors.
-#[allow(dead_code, clippy::wrong_self_convention)]
-mod civil;
 mod cli;
 mod compose;
 mod config;
-mod html;
 mod jmap;
 mod keybindings;
-// The shared store carries more than td-mail's five tables need.
-#[allow(dead_code)]
-mod kv;
 // The shared module carries td-txt's whole engine; td-mail reads one adapter.
 #[allow(dead_code)]
 mod regex;
 mod rules;
 mod spam;
 mod submit;
-mod td_fetch;
 #[cfg(test)]
 mod testing;
 mod ui;

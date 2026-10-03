@@ -4,7 +4,8 @@
 //! directory rather than the socket inode, so a restarted service's fresh
 //! socket is at the same path. The service holds the TLS trust, the
 //! resolver, the timeouts and the body caps; this side holds a socket and
-//! the framing, in `std` alone.
+//! the framing, in `std` alone: one crate td's applications depend on by
+//! path (AGENTS.md principle 2).
 //!
 //! One request per connection: a text head, a blank line, the body; back,
 //! a text head, a blank line, the body, or an `error` line the service
@@ -17,6 +18,9 @@
 //! the origin sends it: the reply head ends in `stream` rather than
 //! `body N`, and the body comes as `chunk N` frames of at most 64 KiB each,
 //! closed by an `end` line or an `error` line.
+
+#![forbid(unsafe_code)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
@@ -530,8 +534,22 @@ fn read_stream_head(reader: &mut impl BufRead) -> Result<(u16, Vec<(String, Stri
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
+
+    /// Held by every test that points `XDG_RUNTIME_DIR` at a directory of
+    /// its own: the environment is one per process and the tests run in
+    /// parallel.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn reply(bytes: &[u8]) -> Result<Response, Error> {
         read_reply(&mut BufReader::new(bytes), DEFAULT_LIMIT)
@@ -611,7 +629,7 @@ mod tests {
 
     #[test]
     fn the_socket_is_found_under_the_runtime_directory_only_as_a_socket() {
-        let _env = crate::testing::env_lock();
+        let _env = env_lock();
         let dir = std::env::temp_dir().join(format!("td-fetch-client-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(SOCKET_DIRECTORY)).unwrap();
@@ -855,7 +873,7 @@ mod tests {
 
     #[test]
     fn a_stream_is_asked_for_and_read_over_the_socket() {
-        let _env = crate::testing::env_lock();
+        let _env = env_lock();
         let dir = std::env::temp_dir().join(format!("td-fetch-stream-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(SOCKET_DIRECTORY)).unwrap();

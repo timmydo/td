@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::civil;
 use crate::jmap::types::{EmailAddress, Identity};
 use td_json::{json, Json, ObjectBuilder};
 
@@ -542,7 +541,7 @@ pub fn sent_dir_for(draft: &Path) -> Option<PathBuf> {
 
 /// A Unix time as JMAP's `UTCDate`, RFC 3339 in UTC to the second.
 pub fn rfc3339_utc(unix: i64) -> String {
-    let c = civil::unix_to_civil_utc(unix);
+    let c = td_civil::unix_to_civil_utc(unix);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         c.year, c.month, c.day, c.hour, c.minute, c.second

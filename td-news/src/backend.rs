@@ -215,7 +215,7 @@ fn schedule(
     let Some(interval_secs) = interval_seconds(sync_interval) else {
         return (Vec::new(), IDLE_WAIT);
     };
-    let now = crate::civil::now_unix();
+    let now = td_civil::now_unix();
     let mut due = Vec::new();
     let mut wait = interval_secs;
     for (idx, feed) in feeds.iter().enumerate() {
@@ -380,7 +380,7 @@ mod tests {
             cache.put_feed_meta(&FeedMeta {
                 url: url.to_string(),
                 title: String::new(),
-                last_fetched: format_local(crate::civil::now_unix() - seconds_ago),
+                last_fetched: format_local(td_civil::now_unix() - seconds_ago),
             })
         };
         fetched(&feeds[0].url, 1_000);

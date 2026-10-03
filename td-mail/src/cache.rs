@@ -1,7 +1,7 @@
 use crate::jmap::types::{Email, Mailbox};
-use crate::kv::{Error as KvError, Key, Store};
 use std::path::PathBuf;
 use td_json::ToJson;
+use td_kv::{Error as KvError, Key, Store};
 
 /// The five tables. `op_queue` is keyed by a big-endian `u64`, so iteration
 /// order is numeric order and replay is FIFO; the rest are keyed by text.

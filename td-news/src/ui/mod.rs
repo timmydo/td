@@ -1718,7 +1718,7 @@ impl App {
             }
         }
         // Also scan the plain text rendering for URLs
-        let text = crate::html::to_text(html_source.as_bytes(), 200);
+        let text = td_html::to_text(html_source.as_bytes(), 200);
         for url in extract_plain_urls(&text) {
             if seen.insert(url.clone()) {
                 self.article_urls.push(url);
@@ -2333,7 +2333,7 @@ fn article_text(article: &Article, urls: &[String], columns: usize) -> String {
     } else {
         article.content.as_str()
     };
-    let body = crate::html::to_text(html.as_bytes(), columns.max(20));
+    let body = td_html::to_text(html.as_bytes(), columns.max(20));
     // The renderer's reference definitions (`[1]: https://...`) are
     // dropped: the Links section below lists the same URLs.
     let mut rendered: Vec<&str> = body
@@ -2700,7 +2700,7 @@ pub(super) mod tests {
             r#"<p>Hello <a href="https://example.com/x">there</a>"#,
             r#" and <a href="https://example.com/y">here</a>.</p>"#
         );
-        let text = crate::html::to_text(html.as_bytes(), 60);
+        let text = td_html::to_text(html.as_bytes(), 60);
         let definitions: Vec<&str> = text
             .lines()
             .filter(|line| is_reference_link_def(line))

@@ -6,7 +6,8 @@
 //! descriptor before exec. Every committed record is fsynced, so a crash loses
 //! at most the commit that was in flight. The whole live state is
 //! kept in memory as ordered tables; readers take a cheap `Arc` snapshot that
-//! a concurrent commit cannot disturb.
+//! a concurrent commit cannot disturb. It is one crate td's
+//! applications depend on by path (AGENTS.md principle 2).
 //!
 //! # On-disk format
 //!
@@ -41,6 +42,8 @@
 //! commit whose length field is corrupted into a value that runs past
 //! end-of-file is indistinguishable from a truncated tail and is repaired
 //! rather than reported.
+
+#![forbid(unsafe_code)]
 
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
@@ -931,6 +934,12 @@ impl WriteTxn<'_> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};

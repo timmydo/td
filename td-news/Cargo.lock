@@ -3,14 +3,34 @@
 version = 4
 
 [[package]]
+name = "td-civil"
+version = "0.1.0"
+
+[[package]]
+name = "td-fetch-client"
+version = "0.1.0"
+
+[[package]]
+name = "td-html"
+version = "0.1.0"
+
+[[package]]
 name = "td-json"
+version = "0.1.0"
+
+[[package]]
+name = "td-kv"
 version = "0.1.0"
 
 [[package]]
 name = "td-news"
 version = "0.1.0"
 dependencies = [
+ "td-civil",
+ "td-fetch-client",
+ "td-html",
  "td-json",
+ "td-kv",
  "td-toml",
  "td-ui",
 ]

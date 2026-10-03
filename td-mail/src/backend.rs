@@ -1,5 +1,4 @@
 use crate::cache::Cache;
-use crate::civil;
 use crate::config::{RetentionPolicyConfig, SpamConfig};
 use crate::jmap::client::{JmapClient, JmapError};
 use crate::jmap::types::{Email, Identity, Mailbox};
@@ -2481,7 +2480,7 @@ fn send_draft(client: &JmapClient, path: &Path) -> Result<SentDraft, String> {
     }
 
     let message_id = submit::new_message_id(&outgoing.from);
-    let now = civil::now_unix();
+    let now = td_civil::now_unix();
     let email = submit::email_json(&outgoing, identity, &blob_ids, now, &message_id);
     let attempt = LostSend {
         message_id,

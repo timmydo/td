@@ -1,0 +1,25 @@
+[package]
+name = "td-fetch-client"
+version = "0.1.0"
+edition = "2021"
+description = "td's dependency-free client of the td fetch service: HTTP through its unix socket, whole or streamed"
+license = "MIT"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from
+# a worktree nested under it (see the root Cargo.toml). A consumer names this
+# crate as `td-fetch-client = { path = "../td-fetch-client" }`, the one sibling-dependency
+# spelling the lock guard admits (AGENTS.md 'Rust code'); this crate itself
+# depends on nothing but `std`.
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

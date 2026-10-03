@@ -23,15 +23,15 @@ pub mod thread_view;
 
 use super::input::Key;
 use crate::backend::BackendResponse;
-use crate::civil::{self, Zone};
 use std::sync::OnceLock;
 use std::time::SystemTime;
+use td_civil::Zone;
 
 /// The system zone, read once. `Zone::local` opens and parses `/etc/localtime`,
 /// and this is called from a render path.
 static ZONE: OnceLock<Zone> = OnceLock::new();
 
-fn local_civil(time: SystemTime) -> civil::Civil {
+fn local_civil(time: SystemTime) -> td_civil::Civil {
     let duration = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
@@ -40,12 +40,12 @@ fn local_civil(time: SystemTime) -> civil::Civil {
 }
 
 pub fn format_system_time(time: SystemTime) -> String {
-    civil::format_hms(&local_civil(time))
+    td_civil::format_hms(&local_civil(time))
 }
 
 /// The local date and time of `time`.
 pub fn format_system_date_time(time: SystemTime) -> String {
-    civil::format_ymd_hms(&local_civil(time))
+    td_civil::format_ymd_hms(&local_civil(time))
 }
 
 /// One row of a list: its label, the note at its right, and whether it is

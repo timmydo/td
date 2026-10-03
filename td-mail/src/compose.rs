@@ -411,7 +411,7 @@ fn looks_like_html(text: &str) -> bool {
 ///
 /// Rendering cannot fail, so there is no fallback to the raw HTML any more.
 fn html_to_plain(html: &str) -> String {
-    crate::html::to_text(html.as_bytes(), 80)
+    td_html::to_text(html.as_bytes(), 80)
 }
 
 /// Retained draft and sidecar paths. Nothing here ever deletes them.

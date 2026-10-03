@@ -32,7 +32,6 @@ use crate::post::{Outbox, Post};
 use crate::protocol::{Down, Up};
 use crate::store::{self, Event, Id, Kind, Role, StateDir};
 use crate::supervisor::{Opened, Supervisor, Update};
-use crate::td_fetch;
 use crate::ui::{App, Request, Row, RowState};
 
 /// The longest a turn waits before polling the conversation again.
@@ -122,7 +121,7 @@ impl Fetcher {
 
 /// `GET /models`, cached in the state directory as it comes.
 fn models(base_url: &str, state: &std::path::Path) -> Result<Models, String> {
-    let response = td_fetch::get(
+    let response = td_fetch_client::get(
         &format!("{base_url}/models"),
         &[("accept", "application/json")],
         Some(MAX_LIST),
@@ -141,7 +140,7 @@ fn models(base_url: &str, state: &std::path::Path) -> Result<Models, String> {
 fn credit(base_url: &str, key: Option<&Secret>) -> Result<Credit, String> {
     let key = key.ok_or("no API key")?;
     let authorization = format!("Bearer {}", key.expose());
-    let response = td_fetch::get(
+    let response = td_fetch_client::get(
         &format!("{base_url}/key"),
         &[
             ("authorization", authorization.as_str()),

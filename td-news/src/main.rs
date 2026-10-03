@@ -1,13 +1,11 @@
 //! td-news: an RSS and Atom reader in a td-ui window.
 //!
-//! The crate is `std`, td-json, td-toml and td-ui, the shared toolkit
-//! whose widget window it draws in. Four modules — `civil`, `html`, `kv`,
-//! `xml` — are td's shared std modules, copied in whole from one master
-//! each and never edited here, so the import into td can diff them byte
-//! for byte against td-mail's copies. What td-news does not call
-//! therefore stays, allowed on its `mod` line rather than trimmed: a
-//! binary crate exports nothing, so `dead_code` fires here and not in the
-//! module's own crate.
+//! The crate is `std` and td's own crates: td-ui, the shared toolkit
+//! whose widget window it draws in, and the shared library crates td-civil,
+//! td-fetch-client, td-html, td-json, td-kv and td-toml. The `xml` module
+//! is td-news's own reader, carried whole from its master; what td-news
+//! does not call of it stays, allowed on its `mod` line rather than
+//! trimmed, since a binary crate exports nothing and `dead_code` fires here.
 //!
 //! `unsafe` is forbidden for the whole crate: the terminal surface the
 //! reader once carried (UNSAFE.md §18) went with the terminal, and the
@@ -17,25 +15,16 @@
 
 mod backend;
 mod cache;
-// `wrong_self_convention` is clippy declining to rename an exported method;
-// nothing is exported here, so it fires as `dead_code` does.
-#[allow(dead_code, clippy::wrong_self_convention)]
-mod civil;
 mod cli;
 mod config;
 mod feed;
-#[allow(dead_code)]
-mod html;
 mod keybindings;
-#[allow(dead_code)]
-mod kv;
 mod log;
-// Shared with td-mail, which reads response headers where td-news does not.
-#[allow(dead_code)]
-mod td_fetch;
 /// `tempfile`'s replacement, test-only and shared with the integration
-/// tests through a `#[path]` include.
+/// tests through a `#[path]` include. It is the same text as td-mail's,
+/// whose tests also take `env_lock`; td-news's no longer do.
 #[cfg(test)]
+#[allow(dead_code)]
 mod testing;
 mod ui;
 #[allow(dead_code)]

@@ -74,19 +74,15 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's source-built stage2 toolchain. Its manifest declares three
-dependencies, all td crates by path: `td-json`, `td-toml` and `td-ui`, and
-its lock lists exactly those and td-agent. It carries no TLS, resolves no
-names and opens no network
+td's source-built stage2 toolchain. Its manifest declares four
+dependencies, all td crates by path: `td-fetch-client`, `td-json`,
+`td-toml` and `td-ui`, and its lock lists exactly those and td-agent. It
+carries no TLS, resolves no names and opens no network
 connection itself: every request to a model provider goes through the td
-fetch service (APPLICATIONS.md §W.8), as td-news and td-mail do, so it
-needs no dependency sign-off and no td-crypto admission. JSON and TOML
-are the td-json and td-toml crates td-news and td-mail also depend on.
-It is the third carrier of one module td-news and td-mail share byte for
-byte, `td_fetch`. td-agent's own test suite holds its copy identical to
-td-news's; the recipe test that holds td-news's and td-mail's
-(`recipes/src/recipes/td-mail.rs`) gains td-agent only with the packaging
-increment, for the reason §17 gives. Its `grep`
+fetch service (APPLICATIONS.md §W.8) by td-fetch-client, as td-news and
+td-mail do, so it needs no dependency sign-off and no td-crypto
+admission. JSON and TOML are the td-json and td-toml crates td-news and
+td-mail also depend on. Its `grep`
 and `sed` tools are td-txt, the same multicall the image
 ships as `/bin/grep` and `/bin/sed`, run as a program rather than
 reimplemented (§12). It is zone-one source: not a foreign payload, not a
@@ -971,7 +967,8 @@ the exact body; it is sent with `td_fetch::post_stream`, the frames'
 sum bounded at 32 MiB, since every delta is a JSON object of its own,
 many times the text it carries. A title request stays counted, with
 `td_fetch::post` and its 512 KiB cap: it is short, drawn nowhere and
-never interrupted. `td_fetch.rs` is td-news's copy, unedited.
+never interrupted. `td_fetch` was then td-news's copy, unedited; it is
+now the td-fetch-client crate.
 
 - **The stream** is read on a thread of the conversation process's own,
   which hands its head and each frame to the turn through the channel
@@ -1037,9 +1034,10 @@ never interrupted. `td_fetch.rs` is td-news's copy, unedited.
   the stream was closed but not every provider stops generating, or
   billing, when a stream closes. The connection itself closes when the
   stream's thread wakes for its next frame: `td_fetch`'s `Stream` can be
-  closed only by the thread reading it, and the shared module is not
-  edited here. OpenRouter's `: OPENROUTER PROCESSING` comments make
-  that prompt, and the service's two-minute idle deadline bounds it
+  closed only by the thread reading it, and the shared client (now the
+  td-fetch-client crate) is not edited here. OpenRouter's
+  `: OPENROUTER PROCESSING` comments make that prompt, and the service's
+  two-minute idle deadline bounds it
   against a silent origin; a request interrupted before its head came
   is still sent, and closed once its head comes. An interrupt while the
   window reserves the request ends the turn before it is sent, the
@@ -2626,15 +2624,15 @@ follows:
 
 - no crate depends on it, so a td-agent change selects td-agent alone; a
   change to a crate it reads selects td-agent as well, as it should;
-- no recipe, recipe test or seed roster names it until packaging. Its
-  copy of the shared module is held identical by its own test reading
-  td-news's, not by the recipe test;
-- its outgoing edges are pinned: exactly `td-compositor`, `td-json`,
-  `td-news` (that test), `td-toml` and `td-ui` (its dependencies).
-  `td-compositor` joined with the window increment, which declared
-  `native-compositor-tests`, since that opt-in adds the edge; `td-json`
-  and `td-toml` joined when JSON and TOML left the copied modules for
-  crates of their own.
+- no recipe, recipe test or seed roster names it until packaging;
+- its outgoing edges are pinned: exactly `td-compositor`,
+  `td-fetch-client`, `td-json`, `td-toml` and `td-ui` (its
+  dependencies). `td-compositor` joined with the window increment, which
+  declared `native-compositor-tests`, since that opt-in adds the edge;
+  `td-json` and `td-toml` joined when JSON and TOML left the copied
+  modules for crates of their own, and `td-fetch-client` replaced
+  `td-news` when `td_fetch` did, retiring the test that read td-news's
+  copy.
   The pinned set lives in `affected.rs` beside td-mta's, and a diff whose
   edges differ from it takes the workspace pass, because the builder's
   reader-set assertions name td-agent once it reads td-ui;
@@ -2691,8 +2689,8 @@ resent; no key; and the key absent from the log, `meta`, `prefix` and
 standard error. `tests/processes.rs` adds a message sent just before
 switching away, whose turn still runs in the background. The shared
 `td_fetch.rs` joins `json.rs` and `toml.rs` in
-`tests/shared_modules.rs`; those two have since left for the td-json and
-td-toml crates, and `td_fetch.rs` is the test's one module.
+`tests/shared_modules.rs`; all three have since left for the td-json,
+td-toml and td-fetch-client crates, and the test with them.
 
 **As built (increment 7).** Pure units cover the SSE reader in
 `src/sse.rs`: comment lines, `[DONE]` and nothing read after it, an

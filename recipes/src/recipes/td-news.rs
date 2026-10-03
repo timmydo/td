@@ -4,14 +4,23 @@ use crate::types::Recipe;
 /// application packages (APPLICATIONS.md §W.8). Built as td-taskmgr is: a
 /// static Cargo build from the checkout's own `td-news/` tree with the
 /// toolkit, whose editor core is the document view that reads an article,
-/// td-json and td-toml, and the compositor's shared font and wire sources
-/// staged beside it, the `td-news-source` seed pinned by the compiled
-/// seed-digest table, and the crate's committed lock naming itself,
-/// td-json, td-toml and the toolkit.
+/// td's other shared crates it names, and the compositor's shared font
+/// and wire sources staged beside it, the `td-news-source` seed pinned by
+/// the compiled seed-digest table, and the crate's committed lock naming
+/// itself and those crates.
 pub fn recipe() -> Recipe {
     Recipe::rust("td-news", "0.1.0")
         .local_source("td-news")
-        .local_source_trees(&["td-json", "td-toml", "td-ui", "td-compositor"])
+        .local_source_trees(&[
+            "td-civil",
+            "td-fetch-client",
+            "td-html",
+            "td-json",
+            "td-kv",
+            "td-toml",
+            "td-ui",
+            "td-compositor",
+        ])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -38,10 +47,14 @@ mod tests {
         assert_eq!(
             recipe.local_source_trees,
             Some(vec![
+                "td-civil".into(),
+                "td-fetch-client".into(),
+                "td-html".into(),
                 "td-json".into(),
+                "td-kv".into(),
                 "td-toml".into(),
                 "td-ui".into(),
-                "td-compositor".into()
+                "td-compositor".into(),
             ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("td-news"));
@@ -55,7 +68,7 @@ mod tests {
     /// The lock the recipe names is the crate's own, and it closes over
     /// exactly the crate and its td siblings: a registry or git entry would
     /// be a dependency the gate refuses, and a missing sibling a build that
-    /// could not resolve the window, the pane, JSON or TOML.
+    /// could not resolve what it names.
     #[test]
     fn td_news_lock_names_the_crate_and_its_td_siblings() {
         let lock = include_str!("../../../td-news/Cargo.lock");
@@ -64,10 +77,30 @@ mod tests {
             .filter_map(|line| line.strip_prefix("name = \""))
             .filter_map(|rest| rest.strip_suffix('"'))
             .collect();
-        assert_eq!(names, ["td-json", "td-news", "td-toml", "td-ui"]);
+        assert_eq!(
+            names,
+            [
+                "td-civil",
+                "td-fetch-client",
+                "td-html",
+                "td-json",
+                "td-kv",
+                "td-news",
+                "td-toml",
+                "td-ui",
+            ]
+        );
         assert!(!lock.contains("source = "));
         let manifest = include_str!("../../../td-news/Cargo.toml");
-        for sibling in ["td-json", "td-toml", "td-ui"] {
+        for sibling in [
+            "td-civil",
+            "td-fetch-client",
+            "td-html",
+            "td-json",
+            "td-kv",
+            "td-toml",
+            "td-ui",
+        ] {
             assert!(manifest.contains(&format!("{sibling} = {{ path = \"../{sibling}\" }}")));
         }
         assert!(!manifest.contains("td-editor"));

@@ -81,10 +81,10 @@ fn looks_like_html(text: &str) -> bool {
 /// rather than turned into escape sequences: the pane shows a control
 /// scalar as U+FFFD, so an escape would be read as text.
 fn html_to_text(html: &str) -> String {
-    use crate::html::Tag;
+    use td_html::Tag;
 
     let mut out = String::new();
-    for line in crate::html::to_rich(html.as_bytes(), 80) {
+    for line in td_html::to_rich(html.as_bytes(), 80) {
         for span in line {
             out.push_str(&span.text);
             for tag in &span.tags {

@@ -1,7 +1,3 @@
-#[allow(dead_code)]
-#[path = "../src/civil.rs"]
-mod civil;
-
 mod mock_fetch;
 mod mock_jmap;
 

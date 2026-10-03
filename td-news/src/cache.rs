@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::feed::{Article, FeedMeta};
-use crate::kv::{self, Key, Store, WriteTxn};
 use td_json::{Json, ToJson};
+use td_kv::{Key, Store, WriteTxn};
 
 const ARTICLES: &str = "articles";
 const FEEDS: &str = "feeds";
@@ -290,7 +290,7 @@ fn open_store(path: &Path) -> Result<(Store, Option<String>), String> {
     }
     match Store::open(path) {
         Ok(store) => Ok((store, None)),
-        Err(kv::Error::Corrupt(why)) => {
+        Err(td_kv::Error::Corrupt(why)) => {
             std::fs::remove_file(path)
                 .map_err(|e| format!("remove unreadable cache {}: {}", path.display(), e))?;
             let store =

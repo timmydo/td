@@ -22,7 +22,6 @@ use crate::config::Client;
 use crate::cost::{self, Tokens};
 use crate::span::{self, Step};
 use crate::store::{Call, Event, Kind, Purpose, Role};
-use crate::td_fetch;
 use td_json::Json;
 
 /// The attribution pair's values (DESIGN.md §5).
@@ -566,20 +565,22 @@ pub(crate) fn usage(value: &Json) -> Option<Usage> {
 /// The service also refuses a response past a bound (its body over the
 /// request's limit, its headers, its memory), after the origin has run
 /// and may have billed the request.
-fn unsent(error: &td_fetch::Error) -> bool {
+fn unsent(error: &td_fetch_client::Error) -> bool {
     match error {
-        td_fetch::Error::Refused(m) => {
+        td_fetch_client::Error::Refused(m) => {
             !(m.starts_with("response ") || m.starts_with("the exchange with the origin"))
         }
-        td_fetch::Error::Malformed(_) => true,
-        td_fetch::Error::Io(m) => m.starts_with("no td-fetch socket") || m.starts_with("connect:"),
-        td_fetch::Error::Transport(_) => false,
+        td_fetch_client::Error::Malformed(_) => true,
+        td_fetch_client::Error::Io(m) => {
+            m.starts_with("no td-fetch socket") || m.starts_with("connect:")
+        }
+        td_fetch_client::Error::Transport(_) => false,
     }
 }
 
 /// What a request's fetch came to.
 pub fn classify(
-    result: Result<td_fetch::Response, td_fetch::Error>,
+    result: Result<td_fetch_client::Response, td_fetch_client::Error>,
 ) -> Result<Completion, Failure> {
     let response = match result {
         Ok(response) => response,
@@ -796,8 +797,8 @@ mod tests {
         Event { seq, time: 0, kind }
     }
 
-    fn response(status: u16, body: &str, headers: &[(&str, &str)]) -> td_fetch::Response {
-        td_fetch::Response {
+    fn response(status: u16, body: &str, headers: &[(&str, &str)]) -> td_fetch_client::Response {
+        td_fetch_client::Response {
             status,
             headers: headers
                 .iter()
@@ -1193,11 +1194,11 @@ mod tests {
             })
         ));
         assert!(matches!(
-            classify(Err(td_fetch::Error::Io("no td-fetch socket".into()))),
+            classify(Err(td_fetch_client::Error::Io("no td-fetch socket".into()))),
             Err(Failure::Stop { status: None, .. })
         ));
         assert!(matches!(
-            classify(Err(td_fetch::Error::Refused("loopback".into()))),
+            classify(Err(td_fetch_client::Error::Refused("loopback".into()))),
             Err(Failure::Stop { status: None, .. })
         ));
         // A response the service refused for its size came from a run.
@@ -1208,7 +1209,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    classify(Err(td_fetch::Error::Refused(refused.into()))),
+                    classify(Err(td_fetch_client::Error::Refused(refused.into()))),
                     Err(Failure::Retryable { status: None, .. })
                 ),
                 "{refused}"
@@ -1216,11 +1217,11 @@ mod tests {
         }
         // A transport failure after sending may have run.
         assert!(matches!(
-            classify(Err(td_fetch::Error::Transport("reset".into()))),
+            classify(Err(td_fetch_client::Error::Transport("reset".into()))),
             Err(Failure::Retryable { status: None, .. })
         ));
         assert!(matches!(
-            classify(Err(td_fetch::Error::Io("read: timed out".into()))),
+            classify(Err(td_fetch_client::Error::Io("read: timed out".into()))),
             Err(Failure::Retryable { status: None, .. })
         ));
         let long = "x".repeat(2000);
