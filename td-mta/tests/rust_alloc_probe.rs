@@ -1902,6 +1902,40 @@ fn mime_qp_input() {
     assert_eq!(before, after, "owned QP source/text allocated");
 }
 
+fn unicode_lookups() {
+    use td_mta::unicode;
+    let before = COUNTERS.snapshot();
+    for (value, expected, class, lower) in [
+        ('é', "e\u{301}", 0, 'é'),
+        ('\u{ac01}', "\u{1100}\u{1161}\u{11a8}", 0, '\u{ac01}'),
+        ('\u{1fa}', "A\u{30a}\u{301}", 0, '\u{1fb}'),
+        ('\u{0301}', "\u{0301}", 230, '\u{0301}'),
+        ('\u{10400}', "\u{10400}", 0, '\u{10428}'),
+        ('\u{0378}', "\u{0378}", 0, '\u{0378}'),
+    ] {
+        let original = unicode::decompose(black_box(value)).unwrap();
+        let copied = black_box(original);
+        assert!(original.iter().eq(expected.chars()));
+        assert!(copied.iter().eq(expected.chars()));
+        assert_eq!(unicode::combining_class(black_box(value)).unwrap(), class);
+        assert_eq!(unicode::simple_lowercase(black_box(value)).unwrap(), lower);
+    }
+    for (left, right, expected) in [
+        ('e', '\u{301}', Some('é')),
+        ('\u{1100}', '\u{1161}', Some('\u{ac00}')),
+        ('\u{ac00}', '\u{11a8}', Some('\u{ac01}')),
+        ('\u{915}', '\u{93c}', None),
+    ] {
+        assert_eq!(
+            unicode::compose(black_box(left), black_box(right)).unwrap(),
+            expected
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Unicode lookups allocated");
+}
+
 fn mime_qp() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -2322,6 +2356,7 @@ fn main() {
         mime_base64();
         mime_qp();
         mime_qp_input();
+        unicode_lookups();
         mime_input();
         mime_headers();
         body_value();
@@ -2415,6 +2450,7 @@ fn main() {
     mime_base64();
     mime_qp();
     mime_qp_input();
+    unicode_lookups();
     mime_input();
     mime_headers();
     body_value();

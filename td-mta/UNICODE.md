@@ -3,7 +3,8 @@
 This is td-mta's approved upstream data dependency. It adds no Cargo crate,
 runtime file dependency, network fetch during a build, or Unicode library.
 M06m supplies committed inputs and cold verification tooling; M06n generates
-compact tables reproducibly. Runtime lookup and normalization remain open.
+compact tables reproducibly. M06o adds fixed runtime lookups and algorithmic
+Hangul. The streaming normalizer remains open.
 
 ## Inputs
 
@@ -61,8 +62,9 @@ file itself. Capture a candidate from the repository root:
 ```
 
 Check the command succeeds and review the candidate before replacing
-unicode/tables.rs. Shell redirection creates or truncates the candidate
-before verification; any failure can leave it empty or partly written.
+src/unicode_tables.rs. Shell redirection creates or truncates the candidate
+before verification; any failure can leave it empty or partly written. Keep
+candidates outside src so they cannot enter portable source staging.
 
 The generator runs offline and does not invoke a formatter. The emitted
 source already matches the repository's default formatting. The ordinary
@@ -71,14 +73,15 @@ compiles the tables, and checks ordering, scalar values, offsets, class
 count and payload size. The full license notice is retained as comments in
 the generated source.
 
-The current tables contain 2081 decomposition entries (u32 scalar, u16 offset,
-u8 length), 3450 u32 decomposed scalars, 403 combining-class ranges (u32 start,
-u32 end, u8 class), 961 composition triples (three u32 scalars) and 1488 simple
-lowercase pairs (two u32 scalars). Their compiled array payload totals 58720
-bytes on the initial target layout. Slice descriptors, code and mapped-page
-rounding are separate. These tables are compiled by tests only in M06n;
-runtime lookup and algorithmic Hangul remain separate work. Their eventual
-static payload fits within the existing process allowance in RESOURCES.md.
+The current tables contain 2081 decomposition entries (u32 scalar, u16
+offset, u8 length), 3450 u32 decomposed scalars, 403 combining-class ranges
+(u32 start, u32 end, u8 class), 961 composition triples (three u32 scalars)
+and 1488 simple lowercase pairs (two u32 scalars). Their compiled array
+payload totals 58720 bytes on the initial target layout. Slice descriptors,
+code and mapped-page rounding are separate. M06o links these tables into the
+library through checked fixed lookups and implements algorithmic Hangul.
+Their static payload fits within the existing process allowance in
+RESOURCES.md.
 
 Decomposition entries are fully recursively expanded, without canonical
 reordering. The normalizer must still order combining classes and compose.

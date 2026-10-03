@@ -157,5 +157,4 @@ fn allocation_surface_is_separate_and_exact() {
     scan(root, &root.join("tests"));
     scan(root, &root.join("tools"));
     scan(root, &root.join("examples"));
-    scan(root, &root.join("unicode"));
 }

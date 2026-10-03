@@ -1028,6 +1028,31 @@ both bindings and failure retirement, without refunds. Nested source
 checkpoints and protocol output remain separate. The existing
 mime_input::Reader binds this cursor to one immutable raw extent.
 
+### 1.22 Fixed Unicode lookups
+
+M06o supplies the Unicode 17 `unicode` module. `decompose(char)` returns a
+copied `Decomposition` of one to four scalars, at most 20 bytes, exposed by an
+exact-size iterator. The output recursively expands canonical mappings and
+Hangul but does not reorder combining marks. Compatibility mappings remain
+unchanged. `combining_class(char)` returns the pinned class or zero;
+`simple_lowercase(char)` returns one pinned simple mapping or the input.
+This is not full case folding, contextual casing or NFC.
+
+`compose(left, right)` returns an eligible canonical table/Hangul composition
+or None. Its caller must enforce canonical ordering and blocking, including
+class-zero boundaries. All four functions return `InvalidTable` if a checked
+compiled-table access or scalar conversion violates the generator contract;
+unknown valid scalars receive the documented identity/zero/None behavior.
+Private fixed storage cannot grow. These lookups do not allocate, fetch data,
+keep mutable global state, sample a clock or change an admission meter. The
+enclosing cursor charges each bounded operation and checks its deadline.
+
+Sorted static tables bound binary searches independently of message length;
+one decomposition emits at most four scalars. The complete streaming NFC
+cursor, fast/replay storage, checkpoint ownership and interpretation limits
+remain open. The official corpus test here covers all 11172 Hangul syllables,
+not the complete NFC equations.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

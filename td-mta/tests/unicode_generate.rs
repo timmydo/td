@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 #[path = "../tools/unicode_generate.rs"]
 mod generator;
-#[path = "../unicode/tables.rs"]
+#[path = "../src/unicode_tables.rs"]
 mod tables;
 use std::{collections::BTreeSet, mem::size_of_val, path::PathBuf};
 
@@ -11,7 +11,7 @@ use std::{collections::BTreeSet, mem::size_of_val, path::PathBuf};
 fn exact_offline_regeneration_and_compiled_table_bounds() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let generated = generator::generate(&root.join("unicode/17.0.0")).unwrap();
-    assert_eq!(generated, include_str!("../unicode/tables.rs"));
+    assert_eq!(generated, include_str!("../src/unicode_tables.rs"));
     assert_eq!(
         generator::generate(&root.join("unicode/17.0.0")).unwrap(),
         generated

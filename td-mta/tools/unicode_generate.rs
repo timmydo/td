@@ -179,7 +179,7 @@ impl Tables {
             "// Do not edit; UNICODE.md pins inputs and regeneration."
         )
         .map_err(io::Error::other)?;
-        writeln!(out, "\npub const DECOMPOSITION: &[(u32, u16, u8)] = &[")
+        writeln!(out, "\npub static DECOMPOSITION: &[(u32, u16, u8)] = &[")
             .map_err(io::Error::other)?;
         let mut values = Vec::new();
         for (&code, mapping) in &self.decomposition {
@@ -189,7 +189,7 @@ impl Tables {
             values.extend_from_slice(mapping);
         }
         u16::try_from(values.len()).map_err(io::Error::other)?;
-        writeln!(out, "];\npub const DECOMPOSED: &[u32] = &[").map_err(io::Error::other)?;
+        writeln!(out, "];\npub static DECOMPOSED: &[u32] = &[").map_err(io::Error::other)?;
         // Fixed numeric tokens packed to the repository's default 100 columns.
         let mut line = String::from("    ");
         for code in values {
@@ -207,7 +207,8 @@ impl Tables {
         if line.len() > 4 {
             writeln!(out, "{line}").map_err(io::Error::other)?;
         }
-        writeln!(out, "];\npub const CLASSES: &[(u32, u32, u8)] = &[").map_err(io::Error::other)?;
+        writeln!(out, "];\npub static CLASSES: &[(u32, u32, u8)] = &[")
+            .map_err(io::Error::other)?;
         let mut range: Option<(u32, u32, u8)> = None;
         for (&code, &class) in &self.classes {
             if let Some((_, end, old_class)) = range.as_mut() {
@@ -226,13 +227,13 @@ impl Tables {
             writeln!(out, "    (0x{start:04X}, 0x{end:04X}, {class}),")
                 .map_err(io::Error::other)?;
         }
-        writeln!(out, "];\npub const COMPOSITION: &[(u32, u32, u32)] = &[")
+        writeln!(out, "];\npub static COMPOSITION: &[(u32, u32, u32)] = &[")
             .map_err(io::Error::other)?;
         for (&(left, right), &code) in &self.composition {
             writeln!(out, "    (0x{left:04X}, 0x{right:04X}, 0x{code:04X}),")
                 .map_err(io::Error::other)?;
         }
-        writeln!(out, "];\npub const LOWERCASE: &[(u32, u32)] = &[").map_err(io::Error::other)?;
+        writeln!(out, "];\npub static LOWERCASE: &[(u32, u32)] = &[").map_err(io::Error::other)?;
         for (&code, &lower) in &self.lowercase {
             writeln!(out, "    (0x{code:04X}, 0x{lower:04X}),").map_err(io::Error::other)?;
         }

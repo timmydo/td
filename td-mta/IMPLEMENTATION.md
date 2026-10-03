@@ -1278,18 +1278,24 @@ Initial independently landable increments:
   exclusions, class ranges and simple lowercase mappings. Emit licensed Rust
   tables with stable formatting and verify exact regeneration, malformed
   inputs, scalar/offset bounds and the 58720-byte compiled array payload.
-  Runtime lookup, Hangul and complete NFC equations remain open.
+  M06o supplies runtime lookup and Hangul; complete NFC equations remain open.
+
+- **M06o — fixed Unicode lookups:** link the generated tables through checked
+  searches, fixed canonical decomposition, combining classes, simple
+  lowercase and pair composition. Implement algorithmic Hangul and verify
+  every official Hangul syllable vector. Cover all table entries, boundaries,
+  exclusions and allocation-free copied results. Streaming NFC remains open.
 
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
 deterministic MIME serialization for structured outgoing email, including
 attachment streaming, boundary generation through Entropy, reply headers and
-Bcc separation. Use the committed tables in bounded runtime lookups and run
-every official NFC vector. Implement the fixed-memory fast/resident-replay
-algorithm with charged work. Search case mappings come from the same pin. No
-allocating library or ambient Unicode version may replace these contracts.
-Retain static table accounting within the process allowance.
+Bcc separation. Run every official NFC equation through the streaming
+normalizer. Implement the fixed-memory fast/resident-replay algorithm with
+charged work. Search case mappings come from the same pin. No allocating
+library or ambient Unicode version may replace these contracts. Retain
+static table accounting within the process allowance.
 
 **Acceptance:** fragmented input, nested multiparts, malformed encodings, huge
 headers, cyclic-looking boundary data and unsupported charsets do not panic or

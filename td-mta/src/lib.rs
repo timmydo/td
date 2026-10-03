@@ -40,6 +40,7 @@ pub mod tls_admission;
 pub mod tls_io;
 pub mod tls_policy;
 pub mod transport;
+pub mod unicode;
 pub mod wire;
 
 /// Operator configuration schema, independent of the future storage format.
