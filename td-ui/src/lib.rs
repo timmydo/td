@@ -84,6 +84,7 @@ pub mod font;
 mod font_data;
 pub mod hint;
 pub mod keyboard;
+pub mod keys;
 pub mod links;
 pub mod list_model;
 pub mod menus;

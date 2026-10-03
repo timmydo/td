@@ -10,7 +10,7 @@
 //! descriptor of its own in the loop. The window owns the client, the
 //! pinned face, the pointer, the clipboard's transfers and the theme it
 //! paints in, which `theme::CHORD` moves on and the program's theme file
-//! keeps; the handler
+//! keeps, and the key list `keys::CHORD` shows over the frame; the handler
 //! owns everything else, its widgets and their compositions included,
 //! and copies and pastes through the [`Clipboard`] handed it with each
 //! input.
@@ -19,6 +19,7 @@ use crate::client::{App, Client, ClipboardEvent, Handled, KeyboardEvent, Tag};
 use crate::clipboard::{Incoming, Outgoing, MAX_BYTES};
 pub use crate::driven::PointerPhase;
 use crate::font::Font;
+use crate::keys::{self, Help, Panel, Section, Step};
 use crate::pointer::{self, Wheel};
 use crate::raster::{Raster, Scale, Surface};
 use crate::theme::{self, Theme};
@@ -338,6 +339,18 @@ pub trait Handler {
     fn take_scrub(&mut self) -> bool {
         false
     }
+    /// The keys the program binds, as the key list shows them above the
+    /// window's own: read each time the list opens, so a program may list
+    /// what its current view binds first.
+    fn keys(&self) -> Vec<Section> {
+        Vec::new()
+    }
+    /// Takes a request to show the key list, asked after every input: a
+    /// program's own help key opens the window's list with it. An edge,
+    /// answered once per request.
+    fn take_show_keys(&mut self) -> bool {
+        false
+    }
 }
 
 /// The window owns no Wayland objects of its own.
@@ -378,6 +391,11 @@ pub struct Window<'h, H: Handler> {
     /// Whether the handler was last told it has keyboard focus.
     focused: bool,
     board: Board,
+    /// The key list over the frame, and its sections and their lines at
+    /// the surface's width while it is open.
+    help: Help,
+    help_sections: Vec<Section>,
+    help_lines: Vec<keys::Line>,
 }
 
 impl<'h, H: Handler> Window<'h, H> {
@@ -401,6 +419,9 @@ impl<'h, H: Handler> Window<'h, H> {
             title: String::new(),
             focused: false,
             board: Board::default(),
+            help: Help::default(),
+            help_sections: Vec::new(),
+            help_lines: Vec::new(),
         })
     }
 
@@ -426,6 +447,11 @@ impl<'h, H: Handler> Window<'h, H> {
 
     pub fn theme(&self) -> &'static Theme {
         self.theme.theme()
+    }
+
+    /// The key list's state: whether it is shown, and from which line.
+    pub fn help(&self) -> Help {
+        self.help
     }
 
     pub fn handler(&self) -> &H {
@@ -472,6 +498,10 @@ impl<'h, H: Handler> Window<'h, H> {
         withdrawn?;
         if flow == Flow::Quit {
             self.client.close();
+        }
+        // After the close, so a handler that quit opens nothing.
+        if self.handler.take_show_keys() {
+            self.show_keys()?;
         }
         Ok(())
     }
@@ -549,9 +579,57 @@ impl<'h, H: Handler> Window<'h, H> {
             }
         }
         self.dirty = true;
+        if self.help.is_open() {
+            self.lay_out_keys();
+        }
         self.cancel_pointer()?;
         let surface = self.surface;
         self.deliver(Input::Resize(surface))
+    }
+
+    /// Opens the key list from its top with the handler's keys as they
+    /// are now, then the window's own. A drag under way ends first, as
+    /// the list takes the pointer; a closed window opens nothing.
+    fn show_keys(&mut self) -> Result<()> {
+        if self.client.closed() {
+            return Ok(());
+        }
+        self.cancel_pointer()?;
+        self.help_sections = self.handler.keys();
+        self.help_sections.push(keys::window());
+        self.help.open();
+        self.lay_out_keys();
+        Ok(())
+    }
+
+    /// The open list's lines wrapped to the panel the surface holds.
+    fn lay_out_keys(&mut self) {
+        let columns =
+            Panel::new(self.surface).map_or(usize::MAX, |panel| panel.columns(self.surface));
+        self.help_lines = keys::lines(&self.help_sections, columns);
+        self.dirty = true;
+    }
+
+    /// The lines the panel shows at once; one when it does not fit.
+    fn help_page(&self) -> usize {
+        Panel::new(self.surface).map_or(1, |panel| panel.page())
+    }
+
+    /// A chord the open key list takes in the handler's stead.
+    fn help_key(&mut self, chord: &str) -> Step {
+        let step = self
+            .help
+            .key(chord, self.help_lines.len(), self.help_page());
+        match step {
+            Step::Closed => {
+                self.help_sections = Vec::new();
+                self.help_lines = Vec::new();
+                self.dirty = true;
+            }
+            Step::Moved => self.dirty = true,
+            Step::Kept => {}
+        }
+        step
     }
 
     fn next_theme(&mut self) {
@@ -574,6 +652,19 @@ impl<'h, H: Handler> Window<'h, H> {
                     self.next_theme();
                     return Ok(());
                 }
+                // The key list, open, takes every other press, its reading
+                // keys repeating as the handler's would; `keys::CHORD`
+                // opens it.
+                if self.help.is_open() {
+                    let step = self.help_key(&stroke.chord);
+                    if stroke.repeat && step == Step::Moved {
+                        self.client.arm(key, self.clock);
+                    }
+                    return Ok(());
+                }
+                if stroke.chord == keys::CHORD {
+                    return self.show_keys();
+                }
                 self.deliver_at(
                     serial,
                     Input::Key {
@@ -581,7 +672,8 @@ impl<'h, H: Handler> Window<'h, H> {
                         repeat: false,
                     },
                 )?;
-                if stroke.repeat && !self.client.closed() {
+                // A key that opened the list repeats nowhere.
+                if stroke.repeat && !self.client.closed() && !self.help.is_open() {
                     self.client.arm(key, self.clock);
                 }
             }
@@ -647,6 +739,11 @@ impl<'h, H: Handler> Window<'h, H> {
                 button: LEFT,
                 pressed,
             } if self.client.entered().is_some() => {
+                // The key list over the frame takes a press; a release
+                // ends a drag begun before it opened.
+                if pressed && self.help.is_open() {
+                    return Ok(());
+                }
                 if pressed && !self.held {
                     self.held = true;
                     self.button(serial, PointerPhase::Press)?;
@@ -662,7 +759,11 @@ impl<'h, H: Handler> Window<'h, H> {
             }
             P::Frame => {
                 let (rows, columns) = self.wheel.frame();
-                if rows != 0 || columns != 0 {
+                if rows != 0 && self.help.is_open() {
+                    let page = self.help_page();
+                    self.help.wheel(rows, self.help_lines.len(), page);
+                    self.dirty = true;
+                } else if (rows != 0 || columns != 0) && !self.help.is_open() {
                     self.deliver(Input::Wheel { rows, columns })?;
                 }
             }
@@ -885,14 +986,25 @@ impl<H: Handler> App for Window<'_, H> {
             if flow == Flow::Quit {
                 self.client.close();
             }
+            if self.handler.take_show_keys() {
+                self.show_keys()?;
+            }
         }
         self.transfers(now, idle)?;
         if idle && !self.client.closed() {
             if let Some(stroke) = self.client.repeat(now)? {
-                self.deliver(Input::Key {
-                    chord: &stroke.chord,
-                    repeat: true,
-                })?;
+                if self.help.is_open() {
+                    // A repeat that stops moving the list stops; the next
+                    // press arms another.
+                    if self.help_key(&stroke.chord) != Step::Moved {
+                        self.client.cancel_repeat();
+                    }
+                } else {
+                    self.deliver(Input::Key {
+                        chord: &stroke.chord,
+                        repeat: true,
+                    })?;
+                }
             }
         }
         let mut wait = self.client.wait_ms(now).min(self.handler.wait_ms(now));
@@ -912,6 +1024,10 @@ impl<H: Handler> App for Window<'_, H> {
         if !self.dirty || !self.client.can_present() {
             return Ok(());
         }
+        if self.help.is_open() {
+            let page = self.help_page();
+            self.help.clamp(self.help_lines.len(), page);
+        }
         // The title goes out before the frame's commit; a retitle made
         // while painting rides the next frame.
         if self.handler.title() != self.title {
@@ -927,6 +1043,8 @@ impl<H: Handler> App for Window<'_, H> {
             font,
             typeface,
             theme,
+            help,
+            help_lines,
             ..
         } = self;
         let presented = client.present(surface.width, surface.height, &mut |pixels| {
@@ -934,7 +1052,15 @@ impl<H: Handler> App for Window<'_, H> {
                 .map_err(|why| why.to_string())?
                 .with_typeface(typeface.as_mut())
                 .with_theme(theme.theme());
-            handler.paint(&mut raster, surface)
+            handler.paint(&mut raster, surface)?;
+            // A surface too small for the panel shows the handler's frame;
+            // the list keeps its keys until it is closed.
+            if let Some(panel) = help.is_open().then(|| Panel::new(surface)).flatten() {
+                panel.emit(surface, help, help_lines, surface.bounds(), &mut |draw| {
+                    raster.draw(draw)
+                });
+            }
+            Ok(())
         })?;
         if presented {
             self.dirty = false;

@@ -220,6 +220,12 @@ td-photo and the task manager paint their live windows in their theme
 and move it on `F12`, each keeping its own file. td-term and the
 portal's chooser stay in `SAND` (see "Themes").
 
+Newly built (increment 35): the key list `keys`, a program's keys and
+the window's own shown over the frame on `F1`, under "Key list" below.
+The widget window shows it for every program it serves, asking the
+handler for its sections when it opens; a program that lists none shows
+the window's own keys alone.
+
 ## Purpose and trust position
 
 td-ui is target-zone source: it ships only inside the programs that embed
@@ -402,6 +408,14 @@ of its own files may name each module.
   from a path and `host` from a program id, each with the notice a bad
   file gives; `theme`; `advance`, which moves the theme and writes it,
   returning why it was not kept).
+- `keys`: `Row` and `row`, a key and what it does; `Section`, a titled
+  block of rows (`new` from `(keys, what)` pairs); `window`, the
+  window's own section; `Line` and `lines`, the list as text; `Help`, the
+  list's state (`open`, `close`, `is_open`, `first`, `key` with its
+  `Step`, `clamp`, `wheel`); `Panel`, its place over a surface (`new`,
+  `page`, `columns`, `emit`); `CHORD`, `MAX_KEYS_COLUMN`, `MIN_WRAP`,
+  `MAX_COLUMNS`, `MARGIN`, `TITLE` and `TITLE_HINT`. Pure. Under "Key
+  list" below.
 - `pinned_face`: `load` from `host_places`, `load_in` given places and
   `load_from` a directory, the regular style through `face_file::read`;
   `SETTING`, re-exported; and `load_or_note` and `load_in_or_note` given
@@ -669,9 +683,10 @@ of its own files may name each module.
   `NoClipboard`, which refuses everything, for a test or a headless run;
   the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
   `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`,
-  `take_withdrawal`, `take_scrub`); `Object`, the empty tag;
-  `Window<'h, H>` (`new`, `with_typeface`, `with_theme_file`, `theme`,
-  `handler`, `handler_mut`, `surface`), the `App` over a handler it
+  `take_withdrawal`, `take_scrub`, `keys`, `take_show_keys`); `Object`,
+  the empty tag; `Window<'h, H>` (`new`, `with_typeface`,
+  `with_theme_file`, `theme`, `help`, `handler`, `handler_mut`,
+  `surface`), the `App` over a handler it
   borrows; and `run` with an optional `Typeface`, which reads the
   program's theme file, under "Widget window" below.
 - The editor core, under "Editor core" below: `editor_text`, the text
@@ -1727,7 +1742,8 @@ after checking it and bounding the read, lists directories in one place,
 builds its paths from its own names alone, reads exactly its three
 directory values from the environment and writes nothing, and that
 `pinned_face` reads only through it; that `theme` is pure and
-`theme_file` reads exactly its two configuration values, opens its file
+`keys` is pure and `theme_file` reads exactly its two configuration
+values, opens its file
 nonblocking under its bound, makes and locks its directory and writes
 only a private `create_new` sibling it renames over the file; and the
 raw layer: the complete
@@ -2014,6 +2030,71 @@ the handler, the frame repainted in the next theme's paper with the
 handler's own colour passed through, the file written and read back by a
 later window, a held key not repeating, `S-F12` delivered, and a file
 naming no theme starting the default with a notice.
+
+`keys::CHORD`, `F1` with no modifier, is the window's too: it opens the
+key list over the frame (see "Key list" below), asking the handler's
+`keys` for its sections then and ending them with `keys::window`. While
+the list is open the window keeps every press but `theme::CHORD` from
+the handler, the list taking its reading and closing keys and a held
+key repeating there while it moves the list; a drag under way when it
+opens is cancelled, so a left-button press, the motion and the release
+after it are the list's and reach nobody; the wheel scrolls it. A
+handler's own help key opens the same list through `take_show_keys`, an
+edge asked after every input and every poll as `take_withdrawal` is; a
+closed window opens nothing. The lines are laid out at the panel's
+width when the list opens and again when the surface changes, and the
+first shown line is held to the last page before each paint. The list
+is painted after the handler's paint, into the same raster, so it is in
+the window's theme; a surface with no room for it shows the handler's
+frame alone while the list keeps the keys until it is closed, and
+closing it drops its lines and paints the frame again. The test pins
+`F1` kept and the list open, its title bar painted over the handler's
+frame and the frame in the margin, a reading key and its repeat
+scrolling it, a handler key, a press and a release reaching nobody, the
+wheel scrolling it, `F12` still moving the theme, `Escape` closing it,
+the handler's key opening it from its top through `take_show_keys`,
+`F1` closing it unheard and the frame painted again, and a drag cancelled
+when the list opens with its motion and release reaching nobody.
+
+## Key list
+
+`keys` is what a program's keys look like to the person reading them:
+sections of rows, each row the keys as written in the program's own
+documentation (`j/k`, `C-x C-s`, `1-9`) and what they do, a row with
+no keys continuing the description above it. A program owns its rows;
+nothing checks them against a keymap, so a program whose bindings live
+in a table derives its rows from that table and one whose bindings are
+code lists them beside it. `lines` makes the text: each section's
+title, its rows indented with the keys padded to the widest of all the
+rows, at most `MAX_KEYS_COLUMN` cells, so one long key runs on rather
+than pushing every description right, and a blank line between
+sections. A description wider than the columns left beside its keys
+wraps at its spaces onto lines under it, aligned with it, a word wider
+than that at its width; at least `MIN_WRAP` columns are left, below
+which the list clips it. Every list ends with `window`, the window's
+own `F1` and `F12`.
+
+`Help` is the list's state, whether it is open and its first shown line.
+`Escape`, `q`, `?` (the help key of the programs that have one) and
+`CHORD` close it; `j`, `Down`, `k`, `Up`, `PageDown`, space (the
+keymap's `" "`), `PageUp`, `Home`, `g`, `End` and `G` scroll it, held so
+the last line stays on the last row, as `clamp` holds it when the page
+or the lines change; any other key is kept from the program while the
+list is open, so a key read while looking up keys does nothing behind
+it. `Panel` places it `MARGIN` cells in from the surface's edges and at
+most `MAX_COLUMNS` cells wide, centred, with a one-pixel border at the
+scale around a `ROW`-tall title bar in the selection's colours, `TITLE`
+at its left and `TITLE_HINT` at its right where it fits beside the
+title, and chrome's `List` under it: no row is selected, and a section
+title's row is left blank there and its title painted in `ACCENT` where
+the list puts a label. `columns` is the cells a line has there. `None`
+when the surface cannot hold the title bar and one row. The tests pin
+the lines (titles, padding, the ceiling, the window's section last,
+wrapping and its floor), every reading and closing key with the clamp at
+both ends, `clamp`, the wheel, a kept key, the hint naming `CHORD`, the
+panel's place, title bar, hint left out on a slim panel and accented
+titles, the lines fitting its columns, nothing painted outside its
+frame, and no panel on a surface too small.
 
 ## Themes
 
@@ -3590,3 +3671,7 @@ regressions. Those increments extend the original sequence below.
     the task manager, each painting its live window in its theme and
     moving it on `F12`; td-term and the portal's chooser stay in `SAND`.
     Landed.
+35. The key list: `keys`, shown by the widget window on `F1` over the
+    frame with the handler's sections and the window's own, scrolled and
+    closed by its own keys, and opened by a handler's help key through
+    `take_show_keys`. Landed.

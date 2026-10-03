@@ -1,0 +1,374 @@
+//! The key list a window shows over its frame on `CHORD`: the sections of
+//! keys its program says it binds, then the window's own, in a bordered
+//! panel with a title bar, scrolled by the reading keys and the wheel and
+//! closed by `Escape`, `q` or `CHORD` again. A program says what its keys
+//! are as `Section`s of `Row`s, the keys as the user reads them (`j/k`,
+//! `C-x C-s`) and what they do; nothing here reads a keymap or checks a
+//! row against one. Pure: the lines, a chord's effect on the list's state
+//! and a draw stream.
+
+use crate::chrome::{Item, List, ROW};
+use crate::raster::{
+    text_run, Draw, GlyphStyle, Primitive, Rect, Surface, ACCENT, BORDER, CHROME, PAPER, SELECTED,
+};
+use crate::{theme, CELL_WIDTH};
+
+/// The chord that shows the key list, and hides it again.
+pub const CHORD: &str = "F1";
+/// The widest keys column the lines pad to; a wider keys cell runs into
+/// its description, two spaces after it.
+pub const MAX_KEYS_COLUMN: usize = 24;
+/// The panel's widest extent in cells.
+pub const MAX_COLUMNS: usize = 100;
+/// The panel's margin from the surface's edges, in cells.
+pub const MARGIN: usize = 2;
+pub const TITLE: &str = "Keys";
+/// How to close the list, at the title bar's right where it fits beside
+/// `TITLE`.
+pub const TITLE_HINT: &str = "F1, q or Escape closes";
+/// The narrowest description a wrapped row keeps: below it the
+/// description runs on and the list clips it.
+pub const MIN_WRAP: usize = 16;
+
+/// A key, or keys read together, and what it does. Empty keys continue
+/// the row above's description.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Row {
+    pub keys: &'static str,
+    pub what: &'static str,
+}
+
+/// A row from a `(keys, what)` pair, for a program's constant tables.
+pub const fn row((keys, what): (&'static str, &'static str)) -> Row {
+    Row { keys, what }
+}
+
+/// A titled block of rows: a view's keys, a mode's, the window's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Section {
+    pub title: &'static str,
+    pub rows: Vec<Row>,
+}
+
+impl Section {
+    pub fn new(title: &'static str, rows: &[(&'static str, &'static str)]) -> Self {
+        Self {
+            title,
+            rows: rows.iter().copied().map(row).collect(),
+        }
+    }
+}
+
+/// The window's own keys, which every list ends with.
+pub fn window() -> Section {
+    Section::new(
+        "Window",
+        &[
+            (CHORD, "show or hide this list of keys"),
+            (theme::CHORD, "next colour theme, kept for this program"),
+        ],
+    )
+}
+
+/// One line of the list: a section's title, or a row as text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Line {
+    pub text: String,
+    pub title: bool,
+}
+
+/// The list's lines for `sections` at `columns` cells wide: each
+/// section's title, then its rows, indented, with the keys padded to the
+/// widest of them all but at most `MAX_KEYS_COLUMN`, a blank line between
+/// sections. A description wider than what is left of `columns` wraps at
+/// its spaces onto lines under it, a word wider than that at its width;
+/// the space left is at least `MIN_WRAP`.
+pub fn lines(sections: &[Section], columns: usize) -> Vec<Line> {
+    let width = sections
+        .iter()
+        .flat_map(|section| &section.rows)
+        .map(|row| row.keys.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_KEYS_COLUMN);
+    let mut out = Vec::new();
+    let plain = |text: String| Line { text, title: false };
+    for section in sections {
+        if !out.is_empty() {
+            out.push(plain(String::new()));
+        }
+        out.push(Line {
+            text: section.title.to_string(),
+            title: true,
+        });
+        for row in &section.rows {
+            let head = format!("  {:width$}  ", row.keys);
+            let room = columns.saturating_sub(head.chars().count()).max(MIN_WRAP);
+            let mut parts = wrap(row.what, room).into_iter();
+            out.push(plain(format!("{head}{}", parts.next().unwrap_or_default())));
+            let indent = " ".repeat(width + 4);
+            out.extend(parts.map(|part| plain(format!("{indent}{part}"))));
+        }
+    }
+    out
+}
+
+/// `text` in pieces of at most `room` characters, broken at spaces where
+/// a word allows, a run of spaces read as one; one empty piece for empty
+/// text.
+fn wrap(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
+    let mut out = Vec::new();
+    let mut line: Vec<char> = Vec::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        if !line.is_empty() && line.len() + 1 + word.len() > room {
+            out.push(line.drain(..).collect());
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.append(&mut word);
+        // Only a word wider than the room leaves the line wider.
+        while line.len() > room {
+            let rest = line.split_off(room);
+            out.push(line.drain(..).collect());
+            line = rest;
+        }
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line.into_iter().collect());
+    }
+    out
+}
+
+/// What a chord did to the open list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Step {
+    /// The list closed.
+    Closed,
+    /// The list scrolled, or held at an end.
+    Moved,
+    /// Not one of the list's keys. The list keeps it from the program all
+    /// the same while it is open.
+    Kept,
+}
+
+/// Whether the list is shown, and its first shown line.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Help {
+    open: bool,
+    first: usize,
+}
+
+impl Help {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Shows the list from its top.
+    pub fn open(&mut self) {
+        *self = Self {
+            open: true,
+            first: 0,
+        };
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    pub fn first(&self) -> usize {
+        self.first
+    }
+
+    /// A chord while the list is open over `total` lines, `page` of them
+    /// shown: `Escape`, `q`, `?` and `CHORD` close it; `j`, `Down`, `k`,
+    /// `Up`, `PageDown`, `" "`, `PageUp`, `Home`, `g`, `End` and `G`
+    /// scroll it, stopping where the last line is on the last row.
+    pub fn key(&mut self, chord: &str, total: usize, page: usize) -> Step {
+        let page = page.max(1);
+        let last = total.saturating_sub(page);
+        let first = match chord {
+            "Escape" | "q" | "?" | CHORD => {
+                self.open = false;
+                return Step::Closed;
+            }
+            "j" | "Down" => self.first.saturating_add(1),
+            "k" | "Up" => self.first.saturating_sub(1),
+            // The keymap spells an unmodified space as itself.
+            "PageDown" | " " => self.first.saturating_add(page),
+            "PageUp" => self.first.saturating_sub(page),
+            "Home" | "g" => 0,
+            "End" | "G" => last,
+            _ => return Step::Kept,
+        };
+        self.first = first.min(last);
+        Step::Moved
+    }
+
+    /// Holds the first line where the last line is on the last row, as
+    /// the surface or the lines change under it.
+    pub fn clamp(&mut self, total: usize, page: usize) {
+        self.first = self.first.min(total.saturating_sub(page.max(1)));
+    }
+
+    /// Wheel travel of `rows` lines, down when positive.
+    pub fn wheel(&mut self, rows: isize, total: usize, page: usize) {
+        let last = total.saturating_sub(page.max(1));
+        let travel = rows.unsigned_abs();
+        self.first = if rows < 0 {
+            self.first.saturating_sub(travel)
+        } else {
+            self.first.saturating_add(travel)
+        }
+        .min(last);
+    }
+}
+
+/// The panel over a surface: `MARGIN` cells in from its edges and at most
+/// `MAX_COLUMNS` cells wide, centred, a one-pixel border at the scale
+/// around a `ROW`-tall title bar and the list under it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Panel {
+    pub frame: Rect,
+    pub title: Rect,
+    pub list: List,
+}
+
+impl Panel {
+    /// `None` when the surface cannot hold the title bar and one row.
+    pub fn new(surface: Surface) -> Option<Self> {
+        let s = surface.scale.value();
+        let margin = MARGIN.checked_mul(CELL_WIDTH)?.checked_mul(s)?;
+        let width = surface
+            .width
+            .checked_sub(margin.checked_mul(2)?)?
+            .min(MAX_COLUMNS.checked_mul(CELL_WIDTH)?.checked_mul(s)?);
+        let height = surface.height.checked_sub(margin.checked_mul(2)?)?;
+        let frame = Rect {
+            x: i64::try_from((surface.width - width) / 2).ok()?,
+            y: i64::try_from(margin).ok()?,
+            width: u32::try_from(width).ok()?,
+            height: u32::try_from(height).ok()?,
+        };
+        let border = u32::try_from(s).ok()?;
+        let inner = Rect {
+            x: frame.x + i64::from(border),
+            y: frame.y + i64::from(border),
+            width: frame.width.checked_sub(border.checked_mul(2)?)?,
+            height: frame.height.checked_sub(border.checked_mul(2)?)?,
+        };
+        let title = Rect {
+            height: u32::try_from(ROW.checked_mul(s)?).ok()?,
+            ..inner
+        };
+        let list = List::new(
+            surface,
+            Rect {
+                y: inner.y + i64::from(title.height),
+                height: inner.height.checked_sub(title.height)?,
+                ..inner
+            },
+        )?;
+        (list.rows() > 0).then_some(Self { frame, title, list })
+    }
+
+    /// The lines shown at once.
+    pub fn page(&self) -> usize {
+        self.list.rows()
+    }
+
+    /// The cells a line has: the row's text starts after the list's inset
+    /// and its two-cell prefix, and stops an inset short of the gutter.
+    pub fn columns(&self, surface: Surface) -> usize {
+        let cell = CELL_WIDTH.saturating_mul(surface.scale.value()).max(1);
+        (self.list.body().width as usize / cell).saturating_sub(4)
+    }
+
+    /// Paints the panel showing `lines` from `help`'s first: the border,
+    /// the title bar in the selection's colours with `TITLE` at its left
+    /// and `TITLE_HINT` at its right, and the lines as the list's rows,
+    /// each title in `ACCENT`.
+    pub fn emit(
+        &self,
+        surface: Surface,
+        help: &Help,
+        lines: &[Line],
+        damage: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        let s = surface.scale.value() as i64;
+        let cell = CELL_WIDTH as i64 * s;
+        fill(self.frame, BORDER, damage, sink);
+        fill(self.title, SELECTED, damage, sink);
+        let style = GlyphStyle::medium(PAPER, SELECTED);
+        let top = self.title.y + 4 * s;
+        text_run(
+            surface.scale,
+            TITLE.chars(),
+            (self.title.x + cell, top),
+            self.title,
+            style,
+            damage,
+            sink,
+        );
+        // Where it would meet the title it is left out.
+        let hint = TITLE_HINT.chars().count() as i64 + 1;
+        let room = i64::from(self.title.width) / cell.max(1);
+        if room >= hint + TITLE.chars().count() as i64 + 2 {
+            text_run(
+                surface.scale,
+                TITLE_HINT.chars(),
+                (
+                    self.title.x + i64::from(self.title.width) - hint * cell,
+                    top,
+                ),
+                self.title,
+                style,
+                damage,
+                sink,
+            );
+        }
+        let first = help.first.min(lines.len());
+        let shown = lines.get(first..).unwrap_or_default();
+        // A title's row is left blank here and painted in the accent below.
+        let items = shown.iter().map(|line| Item {
+            label: if line.title { "" } else { &line.text },
+            meta: "",
+            enabled: true,
+            marked: false,
+        });
+        // No row is selected: the list is read, not chosen from.
+        self.list
+            .emit(items, first, usize::MAX, lines.len(), damage, sink);
+        let accent = GlyphStyle::medium(ACCENT, CHROME);
+        // Chrome's row label sits one cell's inset and its two-cell
+        // prefix in, four pixels down at the scale.
+        for (index, line) in shown.iter().enumerate() {
+            let Some(rect) = self.list.row(index) else {
+                break;
+            };
+            if line.title {
+                text_run(
+                    surface.scale,
+                    line.text.chars(),
+                    (rect.x + 3 * cell, rect.y + 4 * s),
+                    rect,
+                    accent,
+                    damage,
+                    sink,
+                );
+            }
+        }
+    }
+}
+
+fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    if let Some(clip) = rect.intersection(damage) {
+        sink(Draw {
+            clip,
+            primitive: Primitive::Fill { rect, color },
+        });
+    }
+}

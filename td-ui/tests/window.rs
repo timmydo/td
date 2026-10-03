@@ -25,7 +25,8 @@ use std::time::Duration;
 use td_ui::client::{App, DISPLAY, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, XDG_SURFACE};
 use td_ui::clipboard::MAX_BYTES;
 use td_ui::data::{PLAIN, UTF8};
-use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight, PAPER};
+use td_ui::keys::{self, Section};
+use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight, PAPER, SELECTED};
 use td_ui::theme::{HARBOR, MOSS, SAND};
 use td_ui::typeface::Typeface;
 use td_ui::wayland::{backing_file, peer, Connection, IDLE_WAIT};
@@ -99,6 +100,11 @@ struct Recorder {
     withdraw: bool,
     /// Asks the window to clear its frames, answered once.
     scrub: bool,
+    /// The keys the recorder says it binds, and the chord on which it
+    /// asks the window for its key list.
+    keys: Vec<Section>,
+    help_on: Option<String>,
+    show_keys: bool,
 }
 
 impl Recorder {
@@ -120,6 +126,9 @@ impl Recorder {
             states: Vec::new(),
             withdraw: false,
             scrub: false,
+            keys: Vec::new(),
+            help_on: None,
+            show_keys: false,
         }
     }
     fn paints(&self) -> usize {
@@ -208,6 +217,9 @@ impl Handler for Recorder {
             if self.paste_on.as_deref() == Some(name.as_str()) {
                 self.outcomes.push(clipboard.paste());
             }
+            if self.help_on.as_deref() == Some(name.as_str()) {
+                self.show_keys = true;
+            }
         }
         let quit = self.quit_on.as_ref() == Some(&record);
         self.inputs.push(record);
@@ -246,6 +258,12 @@ impl Handler for Recorder {
     }
     fn take_scrub(&mut self) -> bool {
         std::mem::take(&mut self.scrub)
+    }
+    fn keys(&self) -> Vec<Section> {
+        self.keys.clone()
+    }
+    fn take_show_keys(&mut self) -> bool {
+        std::mem::take(&mut self.show_keys)
     }
 }
 
@@ -693,6 +711,172 @@ fn the_theme_chord_repaints_in_the_next_theme_keeps_it_and_is_not_delivered() {
     assert!(w.handler().notices[0].contains("names no theme"));
     drop(w);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F1 shows the key list over the handler's frame; while it is open the
+/// list takes every press but F12, repeats included, and the left
+/// button's press, and the wheel scrolls it; Escape closes it, and the
+/// handler's own help key opens it through `take_show_keys`.
+#[test]
+fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
+    const F1: u32 = 59;
+    const ESCAPE: u32 = 1;
+    const J: u32 = 36;
+    const X: u32 = 45;
+    let mut handler = Recorder::new();
+    let rows: Vec<(&'static str, &'static str)> = vec![("x", "record an x"); 40];
+    handler.keys = vec![Section::new("Recorder", &rows)];
+    handler.help_on = Some("x".into());
+    let (mut w, peer, keyboard, pointer) = fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    configure(&mut w, 400, 240);
+    w.draw().unwrap();
+    done(&mut w);
+    let buffer = w.client().buffers()[0].id();
+    w.event(message(buffer, 0, &[])).unwrap();
+    let (_, mut files) = drain(&peer);
+    let file = files.pop().unwrap();
+    let seen = w.handler().inputs.len();
+    w.event(message(keyboard, 4, &[30, 0, 0, 0, 0])).unwrap();
+    press(&mut w, keyboard, 31, F1);
+    release(&mut w, keyboard, 32, F1);
+    assert!(w.help().is_open());
+    assert_eq!(w.handler().inputs.len(), seen, "the window keeps F1");
+    // Painted at once: the panel's title bar over the handler's frame,
+    // which still shows in the margin around it.
+    w.draw().unwrap();
+    assert_eq!(w.handler().paints(), 2);
+    let mut bytes = vec![0; 400 * 240 * 4];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    let panel = keys::Panel::new(w.surface()).unwrap();
+    let title = panel.title;
+    assert_eq!(
+        pixel(&bytes, 400, title.x as usize + 2, title.y as usize + 1),
+        SELECTED
+    );
+    assert_eq!(pixel(&bytes, 400, 3, 3), BLUE, "the handler's frame");
+    // The list's keys are the list's: j scrolls it, a repeat of it
+    // scrolls again, and x, the handler's, reaches nobody.
+    press(&mut w, keyboard, 33, J);
+    assert_eq!(w.help().first(), 1);
+    w.end_turn(10_000, true).unwrap();
+    w.end_turn(11_000, true).unwrap();
+    assert!(w.help().first() > 1, "the repeat scrolls the list");
+    release(&mut w, keyboard, 34, J);
+    press(&mut w, keyboard, 35, X);
+    release(&mut w, keyboard, 36, X);
+    assert_eq!(w.handler().inputs.len(), seen);
+    // The wheel scrolls it and a press on it reaches nobody either.
+    w.event(message(pointer, 0, &[37, SURFACE, fixed(200), fixed(120)]))
+        .unwrap();
+    let before = w.help().first();
+    w.event(message(pointer, 8, &[0, 1])).unwrap();
+    w.event(message(pointer, 4, &[0, 0, fixed(15)])).unwrap();
+    w.event(message(pointer, 5, &[])).unwrap();
+    assert_eq!(w.help().first(), before + 3);
+    w.event(message(pointer, 3, &[38, 0, 0x110, 1])).unwrap();
+    w.event(message(pointer, 3, &[39, 0, 0x110, 0])).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+    // F12 is still the window's theme chord.
+    press(&mut w, keyboard, 40, 88);
+    release(&mut w, keyboard, 41, 88);
+    assert_eq!(w.theme(), &HARBOR);
+    assert!(w.help().is_open());
+    // Escape closes it, and x is the handler's again; there it asks for
+    // the list, which opens from its top.
+    press(&mut w, keyboard, 42, ESCAPE);
+    release(&mut w, keyboard, 43, ESCAPE);
+    assert!(!w.help().is_open());
+    assert_eq!(w.handler().inputs.len(), seen);
+    press(&mut w, keyboard, 44, X);
+    assert_eq!(last(&w), Some(&Record::Key("x".into(), false)));
+    assert!(w.help().is_open());
+    assert_eq!(w.help().first(), 0);
+    release(&mut w, keyboard, 45, X);
+    // F1 closes it as it opened it, reaching nobody, and the frame is
+    // painted again without it: the frame before it is presented and
+    // done, so only the close leaves the window dirty.
+    let seen = w.handler().inputs.len();
+    done(&mut w);
+    let painted = w.handler().paints();
+    w.draw().unwrap();
+    assert_eq!(w.handler().paints(), painted + 1);
+    done(&mut w);
+    w.draw().unwrap();
+    assert_eq!(w.handler().paints(), painted + 1, "nothing left to paint");
+    press(&mut w, keyboard, 46, F1);
+    assert!(!w.help().is_open());
+    assert_eq!(w.handler().inputs.len(), seen);
+    let paints = w.handler().paints();
+    w.draw().unwrap();
+    assert_eq!(w.handler().paints(), paints + 1, "closing repaints");
+    release(&mut w, keyboard, 47, F1);
+    // A drag under way when the list opens ends there: the handler hears
+    // it cancelled, and neither the motion nor the release after.
+    w.event(message(pointer, 3, &[48, 0, 0x110, 1])).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::Pointer(
+            PointerPhase::Press,
+            200,
+            120,
+            false,
+            false
+        ))
+    );
+    press(&mut w, keyboard, 49, F1);
+    assert_eq!(last(&w), Some(&Record::CancelPointer));
+    let seen = w.handler().inputs.len();
+    w.event(message(pointer, 2, &[50, fixed(210), fixed(130)]))
+        .unwrap();
+    w.event(message(pointer, 3, &[51, 0, 0x110, 0])).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+}
+
+/// The open list is laid out again for a surface that changes under it,
+/// a narrower one wrapping its lines, and its first line is held to the
+/// last page before a paint; a handler's poll may open it too.
+#[test]
+fn the_key_list_follows_the_surface_and_a_poll_may_open_it() {
+    const F1: u32 = 59;
+    const END: u32 = 107;
+    let mut handler = Recorder::new();
+    let rows: Vec<(&'static str, &'static str)> =
+        vec![("x", "record an x, and say so in a line long enough to wrap"); 30];
+    handler.keys = vec![Section::new("Recorder", &rows)];
+    let (mut w, peer, keyboard, _) = fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    configure(&mut w, 800, 240);
+    w.draw().unwrap();
+    done(&mut w);
+    w.event(message(keyboard, 4, &[30, 0, 0, 0, 0])).unwrap();
+    press(&mut w, keyboard, 31, F1);
+    release(&mut w, keyboard, 32, F1);
+    press(&mut w, keyboard, 33, END);
+    release(&mut w, keyboard, 34, END);
+    let wide = w.help().first();
+    assert!(wide > 0);
+    // Narrower, the rows wrap, so there are more lines and End's first
+    // line is no longer the last page's.
+    configure(&mut w, 300, 240);
+    press(&mut w, keyboard, 35, END);
+    release(&mut w, keyboard, 36, END);
+    let narrow = w.help().first();
+    assert!(
+        narrow > wide,
+        "{narrow} lines past {wide}: the rows wrapped"
+    );
+    // Taller, the page grows and a paint holds the first line to it.
+    configure(&mut w, 300, 600);
+    w.draw().unwrap();
+    assert!(w.help().first() < narrow, "clamped to the taller page");
+    done(&mut w);
+    press(&mut w, keyboard, 37, F1);
+    assert!(!w.help().is_open());
+    // A poll that asks for the list opens it.
+    w.handler_mut().show_keys = true;
+    w.end_turn(20_000, false).unwrap();
+    assert!(w.help().is_open());
 }
 
 #[test]
