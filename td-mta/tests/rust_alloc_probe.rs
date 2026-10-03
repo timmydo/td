@@ -3343,6 +3343,93 @@ fn budgeted_raw_output() {
     assert_eq!(before, after, "budgeted Raw JSON allocated");
 }
 
+fn raw_header_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property,
+        header_select::SourceEnd,
+        header_value::{Raw, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let source = format!("X:{}\r\nX:last\r\n\r\nbody", "a".repeat(16384));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut key = header_property::Cursor::new("header:X:all", header_property::Context::Email);
+    let mut selected = None;
+    for _ in 0..100 {
+        if let header_property::Status::Complete(value) = key.poll(Tick(1), &mut work).unwrap() {
+            selected = value;
+            break;
+        }
+    }
+    let selected = selected.unwrap();
+    let before = COUNTERS.snapshot();
+    let mut cursor = Raw::new(
+        black_box(source.as_bytes()),
+        0,
+        source.len() as u64,
+        selected,
+        SourceEnd::Prefix,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut output = [0; 1];
+    let mut written = 0;
+    let mut complete = false;
+    for _ in 0..200_000 {
+        let progress = cursor.poll(Tick(1), &mut output).unwrap();
+        written += progress.written;
+        if let Status::Complete(end) = progress.status {
+            assert_eq!(end.body_start, source.len() as u64 - 4);
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(written, 16384 + 11);
+    cursor.check_deadline(Tick(1)).unwrap();
+    let mut cursor = Raw::new(
+        b"X:a\nOther: long\n\n",
+        0,
+        5,
+        selected,
+        SourceEnd::Eof,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut refused = false;
+    let mut written = 0;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                assert!(!matches!(progress.status, Status::Complete(_)));
+                written += progress.written;
+            }
+            Err(error) => {
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(written, 4);
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Raw property assembly allocated");
+}
+
 fn header_properties() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4262,6 +4349,7 @@ fn main() {
         header_selection();
         header_selection_budget();
         budgeted_raw_output();
+        raw_header_values();
         header_properties();
         header_nfc();
         phrase_nfc();
@@ -4384,6 +4472,7 @@ fn main() {
     header_selection();
     header_selection_budget();
     budgeted_raw_output();
+    raw_header_values();
     header_properties();
     header_nfc();
     phrase_nfc();

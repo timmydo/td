@@ -1522,6 +1522,13 @@ Initial independently landable increments:
   and allocation-free fragmented output. Whole-field ownership and publication
   remain separate.
 
+- **M06at — provisional Raw property values:** compose aggregate selection,
+  conversion and JSON into last/all values with null/empty-array absence.
+  Move the same live budget borrows through successful per-value handoffs;
+  stage only bounded punctuation and retain terminal whole-property failure.
+  Cover exact layered charges, tiny sinks, late refusal and allocation-free
+  assembly. Other forms and unpublished response-spool retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

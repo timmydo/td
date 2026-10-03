@@ -30,6 +30,7 @@ pub mod header_raw;
 pub mod header_select;
 pub mod header_text;
 pub mod header_urls;
+pub mod header_value;
 mod header_work;
 pub mod ids;
 pub mod json_string;

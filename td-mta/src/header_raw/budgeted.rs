@@ -36,6 +36,15 @@ impl<'a, 'w> Budgeted<'a, 'w> {
     pub const fn is_encoding_problem(&self) -> bool {
         self.cursor.is_encoding_problem()
     }
+    pub(crate) fn finish(self) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !self.cursor.complete {
+            return Err(Error::InvalidState);
+        }
+        Ok((self.work, self.budget))
+    }
     pub(crate) fn charge_output(&mut self, now: Tick, output_bytes: u64) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);
@@ -144,6 +153,26 @@ mod tests {
             )
             .unwrap();
         budget
+    }
+    #[test]
+    fn budget_handoff_requires_successful_complete_state() {
+        let mut work = work();
+        let mut budget = HeaderBudget::new();
+        let cursor = Budgeted::new(b"a", &mut work, &mut budget);
+        assert!(matches!(cursor.finish(), Err(Error::InvalidState)));
+        let mut cursor = Budgeted::new(b"a", &mut work, &mut budget);
+        assert_eq!(cursor.poll(Tick(1)), Ok(Status::Scalar('a')));
+        assert_eq!(cursor.poll(Tick(1)), Ok(Status::Complete));
+        let before = (cursor.work.remaining(), cursor.budget.steps_remaining());
+        let (work, budget) = cursor.finish().unwrap();
+        assert_eq!((work.remaining(), budget.steps_remaining()), before);
+        let mut cursor = Budgeted::new(b"", work, budget);
+        assert_eq!(cursor.poll(Tick(1)), Ok(Status::Complete));
+        assert_eq!(
+            cursor.charge_output(Tick(100), 0),
+            Err(Error::Work(Stop::Deadline))
+        );
+        assert!(matches!(cursor.finish(), Err(Error::Work(Stop::Deadline))));
     }
     #[test]
     fn budgeted_raw_preserves_identity_and_exact_scalar_costs() {

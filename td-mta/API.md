@@ -2371,6 +2371,60 @@ covers long one-byte JSON output and output refusal in both registered modes.
 Selection-to-value ownership, other forms and retained publication remain
 follow-on work; this component does not qualify complete worker memory.
 
+### 1.52 Complete provisional Raw header values
+
+M06at adds `header_value::Raw`, composing occurrence selection, aggregate Raw
+conversion and JSON framing for one already parsed Raw property. Following RFC
+8621 section 4.1.3, a single occurrence returns the last matching field or
+null; `:all` returns an array in source order, including an empty array when
+absent. An empty field remains an empty string. Non-Raw properties return
+UnsupportedForm before work or output. The caller authorizes and retains the
+complete resident header source, property key and supplied header-byte limit.
+Base offsets and Prefix/EOF meaning remain those of the selector.
+
+The coordinator exclusively borrows one job meter and email HeaderBudget for
+its whole lifetime. Its ownership enum moves those same references into each
+fresh budgeted Raw source and accepts them back only after successful scalar
+completion. The private consuming handoff rejects unpolled, partial or failed
+sources. No cloned meter, copied credit, self-reference or refund is involved;
+unused per-value prepaid credit is discarded. Selector credit survives value
+conversion and remains attached to the same job. Field extents are checked
+against the original resident slice before conversion.
+
+A poll performs at most one selector or Raw/JSON child turn, plus bounded
+fixed ownership and literal actions. Literal punctuation and null use four
+fixed bytes; string staging remains the existing six-byte Frame. Every output
+byte, including brackets and commas, is precharged once before fragmentable
+copying. Output chunks contain at most six bytes. Empty output checks the live
+budgets/deadline and returns NeedOutput without advancing. JSON framing costs
+no header-interpretation steps; child bounds remain at most 255 visits, 256
+steps and 16 job records per coordinator turn. The complete coordinator fits
+640 bytes in the existing 16 KiB parser-state reservation; source/property
+arenas and the caller's existing JSON output buffer are separate.
+
+All output is provisional, including values emitted before a later header scan
+fails. The caller writes chunks only to ADMISSION.md section 4's unpublished
+response tail. A field Complete is insufficient to publish a method index or
+HTTP response; the whole method/request must satisfy that retention contract.
+Any refusal discards its method's provisional tail. No whole-value buffer,
+response-sized heap object or truncation-to-success is introduced. Spool I/O
+and response publication are not implemented here.
+
+Success returns the selector's exact header/body boundary and final encoding
+diagnostic. Cached completion is inert. Explicit final deadline checks remain
+live and invalidate a completed value on refusal. Failures latch with typed
+selection, Raw, JSON, job or aggregate causes. Direct framing charges return
+Work; value-owner checks/comma staging return Raw(Work); string-frame charges
+return Json(Raw(Work)); selector work returns Selection(Work). Aggregate
+causes retain the analogous nesting. Callers classify the underlying cause,
+not only the outer wrapper. Failures leave caller output untouched on later
+calls. Tests cover last/all/absent/empty/repaired fields, base offsets, actual
+EOF and incomplete prefixes, one-byte output, exact charges across values, late
+scan refusal, output limits, ownership handoff and final retirement. An
+allocation interval covers long values and failure after a provisional prefix.
+Other parsed forms, spool retention and complete worker qualification remain
+separate increments.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

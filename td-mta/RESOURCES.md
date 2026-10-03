@@ -982,6 +982,19 @@ interpretation credit. Allocation intervals cover long one-byte serialization
 and terminal output refusal. Whole-worker stack, native allocation and RSS
 remain unqualified.
 
+The Raw property coordinator (M06at) fits 640 bytes in the 16 KiB parser-state
+reservation, including occurrence selection, one budgeted Raw owner, JSON
+Frame and four literal bytes. It owns no header, property-key or output arena.
+This path moves the Raw state into the coordinator; it does not simultaneously
+use the standalone Raw state in the 2 KiB decoder reservation. Each turn calls
+at most one bounded child plus fixed ownership/literal actions, copying at
+most six output bytes; aggregate bounds stay 255 visits, 256 steps and 16 job
+records. JSON chunks use the HTTPS slot's existing 16 KiB output region and
+belong to an unpublished response-spool tail; there is no whole-value memory
+reservation. Allocation intervals cover long values, live budget handoffs and
+late refusal. Spool I/O and combined worker/native/RSS qualification remain
+open.
+
 Private JSON Frame state fits 32 bytes and owns no source or work reference.
 The public borrowed adapter still fits 64 bytes; extraction does not introduce
 another simultaneous frame. A future coordinator may retain its parser and
