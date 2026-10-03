@@ -24,6 +24,7 @@ pub mod header_date;
 pub mod header_delimited;
 pub mod header_mailbox;
 pub mod header_message_ids;
+pub mod header_name;
 pub mod header_phrase;
 pub mod header_property;
 pub mod header_raw;

@@ -1130,6 +1130,17 @@ four output bytes. Allocation intervals cover long Parsed/Fallback text,
 repair, noncharacters and refusals. Name/property composition and combined
 worker/native/RSS qualification remain open.
 
+The selected display-name coordinator (M06bf) fits 1280 bytes in the existing
+16 KiB parser reservation and borrows the existing 3072-byte NFC scratch.
+Its inline normalization state replaces the NFC region's standalone cursor;
+that cursor slot is unused on this path. Validation and normalization run
+in separate turns with the original budgets and separate private credit.
+Per-turn ceilings are 255 visits, 256 steps and sixteen job records; scalar
+events carry no serialized-output charge. No name/token list or extra arena
+is retained. Allocation intervals cover long phrase/comment input, overflow
+replay, scratch reuse and final refusal. JSON composition and combined
+worker/native/RSS qualification remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

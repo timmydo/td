@@ -2953,6 +2953,55 @@ repair and refusals in both registered modes. Name normalization, complete
 address-property composition, unpublished response-spool retention and
 combined worker/native/RSS qualification remain follow-on work.
 
+### 1.64 Selected display-name validation and normalization
+
+M06bf adds `header_name::Cursor` for a caller-selected Phrase or Comment
+extent within one admitted field value. Construction checks the range but
+reads no name text. The caller remains responsible for selecting the display
+name from the mailbox/group grammar and authorizing the field/form. This
+cursor never interprets an address identity or grants delivery authority.
+
+One inline owner first validates the complete selected phrase or exactly one
+parenthesized comment. It admits grammar work through the shared Parsing
+policy under the original job/email budgets and retains private credit. Only
+successful completion consumes the grammar cursor into its source-bound
+proof. The owner then lends the same original budgets and NFC scratch to the
+existing phrase/comment decoder and normalizer. Phrase proof binding checks
+the exact source extent inside the original field. Validation credit is
+discarded at this handoff; normalization starts its own private credit.
+There is no replacement budget, alternate input or allocating transition.
+
+The cursor emits no scalar before whole-name validation. It retains the
+existing display-name rules for encoded words, phrase gaps, comment text,
+character filtering, UTF-8 repair and NFC, including fixed-scratch overflow
+replay. Scalar output and encoding diagnostics remain provisional until
+Complete. Malformed, nesting, job and aggregate failures stay typed and
+sticky. Validation admission errors carry the selected Phrase/Comment label;
+normalization errors carry Normalize. No failure silently chooses another
+name. A cached Complete is inert, while explicit check_deadline can still
+retire it. Empty valid names remain empty names, distinct from absence
+selected by the mailbox owner.
+
+The owner fits 1280 bytes in the existing 16 KiB parser reservation and
+borrows the existing 3072-byte NFC scratch. Its inline normalization state
+replaces the standalone cursor in the NFC region, leaving that region's
+cursor slot unused on this path. Each poll executes one bounded grammar or
+normalization turn, with at most 255 visits, 256 aggregate steps and sixteen
+job records. It does not charge serialized output: scalars are internal
+conversion events; a future JSON coordinator must charge its actual bytes
+before staging them. No name string, token list or new arena is retained.
+
+Tests cover exact selected extents, malformed/nesting refusal before output,
+encoded words, filtering, diagnostics and shared-scratch overflow replay.
+Independent validation plus normalization pins composed charges and the
+private-credit handoff. Exhaustive partial byte/step limits cover
+validation, normalization, late scalar refusal and cross-field exhaustion.
+Deadline checks cover validation, the handoff and completed values. Probe
+intervals cover long phrase/comment input, overflow replay, scratch reuse
+and final refusal in both registered modes. Name JSON, complete
+address-property composition, response-spool publication and
+worker/native/RSS qualification remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

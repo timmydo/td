@@ -1604,6 +1604,13 @@ Initial independently landable increments:
   identity spelling and selected encoding diagnostics. Cover partial limits,
   private credit and allocation-free long input. Property JSON remains open.
 
+- **M06bf — selected display-name normalization:** validate one admitted
+  phrase/comment extent under original budgets, consume its source-bound
+  proof and hand the same budgets/scratch to NFC. Preserve typed failures,
+  private credit and selected diagnostics. Cover exact composed costs,
+  partial limits, overflow replay and allocation-free handoff. Name JSON
+  and address-property composition remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

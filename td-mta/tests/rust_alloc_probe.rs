@@ -3202,6 +3202,106 @@ fn url_header_values() {
     assert_eq!(before, after, "URLs property assembly allocated");
 }
 
+fn selected_header_names() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_name::{Cursor, Error, Extent, Kind, Status},
+        nfc::{self, HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let phrase = "e\u{301}".repeat(4096);
+    let comment = format!("({phrase})");
+    let overflow = format!("e{}", "\u{315}\u{301}".repeat(257));
+    let expected = format!("é{}{}", "\u{301}".repeat(256), "\u{315}".repeat(257));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut scratch = Scratch::new();
+    let before = COUNTERS.snapshot();
+    for (source, kind, count) in [
+        (phrase.as_bytes(), Kind::Phrase, 4096),
+        (comment.as_bytes(), Kind::Comment, 4096),
+    ] {
+        let mut cursor = Cursor::new(
+            black_box(source),
+            Extent {
+                start: 0,
+                end: source.len(),
+            },
+            kind,
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut scalars = 0;
+        let mut complete = false;
+        for _ in 0..200_000 {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Scalar(value) => {
+                    assert_eq!(value, 'é');
+                    scalars += 1;
+                }
+                Status::Yield => {}
+                Status::Complete => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete);
+        assert_eq!(scalars, count);
+        assert!(!cursor.is_encoding_problem());
+        cursor.check_deadline(Tick(1)).unwrap();
+    }
+    let mut cursor = Cursor::new(
+        overflow.as_bytes(),
+        Extent {
+            start: 0,
+            end: overflow.len(),
+        },
+        Kind::Phrase,
+        &mut work,
+        &mut budget,
+        &mut scratch,
+    )
+    .unwrap();
+    let mut characters = expected.chars();
+    let mut complete = false;
+    for _ in 0..1_000_000 {
+        match cursor.poll(Tick(1)).unwrap() {
+            Status::Scalar(value) => assert_eq!(Some(value), characters.next()),
+            Status::Yield => {}
+            Status::Complete => {
+                complete = true;
+                break;
+            }
+        }
+    }
+    assert!(complete);
+    assert_eq!(characters.next(), None);
+    assert_eq!(
+        cursor.check_deadline(Tick(100)),
+        Err(Error::Normalize(nfc::Error::Work(Stop::Deadline)))
+    );
+    assert_eq!(
+        cursor.poll(Tick(1)),
+        Err(Error::Normalize(nfc::Error::Work(Stop::Deadline)))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(
+        before, after,
+        "selected name validation/normalization allocated"
+    );
+}
+
 fn budgeted_address_text() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -5270,6 +5370,7 @@ fn main() {
         budgeted_date_projection();
         header_dates();
         url_header_values();
+        selected_header_names();
         budgeted_address_text();
         budgeted_header_addresses();
         budgeted_header_urls();
@@ -5404,6 +5505,7 @@ fn main() {
     budgeted_date_projection();
     header_dates();
     url_header_values();
+    selected_header_names();
     budgeted_address_text();
     budgeted_header_addresses();
     budgeted_header_urls();

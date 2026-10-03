@@ -366,6 +366,11 @@ pub struct Cursor<'a, 'w> {
     encoding_problem: bool,
 }
 impl<'a, 'w> Cursor<'a, 'w> {
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> (Charge, u64) {
+        (self.work.remaining(), self.budget.steps_remaining())
+    }
+
     pub fn new(
         text: &'a str,
         scratch: &'w mut Scratch,

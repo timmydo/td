@@ -1,6 +1,7 @@
 //! Exact comment grammar proofs for separately selected fallback display names.
 use crate::{
     admission::work::{Charge, Meter},
+    decode_work::Work,
     header_cfws,
     ports::Tick,
 };
@@ -55,6 +56,13 @@ impl<'a> Cursor<'a> {
         })
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -67,7 +75,7 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         work.charge(
             now,
             Charge {
@@ -75,7 +83,7 @@ impl<'a> Cursor<'a> {
                 ..Charge::default()
             },
         )?;
-        match self.inner.poll(now, work)? {
+        match self.inner.poll_with_work(now, work)? {
             header_cfws::Status::Yield => Ok(Status::Yield),
             header_cfws::Status::Comment(comment) => {
                 if self.seen || comment.start != 0 || comment.end != self.source.len() {
