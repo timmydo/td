@@ -1100,11 +1100,10 @@ errors are sticky and invalidate the entire provisional property, including
 any scalar already returned. Cached completion does not recheck the clock.
 
 This entry point accepts valid UTF-8 only; NUL, noncharacters and unassigned
-scalars retain their Unicode normalization semantics. Decoded email-header
-cursors, malformed UTF-8 replacement, encoded words, I-JSON filtering and
-protocol integration remain separate. Callers must enforce the admitted
-source extent. The complete official NFC equations and adversarial resident
-replay tests do not establish those future adapters or whole-service memory.
+scalars retain their Unicode normalization semantics. Section 1.27 adds a
+separate decoded unstructured-header entry point. Callers must enforce the
+admitted source extent. Protocol integration remains separate; Unicode
+conformance and bounded replay do not establish whole-service memory.
 
 ### 1.24 Encoded-word candidate syntax
 
@@ -1176,8 +1175,8 @@ not a composed-header memory or stack qualification. Lexical placement,
 adjacent-word whitespace suppression, unfolding, initial-SP removal, NFC
 and protocol output remain enclosing header responsibilities. In particular,
 a caller cannot treat candidate recognition as placement authorization or
-join charset bytes from separate words. Resident NFC composition with a
-replayable header source remains a subsequent increment.
+join charset bytes from separate words. Section 1.27 composes the resident
+unstructured-header source with NFC.
 
 ### 1.26 Resident unstructured header decoding
 
@@ -1206,7 +1205,7 @@ adjacency rule. Removing a NUL or other decoded control does not retroactively
 create lexical boundaries or a new initial-SP trim opportunity.
 
 The copied cursor fits 208 bytes, including its borrowed source and current
-word decoder, within the future 256-byte decoding checkpoint. It owns no
+word decoder, within the 256-byte decoding checkpoint. It owns no
 header string, candidate buffer or whitespace buffer. Candidate scans stop
 after at most 76 raw bytes; an oversized token streams literally thereafter.
 Whitespace scanning/replay advances one unfolded byte per poll. Recognition
@@ -1219,9 +1218,61 @@ The cursor latches failures; copied checkpoints contain no meter and the
 owner must retain retirement across them. The owner brackets turns with
 clock/cancellation checks and charges output bytes separately. Cached Complete
 is inert. The final diagnostic combines literal and word decoding problems.
-NFC integration must also retain the aggregate header source/step budget,
-exact restart points and the four-checkpoint memory reservation. No complete
-normalization pipeline, worker stack or service activation is claimed here.
+Section 1.27 connects this cursor to NFC with aggregate header source/step
+accounting and exact restart points. This standalone entry point uses only
+the job meter. Worker stack and service activation remain unqualified.
+
+### 1.27 Normalized unstructured headers
+
+M06t supplies `nfc::Cursor::from_unstructured_header(bytes, scratch, meter,
+header_budget)`. It uses section 1.26's resident decoding before canonical
+normalization, including composition across adjacent encoded words. The
+caller must first authorize one unstructured field/form and exclude its final
+line ending. Structured header parsing, header-form selection, provisional
+property publication, JSON escaping and worker scheduling remain external.
+The valid-UTF8 constructor retains section 1.23's original scalar semantics.
+
+Both constructors borrow the same exclusive Scratch, live job Meter and
+aggregate HeaderBudget. Source checkpoints now hold either a valid UTF-8
+position or the complete unstructured-header decoding state, plus pending
+canonical expansion. Each fits 256 bytes; the complete cursor plus aggregate
+budget remains within 1024 bytes alongside the 3072-byte scratch. A checked
+successful-turn ordinal identifies exact deterministic header state together
+with source pointer/length, without scanning any prefix. Failed cursors are
+retired before comparisons. Restore includes states inside a word, charset
+sequence, candidate scan, whitespace replay or decomposition. EOF replay ends
+at the before-turn checkpoint; resumption retains the consumed EOF state.
+
+A private charging interface routes every source/lookahead, recognition and
+charset charge through the aggregate header budget before work. Each header
+poll and canonical decomposition also charges a step; each normalizer state
+transition and decomposed scalar retains section 1.23's charges. Thus source
+visits include decoding lookahead, charset-byte visits and repeated
+candidate scans. Job records prepay these steps in groups of 16, with
+private credit outside checkpoints; a recognition batch can prepay several
+groups at once. No refund or copied credit bypasses either live budget.
+Standalone decoder APIs continue to use the supplied job Meter directly.
+Internal interpretation-limit errors remain distinct from malformed data and
+enclosing job refusals.
+
+Header normalization performs one engine transition per poll, at most 228
+aggregate steps and 15 job records, within the 256-step fairness ceiling.
+Valid UTF-8 retains its 32-transition/128-step/eight-record bound. Output is
+charged through `charge_output` on the same borrowed meter; a zero-byte
+charge checks the post-turn deadline. Clock/cancellation checks remain with
+the caller. All failures retire the whole provisional property and aggregate
+interpretation refusal retires that budget across later header projections.
+The final `is_encoding_problem` combines literal/word/noncharacter diagnostics
+across original scanning and replay. Completion is inert; output-charge
+refusal still retires a completed cursor.
+
+Fixtures cover cross-word canonical/Hangul composition, filtering before NFC,
+long replay across word/decomposition checkpoints, exact no-prefix-rescan
+visits, default-budget maximal ASCII, shared limits and deadline failures.
+Allocation intervals include fast and overflow paths with output charging.
+The complete official resident Unicode corpus remains the normalization
+oracle. No new allocation, dependency or unsafe surface is introduced; these
+checks do not establish whole-worker stack or service RSS qualification.
 
 ## 2. Read views and change history
 

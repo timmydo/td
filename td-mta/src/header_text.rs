@@ -2,6 +2,7 @@
 pub use crate::encoded_word::decode::Status;
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::Work,
     encoded_word::{self, Context, Word},
     mime_charset::{Charset, Decoder, Status as Decoded},
     ports::Tick,
@@ -10,6 +11,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl std::fmt::Display for Error {
@@ -17,10 +19,20 @@ impl std::fmt::Display for Error {
         match self {
             Self::Work(error) => write!(f, "header text work: {error}"),
             Self::InvalidState => f.write_str("invalid header text state"),
+            Self::InterpretationLimit => f.write_str("header interpretation limit"),
         }
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            crate::decode_work::Error::InterpretationLimit => Self::InterpretationLimit,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 impl From<crate::mime_charset::Error> for Error {
     fn from(error: crate::mime_charset::Error) -> Self {
         match error {
@@ -55,6 +67,7 @@ enum Phase {
 #[derive(Clone, Copy)]
 pub struct Cursor<'a> {
     source: &'a [u8],
+    turn: u64,
     position: usize,
     scan: usize,
     token_start: usize,
@@ -70,6 +83,7 @@ impl<'a> Cursor<'a> {
     pub const fn new(source: &'a [u8]) -> Self {
         Self {
             source,
+            turn: 0,
             position: 0,
             scan: 0,
             token_start: 0,
@@ -89,20 +103,35 @@ impl<'a> Cursor<'a> {
                 None => false,
             }
     }
+    // Immutable deterministic input makes the turn ordinal an O(1) exact
+    // checkpoint identity. Failed cursors are retired before comparison.
+    pub(crate) fn at(&self, other: &Self) -> bool {
+        std::ptr::eq(self.source, other.source) && self.turn == other.turn
+    }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
         if matches!(self.phase, Phase::Complete) {
             return Ok(Status::Complete);
         }
-        let result = self.step(now, work);
+        let result = self.step(now, work).and_then(|status| {
+            self.turn = self.turn.checked_add(1).ok_or(Error::InvalidState)?;
+            Ok(status)
+        });
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn byte(&self, at: usize, now: Tick, work: &mut Meter) -> Result<Option<u8>, Error> {
+    fn byte(&self, at: usize, now: Tick, work: &mut impl Work) -> Result<Option<u8>, Error> {
         if at > self.source.len() {
             return Err(Error::InvalidState);
         }
@@ -113,12 +142,17 @@ impl<'a> Cursor<'a> {
                 ..Charge::default()
             },
         )
-        .map_err(Error::Work)?;
+        .map_err(Error::from)?;
         Ok(self.source.get(at).copied())
     }
     // Fold removal preserves the following whitespace. Return that octet
     // and its complete raw extent so checkpoints need no unfolding buffer.
-    fn atom(&self, at: usize, now: Tick, work: &mut Meter) -> Result<Option<(u8, usize)>, Error> {
+    fn atom(
+        &self,
+        at: usize,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Option<(u8, usize)>, Error> {
         let Some(byte) = self.byte(at, now, work)? else {
             return Ok(None);
         };
@@ -158,9 +192,9 @@ impl<'a> Cursor<'a> {
         byte: u8,
         next: usize,
         now: Tick,
-        work: &mut Meter,
+        work: &mut impl Work,
     ) -> Result<Status, Error> {
-        let decoded = self.literal.poll(&[byte], false, now, work)?;
+        let decoded = self.literal.poll_with_work(&[byte], false, now, work)?;
         if decoded.consumed == 1 {
             self.position = next;
             if !matches!(self.phase, Phase::EmitGap) {
@@ -196,8 +230,8 @@ impl<'a> Cursor<'a> {
             }
         }
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
-        work.charge(now, Charge::default()).map_err(Error::Work)?;
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
+        work.charge(now, Charge::default()).map_err(Error::from)?;
         match self.phase {
             Phase::Leading => {
                 match self.atom(self.position, now, work)? {
@@ -260,7 +294,9 @@ impl<'a> Cursor<'a> {
                     .source
                     .get(self.token_start..self.scan)
                     .ok_or(Error::InvalidState)?;
-                match Word::recognize(token, Context::Text, now, work).map_err(Error::Work)? {
+                match Word::recognize_with_work(token, Context::Text, now, work)
+                    .map_err(Error::from)?
+                {
                     Some(word) => {
                         self.word = Some(encoded_word::decode::Cursor::new(word));
                         self.position = self.scan;
@@ -272,7 +308,7 @@ impl<'a> Cursor<'a> {
             }
             Phase::Word => {
                 let word = self.word.as_mut().ok_or(Error::InvalidState)?;
-                let status = word.poll(now, work)?;
+                let status = word.poll_with_work(now, work)?;
                 self.problem |= word.is_encoding_problem();
                 if status == Status::Complete {
                     self.word = None;
@@ -284,7 +320,7 @@ impl<'a> Cursor<'a> {
                 }
             }
             Phase::Finish => {
-                let decoded = self.literal.poll(&[], true, now, work)?;
+                let decoded = self.literal.poll_with_work(&[], true, now, work)?;
                 self.literal_status(decoded.status)
             }
             Phase::Complete => Ok(Status::Complete),

@@ -1,4 +1,4 @@
-//! Bounded NFC over resident UTF-8; decoded-header integration is separate.
+//! Bounded NFC over resident UTF-8 or authorized unstructured header bytes.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     ports::Tick,
@@ -67,9 +67,10 @@ impl HeaderBudget {
             self.exhausted = true;
             return Err(Error::InterpretationLimit);
         };
-        let records = u64::from(steps > u64::from(*credit));
+        let records = steps.saturating_sub(u64::from(*credit)).div_ceil(16);
+        let prepaid = records.checked_mul(16).ok_or(Error::InvalidState)?;
         let next_credit = u64::from(*credit)
-            .checked_add(records * 16)
+            .checked_add(prepaid)
             .and_then(|value| value.checked_sub(steps))
             .and_then(|value| u8::try_from(value).ok())
             .ok_or(Error::InvalidState)?;
@@ -119,27 +120,88 @@ impl Scratch {
     }
 }
 
+struct DecodeWork<'w> {
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: &'w mut u8,
+}
+impl crate::decode_work::Work for DecodeWork<'_> {
+    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), crate::decode_work::Error> {
+        use crate::decode_work::Error as DecodeError;
+        if charge.output_bytes != 0 || charge.unlinks != 0 {
+            return Err(DecodeError::InvalidState);
+        }
+        self.budget
+            .charge(self.work, now, charge.io_bytes, charge.records, self.credit)
+            .map_err(|error| match error {
+                Error::Work(stop) => DecodeError::Work(stop),
+                Error::InterpretationLimit => DecodeError::InterpretationLimit,
+                Error::InvalidState | Error::InvalidTable => DecodeError::InvalidState,
+            })
+    }
+}
+impl From<crate::header_text::Error> for Error {
+    fn from(error: crate::header_text::Error) -> Self {
+        match error {
+            crate::header_text::Error::Work(stop) => Self::Work(stop),
+            crate::header_text::Error::InterpretationLimit => Self::InterpretationLimit,
+            crate::header_text::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum Input<'a> {
+    Utf8 { text: &'a str, position: usize },
+    Header(crate::header_text::Cursor<'a>),
+}
 #[derive(Clone, Copy)]
 struct Source<'a> {
-    text: &'a str,
-    position: usize,
+    input: Input<'a>,
     pending: Option<Decomposition>,
     next: u8,
+}
+enum Read {
+    Cell(Cell),
+    Yield,
+    End,
 }
 impl<'a> Source<'a> {
     fn new(text: &'a str) -> Self {
         Self {
-            text,
-            position: 0,
+            input: Input::Utf8 { text, position: 0 },
+            pending: None,
+            next: 0,
+        }
+    }
+    fn header(bytes: &'a [u8]) -> Self {
+        Self {
+            input: Input::Header(crate::header_text::Cursor::new(bytes)),
             pending: None,
             next: 0,
         }
     }
     fn at(&self, other: &Self) -> bool {
-        std::ptr::eq(self.text, other.text)
-            && self.position == other.position
-            && self.pending == other.pending
-            && self.next == other.next
+        let same = match (self.input, other.input) {
+            (
+                Input::Utf8 { text, position },
+                Input::Utf8 {
+                    text: right,
+                    position: at,
+                },
+            ) => std::ptr::eq(text, right) && position == at,
+            (Input::Header(left), Input::Header(right)) => left.at(&right),
+            _ => false,
+        };
+        same && self.pending == other.pending && self.next == other.next
+    }
+    fn is_header(&self) -> bool {
+        matches!(self.input, Input::Header(_))
+    }
+    fn is_encoding_problem(&self) -> bool {
+        match self.input {
+            Input::Header(cursor) => cursor.is_encoding_problem(),
+            Input::Utf8 { .. } => false,
+        }
     }
     fn read(
         &mut self,
@@ -147,26 +209,45 @@ impl<'a> Source<'a> {
         budget: &mut HeaderBudget,
         credit: &mut u8,
         now: Tick,
-    ) -> Result<Option<Cell>, Error> {
+    ) -> Result<Read, Error> {
         if self.pending.is_none() {
-            let text = self.text.get(self.position..).ok_or(Error::InvalidState)?;
-            let Some(first) = text.as_bytes().first() else {
-                return Ok(None);
+            let value = match &mut self.input {
+                Input::Utf8 { text, position } => {
+                    let tail = text.get(*position..).ok_or(Error::InvalidState)?;
+                    let Some(first) = tail.as_bytes().first() else {
+                        return Ok(Read::End);
+                    };
+                    let width = match first {
+                        0..=0x7f => 1,
+                        0x80..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        _ => 4,
+                    };
+                    budget.charge(work, now, width, 2, credit)?;
+                    let value = tail.chars().next().ok_or(Error::InvalidState)?;
+                    *position = position
+                        .checked_add(value.len_utf8())
+                        .ok_or(Error::InvalidState)?;
+                    value
+                }
+                Input::Header(cursor) => {
+                    budget.charge(work, now, 0, 1, credit)?;
+                    let mut charged = DecodeWork {
+                        work,
+                        budget,
+                        credit,
+                    };
+                    match cursor.poll_with_work(now, &mut charged)? {
+                        crate::header_text::Status::Scalar(value) => {
+                            budget.charge(work, now, 0, 1, credit)?;
+                            value
+                        }
+                        crate::header_text::Status::Yield => return Ok(Read::Yield),
+                        crate::header_text::Status::Complete => return Ok(Read::End),
+                    }
+                }
             };
-            // Valid str guarantees a scalar boundary and its encoded width.
-            let width = match first {
-                0..=0x7f => 1,
-                0x80..=0xdf => 2,
-                0xe0..=0xef => 3,
-                _ => 4,
-            };
-            budget.charge(work, now, width, 2, credit)?;
-            let value = text.chars().next().ok_or(Error::InvalidState)?;
             self.pending = Some(unicode::decompose(value).map_err(|_| Error::InvalidTable)?);
-            self.position = self
-                .position
-                .checked_add(value.len_utf8())
-                .ok_or(Error::InvalidState)?;
             self.next = 0;
         }
         budget.charge(work, now, 0, 1, credit)?;
@@ -181,7 +262,7 @@ impl<'a> Source<'a> {
             self.pending = None;
             self.next = 0;
         }
-        Ok(Some(Cell { value, class }))
+        Ok(Read::Cell(Cell { value, class }))
     }
 }
 
@@ -231,6 +312,7 @@ pub struct Cursor<'a, 'w> {
     ordered_left: u32,
     failure: Option<Error>,
     work_credit: u8,
+    encoding_problem: bool,
 }
 impl<'a, 'w> Cursor<'a, 'w> {
     pub fn new(
@@ -239,7 +321,23 @@ impl<'a, 'w> Cursor<'a, 'w> {
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
     ) -> Self {
-        let source = Source::new(text);
+        Self::from_source(Source::new(text), scratch, work, budget)
+    }
+    /// The caller must authorize an unstructured field/form before normalization.
+    pub fn from_unstructured_header(
+        bytes: &'a [u8],
+        scratch: &'w mut Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Self {
+        Self::from_source(Source::header(bytes), scratch, work, budget)
+    }
+    fn from_source(
+        source: Source<'a>,
+        scratch: &'w mut Scratch,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Self {
         Self {
             scratch,
             work,
@@ -263,7 +361,12 @@ impl<'a, 'w> Cursor<'a, 'w> {
             ordered_left: 0,
             failure: None,
             work_credit: 0,
+            encoding_problem: false,
         }
+    }
+    /// Final at completion; source malformation is distinct from budget refusal.
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.encoding_problem
     }
     /// Charge actual serialized bytes, or zero for a post-turn deadline check.
     /// Refusal retires the cursor even after its final scalar was returned.
@@ -301,7 +404,8 @@ impl<'a, 'w> Cursor<'a, 'w> {
         result
     }
     fn advance(&mut self, now: Tick) -> Result<Status, Error> {
-        for _ in 0..32 {
+        let turns = if self.scan.is_header() { 1 } else { 32 };
+        for _ in 0..turns {
             self.budget
                 .charge(self.work, now, 0, 1, &mut self.work_credit)?;
             if let Some(status) = self.step(now)? {
@@ -314,11 +418,12 @@ impl<'a, 'w> Cursor<'a, 'w> {
         match self.phase {
             Phase::Scan => {
                 let before = self.scan;
-                match self
+                let read = self
                     .scan
-                    .read(self.work, self.budget, &mut self.work_credit, now)?
-                {
-                    Some(cell) if cell.class == 0 => {
+                    .read(self.work, self.budget, &mut self.work_credit, now)?;
+                self.encoding_problem |= self.scan.is_encoding_problem();
+                match read {
+                    Read::Cell(cell) if cell.class == 0 => {
                         if self.initial.is_none() && self.used == 0 && !self.overflow {
                             self.initial = Some(cell.value);
                             self.start = self.scan;
@@ -329,10 +434,12 @@ impl<'a, 'w> Cursor<'a, 'w> {
                             self.prepare()?;
                         }
                     }
-                    Some(cell) => self.mark(cell)?,
-                    None => {
+                    Read::Cell(cell) => self.mark(cell)?,
+                    Read::Yield => return Ok(Some(Status::Yield)),
+                    Read::End => {
+                        // Header EOF advances its cursor; exclude that turn from replay.
                         self.boundary = None;
-                        self.end = self.scan;
+                        self.end = before;
                         self.resume = self.scan;
                         self.prepare()?;
                     }
@@ -532,10 +639,15 @@ impl<'a, 'w> Cursor<'a, 'w> {
             };
             return Ok(Ordered::Yield);
         }
-        let cell = self
+        let read = self
             .scan
-            .read(self.work, self.budget, &mut self.work_credit, now)?
-            .ok_or(Error::InvalidState)?;
+            .read(self.work, self.budget, &mut self.work_credit, now)?;
+        self.encoding_problem |= self.scan.is_encoding_problem();
+        let cell = match read {
+            Read::Cell(cell) => cell,
+            Read::Yield => return Ok(Ordered::Yield),
+            Read::End => return Err(Error::InvalidState),
+        };
         if cell.class == class {
             self.ordered_left = self
                 .ordered_left
@@ -611,7 +723,7 @@ mod tests {
     #[test]
     fn fixed_layout_and_basic_composition_boundaries() {
         assert_eq!(std::mem::size_of::<Scratch>(), 3072);
-        assert!(std::mem::size_of::<Source<'_>>() <= 64);
+        assert!(std::mem::size_of::<Source<'_>>() <= 256);
         assert!(
             std::mem::size_of::<Cursor<'_, '_>>() + std::mem::size_of::<HeaderBudget>() <= 1024
         );
@@ -788,7 +900,10 @@ mod tests {
             let mut reached = false;
             for _ in 0..10000 {
                 reached = match phase {
-                    0 => matches!(cursor.phase, Phase::Scan) && cursor.scan.position > 0,
+                    0 => {
+                        matches!(cursor.phase, Phase::Scan)
+                            && matches!(cursor.scan.input, Input::Utf8 { position, .. } if position > 0)
+                    }
                     1 => matches!(cursor.phase, Phase::Insert { .. }),
                     2 => cursor.overflow && matches!(cursor.phase, Phase::Compute),
                     3 => cursor.overflow && matches!(cursor.phase, Phase::Emit),
@@ -838,5 +953,315 @@ mod tests {
         let mut cursor = Cursor::new("e\u{301}", &mut scratch, &mut work, &mut budget);
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Scalar('é')));
         assert_eq!(cursor.poll(Tick(1)), Ok(Status::Complete));
+    }
+    fn header(input: &[u8]) -> (String, bool, u64) {
+        let mut scratch = Scratch::new();
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 1000).unwrap(),
+            Charge {
+                io_bytes: crate::admission::WorkLimits::default().foreground_io_bytes,
+                records: crate::admission::WorkLimits::default().foreground_records,
+                output_bytes: 32 * 1024 * 1024,
+                ..Charge::default()
+            },
+        );
+        let before = work.remaining();
+        let mut budget = HeaderBudget::new();
+        let mut cursor =
+            Cursor::from_unstructured_header(input, &mut scratch, &mut work, &mut budget);
+        assert!(std::mem::size_of_val(&cursor) + std::mem::size_of::<HeaderBudget>() <= 1024);
+        assert!(std::mem::size_of::<Source<'_>>() <= 256);
+        let mut output = String::new();
+        for _ in 0..1_000_000 {
+            let steps = cursor.budget.steps_remaining();
+            let records = cursor.work.remaining().records;
+            let status = cursor.poll(Tick(1)).unwrap();
+            assert!(steps - cursor.budget.steps_remaining() <= 228);
+            assert!(records - cursor.work.remaining().records <= 15);
+            match status {
+                Status::Scalar(value) => {
+                    cursor
+                        .charge_output(Tick(1), value.len_utf8() as u64)
+                        .unwrap();
+                    output.push(value);
+                }
+                Status::Yield => {}
+                Status::Complete => {
+                    let problem = cursor.is_encoding_problem();
+                    assert_eq!(
+                        before.io_bytes - work.remaining().io_bytes,
+                        16 * 1024 * 1024 - budget.source_bytes_remaining()
+                    );
+                    return (output, problem, before.io_bytes - work.remaining().io_bytes);
+                }
+            }
+        }
+        panic!("header normalization did not finish");
+    }
+    #[test]
+    fn header_normalization_crosses_words_and_filters_before_nfc() {
+        for (input, expected, problem) in [
+            (
+                b"  =?utf-8?Q?e?=\r\n =?utf-8?Q?=CC=81?=".as_slice(),
+                "é",
+                false,
+            ),
+            (b" \t=?utf-8?Q?e=CC=81?=  ", "\té  ", false),
+            (
+                b"=?utf-8?Q?=E1=84=80?= =?utf-8?Q?=E1=85=A1?= =?utf-8?Q?=E1=86=A8?=",
+                "각",
+                false,
+            ),
+            (b"=?utf-8?Q?e=00=CC=81?=", "é", false),
+            (b"e\0\xcc\x81\xef\xbf\xbf", "é�", true),
+            (b"=?utf-8?Q?=E2=82?= =?utf-8?Q?=AC?=", "��", true),
+            (b"=?utf-8?Q?e?= \r\n\tbad", "e \tbad", false),
+            (b"e\xcc\x81", "é", false),
+        ] {
+            let (actual, diagnostic, _) = header(input);
+            assert_eq!(
+                (actual, diagnostic),
+                (expected.to_owned(), problem),
+                "{input:?}"
+            );
+        }
+    }
+    #[test]
+    fn header_replay_restores_word_and_decomposition_positions_without_prefix_scans() {
+        let left = vec![b'a'];
+        let right = vec![b'a'];
+        let original = Source::header(&left);
+        let mut advanced = original;
+        assert!(original.at(&advanced));
+        assert!(!original.at(&Source::header(&right)));
+        assert!(matches!(
+            advanced
+                .read(&mut work(), &mut HeaderBudget::new(), &mut 0, Tick(1))
+                .unwrap(),
+            Read::Yield
+        ));
+        assert!(!original.at(&advanced));
+        let word = "=?utf-8?Q?=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80?=";
+        let tail = format!("=?utf-8?Q?a?={}", format!(" {word}").repeat(30));
+        let expected = format!("à{}{}", "\u{300}".repeat(149), "\u{315}".repeat(150));
+        let (output, problem, visits) = header(tail.as_bytes());
+        assert_eq!(output, expected);
+        assert!(!problem);
+        for (suffix, decoded) in [
+            (" b", " b"),
+            (" =?utf-8?Q?=E2=82=AC?=", "€"),
+            ("  =?bogus?=x", "  =?bogus?=x"),
+        ] {
+            let (actual, problem, _) = header(format!("{tail}{suffix}").as_bytes());
+            assert_eq!(actual, format!("{expected}{decoded}"));
+            assert!(!problem);
+        }
+        let prefix = "x".repeat(10000);
+        let (output, problem, with_prefix) = header(format!("{prefix} {tail}").as_bytes());
+        assert_eq!(output, format!("{prefix} {expected}"));
+        assert!(!problem);
+        assert_eq!(with_prefix - visits, 20002);
+        let tail = format!("=?utf-8?Q?a?={}", " =?utf-8?Q?=CD=84?=".repeat(257));
+        let (output, problem, _) = header(tail.as_bytes());
+        assert_eq!(output, format!("ä\u{301}{}", "\u{308}\u{301}".repeat(256)));
+        assert!(!problem);
+    }
+    #[test]
+    fn header_global_limits_retire_decoding_and_maximal_ascii_fits() {
+        let mut scratch = Scratch::new();
+        let mut budget = HeaderBudget::new();
+        budget.bytes = 2;
+        let mut work = work();
+        let mut cursor = Cursor::from_unstructured_header(
+            b"=?utf-8?Q?a?=",
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        );
+        assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
+        assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
+        assert_eq!(cursor.poll(Tick(1)), Err(Error::InterpretationLimit));
+        assert_eq!(cursor.poll(Tick(1)), Err(Error::InterpretationLimit));
+        let mut fresh = self::work();
+        let mut next =
+            Cursor::from_unstructured_header(b"x", &mut scratch, &mut fresh, &mut budget);
+        assert_eq!(next.poll(Tick(1)), Err(Error::InterpretationLimit));
+        for capacity in [66, 70] {
+            let mut budget = HeaderBudget::new();
+            budget.bytes = capacity;
+            let mut fresh = self::work();
+            let before = fresh.remaining().io_bytes;
+            let mut cursor = Cursor::from_unstructured_header(
+                b"=?utf-8?B?4oKs?=",
+                &mut scratch,
+                &mut fresh,
+                &mut budget,
+            );
+            let mut failed = false;
+            for _ in 0..100 {
+                match cursor.poll(Tick(1)) {
+                    Err(error) => {
+                        assert_eq!(error, Error::InterpretationLimit);
+                        failed = true;
+                        break;
+                    }
+                    Ok(Status::Yield) => {}
+                    Ok(_) => panic!("transfer/charset exceeded aggregate bytes"),
+                }
+            }
+            assert!(failed);
+            assert_eq!(budget.source_bytes_remaining(), 0);
+            assert_eq!(before - fresh.remaining().io_bytes, capacity);
+        }
+        let input = format!("=?utf-8?Q?{}?=", "a".repeat(63));
+        assert_eq!(input.len(), 75);
+        let mut budget = HeaderBudget::new();
+        budget.steps = 200;
+        let mut fresh = self::work();
+        let mut cursor = Cursor::from_unstructured_header(
+            input.as_bytes(),
+            &mut scratch,
+            &mut fresh,
+            &mut budget,
+        );
+        let mut failed = false;
+        for _ in 0..300 {
+            match cursor.poll(Tick(1)) {
+                Err(error) => {
+                    assert_eq!(error, Error::InterpretationLimit);
+                    failed = true;
+                    break;
+                }
+                Ok(Status::Yield) => {}
+                Ok(_) => panic!("recognition exceeded its aggregate steps"),
+            }
+        }
+        assert!(failed);
+        assert_eq!(16 * 1024 * 1024 - budget.source_bytes_remaining(), 77);
+        let bytes = vec![b'x'; 1024 * 1024];
+        let mut budget = HeaderBudget::new();
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 256 * 1024 * 1024,
+                records: 2_000_000,
+                output_bytes: 32 * 1024 * 1024,
+                ..Charge::default()
+            },
+        );
+        let mut cursor =
+            Cursor::from_unstructured_header(&bytes, &mut scratch, &mut work, &mut budget);
+        let mut count = 0;
+        let mut done = false;
+        for _ in 0..16_000_000 {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Scalar('x') => count += 1,
+                Status::Scalar(_) => panic!("unexpected header scalar"),
+                Status::Yield => {}
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(count, bytes.len());
+        assert!(!cursor.is_encoding_problem());
+        assert_eq!(
+            16 * 1024 * 1024 - budget.source_bytes_remaining(),
+            2 * bytes.len() as u64 + 1
+        );
+        assert!(work.remaining().records > 0);
+    }
+    #[test]
+    fn header_adapter_job_refusal_does_not_retire_aggregate_budget() {
+        let input = format!("=?utf-8?Q?{}?=", "a".repeat(63));
+        let mut scratch = Scratch::new();
+        let mut budget = HeaderBudget::new();
+        let mut limited = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 1000,
+                records: 16,
+                ..Charge::default()
+            },
+        );
+        let mut cursor = Cursor::from_unstructured_header(
+            input.as_bytes(),
+            &mut scratch,
+            &mut limited,
+            &mut budget,
+        );
+        let mut failed = false;
+        for _ in 0..300 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Err(error) => {
+                    assert_eq!(error, Error::Work(Stop::Records));
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    failed = true;
+                    break;
+                }
+                Ok(_) => panic!("recognizer exceeded job records"),
+            }
+        }
+        assert!(failed);
+        // Candidate scans finish; the next 225-byte recognizer precharge refuses.
+        assert_eq!(16 * 1024 * 1024 - budget.source_bytes_remaining(), 77);
+        let mut fresh = work();
+        let mut cursor =
+            Cursor::from_unstructured_header(b"x", &mut scratch, &mut fresh, &mut budget);
+        let mut output = String::new();
+        let mut complete = false;
+        for _ in 0..100 {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Scalar(value) => output.push(value),
+                Status::Yield => {}
+                Status::Complete => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete);
+        assert_eq!(output, "x");
+    }
+    #[test]
+    fn header_deadlines_retire_scanning_and_both_replay_passes() {
+        let input = format!("=?utf-8?Q?a?={}", " =?utf-8?Q?=CC=95=CC=80?=".repeat(150));
+        for target in 0..3 {
+            let mut scratch = Scratch::new();
+            let mut work = work();
+            let mut budget = HeaderBudget::new();
+            let mut cursor = Cursor::from_unstructured_header(
+                input.as_bytes(),
+                &mut scratch,
+                &mut work,
+                &mut budget,
+            );
+            let mut reached = false;
+            for _ in 0..1_000_000 {
+                let ready = match target {
+                    0 => {
+                        matches!(cursor.phase, Phase::Scan)
+                            && cursor.budget.steps_remaining() < 15_999_980
+                    }
+                    1 => matches!(cursor.phase, Phase::Compute) && cursor.overflow,
+                    _ => matches!(cursor.phase, Phase::Emit) && cursor.overflow,
+                };
+                if ready {
+                    let bytes = cursor.budget.source_bytes_remaining();
+                    let steps = cursor.budget.steps_remaining();
+                    assert_eq!(cursor.poll(Tick(1000)), Err(Error::Work(Stop::Deadline)));
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+                    assert_eq!(cursor.budget.source_bytes_remaining(), bytes);
+                    assert_eq!(cursor.budget.steps_remaining(), steps);
+                    reached = true;
+                    break;
+                }
+                assert_ne!(cursor.poll(Tick(1)).unwrap(), Status::Complete);
+            }
+            assert!(reached);
+        }
     }
 }

@@ -34,26 +34,35 @@ impl<'a> Word<'a> {
         now: Tick,
         meter: &mut Meter,
     ) -> Result<Option<Self>, Stop> {
-        meter.charge(
-            now,
-            Charge {
-                records: 1,
-                ..Charge::default()
-            },
-        )?;
+        Self::recognize_charged(token, context, |charge| meter.charge(now, charge))
+    }
+    pub(crate) fn recognize_with_work(
+        token: &'a [u8],
+        context: Context,
+        now: Tick,
+        work: &mut impl crate::decode_work::Work,
+    ) -> Result<Option<Self>, crate::decode_work::Error> {
+        Self::recognize_charged(token, context, |charge| work.charge(now, charge))
+    }
+    fn recognize_charged<E>(
+        token: &'a [u8],
+        context: Context,
+        mut charge: impl FnMut(Charge) -> Result<(), E>,
+    ) -> Result<Option<Self>, E> {
+        charge(Charge {
+            records: 1,
+            ..Charge::default()
+        })?;
         if !(9..=75).contains(&token.len()) {
             return Ok(None);
         }
         // Precharge three bounded scans and one fixed charset lookup (above).
         let visits = (token.len() as u64) * 3;
-        meter.charge(
-            now,
-            Charge {
-                io_bytes: visits,
-                records: visits,
-                ..Charge::default()
-            },
-        )?;
+        charge(Charge {
+            io_bytes: visits,
+            records: visits,
+            ..Charge::default()
+        })?;
         Ok(Self::syntax(token, context))
     }
     pub const fn payload(self) -> &'a [u8] {

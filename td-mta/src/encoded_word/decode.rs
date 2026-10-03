@@ -2,6 +2,7 @@
 use super::{Encoding, Word};
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     mime_charset::{Decoder, Status as Decoded},
     ports::Tick,
 };
@@ -20,6 +21,16 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            // Public Meter calls cannot reach an aggregate header refusal.
+            crate::decode_work::Error::InterpretationLimit => Self::InvalidState,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 impl From<crate::mime_charset::Error> for Error {
     fn from(error: crate::mime_charset::Error) -> Self {
         match error {
@@ -52,31 +63,30 @@ impl<'a> Transfer<'a> {
             len: 0,
         }
     }
-    fn advance(&mut self, bytes: usize) -> Result<(), Error> {
+    fn advance(&mut self, bytes: usize) -> Result<(), DecodeError> {
         self.position = self
             .position
-            .checked_add(u8::try_from(bytes).map_err(|_| Error::InvalidState)?)
-            .ok_or(Error::InvalidState)?;
+            .checked_add(u8::try_from(bytes).map_err(|_| DecodeError::InvalidState)?)
+            .ok_or(DecodeError::InvalidState)?;
         Ok(())
     }
-    fn take(&mut self) -> Result<Event, Error> {
+    fn take(&mut self) -> Result<Event, DecodeError> {
         let byte = self
             .pending
             .get(usize::from(self.next))
             .copied()
-            .ok_or(Error::InvalidState)?;
-        self.next = self.next.checked_add(1).ok_or(Error::InvalidState)?;
+            .ok_or(DecodeError::InvalidState)?;
+        self.next = self.next.checked_add(1).ok_or(DecodeError::InvalidState)?;
         Ok(Event::Byte(byte))
     }
-    fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Event, Error> {
+    fn poll(&mut self, now: Tick, work: &mut impl Work) -> Result<Event, DecodeError> {
         work.charge(
             now,
             Charge {
                 records: 1,
                 ..Charge::default()
             },
-        )
-        .map_err(Error::Work)?;
+        )?;
         if self.next < self.len {
             return self.take();
         }
@@ -84,7 +94,7 @@ impl<'a> Transfer<'a> {
             .word
             .payload()
             .get(usize::from(self.position)..)
-            .ok_or(Error::InvalidState)?;
+            .ok_or(DecodeError::InvalidState)?;
         if input.is_empty() {
             return Ok(Event::End);
         }
@@ -96,9 +106,8 @@ impl<'a> Transfer<'a> {
                         io_bytes: 1,
                         ..Charge::default()
                     },
-                )
-                .map_err(Error::Work)?;
-                let byte = *input.first().ok_or(Error::InvalidState)?;
+                )?;
+                let byte = *input.first().ok_or(DecodeError::InvalidState)?;
                 let (event, consumed) = match byte {
                     b'_' => (Event::Byte(b' '), 1),
                     b'=' => {
@@ -109,8 +118,7 @@ impl<'a> Transfer<'a> {
                                 io_bytes: lookahead as u64,
                                 ..Charge::default()
                             },
-                        )
-                        .map_err(Error::Work)?;
+                        )?;
                         match (
                             input.get(1).copied().and_then(hex),
                             input.get(2).copied().and_then(hex),
@@ -132,9 +140,8 @@ impl<'a> Transfer<'a> {
                         io_bytes: count as u64,
                         ..Charge::default()
                     },
-                )
-                .map_err(Error::Work)?;
-                let chunk = input.get(..count).ok_or(Error::InvalidState)?;
+                )?;
+                let chunk = input.get(..count).ok_or(DecodeError::InvalidState)?;
                 let decoded = quartet(chunk, count == input.len());
                 self.advance(count)?;
                 match decoded {
@@ -200,7 +207,7 @@ pub struct Cursor<'a> {
     pending: Option<Event>,
     problem: bool,
     complete: bool,
-    failure: Option<Error>,
+    failure: Option<DecodeError>,
 }
 impl<'a> Cursor<'a> {
     pub const fn new(word: Word<'a>) -> Self {
@@ -218,6 +225,13 @@ impl<'a> Cursor<'a> {
         self.problem || self.charset.is_encoding_problem()
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work).map_err(Error::from)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, DecodeError> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -230,15 +244,14 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, DecodeError> {
         work.charge(
             now,
             Charge {
                 records: 1,
                 ..Charge::default()
             },
-        )
-        .map_err(Error::Work)?;
+        )?;
         let event = match self.pending {
             Some(event) => event,
             None => {
@@ -249,15 +262,15 @@ impl<'a> Cursor<'a> {
         };
         let decoded = match event {
             Event::Byte(byte) => {
-                let decoded = self.charset.poll(&[byte], false, now, work)?;
+                let decoded = self.charset.poll_with_work(&[byte], false, now, work)?;
                 if decoded.consumed == 1 {
                     self.pending = None;
                 } else if decoded.consumed != 0 {
-                    return Err(Error::InvalidState);
+                    return Err(DecodeError::InvalidState);
                 }
                 decoded
             }
-            Event::Fault | Event::End => self.charset.poll(&[], true, now, work)?,
+            Event::Fault | Event::End => self.charset.poll_with_work(&[], true, now, work)?,
         };
         self.problem |= self.charset.is_encoding_problem();
         match decoded.status {
@@ -274,7 +287,7 @@ impl<'a> Cursor<'a> {
                 Ok(Status::Scalar(value))
             }
             Decoded::Complete => match event {
-                Event::Byte(_) => Err(Error::InvalidState),
+                Event::Byte(_) => Err(DecodeError::InvalidState),
                 Event::Fault => {
                     self.problem = true;
                     self.pending = None;

@@ -2064,6 +2064,82 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_nfc() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        nfc::{Cursor, HeaderBudget, Scratch, Status},
+        ports::{Deadline, Tick},
+    };
+    let mut bytes = [0; 8192];
+    let starter = b"=?utf-8?Q?a?=";
+    bytes
+        .get_mut(..starter.len())
+        .unwrap()
+        .copy_from_slice(starter);
+    let mut used = starter.len();
+    for _ in 0..300 {
+        let word = b" =?utf-8?Q?=CC=80?=";
+        let end = used + word.len();
+        bytes.get_mut(used..end).unwrap().copy_from_slice(word);
+        used = end;
+    }
+    let source = bytes.get(..used).unwrap();
+    let mut scratch = Scratch::new();
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 16 * 1024 * 1024,
+            records: 2_000_000,
+            output_bytes: 1024 * 1024,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    for (input, long) in [
+        (b"=?utf-8?Q?e?=\r\n =?utf-8?Q?=CC=81?=".as_slice(), false),
+        (source, true),
+    ] {
+        let mut cursor = Cursor::from_unstructured_header(
+            black_box(input),
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        );
+        let mut count = 0;
+        let mut done = false;
+        for _ in 0..1_000_000 {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Scalar(value) => {
+                    let expected = if !long {
+                        'é'
+                    } else if count == 0 {
+                        'à'
+                    } else {
+                        '\u{300}'
+                    };
+                    assert_eq!(value, expected);
+                    cursor
+                        .charge_output(Tick(1), value.len_utf8() as u64)
+                        .unwrap();
+                    count += 1;
+                }
+                Status::Yield => {}
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(count, if long { 300 } else { 1 });
+        assert!(!cursor.is_encoding_problem());
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "decoded-header NFC allocated");
+}
+
 fn unicode_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2569,6 +2645,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        header_nfc();
         encoded_word_candidates();
         encoded_word_decoding();
         header_text();
@@ -2667,6 +2744,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    header_nfc();
     encoded_word_candidates();
     encoded_word_decoding();
     header_text();

@@ -830,7 +830,12 @@ UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
 candidate, whitespace or decoded-header buffer. Allocation intervals cover
 folding, words, malformed literals/payloads, whitespace retention and copied
-replay. Full normalization composition and worker-stack bounds remain open.
+replay. M06t adds a checked turn ordinal within the same 208-byte bound and
+composes this state into each of four NFC source checkpoints, each at most
+256 bytes including pending decomposition. The complete normalizer cursor
+plus aggregate budget stays within the 1 KiB checkpoint reservation alongside
+3 KiB segment/count scratch. Combined allocation intervals cover fast and
+replay paths with charged output. Worker-stack bounds remain open.
 
 Body charset prescan fits 64 bytes in the existing 2 KiB decoder/HTML/snippet
 state and future decoding cursor checkpoint. It borrows caller fragments

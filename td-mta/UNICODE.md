@@ -4,8 +4,9 @@ This is td-mta's approved upstream data dependency. It adds no Cargo crate,
 runtime file dependency, network fetch during a build, or Unicode library.
 M06m supplies committed inputs and cold verification tooling; M06n generates
 compact tables reproducibly. M06o adds fixed runtime lookups and algorithmic
-Hangul. M06p supplies bounded NFC over resident valid UTF-8. Decoded-header
-integration remains open.
+Hangul. M06p supplies bounded NFC over resident valid UTF-8; M06t adds
+resident unstructured-header decoding before NFC. Structured header parsing
+and protocol integration remain open.
 
 ## Inputs
 
@@ -165,13 +166,15 @@ composition/output boundaries are distinct. The fast and replay paths must
 produce identical octets for every split point.
 
 At most 110 ordered replay passes visit a segment, plus its initial scan.
-Source checkpoints make the whole header's work proportional to its own length
-times this fixed bound; adjacent segments do not repeatedly scan a prefix. At
-header_bytes=1 MiB this is at most 111 MiB of source bytes and four times as
-many decomposed scalars, before cursor bookkeeping. These are resident-source
-visits, not disk reads. Encoded-word/charset decoding cannot produce more
-scalars than input octets under POLICY.md's charset set. No extra disk reserve
-is required, and a busy external sort cannot block NFC.
+Source checkpoints make the whole header's work proportional to its own
+length times this fixed bound; adjacent segments do not repeatedly scan a
+prefix. At header_bytes=1 MiB this spans at most 111 MiB of raw input
+extents and four times as many decomposed scalars. Charged byte visits
+additionally include bounded decoder lookahead, recognizer scans and
+charset-byte visits. These are resident-source visits; replay performs no
+disk reads. Encoded-word/charset decoding cannot produce more scalars than
+input octets under POLICY.md's charset set. No extra disk reserve is
+required, and a busy external sort cannot block NFC.
 
 In addition to ADMISSION.md's enclosing deadline/work budgets, one email's
 aggregate header projection permits at most 16 MiB of source visits and
@@ -189,14 +192,16 @@ available. No runtime timing claim is made.
 M06p implements the ordering/composition algorithm above for immutable valid
 UTF-8 strings. Its fixed 3072-byte scratch and at most 1024 bytes of cursor
 plus aggregate budget fit the existing 4 KiB reservation. Private source
-checkpoints are at most 64 bytes; they retain pending canonical expansion.
-The API.md resident NFC section defines exact charging and ownership. A turn
-has at most 32 state transitions and 128 charged steps, within the 256-step
-ceiling. One job-meter record prepays 16 internal steps using private cursor
-credit; individual steps still debit the header budget. The cursor's output
-charge method lets the caller debit the same meter before serialization and
-check its deadline after a turn. External clock/cancellation checks belong
-to the caller. On any error the entire provisional property must be discarded.
+checkpoints now fit 256 bytes each, including the M06t header-decoder state
+and pending canonical expansion. API.md sections 1.23 and 1.27 define exact
+charging and ownership. Valid-UTF8 turns have at most 32 state transitions
+and 128 charged steps; unstructured-header turns have one transition and at
+most 228 steps. Both fit the 256-step ceiling. One job-meter record prepays
+16 internal steps using private cursor credit; individual steps still debit
+the header budget. The cursor's output charge method lets the caller debit
+the same meter before serialization and check its deadline after a turn.
+External clock/cancellation checks belong to the caller. On any error the
+entire provisional property must be discarded.
 
 Ordinary tests run all five NFC equations for each of the 20034 official
 vectors, including idempotence, plus every scalar outside Part 1 as an
@@ -215,11 +220,23 @@ Source/step
 limits and aggregate retirement are checked. The isolated Rust allocation
 probe covers fast and replay paths using fixed scratch.
 
-This scope has no byte-fragment input: a valid `&str` is resident for the
-cursor's lifetime. Encoded-word/charset adapters, malformed-byte replacement,
-fragmented decoding, outer property failure handling and worker scheduling
-remain open. Those adapters must preserve the source and aggregate-meter
-ownership proved here; resident NFC conformance alone does not qualify them.
+Both entry points retain resident immutable source for the cursor's lifetime.
+M06t composes unstructured-header unfolding, word/charset decoding, malformed
+replacement and scalar filtering before NFC. A private charging adapter
+retains both live budgets across candidate scans, word decoding and replay.
+Header checkpoints include a checked deterministic turn ordinal and immutable
+source identity, so even positions inside words compare without prefix scans.
+The before-EOF checkpoint ends replay; the consumed state is kept separately
+for resumption. Diagnostics accumulate across every pass.
+
+Additional literal oracles cover composition across encoded words and folds,
+Hangul, replacement before NFC, overflow spanning words and pending canonical
+decomposition, exact prefix visit counts, shared source/step limits and
+progressed deadline failures. A maximal one-MiB ASCII header fits default
+budgets and retains exact source accounting. Isolated allocation intervals
+cover the complete decoding/normalization fast and replay paths. Structured
+headers, source gathering, outer property failure publication and worker
+scheduling remain open; this does not qualify their stacks or the service RSS.
 
 ## Acceptance evidence owned by M06
 

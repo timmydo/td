@@ -1321,12 +1321,20 @@ Initial independently landable increments:
   work/deadline failures and allocation-free turns. NFC composition and
   structured header-form authorization/parsing remain open.
 
+- **M06t — normalized unstructured headers:** connect resident decoding to
+  canonical normalization with exact word/charset/decomposition checkpoints,
+  private aggregate charging and bounded header turns. Keep all source state
+  within the four 256-byte checkpoints and the existing 4 KiB NFC region.
+  Verify cross-word composition, overflow replay without prefix rescans,
+  filtering, limits, deadlines, maximal ASCII and allocation-free output
+  charging. Structured forms and protocol/worker integration remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
 deterministic MIME serialization for structured outgoing email, including
 attachment streaming, boundary generation through Entropy, reply headers and
-Bcc separation. Connect decoded-header cursors to the resident NFC
+Bcc separation. Connect structured-header cursors to the resident NFC
 algorithm while retaining its fixed memory and charged replay contract.
 Search case mappings come from the same pin. No allocating
 library or ambient Unicode version may replace these contracts. Retain

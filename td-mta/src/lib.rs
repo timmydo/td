@@ -8,6 +8,7 @@ pub mod bounded;
 pub mod change_cursor;
 pub mod clock;
 pub mod config;
+mod decode_work;
 pub mod encoded_word;
 pub mod format;
 pub mod frame_changes;

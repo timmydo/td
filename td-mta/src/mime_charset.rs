@@ -1,6 +1,7 @@
 //! Fixed-state decoding of the mail policy's explicit charset set.
 use crate::{
     admission::work::{Charge, Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     ports::Tick,
 };
 
@@ -61,6 +62,16 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::decode_work::Error> for Error {
+    fn from(error: crate::decode_work::Error) -> Self {
+        match error {
+            crate::decode_work::Error::Work(stop) => Self::Work(stop),
+            // Public Meter calls cannot reach an aggregate header refusal.
+            crate::decode_work::Error::InterpretationLimit => Self::InvalidState,
+            crate::decode_work::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
 /// One scalar per turn. Copies carry decoding state, never the enclosing meter.
 #[derive(Clone, Copy)]
 pub struct Decoder {
@@ -72,7 +83,7 @@ pub struct Decoder {
     problem: bool,
     complete: bool,
     eof: bool,
-    failure: Option<Error>,
+    failure: Option<DecodeError>,
 }
 impl Decoder {
     pub const fn new(charset: Charset) -> Self {
@@ -96,17 +107,15 @@ impl Decoder {
         value: char,
         consumed: usize,
         now: Tick,
-        meter: &mut Meter,
-    ) -> Result<Progress, Error> {
-        meter
-            .charge(
-                now,
-                Charge {
-                    records: 1,
-                    ..Charge::default()
-                },
-            )
-            .map_err(Error::Work)?;
+        meter: &mut impl Work,
+    ) -> Result<Progress, DecodeError> {
+        meter.charge(
+            now,
+            Charge {
+                records: 1,
+                ..Charge::default()
+            },
+        )?;
         Ok(Progress {
             consumed,
             status: Status::Scalar(value),
@@ -116,8 +125,8 @@ impl Decoder {
         &mut self,
         consumed: usize,
         now: Tick,
-        meter: &mut Meter,
-    ) -> Result<Progress, Error> {
+        meter: &mut impl Work,
+    ) -> Result<Progress, DecodeError> {
         self.remaining = 0;
         self.problem = true;
         self.emit('\u{fffd}', consumed, now, meter)
@@ -130,6 +139,16 @@ impl Decoder {
         now: Tick,
         meter: &mut Meter,
     ) -> Result<Progress, Error> {
+        self.poll_with_work(input, last, now, meter)
+            .map_err(Error::from)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        input: &[u8],
+        last: bool,
+        now: Tick,
+        meter: &mut impl Work,
+    ) -> Result<Progress, DecodeError> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -150,11 +169,11 @@ impl Decoder {
         input: &[u8],
         last: bool,
         now: Tick,
-        meter: &mut Meter,
-    ) -> Result<Progress, Error> {
+        meter: &mut impl Work,
+    ) -> Result<Progress, DecodeError> {
         let mut consumed = 0;
         if self.eof {
-            meter.charge(now, Charge::default()).map_err(Error::Work)?;
+            meter.charge(now, Charge::default())?;
             self.complete = true;
             return Ok(Progress {
                 consumed,
@@ -165,15 +184,13 @@ impl Decoder {
         // replaces the accepted prefix and is revisited on the following turn.
         for _ in 0..4 {
             let byte = input.get(consumed).copied();
-            meter
-                .charge(
-                    now,
-                    Charge {
-                        io_bytes: u64::from(byte.is_some()),
-                        ..Charge::default()
-                    },
-                )
-                .map_err(Error::Work)?;
+            meter.charge(
+                now,
+                Charge {
+                    io_bytes: u64::from(byte.is_some()),
+                    ..Charge::default()
+                },
+            )?;
             let Some(byte) = byte else {
                 if !last {
                     return Ok(Progress {
@@ -211,13 +228,16 @@ impl Decoder {
                 }
                 // Lead masks and continuation bounds keep the accumulator within 21 bits.
                 self.scalar = (self.scalar << 6) | u32::from(byte & 0x3f);
-                self.remaining = self.remaining.checked_sub(1).ok_or(Error::InvalidState)?;
+                self.remaining = self
+                    .remaining
+                    .checked_sub(1)
+                    .ok_or(DecodeError::InvalidState)?;
                 self.low = 0x80;
                 self.high = 0xbf;
                 consumed += 1;
                 if self.remaining == 0 {
                     return self.emit(
-                        char::from_u32(self.scalar).ok_or(Error::InvalidState)?,
+                        char::from_u32(self.scalar).ok_or(DecodeError::InvalidState)?,
                         consumed,
                         now,
                         meter,
@@ -242,7 +262,7 @@ impl Decoder {
             self.low = low;
             self.high = high;
         }
-        Err(Error::InvalidState)
+        Err(DecodeError::InvalidState)
     }
 }
 fn windows1252(byte: u8) -> Option<char> {
