@@ -1141,6 +1141,17 @@ is retained. Allocation intervals cover long phrase/comment input, overflow
 replay, scratch reuse and final refusal. JSON composition and combined
 worker/native/RSS qualification remain open.
 
+Budgeted address/name JSON adapters (M06bg) retain the existing 64-byte
+borrowed coordinator and 32-byte frame. Address/name owners keep their prior
+parser/scratch reservations; no additional string, collection or arena is
+retained. Turn ceilings remain 255 visits, 256 steps, sixteen job records
+and six externally copied bytes; address sources retain their tighter
+160-visit/255-step ceiling. Combined conversion/JSON output charges are at
+most eight bytes for addresses and six for names; framing adds no
+interpretation steps. Allocation intervals cover long inputs, original
+budgets/scratch, one-byte drains and output refusal. Complete property
+assembly and worker/native/RSS qualification remain open.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

@@ -89,7 +89,7 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         result
     }
     /// Final only after Complete.
-    pub fn is_encoding_problem(&self) -> bool {
+    pub const fn is_encoding_problem(&self) -> bool {
         self.cursor.is_encoding_problem()
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {

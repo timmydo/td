@@ -1,7 +1,7 @@
 //! Bounded JSON strings from already selected header scalar sources.
 use crate::{
     admission::work::{Charge, Meter, Stop},
-    header_address_text, header_raw, nfc,
+    header_address_text, header_name, header_raw, nfc,
     ports::Tick,
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9,6 +9,7 @@ pub enum Error {
     Source(nfc::Error),
     Raw(header_raw::Error),
     Address(header_address_text::Error),
+    Name(header_name::Error),
     MessageIds(crate::header_message_ids::Error),
     URLs(crate::header_urls::Error),
     Work(Stop),
@@ -21,6 +22,7 @@ impl std::fmt::Display for Error {
             Self::Raw(error) => write!(f, "JSON Raw source: {error}"),
             Self::URLs(error) => write!(f, "JSON URLs source: {error}"),
             Self::MessageIds(error) => write!(f, "JSON MessageIds source: {error}"),
+            Self::Name(error) => write!(f, "JSON display-name source: {error}"),
             Self::Address(error) => write!(f, "JSON address source: {error}"),
             Self::Work(error) => write!(f, "JSON string output: {error}"),
             Self::InvalidState => f.write_str("invalid JSON string state"),
@@ -75,6 +77,8 @@ pub(crate) enum Source<'c, 'a, 'w> {
     Raw(&'c mut header_raw::Cursor<'a>, &'c mut Meter),
     BudgetedRaw(&'c mut header_raw::Budgeted<'a, 'w>),
     Address(&'c mut header_address_text::Cursor<'a>, &'c mut Meter),
+    BudgetedAddress(&'c mut header_address_text::Budgeted<'a, 'w>),
+    Name(&'c mut header_name::Cursor<'a, 'w>),
 }
 impl ScalarSource for Source<'_, '_, '_> {
     fn charge_output(&mut self, now: Tick, output_bytes: u64) -> Result<(), Error> {
@@ -85,6 +89,10 @@ impl ScalarSource for Source<'_, '_, '_> {
             Self::BudgetedRaw(cursor) => {
                 cursor.charge_output(now, output_bytes).map_err(Error::Raw)
             }
+            Self::BudgetedAddress(cursor) => cursor
+                .charge_output(now, output_bytes)
+                .map_err(Error::Address),
+            Self::Name(cursor) => cursor.charge_output(now, output_bytes).map_err(Error::Name),
             Self::Raw(_, work) | Self::Address(_, work) => work
                 .charge(
                     now,
@@ -109,6 +117,12 @@ impl ScalarSource for Source<'_, '_, '_> {
                 header_raw::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
                 header_raw::Status::Complete => Ok(nfc::Status::Complete),
             },
+            Self::Name(cursor) => cursor.poll(now).map_err(Error::Name),
+            Self::BudgetedAddress(cursor) => match cursor.poll(now).map_err(Error::Address)? {
+                header_address_text::Status::Yield => Ok(nfc::Status::Yield),
+                header_address_text::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
+                header_address_text::Status::Complete => Ok(nfc::Status::Complete),
+            },
             Self::Address(cursor, work) => match cursor.poll(now, work).map_err(Error::Address)? {
                 header_address_text::Status::Yield => Ok(nfc::Status::Yield),
                 header_address_text::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
@@ -124,6 +138,8 @@ impl Source<'_, '_, '_> {
             Self::Raw(cursor, _) => cursor.is_encoding_problem(),
             Self::BudgetedRaw(cursor) => cursor.is_encoding_problem(),
             Self::Address(cursor, _) => cursor.is_encoding_problem(),
+            Self::BudgetedAddress(cursor) => cursor.is_encoding_problem(),
+            Self::Name(cursor) => cursor.is_encoding_problem(),
         }
     }
 }
@@ -153,6 +169,14 @@ impl<'c, 'a, 'w> Cursor<'c, 'a, 'w> {
         work: &'c mut Meter,
     ) -> Self {
         Self::from_source(Source::Address(source, work))
+    }
+    /// Supply an unpolled address owner retaining the original job/email budgets.
+    pub fn from_budgeted_address(source: &'c mut header_address_text::Budgeted<'a, 'w>) -> Self {
+        Self::from_source(Source::BudgetedAddress(source))
+    }
+    /// Supply an unpolled selected-name owner retaining original budgets/scratch.
+    pub fn from_name(source: &'c mut header_name::Cursor<'a, 'w>) -> Self {
+        Self::from_source(Source::Name(source))
     }
     fn from_source(source: Source<'c, 'a, 'w>) -> Self {
         Self {
@@ -926,3 +950,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod address_name_tests;

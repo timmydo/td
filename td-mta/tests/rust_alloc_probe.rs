@@ -3202,6 +3202,116 @@ fn url_header_values() {
     assert_eq!(before, after, "URLs property assembly allocated");
 }
 
+fn budgeted_address_name_json() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_address_text,
+        header_name::{self, Extent, Kind},
+        json_string::{Cursor, Error, Status},
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    fn stream(cursor: &mut Cursor<'_, '_, '_>, expected: &[u8]) {
+        let mut offset = 0;
+        let mut complete = false;
+        for _ in 0..1_000_000 {
+            let mut output = [0; 1];
+            let progress = cursor.poll(Tick(1), &mut output).unwrap();
+            if progress.written == 1 {
+                assert_eq!(output.first(), expected.get(offset));
+            }
+            offset += progress.written;
+            if progress.status == Status::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        assert_eq!(offset, expected.len());
+        cursor.check_deadline(Tick(1)).unwrap();
+    }
+    let name = "e\u{301}".repeat(4096);
+    let address = format!("{name}@EXAMPLE");
+    let expected_address = format!("\"{address}\"");
+    let expected_name = format!("\"{}\"", "é".repeat(4096));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut scratch = Scratch::new();
+    let before = COUNTERS.snapshot();
+    let mut source = header_address_text::Budgeted::new(
+        black_box(address.as_bytes()),
+        header_address_text::Mode::Parsed,
+        &mut work,
+        &mut budget,
+    );
+    stream(
+        &mut Cursor::from_budgeted_address(&mut source),
+        expected_address.as_bytes(),
+    );
+    let mut source = header_name::Cursor::new(
+        black_box(name.as_bytes()),
+        Extent {
+            start: 0,
+            end: name.len(),
+        },
+        Kind::Phrase,
+        &mut work,
+        &mut budget,
+        &mut scratch,
+    )
+    .unwrap();
+    stream(
+        &mut Cursor::from_name(&mut source),
+        expected_name.as_bytes(),
+    );
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1000,
+            records: 1000,
+            output_bytes: 1,
+            ..Charge::default()
+        },
+    );
+    let mut source = header_address_text::Budgeted::new(
+        b"a@b",
+        header_address_text::Mode::Parsed,
+        &mut limited,
+        &mut budget,
+    );
+    let mut cursor = Cursor::from_budgeted_address(&mut source);
+    let expected = Error::Address(header_address_text::Error::Work(Stop::OutputBytes));
+    let mut refused = false;
+    let mut written = 0;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut [0; 1]) {
+            Ok(progress) => {
+                written += progress.written;
+                assert_ne!(progress.status, Status::Complete);
+            }
+            Err(error) => {
+                assert_eq!(error, expected);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(written, 1);
+    assert_eq!(cursor.poll(Tick(1), &mut [0; 1]), Err(expected));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted address/name JSON allocated");
+}
+
 fn selected_header_names() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -5370,6 +5480,7 @@ fn main() {
         budgeted_date_projection();
         header_dates();
         url_header_values();
+        budgeted_address_name_json();
         selected_header_names();
         budgeted_address_text();
         budgeted_header_addresses();
@@ -5505,6 +5616,7 @@ fn main() {
     budgeted_date_projection();
     header_dates();
     url_header_values();
+    budgeted_address_name_json();
     selected_header_names();
     budgeted_address_text();
     budgeted_header_addresses();

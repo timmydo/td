@@ -1611,6 +1611,12 @@ Initial independently landable increments:
   partial limits, overflow replay and allocation-free handoff. Name JSON
   and address-property composition remain open.
 
+- **M06bg — budgeted address/name JSON strings:** borrow original-budget
+  address and selected-name owners into the existing fixed JSON frame.
+  Charge exact output before staging; preserve identity, NFC, diagnostics and
+  typed refusal. Cover composed costs, short drains, partial resources and
+  allocation-free long input. Complete address properties remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

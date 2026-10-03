@@ -1,6 +1,6 @@
 //! Selected display-name validation and NFC under the original email budgets.
 use crate::{
-    admission::work::Meter,
+    admission::work::{Charge, Meter},
     decode_work::{Error as DecodeError, Parsing},
     header_comment, header_phrase,
     nfc::{self, HeaderBudget, Scratch},
@@ -69,6 +69,17 @@ pub struct Cursor<'a, 'w> {
     failure: Option<Error>,
 }
 impl<'a, 'w> Cursor<'a, 'w> {
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> Option<(Charge, u64)> {
+        match &self.owner {
+            Owner::Validate { work, budget, .. } => {
+                Some((work.remaining(), budget.steps_remaining()))
+            }
+            Owner::Normalize(cursor) => Some(cursor.remaining()),
+            Owner::Retired => None,
+        }
+    }
+
     pub fn new(
         field: &'a [u8],
         extent: Extent,
@@ -98,13 +109,16 @@ impl<'a, 'w> Cursor<'a, 'w> {
             failure: None,
         })
     }
-    pub fn is_encoding_problem(&self) -> bool {
+    pub const fn is_encoding_problem(&self) -> bool {
         match &self.owner {
             Owner::Normalize(cursor) => cursor.is_encoding_problem(),
             _ => false,
         }
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.charge_output(now, 0)
+    }
+    pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -117,9 +131,19 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 ..
             } => budget
                 .charge(work, now, 0, 0, credit)
+                .and_then(|()| {
+                    work.charge(
+                        now,
+                        Charge {
+                            output_bytes: bytes,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(nfc::Error::Work)
+                })
                 .map_err(DecodeError::from)
                 .map_err(|error| grammar.error(error)),
-            Owner::Normalize(cursor) => cursor.charge_output(now, 0).map_err(Error::Normalize),
+            Owner::Normalize(cursor) => cursor.charge_output(now, bytes).map_err(Error::Normalize),
             Owner::Retired => Err(Error::InvalidState),
         };
         if let Err(error) = result {

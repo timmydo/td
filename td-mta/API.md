@@ -3002,6 +3002,52 @@ and final refusal in both registered modes. Name JSON, complete
 address-property composition, response-spool publication and
 worker/native/RSS qualification remain follow-on work.
 
+### 1.65 JSON strings from budgeted address and selected-name owners
+
+M06bg adds `json_string::Cursor::from_budgeted_address` and `from_name`.
+Both borrow an unpolled source for the frame's entire lifetime and retain
+its original budgets; the selected-name source also owns the scratch borrow.
+They reuse the existing fixed JSON Frame. Dropping an incomplete frame
+abandons the whole property: an advanced source must not be rewrapped. These
+are individual strings, not complete address objects or properties.
+
+Name framing validates and normalizes through the selected-name owner;
+address framing preserves Parsed/Fallback identity behavior. Diagnostics
+stay with that source and are final only after complete framing. Quotes,
+escapes and UTF-8 bytes are prepaid before staging. Name scalar events add
+no other output debit; address conversion retains its intermediate/scalar
+debits in addition to JSON bytes. Short-buffer drains copy already-paid
+bytes. The shared sources expose only private output-charging hooks for this
+adapter.
+
+Zero-byte checks remain live during validation, conversion, normalization
+and staged drains. Name admission errors retain the active Phrase/Comment or
+Normalize label inside JSON Name; address errors retain JSON Address.
+Resource failure cannot become malformed or a partial success. Malformed
+sources may leave a provisional opening quote but emit no invalid source
+text; their entire property must be discarded. Cached frame completion is
+inert; explicit final admission can retire it after its closing quote has
+drained.
+
+The borrowed adapter still fits 64 bytes and the common frame 32 bytes. The
+source owners retain their existing bounds and scratch reservations; no
+owned string, collection or arena is added. Per turn bounds remain 255
+visits, 256 aggregate steps, sixteen job records and six externally copied
+bytes. Address sources retain the tighter 160-visit/255-step ceiling.
+Combined address conversion/JSON output charges at most eight bytes per
+poll; name JSON charges at most six. Framing adds no aggregate
+interpretation steps.
+
+Tests cover widths one through eight, address identity, name normalization,
+escapes, diagnostics and malformed sources. Independent source conversion
+plus wire length pins exact combined costs. Every partial byte/step/output
+budget retires the provisional JSON, including refusal before the closing
+quote; empty output and final deadlines retain their contracts. Allocation
+intervals cover long address/name inputs, original budgets and scratch,
+one-byte drains and output refusal in both registered modes. Full
+address-property assembly, response-spool publication and complete
+worker/native/RSS qualification remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

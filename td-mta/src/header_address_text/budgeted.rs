@@ -11,6 +11,11 @@ pub struct Budgeted<'a, 'w> {
     failure: Option<Error>,
 }
 impl<'a, 'w> Budgeted<'a, 'w> {
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> (crate::admission::work::Charge, u64) {
+        self.inner.remaining()
+    }
+
     pub fn new(
         source: &'a [u8],
         mode: Mode,
@@ -27,8 +32,18 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         }
     }
     /// Final only after Complete.
-    pub fn is_encoding_problem(&self) -> bool {
+    pub const fn is_encoding_problem(&self) -> bool {
         self.inner.is_encoding_problem()
+    }
+    pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = self.inner.charge_output(now, bytes).map_err(Error::from);
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         if let Some(error) = self.failure {
