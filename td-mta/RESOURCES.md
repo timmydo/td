@@ -843,6 +843,15 @@ Allocation intervals cover long Unicode text, folds, noncharacters,
 malformed tails and output refusal. Response storage, JSON escaping and
 complete worker composition remain the enclosing owner's responsibility.
 
+The URLs cursor fits 256 bytes in the body parser reservation, including
+CFWS and URI states plus 45 bytes for an IPv6 literal. Two charged passes
+validate then replay individual ASCII URL bytes without retaining a list.
+The bounded std IPv6 parser adds 64 prepaid records per literal per pass;
+IPvFuture and arbitrarily long names/paths retain fixed state. Allocation
+intervals cover long URLs, IPv6 and IPvFuture, whitespace, malformed input
+and refusal. Complete JMAP response storage and worker composition remain
+unqualified.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

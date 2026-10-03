@@ -1651,6 +1651,56 @@ text, whole-field refusal, exact charges, long inputs and allocation-free
 success/refusal. Complete JMAP serialization and worker qualification remain
 open.
 
+### 1.36 Resident URLs form
+
+M06ad supplies `header_urls::Cursor` over the admitted immutable field slice
+ending at scanner value_end. Mode URLs requires one or more comma-separated
+angle-bracketed URLs with optional surrounding CFWS. Mode ListPost also
+accepts exact `NO` with surrounding CFWS as an empty list; the property
+owner must authorize that mode only for List-Post. No leading, trailing or
+repeated comma is accepted. Malformed comments, URLs or trailing text
+invalidate the entire field, with no prefix recovery. This deliberate
+strict choice follows POLICY's null-on-parse-failure contract rather than
+RFC 2369's SHOULD-ignore-tail client recovery. Raw remains available.
+
+A complete charged validation pass precedes Begin/Byte/End events during
+charged replay of the same source. The two passes use the same live meter.
+Outer comments and brackets are removed. Within brackets, SP/HTAB and
+CRLF or bare LF followed by SP/HTAB are discarded, including within scheme
+names and percent escapes. Other raw line endings and controls refuse.
+Parentheses inside a URL are URI data, not mail comments. Output is ASCII
+and preserves scheme case, host case, percent spelling and dot segments.
+
+The private validator checks the RFC 3986 URI grammar, including scheme,
+authority/userinfo/port, path, query, fragment and percent escapes. Unknown
+schemes and empty generic components are legal; scheme-specific usability
+is left to clients. Ports have digit syntax without a numeric range check.
+An invalid IPv4-looking name may still be a generic reg-name. IPv6 literals
+use a fixed 45-byte local buffer and std's Ipv6Addr parser; IPvFuture uses
+fixed scalar state. Scoped IP literals and IRIs are outside this grammar.
+No URL is decoded, normalized, resolved, fetched or treated as authorization.
+
+Every active poll charges one parent record and at most one CFWS turn or
+one syntax byte. Source lookahead is charged before inspection; closing an
+IPv6 literal prepays 64 additional records for the bounded local std parse.
+Per-poll ceilings are 160 source-byte visits, 65 records and one output byte.
+Both passes visit all required input and repeat literal verification. Output
+work counts only replayed URL bytes; JSON framing/copying/escaping is the
+response owner's separate responsibility. `<x:>` costs ten visits, eighteen
+records and two output bytes; each IPv6 literal adds 128 records across both
+passes. Long URL data costs about two records per raw byte plus list, CFWS
+and literal overhead. Permitted header size does not guarantee fitting a
+job's remaining aggregate work.
+
+The non-Copy cursor fits 256 bytes including CFWS, URI and literal state.
+No list or URL string is allocated. Malformed maps to the future form's null;
+nesting and work refusal retain their resource meaning. All errors latch
+across fresh meters; cached Complete is inert. Replay can fail after emitting
+text, so admission, cancellation/clock checks and reserved response lifetime
+remain external. Tests cover URI grammar, folds, special NO, long data,
+whole-field refusal, exact costs and allocation-free success/refusal. JMAP
+serialization and complete worker qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

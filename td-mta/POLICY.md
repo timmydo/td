@@ -187,9 +187,16 @@ reviewed git changes. The exact input and cold validation contract are in
 leap-seconds/README.md.
 
 The URLs form parses RFC 2369 lists and returns null for invalid input.
-These forms never fetch a URL. RFC date/header parsing does not broaden SMTP
-envelope grammar. Header values unsupported by a form remain readable as
-Raw.
+Validate the complete list; do not apply RFC 2369's SHOULD-ignore-tail
+client recovery to expose a prefix from a malformed field. Raw remains
+available. Strip surrounding CFWS/brackets and internal SP/HTAB or admitted
+folds; preserve literal URI spelling. Use the ASCII RFC 3986 generic URI
+grammar, including valid percent escapes, with no scheme-specific execution
+or usability checks. Exact List-Post NO with surrounding CFWS maps to an
+empty list; NO in other fields is not a URL. This is an explicit mapping
+for RFC 2369's nonposting marker. These forms never fetch a URL. RFC
+date/header parsing does not broaden SMTP envelope grammar. Header values
+unsupported by a form remain readable as Raw.
 
 RFC 2231 MIME parameters support percent decoding, charset/language prefixes,
 and numbered continuations beginning at zero without gaps. Duplicate segment

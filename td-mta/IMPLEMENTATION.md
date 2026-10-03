@@ -1396,6 +1396,15 @@ Initial independently landable increments:
   and allocation-free polling. State fits 384 bytes. JSON serialization,
   response admission and complete worker qualification remain open.
 
+- **M06ad — resident URLs form:** validate a complete RFC 2369 list before
+  charged replay without prefix recovery. Remove outer comments/brackets
+  and internal whitespace; check generic ASCII URI syntax and preserve
+  spelling. Handle List-Post NO as an explicitly authorized empty list.
+  Cover percent escapes, authority/path/query/fragment, bounded IPv6 and
+  scalar IPvFuture, malformed tails, long data and allocation-free refusal.
+  No URL fetching, scheme execution or response publication is authorized.
+  JSON serialization and complete worker qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

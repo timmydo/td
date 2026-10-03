@@ -2064,6 +2064,78 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_url_text() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_urls::{Cursor, Error, Mode, Status},
+        ports::{Deadline, Tick},
+    };
+    fn drive(cursor: &mut Cursor<'_>, work: &mut Meter) -> Result<(usize, usize), Error> {
+        let mut ends = 0;
+        let mut bytes = 0;
+        for _ in 0..1_000_000 {
+            match cursor.poll(Tick(1), work)? {
+                Status::Complete => return Ok((ends, bytes)),
+                Status::End => ends += 1,
+                Status::Byte(value) => {
+                    black_box(value);
+                    bytes += 1;
+                }
+                _ => {}
+            }
+        }
+        panic!("URL allocation probe did not finish");
+    }
+    let source = format!("<x:/{}>", "a".repeat(100_000));
+    let future = format!("<x://[v1.{}]>", "a".repeat(100_000));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 10_000_000,
+            output_bytes: 10_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, mode, expected) in [
+        (source.as_bytes(), Mode::URLs, Ok((1, 100003))),
+        (future.as_bytes(), Mode::URLs, Ok((1, 100009))),
+        (b"NO".as_slice(), Mode::ListPost, Ok((0, 0))),
+        (b"<mailto:l@x>, <https://x/>", Mode::ListPost, Ok((2, 20))),
+        (b"<x://[::1]>", Mode::URLs, Ok((1, 9))),
+        (b"<x: \r\n a>", Mode::URLs, Ok((1, 3))),
+        (b"<x:>, bad", Mode::URLs, Err(Error::Malformed)),
+        (b"<x://[:::]>", Mode::URLs, Err(Error::Malformed)),
+    ] {
+        assert_eq!(
+            drive(&mut Cursor::new(black_box(source), mode), &mut work),
+            expected
+        );
+    }
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1000,
+            records: 64,
+            output_bytes: 1000,
+            ..Charge::default()
+        },
+    );
+    let mut cursor = Cursor::new(b"<x://[::1]>", Mode::URLs);
+    assert_eq!(
+        drive(&mut cursor, &mut limited),
+        Err(Error::Work(Stop::Records))
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut work),
+        Err(Error::Work(Stop::Records))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "URL parsing allocated");
+}
+
 fn header_message_id_text() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3230,6 +3302,7 @@ fn main() {
         header_delimited_tokens();
         header_message_id_lists();
         header_message_id_text();
+        header_url_text();
         header_date_projection();
         header_dates();
         header_comments();
@@ -3337,6 +3410,7 @@ fn main() {
     header_delimited_tokens();
     header_message_id_lists();
     header_message_id_text();
+    header_url_text();
     header_date_projection();
     header_dates();
     header_comments();
