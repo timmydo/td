@@ -91,10 +91,28 @@ sources, with the script that builds it for the gate and the crate files
 its shared modules compile in (`catalog::shared_embeds`), each as
 fingerprinted when its binary was built (`td-builder engine-fingerprint`
 prints the builder's).
-Every recipe file is in that fingerprint, so an edit to one re-keys every
-check. The repo's cargo config is in that key; the host toolchain that
-compiles either binary is not. The gate says how many checks it answered
-that way and counts them apart from the ones it ran.
+A recipe file, and a file under `recipes/src/recipes` only recipes
+embed, is not in that fingerprint: it keys the checks whose closure holds
+a recipe that reads it, by that recipe's source digest (its own file,
+what it embeds, and the files of the recipes whose modules it names,
+transitively), so a uutils bump re-keys only the check that builds
+uutils. A recipe file the evaluator's own code reads stays in the
+fingerprint and re-keys every check, as fixtures and probes do. The
+repo's cargo config is in that key; the host toolchain that compiles
+either binary is not. The gate says how many checks it answered that way
+and counts them apart from the ones it ran.
+
+A check that runs says why in its log, as `[memo] CHECK runs (key K):
+...`: the key's components that changed since the pass it last used
+(`changed recipe uutils, changed sources uutils, changed lock ...`), or
+that it has none on record, or that `TD_CHECK_FULL` is set. Every check
+run, memoized or not, appends a line to
+`~/.td/build-daemon/check-history.jsonl` — outcome, wall time, key, and
+that reason — shared by every worktree and kept by `clear-store`;
+`td-recipe-eval check-history [CHECK...]` sums it per check, costliest
+first, to say where check time goes. A run that fails before the check
+starts (the ladder lock, the memo dir) writes no record.
+
 The memo does not see the host — its qemu, kernel, or toolchain — so after
 such a change, or when a recorded pass is in doubt, run everything:
 

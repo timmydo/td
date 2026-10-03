@@ -36,7 +36,7 @@ mod sha256;
 mod embed_scan;
 use embed_scan::{
     declares_out_of_line_module, embed_literals, has_computed_embed, has_embed_marker,
-    normalize_join, production_code, sibling_reads, strip_comments, td_dirs_embedded,
+    impure_names, normalize_join, production_code, sibling_reads, strip_comments, td_dirs_embedded,
     td_dirs_named, td_dirs_named_beside_embeds, td_files_embedded,
 };
 
@@ -101,6 +101,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
         let text = fs::read_to_string(entry.path())?;
+        // A check's key holds only its closure's recipe sources, yet every
+        // run constructs every recipe: a constructor must be pure for that
+        // to be sound (`embed_scan::impure_names`).
+        let impure = impure_names(&text);
+        if !impure.is_empty() {
+            return Err(format!(
+                "src/recipes/{name}: production code names {} — a recipe builds a \
+                 value and touches nothing else, since every check run constructs \
+                 every recipe while its key holds only its closure's",
+                impure.join(", ")
+            )
+            .into());
+        }
         recipes.push((stem.to_string(), module, td_dirs_named(&text)));
         recipe_texts.insert(stem.to_string(), text);
     }
@@ -292,12 +305,50 @@ fn main() -> Result<(), Box<dyn Error>> {
         out,
         "pub fn recipe_evaluator_reads() -> &'static [&'static str] {{"
     )?;
-    let list: Vec<String> = evaluator.files.iter().map(|s| format!("{s:?}")).collect();
+    // What the evaluator reads, closed over what those recipes read in turn:
+    // a recipe it runs runs the modules that recipe names.
+    let evaluator_files = evaluator_closure(&evaluator.files, &file_readers, &wide_readers);
+    let list: Vec<String> = evaluator_files.iter().map(|s| format!("{s:?}")).collect();
     writeln!(out, "    &[{}]", list.join(", "))?;
     writeln!(out, "}}")?;
 
+    // A recipe file, or a file only recipes embed, keys the checks whose
+    // closure holds a recipe reading it, by that recipe's source digest; it
+    // leaves the evaluator fingerprint every check holds. Not one the
+    // evaluator's own code reads (`EvaluatorReads`), directly or through a
+    // recipe it reads: that file can change any check's assertions, so it
+    // stays in the fingerprint.
+    let per_recipe: BTreeSet<String> = file_readers
+        .keys()
+        .filter(|p| p.starts_with(RECIPE_DIR) && !evaluator_files.contains(*p))
+        .cloned()
+        .collect();
+    let digests = recipe_source_digests(repo, &recipes, &file_readers, &wide_readers)?;
+    writeln!(
+        out,
+        "/// Each recipe's source digest: sha256 over the recipe files and embedded"
+    )?;
+    writeln!(
+        out,
+        "/// files its evaluation reads, its own and, transitively, those of the"
+    )?;
+    writeln!(
+        out,
+        "/// recipes whose modules it names, as this binary was compiled."
+    )?;
+    writeln!(
+        out,
+        "pub fn recipe_source_digests() -> &'static [(&'static str, &'static str)] {{"
+    )?;
+    writeln!(out, "    &[")?;
+    for (stem, digest) in &digests {
+        writeln!(out, "        ({stem:?}, {digest:?}),")?;
+    }
+    writeln!(out, "    ]")?;
+    writeln!(out, "}}")?;
+
     let (fingerprint, fingerprinted) =
-        evaluator_source_fingerprint(Path::new(&manifest_dir), &shared_files)?;
+        evaluator_source_fingerprint(Path::new(&manifest_dir), &shared_files, &per_recipe)?;
     writeln!(
         out,
         "/// The repository-relative files `TD_EVALUATOR_SOURCE_FINGERPRINT` covers."
@@ -410,6 +461,98 @@ fn recipe_file_readers(
 
 /// Where the recipe files live, repository-relative.
 const RECIPE_DIR: &str = "recipes/src/recipes/";
+
+/// `direct` with every file a recipe file among them reads, transitively,
+/// by `readers`; a wide reader among them may read any, so every file.
+fn evaluator_closure(
+    direct: &BTreeSet<String>,
+    readers: &FileReaders,
+    wide: &[String],
+) -> BTreeSet<String> {
+    let mut out = direct.clone();
+    let mut pending: Vec<String> = direct.iter().cloned().collect();
+    while let Some(path) = pending.pop() {
+        let Some(stem) = path
+            .strip_prefix(RECIPE_DIR)
+            .and_then(|f| f.strip_suffix(".rs"))
+        else {
+            continue;
+        };
+        let any = wide.iter().any(|w| w == stem);
+        for (read, stems) in readers {
+            if (any || stems.contains(stem)) && out.insert(read.clone()) {
+                pending.push(read.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Each recipe's source digest over the files `readers` says it reads,
+/// closed over the recipe files among them: a recipe naming another's
+/// module runs that module's code, and so whatever that one reads. A recipe
+/// in `wide` reads every file in `readers`. Each file's bytes are hashed
+/// with its path, in path order.
+fn recipe_source_digests(
+    repo: &Path,
+    recipes: &[(String, String, Vec<String>)],
+    readers: &FileReaders,
+    wide: &[String],
+) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let mut reads: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (path, stems) in readers {
+        for stem in stems {
+            reads
+                .entry(stem.as_str())
+                .or_default()
+                .insert(path.as_str());
+        }
+    }
+    let mut file_digests: BTreeMap<&str, String> = BTreeMap::new();
+    for path in readers.keys() {
+        println!("cargo:rerun-if-changed={}", repo.join(path).display());
+        let digest =
+            sha256::sha256_file(&repo.join(path)).map_err(|e| format!("digest {path}: {e}"))?;
+        file_digests.insert(path.as_str(), digest);
+    }
+    let mut out = BTreeMap::new();
+    for (stem, _, _) in recipes {
+        let mut files: BTreeSet<&str> = BTreeSet::new();
+        let mut pending: Vec<&str> = vec![stem.as_str()];
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        while let Some(s) = pending.pop() {
+            if !seen.insert(s) {
+                continue;
+            }
+            // A wide reader anywhere in the walk may read any file, as the
+            // reach takes it to.
+            if wide.iter().any(|w| w == s) {
+                files.extend(readers.keys().map(String::as_str));
+            }
+            for path in reads.get(s).into_iter().flatten() {
+                files.insert(path);
+                let module = path
+                    .strip_prefix(RECIPE_DIR)
+                    .and_then(|f| f.strip_suffix(".rs"));
+                if let Some(other) = module {
+                    pending.push(other);
+                }
+            }
+        }
+        let mut h = sha256::Sha256::new();
+        for path in files {
+            let digest = file_digests
+                .get(path)
+                .ok_or_else(|| format!("{stem}: no digest for {path}"))?;
+            h.update(path.as_bytes());
+            h.update(b"\0");
+            h.update(digest.as_bytes());
+            h.update(b"\n");
+        }
+        out.insert(stem.clone(), sha256::to_base16(&h.finalize()));
+    }
+    Ok(out)
+}
 
 /// What the crate's sources other than the recipe files (the shared
 /// modules, the evaluator) read of the recipes, in production code.
@@ -533,10 +676,13 @@ fn shared_file_entry(repo: &Path, file: &str) -> Result<String, Box<dyn Error>> 
 /// workspace manifest and lock, the builder preparation implementation and
 /// its script entry point, and the crate files the shared modules compile in
 /// (a whole-directory entry by its `src/`) — as (path, file digest) pairs in
-/// path order, returned with those paths. The check verdict key holds it in
-/// place of reading those trees at run time: a key read from the tree names
-/// the tree at that moment, and a check whose assertions were compiled from
-/// older sources could record a pass under a newer key. Every file is
+/// path order, returned with those paths. Not the `per_recipe` files: a
+/// recipe file and what recipes alone embed under it key the checks of the
+/// recipes that read them, by `recipe_source_digests`. The check verdict
+/// key holds it in place of reading those trees at run time: a key read
+/// from the tree names the tree at that moment, and a check whose
+/// assertions were compiled from older sources could record a pass under a
+/// newer key. Every file is
 /// declared to cargo, and every directory for its adds and removes, so an
 /// edit reruns this script and re-keys. A hidden entry — an editor's swap
 /// file, its lock link, a scratch directory — is skipped, file or directory
@@ -545,6 +691,7 @@ fn shared_file_entry(repo: &Path, file: &str) -> Result<String, Box<dyn Error>> 
 fn evaluator_source_fingerprint(
     manifest_dir: &Path,
     shared_embeds: &[String],
+    per_recipe: &BTreeSet<String>,
 ) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let root = manifest_dir
         .parent()
@@ -592,6 +739,9 @@ fn evaluator_source_fingerprint(
             .to_str()
             .ok_or("non-UTF-8 path under the evaluator sources")?;
         println!("cargo:rerun-if-changed={}", file.display());
+        if per_recipe.contains(rel) {
+            continue;
+        }
         let digest = sha256::sha256_file(file)
             .map_err(|e| format!("fingerprint {}: {e}", file.display()))?;
         h.update(rel.as_bytes());

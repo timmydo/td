@@ -338,6 +338,54 @@ pub(crate) fn sibling_reads(text: &str, modules: &[&str]) -> (Vec<String>, bool)
     (reads, wide)
 }
 
+/// What a recipe file's production code may not name: anything that reads
+/// or changes state outside the recipe value it builds. Every check run
+/// constructs every recipe (`catalog::all`), while a check's verdict key
+/// holds only its closure's recipe sources, so a constructor outside the
+/// closure must not be able to change the run.
+const IMPURE: &[&str] = &[
+    "set_var",
+    "remove_var",
+    "env::var",
+    "env::args",
+    "env::current_dir",
+    "set_current_dir",
+    "env::temp_dir",
+    "env::home_dir",
+    "set_hook",
+    "thread::",
+    "net::",
+    "io::stdin",
+    "fs::",
+    "File::",
+    "OpenOptions",
+    "Command::",
+    "process::",
+    "static mut",
+    "OnceLock",
+    "LazyLock",
+    "thread_local!",
+    "Cell<",
+    "Mutex",
+    "RwLock",
+    "Atomic",
+    "SystemTime",
+    "Instant::",
+    "unsafe",
+];
+
+/// The `IMPURE` names a recipe file's production code holds outside its
+/// literals and comments, in `IMPURE` order. A spelling scan: an alias
+/// (`use std::fs as f`) passes it, and review covers that.
+pub(crate) fn impure_names(text: &str) -> Vec<&'static str> {
+    let code = squeeze_paths(&blank_literals(&production_code(text)));
+    IMPURE
+        .iter()
+        .copied()
+        .filter(|name| code.contains(name))
+        .collect()
+}
+
 /// `code` with its string and char literals blanked to spaces.
 fn blank_literals(code: &str) -> String {
     let mut literals = Vec::new();
@@ -831,6 +879,27 @@ mod tests {
             "fn r() { super::recipe(); xsuper::firefox::recipe(); }\n",
         ] {
             assert_eq!(reads(text), none, "{text}");
+        }
+    }
+
+    /// A recipe's production code may name nothing that touches state
+    /// beyond its value; a test module, a comment or a string may.
+    #[test]
+    fn a_recipe_constructor_names_nothing_impure() {
+        assert_eq!(
+            impure_names("fn r() { std::env::set_var(\"A\", \"\"); std::fs::read(\"x\"); }\n"),
+            ["set_var", "fs::"]
+        );
+        assert_eq!(
+            impure_names("fn r() { std :: process :: exit(1) }\n"),
+            ["process::"]
+        );
+        for pure in [
+            "#[cfg(test)]\nmod tests {\n    fn t() { std::fs::read(\"x\"); }\n}\n",
+            "// std::fs::read\nfn r() {}\n",
+            "const S: &str = \"Command::new(\\\"sh\\\")\";\n",
+        ] {
+            assert!(impure_names(pure).is_empty(), "{pure}");
         }
     }
 

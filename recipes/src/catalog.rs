@@ -70,6 +70,21 @@ pub fn recipe_wide_readers() -> &'static [&'static str] {
     registry::recipe_wide_readers()
 }
 
+/// The whole `recipe_file_readers` table, path-sorted.
+pub fn recipe_file_reader_table() -> &'static [(&'static str, &'static [&'static str])] {
+    registry::recipe_file_readers()
+}
+
+/// `stem`'s source digest as this binary was compiled: the recipe files and
+/// embedded files its evaluation reads, its own and, transitively, those of
+/// the recipes whose modules it names. Read from the sources by `build.rs`.
+pub fn recipe_source_digest(stem: &str) -> Option<&'static str> {
+    registry::recipe_source_digests()
+        .iter()
+        .find(|(s, _)| *s == stem)
+        .map(|(_, d)| *d)
+}
+
 /// The outline face's recipe, whose install plan `install-fonts-plan`
 /// prints.
 pub use registry::jetbrains_mono_nerd_font as outline_face;
@@ -694,18 +709,41 @@ mod named_dirs_tests {
     }
 
     /// Every check's verdict key holds the evaluator fingerprint, so what
-    /// every recipe compiles in belongs to it: the shared modules, every
-    /// recipe file, and each shared embed, a directory by its sources.
+    /// every recipe compiles in belongs to it: the shared modules, each
+    /// shared embed (a directory by its sources), and a recipe file the
+    /// evaluator's own code reads. Any other recipe file, and a file only
+    /// recipes embed, keys a check by the source digest of each recipe in
+    /// its closure, which changes with it and with what it names.
     #[test]
     fn the_fingerprint_holds_the_shared_embeds() {
         let files = registry::evaluator_fingerprint_files();
         for kept in [
             "recipes/src/types.rs",
             "recipes/src/catalog.rs",
-            "recipes/src/recipes/hello.rs",
+            "recipes/src/probes/rust_clippy.rs",
+            "recipes/src/recipes/jetbrains-mono-nerd-font.rs",
             "engine/src/sha256.rs",
         ] {
             assert!(files.contains(&kept), "{kept} not fingerprinted");
+        }
+        for per_recipe in [
+            "recipes/src/recipes/hello.rs",
+            "recipes/src/recipes/uutils.rs",
+            "recipes/src/recipes/bash-mesboot.mk",
+        ] {
+            assert!(!files.contains(&per_recipe), "{per_recipe} fingerprinted");
+        }
+        let digest = |s| recipe_source_digest(s).expect(s);
+        assert_ne!(digest("uutils"), digest("fd"));
+        assert_eq!(digest("uutils").len(), 64);
+        // Every recipe has one, and none is the empty set's: each reads at
+        // least its own file.
+        const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        for (stem, _) in all() {
+            assert!(
+                recipe_source_digest(stem).is_some_and(|d| d != EMPTY),
+                "{stem}"
+            );
         }
         assert!(!shared_embeds().is_empty());
         for embed in shared_embeds() {

@@ -122,29 +122,55 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         }
     );
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_allowed_builds(allowed);
+    let started = std::time::Instant::now();
     // The verdict memo is consulted BEFORE the ladder lock: a memoized pass
     // needs nothing the lock guards, and not queueing behind another
     // worktree's climb is part of what it saves.
-    let key = runner.check_verdict_key(stem, index)?;
+    let components = runner.check_verdict_components(stem, index)?;
+    let key = verdict_key_of(&components);
     let bypassed = check_memo_bypassed();
-    if !bypassed && reap_then_check_memoized(&runner, stem, index, &key) {
+    let memo_hit = |why: &str| {
         say_memoized(stem, index, &key);
+        runner.record_check_history(stem, index, "memo", started.elapsed(), &key, why);
+    };
+    if !bypassed && reap_then_check_memoized(&runner, stem, index, &key) {
+        memo_hit("");
         return Ok(());
     }
+    // Why this check runs rather than answering from a pass on record: the
+    // line that explains a surprising rerun, and the history keeps it.
+    let why = if bypassed {
+        format!("{CHECK_FULL_ENV} is set")
+    } else {
+        runner.explain_verdict_miss(stem, index, &key, &components)
+    };
+    println!(
+        "   [memo] {stem}#{index} runs (key {}): {why}",
+        key.get(..12).unwrap_or(&key)
+    );
     let _lock = lock_ladder_for_run(&runner)?;
     // Asked again under the lock: a peer running this same check — beside
     // this run, since the lock is shared by default, or ahead of it while
     // this run waited on an exclusive one — may have recorded the pass this
     // run was about to earn.
     if !bypassed && runner.check_verdict_memoized(stem, index, &key) {
-        say_memoized(stem, index, &key);
+        memo_hit("a peer recorded the pass while this run waited");
         return Ok(());
     }
     // The pass on record, if any, is forgotten BEFORE the run, not after a
     // failure: a `TD_CHECK_FULL=1` rerun that fails, or dies, must not leave
     // the pass it was sent to doubt for the next ordinary run to answer from.
     runner.forget_check_verdict(stem, index, &key)?;
-    crate::checks::run(check_runner, &runner, stem)?;
+    if let Err(e) = crate::checks::run(check_runner, &runner, stem) {
+        let outcome = if e.starts_with(HOST_GAP) {
+            "host-gap"
+        } else {
+            "fail"
+        };
+        runner.record_check_history(stem, index, outcome, started.elapsed(), &key, &why);
+        return Err(e);
+    }
+    runner.record_check_history(stem, index, "pass", started.elapsed(), &key, &why);
     // Recorded only after a PASS — a failure or a host-gap skip returned Err
     // above — and only if the key still matches: the inputs were hashed before
     // a run that reads them, and the ladder lock does not serialize
@@ -152,7 +178,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     // fails a check that passed.
     match runner.check_verdict_key(stem, index) {
         Ok(after) if after == key => {
-            if let Err(e) = runner.write_check_verdict_memo(stem, index, &key) {
+            if let Err(e) = runner.write_check_verdict_memo(stem, index, &key, &components) {
                 eprintln!("check: verdict memo not recorded (non-fatal): {e}");
             }
         }
@@ -1845,6 +1871,18 @@ fn hash_repo_inputs(
     cargo_locks: &[String],
     local_sources: &[String],
 ) -> Result<(), String> {
+    hash_seed_patches(h, patches_dir)?;
+    for rel in cargo_locks {
+        hash_cargo_lock(h, repo_root, rel)?;
+    }
+    for rel in local_sources {
+        hash_local_source(h, repo_root, rel)?;
+    }
+    Ok(())
+}
+
+/// The seed patches' part of `hash_repo_inputs`.
+fn hash_seed_patches(h: &mut crate::sha256::Sha256, patches_dir: &Path) -> Result<(), String> {
     // Only a MISSING patch dir hashes as zero patches (a tree that GAINS the dir
     // re-keys by growing the hashed list). Any other read error — and any entry
     // error — fails closed: silently dropping a patch from the key would let a
@@ -1884,25 +1922,38 @@ fn hash_repo_inputs(
         h.update(&(bytes.len() as u64).to_le_bytes());
         h.update(&bytes);
     }
-    for rel in cargo_locks {
-        let p = repo_root.join(rel);
-        let bytes =
-            fs::read(&p).map_err(|e| format!("read committed cargoLock {}: {e}", p.display()))?;
-        h.update(&(rel.len() as u64).to_le_bytes());
-        h.update(rel.as_bytes());
-        h.update(&(bytes.len() as u64).to_le_bytes());
-        h.update(&bytes);
-    }
-    for rel in local_sources {
-        let p = repo_root.join(rel);
-        h.update(&(rel.len() as u64).to_le_bytes());
-        h.update(rel.as_bytes());
-        // hash_source_tree emits its own self-delimiting type/length framing, and
-        // this section follows cargo_locks in a fixed order, so no cross-section
-        // ambiguity. A missing/unreadable declared source dir fails closed.
-        hash_source_tree(&p, h)?;
-    }
     Ok(())
+}
+
+/// One committed cargo lock's part of `hash_repo_inputs`.
+fn hash_cargo_lock(
+    h: &mut crate::sha256::Sha256,
+    repo_root: &Path,
+    rel: &str,
+) -> Result<(), String> {
+    let p = repo_root.join(rel);
+    let bytes =
+        fs::read(&p).map_err(|e| format!("read committed cargoLock {}: {e}", p.display()))?;
+    h.update(&(rel.len() as u64).to_le_bytes());
+    h.update(rel.as_bytes());
+    h.update(&(bytes.len() as u64).to_le_bytes());
+    h.update(&bytes);
+    Ok(())
+}
+
+/// One local-source tree's part of `hash_repo_inputs`.
+fn hash_local_source(
+    h: &mut crate::sha256::Sha256,
+    repo_root: &Path,
+    rel: &str,
+) -> Result<(), String> {
+    let p = repo_root.join(rel);
+    h.update(&(rel.len() as u64).to_le_bytes());
+    h.update(rel.as_bytes());
+    // hash_source_tree emits its own self-delimiting type/length framing, and
+    // this section follows cargo_locks in a fixed order, so no cross-section
+    // ambiguity. A missing/unreadable declared source dir fails closed.
+    hash_source_tree(&p, h)
 }
 
 /// Hash a local-source tree into `h` exactly the way `td_engine::local_source::stage`
@@ -1957,6 +2008,27 @@ fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), Str
         return Ok(());
     }
     Err(format!("unsupported file type at {}", dir.display()))
+}
+
+/// The sha256, hex, of what `fill` hashes.
+fn digest_of(
+    fill: impl FnOnce(&mut crate::sha256::Sha256) -> Result<(), String>,
+) -> Result<String, String> {
+    let mut h = crate::sha256::Sha256::new();
+    fill(&mut h)?;
+    Ok(crate::sha256::to_base16(&h.finalize()))
+}
+
+/// The verdict key over its named `components`: each name and digest as
+/// length-delimited fields, in order.
+fn verdict_key_of(components: &[(String, String)]) -> String {
+    let mut h = crate::sha256::Sha256::new();
+    hash_field(&mut h, b"td-check-verdict-v2");
+    for (name, digest) in components {
+        hash_field(&mut h, name.as_bytes());
+        hash_field(&mut h, digest.as_bytes());
+    }
+    crate::sha256::to_base16(&h.finalize())
 }
 
 /// One length-delimited field of a fingerprint, so no boundary is ambiguous.
@@ -2025,9 +2097,246 @@ fn closure_repo_inputs(closure: &[RecipeNode]) -> (Vec<String>, Vec<String>) {
 /// A verdict memo is two lines: the key it answers for, and the one verdict it
 /// can hold. Only a pass is ever written — a failure has to be re-run to be
 /// believed, and a host-gap skip is not a verdict — so a file that says
-/// anything else is not one of ours and is ignored.
-fn serialize_check_verdict_memo(key: &str) -> String {
-    format!("fingerprint {key}\nverdict pass\n")
+/// anything else is not one of ours and is ignored. Then one `component NAME
+/// DIGEST` line per input the key was taken over, which only a later miss's
+/// explanation reads: the verdict is the first two lines alone.
+fn serialize_check_verdict_memo(key: &str, components: &[(String, String)]) -> String {
+    let mut out = format!("fingerprint {key}\nverdict pass\n");
+    for (name, digest) in components {
+        out.push_str(&format!("component {name} {digest}\n"));
+    }
+    out
+}
+
+/// The components a verdict memo recorded, in order; none for one written
+/// before they were.
+fn parse_check_verdict_components(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("component "))
+        .filter_map(|l| l.trim_end().rsplit_once(' '))
+        .map(|(name, digest)| (name.to_string(), digest.to_string()))
+        .collect()
+}
+
+/// How many changed components a miss's log line names before counting the
+/// rest.
+const MISS_CHANGES_SHOWN: usize = 12;
+
+/// The check history: one JSON line per check run on this machine, beside
+/// the ladder work dir rather than in it, so every worktree's runs land in
+/// one file and `clear-store` keeps it. `td-recipe-eval check-history`
+/// summarizes it.
+fn check_history_path(lw: &Path) -> PathBuf {
+    lw.parent().unwrap_or(lw).join(CHECK_HISTORY_FILE)
+}
+
+const CHECK_HISTORY_FILE: &str = "check-history.jsonl";
+
+/// The size past which the history is rotated to one `.1` file before the
+/// next line, so it stays bounded at about twice this.
+const CHECK_HISTORY_MAX_BYTES: u64 = 8 << 20;
+
+/// One history record as a JSON line (keys sorted).
+fn check_history_line(
+    at: u64,
+    check: &str,
+    outcome: &str,
+    took: std::time::Duration,
+    key: &str,
+    why: &str,
+) -> String {
+    use td_engine::json::Json;
+    let record = Json::Obj(vec![
+        ("at".to_string(), Json::Num(at.to_string())),
+        ("check".to_string(), Json::Str(check.to_string())),
+        ("key".to_string(), Json::Str(key.to_string())),
+        ("outcome".to_string(), Json::Str(outcome.to_string())),
+        (
+            "secs".to_string(),
+            Json::Num(format!("{:.1}", took.as_secs_f64())),
+        ),
+        ("why".to_string(), Json::Str(why.to_string())),
+    ]);
+    let mut line = record.to_canonical();
+    line.push('\n');
+    line
+}
+
+/// Append `line` as one buffer to an `O_APPEND` file, which for a line this
+/// short lands whole in practice, so concurrent checks' lines do not
+/// interleave; rotate first when the file has outgrown its bound.
+fn append_check_history(path: &Path, line: &str) -> Result<(), String> {
+    if fs::metadata(path).is_ok_and(|m| m.len() > CHECK_HISTORY_MAX_BYTES) {
+        let rotated = path.with_extension("jsonl.1");
+        // Unlocked, as the history is best-effort: a peer that saw the same
+        // size and renames second moves the fresh file over the rotated one,
+        // losing that rotated half.
+        let _ = fs::rename(path, &rotated);
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("append {}: {e}", path.display()))
+}
+
+/// `td-recipe-eval check-history [CHECK...]`: per check, over the history
+/// and its rotated predecessor, how many runs executed and how many were
+/// answered from the memo or failed, the median and longest executed wall
+/// time, and the last run's outcome, age and reason; the checks that cost
+/// the most in all first. Narrowed to the named checks (`STEM#INDEX` or a
+/// stem) when given.
+pub fn check_history_cli(args: &[String]) -> Result<(), String> {
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let path = check_history_path(&ladder_work_dir(&root, home.as_deref()));
+    let mut text = fs::read_to_string(path.with_extension("jsonl.1")).unwrap_or_default();
+    match fs::read_to_string(&path) {
+        Ok(t) => text.push_str(&t),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !text.is_empty() => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!("no check history yet at {}", path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for line in summarize_check_history(&text, args, now) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The summary `check_history_cli` prints, from the history's `text`.
+/// Lines that do not parse are skipped and counted.
+fn summarize_check_history(text: &str, only: &[String], now: u64) -> Vec<String> {
+    #[derive(Default)]
+    struct Runs {
+        executed: Vec<f64>,
+        memo: usize,
+        failed: usize,
+        unprovisioned: usize,
+        last: Option<(u64, String, String, String)>,
+    }
+    let mut by_check: BTreeMap<String, Runs> = BTreeMap::new();
+    let mut skipped = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(record) = td_engine::json::parse(line) else {
+            skipped += 1;
+            continue;
+        };
+        let field = |k: &str| match record.get(k) {
+            Some(td_engine::json::Json::Str(s)) | Some(td_engine::json::Json::Num(s)) => {
+                Some(s.clone())
+            }
+            _ => None,
+        };
+        let (Some(check), Some(outcome)) = (field("check"), field("outcome")) else {
+            skipped += 1;
+            continue;
+        };
+        let stem = check.split('#').next().unwrap_or(&check);
+        if !only.is_empty() && !only.iter().any(|o| *o == check || o == stem) {
+            continue;
+        }
+        let secs: f64 = field("secs").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let at: u64 = field("at").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let runs = by_check.entry(check).or_default();
+        match outcome.as_str() {
+            "memo" => runs.memo += 1,
+            // A host gap ran nothing: no part of the check's cost.
+            "host-gap" => runs.unprovisioned += 1,
+            "fail" => {
+                runs.failed += 1;
+                runs.executed.push(secs);
+            }
+            _ => runs.executed.push(secs),
+        }
+        if runs.last.as_ref().is_none_or(|(t, ..)| at >= *t) {
+            let why = field("why").unwrap_or_default();
+            runs.last = Some((at, outcome, format!("{secs:.1}s"), why));
+        }
+    }
+    let mut rows: Vec<(f64, String)> = by_check
+        .into_iter()
+        .map(|(check, mut runs)| {
+            runs.executed.sort_by(f64::total_cmp);
+            let total: f64 = runs.executed.iter().sum();
+            let n = runs.executed.len();
+            let mid = |i: usize| runs.executed.get(i).copied().unwrap_or(0.0);
+            let median = if n % 2 == 1 {
+                mid(n / 2)
+            } else {
+                (mid((n / 2).saturating_sub(1)) + mid(n / 2)) / 2.0
+            };
+            let longest = runs.executed.last().copied().unwrap_or(0.0);
+            let last = runs.last.map_or(String::new(), |(at, outcome, secs, why)| {
+                let why = if why.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {why}")
+                };
+                format!(
+                    "; last {outcome} {secs} {}s ago{why}",
+                    now.saturating_sub(at)
+                )
+            });
+            (
+                total,
+                format!(
+                    "{check}: {n} executed ({} failed, {total:.0}s in all, median {median:.1}s, \
+                     longest {longest:.1}s), {} from the memo{}{last}",
+                    runs.failed,
+                    runs.memo,
+                    if runs.unprovisioned > 0 {
+                        format!(", {} unprovisioned", runs.unprovisioned)
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut out: Vec<String> = rows.into_iter().map(|(_, row)| row).collect();
+    if skipped > 0 {
+        out.push(format!("({skipped} unreadable history line(s) skipped)"));
+    }
+    out
+}
+
+/// What changed between the components of a recorded pass (`was`) and this
+/// run's (`now`), by name: changed, then new, then gone, at most `shown`
+/// names in all and a count of the rest.
+fn component_changes(was: &[(String, String)], now: &[(String, String)], shown: usize) -> String {
+    let old: BTreeMap<&str, &str> = was.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    let new: BTreeMap<&str, &str> = now.iter().map(|(n, d)| (n.as_str(), d.as_str())).collect();
+    let mut names: Vec<String> = Vec::new();
+    for (name, digest) in &new {
+        if old.get(name).is_some_and(|was| was != digest) {
+            names.push(format!("changed {name}"));
+        }
+    }
+    for name in new.keys().filter(|n| !old.contains_key(*n)) {
+        names.push(format!("new {name}"));
+    }
+    for name in old.keys().filter(|n| !new.contains_key(*n)) {
+        names.push(format!("gone {name}"));
+    }
+    if names.is_empty() {
+        return "no component changed (the key's own form did)".to_string();
+    }
+    let rest = names.len().saturating_sub(shown);
+    names.truncate(shown);
+    let mut out = names.join(", ");
+    if rest > 0 {
+        out.push_str(&format!(", and {rest} more"));
+    }
+    out
 }
 
 fn parse_check_verdict_memo(text: &str, expected: &str) -> bool {
@@ -3995,7 +4304,11 @@ impl RecipeCheckRunner {
     /// binary was compiled, so the key names the assertions that run and not
     /// the tree at the moment of asking, and so an edit anywhere under
     /// `recipes/src` or `engine/src`, or to a crate file the shared modules
-    /// compile in, re-keys every check. NOT the evaluator binary: it embeds
+    /// compile in, re-keys every check — except a recipe file, or a file
+    /// only recipes embed, which re-keys only the checks whose closure holds
+    /// a recipe reading it, by that recipe's compiled source digest. Each
+    /// input is a named component (`check_verdict_components`), recorded
+    /// with a pass so a later miss can name what changed. NOT the evaluator binary: it embeds
     /// every target crate's sources, so it changes with any of them, and a
     /// key that held it would miss on every change to a crate the closure
     /// never reads, which is the case the memo exists for.
@@ -4006,44 +4319,89 @@ impl RecipeCheckRunner {
     /// `TD_CHECK_FULL=1` or `clear-store`; the build-run memo makes the same
     /// bargain for its outputs.
     fn check_verdict_key(&self, stem: &str, index: usize) -> Result<String, String> {
-        let mut h = crate::sha256::Sha256::new();
-        hash_field(&mut h, b"td-check-verdict-v1");
-        hash_field(&mut h, stem.as_bytes());
-        hash_field(&mut h, &(index as u64).to_le_bytes());
+        Ok(verdict_key_of(&self.check_verdict_components(stem, index)?))
+    }
+
+    /// The verdict key's inputs, each by name with its own digest, so a
+    /// recorded pass can say which of them a later miss changed: `check`
+    /// (stem, index, script, runner); per closure recipe, `recipe STEM`
+    /// (its JSON) and `sources STEM` (`catalog::recipe_source_digest`, the
+    /// recipe files and embeds its evaluation reads); `builder-engine`;
+    /// `seed-patches`; `lock PATH` and `local-source PATH` per repo input;
+    /// and `evaluator`, the evaluator's own sources less the per-recipe
+    /// files. In this order, the closure's in stem order.
+    fn check_verdict_components(
+        &self,
+        stem: &str,
+        index: usize,
+    ) -> Result<Vec<(String, String)>, String> {
         let check = catalog::lookup(stem)
             .and_then(|r| r.checks.and_then(|c| c.get(index.checked_sub(1)?).cloned()))
             .ok_or_else(|| format!("{stem} has no check {index}"))?;
-        hash_field(&mut h, check.script.as_bytes());
-        hash_field(
-            &mut h,
-            match check.runner {
-                Some(CheckRunner::BuildOnly) => b"build-only".as_slice(),
-                Some(CheckRunner::Codex) => b"codex".as_slice(),
-                Some(CheckRunner::RustToolchain) => b"rust-toolchain".as_slice(),
-                Some(CheckRunner::Tzdata) => b"tzdata".as_slice(),
-                None => b"none".as_slice(),
-            },
-        );
+        let mut out = Vec::new();
+        out.push((
+            "check".to_string(),
+            digest_of(|h| {
+                hash_field(h, stem.as_bytes());
+                hash_field(h, &(index as u64).to_le_bytes());
+                hash_field(h, check.script.as_bytes());
+                hash_field(
+                    h,
+                    match check.runner {
+                        Some(CheckRunner::BuildOnly) => b"build-only".as_slice(),
+                        Some(CheckRunner::Codex) => b"codex".as_slice(),
+                        Some(CheckRunner::RustToolchain) => b"rust-toolchain".as_slice(),
+                        Some(CheckRunner::Tzdata) => b"tzdata".as_slice(),
+                        None => b"none".as_slice(),
+                    },
+                );
+                Ok(())
+            })?,
+        ));
         let closure = recipe_closure(&check_roots(stem, check.runner))?;
         // In stem order, not walk order: the walk is deterministic today, and
         // the key should not depend on that staying so.
         let mut nodes: Vec<&RecipeNode> = closure.iter().collect();
         nodes.sort_by(|a, b| a.stem.cmp(&b.stem));
         for node in nodes {
-            hash_field(&mut h, node.stem.as_bytes());
-            hash_field(&mut h, node.recipe.to_json().to_canonical().as_bytes());
+            let json = node.recipe.to_json().to_canonical();
+            out.push((
+                format!("recipe {}", node.stem),
+                digest_of(|h| {
+                    hash_field(h, json.as_bytes());
+                    Ok(())
+                })?,
+            ));
+            let sources = catalog::recipe_source_digest(&node.stem)
+                .ok_or_else(|| format!("{}: no recipe source digest", node.stem))?;
+            out.push((format!("sources {}", node.stem), sources.to_string()));
         }
-        hash_field(&mut h, self.builder_engine_fingerprint()?.as_bytes());
+        out.push((
+            "builder-engine".to_string(),
+            self.builder_engine_fingerprint()?,
+        ));
+        out.push((
+            "seed-patches".to_string(),
+            digest_of(|h| hash_seed_patches(h, &self.root.join("seed/patches")))?,
+        ));
         let (locks, local_sources) = closure_repo_inputs(&closure);
-        hash_repo_inputs(
-            &mut h,
-            &self.root.join("seed/patches"),
-            &self.root,
-            &locks,
-            &local_sources,
-        )?;
-        hash_field(&mut h, env!("TD_EVALUATOR_SOURCE_FINGERPRINT").as_bytes());
-        Ok(crate::sha256::to_base16(&h.finalize()))
+        for rel in &locks {
+            out.push((
+                format!("lock {rel}"),
+                digest_of(|h| hash_cargo_lock(h, &self.root, rel))?,
+            ));
+        }
+        for rel in &local_sources {
+            out.push((
+                format!("local-source {rel}"),
+                digest_of(|h| hash_local_source(h, &self.root, rel))?,
+            ));
+        }
+        out.push((
+            "evaluator".to_string(),
+            env!("TD_EVALUATOR_SOURCE_FINGERPRINT").to_string(),
+        ));
+        Ok(out)
     }
 
     fn check_verdict_memo_path(&self, stem: &str, index: usize, key: &str) -> PathBuf {
@@ -4085,7 +4443,13 @@ impl RecipeCheckRunner {
     /// Per-key files sit side by side and no run reaps them, as with the
     /// build-run maps: a stale one is inert, `clear-store` removes them all, and
     /// `gc-store` removes the ones no check has read within its window.
-    fn write_check_verdict_memo(&self, stem: &str, index: usize, key: &str) -> Result<(), String> {
+    fn write_check_verdict_memo(
+        &self,
+        stem: &str,
+        index: usize,
+        key: &str,
+        components: &[(String, String)],
+    ) -> Result<(), String> {
         let dir = self.lw.join("check-memo");
         fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
         let path = self.check_verdict_memo_path(stem, index, key);
@@ -4095,10 +4459,105 @@ impl RecipeCheckRunner {
             self.scratch_id()
         ));
         remove_path_if_exists(&tmp)?;
-        fs::write(&tmp, serialize_check_verdict_memo(key))
+        fs::write(&tmp, serialize_check_verdict_memo(key, components))
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         fs::rename(&tmp, &path)
             .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
+    }
+
+    /// Append one run of STEM#INDEX to the check history
+    /// (`check_history_path`): when it ended, its outcome (`memo`, `pass`,
+    /// `fail`, `host-gap`), its wall time, its key's prefix, and why it ran
+    /// when it did. Best-effort: a history that cannot be written fails no
+    /// check, and says so.
+    fn record_check_history(
+        &self,
+        stem: &str,
+        index: usize,
+        outcome: &str,
+        took: std::time::Duration,
+        key: &str,
+        why: &str,
+    ) {
+        let line = check_history_line(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            &format!("{stem}#{index}"),
+            outcome,
+            took,
+            key.get(..12).unwrap_or(key),
+            why,
+        );
+        if let Err(e) = append_check_history(&check_history_path(&self.lw), &line) {
+            eprintln!("check: history not recorded (non-fatal): {e}");
+        }
+    }
+
+    /// Why `key` has no recorded pass for STEM#INDEX, for the log: the
+    /// components that differ from the most recently used pass on record
+    /// for this check under another key, or that there is none. Read-only
+    /// and best-effort: a memo dir it cannot list says so.
+    fn explain_verdict_miss(
+        &self,
+        stem: &str,
+        index: usize,
+        key: &str,
+        components: &[(String, String)],
+    ) -> String {
+        let dir = self.lw.join("check-memo");
+        let prefix = format!("{}.{index}.", sanitize_target_for_filename(stem));
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return "no pass recorded here for any check yet".to_string()
+            }
+            Err(e) => return format!("memo dir {} unreadable: {e}", dir.display()),
+        };
+        let mut last: Option<(std::time::SystemTime, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let other_key = name
+                .strip_prefix(&prefix)
+                .and_then(|r| r.strip_suffix(".pass"));
+            // A longer stem sharing the prefix leaves a dot in the remainder.
+            if other_key.is_none_or(|k| k == key || k.contains('.')) {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            // The same mtime breaks by path, so the choice is not the
+            // directory's order.
+            let candidate = (modified, entry.path());
+            if last.as_ref().is_none_or(|l| candidate > *l) {
+                last = Some(candidate);
+            }
+        }
+        let Some((when, path)) = last else {
+            return "no earlier pass of this check recorded here".to_string();
+        };
+        let age = std::time::SystemTime::now()
+            .duration_since(when)
+            .map_or(String::new(), |d| {
+                format!(", last used {}s ago", d.as_secs())
+            });
+        let was = match fs::read_to_string(&path) {
+            Ok(text) => parse_check_verdict_components(&text),
+            Err(e) => return format!("the last pass here ({}) is unreadable: {e}", path.display()),
+        };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        if was.is_empty() {
+            return format!(
+                "the last pass here ({}{age}) predates recorded key components",
+                name.unwrap_or_default()
+            );
+        }
+        format!(
+            "since the last pass here{age}: {}",
+            component_changes(&was, components, MISS_CHANGES_SHOWN)
+        )
     }
 
     /// A memo HIT: the recorded plan for `fingerprint` is present and every
@@ -8803,7 +9262,9 @@ chmod 755 '{}'
         // unchanged tree — the scenario that used to skip `setup()`, and with it
         // `reap_dead_scratch`, entirely.
         let (stem, index, key) = ("td-boot-test", 1, "deadbeef");
-        runner.write_check_verdict_memo(stem, index, key).unwrap();
+        runner
+            .write_check_verdict_memo(stem, index, key, &[])
+            .unwrap();
 
         // A peer hard-killed mid-run: its claim is free, so its tree is abandoned.
         let dead = "check-td-boot-test-1-31337";
@@ -8839,7 +9300,9 @@ chmod 755 '{}'
         fs::create_dir_all(&scratch_root).unwrap();
 
         let (stem, index, key) = ("td-boot-test", 1, "deadbeef");
-        runner.write_check_verdict_memo(stem, index, key).unwrap();
+        runner
+            .write_check_verdict_memo(stem, index, key, &[])
+            .unwrap();
 
         let dead = "check-td-boot-test-1-31337";
         fs::create_dir_all(scratch_root.join(dead)).unwrap();
@@ -10174,7 +10637,7 @@ chmod 755 '{}'
     /// not a memoized pass.
     #[test]
     fn check_verdict_memo_answers_only_for_its_key_and_only_a_pass() {
-        let text = serialize_check_verdict_memo("deadbeef");
+        let text = serialize_check_verdict_memo("deadbeef", &[]);
         assert!(parse_check_verdict_memo(&text, "deadbeef"));
         assert!(!parse_check_verdict_memo(&text, "cafef00d"));
         assert!(!parse_check_verdict_memo(
@@ -10450,7 +10913,7 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
         let runner = shared_test_runner(&lw);
         runner
-            .write_check_verdict_memo("td-sh-test", 1, "k1")
+            .write_check_verdict_memo("td-sh-test", 1, "k1", &[])
             .unwrap();
         let memo = runner.check_verdict_memo_path("td-sh-test", 1, "k1");
         let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
@@ -10465,9 +10928,241 @@ chmod 755 '{}'
         assert!(mtime(&memo) > old, "a hit stamps the memo it read");
         assert_eq!(
             fs::read_to_string(&memo).unwrap(),
-            serialize_check_verdict_memo("k1")
+            serialize_check_verdict_memo("k1", &[])
         );
         let _ = fs::remove_dir_all(&lw);
+    }
+
+    /// A pass records its key's components, which only a later miss reads:
+    /// the verdict is still the first two lines. A miss names what changed
+    /// since the pass this check last used, or that there is none to
+    /// compare, and an older memo without components says so.
+    #[test]
+    fn a_verdict_miss_names_the_components_that_changed() {
+        let lw = env::temp_dir().join(format!("td-verdict-why-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let c = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+                .collect()
+        };
+        let was = c(&[("check", "a"), ("recipe uutils", "b"), ("lock x", "c")]);
+        let now = c(&[("check", "a"), ("recipe uutils", "B"), ("sources fd", "d")]);
+        assert_ne!(verdict_key_of(&was), verdict_key_of(&now));
+        assert_eq!(
+            component_changes(&was, &now, 12),
+            "changed recipe uutils, new sources fd, gone lock x"
+        );
+        assert_eq!(
+            component_changes(&was, &now, 1),
+            "changed recipe uutils, and 2 more"
+        );
+        let text = serialize_check_verdict_memo("k1", &was);
+        assert!(parse_check_verdict_memo(&text, "k1"));
+        assert_eq!(parse_check_verdict_components(&text), was);
+
+        let why = |key| runner.explain_verdict_miss("td-sh-test", 1, key, &now);
+        assert!(
+            why("k2").starts_with("no pass recorded here"),
+            "{}",
+            why("k2")
+        );
+        runner
+            .write_check_verdict_memo("td-sh-test", 1, "k1", &was)
+            .unwrap();
+        // Another check's pass, and this key's own, are not compared.
+        runner
+            .write_check_verdict_memo("td-sh-test-x", 1, "k9", &now)
+            .unwrap();
+        runner
+            .write_check_verdict_memo("td-sh-test", 1, "k2", &now)
+            .unwrap();
+        let said = why("k2");
+        assert!(said.starts_with("since the last pass here"), "{said}");
+        assert!(said.ends_with("changed recipe uutils, new sources fd, gone lock x"));
+        fs::write(
+            runner.check_verdict_memo_path("td-sh-test", 1, "k1"),
+            serialize_check_verdict_memo("k1", &[]),
+        )
+        .unwrap();
+        assert!(why("k2").contains("predates recorded key components"));
+        assert!(runner
+            .explain_verdict_miss("td-sh-test", 2, "k2", &now)
+            .starts_with("no earlier pass of this check"));
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    /// Each recipe's compiled source digest is the files the reach's tables
+    /// say it reads, walked as the reach walks them — module readers
+    /// transitively, a wide reader anywhere taking every file — over the
+    /// bytes on disk now: the key and the reach cannot drift apart, and a
+    /// stale build-script output reds here.
+    #[test]
+    fn every_recipe_source_digest_is_the_files_the_reach_says_it_reads() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let table = catalog::recipe_file_reader_table();
+        let wide = catalog::recipe_wide_readers();
+        let mut reads: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (path, stems) in table {
+            for stem in *stems {
+                reads.entry(stem).or_default().push(path);
+            }
+        }
+        let mut file_digest: BTreeMap<&str, String> = BTreeMap::new();
+        for (path, _) in table {
+            file_digest.insert(path, crate::sha256::sha256_file(&root.join(path)).unwrap());
+        }
+        for (stem, _) in catalog::all() {
+            let mut files: BTreeSet<&str> = BTreeSet::new();
+            let (mut pending, mut seen) = (vec![stem], BTreeSet::new());
+            while let Some(s) = pending.pop() {
+                if !seen.insert(s) {
+                    continue;
+                }
+                if wide.contains(&s) {
+                    files.extend(table.iter().map(|(p, _)| *p));
+                }
+                for path in reads.get(s).into_iter().flatten() {
+                    files.insert(path);
+                    if let Some(other) = path
+                        .strip_prefix("recipes/src/recipes/")
+                        .and_then(|f| f.strip_suffix(".rs"))
+                    {
+                        pending.push(other);
+                    }
+                }
+            }
+            let mut h = crate::sha256::Sha256::new();
+            for path in files {
+                h.update(path.as_bytes());
+                h.update(b"\0");
+                h.update(file_digest[path].as_bytes());
+                h.update(b"\n");
+            }
+            assert_eq!(
+                catalog::recipe_source_digest(stem),
+                Some(crate::sha256::to_base16(&h.finalize()).as_str()),
+                "{stem}"
+            );
+        }
+    }
+
+    /// The check's key takes its components in order, the declared builds'
+    /// recipes and sources among them.
+    #[test]
+    fn the_verdict_key_is_taken_over_named_components() {
+        let lw = env::temp_dir().join(format!("td-verdict-parts-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let mut runner = shared_test_runner(&lw);
+        // The tree the locks are read from, and an engine fingerprint the
+        // staged builder would otherwise report.
+        runner.root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        runner.engine_fp.set(Ok("e".repeat(64))).unwrap();
+        let parts = runner
+            .check_verdict_components("rust-toolchain", 1)
+            .unwrap();
+        let names: Vec<&str> = parts.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names.first(), Some(&"check"));
+        assert_eq!(names.last(), Some(&"evaluator"));
+        for name in [
+            "recipe uutils",
+            "sources uutils",
+            "lock recipes/locks/uutils/Cargo.lock",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        assert_eq!(
+            runner.check_verdict_key("rust-toolchain", 1).ok(),
+            Some(verdict_key_of(&parts))
+        );
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    /// A history line is one compact JSON record; the summary orders checks
+    /// by the time they cost, counts memo answers and failures apart, and
+    /// keeps the last run's reason.
+    #[test]
+    fn the_check_history_says_where_the_time_went() {
+        let secs = std::time::Duration::from_secs_f64;
+        let mut text = String::new();
+        text.push_str(&check_history_line(
+            100,
+            "a#1",
+            "pass",
+            secs(10.0),
+            "k",
+            "x changed",
+        ));
+        text.push_str(&check_history_line(200, "a#1", "memo", secs(0.2), "k", ""));
+        text.push_str(&check_history_line(
+            150,
+            "b#1",
+            "fail",
+            secs(30.0),
+            "k",
+            "TD_CHECK_FULL is set",
+        ));
+        text.push_str(&check_history_line(
+            160,
+            "b#1",
+            "pass",
+            secs(50.0),
+            "k",
+            "y \"quoted\"",
+        ));
+        text.push_str(&check_history_line(
+            90,
+            "b#1",
+            "host-gap",
+            secs(0.1),
+            "k",
+            "",
+        ));
+        text.push_str("not json\n");
+        assert!(text
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("{\"at\":100,\"check\":\"a#1\""));
+        let rows = summarize_check_history(&text, &[], 300);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        // A host gap ran nothing: counted apart, out of the times; the
+        // median of an even count is the mean of the middle two.
+        assert!(
+            rows[0].starts_with("b#1: 2 executed (1 failed, 80s in all, median 40.0s"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[0].contains("0 from the memo, 1 unprovisioned;"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[0].ends_with("last pass 50.0s 140s ago — y \"quoted\""),
+            "{rows:?}"
+        );
+        assert!(rows[1].starts_with("a#1: 1 executed"), "{rows:?}");
+        assert!(
+            rows[1].contains("1 from the memo; last memo 0.2s 100s ago"),
+            "{rows:?}"
+        );
+        assert_eq!(rows[2], "(1 unreadable history line(s) skipped)");
+        let only = summarize_check_history(&text, &["a".to_string()], 300);
+        assert_eq!(only.len(), 2, "{only:?}");
+
+        let dir = env::temp_dir().join(format!("td-check-history-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("ladder")).unwrap();
+        let path = check_history_path(&dir.join("ladder"));
+        assert_eq!(path, dir.join(CHECK_HISTORY_FILE));
+        append_check_history(&path, "1\n").unwrap();
+        append_check_history(&path, "2\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "1\n2\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // The STEP map takes the LAST line for a stem (matching ladder_out_from) and
