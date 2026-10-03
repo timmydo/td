@@ -1,17 +1,17 @@
-//! The review window's keys, as the window's key list shows them on `F1`
-//! or `?`: a section per pane, and the two table columns whose cells need
-//! spelling out. Each row's description is whole, for the list to wrap to
-//! its panel; only the landing's closing prose has rows with no keys.
+//! The review window's keys, as the window's key list shows them on `F1`,
+//! `?` or a press on the footer: a section per pane, and the two
+//! table columns whose cells need spelling out, as prose. Each row's
+//! description is whole, for the list to wrap to its panel.
 
 use td_ui::keys::Section;
 
 const LIST: &[(&str, &str)] = &[
-    ("j / k", "move"),
-    ("space / b", "page down / up"),
-    ("g / G", "first / last"),
-    ("enter", "review the selected branch against the base"),
-    ("f", "fetch + prune the base's remote (else origin)"),
-    ("F", "fetch + prune every remote, mirrors included"),
+    ("j/k", "move"),
+    ("Space/b", "page down or up"),
+    ("g/G", "first or last"),
+    ("Return", "review the selected branch against the base"),
+    ("f", "fetch and prune the base's remote (else origin)"),
+    ("F", "fetch and prune every remote, mirrors included"),
     (
         "p",
         "push the base to its remote (else origin), then delete the branches \
@@ -24,7 +24,7 @@ const LIST: &[(&str, &str)] = &[
          hand-typed `git push` still reach",
     ),
     ("r", "re-read branches"),
-    ("/", "filter by branch name (esc clears)"),
+    ("/", "filter by branch name (Escape clears)"),
     (
         "D",
         "delete the selected branch from the remote its row names — asked \
@@ -36,52 +36,64 @@ const LIST: &[(&str, &str)] = &[
         "sweep worktrees whose branch has fully landed (clean, unpushed, not \
          -rolling); every other one says why it stays",
     ),
-    ("?", "this list of keys, in any pane"),
+    (
+        "?",
+        "show this list of keys, in any pane; a click on the footer shows it \
+         too",
+    ),
     ("q", "quit"),
 ];
 
 // The column's whole vocabulary, because two of these cells are answers to
 // a question the operator did not ask — what a LANDING would find, which no
-// key spells out until one is pressed. Titled as CELLS because `?` is also
-// a key above, and the two columns of this list look alike.
+// key spells out until one is pressed. Cells, not keys, so prose rows
+// that quote the cell.
 // Its two halves answer different questions now, which was self-evident
 // while the whole cell was `%(ahead-behind:)` and is not any more.
 const AHEAD_BEHIND: &[(&str, &str)] = &[
     (
-        "A",
-        "commits a landing would take — none on a landed row, however many \
-         of its own the branch still carries",
+        "",
+        "The A half, before the slash: commits a landing would take — none on a \
+         landed row, however many of its own the branch still carries",
     ),
     (
-        "B",
-        "commits the base has that the branch does not, by ancestry: how far \
-         behind it has fallen",
+        "",
+        "The B half, after it: commits the base has that the branch does not, by \
+         ancestry: how far behind it has fallen",
     ),
 ];
 
 const READY: &[(&str, &str)] = &[
-    ("ok", "every commit carries the record AGENTS.md requires"),
-    ("n/m!", "n of its m commits do not"),
-    ("?", "the records could not be read"),
-    ("-", "no commits over the base"),
     (
-        "landed",
-        "nothing left to land: the base carries this work already, under its \
-         own oids after a landing replayed them — rebase the branch and it \
-         empties",
+        "",
+        "\"ok\": every commit carries the record AGENTS.md requires",
+    ),
+    ("", "\"n/m!\": n of its m commits do not"),
+    ("", "\"?\": the records could not be read"),
+    ("", "\"-\": no commits over the base"),
+    (
+        "",
+        "\"landed\": nothing left to land: the base carries this work \
+         already, under its own oids after a landing replayed them — rebase \
+         the branch and it empties",
     ),
     (
-        "!merge",
-        "does not merge onto the base, so neither s nor r can take it as it \
-         stands; rebase it, unless it shares no history with the base at \
-         all, which nothing lands",
+        "",
+        "\"!merge\": does not merge onto the base, so neither s nor r can \
+         take it as it stands; rebase it, unless it shares no history with \
+         the base at all, which nothing lands",
     ),
 ];
 
 const REVIEW: &[(&str, &str)] = &[
-    ("j / k, space / b", "scroll"),
-    ("g / G", "top / end"),
-    ("drag", "select; double, triple click a word, a line"),
+    ("j/k", "scroll a line"),
+    ("Space/b", "scroll a page"),
+    ("g/G", "top or end"),
+    ("drag", "select"),
+    (
+        "double-click",
+        "select a word; a triple click selects a line",
+    ),
     ("C-c", "copy the selection"),
     ("s", "land it squashed: one commit on the base — asks first"),
     (
@@ -96,8 +108,8 @@ const REVIEW: &[(&str, &str)] = &[
 // no keys, a sentence each.
 const LANDING: &[(&str, &str)] = &[
     (
-        "s then y",
-        "squash + commit, message from the branch's commits",
+        "s y",
+        "squash and commit, the message from the branch's commits",
     ),
     (
         "r",
@@ -105,11 +117,11 @@ const LANDING: &[(&str, &str)] = &[
          all of them or none, and with no confirmation: it commits, it does \
          not publish",
     ),
-    ("q, then p", "publish it: push the base (P = every remote)"),
     (
-        "after the push",
-        "the branches it published are deleted from the remotes it reached \
-         — no further confirmation",
+        "q p",
+        "publish it: push the base (P: every remote); the branches it \
+         published are then deleted from the remotes it reached — no \
+         further confirmation",
     ),
     ("", ""),
     (
@@ -130,7 +142,7 @@ const LANDING: &[(&str, &str)] = &[
     ),
     (
         "",
-        "p and P push straight away: the keystroke is the decision, and the \
+        "Both p and P push straight away: the keystroke is the decision, and the \
          branches this session landed onto what it published go with it.",
     ),
     (
@@ -149,13 +161,13 @@ const LANDING: &[(&str, &str)] = &[
 /// while a review is on screen.
 pub fn sections(reviewing: bool) -> Vec<Section> {
     let list = [
-        Section::new("branch list", LIST),
-        Section::new("A/B column (cells, not keys)", AHEAD_BEHIND),
-        Section::new("READY column (cells, not keys)", READY),
+        Section::new("Branch list", LIST),
+        Section::new("A/B column cells", AHEAD_BEHIND),
+        Section::new("READY column cells", READY),
     ];
     let review = [
-        Section::new("review", REVIEW),
-        Section::new("landing", LANDING),
+        Section::new("Review", REVIEW),
+        Section::new("Landing", LANDING),
     ];
     if reviewing {
         review.into_iter().chain(list).collect()
@@ -167,7 +179,7 @@ pub fn sections(reviewing: bool) -> Vec<Section> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use td_ui::keys::{row, Row};
+    use td_ui::keys::{self, row, Row};
 
     fn titles(sections: &[Section]) -> Vec<&'static str> {
         sections.iter().map(|s| s.title).collect()
@@ -179,34 +191,49 @@ mod tests {
         assert_eq!(
             titles(&listed),
             [
-                "branch list",
-                "A/B column (cells, not keys)",
-                "READY column (cells, not keys)",
-                "review",
-                "landing",
+                "Branch list",
+                "A/B column cells",
+                "READY column cells",
+                "Review",
+                "Landing",
             ]
         );
         let reviewed = sections(true);
         assert_eq!(
             titles(&reviewed),
             [
-                "review",
-                "landing",
-                "branch list",
-                "A/B column (cells, not keys)",
-                "READY column (cells, not keys)",
+                "Review",
+                "Landing",
+                "Branch list",
+                "A/B column cells",
+                "READY column cells",
             ]
         );
         let first = |sections: &[Section]| sections.first().and_then(|s| s.rows.first().copied());
-        assert_eq!(first(&listed), Some(row(("j / k", "move"))));
-        assert_eq!(first(&reviewed), Some(row(("j / k, space / b", "scroll"))));
+        assert_eq!(first(&listed), Some(row(("j/k", "move"))));
+        assert_eq!(first(&reviewed), Some(row(("j/k", "scroll a line"))));
+    }
+
+    /// Both orders of the list are spelled as td-ui's keymap spells chords,
+    /// their titles capitalised and every keyed row described.
+    #[test]
+    fn every_variant_passes_the_key_list_check() {
+        for reviewing in [false, true] {
+            let problems = keys::check(&sections(reviewing));
+            assert!(
+                problems.is_empty(),
+                "reviewing {reviewing}:\n{}",
+                problems.join("\n")
+            );
+        }
     }
 
     /// Every keyed row carries its whole description, and rows with no keys
-    /// are only the landing's prose, after a blank row: the list wraps a
-    /// description itself, so a row broken by hand would read ragged.
+    /// are the column cells, a section of them each, and the landing's
+    /// prose after a blank row: the list wraps a description itself, so a
+    /// row broken by hand would read ragged.
     #[test]
-    fn descriptions_are_whole_and_only_the_landing_ends_in_prose() {
+    fn descriptions_are_whole_and_prose_is_the_cells_and_the_landing_s_end() {
         let all = sections(false);
         let rows = |title: &str| -> Vec<Row> {
             all.iter()
@@ -214,40 +241,43 @@ mod tests {
                 .map(|s| s.rows.clone())
                 .unwrap_or_default()
         };
-        let list = rows("branch list");
-        assert!(list.contains(&row(("?", "this list of keys, in any pane"))));
+        let list = rows("Branch list");
         assert!(list.contains(&row(("q", "quit"))));
-        assert!(rows("READY column (cells, not keys)").contains(&row((
-            "!merge",
-            "does not merge onto the base, so neither s nor r can take it as it \
-             stands; rebase it, unless it shares no history with the base at \
-             all, which nothing lands"
+        assert!(list.iter().any(|r| r.keys == "?"));
+        assert!(rows("READY column cells").contains(&row((
+            "",
+            "\"!merge\": does not merge onto the base, so neither s nor r can \
+             take it as it stands; rebase it, unless it shares no history with \
+             the base at all, which nothing lands"
         ))));
         for section in &all {
-            // A row with no keys never opens a section.
-            assert!(
-                section.rows.first().is_some_and(|r| !r.keys.is_empty()),
-                "{}",
-                section.title
-            );
+            let cells = section.title.ends_with("column cells");
             let keyed = section
                 .rows
                 .iter()
                 .take_while(|r| !r.keys.is_empty())
                 .count();
             let prose = section.rows.get(keyed..).unwrap_or_default();
-            if section.title == "landing" {
-                assert_eq!(prose.first(), Some(&row(("", ""))));
-                assert!(prose.iter().all(|r| r.keys.is_empty()));
+            if cells {
+                // Each cell is quoted or named before what it means.
+                assert_eq!(keyed, 0, "{}", section.title);
+                assert!(prose.iter().all(|r| r.what.contains(": ")));
             } else {
-                assert!(prose.is_empty(), "{}: {prose:?}", section.title);
+                // A row with no keys never opens a keyed section.
+                assert!(keyed > 0, "{}", section.title);
+                if section.title == "Landing" {
+                    assert_eq!(prose.first(), Some(&row(("", ""))));
+                    assert!(prose.iter().all(|r| r.keys.is_empty()));
+                } else {
+                    assert!(prose.is_empty(), "{}: {prose:?}", section.title);
+                }
             }
             for r in &section.rows {
                 assert!(!r.what.contains("  "), "{}: {r:?}", section.title);
             }
         }
         assert_eq!(
-            rows("landing").last(),
+            rows("Landing").last(),
             Some(&row((
                 "",
                 "Landing needs a clean work tree with the base branch checked out."

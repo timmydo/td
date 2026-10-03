@@ -1086,6 +1086,10 @@ impl Session {
             self.open_menu(menu);
             return;
         }
+        if key == Key::ShowKeys {
+            self.act(ViewAction::ShowKeys);
+            return;
+        }
         let page = self.page();
         match self.stack.handle_key(key, page) {
             Some(action) => self.act(action),
@@ -3340,7 +3344,7 @@ mod frame_tests {
         let bar = session.shape().unwrap().layout.bar;
         assert_eq!(
             session.stack.current().unwrap().scene().labels,
-            ["Send", "Attach", "Save", "Close"]
+            ["Send", "Attach", "Save", "Help", "Close"]
         );
         let save = bar.header(2).expect("save label");
         press(&mut session, save.x + 2, save.y + 2);
@@ -3348,7 +3352,7 @@ mod frame_tests {
             std::fs::read_to_string(&fourth).unwrap(),
             format!("z{template}")
         );
-        let close = bar.header(3).expect("close label");
+        let close = bar.header(4).expect("close label");
         press(&mut session, close.x + 2, close.y + 2);
         assert_eq!(session.stack.depth(), 1);
         // The question's labels answer it: Discard, pressed, pops with
@@ -3986,5 +3990,74 @@ mod frame_tests {
         assert_eq!(session.title, "Drafts");
         key(&mut session, "q");
         assert_eq!(session.stack.depth(), 1);
+    }
+
+    /// The bar's Help label on the views whose bars lacked it, the
+    /// thread view, the drafts, a sent draft and a draft being edited:
+    /// a press on it asks for the key list and is nothing else, the
+    /// view staying up and the draft, which types `?`, typing nothing.
+    #[test]
+    fn the_help_label_asks_for_the_key_list_and_types_nothing() {
+        fn help(session: &mut Session) {
+            let labels = session.stack.current().unwrap().scene().labels;
+            let index = labels
+                .iter()
+                .position(|label| *label == td_ui::keys::BUTTON)
+                .unwrap_or_else(|| panic!("no Help label in {labels:?}"));
+            let rect = session.shape().unwrap().layout.bar.header(index).unwrap();
+            press(session, rect.x + 2, rect.y + 2);
+        }
+        let (mut session, _cmd_rx, _resp_tx) = session(true);
+        let (cmd_tx, _thread_rx) = mpsc::channel();
+        session.act(ViewAction::Push(Box::new(
+            views::thread_view::ThreadView::new(
+                cmd_tx,
+                "me@example.com".to_string(),
+                "thread-1".to_string(),
+                "Roof repair".to_string(),
+                Vec::new(),
+                "Archive".to_string(),
+                "Trash".to_string(),
+                false,
+                None,
+                None,
+            ),
+        )));
+        assert!(!session.take_show_keys());
+        help(&mut session);
+        assert!(session.take_show_keys(), "the thread view's Help");
+        assert_eq!(session.stack.depth(), 2);
+        key(&mut session, "q");
+        assert_eq!(session.stack.depth(), 1);
+
+        key(&mut session, "D");
+        assert_eq!(session.title, "Drafts");
+        help(&mut session);
+        assert!(session.take_show_keys(), "the drafts' Help");
+        assert_eq!(session.title, "Drafts");
+
+        let dir = crate::testing::tempdir().unwrap();
+        let sent = dir.path().join("td-mail-draft-1-1.eml");
+        std::fs::write(&sent, "Subject: Went\n").unwrap();
+        let view = views::drafts::SentView::open(&sent).unwrap();
+        session.act(ViewAction::Push(Box::new(view)));
+        help(&mut session);
+        assert!(session.take_show_keys(), "a sent draft's Help");
+        assert_eq!(session.title, "Sent td-mail-draft-1-1.eml");
+        key(&mut session, "q");
+        key(&mut session, "q");
+        assert_eq!(session.stack.depth(), 1);
+
+        key(&mut session, "c");
+        assert!(session.title.starts_with("Draft "), "{}", session.title);
+        let typed = text(&session);
+        help(&mut session);
+        assert!(session.take_show_keys(), "the draft's Help");
+        assert_eq!(text(&session), typed, "Help types nothing");
+        assert!(session.title.starts_with("Draft "), "{}", session.title);
+        // `?` itself is the draft's character, not the list.
+        key(&mut session, "?");
+        assert!(!session.take_show_keys());
+        assert_ne!(text(&session), typed, "`?` types");
     }
 }

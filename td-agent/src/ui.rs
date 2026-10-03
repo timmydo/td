@@ -21,10 +21,11 @@
 //! shows the whole list and `C-S-t` clears it. `C-S-p` pauses or resumes
 //! the open conversation (§3).
 //!
-//! A menu bar holds the File and Conversation menus (`menu`), which `F10`
-//! or a press on a header opens. File → Set OpenRouter key… opens the key
-//! dialog (`keydialog`) and Conversation → Model… the model picker
-//! (`picker`), each modal over the window until it closes.
+//! A menu bar holds the File, Conversation and Help menus (`menu`), which
+//! a press on a header opens, `F10` opening File. File → Set OpenRouter
+//! key… opens the key dialog (`keydialog`) and Conversation → Model… the
+//! model picker (`picker`), each modal over the window until it closes;
+//! Help → Keys opens the window's key list.
 
 use std::collections::VecDeque;
 
@@ -491,6 +492,10 @@ pub struct App {
     requests: Vec<Request>,
     /// The bar's menu, closed until opened.
     menu: menu::Menu,
+    /// Help → Keys was chosen during the input `input_live` delivers;
+    /// cleared before each, so a choice through another path (the
+    /// control seam's) never reaches the window.
+    keys_chosen: bool,
     /// The key dialog while it is open, modal over the window.
     dialog: Option<KeyDialog>,
     /// Where the key file is, as the dialog says it; none when there is
@@ -575,6 +580,7 @@ impl App {
             requests: Vec::new(),
             menu: menu::menu(surface, menu::State::default(), 1)
                 .map_err(|e| format!("the menu: {e}"))?,
+            keys_chosen: false,
             dialog: None,
             key_path: None,
             keyed: true,
@@ -1915,7 +1921,19 @@ impl App {
         self.touch();
     }
 
-    /// One input from the window, with its clipboard.
+    /// One input from td-ui's window, the live pointer's or the physical
+    /// keyboard's, as `input`; true when it chose Help → Keys, which the
+    /// window answers by showing its key list. The control seam delivers
+    /// through `input` alone, so its choice of the item shows nothing:
+    /// only a choice made inside this call is reported.
+    pub fn input_live(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) -> bool {
+        self.keys_chosen = false;
+        self.input(input, clipboard);
+        std::mem::take(&mut self.keys_chosen)
+    }
+
+    /// One input, with its clipboard: td-ui's window's through
+    /// `input_live`, or the control seam's.
     pub fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
         if let Input::Paste(text) = input {
             return self.pasted(text);
@@ -2114,6 +2132,8 @@ impl App {
             menu::Action::Quit => self.requests.push(Request::Quit),
             menu::Action::Model => self.open_picker(),
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
+            // The list is the window's: `input_live` reports the choice.
+            menu::Action::Keys => self.keys_chosen = true,
         }
     }
 
@@ -2359,7 +2379,7 @@ impl App {
     /// table, then the focused widget's keys and the other widgets'.
     pub fn key_list(&self) -> Vec<Section> {
         let window = Section {
-            title: "td-agent",
+            title: "Global",
             rows: crate::control::BINDINGS
                 .iter()
                 .filter_map(|binding| {
@@ -2873,7 +2893,7 @@ pub mod tests {
         let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
         assert_eq!(
             titles,
-            ["td-agent", "Composer", "Conversation list", "Transcript"]
+            ["Global", "Composer", "Conversation list", "Transcript"]
         );
         // Every chord the driven table binds, in its order and words; the
         // chordless menu items, `set-key` and `model`, are no key.
@@ -2894,7 +2914,31 @@ pub mod tests {
         let titles: Vec<&str> = app.key_list().iter().map(|s| s.title).collect();
         assert_eq!(
             titles,
-            ["td-agent", "Conversation list", "Transcript", "Composer"]
+            ["Global", "Conversation list", "Transcript", "Composer"]
+        );
+    }
+
+    /// Every focus's list is spelled as td-ui's keymap spells chords, and
+    /// Help → Keys adds no row: the window's own section lists `F1`.
+    #[test]
+    fn the_key_list_passes_the_check_under_every_focus() {
+        let mut app = app();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let sections = app.key_list();
+            let problems = keys::check(&sections);
+            assert!(problems.is_empty(), "{:?}: {problems:#?}", app.focus());
+            assert!(!sections
+                .iter()
+                .flat_map(|s| &s.rows)
+                .any(|r| r.keys == keys::CHORD || r.what.contains(keys::ITEM)));
+            seen.push(app.focus());
+            key(&mut app, "F6");
+        }
+        assert_eq!(
+            seen,
+            [Focus::Composer, Focus::List, Focus::Transcript],
+            "every focus"
         );
     }
 
@@ -4086,6 +4130,86 @@ pub mod tests {
             requests.is_empty(),
             "the press opened nothing: {requests:?}"
         );
+    }
+
+    /// Whether any of a live press and release at `x`, `y` chose Help →
+    /// Keys.
+    fn press_live(app: &mut App, x: i64, y: i64) -> bool {
+        [PointerPhase::Press, PointerPhase::Release]
+            .into_iter()
+            .fold(false, |chosen, phase| {
+                let input = Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                    follow: false,
+                };
+                app.input_live(input, &mut NoClipboard) | chosen
+            })
+    }
+
+    fn key_live(app: &mut App, chord: &str) -> bool {
+        let input = Input::Key {
+            chord,
+            repeat: false,
+        };
+        app.input_live(input, &mut NoClipboard)
+    }
+
+    #[test]
+    fn help_keys_by_the_live_pointer_or_keyboard_asks_for_the_key_list() {
+        let mut app = app();
+        let header = menu::bar(app.surface).header(2).unwrap();
+        assert!(!press_live(&mut app, header.x + 4, header.y + 4));
+        assert!(app.menu_open());
+        assert!(text(&app).contains(keys::ITEM), "{}", text(&app));
+        let panel = app.menu.panel(0).unwrap();
+        assert!(press_live(&mut app, panel.x + 8, panel.y + 4));
+        assert!(!app.menu_open());
+        assert!(app.take_requests().is_empty());
+        // The keyboard's way: F10, Right past Conversation to Help, Return.
+        assert!(!key_live(&mut app, "F10"));
+        assert!(!key_live(&mut app, "Right"));
+        assert!(!key_live(&mut app, "Right"));
+        assert!(key_live(&mut app, "Return"));
+        assert!(!app.menu_open());
+        // Asked once: the next input asks nothing.
+        assert!(!key_live(&mut app, "Right"));
+    }
+
+    /// Help → Keys through the control seam's keys or pointer chooses the
+    /// item, but the window's next input reports no choice: only one made
+    /// inside `input_live` is, and the seam delivers through `input`.
+    #[test]
+    fn help_keys_through_the_control_seam_asks_for_no_key_list() {
+        use td_ui::driven;
+        let mut app = app();
+        let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02x}")).collect() };
+        let mut remote = crate::control::Remote { app: &mut app };
+        for (n, chord) in ["F10", "Right", "Right", "Return"].iter().enumerate() {
+            let line = format!("1\t{n}\tkey\t{}", hex(chord));
+            assert!(driven::request(&mut remote, line.as_bytes()).ends_with("changed"));
+        }
+        assert!(app.keys_chosen, "the seam's keys chose the item");
+        assert!(!app.menu_open());
+        assert!(!app.input_live(Input::Focus(true), &mut NoClipboard));
+        let header = menu::bar(app.surface).header(2).unwrap();
+        let mut lines = vec![(header.x + 4, header.y + 4)];
+        let mut opened = menu::menu(app.surface, menu::State::default(), 1).unwrap();
+        opened.open_bar(2).unwrap();
+        let panel = opened.panel(0).unwrap();
+        lines.push((panel.x + 8, panel.y + 4));
+        let mut remote = crate::control::Remote { app: &mut app };
+        for (n, (x, y)) in lines.into_iter().enumerate() {
+            for phase in ["press", "release"] {
+                let line = format!("1\t{}\tpointer\t{phase}\t{x}\t{y}", 10 + n);
+                driven::request(&mut remote, line.as_bytes());
+            }
+        }
+        assert!(app.keys_chosen, "the seam's pointer chose the item");
+        assert!(!app.input_live(Input::Focus(true), &mut NoClipboard));
+        assert!(app.take_requests().is_empty());
     }
 
     #[test]

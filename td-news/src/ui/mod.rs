@@ -23,7 +23,7 @@ use td_ui::chrome::{Bar, Field, Item, List, Status, Strip, TabHit, TextEntry, RO
 use td_ui::editor::{Controller, Event, Outcome, PointerPhase as PanePhase};
 use td_ui::editor_clipboard::Snapshot;
 use td_ui::editor_model::TabId;
-use td_ui::keys::Section;
+use td_ui::keys::{self, Section};
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::window::{Clipboard, Input, PointerPhase};
 
@@ -127,7 +127,7 @@ const FEED_LABELS: &[&str] = &[
     "Refresh",
     "Refresh all",
     "Mark read",
-    "Help",
+    keys::BUTTON,
     "Quit",
 ];
 const FEED_KEYS: &[Key] = &[
@@ -145,7 +145,7 @@ const ARTICLE_LIST_LABELS: &[&str] = &[
     "Read, next",
     "Digest",
     "Open link",
-    "Help",
+    keys::BUTTON,
 ];
 const ARTICLE_LIST_KEYS: &[Key] = &[
     Key::Char('q'),
@@ -163,7 +163,7 @@ const ARTICLE_LABELS: &[&str] = &[
     "Links",
     "Open link",
     "Toggle read",
-    "Help",
+    keys::BUTTON,
 ];
 const ARTICLE_KEYS: &[Key] = &[
     Key::Char('q'),
@@ -174,9 +174,9 @@ const ARTICLE_KEYS: &[Key] = &[
     Key::Char('u'),
     Key::Char('?'),
 ];
-const LINKS_LABELS: &[&str] = &["Cancel", "Open"];
-const LINKS_KEYS: &[Key] = &[Key::Char('q'), Key::Enter];
-const LOG_LABELS: &[&str] = &["Back", "News", "Debug", "Help"];
+const LINKS_LABELS: &[&str] = &["Cancel", "Open", keys::BUTTON];
+const LINKS_KEYS: &[Key] = &[Key::Char('q'), Key::Enter, Key::Char('?')];
+const LOG_LABELS: &[&str] = &["Back", "News", "Debug", keys::BUTTON];
 const LOG_KEYS: &[Key] = &[
     Key::Char('q'),
     Key::Char('n'),
@@ -1484,7 +1484,7 @@ impl App {
         }
         match self.view {
             View::Article if self.url_picking => format!(
-                "Link [{}] of {} (Enter open, 1-9 jump, q cancel)",
+                "Link [{}] of {} (Return open, 1..9 jump, q cancel)",
                 self.url_cursor + 1,
                 self.article_urls.len()
             ),
@@ -2900,6 +2900,50 @@ pub(super) mod tests {
         app.mouse_config = false;
         press(&mut app, 10, row(0).y + 3);
         assert_eq!(app.selected_feed, last, "the mouse off");
+    }
+
+    /// The link picker's bar has the Help label every other bar has: a
+    /// press on it asks the window for the key list and leaves the
+    /// picker as it was.
+    #[test]
+    fn the_link_pickers_help_label_asks_for_the_key_list() {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open_at(dir.path().join("test.tdkv")).expect("cache");
+        seed_cache(&cache, false);
+        let config = test_config();
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let mut app = App::new(&config, &cache, true).expect("app");
+        for chord in ["Down", "Down", "Return", "Return"] {
+            let input = Input::Key {
+                chord,
+                repeat: false,
+            };
+            app.input(input, &cache, &cmd_tx);
+        }
+        assert_eq!(app.view, View::Article);
+        app.article_urls = vec!["https://a.test/".into(), "https://b.test/".into()];
+        app.url_picking = true;
+        app.url_cursor = 1;
+        let layout = app.layout();
+        let index = LINKS_LABELS
+            .iter()
+            .position(|label| *label == keys::BUTTON)
+            .expect("a Help label");
+        let help = layout.bar.header(index).expect("help label");
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            let input = Input::Pointer {
+                phase,
+                x: help.x + 2,
+                y: help.y + 2,
+                extend: false,
+                follow: false,
+            };
+            app.input(input, &cache, &cmd_tx);
+        }
+        assert!(std::mem::take(&mut app.show_keys));
+        assert!(app.url_picking, "the picker stays");
+        assert_eq!(app.url_cursor, 1);
+        assert_eq!(app.view, View::Article);
     }
 
     /// A Control-press on a link in an opened article opens it through the

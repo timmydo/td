@@ -11,6 +11,7 @@ use crate::ui::views::{
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::SystemTime;
+use td_ui::keys;
 
 /// The action bar's labels for each of the view's modes, and the key each
 /// stands for; a press on a label is that key, and Folder's is the
@@ -23,7 +24,7 @@ const LABELS: &[&str] = &[
     "Folder",
     "Mark read",
     "Account",
-    "Help",
+    keys::BUTTON,
     "Quit",
 ];
 const KEYS: &[Key] = &[
@@ -41,7 +42,7 @@ const CREATE_LABELS: &[&str] = &["Create", "Cancel"];
 const CREATE_KEYS: &[Key] = &[Key::Enter, Key::Escape];
 const DELETE_LABELS: &[&str] = &["Delete", "Cancel"];
 const DELETE_KEYS: &[Key] = &[Key::Char('y'), Key::Escape];
-const SETUP_SCREEN_LABELS: &[&str] = &["Set up", "Account", "Help", "Quit"];
+const SETUP_SCREEN_LABELS: &[&str] = &["Set up", "Account", keys::BUTTON, "Quit"];
 const SETUP_SCREEN_KEYS: &[Key] = &[
     Key::Char('s'),
     Key::Char('a'),
@@ -49,7 +50,7 @@ const SETUP_SCREEN_KEYS: &[Key] = &[
     Key::Char('q'),
 ];
 /// A placeholder the form cannot change: only its own keys act.
-const PLACEHOLDER_LABELS: &[&str] = &["Account", "Help", "Quit"];
+const PLACEHOLDER_LABELS: &[&str] = &["Account", keys::BUTTON, "Quit"];
 const PLACEHOLDER_KEYS: &[Key] = &[Key::Char('a'), Key::Char('?'), Key::Char('q')];
 const SETUP_LABELS: &[&str] = &["OK", "Cancel"];
 const SETUP_KEYS: &[Key] = &[Key::Enter, Key::Escape];

@@ -119,9 +119,21 @@ scroll sideways; the wheel scrolls three rows a notch.
 - Ctrl+Q or the compositor's close quits.
 
 `F1` shows these keys in td-ui's key list (td-ui/DESIGN.md, "Key
-list"): the window's own from `app::KEYS`, the table the status row's
-and `--help`'s hint is made from, then the list's and the delete
-question's, the question's first while it is open.
+list"): the window's own from `app::KEYS`, titled "Disk usage", then the
+list's and the delete question's, the question's first while it is
+open. The rows are spelled as td-ui's keymap spells chords, which the
+tests hold them to with `keys::check`. The status row's and `--help`'s
+hint is `F1: keys` followed by `app::KEYS`; the chord's own row is the
+key list's Window section, so the list does not repeat it. The status
+row shows the hint at start and after each scan or refresh: `F1: keys`
+leads the row, before the running job's count, the list's notes and
+the message, so a narrow row cannot clip it, and `app::KEYS` ends it;
+any other message replaces the hint. A left press on the status row
+opens the list too, but only while the row shows the hint, lies whole
+on the surface and holds `F1: keys` whole short of its ellipsis, and
+not while the delete question is open and takes the pointer. Only that
+live press sets the request `take_show_keys` answers: td-dua has no
+control socket, and `--preview` never shows the list.
 
 While a scan or deletion is running, `x`, `D` and `r` are refused, so
 replies always apply to the tree they were asked about; `d` and `u` are

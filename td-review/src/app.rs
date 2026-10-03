@@ -69,6 +69,11 @@ struct Landed {
 /// how many more there are.
 const SHOWN_COMMITS: usize = 10;
 
+/// The footer's hint for the window's key list, first, so a narrow window
+/// clips the others before it. A press on a footer that shows it whole
+/// opens the list.
+pub const KEYS_HINT: &str = "?/F1 keys";
+
 /// Widest the branch-name column may grow, however long the longest name is.
 const MAX_NAME_COL: usize = 48;
 
@@ -332,7 +337,7 @@ impl App {
         if self.status.is_empty() {
             // The status row's ground with nothing to report: muted, so the
             // hints read as chrome rather than as a note somebody raised.
-            f.push_text(keys, Style::dim().with_invert());
+            f.push_keys(keys, Style::dim().with_invert(), KEYS_HINT);
         } else {
             f.push_text(
                 &format!(" {}", self.status),
@@ -474,7 +479,9 @@ impl App {
         }
         self.footer(
             f,
-            " enter review · f/F fetch · p/P push+clean up · / filter · D delete · w worktrees · ? keys · q quit",
+            &format!(
+                " {KEYS_HINT} · Return review · f/F fetch · p/P push+clean up · / filter · D delete · w worktrees · q quit"
+            ),
         );
     }
 
@@ -496,7 +503,7 @@ impl App {
         );
         self.footer(
             f,
-            " j/k scroll · g/G ends · C-c copy · s squash · r rebase now · q back",
+            &format!(" {KEYS_HINT} · j/k scroll · g/G ends · C-c copy · s squash · r rebase now · q back"),
         );
     }
 
@@ -509,7 +516,10 @@ impl App {
         for line in &view::wrap_window(&self.log, f.cols, top, height) {
             f.push(line);
         }
-        self.footer(f, " j/k scroll · q back to branches");
+        self.footer(
+            f,
+            &format!(" {KEYS_HINT} · j/k scroll · q back to branches"),
+        );
     }
 
     // ----------------------------------------------------------------- input

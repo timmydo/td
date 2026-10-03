@@ -11,66 +11,74 @@ pub const LOG: &str = "Log";
 const MOUSE_TITLE: &str = "Mouse";
 
 const GLOBAL: &[(&str, &str)] = &[
-    ("q", "quit/back"),
+    ("q", "quit, or go back"),
     ("?", "show this list of keys"),
-    ("g", "refresh current feed"),
+    ("g", "refresh the current feed"),
     ("G", "refresh all feeds"),
 ];
 
 const FEED_LIST: &[(&str, &str)] = &[
-    ("j/k or arrows", "move"),
-    ("n/p", "next/prev"),
-    ("PgUp/PgDn", "move by page"),
-    ("Home/End", "jump to top/bottom"),
-    ("Enter", "open feed/[Log]"),
-    ("g", "refresh current feed"),
+    ("j/k/Up/Down", "move"),
+    ("n/p", "next or previous"),
+    ("PageUp/PageDown", "move by a page"),
+    ("Home/End", "jump to the top or the bottom"),
+    ("Return", "open the feed, or the [Log]"),
+    ("g", "refresh the current feed"),
     ("G", "refresh all feeds"),
-    ("u", "mark feed read"),
+    ("u", "mark the feed read"),
 ];
 
 const ARTICLE_LIST: &[(&str, &str)] = &[
-    ("j/k or arrows", "move"),
-    ("n/p", "next/prev"),
-    ("PgUp/PgDn", "move by page"),
-    ("Home/End", "jump to top/bottom"),
-    ("Enter", "open article"),
+    ("j/k/Up/Down", "move"),
+    ("n/p", "next or previous"),
+    ("PageUp/PageDown", "move by a page"),
+    ("Home/End", "jump to the top or the bottom"),
+    ("Return", "open the article"),
     ("/", "search titles and text"),
-    ("g", "refresh current feed"),
+    ("g", "refresh the current feed"),
     ("G", "refresh all feeds"),
-    ("u", "mark read + next (toggle if read)"),
-    ("H", "open HTML digest in browser"),
-    ("o", "open link"),
+    (
+        "u",
+        "mark read and go to the next unread; on a read article, mark it unread",
+    ),
+    ("H", "open the HTML digest in the browser"),
+    ("o", "open the article's link"),
 ];
 
 const ARTICLE_VIEW: &[(&str, &str)] = &[
     ("j/k", "scroll"),
-    ("Space/PgDn", "page down"),
-    ("PgUp", "page up"),
-    ("arrows, Home/End", "move the caret; the view follows"),
-    ("n/p", "next/prev article"),
+    ("Space/PageDown", "page down"),
+    ("PageUp", "page up"),
+    ("arrows/Home/End", "move the caret; the view follows"),
+    ("n/p", "next or previous article"),
     ("u", "toggle read"),
-    ("o", "open article link"),
-    ("b", "open URL (picker if multiple)"),
-    ("1-9", "open URL by number"),
+    ("o", "open the article's link"),
+    (
+        "b",
+        "open a link in the text, from a picker if there are several",
+    ),
+    ("1..9", "open a link in the text by its number"),
 ];
 
 const LOG_VIEW: &[(&str, &str)] = &[
     ("n", "show [News Log]"),
     ("d", "show [Debug Log]"),
-    ("j/k or arrows", "scroll"),
-    ("PgUp/PgDn", "page scroll"),
-    ("Home/End", "top/bottom"),
+    ("j/k/Up/Down", "scroll"),
+    ("PageUp/PageDown", "scroll by a page"),
+    ("Home/End", "scroll to the top or the bottom"),
     ("q", "back"),
 ];
 
 const MOUSE: &[(&str, &str)] = &[
-    ("click", "select the row; a bar label is its key"),
-    ("click an article", "open it"),
-    ("wheel", "move the selection, or scroll the article"),
-    ("drag in the article", "select text"),
     (
-        "Ctrl-click a link",
-        "in the article: open it in the browser",
+        "click",
+        "select a feed, or open an article or a link; a bar label is its key",
+    ),
+    ("wheel", "move the selection, or scroll the article"),
+    ("drag", "in the article: select text"),
+    (
+        "C-click",
+        "on a link in the article: open it in the browser",
     ),
 ];
 
@@ -115,8 +123,8 @@ mod tests {
         );
         let all = sections(FEEDS);
         let feeds = all.first().expect("the feeds lead");
-        assert_eq!(feeds.rows.first(), Some(&row(("j/k or arrows", "move"))));
-        assert!(feeds.rows.contains(&row(("u", "mark feed read"))));
+        assert_eq!(feeds.rows.first(), Some(&row(("j/k/Up/Down", "move"))));
+        assert!(feeds.rows.contains(&row(("u", "mark the feed read"))));
         let everywhere = all.get(1).expect("then everywhere");
         assert!(everywhere
             .rows
@@ -124,8 +132,22 @@ mod tests {
         let mouse = all.last().expect("the mouse last");
         assert_eq!(mouse.title, MOUSE_TITLE);
         assert_eq!(
-            mouse.rows.get(2),
+            mouse.rows.get(1),
             Some(&row(("wheel", "move the selection, or scroll the article")))
         );
+    }
+
+    /// Every list the reader can show, whichever view leads, is spelled
+    /// and written as td-ui's key list holds every program's.
+    #[test]
+    fn every_list_passes_the_key_list_check() {
+        for lead in ["", EVERYWHERE, FEEDS, ARTICLES, ARTICLE, LOG, MOUSE_TITLE] {
+            let problems = td_ui::keys::check(&sections(lead));
+            assert!(
+                problems.is_empty(),
+                "lead {lead:?}:\n{}",
+                problems.join("\n")
+            );
+        }
     }
 }

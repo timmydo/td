@@ -713,15 +713,17 @@ the result whose copy action copies the whole, marked `error` when it is
 one. A pause, a resumption and a cleared list are `td-agent` notices.
 
 **As built (the File menu).** A menu bar, td-ui's `chrome::Bar`, takes
-the window's top row, and the split lies under it. Its one header,
-`File`, opens td-ui's shared menu controller (td-ui/DESIGN.md, "Shared
-menu controller") in adaptive fit, as td-mail's Folder menu does. `F10`
-opens it, as it opens td-editor's menus, and so does a press on the
-header. While it is open the window routes its keys and the pointer to
-it, td-editor's set: `Up` and `Down` move, `Return` or `Space` chooses,
-`Escape` or `F10` closes it, every other chord is consumed, as is a
-hover, a press outside closes it and goes no further, and a focus loss
-or a resize closes it. It is painted after the window's frame. Its items are:
+the window's top row, and the split lies under it. Its headers, `File`,
+`Conversation` (below) and `Help`, in that order, open td-ui's shared
+menu controller (td-ui/DESIGN.md, "Shared menu controller") in adaptive
+fit, as td-mail's Folder menu does. `F10` opens File, as it opens
+td-editor's menus, a press on a header opens its menu, and `Left` and
+`Right` move between them. While one is open the
+window routes its keys and the pointer to it, td-editor's set: `Up` and
+`Down` move, `Return` or `Space` chooses, `Escape` or `F10` closes it,
+every other chord is consumed, as is a hover, a press outside closes it
+and goes no further, and a focus loss or a resize closes it. It is
+painted after the window's frame. File's items are:
 
 - `New conversation`, shown with `C-n`, which does what `C-n` does;
 - `Set OpenRouter key…`, which opens the key dialog below; it has no
@@ -731,8 +733,11 @@ or a resize closes it. It is painted after the window's frame. Its items are:
 - `Quit`, which closes the window as the compositor's close does; it has
   no chord.
 
-A shortcut the menu shows is a chord the window binds, which a test
-holds. Pausing and the todo list are the open conversation's, not a
+The header `Help` is td-ui's `keys::BUTTON`, and its one item, `Keys`,
+is `keys::ITEM`: it shows the key list below, as `F1` does, and shows
+`F1`. A shortcut File shows is a chord the window binds, which a test
+holds; Help's `F1` is td-ui's window's own chord, which the program
+never sees. Pausing and the todo list are the open conversation's, not a
 file's, and stay chords only. The driven actions gain `menu` (`F10`)
 and `set-key`, which has no chord and opens the dialog through the
 item's own path; the driven state gains `menu` (`open` or `closed`),
@@ -794,11 +799,24 @@ window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
 of the driven action table, `control::BINDINGS`, with its help line, so
 the list and the table an agent reads are one source; `set-key`,
 `model` and `export-diagnostics`, which have no chord, are the File and
-Conversation menus'. Then
-come the focused widget's keys (the conversation list's, the
-transcript's or the composer's) and the other two's, listed beside
-`ui::App::key`. The control socket delivers its keys to the window's
-state, not through td-ui's window, so an `F1` sent there opens nothing.
+Conversation menus'. The section is titled `Global`. Then come the
+focused widget's keys (the conversation list's, the transcript's or the
+composer's) and the other two's, listed beside `ui::App::key`. Every
+row is spelled as td-ui's keymap spells chords, which `keys::check`
+holds under each focus, and Help → Keys adds no row: td-ui's own Window
+section lists `F1`. The control socket delivers its keys to the
+window's state, not through td-ui's window, so an `F1` sent there opens
+nothing.
+
+Help → Keys opens the list only when td-ui's window's own input chose
+it, the live pointer or the physical keyboard (td-ui/DESIGN.md, "Key
+list"). The choice cannot tell its origin where the menu carries it out:
+the window and the control seam both deliver to `App::input`. So the
+window delivers through `App::input_live`, which clears the choice
+before the input and reports it after, and `Session` answers
+`take_show_keys` from that alone; the seam's `F10`, `Right` and
+`Return`, or its presses, choose the item and show nothing, and the
+choice they leave is cleared before the window's next input.
 
 **As built (the Conversation menu).** Each conversation has its own
 model and reasoning effort. The configuration's `model` (or
@@ -807,8 +825,8 @@ conversation starts with and keeps until the human chooses otherwise,
 and a choice is the open conversation's alone: it moves to no other,
 and the configuration file is never written.
 
-- **The menu.** The bar gains a second header, `Conversation`, after
-  `File`. Its items are `Model…`, which opens the picker below, and
+- **The menu.** The bar's second header, `Conversation`, lies between
+  `File` and `Help`. Its items are `Model…`, which opens the picker below, and
   `Effort`, a submenu of every effort §15 admits (`none`, `minimal`,
   `low`, `medium`, `high`, `xhigh`), the open conversation's checked.
   Choosing one asks for it at once. Both items are off with no
@@ -2988,12 +3006,18 @@ the window, which lets that call finish, answers the next as not run
 and offers `C-r`, whose request carries both results.
 
 **As built (the File menu).** `src/menu.rs` covers each item's action
-in order, its shortcuts being chords the window binds, `F10` and
-`Escape` closing it, other chords consumed, and a press on the header
-and on an item. `src/key.rs` covers the dialog's check and the paste's
-trimming; the write making a 0700 directory and a 0600 file holding
-the key and a newline, read back, leaving no temporary file and the
-key in no other file, and using an existing directory as it is; a
+in order, File's shortcuts being chords the window binds and Help's
+`F1` none of them, `F10` and `Escape` closing it, other chords
+consumed, a press on the header and on an item, and Help after
+Conversation, its `Keys` chosen by `Right`, `Right` and `Return` or by
+presses. The window's
+units hold that every focus's key list passes `keys::check` with no row
+for Help → Keys, that the live pointer's and keyboard's choice of it
+asks for the list once, and that the control seam's keys and presses
+choosing it ask for nothing. `src/key.rs` covers the dialog's check and
+the paste's trimming; the write making a 0700 directory and a 0600 file
+holding the key and a newline, read back, leaving no temporary file and
+the key in no other file, and using an existing directory as it is; a
 stored key replaced only when asked, a refused one included; refusals
 by name of a group-writable ancestor (with nothing made under it), a
 missing configuration home, a link or a file where the temporary file

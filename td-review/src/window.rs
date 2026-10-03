@@ -519,7 +519,9 @@ struct Session {
     /// What a copy came to, over the status row until the next input or
     /// the next frame, so it never covers a prompt bar a frame raised.
     note: Option<String>,
-    /// `?` was pressed: the window's key list opens after this input.
+    /// `?` was pressed, or the footer's hint: the window's key list opens
+    /// after this input. Only the live keyboard and pointer set it; the
+    /// window has no other input.
     show_keys: bool,
 }
 
@@ -800,11 +802,25 @@ impl Session {
         });
     }
 
-    fn press(&mut self, x: i64, y: i64, now: Instant) -> Flow {
+    /// A left press off the pane at `x`, `y`; `covered` when a notice was
+    /// painted over the frame's last row as it was made.
+    fn press(&mut self, x: i64, y: i64, now: Instant, covered: bool) -> Flow {
         let height = (LINE * self.scale) as i64;
         let Ok(row) = usize::try_from(y.div_euclid(height)) else {
             return Flow::Continue;
         };
+        // The footer's hint opens the key list, on the frame on screen where
+        // it is laid out for this surface and no notice covers it. Asking is
+        // harmless, so the dwell a pick waits out is not needed.
+        let keys = !covered
+            && self.shown.as_ref().is_some_and(|(_, frame)| {
+                frame.opens_keys_at(row) && self.surface.is_some_and(|s| fits(frame, s))
+            });
+        if keys {
+            self.clicks.cancel();
+            self.show_keys = true;
+            return Flow::Continue;
+        }
         let s = self.scale as i64;
         let nanos =
             u64::try_from(now.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX);
@@ -857,6 +873,7 @@ impl Session {
                     ..
                 }
         );
+        let covered = self.closing || self.note.is_some();
         if pressed && self.note.take().is_some() {
             self.dirty = true;
         }
@@ -887,7 +904,7 @@ impl Session {
                 if self.pane_pointer(phase, x, y, extend) || phase != PointerPhase::Press {
                     return Flow::Continue;
                 }
-                self.press(x, y, now)
+                self.press(x, y, now, covered)
             }
             Input::Wheel { rows, .. } if rows != 0 => {
                 self.clicks.cancel();
@@ -1546,12 +1563,69 @@ mod tests {
         let at = until(&mut session, "cancelled");
 
         session.input_at(press("q", false), at);
-        let at = until(&mut session, " enter review ");
+        let at = until(&mut session, " Return review ");
         session.input_at(press("/", false), at);
         let at = until(&mut session, " filter: _");
         question(&mut session, at);
         session.input_at(press("x", false), at);
         until(&mut session, " filter: x_");
+
+        session.input_at(Input::Close, Instant::now());
+        assert!(worker.join().unwrap().is_ok());
+    }
+
+    /// With the worker's own frames on screen, a left press on the footer
+    /// while it shows the hints, `?/F1 keys` among them, opens the key list
+    /// and sends the worker nothing, on the review's footer and the list's.
+    /// A press on another row, on a prompt or a status the footer shows
+    /// instead, or on a note painted over it, opens nothing.
+    #[test]
+    fn a_press_on_the_footer_s_hints_opens_the_key_list() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (message_tx, message_rx) = mpsc::channel();
+        let grid = Arc::new(Grid::new((24, 80)));
+        let link = Link::new(event_rx, message_tx, Arc::clone(&grid));
+        let worker = thread::spawn(move || serve(crate::app::reviewing_fixture(), link));
+        let mut session = Session::new("td-review".into(), event_tx, message_rx, grid).unwrap();
+        session.surface = Some(surface(800, 600, 1));
+        let click = |session: &mut Session, row: i64, at: Instant| {
+            let sent = session.sent;
+            session.input_at(
+                Input::Pointer {
+                    phase: PointerPhase::Press,
+                    x: 10,
+                    y: row * LINE as i64 + 5,
+                    extend: false,
+                    follow: false,
+                },
+                at,
+            );
+            assert_eq!(session.sent, sent, "the worker was sent the press");
+            session.take_show_keys()
+        };
+        let footer = 23;
+
+        let at = until(&mut session, crate::app::KEYS_HINT);
+        assert!(session
+            .shown
+            .as_ref()
+            .is_some_and(|(_, frame)| frame.text().contains(" review ")));
+        assert!(click(&mut session, footer, at), "the review's footer");
+        assert!(!click(&mut session, 0, at), "the title row");
+        session.note = Some(" copied to the clipboard".into());
+        assert!(!click(&mut session, footer, at), "under a note");
+        assert!(click(&mut session, footer, at), "the note gone");
+
+        session.input_at(press("s", false), at);
+        let at = until(&mut session, "squash into one commit");
+        assert!(!click(&mut session, footer, at), "a prompt");
+        session.input_at(press("n", false), at);
+        let at = until(&mut session, "cancelled");
+        assert!(!click(&mut session, footer, at), "a status");
+
+        session.input_at(press("q", false), at);
+        let at = until(&mut session, " Return review ");
+        assert!(click(&mut session, footer, at), "the list's footer");
 
         session.input_at(Input::Close, Instant::now());
         assert!(worker.join().unwrap().is_ok());
@@ -1563,13 +1637,13 @@ mod tests {
     fn the_key_list_leads_with_the_pane_on_screen() {
         let (mut session, _events, _messages) = session();
         let first = |session: &Session| session.keys().first().map(|s| s.title);
-        assert_eq!(first(&session), Some("branch list"));
+        assert_eq!(first(&session), Some("Branch list"));
         let document = Arc::new(Document::new(1, &[Line::plain("hello")]));
         showing(&mut session, 1, reviewing(&document, true));
-        assert_eq!(first(&session), Some("review"));
+        assert_eq!(first(&session), Some("Review"));
         assert_eq!(session.keys().len(), 5);
         showing(&mut session, 2, listing(&["origin/a"]));
-        assert_eq!(first(&session), Some("branch list"));
+        assert_eq!(first(&session), Some("Branch list"));
     }
 
     fn listing(names: &[&str]) -> Frame {

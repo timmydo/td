@@ -166,6 +166,12 @@ impl Handler for Session {
         self.app.key_list()
     }
 
+    // td-pass has no control socket: every input is the live pointer's
+    // or the physical keyboard's.
+    fn take_show_keys(&mut self) -> bool {
+        self.app.take_key_list_asked()
+    }
+
     fn notice(&mut self, message: &str) {
         eprintln!("td-pass: window: {message}");
     }

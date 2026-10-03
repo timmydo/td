@@ -7,20 +7,34 @@ use td_ui::chrome::{Buttons, List, Status, TextEntry, ROW};
 use td_ui::raster::{Rect, Surface};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
-// Every strip ends with Quit, which closing the window also asks for.
-pub const NOTEBOOK: [&str; 8] = [
-    "New", "Rename", "Delete", "Save", "Find", "Keys", "Lock", "Quit",
+/// The strips' last button, which closing the window also asks for.
+pub const QUIT: &str = "Quit";
+
+// Every strip ends with Help (`td_ui::keys::BUTTON`), which shows the
+// window's key list, then Quit. The notebook's Keys is the encryption
+// keys' view.
+pub const NOTEBOOK: &[&str] = &[
+    "New",
+    "Rename",
+    "Delete",
+    "Save",
+    "Find",
+    "Keys",
+    "Lock",
+    td_ui::keys::BUTTON,
+    QUIT,
 ];
-pub const KEYS: [&str; 6] = [
+pub const KEYS: &[&str] = &[
     "Notebook",
     "Add backup",
     "Replace",
     "Export",
     "Lock",
-    "Quit",
+    td_ui::keys::BUTTON,
+    QUIT,
 ];
-pub const LOCKED: [&str; 4] = ["Unlock", "Create", "Import", "Quit"];
-pub const IMPORT: [&str; 3] = ["Import", "Cancel", "Quit"];
+pub const LOCKED: &[&str] = &["Unlock", "Create", "Import", td_ui::keys::BUTTON, QUIT];
+pub const IMPORT: &[&str] = &["Import", "Cancel", td_ui::keys::BUTTON, QUIT];
 pub const PRESENT: [&str; 2] = ["Continue", "Cancel"];
 pub const PIN: [&str; 2] = ["OK", "Cancel"];
 
@@ -80,7 +94,7 @@ fn rect(x: i64, y: i64, width: i64, height: i64) -> Rect {
 /// field under the text while finding. Each is outlined, so the two
 /// sides meet at their outlines with no divider between.
 pub fn panes(surface: Surface, finding: bool) -> Panes {
-    let body = body(surface, &NOTEBOOK);
+    let body = body(surface, NOTEBOOK);
     let s = surface.scale.value() as i64;
     let row = row(surface);
     let width = i64::from(body.width);
@@ -110,24 +124,24 @@ pub fn panes(surface: Surface, finding: bool) -> Panes {
 
 /// The locked view: two message rows, then the enrolled keys.
 pub fn keys(surface: Surface) -> Option<List> {
-    listing(surface, &LOCKED)
+    listing(surface, LOCKED)
 }
 
 /// The unlocked notebook's keys view, laid out as the locked view.
 pub fn enrolled(surface: Surface) -> Option<List> {
-    listing(surface, &KEYS)
+    listing(surface, KEYS)
 }
 
 /// The keys an encrypted copy opens with, laid out as the locked view.
 pub fn copy_keys(surface: Surface) -> Option<List> {
-    listing(surface, &IMPORT)
+    listing(surface, IMPORT)
 }
 
 /// The finder: the body under the strip it was opened from, the locked
 /// view's for an import and the keys view's for an export, a cell in
 /// from each side.
 pub fn finder(surface: Surface, import: bool) -> Rect {
-    let body = body(surface, if import { &LOCKED } else { &KEYS });
+    let body = body(surface, if import { LOCKED } else { KEYS });
     let cell = cell(surface);
     rect(
         cell,
@@ -233,7 +247,7 @@ pub const SWAP_ROWS: i64 = 22;
 /// then at the top and the bottom of the body, so its actions can be kept
 /// from under the pointer that opened it.
 pub fn dialog(surface: Surface, rows: i64) -> [Rect; 3] {
-    let body = body(surface, &NOTEBOOK);
+    let body = body(surface, NOTEBOOK);
     let row = row(surface);
     let cell = cell(surface);
     let width = ((surface.width as i64) - 2 * cell).clamp(0, 56 * cell);
@@ -260,7 +274,7 @@ mod tests {
                 Scale::new(scale).unwrap(),
             )
             .unwrap();
-            let body = body(surface, &NOTEBOOK);
+            let body = body(surface, NOTEBOOK);
             let split = panes(surface, true);
             let search = split.search.unwrap().rect();
             let list = split.list.unwrap().rect();

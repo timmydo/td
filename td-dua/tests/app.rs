@@ -240,7 +240,7 @@ fn the_key_list_is_the_window_s_keys_then_the_list_s_and_the_question_s() {
     let scratch = sample("keys");
     let mut app = open(&scratch);
     let titles = |app: &App| -> Vec<&str> { app.key_list().iter().map(|s| s.title).collect() };
-    assert_eq!(titles(&app), ["td-dua", "List", "Delete question"]);
+    assert_eq!(titles(&app), ["Disk usage", "List", "Delete question"]);
     let sections = app.key_list();
     let window: Vec<(&str, &str)> = sections[0].rows.iter().map(|r| (r.keys, r.what)).collect();
     assert_eq!(window, td_dua::app::KEYS);
@@ -251,22 +251,129 @@ fn the_key_list_is_the_window_s_keys_then_the_list_s_and_the_question_s() {
         .rows
         .iter()
         .any(|r| r.keys == "Return/Space" && r.what.ends_with(&more)));
-    // The status row's hint is the same table.
-    assert!(
-        app.message().ends_with(&td_dua::app::hint()),
-        "{}",
-        app.message()
-    );
+    // The status row's hint is the same table, its lead first and the
+    // window's keys after the scan's message.
+    let line = app.status_line();
+    let (lead, keys) = td_dua::app::hint()
+        .split_once("  ")
+        .map(|(lead, keys)| (lead.to_owned(), keys.to_owned()))
+        .unwrap();
+    assert!(line.starts_with(&format!("{lead}  ")), "{line}");
+    assert!(line.ends_with(&format!(".  {keys}")), "{line}");
     assert_eq!(
         td_dua::app::hint(),
-        "d: add to delete list  D: delete now  x: delete the list  u: undo add  r: refresh  a: allocated/apparent  C-q: quit"
+        "F1: keys  d: add to delete list  D: delete now  x: delete the list  u: undo add  r: refresh  a: allocated or apparent size  C-q: quit"
     );
     // While the question is open its keys come first.
     select(&mut app, "small.txt");
     key(&mut app, "d");
     key(&mut app, "x");
     assert!(app.dialog_open());
-    assert_eq!(titles(&app), ["Delete question", "td-dua", "List"]);
+    assert_eq!(titles(&app), ["Delete question", "Disk usage", "List"]);
+}
+
+/// Both orders of the key list, the question closed and open, are spelled
+/// as td-ui's keymap spells chords, titled with a capital and described.
+#[test]
+fn the_key_list_passes_td_ui_s_check() {
+    let scratch = sample("check");
+    let mut app = open(&scratch);
+    let problems = td_ui::keys::check(&app.key_list());
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    select(&mut app, "small.txt");
+    key(&mut app, "d");
+    key(&mut app, "x");
+    assert!(app.dialog_open());
+    let problems = td_ui::keys::check(&app.key_list());
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+fn press(app: &mut App, phase: PointerPhase, x: i64, y: i64) {
+    app.input(Input::Pointer {
+        phase,
+        x,
+        y,
+        extend: false,
+        follow: false,
+    });
+}
+
+/// A press on the status row, whose hint starts with `F1: keys`, asks the
+/// window for its key list, once a press, and changes nothing else; a
+/// press anywhere else, or on the status row while the delete question
+/// takes the pointer, asks for nothing.
+#[test]
+fn a_press_on_the_status_row_opens_the_key_list() {
+    let scratch = sample("status");
+    let mut app = open(&scratch);
+    let status = td_ui::chrome::Status::new(surface()).rect();
+    let (x, y) = (status.x + 40, status.y + status.height as i64 / 2);
+    assert!(
+        app.status_line().starts_with("F1: keys  "),
+        "{}",
+        app.status_line()
+    );
+    assert!(!app.take_show_keys());
+    let selected = app.selected();
+    press(&mut app, PointerPhase::Press, x, y);
+    press(&mut app, PointerPhase::Release, x, y);
+    assert!(app.take_show_keys());
+    assert!(!app.take_show_keys(), "an edge, taken once");
+    assert_eq!(app.selected(), selected);
+    assert!(app.take_jobs().is_empty());
+    // Just above the status row is the treemap, not the list.
+    press(&mut app, PointerPhase::Press, x, status.y - 1);
+    press(&mut app, PointerPhase::Release, x, status.y - 1);
+    assert!(!app.take_show_keys());
+    // A key reaches nobody's list: the window's own F1 does that.
+    key(&mut app, "F1");
+    assert!(!app.take_show_keys());
+    select(&mut app, "small.txt");
+    key(&mut app, "d");
+    key(&mut app, "x");
+    assert!(app.dialog_open());
+    press(&mut app, PointerPhase::Press, x, y);
+    press(&mut app, PointerPhase::Release, x, y);
+    assert!(!app.take_show_keys(), "the question takes the pointer");
+}
+
+/// The status row opens the key list only while it shows the hint's
+/// lead whole: a message without the hint, a row too narrow for the
+/// lead before its ellipsis, or a row the surface cuts, opens nothing.
+#[test]
+fn a_status_row_without_its_hint_whole_opens_nothing() {
+    let scratch = sample("status-unhinted");
+    let mut app = open(&scratch);
+    let at = |surface: Surface| {
+        let status = td_ui::chrome::Status::new(surface).rect();
+        (status.x + 20, status.y + status.height as i64 / 2)
+    };
+    let (x, y) = at(surface());
+    key(&mut app, "x");
+    assert_eq!(
+        app.message(),
+        "The delete list is empty: add entries with d"
+    );
+    assert!(!app.status_line().contains("F1"), "{}", app.status_line());
+    press(&mut app, PointerPhase::Press, x, y);
+    press(&mut app, PointerPhase::Release, x, y);
+    assert!(!app.take_show_keys(), "a message without the hint");
+    // A refresh's message carries the hint again.
+    key(&mut app, "r");
+    settle(&mut app);
+    assert!(app.status_line().starts_with("F1: keys  "));
+    press(&mut app, PointerPhase::Press, x, y);
+    assert!(app.take_show_keys());
+    // Eight cells hold the lead only when the line is no longer; nine hold
+    // it before the ellipsis.
+    for (width, height, opens) in [(80, 600, false), (88, 600, true), (800, 20, false)] {
+        let narrow = Surface::new(width, height, Scale::default()).unwrap();
+        app.input(Input::Resize(narrow));
+        let (x, y) = at(narrow);
+        press(&mut app, PointerPhase::Press, x, y.max(0));
+        press(&mut app, PointerPhase::Release, x, y.max(0));
+        assert_eq!(app.take_show_keys(), opens, "{width}x{height}");
+    }
 }
 
 #[test]

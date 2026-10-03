@@ -18,7 +18,8 @@ td-dua --font-license
   Print the embedded font notices.
 
 The list (top) is sorted by size; click a heading to sort by it. Clicking
-the treemap (bottom) selects that file and opens the list to it.";
+the treemap (bottom) selects that file and opens the list to it. F1, or
+clicking the status row while it starts with F1: keys, shows the keys.";
 
 fn main() -> ExitCode {
     match run() {

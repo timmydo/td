@@ -30,12 +30,15 @@ use crate::ui::views::{Body, Scene, View, ViewAction};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use td_ui::keys;
 
-const EDIT_LABELS: &[&str] = &["Send", "Attach", "Save", "Close"];
+const EDIT_LABELS: &[&str] = &["Send", "Attach", "Save", keys::BUTTON, "Close"];
+// The draft types `?`: Help opens the key list without being a key.
 const EDIT_KEYS: &[Key] = &[
     Key::Request("send"),
     Key::Request("attach"),
     Key::Request("save"),
+    Key::ShowKeys,
     Key::Request("close-tab"),
 ];
 const ASK_LABELS: &[&str] = &["Save", "Discard", "Cancel"];

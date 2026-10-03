@@ -15,6 +15,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::SystemTime;
+use td_ui::keys;
 
 /// The most entries listed from each directory, of the first `EXAMINED`
 /// names read from it.
@@ -289,8 +290,8 @@ impl DraftsView {
     }
 }
 
-const LABELS: &[&str] = &["Open", "Refresh", "Back"];
-const KEYS: &[Key] = &[Key::Enter, Key::Char('g'), Key::Escape];
+const LABELS: &[&str] = &["Open", "Refresh", keys::BUTTON, "Back"];
+const KEYS: &[Key] = &[Key::Enter, Key::Char('g'), Key::Char('?'), Key::Escape];
 
 impl View for DraftsView {
     fn keys(&self) -> Option<&'static crate::keybindings::Table> {
@@ -437,8 +438,8 @@ impl SentView {
     }
 }
 
-const SENT_LABELS: &[&str] = &["Back"];
-const SENT_KEYS: &[Key] = &[Key::Escape];
+const SENT_LABELS: &[&str] = &[keys::BUTTON, "Back"];
+const SENT_KEYS: &[Key] = &[Key::Char('?'), Key::Escape];
 
 impl View for SentView {
     fn keys(&self) -> Option<&'static crate::keybindings::Table> {

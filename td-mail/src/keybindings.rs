@@ -27,7 +27,7 @@ pub const MAILBOX_LIST: Table = Table {
         ("q", "quit", "Quit"),
         ("n/j/Down", "next", "Next mailbox"),
         ("p/k/Up", "prev", "Previous mailbox"),
-        ("Enter", "open", "Open mailbox"),
+        ("Return", "open", "Open mailbox"),
         ("g", "refresh", "Refresh"),
         (
             "a",
@@ -39,7 +39,7 @@ pub const MAILBOX_LIST: Table = Table {
             "set_up",
             "Set up an account with no server, or one not reached",
         ),
-        ("D", "drafts", "Drafts: retained and sent; Enter opens one"),
+        ("D", "drafts", "Drafts: retained and sent; Return opens one"),
         ("+", "create_folder", "Create folder"),
         ("d", "delete_folder", "Delete selected folder"),
         (
@@ -49,8 +49,8 @@ pub const MAILBOX_LIST: Table = Table {
         ),
         ("x", "preview_retention", "Preview retention expiry list"),
         ("X", "expire_retention", "Expire retained mail now"),
-        ("PgDn", "page_down", "Page down"),
-        ("PgUp", "page_up", "Page up"),
+        ("PageDown", "page_down", "Page down"),
+        ("PageUp", "page_up", "Page up"),
         ("Home", "jump_top", "Jump to top"),
         ("End", "jump_bottom", "Jump to bottom"),
     ],
@@ -63,7 +63,7 @@ pub const EMAIL_LIST: Table = Table {
         ("q", "back", "Back to mailbox list"),
         ("n/j/Down", "next", "Next email"),
         ("p/k/Up", "prev", "Previous email"),
-        ("Enter", "open", "Open email"),
+        ("Return", "open", "Open email"),
         ("t", "open_thread", "Open thread list view (same folder)"),
         (
             "T",
@@ -98,13 +98,13 @@ pub const EMAIL_LIST: Table = Table {
             "Score selected message and tag it (S=spam, ?=unsure)",
         ),
         ("f", "toggle_flagged", "Toggle flagged"),
-        ("u", "toggle_read", "Toggle read/unread"),
+        ("u", "toggle_read", "Toggle read or unread"),
         ("m", "move", "Move to folder"),
         ("s", "search", "Search in mailbox"),
         ("l", "load_more", "Load more messages"),
         ("Escape", "clear_search", "Clear search"),
-        ("PgDn", "page_down", "Page down"),
-        ("PgUp", "page_up", "Page up"),
+        ("PageDown", "page_down", "Page down"),
+        ("PageUp", "page_up", "Page up"),
         ("Home", "jump_top", "Jump to top"),
         ("End", "jump_bottom", "Jump to bottom"),
     ],
@@ -117,7 +117,7 @@ pub const THREAD_VIEW: Table = Table {
         ("q", "back", "Back to email list"),
         ("n/j/Down", "next", "Next email"),
         ("p/k/Up", "prev", "Previous email"),
-        ("Enter", "open", "Open email"),
+        ("Return", "open", "Open email"),
         ("g", "refresh", "Refresh"),
         ("a", "archive", "Archive selected email"),
         ("d", "delete", "Move selected email to deleted folder"),
@@ -127,9 +127,9 @@ pub const THREAD_VIEW: Table = Table {
             "Expire selected email now (deleted folder only)",
         ),
         ("f", "toggle_flagged", "Toggle flagged"),
-        ("u", "toggle_read", "Toggle read/unread"),
-        ("PgDn", "page_down", "Page down"),
-        ("PgUp", "page_up", "Page up"),
+        ("u", "toggle_read", "Toggle read or unread"),
+        ("PageDown", "page_down", "Page down"),
+        ("PageUp", "page_up", "Page up"),
         ("Home", "jump_top", "Jump to top"),
         ("End", "jump_bottom", "Jump to bottom"),
     ],
@@ -144,8 +144,8 @@ pub const EMAIL_VIEW: Table = Table {
         ("p", "prev_unread", "Open previous unread email"),
         ("j/Down", "scroll_down", "Scroll down"),
         ("k/Up", "scroll_up", "Scroll up"),
-        ("Space/PgDn", "page_down", "Page down"),
-        ("PgUp", "page_up", "Page up"),
+        ("Space/PageDown", "page_down", "Page down"),
+        ("PageUp", "page_up", "Page up"),
         ("Home", "jump_top", "Jump to top"),
         ("End", "jump_bottom", "Jump to bottom"),
         ("r", "reply", "Reply"),
@@ -159,15 +159,15 @@ pub const EMAIL_VIEW: Table = Table {
         ("a", "archive", "Archive message"),
         ("d", "delete", "Delete message (move to trash)"),
         ("m", "move", "Move to mailbox (interactive picker)"),
-        ("A", "attachment", "Download/open attachment"),
+        ("A", "attachment", "Download or open an attachment"),
         ("b", "browse_urls", "Browse URLs found in message body"),
         (
-            "1-9",
+            "1..9",
             "open_url",
             "Open URL by number in configured browser",
         ),
         (
-            "Ctrl-click",
+            "C-click",
             "follow_link",
             "Open the link under the pointer in the browser",
         ),
@@ -178,7 +178,7 @@ pub const EMAIL_VIEW: Table = Table {
             "Toggle raw headers (DKIM, Received, etc)",
         ),
         ("*", "toggle_flagged", "Toggle flagged"),
-        ("u", "toggle_read", "Toggle read/unread"),
+        ("u", "toggle_read", "Toggle read or unread"),
         (
             "J",
             "mark_spam",
@@ -203,7 +203,7 @@ pub const DRAFTS: Table = Table {
     title: "Drafts",
     bindings: &[
         (
-            "Enter",
+            "Return",
             "open",
             "Reopen the draft to edit, or show the sent one read-only",
         ),
@@ -220,8 +220,8 @@ pub const SENT: Table = Table {
         ("q/Escape", "back", "Back to the drafts"),
         ("n/j", "scroll_down", "Scroll down a line"),
         ("p/k", "scroll_up", "Scroll up a line"),
-        ("Space/PgDn", "page_down", "Page down"),
-        ("PgUp", "page_up", "Page up"),
+        ("Space/PageDown", "page_down", "Page down"),
+        ("PageUp", "page_up", "Page up"),
         (
             "Up/Down",
             "caret_line",
@@ -242,30 +242,30 @@ pub const COMPOSE: Table = Table {
     title: "Compose",
     bindings: &[
         (
-            "Ctrl-Enter",
+            "C-Return",
             "send",
             "Send the draft through the account's server (saves it first)",
         ),
         (
-            "Ctrl-Shift-A",
+            "C-S-a",
             "attach",
             "Attach a file: its tag at the caret's line, or at the end \
              (the finder: Return opens or attaches, Backspace on an empty \
              filter goes up, letters filter, Escape closes it)",
         ),
-        ("Ctrl-S", "save", "Save the draft over its retained file"),
+        ("C-s", "save", "Save the draft over its retained file"),
         (
-            "Ctrl-W",
+            "C-w",
             "close",
             "Close (asks when unsaved: y saves, n keeps the file as saved)",
         ),
         (
-            "Ctrl-X/C/V",
+            "C-x/C-c/C-v",
             "cut_copy_paste",
             "Cut, copy, paste within td-mail (a message's selection too)",
         ),
-        ("Ctrl-Z/Y", "undo_redo", "Undo, redo"),
-        ("Ctrl-A", "select_all", "Select all"),
+        ("C-z/C-y", "undo_redo", "Undo, redo"),
+        ("C-a", "select_all", "Select all"),
     ],
 };
 
@@ -380,7 +380,7 @@ mod tests {
             what: "Browse URLs found in message body"
         }));
         let compose = &viewing[7].rows;
-        assert_eq!(compose[1].keys, "Ctrl-Shift-A");
+        assert_eq!(compose[1].keys, "C-S-a");
     }
 
     /// The CLI's export is every row, each with its view, keys and
@@ -395,5 +395,21 @@ mod tests {
             .all(|binding| !binding.key.is_empty() && !binding.action.is_empty()));
         let rows: usize = TABLES.iter().map(|table| table.bindings.len()).sum();
         assert_eq!(all.len(), rows);
+    }
+
+    /// Every list the window can show, whichever view leads, is spelled
+    /// and written as td-ui's key list holds every program's.
+    #[test]
+    fn every_list_passes_the_key_list_check() {
+        let leads = std::iter::once(None).chain(TABLES.iter().copied().map(Some));
+        for lead in leads {
+            let problems = td_ui::keys::check(&sections(lead));
+            assert!(
+                problems.is_empty(),
+                "lead {:?}:\n{}",
+                lead.map(|table| table.id),
+                problems.join("\n")
+            );
+        }
     }
 }

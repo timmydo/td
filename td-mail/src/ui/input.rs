@@ -34,6 +34,10 @@ pub enum Key {
     /// being one: the session opens it under the label, and the key the
     /// dropdown activates is the view's, as the label would have been.
     Menu(Menu),
+    /// The bar's Help label where `?` is not a key of the view's, as in
+    /// a draft, which it types into: the session opens the window's key
+    /// list. No chord names it, so it comes from the pointer alone.
+    ShowKeys,
 }
 
 /// The dropdowns a bar label opens.

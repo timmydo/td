@@ -97,6 +97,12 @@ impl Handler for Session {
     fn keys(&self) -> Vec<td_ui::keys::Section> {
         self.app.key_list()
     }
+
+    // The app sets it only from a live pointer press; td-dua has no control
+    // socket, and `preview` never asks.
+    fn take_show_keys(&mut self) -> bool {
+        self.app.take_show_keys()
+    }
 }
 
 /// Runs the analyzer over `root` on the compositor the environment names

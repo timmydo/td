@@ -30,11 +30,11 @@ already be private and must not itself be a symlink. Files are mode 0600.
 These checks are not protection against a hostile ancestor-directory owner.
 
 The retained file is then opened in the window, in td-ui's editor
-pane, editable, with paragraphs filled as they are typed: Ctrl-S writes
+pane, editable, with paragraphs filled as they are typed: C-s writes
 what is in the window over the file, whole or not at all (a private
 sibling is written and renamed over the draft, so a write that fails
 leaves the draft as it was, and a symlink put at the path is replaced
-rather than followed), and Ctrl-W closes the draft, asking first when it
+rather than followed), and C-w closes the draft, asking first when it
 has unsaved changes (y saves, n keeps the file as it was last saved,
 Escape returns to it); the Save and Close labels do the same. Closing
 the window with an unsaved draft asks the same question: a save or a
@@ -43,7 +43,7 @@ to the close and a save that fails is shown, not skipped. While the
 window holds a draft the file is its own: an edit made to it elsewhere
 is overwritten by the next save. A draft larger than the document view's
 ceiling (16 MiB) is retained but not opened, and the log says so. Cut,
-copy and paste are Ctrl-X, Ctrl-C and Ctrl-V (Ctrl-A selects all): a
+copy and paste are C-x, C-c and C-v (C-a selects all): a
 selection made in any text, a message's view or an error's, is copied to
 the system clipboard and kept in td-mail's own kill ring, a cut one too.
 With no selection in a draft, Copy or Cut takes the caret's whole line;
@@ -82,15 +82,15 @@ rewrite attachment references. Nothing expires a draft.
 
 ## Attaching
 
-Ctrl-Shift-A, or the Attach label, opens a finder over the draft on the
+C-S-a, or the Attach label, opens a finder over the draft on the
 folder a file was last attached from, else `$HOME`: Return opens a
-folder or attaches the selected file, Ctrl-Return attaches it too, a
+folder or attaches the selected file, C-Return attaches it too, a
 second press on a row attaches that file, Backspace on an empty filter,
-Alt-Up and `^` go up, typed characters filter the names, and Escape
+M-Up and `^` go up, typed characters filter the names, and Escape
 closes the finder with nothing attached. It lists the folders and
 regular files td-mail can read (in its jail its state directory and the
 Downloads grant, on a host everything), leaving out names beginning with
-`.` until Ctrl-H shows them (Ctrl-H again leaves them out, the folder
+`.` until C-h shows them (C-h again leaves them out, the folder
 listed again with the filter cleared and the selection kept, the status
 row saying which; the choice holds for the next finder while td-mail
 runs), folders first and each sorted; a folder of more than 4096 of them
@@ -133,7 +133,7 @@ draft.
 
 ## Sending
 
-Ctrl-Enter, or the Send label, sends the draft being edited: it is
+C-Return, or the Send label, sends the draft being edited: it is
 saved first when it has unsaved changes, then handed to the account's
 server through JMAP mail submission (RFC 8621 `EmailSubmission`), which
 the server must list for the account (`urn:ietf:params:jmap:submission`
@@ -384,11 +384,16 @@ after `cargo build --release --manifest-path net/Cargo.toml`), and
 cargo run
 ```
 
-In the window, F1, or `?` (the Help label) in a view, shows the window's
-key list over the frame: the shown view's keys first, then every other
-view's and the window's own. Its rows are `src/keybindings.rs`'s tables,
-which the CLI's `keybindings` command exports too, so the two cannot
-drift apart.
+In the window, F1, or `?` in a view, shows the window's key list over
+the frame: the shown view's keys first, then every other view's and the
+window's own; F1, Escape or a click closes it. The Help label on the
+bars of the mailbox and email lists, a message, a thread, the drafts, a
+sent draft and a draft being edited shows it too; in a draft, where `?`
+types, the label opens the list without typing. Only a press of the
+window's own pointer does: td-mail has no control socket. Its rows are
+`src/keybindings.rs`'s tables, spelled as td-ui's keymap spells chords
+(`C-S-a`, `PageDown`, `1..9`), which the CLI's `keybindings` command
+exports too, so the two cannot drift apart.
 
 For all command-line options, run:
 
@@ -407,8 +412,8 @@ cargo fmt -- --check
 The window's one native case, `tests/control_process.rs`, launches
 td-mail offline under the real headless td-compositor with its home,
 state and configuration in a private directory, composes with `c`,
-attaches with Ctrl-Shift-A, a filter and Return in the finder, saves
-with Ctrl-S, and reads the draft, its tag and the sidecar's copy back
+attaches with C-S-a, a filter and Return in the finder, saves
+with C-s, and reads the draft, its tag and the sidecar's copy back
 from disk; td-mail has no control socket, so the files are the oracle.
 It is `#[ignore]`d for plain `cargo test`; `ready` runs it, and so does:
 

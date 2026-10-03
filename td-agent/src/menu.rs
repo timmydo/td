@@ -1,22 +1,23 @@
-//! The window's menu bar (DESIGN.md §4): `File` and `Conversation` headers
-//! on td-ui's bar, their menus td-ui's shared menu controller
-//! (td-ui/DESIGN.md, "Shared menu controller") in adaptive fit, as
-//! td-mail's Folder menu is. `F10` opens it, as td-editor's does, and a
-//! press on a header does too; while it is open the window routes its
-//! keys and the pointer to it and paints it after its frame. The
-//! controller chooses; the window carries the action out, through the
-//! same paths as the item's chord. The Conversation menu shows the open
-//! conversation's effort checked, so the window builds the menu again,
-//! at a new revision, from the state of the moment it opens.
+//! The window's menu bar (DESIGN.md §4): `File`, `Conversation` and
+//! `Help` headers on td-ui's bar, their menus td-ui's shared menu
+//! controller (td-ui/DESIGN.md, "Shared menu controller") in adaptive
+//! fit, as td-mail's Folder menu is. `F10` opens File, as td-editor's
+//! does, and a press on a header opens its menu; while one is open the
+//! window routes its keys and the pointer to it and paints it after its
+//! frame. The controller chooses; the window carries the action out,
+//! through the same paths as the item's chord. The Conversation menu
+//! shows the open conversation's effort checked, so the window builds the
+//! menu again, at a new revision, from the state of the moment it opens.
 
 use td_ui::chrome::{Bar, Row};
+use td_ui::keys;
 use td_ui::menus::{self, Controller, Event, Fit, Item, Key, Kind, Model, Node};
 use td_ui::raster::Surface;
 
 use crate::config::EFFORTS;
 
-/// The bar's headers.
-pub const LABELS: &[&str] = &["File", "Conversation"];
+/// The bar's headers: File, Conversation, then Help.
+pub const LABELS: &[&str] = &["File", "Conversation", keys::BUTTON];
 /// The chord that opens the File menu, and closes it while it is open.
 pub const OPEN: &str = "F10";
 
@@ -35,6 +36,10 @@ pub enum Action {
     Model,
     /// Choose the open conversation's reasoning effort.
     Effort(&'static str),
+    /// Show td-ui's key list, as `keys::CHORD` does: the window opens it
+    /// when the live pointer or keyboard chose this, never the control
+    /// socket (`App::input_live`).
+    Keys,
 }
 
 /// The File menu's items: label, the chord shown beside it (one that
@@ -45,6 +50,10 @@ pub const FILE: &[(&str, &str, Action)] = &[
     ("Export diagnostics", "", Action::Export),
     ("Quit", "", Action::Quit),
 ];
+/// The Help menu's items, as `FILE`'s: the key list, shown with td-ui's
+/// window chord for it, which the window keeps and the program never
+/// sees.
+pub const HELP: &[(&str, &str, Action)] = &[(keys::ITEM, keys::CHORD, Action::Keys)];
 
 /// The Conversation menu's item that opens the model picker.
 pub const MODEL: &str = "Model\u{2026}";
@@ -67,7 +76,8 @@ pub fn bar(surface: Surface) -> Bar<'static> {
     Bar::new(surface, LABELS)
 }
 
-/// The bar's menus over `surface` at `revision`, closed.
+/// The bar's menus over `surface` at `revision`, closed: a header for
+/// each of `LABELS`, in its order, over its items.
 pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, menus::Error> {
     let row = |label, shortcut, enabled, checked| Row {
         label,
@@ -106,6 +116,17 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         parent: Some(effort),
         row: row(level, "", true, level == state.effort),
         item: Item::Action(Action::Effort(level)),
+    }));
+    let help = nodes.len();
+    nodes.push(Node {
+        parent: None,
+        row: row(keys::BUTTON, "", true, false),
+        item: Item::Submenu,
+    });
+    nodes.extend(HELP.iter().map(|&(label, shortcut, action)| Node {
+        parent: Some(help),
+        row: row(label, shortcut, true, false),
+        item: Item::Action(action),
     }));
     Controller::new(
         Model::new(Kind::Bar, revision, &nodes)?,
@@ -219,7 +240,7 @@ mod tests {
 
     #[test]
     fn its_shortcuts_are_the_window_bindings_chords() {
-        for (label, shortcut, _) in FILE {
+        for &(label, shortcut, _) in FILE {
             if !shortcut.is_empty() {
                 assert!(
                     crate::control::BINDINGS
@@ -232,6 +253,44 @@ mod tests {
         assert!(crate::control::BINDINGS
             .iter()
             .any(|b| b.chord == Some(OPEN)));
+        // Help's one item shows td-ui's window chord for the key list,
+        // which the window keeps: no binding of the program's.
+        assert_eq!(HELP, [(keys::ITEM, keys::CHORD, Action::Keys)]);
+        assert!(!crate::control::BINDINGS
+            .iter()
+            .any(|b| b.chord == Some(keys::CHORD)));
+    }
+
+    #[test]
+    fn help_follows_conversation_and_its_keys_item_is_chosen_by_key_or_press() {
+        assert_eq!(LABELS, ["File", "Conversation", keys::BUTTON]);
+        // The headers the nodes build are `LABELS`, in its order.
+        let headers: Vec<&str> = nodes(&menu(surface(), OPENED, 1).unwrap())
+            .into_iter()
+            .filter(|node| node.parent.is_none())
+            .map(|node| node.row.label)
+            .collect();
+        assert_eq!(headers, LABELS);
+        let mut menu = menu(surface(), OPENED, 1).unwrap();
+        menu.open_bar(0).unwrap();
+        assert_eq!(key(&mut menu, "Right"), Outcome::Changed);
+        assert_eq!(key(&mut menu, "Right"), Outcome::Changed);
+        assert_eq!(menu.group(), Some(2));
+        assert_eq!(key(&mut menu, "Return"), Outcome::Activated(Action::Keys));
+        let header = bar(surface()).header(2).unwrap();
+        let press = Event::Press {
+            x: header.x + 2,
+            y: header.y + 2,
+        };
+        assert_eq!(menu.event(Some(1), press).unwrap(), Outcome::Changed);
+        let row = menu
+            .panel(0)
+            .map(|panel| (panel.x + 4, panel.y + 4))
+            .unwrap();
+        let outcome = menu
+            .event(Some(1), Event::Press { x: row.0, y: row.1 })
+            .unwrap();
+        assert_eq!(outcome, Outcome::Activated(Action::Keys));
     }
 
     #[test]

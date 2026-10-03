@@ -4,7 +4,7 @@
 //! asked for them, as the window requires.
 
 use super::*;
-use td_ui::keys::Section;
+use td_ui::keys::{self, Section};
 
 /// A section's rows, `(keys, what)`.
 type Rows = &'static [(&'static str, &'static str)];
@@ -12,7 +12,7 @@ type Rows = &'static [(&'static str, &'static str)];
 /// The key list's sections, as the handlers below bind the keys: each
 /// mode's and focus's, titled, in the order the list shows them when none
 /// is current.
-const SECTIONS: &[(&str, Rows)] = &[
+pub(super) const SECTIONS: &[(&str, Rows)] = &[
     (
         "Key prompt",
         &[
@@ -248,23 +248,21 @@ impl App {
         self.request(Then::Quit, opener);
     }
 
-    /// Whether (x, y) is on the strip's Quit and no prompt or question
-    /// lies over it.
-    fn quit_at(&self, x: i64, y: i64) -> bool {
+    /// The label of the strip's button at (x, y) when no prompt or
+    /// question lies over it.
+    fn strip_at(&self, x: i64, y: i64) -> Option<&'static str> {
         let labels = self.strip();
-        let hit = layout::strip(self.surface, labels).hit(x, y);
-        if !hit.is_some_and(|index| index + 1 == labels.len()) {
-            return false;
-        }
+        let index = layout::strip(self.surface, labels).hit(x, y)?;
         let prompt = self.prompt.as_ref().map(|prompt| {
             let (view, ..) = prompt_view(self.surface, &prompt.ask);
             view.rect
         });
         let dialog = self.dialog.as_ref().map(|(dialog, _)| dialog.rect());
-        ![prompt, dialog]
+        let covered = [prompt, dialog]
             .into_iter()
             .flatten()
-            .any(|rect| rect.contains(x, y))
+            .any(|rect| rect.contains(x, y));
+        (!covered).then(|| labels.get(index).copied()).flatten()
     }
 
     fn key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
@@ -935,10 +933,18 @@ impl App {
 
     fn pointer(&mut self, phase: PointerPhase, x: i64, y: i64, extend: bool) {
         self.pointer = Some((x, y));
-        // Quit ends every strip and answers in every phase, before an open
-        // prompt, question or finder, as closing the window does.
-        if phase == PointerPhase::Press && self.quit_at(x, y) {
-            return self.close(Some((x, y)));
+        // Help and Quit end every strip and answer in every phase, before
+        // an open prompt, question or finder: Help as F1 does, Quit as
+        // closing the window does.
+        if phase == PointerPhase::Press {
+            match self.strip_at(x, y) {
+                Some(layout::QUIT) => return self.close(Some((x, y))),
+                Some(keys::BUTTON) => {
+                    self.key_list_asked = true;
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.prompt.is_some() {
             return self.prompt_pointer(phase, x, y, extend);
@@ -1000,7 +1006,7 @@ impl App {
         let opener = Some((x, y));
         match &self.phase {
             Phase::Locked { .. } => {
-                match layout::strip(surface, &layout::LOCKED).hit(x, y) {
+                match layout::strip(surface, layout::LOCKED).hit(x, y) {
                     Some(0) => return self.unlock(),
                     Some(1) => return self.create(opener),
                     Some(2) => return self.start_import(),
@@ -1016,7 +1022,7 @@ impl App {
                 }
             }
             Phase::Importing { .. } => {
-                match layout::strip(surface, &layout::IMPORT).hit(x, y) {
+                match layout::strip(surface, layout::IMPORT).hit(x, y) {
                     Some(0) => return self.import(),
                     Some(1) => return self.cancel_import(),
                     _ => {}
@@ -1031,7 +1037,7 @@ impl App {
                 }
             }
             Phase::Unlocked(notebook) if notebook.keys.showing => {
-                match layout::strip(surface, &layout::KEYS).hit(x, y) {
+                match layout::strip(surface, layout::KEYS).hit(x, y) {
                     Some(0) => return self.show_keys(false),
                     Some(1) => return self.add_key(),
                     Some(2) => return self.replace_keys(opener),
@@ -1053,7 +1059,7 @@ impl App {
                 }
             }
             Phase::Unlocked(notebook) => {
-                match layout::strip(surface, &layout::NOTEBOOK).hit(x, y) {
+                match layout::strip(surface, layout::NOTEBOOK).hit(x, y) {
                     Some(0) => return self.request(Then::New, opener),
                     Some(1) => return self.rename(),
                     Some(2) => return self.delete(opener),

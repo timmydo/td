@@ -2184,9 +2184,10 @@ the program, and every window routes alike, as the widget window does
   the release after it reaches nobody either; a click that closes it
   cancels a held key's repeat;
 - a program may open it from the pointer too: a bar's or strip's
-  button labelled `BUTTON` (`Help`), or an item `ITEM` (`Keys`) in a
-  menu named `BUTTON`, whose shortcut shows `CHORD`; the list's
-  sections gain no row for that entry, `window` already listing
+  button labelled `BUTTON` (`Help`), an item `ITEM` (`Keys`) in a
+  menu named `BUTTON`, whose shortcut shows `CHORD`, or a press on a
+  status or footer row while it shows a hint naming `CHORD` whole; the
+  list's sections gain no row for that entry, `window` already listing
   `CHORD`. Only the live pointer or a physical-keyboard menu choice
   opens it so; a control socket, a replay, a preview or a render check
   never does, and in the widget window that is the rule for

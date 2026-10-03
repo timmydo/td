@@ -115,12 +115,18 @@ mode.
   it carried. Lock cancels the operation's `pass::Cancel` and declines
   the prompt it may wait on, then drops the vault.
 - **Window state.** `src/app/` is the notebook as td-ui widgets: the
-  action strip (New, Rename, Delete, Save, Find, Keys, Lock, Quit), the
-  search field over the title list, the title field over the editor pane,
-  and the status row. Every strip, locked or unlocked, ends with Quit,
-  which does what closing the window does, over an open prompt, question
-  or finder too: it declines a waiting prompt and asks about unsaved
-  changes. It reaches the vault only through commands and replies, so its
+  action strip (New, Rename, Delete, Save, Find, Keys, Lock, Help, Quit),
+  the search field over the title list, the title field over the editor
+  pane, and the status row. Every strip, locked or unlocked, ends with
+  Help (td-ui's `keys::BUTTON`), then Quit, and both answer over an open
+  prompt, question or finder too, where neither lies over the button.
+  Help shows td-ui's key list, as `F1` does, through the window's
+  `take_show_keys`; the strip's Keys is the encryption keys' view below,
+  not the list. Quit does what closing the window does: it declines a
+  waiting prompt and asks about unsaved changes. A strip too narrow for
+  its buttons wraps: at 320 pixels the locked strip's Quit takes a
+  second row, as the notebook's and the keys view's strips wrapped
+  already. It reaches the vault only through commands and replies, so its
   tests run without a token. Titles and bodies travel in clearing
   owners (`src/plain.rs`), and the window's title names no entry.
 - **Entries.** Every entry document is loaded through one function that
@@ -167,9 +173,12 @@ mode.
   question, the finder, the swap screen, the window while nothing is
   open (opening, locking or refused), the locked view, a copy being
   imported, the keys view, the notebook's shortcuts and each focus,
-  listed beside the input code in `src/app/input.rs`. The sections for
-  what has the keyboard now come first; under the keys view, which takes
-  every key, the notebook's and its focuses' come last.
+  listed beside the input code in `src/app/input.rs` and spelled as
+  td-ui's keymap spells chords, which `keys::check` holds in every phase
+  and focus. The sections for what has the keyboard now come first;
+  under the keys view, which takes every key, the notebook's and its
+  focuses' come last. td-pass has no control socket, so every press on
+  Help is the live pointer's.
 - **Copies.** In the keys view Export (Ctrl+E) opens td-ui's finder on
   folders, from `$HOME`; Ctrl+Return writes the notebook's encrypted
   copy, the authenticated ciphertext of the revision the session holds,
@@ -234,44 +243,46 @@ mode.
 Tests drive the window state headless: unlock through both prompts,
 search, open, edit and save with the entry's line endings, a failed and
 a stale save, the unsaved-changes question, each strip's Quit (over the
-swap question and a waiting prompt as well), selection-only copy and cut,
-paste, creation, rename, delete, a declined prompt, lock during a save
-with its late replies ignored, the rules for a save in flight, a read
-answered after an edit, pastes bound to their place, the dialog's
-placement, the keys view's adding key, add and replace by key and by
-pointer, the refusal to revoke every key, marks that a held Space does
-not flicker, lock during a key operation, a failure's report kept past the
-view, the unsaved edits and focus kept under the view, the lists given
-their keys when the window grows, the key list's order, the pane's
-bezel on every side and its seams with the list and the search field
-with and without an entry and finding, a pane too short for a row
-keeping its lower bezel under the placeholder and an open entry, and
-painting the notebook, its keys view, its prompt and dialogs and each
-locked view, export into the
-folder the finder accepts, import of a chosen copy with one of its keys,
-a copy given up or unread, the finder painted, filtered and closed by
-Ctrl+L or the strip's Lock, a listing for a closed finder dropped, a
-host lock or sleep that asks nothing and is reported at the next unlock,
-closes a question and gives up a copy being imported, sleep during a
-save and an edit made after it was sent, a host lock during an unlock or
-a key change, no second lock while locking, nothing locked while nothing
-is held, unlocking waiting for the watch, a warning waiting behind a
-prompt and keeping why it locked, and the warnings for a host not
-watched, not delaying sleep, or lost. The vault thread's tests pin that
-a prompt takes only its operation's answer, that cancel declines once
-and that a key command without an open notebook is refused, as are a
-copy that cannot be read and an export or import without a notebook; the
-files' tests that a copy is written new and private, never over another,
-and read to its bound, and how folders are listed; the frame
-directory's, the mount table's rules. Confinement tests pin the source
-inventory, that pure files reach no system, vault or compositor and only
-the toolkit's drawing, widget and editor modules, that td-secret is
-named only by the vault thread's file, for the vault and the host's
-events, and the worker dispatch, the two reads the window makes itself,
-that it lists folders only through `src/files.rs`, that pure files call
-no path method that reaches the file system, that copies are written and
-read only through `src/files.rs` in those ways, the vault-document
-policy, and that the test vault below is built only by its feature.
+swap question and a waiting prompt as well), each strip's Help asking
+for the key list once and nothing else (over the swap question and the
+finder as well), every strip holding its buttons at 320 and 640 pixels,
+selection-only copy and cut, paste, creation, rename, delete, a declined
+prompt, lock during a save with its late replies ignored, the rules for
+a save in flight, a read answered after an edit, pastes bound to their
+place, the dialog's placement, the keys view's adding key, add and
+replace by key and by pointer, the refusal to revoke every key, marks
+that a held Space does not flicker, lock during a key operation, a
+failure's report kept past the view, the unsaved edits and focus kept
+under the view, the lists given their keys when the window grows, the
+key list's order and spelling, the pane's bezel on every side and its
+seams with the list and the search field with and without an entry and
+finding, a pane too short for a row keeping its lower bezel under the
+placeholder and an open entry, and painting the notebook, its keys view,
+its prompt and dialogs and each locked view, export into the folder the
+finder accepts, import of a chosen copy with one of its keys, a copy
+given up or unread, the finder painted, filtered and closed by Ctrl+L or
+the strip's Lock, a listing for a closed finder dropped, a host lock or
+sleep that asks nothing and is reported at the next unlock, closes a
+question and gives up a copy being imported, sleep during a save and an
+edit made after it was sent, a host lock during an unlock or a key
+change, no second lock while locking, nothing locked while nothing is
+held, unlocking waiting for the watch, a warning waiting behind a prompt
+and keeping why it locked, and the warnings for a host not watched, not
+delaying sleep, or lost. The vault thread's tests pin that a prompt
+takes only its operation's answer, that cancel declines once and that a
+key command without an open notebook is refused, as are a copy that
+cannot be read and an export or import without a notebook; the files'
+tests that a copy is written new and private, never over another, and
+read to its bound, and how folders are listed; the frame directory's,
+the mount table's rules. Confinement tests pin the source inventory,
+that pure files reach no system, vault or compositor and only the
+toolkit's drawing, widget and editor modules, that td-secret is named
+only by the vault thread's file, for the vault and the host's events,
+and the worker dispatch, the two reads the window makes itself, that it
+lists folders only through `src/files.rs`, that pure files call no path
+method that reaches the file system, that copies are written and read
+only through `src/files.rs` in those ways, the vault-document policy,
+and that the test vault below is built only by its feature.
 
 Native compositor cases run the binary under a real headless
 td-compositor and type through its seat

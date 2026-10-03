@@ -357,6 +357,9 @@ pub struct Frame {
     /// against the frame it was made on rather than whatever the list has
     /// become since.
     picks: Vec<(usize, String)>,
+    /// The row whose press opens the window's key list: the footer while
+    /// it shows the hint that names it.
+    keys_row: Option<usize>,
 }
 
 impl Frame {
@@ -368,6 +371,7 @@ impl Frame {
             scroll: None,
             pane: None,
             picks: Vec::new(),
+            keys_row: None,
         }
     }
 
@@ -436,6 +440,24 @@ impl Frame {
             .iter()
             .find(|(at, _)| *at == row)
             .map(|(_, refname)| refname.as_str())
+    }
+
+    /// Pushes `text` as `push_text` does; its row opens the key list on a
+    /// press if the push landed and the row shows `hint` whole after
+    /// clipping, and otherwise no row does.
+    pub fn push_keys(&mut self, text: &str, style: Style, hint: &str) {
+        let row = self.lines.len();
+        self.push_parts(text, style);
+        self.keys_row = self
+            .lines
+            .get(row)
+            .filter(|line| line.text.contains(hint))
+            .map(|_| row);
+    }
+
+    /// Whether a press on frame row `row` opens the key list.
+    pub fn opens_keys_at(&self, row: usize) -> bool {
+        self.keys_row == Some(row)
     }
 
     fn push_parts(&mut self, text: &str, style: Style) {
@@ -638,6 +660,24 @@ mod tests {
         assert_eq!(f.lines().len(), 2);
         assert_eq!(f.lines().get(1).map(|l| l.style), Some(Style::dim()));
         assert_eq!(f.room(), 0);
+    }
+
+    /// Only a footer whose push landed and shows the key list's hint whole
+    /// opens the list: a later one clipped short of it, or one the full
+    /// frame drops, leaves no row opening it, not even an earlier one.
+    #[test]
+    fn a_row_opens_the_key_list_only_where_its_hint_shows_whole() {
+        let mut f = Frame::new(3, 12);
+        assert!(!(0..3).any(|row| f.opens_keys_at(row)));
+        f.push_keys(" q · ? keys", Style::PLAIN, "? keys");
+        assert!(f.opens_keys_at(0));
+        f.push_keys(" q quit · ? keys", Style::PLAIN, "? keys");
+        assert!(!(0..3).any(|row| f.opens_keys_at(row)), "{:?}", f.lines());
+        f.push_keys(" q · ? keys", Style::PLAIN, "? keys");
+        assert!(f.opens_keys_at(2));
+        f.push_keys(" q · ? keys", Style::PLAIN, "? keys");
+        assert_eq!(f.lines().len(), 3, "the frame is full");
+        assert!(!(0..3).any(|row| f.opens_keys_at(row)));
     }
 
     /// The scrollbar starts at the row pushed next and never claims more rows

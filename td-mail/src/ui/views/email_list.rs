@@ -12,11 +12,21 @@ use crate::ui::views::{
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::SystemTime;
+use td_ui::keys;
 
 /// The action bar's labels for each mode, and the key each stands for; a
 /// click on a label is that key.
 const LIST_LABELS: &[&str] = &[
-    "Read", "Refresh", "Reply", "Archive", "Delete", "Move", "Search", "Compose", "Help", "Back",
+    "Read",
+    "Refresh",
+    "Reply",
+    "Archive",
+    "Delete",
+    "Move",
+    "Search",
+    "Compose",
+    keys::BUTTON,
+    "Back",
 ];
 const LIST_KEYS: &[Key] = &[
     Key::Enter,

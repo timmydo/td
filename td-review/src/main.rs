@@ -64,12 +64,13 @@ options:
   -h, --help          this text
 
 keys (window; it opens on $WAYLAND_DISPLAY):
-  j/k move   enter review   r reload   / filter   D delete   w worktrees
-  ?/F1 keys   q quit   a click selects a row, a double click reviews it
+  j/k move   Return review   r reload   / filter   D delete   w worktrees
+  ?/F1 keys, as does a click on the footer   q quit
+  a click selects a row, a double click reviews it
   f fetch the base's remote   F fetch every remote
   p push the base to its remote   P push the base to every remote that has
   not set remote.<name>.skipPushAll
-  in review: j/k or space/b scroll, s squash + land, r rebase + land
+  in review: j/k or Space/b scroll, s squash + land, r rebase + land
   landing commits only; p publishes it afterwards, unconfirmed, and
   deletes the branches it published from the remotes it reached
 ";

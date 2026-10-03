@@ -8,6 +8,7 @@ use crate::ui::views::{
 };
 use std::collections::HashMap;
 use std::sync::mpsc;
+use td_ui::keys;
 
 /// The action bar's labels for the view's modes, and the key each stands
 /// for; a press on a label is that key.
@@ -21,7 +22,7 @@ const LABELS: &[&str] = &[
     "Move",
     "Links",
     "HTML",
-    "Help",
+    keys::BUTTON,
 ];
 const KEYS: &[Key] = &[
     Key::Char('q'),
@@ -322,7 +323,7 @@ impl EmailView {
                     let type_str = att.r#type.as_deref().unwrap_or("application/octet-stream");
                     lines.push(format!("  [{}] {} ({}, {})", i + 1, name, type_str, size));
                 }
-                lines.push("  Press 'A' then 1-9 to download/open".to_string());
+                lines.push("  Press A then 1..9 to download or open".to_string());
             }
         }
 

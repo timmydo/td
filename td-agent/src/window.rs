@@ -178,6 +178,9 @@ pub struct Session {
     export: Option<Receiver<Result<Exported, String>>>,
     /// Every key this window has held, which the export looks for.
     keys: Vec<Secret>,
+    /// Help → Keys was chosen by the live pointer or keyboard: td-ui's
+    /// window shows its key list.
+    show_keys: bool,
 }
 
 impl Session {
@@ -552,7 +555,9 @@ impl Handler for Session {
         if input == Input::Close {
             return Flow::Quit;
         }
-        self.app.input(input, clipboard);
+        // The live input's choice only: `control` delivers the seam's
+        // through `App::input`, which reports none.
+        self.show_keys |= self.app.input_live(input, clipboard);
         self.serve();
         self.flow()
     }
@@ -589,6 +594,10 @@ impl Handler for Session {
 
     fn keys(&self) -> Vec<td_ui::keys::Section> {
         self.app.key_list()
+    }
+
+    fn take_show_keys(&mut self) -> bool {
+        std::mem::take(&mut self.show_keys)
     }
 }
 
@@ -716,6 +725,7 @@ pub fn run(
         quit: false,
         export: None,
         keys: key.iter().cloned().collect(),
+        show_keys: false,
     };
     // A cached list serves until the provider's comes.
     match Models::load(session.state.root()) {

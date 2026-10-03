@@ -132,8 +132,9 @@ impl Composition for Frame<'_> {
                     true,
                     true,
                     true,
+                    true,
                 ];
-                layout::strip(surface, &layout::NOTEBOOK).emit(
+                layout::strip(surface, layout::NOTEBOOK).emit(
                     states.map(|enabled| (false, enabled)),
                     damage,
                     sink,
@@ -142,17 +143,18 @@ impl Composition for Frame<'_> {
             }
             Phase::Locked { keys, list } => {
                 let idle = app.busy.is_none();
-                layout::strip(surface, &layout::LOCKED).emit(
+                layout::strip(surface, layout::LOCKED).emit(
                     [
                         (false, idle && keys.is_some()),
                         (false, idle && keys.is_none()),
                         (false, idle && keys.is_none()),
                         (false, true),
+                        (false, true),
                     ],
                     damage,
                     sink,
                 );
-                let body = layout::body(surface, &layout::LOCKED);
+                let body = layout::body(surface, layout::LOCKED);
                 let row = layout::row(surface);
                 let message = match keys {
                     Some(_) => "The notebook is locked. Unlock it with one of its keys:",
@@ -214,16 +216,17 @@ impl Composition for Frame<'_> {
             }
             Phase::Importing { keys, list } => {
                 let idle = app.busy.is_none();
-                layout::strip(surface, &layout::IMPORT).emit(
+                layout::strip(surface, layout::IMPORT).emit(
                     [
                         (false, idle && list.selected().is_some()),
+                        (false, true),
                         (false, true),
                         (false, true),
                     ],
                     damage,
                     sink,
                 );
-                let body = layout::body(surface, &layout::IMPORT);
+                let body = layout::body(surface, layout::IMPORT);
                 line(
                     surface,
                     Rect {
@@ -259,18 +262,19 @@ impl Composition for Frame<'_> {
                 }
             }
             Phase::Opening | Phase::Swap(_) | Phase::Locking | Phase::Refused(_) => {
-                layout::strip(surface, &layout::LOCKED).emit(
+                layout::strip(surface, layout::LOCKED).emit(
                     [
                         (false, false),
                         (false, false),
                         (false, false),
+                        (false, true),
                         (false, true),
                     ],
                     damage,
                     sink,
                 );
                 if let Phase::Refused(text) = &app.phase {
-                    let body = layout::body(surface, &layout::LOCKED);
+                    let body = layout::body(surface, layout::LOCKED);
                     line(
                         surface,
                         Rect {
@@ -326,7 +330,7 @@ impl Frame<'_> {
         let surface = app.surface;
         let idle = app.busy.is_none();
         let count = view.keys.labels.len();
-        layout::strip(surface, &layout::KEYS).emit(
+        layout::strip(surface, layout::KEYS).emit(
             [
                 (false, true),
                 (false, idle),
@@ -334,11 +338,12 @@ impl Frame<'_> {
                 (false, idle),
                 (false, true),
                 (false, true),
+                (false, true),
             ],
             damage,
             sink,
         );
-        let body = layout::body(surface, &layout::KEYS);
+        let body = layout::body(surface, layout::KEYS);
         let row = layout::row(surface);
         for (index, text) in [
             "The keys that open this notebook. Each one can unlock it alone.",

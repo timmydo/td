@@ -326,6 +326,9 @@ pub struct App {
     /// operation ends and the question can be asked again.
     deferred: Option<Then>,
     quit: bool,
+    /// The strip's Help was pressed: the window shows td-ui's key list,
+    /// asked once. Not the notebook's encryption keys view.
+    key_list_asked: bool,
     out: Vec<Out>,
 }
 
@@ -363,6 +366,7 @@ impl App {
             scrub: false,
             deferred: None,
             quit: false,
+            key_list_asked: false,
             out: vec![Out::Send(Command::Open)],
         })
     }
@@ -382,15 +386,21 @@ impl App {
     /// The labels of the strip this phase shows.
     fn strip(&self) -> &'static [&'static str] {
         match &self.phase {
-            Phase::Unlocked(notebook) if notebook.keys.showing => &layout::KEYS,
-            Phase::Unlocked(_) => &layout::NOTEBOOK,
-            Phase::Importing { .. } => &layout::IMPORT,
+            Phase::Unlocked(notebook) if notebook.keys.showing => layout::KEYS,
+            Phase::Unlocked(_) => layout::NOTEBOOK,
+            Phase::Importing { .. } => layout::IMPORT,
             Phase::Locked { .. }
             | Phase::Opening
             | Phase::Swap(_)
             | Phase::Locking
-            | Phase::Refused(_) => &layout::LOCKED,
+            | Phase::Refused(_) => layout::LOCKED,
         }
+    }
+
+    /// Whether the strip's Help asked for td-ui's key list since this was
+    /// last asked; answered once per press.
+    pub fn take_key_list_asked(&mut self) -> bool {
+        std::mem::take(&mut self.key_list_asked)
     }
 
     /// Whether the clipboard text this window offered must be withdrawn;

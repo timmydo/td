@@ -1266,6 +1266,122 @@ fn click_button(app: &mut App, board: &mut Board, labels: &'static [&'static str
     press(app, board, at, false);
 }
 
+/// The index of the strip's Quit, its last button.
+fn quit(labels: &[&str]) -> usize {
+    assert_eq!(labels.last(), Some(&layout::QUIT));
+    labels.len() - 1
+}
+
+/// The index of the strip's Help, just before Quit.
+fn help(labels: &[&str]) -> usize {
+    assert_eq!(labels.get(quit(labels) - 1), Some(&td_ui::keys::BUTTON));
+    labels.len() - 2
+}
+
+/// A press on the strip's Help asks the window for its key list once,
+/// and does nothing else.
+fn asks_for_the_key_list(app: &mut App, board: &mut Board, labels: &'static [&'static str]) {
+    let strip = app.strip();
+    assert_eq!(strip, labels);
+    let showing = app.notebook().map(|notebook| notebook.keys.showing);
+    let status = app.status.clone();
+    assert!(!app.take_key_list_asked());
+    click_button(app, board, labels, help(labels));
+    assert!(app.take_key_list_asked(), "{labels:?}");
+    assert!(!app.take_key_list_asked(), "asked once");
+    assert!(app.take_out().is_empty());
+    assert!(!app.quitting());
+    assert_eq!(app.strip(), strip);
+    assert_eq!(app.notebook().map(|n| n.keys.showing), showing);
+    assert_eq!(app.status, status);
+}
+
+#[test]
+fn every_strip_has_help_before_quit_and_it_asks_for_the_key_list() {
+    let mut board = Board::default();
+    for labels in [
+        layout::NOTEBOOK,
+        layout::KEYS,
+        layout::LOCKED,
+        layout::IMPORT,
+    ] {
+        help(labels);
+        // Not the notebook's Keys, the encryption keys' view.
+        assert!(!labels.contains(&td_ui::keys::ITEM) || labels == layout::NOTEBOOK);
+    }
+    // Before the vault answers, and locked.
+    let mut app = watched();
+    app.take_out();
+    asks_for_the_key_list(&mut app, &mut board, layout::LOCKED);
+    app.reply(Reply::Opened {
+        keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
+    });
+    asks_for_the_key_list(&mut app, &mut board, layout::LOCKED);
+    // The notebook, and its keys view; the finder open over the body
+    // stays open.
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    asks_for_the_key_list(&mut app, &mut board, layout::NOTEBOOK);
+    let mut app = keys_view(&mut board);
+    asks_for_the_key_list(&mut app, &mut board, layout::KEYS);
+    key(&mut app, &mut board, "C-e");
+    app.take_out();
+    assert!(app.chooser.is_some());
+    asks_for_the_key_list(&mut app, &mut board, layout::KEYS);
+    assert!(app.chooser.is_some());
+    // The swap question is open over the body, and Help still answers.
+    let mut app = watched();
+    app.take_out();
+    app.reply(Reply::Swap {
+        devices: vec!["/dev/sda2".to_owned()],
+    });
+    asks_for_the_key_list(&mut app, &mut board, layout::LOCKED);
+    assert!(app.dialog.is_some());
+    // A copy read for import.
+    let mut app = empty();
+    key(&mut app, &mut board, "C-o");
+    app.listed(
+        chooser_id(&app),
+        PathBuf::from("/media/usb"),
+        Ok(listing("/media/usb", &[], &["copy.tdpass"])),
+        None,
+    );
+    key(&mut app, &mut board, "Return");
+    let op = op_of(&app.take_out());
+    app.reply(Reply::Copy {
+        op,
+        keys: two_keys().labels,
+    });
+    asks_for_the_key_list(&mut app, &mut board, layout::IMPORT);
+    // A press elsewhere asks nothing.
+    click_button(&mut app, &mut board, layout::IMPORT, 1);
+    assert!(!app.take_key_list_asked());
+}
+
+/// Every strip holds each of its buttons whole at the narrowest surface
+/// the tests lay one out on but the tiny one, wrapping there: Help moves
+/// the locked strip's Quit to a second row at 320 pixels, as the
+/// notebook's and the keys view's wrapped already; at 640 each is one row.
+#[test]
+fn every_strip_holds_its_buttons_at_the_narrowest_width() {
+    for (width, rows) in [(320, [2, 2, 2, 1]), (640, [1, 1, 1, 1])] {
+        let surface = Surface::new(width, 240, td_ui::raster::Scale::default()).unwrap();
+        let strips = [
+            layout::NOTEBOOK,
+            layout::KEYS,
+            layout::LOCKED,
+            layout::IMPORT,
+        ];
+        for (labels, rows) in strips.into_iter().zip(rows) {
+            let strip = layout::strip(surface, labels);
+            assert!(
+                strip.buttons().all(|button| button.is_some()),
+                "{width}: {labels:?}"
+            );
+            assert_eq!(strip.rows(), rows, "{width}: {labels:?}");
+        }
+    }
+}
+
 fn click_row(app: &mut App, board: &mut Board, index: usize, extend: bool) {
     let at = key_row(app, index);
     press(app, board, at, extend);
@@ -1296,7 +1412,7 @@ fn key_row(app: &App, index: usize) -> (i64, i64) {
 fn the_strips_buttons_reach_the_keys_view_and_its_actions() {
     let mut board = Board::default();
     let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
-    click_button(&mut app, &mut board, &layout::NOTEBOOK, 5);
+    click_button(&mut app, &mut board, layout::NOTEBOOK, 5);
     assert!(notebook(&app).keys.showing);
     // Shift and a press marks a row; a press alone selects it.
     click_row(&mut app, &mut board, 1, true);
@@ -1305,20 +1421,20 @@ fn the_strips_buttons_reach_the_keys_view_and_its_actions() {
     click_row(&mut app, &mut board, 0, false);
     assert_eq!(notebook(&app).keys.marked, vec![false, true]);
     // Replace asks about the marked key, not the selected one.
-    click_button(&mut app, &mut board, &layout::KEYS, 2);
+    click_button(&mut app, &mut board, layout::KEYS, 2);
     assert!(app.dialog.is_some());
     key(&mut app, &mut board, "Escape");
     assert!(app.take_out().is_empty());
-    click_button(&mut app, &mut board, &layout::KEYS, 1);
+    click_button(&mut app, &mut board, layout::KEYS, 1);
     assert!(matches!(
         app.take_out()[..],
         [Out::Send(Command::AddKey { .. })]
     ));
     app.busy = None;
-    click_button(&mut app, &mut board, &layout::KEYS, 0);
+    click_button(&mut app, &mut board, layout::KEYS, 0);
     assert!(!notebook(&app).keys.showing);
     assert_eq!(notebook(&app).keys.marked, vec![false, false]);
-    click_button(&mut app, &mut board, &layout::NOTEBOOK, 6);
+    click_button(&mut app, &mut board, layout::NOTEBOOK, 6);
     assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
 }
 
@@ -1329,7 +1445,7 @@ fn every_strip_ends_with_a_quit_that_asks_as_closing_does() {
     // nothing is held to lock.
     let mut app = watched();
     app.take_out();
-    click_button(&mut app, &mut board, &layout::LOCKED, 3);
+    click_button(&mut app, &mut board, layout::LOCKED, quit(layout::LOCKED));
     assert!(app.quitting());
     assert!(app.take_out().is_empty());
     let mut app = watched();
@@ -1337,7 +1453,7 @@ fn every_strip_ends_with_a_quit_that_asks_as_closing_does() {
     app.reply(Reply::Opened {
         keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
     });
-    click_button(&mut app, &mut board, &layout::LOCKED, 3);
+    click_button(&mut app, &mut board, layout::LOCKED, quit(layout::LOCKED));
     assert!(app.quitting());
     assert!(app.take_out().is_empty());
     // The swap question is open over the body, and Quit still answers.
@@ -1347,7 +1463,7 @@ fn every_strip_ends_with_a_quit_that_asks_as_closing_does() {
         devices: vec!["/dev/sda2".to_owned()],
     });
     assert!(app.dialog.is_some());
-    click_button(&mut app, &mut board, &layout::LOCKED, 3);
+    click_button(&mut app, &mut board, layout::LOCKED, quit(layout::LOCKED));
     assert!(app.quitting());
     assert!(app.take_out().is_empty());
     // A copy read for import.
@@ -1366,11 +1482,11 @@ fn every_strip_ends_with_a_quit_that_asks_as_closing_does() {
         keys: two_keys().labels,
     });
     assert!(matches!(app.phase, Phase::Importing { .. }));
-    click_button(&mut app, &mut board, &layout::IMPORT, 2);
+    click_button(&mut app, &mut board, layout::IMPORT, quit(layout::IMPORT));
     assert!(app.quitting());
     // The keys view locks the vault as it quits.
     let mut app = keys_view(&mut board);
-    click_button(&mut app, &mut board, &layout::KEYS, 5);
+    click_button(&mut app, &mut board, layout::KEYS, quit(layout::KEYS));
     assert!(app.quitting());
     assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
     // A waiting prompt is declined, and unsaved text asks first, as
@@ -1381,11 +1497,11 @@ fn every_strip_ends_with_a_quit_that_asks_as_closing_does() {
         op,
         ask: add_ask(None),
     });
-    click_button(&mut app, &mut board, &layout::KEYS, 5);
+    click_button(&mut app, &mut board, layout::KEYS, quit(layout::KEYS));
     assert!(app.prompt.is_none());
     assert!(matches!(app.take_out()[..], [Out::Answer(o, Answer::Decline)] if o == op));
     assert_eq!(app.dialog.as_ref().unwrap().1, Some(Then::Quit));
-    click_button(&mut app, &mut board, &layout::KEYS, 5);
+    click_button(&mut app, &mut board, layout::KEYS, quit(layout::KEYS));
     assert_eq!(app.dialog.as_ref().unwrap().1, Some(Then::Quit));
     assert!(!app.quitting());
 }
@@ -1809,7 +1925,7 @@ fn the_strips_lock_is_not_held_back_by_the_finder() {
         false,
     );
     assert!(app.chooser.is_some());
-    click_button(&mut app, &mut board, &layout::KEYS, 4);
+    click_button(&mut app, &mut board, layout::KEYS, 4);
     assert!(app.chooser.is_none());
     assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
 }
@@ -2711,4 +2827,34 @@ fn the_key_list_puts_what_has_the_keyboard_first() {
     assert!(app.dialog.is_some());
     assert_eq!(&titles(&app)[..2], ["Question", "Keys view"]);
     assert_eq!(titles(&app).last(), Some(&"Find"));
+}
+
+/// Every list the window can show is spelled as td-ui's keymap spells
+/// chords: each phase and focus orders the same sections.
+#[test]
+fn the_key_list_passes_the_check_in_every_phase_and_focus() {
+    fn checked(app: &App) {
+        let sections = app.key_list();
+        assert_eq!(sections.len(), input::SECTIONS.len());
+        let problems = td_ui::keys::check(&sections);
+        assert!(problems.is_empty(), "{:?}: {problems:#?}", titles(app));
+    }
+    let mut board = Board::default();
+    let mut app = watched();
+    checked(&app);
+    app.reply(Reply::Swap {
+        devices: vec!["/swapfile".to_owned()],
+    });
+    checked(&app);
+    let mut app = watched();
+    app.reply(Reply::Opened {
+        keys: Some(vec![label(Role::Primary, "0a0b0c0d")]),
+    });
+    checked(&app);
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    for chord in ["Return", "Tab", "Tab", "C-f", "C-k", "Delete"] {
+        checked(&app);
+        key(&mut app, &mut board, chord);
+    }
+    checked(&app);
 }

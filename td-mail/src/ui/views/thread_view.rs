@@ -7,11 +7,19 @@ use crate::ui::views::email_view::{EmailNavEntry, EmailView};
 use crate::ui::views::{strip_newlines, Body, Row, Scene, View, ViewAction};
 use std::collections::HashMap;
 use std::sync::mpsc;
+use td_ui::keys;
 
 /// The action bar's labels, and the key each stands for; a press on a
 /// label is that key.
 const LABELS: &[&str] = &[
-    "Read", "Refresh", "Archive", "Delete", "Flag", "Unread", "Back",
+    "Read",
+    "Refresh",
+    "Archive",
+    "Delete",
+    "Flag",
+    "Unread",
+    keys::BUTTON,
+    "Back",
 ];
 const KEYS: &[Key] = &[
     Key::Enter,
@@ -20,6 +28,7 @@ const KEYS: &[Key] = &[
     Key::Char('d'),
     Key::Char('f'),
     Key::Char('u'),
+    Key::Char('?'),
     Key::Char('q'),
 ];
 

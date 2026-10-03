@@ -90,18 +90,20 @@ shows and draw in the toolkit's palette.
 ### Keybindings
 
 - Global: `?` or `F1` shows the window's list of keys, the view's
-  first (`?`, `q`, `Escape` or `F1` closes it); `q` back/quit, `g` refresh
-- Feed list: `j/k/n/p` or arrows, `PgUp/PgDn`, `Home/End`, `Enter`, `u`
-- Article list: `j/k/n/p` or arrows, `PgUp/PgDn`, `Home/End`, `Enter`, `u`, `o`, `/`
-- Article view: `j/k`, `Space`, `PgUp/PgDn` scroll; arrows and `Home/End` move the caret; `n/p`, `u`, `o`, `b`
-- Any text (an article, the log): `Ctrl-A` selects all, `Ctrl-C` copies the selection to the system clipboard; the status row says whether it was taken
+  first (`?`, `q`, `Escape`, `F1` or a click closes it); every action
+  bar's `Help`, the link picker's too, shows it as well; `q` quits, or
+  goes back; `g` refreshes
+- Feed list: `j/k/Up/Down`, `n/p`, `PageUp/PageDown`, `Home/End`, `Return`, `u`
+- Article list: `j/k/Up/Down`, `n/p`, `PageUp/PageDown`, `Home/End`, `Return`, `u`, `o`, `/`
+- Article view: `j/k`, `Space/PageDown`, `PageUp` scroll; arrows and `Home/End` move the caret; `n/p`, `u`, `o`, `b`, `1..9`
+- Any text (an article, the log): `C-a` selects all, `C-c` copies the selection to the system clipboard; the status row says whether it was taken
 - Mouse:
 - A click selects a list row; a click on an article opens it
 - The action bar's labels are the view's keys
 - The wheel moves the selection, or scrolls the article
-- A drag in the article selects text, and `Ctrl-C` copies it
-- A Ctrl-click on a link in the article opens it in the browser;
-  holding Ctrl over one underlines it
+- A drag in the article selects text, and `C-c` copies it
+- A `C-click` on a link in the article opens it in the browser;
+  holding Control over one underlines it
 
 ## Cache
 

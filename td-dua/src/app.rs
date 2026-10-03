@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use td_ui::chrome::Status;
 use td_ui::confirmations::{self, Choice};
-use td_ui::keys::Section;
+use td_ui::keys::{self, Section};
 use td_ui::pointer::DoubleClick;
 use td_ui::raster::{Composition, Draw, Primitive, Raster, Rect, Surface, PAPER};
 use td_ui::split;
@@ -31,16 +31,18 @@ pub enum Act {
 type Dialog = confirmations::Controller<Act, u64, ()>;
 
 /// The window's own keys, as `key` binds them: the key list's first
-/// section, and `hint` for `--help` and the status row.
+/// section, and after `CHORD_HINT` `hint` for `--help` and the status row.
 pub const KEYS: &[(&str, &str)] = &[
     ("d", "add to delete list"),
     ("D", "delete now"),
     ("x", "delete the list"),
     ("u", "undo add"),
     ("r", "refresh"),
-    ("a", "allocated/apparent"),
+    ("a", "allocated or apparent size"),
     ("C-q", "quit"),
 ];
+/// The title of `KEYS`'s section in the key list.
+const KEYS_TITLE: &str = "Disk usage";
 /// The list's keys, `tree_table::Key::from_chord`'s.
 const LIST_KEYS: &[(&str, &str)] = &[
     ("Up/Down", "select the entry above or below"),
@@ -56,8 +58,23 @@ const LIST_KEYS: &[(&str, &str)] = &[
     ("S-Left/S-Right", "scroll sideways"),
 ];
 
-/// `KEYS` as one line, `key: what` two spaces apart.
+/// What `keys::CHORD`, or a press on the status row, does, first in
+/// `hint` so a narrow row cannot clip it; the key list's own Window
+/// section lists the chord.
+const CHORD_HINT: (&str, &str) = (keys::CHORD, "keys");
+
+/// `CHORD_HINT` and then `KEYS` as one line, `key: what` two spaces apart.
 pub fn hint() -> String {
+    format!("{}  {}", lead(), keys_hint())
+}
+
+/// `CHORD_HINT` as `hint` spells it: what a hinted status row starts with.
+fn lead() -> String {
+    format!("{}: {}", CHORD_HINT.0, CHORD_HINT.1)
+}
+
+/// `KEYS` as `hint` spells them.
+fn keys_hint() -> String {
     KEYS.iter()
         .map(|(keys, what)| format!("{keys}: {what}"))
         .collect::<Vec<_>>()
@@ -99,6 +116,9 @@ pub struct App {
     deleting: bool,
     progress: (u64, u64),
     message: String,
+    /// The status row shows the key hint around `message`: `lead` first,
+    /// `KEYS` last.
+    hinted: bool,
     title: String,
     capture: Option<Capture>,
     clicks: DoubleClick<RowId>,
@@ -108,6 +128,8 @@ pub struct App {
     cache_first: usize,
     redraw: bool,
     quitting: bool,
+    /// A press on the status row asked for the window's key list.
+    show_keys: bool,
 }
 
 /// Where a dialog may go: centred over the window's body.
@@ -155,7 +177,8 @@ impl App {
             pending: 0,
             deleting: false,
             progress: (0, 0),
-            message: hint(),
+            message: String::new(),
+            hinted: true,
             title,
             capture: None,
             clicks: DoubleClick::default(),
@@ -164,6 +187,7 @@ impl App {
             cache_first: 0,
             redraw: true,
             quitting: false,
+            show_keys: false,
         };
         app.relayout();
         app.send(Job::Scan {
@@ -191,6 +215,7 @@ impl App {
     pub fn queue(&self) -> &[NodeId] {
         &self.queue
     }
+    /// The status row's message, without the key hint around it.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -210,13 +235,18 @@ impl App {
     /// open, then the window's keys and the list's.
     pub fn key_list(&self) -> Vec<Section> {
         let question = Section::new("Delete question", confirmations::KEYS);
-        let window = Section::new("td-dua", KEYS);
+        let window = Section::new(KEYS_TITLE, KEYS);
         let list = Section::new("List", LIST_KEYS);
         if self.dialog_open() {
             vec![question, window, list]
         } else {
             vec![window, list, question]
         }
+    }
+    /// Whether a press on the status row asked for the key list since the
+    /// last take. Only `input`'s live pointer sets it.
+    pub fn take_show_keys(&mut self) -> bool {
+        std::mem::take(&mut self.show_keys)
     }
     pub fn expanded(&self, id: NodeId) -> bool {
         self.expanded.contains(&id)
@@ -242,9 +272,30 @@ impl App {
         self.redraw = true;
     }
 
+    /// Shows `message` on the status row without the key hint.
     fn say(&mut self, message: impl Into<String>) {
         self.message = message.into();
+        self.hinted = false;
         self.redraw = true;
+    }
+
+    /// Shows `message` on the status row inside the key hint.
+    fn say_hinted(&mut self, message: impl Into<String>) {
+        self.say(message);
+        self.hinted = true;
+    }
+
+    /// Whether the status row shows the key hint's lead whole: the row
+    /// shows the hint, lies whole on the surface, and holds the lead's
+    /// cells short of the ellipsis that ends a longer line.
+    fn status_opens_keys(&self) -> bool {
+        let status = Status::new(self.surface);
+        let rect = status.rect();
+        let lead = lead().chars().count();
+        let columns = status.columns();
+        self.hinted
+            && rect.intersection(self.surface.bounds()) == Some(rect)
+            && (lead < columns || self.status_line().chars().count() <= columns)
     }
 
     /// The worker's running count while a job is out.
@@ -371,7 +422,7 @@ impl App {
         match &mut self.table {
             Some(table) => {
                 if let Err(error) = table.replace(model) {
-                    self.message = format!("cannot lay the list out: {error}");
+                    self.say(format!("cannot lay the list out: {error}"));
                 }
             }
             None => {
@@ -387,7 +438,7 @@ impl App {
                         table.select(Some(RowId::Node(ROOT)), true);
                         self.table = Some(table);
                     }
-                    Err(error) => self.message = format!("cannot lay the list out: {error}"),
+                    Err(error) => self.say(format!("cannot lay the list out: {error}")),
                 }
             }
         }
@@ -518,6 +569,17 @@ impl App {
                 PointerPhase::Move => confirmations::Event::Move { x, y },
                 PointerPhase::Release => confirmations::Event::Release { x, y },
             });
+            return;
+        }
+        if phase == PointerPhase::Press
+            && Status::new(self.surface).rect().contains(x, y)
+            && self.status_opens_keys()
+        {
+            // The status row shows the key list's hint whole: a press on
+            // it opens the list, and its release is nobody's.
+            self.capture = None;
+            self.clicks.cancel();
+            self.show_keys = true;
             return;
         }
         let capture = match phase {
@@ -1132,7 +1194,11 @@ impl App {
                 if lost == 1 { "y" } else { "ies" },
                 self.message
             );
-            self.say(message);
+            if self.hinted {
+                self.say_hinted(message);
+            } else {
+                self.say(message);
+            }
         }
     }
 
@@ -1152,8 +1218,7 @@ impl App {
             message.push_str(" (some entries could not be read)");
         }
         message.push_str(".  ");
-        message.push_str(&hint());
-        self.say(message);
+        self.say_hinted(message);
     }
 
     /// Drops what the tree no longer holds from the list's state.
@@ -1325,8 +1390,15 @@ impl App {
         }
     }
 
-    fn status_line(&self) -> String {
+    /// The status row's line: the key hint's lead when it shows the hint,
+    /// the running job's count, the list's notes, the message, and the
+    /// hint's `KEYS`.
+    pub fn status_line(&self) -> String {
         let mut line = String::new();
+        if self.hinted {
+            line.push_str(&lead());
+            line.push_str("  ");
+        }
         if self.pending > 0 {
             if self.deleting {
                 line.push_str("Deleting…  ");
@@ -1349,6 +1421,9 @@ impl App {
             ));
         }
         line.push_str(&self.message);
+        if self.hinted {
+            line.push_str(&keys_hint());
+        }
         line
     }
 }
