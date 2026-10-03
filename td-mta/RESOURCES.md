@@ -909,6 +909,17 @@ intervals cover proof creation, Unicode/quotes/comments, checkpoint copies,
 replay and sticky refusal. Integration into the fixed NFC Source allowance
 and the complete worker remains unqualified.
 
+The phrase display-name decoder fits 224 bytes. Its enum stores either
+token replay or encoded-word decoding, with a private source-bound resume
+checkpoint and scalar offsets/flags, including a turn ordinal for future
+NFC checkpoints. It retains the admitted field for exact placement context;
+names are never copied. Literal UTF-8 uses a four-byte stack array. Each
+poll charges at most 230 byte visits and 227 records, including charged
+classification, quote trimming, lookahead and copied traversal. Scalar
+output charging belongs to the enclosing serializer. Allocation intervals
+cover the complete phrase composition and refusal. NFC Source/whole-worker
+integration must still demonstrate their existing size and work ceilings.
+
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
 including the fixed one-byte handoff; public MessageIds state remains

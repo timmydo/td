@@ -1,5 +1,6 @@
 //! Charged token traversal of an immutable, fully validated phrase.
 use super::{Error, Extent, Kind, Status, Token, Validated};
+use crate::decode_work::{Error as DecodeError, Work};
 use crate::{
     admission::work::{Charge, Meter},
     header_message_ids::atext,
@@ -23,7 +24,7 @@ pub struct Cursor<'a> {
     phase: Phase,
     depth: u8,
     escaped: bool,
-    failure: Option<Error>,
+    failure: Option<DecodeError>,
 }
 impl<'a> Cursor<'a> {
     pub(super) const fn new(validated: Validated<'a>) -> Self {
@@ -44,19 +45,22 @@ impl<'a> Cursor<'a> {
             end: self.source.len(),
         }
     }
-    fn advance(&mut self) -> Result<(), Error> {
-        self.position = self.position.checked_add(1).ok_or(Error::InvalidState)?;
+    fn advance(&mut self) -> Result<(), DecodeError> {
+        self.position = self
+            .position
+            .checked_add(1)
+            .ok_or(DecodeError::InvalidState)?;
         if self.position > self.source.len() {
-            return Err(Error::InvalidState);
+            return Err(DecodeError::InvalidState);
         }
         Ok(())
     }
-    fn token(&mut self, kind: Kind) -> Result<Status, Error> {
+    fn token(&mut self, kind: Kind) -> Result<Status, DecodeError> {
         if self.previous > self.start
             || self.start >= self.position
             || self.position > self.source.len()
         {
-            return Err(Error::InvalidState);
+            return Err(DecodeError::InvalidState);
         }
         let token = Token {
             leading: Extent {
@@ -74,6 +78,16 @@ impl<'a> Cursor<'a> {
         Ok(Status::Token(token))
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work).map_err(|error| match error {
+            DecodeError::Work(stop) => Error::Work(stop),
+            DecodeError::InvalidState | DecodeError::InterpretationLimit => Error::InvalidState,
+        })
+    }
+    pub(super) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, DecodeError> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -86,9 +100,22 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+    pub(super) fn checkpoint(&self) -> Result<Checkpoint<'a>, DecodeError> {
+        if self.failure.is_some()
+            || !matches!(self.phase, Phase::Cfws)
+            || self.position != self.previous
+            || self.position == 0
+        {
+            return Err(DecodeError::InvalidState);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            position: self.position,
+        })
+    }
+    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, DecodeError> {
         if self.position > self.source.len() {
-            return Err(Error::InvalidState);
+            return Err(DecodeError::InvalidState);
         }
         for _ in 0..32 {
             work.charge(
@@ -98,8 +125,7 @@ impl<'a> Cursor<'a> {
                     io_bytes: u64::from(self.position < self.source.len()),
                     ..Charge::default()
                 },
-            )
-            .map_err(Error::Work)?;
+            )?;
             let byte = self.source.get(self.position).copied();
             if matches!(self.phase, Phase::Atom) {
                 if byte.is_some_and(atext) {
@@ -110,7 +136,7 @@ impl<'a> Cursor<'a> {
             }
             let Some(byte) = byte else {
                 if !matches!(self.phase, Phase::Cfws) {
-                    return Err(Error::InvalidState);
+                    return Err(DecodeError::InvalidState);
                 }
                 self.phase = Phase::Complete;
                 return Ok(Status::Complete(self.tail()));
@@ -138,7 +164,7 @@ impl<'a> Cursor<'a> {
                         self.phase = Phase::Atom;
                         return Ok(Status::Yield);
                     }
-                    _ => return Err(Error::InvalidState),
+                    _ => return Err(DecodeError::InvalidState),
                 },
                 Phase::Comment => {
                     self.advance()?;
@@ -149,14 +175,14 @@ impl<'a> Cursor<'a> {
                             b'\\' => self.escaped = true,
                             b'(' => {
                                 self.depth =
-                                    self.depth.checked_add(1).ok_or(Error::InvalidState)?;
+                                    self.depth.checked_add(1).ok_or(DecodeError::InvalidState)?;
                                 if self.depth > 32 {
-                                    return Err(Error::InvalidState);
+                                    return Err(DecodeError::InvalidState);
                                 }
                             }
                             b')' => {
                                 self.depth =
-                                    self.depth.checked_sub(1).ok_or(Error::InvalidState)?;
+                                    self.depth.checked_sub(1).ok_or(DecodeError::InvalidState)?;
                                 if self.depth == 0 {
                                     self.phase = Phase::Cfws;
                                 }
@@ -177,10 +203,33 @@ impl<'a> Cursor<'a> {
                         }
                     }
                 }
-                Phase::Atom | Phase::Complete => return Err(Error::InvalidState),
+                Phase::Atom | Phase::Complete => return Err(DecodeError::InvalidState),
             }
         }
         Ok(Status::Yield)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Checkpoint<'a> {
+    source: &'a [u8],
+    position: usize,
+}
+impl<'a> Checkpoint<'a> {
+    pub(super) const fn initial(proof: Validated<'a>) -> Self {
+        Self {
+            source: proof.source,
+            position: 0,
+        }
+    }
+    pub(super) const fn replay(self) -> Cursor<'a> {
+        Cursor {
+            position: self.position,
+            previous: self.position,
+            ..Cursor::new(Validated {
+                source: self.source,
+            })
+        }
     }
 }
 

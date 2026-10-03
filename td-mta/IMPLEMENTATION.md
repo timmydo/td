@@ -1462,6 +1462,15 @@ Initial independently landable increments:
   work refusal and allocation-free traversal. Encoded-word placement, name
   scalar projection, NFC integration and publication remain follow-on work.
 
+- **M06al — phrase display-name scalars:** bind the completed phrase proof
+  to the exact range of its whole field. Use actual neighboring bytes for
+  encoded-word placement, unquote/unfold literals and trim a sole quoted word.
+  Preserve semantic CFWS and conditional adjacent-word whitespace suppression.
+  Share one state slot between replay and word decoding; retain private token
+  checkpoints and live work charging. Cover literals, encoded text, context,
+  copies, exact work and allocation-free refusal. Comment names, NFC and
+  JMAP publication remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

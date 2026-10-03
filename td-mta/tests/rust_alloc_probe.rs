@@ -2269,6 +2269,86 @@ fn header_single_mailbox() {
     assert_eq!(before, after, "mailbox parsing allocated");
 }
 
+fn header_phrase_display() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_phrase::{
+            self,
+            decode::{Cursor, Error, Status},
+            Extent,
+        },
+        ports::{Deadline, Tick},
+    };
+    let long = format!("\" {} \"", "🐈".repeat(10_000));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 10_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, expected) in [
+        (long.as_bytes(), 10_000),
+        (b"=?utf-8?q?one?= \r\n\t=?utf-8?q?two?=".as_slice(), 6),
+        (b"=?utf-8?q?one?= (x) =?utf-8?q?two?=", 7),
+        (b"=?utf-8?q?one?=\r\n =?utf-8?q?two?=", 6),
+        (b"=?utf-8?q?one?=\n =?utf-8?q?two?=", 6),
+        (b"\"\\\0 a\"", 1),
+        (b"\"a \\\0\"", 1),
+        (b"\" \t\"", 0),
+        (b"\"a\\\"b\"", 3),
+        (b"=?utf-8?q?=FF?=", 1),
+        ("例\u{fdd0}".as_bytes(), 2),
+    ] {
+        let mut parser = header_phrase::Cursor::new(black_box(source));
+        while !matches!(
+            parser.poll(Tick(1), &mut work).unwrap(),
+            header_phrase::Status::Complete(_)
+        ) {}
+        let mut cursor = Cursor::new(
+            parser.into_validated().unwrap(),
+            source,
+            Extent {
+                start: 0,
+                end: source.len(),
+            },
+        )
+        .unwrap();
+        let initial = cursor;
+        let mut count = 0;
+        loop {
+            let mut copy = cursor;
+            let status = cursor.poll(Tick(1), &mut work).unwrap();
+            assert_eq!(copy.poll(Tick(1), &mut work).unwrap(), status);
+            match status {
+                Status::Yield => {}
+                Status::Scalar(value) => {
+                    black_box(value);
+                    count += 1;
+                }
+                Status::Complete => break,
+            }
+        }
+        assert_eq!(count, expected);
+        let mut refused = initial;
+        let mut limited = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+        assert_eq!(
+            refused.poll(Tick(1), &mut limited),
+            Err(Error::Work(Stop::Records))
+        );
+        let mut copy = refused;
+        assert_eq!(
+            copy.poll(Tick(1), &mut work),
+            Err(Error::Work(Stop::Records))
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "phrase display decoding allocated");
+}
+
 fn header_phrase_replay() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3759,6 +3839,7 @@ fn main() {
         header_single_mailbox();
         header_phrase_tokens();
         header_phrase_replay();
+        header_phrase_display();
         header_single_addr_spec();
         header_date_projection();
         header_dates();
@@ -3874,6 +3955,7 @@ fn main() {
     header_single_mailbox();
     header_phrase_tokens();
     header_phrase_replay();
+    header_phrase_display();
     header_single_addr_spec();
     header_date_projection();
     header_dates();

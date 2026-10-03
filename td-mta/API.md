@@ -1996,6 +1996,57 @@ Display-name decoding, external delimiter placement, NFC source integration,
 JSON publication and composed worker qualification remain open. A proof does
 not supply comma, angle or group-colon context outside its slice.
 
+### 1.44 Phrase display-name scalars
+
+M06al adds `header_phrase::decode::Cursor` from a completed phrase proof,
+its admitted whole field value and the phrase's exact extent in that field.
+Construction requires pointer/length identity between that extent and the
+proof's borrowed slice. Retain the whole field so placement checks inspect
+actual neighboring bytes, including commas, angle brackets and group colons;
+the decoder has no separate permission flag. This binding proves containment
+only. The caller must supply the whole admitted field value: a narrower slice
+would invent field boundaries and change placement. Field/form authorization
+and selection of the complete phrase remain with that caller.
+
+Classify whether the phrase consists solely of one quoted word, then replay
+raw tokens. Only whole Atom tokens with valid immediate LWS/field-boundary
+placement may use the existing encoded-word recognizer in Phrase context.
+Quoted words and obsolete dots remain literal. Reject invalid placement by
+retaining the literal spelling, even where a tolerant reader might recover.
+Omit comments and collapse nonempty grammatical CFWS between words to one SP.
+Suppress a pure LWS gap only between two recognized encoded words. Comments
+never count as the immediate LWS required beside an encoded word; a gap
+containing comments is not suppressed. Leading/trailing CFWS is omitted.
+
+Remove quote delimiters and quoted-pair escapes, then unfold logical bytes.
+For a sole quoted word, a charged prepass finds the first/last non-SP/HTAB,
+non-NUL logical byte before emitting scalars, trimming its edges without
+buffering whitespace. Mixed-word phrases preserve whitespace inside each
+quoted word. Literal NUL is dropped; other literal controls remain.
+Noncharacters become U+FFFD with an encoding diagnostic. Encoded controls
+are dropped and malformed encoded text is repaired by the existing word
+decoder. Decoded word spaces are preserved. NFC, comment fallback names and
+JSON serialization remain separate. Scalars and diagnostics are provisional
+until Complete.
+
+Copy state fits 224 bytes, including a checked turn ordinal reserved for future
+NFC checkpoint identity. Replay and word decoding occupy mutually exclusive
+enum variants; a private source-bound token checkpoint recreates replay only
+at a proven token boundary. Literal UTF-8 conversion uses a fixed four-byte
+stack array. No token/name buffer or meter is retained. The private charging
+seam preserves aggregate interpretation refusal for future NFC composition.
+Each poll charges at most 230 byte visits and 227 records; scalar emission
+here spends no output bytes, so the owner must debit serialized output.
+Classification, trim prepasses, byte lookahead, conversion and copied replay
+all spend the same live meter. Plain `a` costs six visits/17 records; `""`
+costs four/14 and `" a "` costs 15/24, excluding initial grammar validation.
+Errors latch across copies/fresh meters; cached Complete is inert.
+
+Tests cover field-bound placement, quote/fold/trim policy, comments, encoding
+repair, long Unicode, exact work, every copied suffix, refusal after output
+and aggregate refusal inside replay. Allocation intervals cover composition
+and refusal. Complete NFC Source and worker resource qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

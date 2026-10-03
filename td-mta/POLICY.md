@@ -194,6 +194,21 @@ literal controls and encoded-word-looking text without NFC or RFC 2047
 interpretation. Later JSON escapes controls; SMTP validation remains the
 separate authority boundary. Display-name decoding and NFC are distinct.
 
+Phrase display names omit comments and leading/trailing grammatical CFWS;
+nonempty CFWS between words becomes one SP. Adjacent raw tokens with no
+CFWS concatenate. Decode only whole atom words with RFC 2047 Phrase syntax
+and valid immediate LWS/field-boundary placement, inspecting the whole
+field's neighboring bytes. Preserve invalid placement literally as strict
+recovery; encoded-looking quoted strings are always literal. Suppress a
+pure LWS gap only between adjacent recognized encoded words, never a
+comment-bearing gap. Unquote quoted words and unfold after quoted-pair
+decoding. A sole quoted word ignores dropped NULs when trimming SP/HTAB at
+its resulting edges; mixed-word phrases retain quoted interior whitespace.
+Drop literal NUL, preserve other literal controls, and replace
+noncharacters. The word decoder drops encoded controls and repairs encoding
+faults; spaces produced by encoded words are preserved. Apply NFC only
+after this name projection, with JSON control escaping at serialization.
+
 MessageIds parses complete RFC 5322 msg-id lists, removes grammatical CFWS
 and outer angle brackets, and returns null for an invalid list. For
 References and In-Reply-To also accept their RFC 5322 section 4 obsolete

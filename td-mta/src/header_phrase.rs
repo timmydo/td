@@ -1,4 +1,5 @@
-//! Raw phrase tokens and exact CFWS context; decoding and publication are external.
+//! Phrase validation and display decoding; NFC and publication are external.
+pub mod decode;
 pub mod replay;
 pub use crate::header_message_ids::Extent;
 use crate::{
