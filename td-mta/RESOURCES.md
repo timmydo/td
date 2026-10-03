@@ -815,7 +815,13 @@ including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no
 copied strings. Isolated allocation intervals cover successful long inputs,
 malformed dates/tails and nesting refusal. No time-zone database or native
-calendar call is used; formatting and the composed worker stack remain open.
+calendar call is used. Ordinary date projection formats checked components
+into 20 or 25 caller bytes. Placement and exclusive lifetime of that output
+remain the enclosing owner's responsibility; no existing scratch partition
+is claimed by this helper. Its calendar shift is bounded to five days and
+uses scalar locals. It allocates no time-zone table or owned string. The
+complete Date form's output reservation, leap-second qualification and
+composed worker stack remain open.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also

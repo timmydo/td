@@ -1455,8 +1455,58 @@ with no output bytes. Revisited token delimiters and the trailing-FWS check
 are charged. The non-Copy cursor fits 192 bytes, including inline CFWS state,
 a three-byte word prefix and scalar counters. Long comments, zone names and
 zero-prefixed years use constant storage. Source capture and enclosing
-aggregate interpretation admission remain external. UTC conversion, RFC 3339
-rendering, JSON output and the JMAP method adapter remain follow-on work.
+aggregate interpretation admission remain external. Section 1.32 projects
+ordinary dates; leap-second qualification, JSON output and the JMAP method
+adapter remain follow-on work.
+
+### 1.32 Ordinary date projection
+
+M06y supplies `header_date::project::render` over copied Date components,
+caller output storage, a tick and the live job meter. It revalidates the
+public components before arithmetic. Ordinary seconds 00..59 produce an
+RFC 3339 string with mandatory whole seconds and uppercase T/Z. Known
+offsets normalize to UTC Z, including mail offsets through +/-99:59.
+Unknown offsets keep the original clock and -00:00. No local time-zone
+setting or native calendar routine participates.
+
+The formatter accepts Gregorian component years 0000..9999; the mail parser
+still accepts interpreted source years only from 1900. Offset normalization
+may cross a month, leap day or year, but cannot leave the four-digit output
+year range. Invalid public components or unrepresentable normalization
+return OutOfRange without output. At most five day transitions are required
+by the supported signed-minute offset range. Arithmetic on these bounded
+components cannot wrap; year boundary transitions use checked operations.
+
+After raw component validation, second 60 returns LeapSecondUnverified
+before offset normalization, retaining the original parsed Date and emitting
+nothing, even at output year boundaries. Invalid raw components still return
+OutOfRange. The unverified outcome is distinct from OutOfRange and
+malformed/null.
+No leap-second announcement source is currently qualified, and placement at
+the end of a UTC month alone cannot certify that a leap actually occurred.
+An eventual JMAP Date adapter must resolve this outcome under a reviewed
+verification policy before claiming complete Date support; it must not
+silently clamp, roll forward or relabel it as malformed. Raw headers and
+parsed components remain available. This increment adds no upstream data.
+
+Successful output occupies exactly 20 bytes for Z or 25 for -00:00 and
+borrows the caller buffer; it includes no JSON quotes or fractional seconds.
+The bounded TextBuffer formats only checked integer components and a static
+suffix. Eight records prepay component validation, up to five date steps,
+and fixed-width formatting. No source bytes are visited. Capacity is checked
+before charging the exact output byte count, and that charge precedes all
+writes. Capacity, work, OutOfRange and LeapSecondUnverified leave the buffer
+unchanged; an internal formatting/state failure requires discarding output.
+The caller propagates a failed live meter and retires its enclosing job;
+this stateless helper cannot own that lifetime or prevent supplying a new
+meter. JSON framing/publication needs its own separately charged bytes.
+
+No string, timezone table or calendar object is allocated. Tests cover
+literal mail-to-RFC output, nonhour offsets, five-day shifts, leap-century
+boundaries, both four-digit year edges, malformed public components,
+capacity/work refusal and the explicit unverified leap outcome. The Rust
+allocation interval exercises successful formatting and refusal paths.
+The complete Date/JMAP adapter and worker stack remain unqualified.
 
 ## 2. Read views and change history
 

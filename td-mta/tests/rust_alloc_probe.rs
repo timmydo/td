@@ -2064,6 +2064,90 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_date_projection() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_date::{
+            project::{render, Error, Outcome},
+            Date, Offset,
+        },
+        ports::{Deadline, Tick},
+    };
+    let date = Date {
+        year: 2000,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        offset: Offset::Known(5999),
+    };
+    let mut output = [0; 25];
+    let before = COUNTERS.snapshot();
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            records: 1000,
+            output_bytes: 1000,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        render(black_box(date), &mut output, Tick(1), &mut work),
+        Ok(Outcome::Date("1999-12-27T20:01:00Z"))
+    );
+    assert_eq!(
+        render(
+            Date {
+                offset: Offset::Unknown,
+                ..date
+            },
+            &mut output,
+            Tick(1),
+            &mut work
+        ),
+        Ok(Outcome::Date("2000-01-01T00:00:00-00:00"))
+    );
+    assert_eq!(
+        render(
+            Date {
+                year: u16::MAX,
+                ..date
+            },
+            &mut output,
+            Tick(1),
+            &mut work
+        ),
+        Ok(Outcome::OutOfRange)
+    );
+    assert_eq!(
+        render(Date { second: 60, ..date }, &mut output, Tick(1), &mut work),
+        Ok(Outcome::LeapSecondUnverified)
+    );
+    assert_eq!(
+        render(date, &mut [], Tick(1), &mut work),
+        Err(Error::Capacity)
+    );
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            records: 8,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        render(date, &mut output, Tick(1), &mut limited),
+        Err(Error::Work(Stop::OutputBytes))
+    );
+    assert_eq!(
+        render(date, &mut output, Tick(100), &mut work),
+        Err(Error::Work(Stop::Deadline))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "header date projection allocated");
+}
+
 fn header_dates() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2901,6 +2985,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        header_date_projection();
         header_dates();
         header_comments();
         header_selection();
@@ -3004,6 +3089,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    header_date_projection();
     header_dates();
     header_comments();
     header_selection();

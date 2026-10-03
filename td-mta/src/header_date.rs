@@ -1,4 +1,6 @@
 //! Complete resident RFC 5322 date-time parsing; output formatting is separate.
+pub mod project;
+
 use crate::{
     admission::work::{Charge, Meter, Stop},
     header_cfws,

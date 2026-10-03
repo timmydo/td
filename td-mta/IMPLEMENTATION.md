@@ -1357,6 +1357,14 @@ Initial independently landable increments:
   long inputs, sticky resource refusals and allocation-free polling. UTC
   conversion, RFC 3339 rendering and JMAP projection remain separate.
 
+- **M06y — ordinary date projection:** validate copied components and render
+  ordinary dates into fixed caller storage, normalizing known offsets to Z
+  while preserving unknown -00:00. Bound month/year carries and output work;
+  retain an explicit unverified outcome for leap-second input. Cover date
+  boundaries, large/nonhour offsets, hostile components, capacity/work
+  refusals and allocation-free formatting. Leap-second qualification and
+  JMAP form publication remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
