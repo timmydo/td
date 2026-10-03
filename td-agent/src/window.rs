@@ -5,7 +5,9 @@
 //! and carries out what the app asked.
 //!
 //! It also holds what crosses conversations: the API key, read once at
-//! startup and handed to each conversation process over its socketpair;
+//! startup and handed to each conversation process over its socketpair,
+//! and stored from the key dialog, which hands every running process the
+//! new one over its socketpair;
 //! the day's spending (`accounts::Ledger`); the messages between
 //! conversations, which it routes (`post`); and the provider's models
 //! list and the key's credit, fetched on a thread of their own
@@ -24,7 +26,7 @@ use td_ui::window::{Clipboard, Flow, Handler, Input};
 use crate::accounts::Ledger;
 use crate::config::{Client, Config};
 use crate::control::Remote;
-use crate::key::Secret;
+use crate::key::{self, Secret, Unwritten};
 use crate::models::{Credit, Models, MAX_LIST};
 use crate::post::{Outbox, Post};
 use crate::protocol::{Down, Up};
@@ -47,6 +49,8 @@ const MAX_CREDIT: u64 = 64 * 1024;
 enum Job {
     Models,
     Credit,
+    /// The key the human stored, for the credit asked after it.
+    Key(Secret),
 }
 
 enum Fetched {
@@ -71,10 +75,15 @@ impl Fetcher {
         std::thread::Builder::new()
             .name("td-agent-fetcher".into())
             .spawn(move || {
+                let mut key = key;
                 for job in work {
                     let fetched = match job {
                         Job::Models => Fetched::Models(models(&base_url, &state)),
                         Job::Credit => Fetched::Credit(credit(&base_url, key.as_ref())),
+                        Job::Key(stored) => {
+                            key = Some(stored);
+                            continue;
+                        }
                     };
                     if answer.send(fetched).is_err() {
                         break;
@@ -100,6 +109,14 @@ impl Fetcher {
         }
         self.last_credit = Some(now);
         let _ = self.jobs.send(Job::Credit);
+    }
+
+    /// A key the human stored: its credit is asked for at once.
+    fn rekey(&mut self, key: Secret, now: Instant) {
+        let _ = self.jobs.send(Job::Key(key));
+        self.keyed = true;
+        self.last_credit = None;
+        self.credit(now);
     }
 }
 
@@ -151,6 +168,11 @@ pub struct Session {
     fetcher: Option<Fetcher>,
     client: Client,
     post: Post,
+    /// Where the key dialog stores the key; none without a configuration
+    /// directory.
+    key_path: Option<PathBuf>,
+    /// File → Quit was chosen: the window closes.
+    quit: bool,
 }
 
 impl Session {
@@ -190,7 +212,44 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
+                Request::Quit => self.quit = true,
             }
+        }
+    }
+
+    /// Stores the key from the dialog (DESIGN.md §6) and hands it to every
+    /// conversation process, running or started later, and to the credit
+    /// fetch; a stored key is replaced only when `replace` says so.
+    fn save_key(&mut self, secret: &Secret, replace: bool) {
+        let Some(path) = self.key_path.clone() else {
+            self.app.key_refused(
+                "there is nowhere to store a key: neither XDG_CONFIG_HOME nor HOME is an absolute path"
+                    .into(),
+            );
+            return;
+        };
+        match key::write(&path, secret, replace) {
+            Ok(stored) => {
+                self.supervisor.rekey(stored.clone());
+                if let Some(fetcher) = self.fetcher.as_mut() {
+                    fetcher.rekey(stored, Instant::now());
+                }
+                self.app.key_saved(&path.display().to_string());
+            }
+            Err(Unwritten::Exists) => self.app.key_exists(),
+            Err(Unwritten::Refused(why)) => {
+                eprintln!("td-agent: saving the key: {why}");
+                self.app.key_refused(why);
+            }
+        }
+    }
+
+    fn flow(&self) -> Flow {
+        if self.quit {
+            Flow::Quit
+        } else {
+            Flow::Continue
         }
     }
 
@@ -384,7 +443,7 @@ impl Handler for Session {
         }
         self.app.input(input, clipboard);
         self.serve();
-        Flow::Continue
+        self.flow()
     }
 
     fn poll(&mut self, now: u64) -> Flow {
@@ -392,7 +451,7 @@ impl Handler for Session {
         self.hear();
         self.control();
         self.serve();
-        Flow::Continue
+        self.flow()
     }
 
     fn wait_ms(&self, _now: u64) -> u64 {
@@ -446,10 +505,12 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
 /// Runs the window process over the state directory until the window
 /// closes: it takes the window lock, opens the orchestrator, creating it
 /// the first time, and serves `control` when given. `key` is the API key,
-/// or why there is none, which every turn then says.
+/// or why there is none, which every turn then says; `key_path` is where
+/// the key dialog stores one.
 pub fn run(
     config: Config,
     key: Result<Secret, String>,
+    key_path: Option<PathBuf>,
     state: StateDir,
     program: PathBuf,
     control: Option<PathBuf>,
@@ -485,6 +546,8 @@ pub fn run(
         eprintln!("td-agent: {why}");
         app.note(why.clone());
     }
+    app.set_keyed(key.is_ok());
+    app.set_key_path(key_path.as_ref().map(|p| p.display().to_string()));
     let (rows, problems) = rows(&state);
     for problem in &problems {
         eprintln!("td-agent: the store: {problem}");
@@ -533,6 +596,8 @@ pub fn run(
         fetcher,
         client,
         post: Post::new(outbox),
+        key_path,
+        quit: false,
     };
     // A cached list serves until the provider's comes.
     match Models::load(session.state.root()) {

@@ -20,6 +20,10 @@
 //! drawn above the composer, collapsed to the item in progress; `C-t`
 //! shows the whole list and `C-S-t` clears it. `C-S-p` pauses or resumes
 //! the open conversation (§3).
+//!
+//! A menu bar holds the File menu (`menu`), which `F10` or a press on its
+//! header opens, and File → Set OpenRouter key… opens the key dialog
+//! (`keydialog`), modal over the window until it closes.
 
 use td_ui::chrome::ROW;
 use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
@@ -37,6 +41,9 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::config::Mode;
 use crate::cost;
+use crate::key::Secret;
+use crate::keydialog::{KeyDialog, Reply};
+use crate::menu;
 use crate::post::Entry;
 use crate::protocol::{Up, MAX_TEXT};
 use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TodoItem};
@@ -181,6 +188,12 @@ pub enum Request {
     ClearTodo,
     /// Save the split's preferred share.
     SaveShare(u32, u32),
+    /// Store the OpenRouter key from the key dialog, replacing a stored
+    /// one only when `replace` says so; the session answers through
+    /// `key_saved`, `key_exists` or `key_refused`.
+    SaveKey { secret: Secret, replace: bool },
+    /// Close the window, from File → Quit.
+    Quit,
 }
 
 /// What has the keyboard.
@@ -413,6 +426,22 @@ pub struct App {
     today: Option<u64>,
     limits: cost::Limits,
     requests: Vec<Request>,
+    /// The bar's menu, closed until opened.
+    menu: menu::Menu,
+    /// The key dialog while it is open, modal over the window.
+    dialog: Option<KeyDialog>,
+    /// Where the key file is, as the dialog says it; none when there is
+    /// no configuration directory to put it in.
+    key_path: Option<String>,
+    /// Whether the session has a key to hand the conversations.
+    keyed: bool,
+    /// Where the press that is the dialog's latest input was, to keep a
+    /// confirmation's action from under it; none after a key.
+    press: Option<(i64, i64)>,
+    /// The key dialog asked the clipboard for its text, and the paste has
+    /// not come: it is the dialog's, and dropped if the dialog has gone,
+    /// never the composer's.
+    dialog_paste: bool,
     clock: u64,
     dirty: bool,
     /// Counts the changes that need a paint, so a driven input can say
@@ -435,7 +464,7 @@ impl App {
             },
             share,
             surface,
-            surface.bounds(),
+            body(surface),
         )
         .map_err(|e| e.to_string())?;
         let model = Model::new(&[], &COLUMNS).map_err(|e| e.to_string())?;
@@ -474,6 +503,12 @@ impl App {
                 day: None,
             },
             requests: Vec::new(),
+            menu: menu::menu(surface).map_err(|e| format!("the menu: {e}"))?,
+            dialog: None,
+            key_path: None,
+            keyed: true,
+            press: None,
+            dialog_paste: false,
             clock: 0,
             dirty: true,
             generation: 0,
@@ -576,6 +611,11 @@ impl App {
         } else {
             ""
         };
+        let keyless = if self.keyed {
+            ""
+        } else {
+            " | no key: File \u{2192} Set OpenRouter key\u{2026} (F10)"
+        };
         let model = match row.map(|r| r.role) {
             Some(Role::Orchestrator) => self.models.1.as_str(),
             _ => self.models.0.as_str(),
@@ -606,7 +646,7 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{retry}{notice} | {model} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
+            "{state}{retry}{keyless}{notice} | {model} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
             of(self.meter.spent, self.limits.conversation),
             self.mode.word()
         )
@@ -634,6 +674,29 @@ impl App {
     pub fn set_limits(&mut self, limits: cost::Limits) {
         self.limits = limits;
         self.touch();
+    }
+
+    /// Where the key file is, which the key dialog names; `None` when
+    /// there is nowhere to store one.
+    pub fn set_key_path(&mut self, path: Option<String>) {
+        self.key_path = path;
+    }
+
+    /// Whether there is a key; without one the status row says how to
+    /// store one.
+    pub fn set_keyed(&mut self, keyed: bool) {
+        self.keyed = keyed;
+        self.touch();
+    }
+
+    /// The key dialog, while it is open.
+    pub fn dialog(&self) -> Option<&KeyDialog> {
+        self.dialog.as_ref()
+    }
+
+    /// Whether the menu is open.
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_open()
     }
 
     /// What today has spent across conversations.
@@ -1502,11 +1565,19 @@ impl App {
     }
 
     fn layout(&mut self) {
-        let bounds = self.surface.bounds();
         let _ = self.split.event(split::Event::Resize {
             surface: self.surface,
-            rect: bounds,
+            rect: body(self.surface),
         });
+        let _ = self
+            .menu
+            .event(menu::revision(), td_ui::menus::Event::Resize(self.surface));
+        if let Some(dialog) = self.dialog.as_mut() {
+            if !dialog.resize(self.surface) {
+                self.close_dialog();
+                self.note("the window is now too small for the key dialog, which is closed");
+            }
+        }
         self.place();
     }
 
@@ -1569,7 +1640,8 @@ impl App {
     /// Hands the keyboard focus to the focused widget, and takes it from
     /// the others, so exactly one shows a focused caret or selection.
     fn apply_focus(&mut self) {
-        let on = |f: Focus| self.focused && self.focus == f;
+        // A modal dialog has the keyboard: no widget under it shows focus.
+        let on = |f: Focus| self.focused && self.dialog.is_none() && self.focus == f;
         let list_focus = if on(Focus::List) {
             tree_table::Focus::Rows
         } else {
@@ -1674,6 +1746,23 @@ impl App {
 
     /// One input from the window, with its clipboard.
     pub fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        if let Input::Paste(text) = input {
+            return self.pasted(text);
+        }
+        // The dialog's paste that the clipboard gave up on (a focus loss,
+        // a failed transfer, the device going away) never comes; td-ui hands a paste over only
+        // after it stops saying one is in flight. Only the window's own
+        // clipboard can say so: the control seam's has none, and its
+        // inputs never release the dialog's paste.
+        if self.dialog_paste && clipboard.available() && !clipboard.pasting() {
+            self.dialog_paste = false;
+        }
+        if self.dialog.is_some() {
+            return self.dialog_input(input, clipboard);
+        }
+        if self.menu.is_open() && self.menu_input(&input) {
+            return;
+        }
         match input {
             Input::Key { chord, repeat } => self.key(chord, repeat, clipboard),
             Input::Pointer {
@@ -1713,14 +1802,34 @@ impl App {
                 self.apply_focus();
             }
             Input::Close => {}
-            Input::Paste(text) => {
-                if self.focus == Focus::Composer {
-                    match self.composer.insert(text) {
-                        Ok(true) => self.touch(),
-                        Ok(false) => {}
-                        Err(e) => self.note(e),
-                    }
+            // Taken above, by `pasted`.
+            Input::Paste(_) => {}
+        }
+    }
+
+    /// The clipboard's text, for whoever asked: the key dialog's paste is
+    /// its own, and dropped once it has closed; while the dialog is open
+    /// no other paste goes anywhere; otherwise the focused composer
+    /// takes it.
+    fn pasted(&mut self, text: &str) {
+        if std::mem::take(&mut self.dialog_paste) {
+            match self.dialog.as_mut() {
+                Some(dialog) => {
+                    let reply = dialog.paste(text);
+                    self.reply(reply);
                 }
+                None => self.note("the key dialog closed before its paste came; it is dropped"),
+            }
+            return;
+        }
+        if self.dialog.is_some() {
+            return self.note("a paste that came while the key dialog was open is dropped");
+        }
+        if self.focus == Focus::Composer {
+            match self.composer.insert(text) {
+                Ok(true) => self.touch(),
+                Ok(false) => {}
+                Err(e) => self.note(e),
             }
         }
     }
@@ -1745,10 +1854,228 @@ impl App {
         self.apply_focus();
     }
 
+    // --- the menu and the key dialog ---------------------------------
+
+    /// Opens the File menu.
+    fn open_menu(&mut self) {
+        self.cancel_pointer();
+        match self.menu.open_bar(0) {
+            Ok(()) => self.touch(),
+            Err(e) => self.note(format!("the menu: {e}")),
+        }
+    }
+
+    /// An input while the menu is open, which is the menu's: its keys,
+    /// every other chord consumed, the pointer, the wheel over its panel,
+    /// and a focus loss or resize closing it. True when the input went no
+    /// further; a resize and a focus change are the window's as well.
+    fn menu_input(&mut self, input: &Input<'_>) -> bool {
+        use td_ui::menus::Event;
+        let event = match *input {
+            Input::Key { chord, repeat } => menu::event(chord, repeat),
+            Input::Pointer {
+                phase: PointerPhase::Press,
+                x,
+                y,
+                ..
+            } => Event::Press { x, y },
+            Input::Pointer {
+                phase: PointerPhase::Move,
+                x,
+                y,
+                ..
+            } => Event::Move { x, y },
+            Input::Pointer {
+                phase: PointerPhase::Release,
+                ..
+            } => Event::Release,
+            Input::Wheel { rows, .. } => match self.menu.panel(0) {
+                Some(panel) => Event::Wheel {
+                    x: panel.x,
+                    y: panel.y,
+                    rows,
+                },
+                None => Event::Other,
+            },
+            Input::Focus(false) => Event::FocusLost,
+            // Under the open menu, nothing shows hover.
+            Input::Hover(_) => return true,
+            Input::Resize(_)
+            | Input::Focus(true)
+            | Input::Close
+            | Input::Paste(_)
+            | Input::CancelPointer => return false,
+        };
+        self.menu_event(event);
+        !matches!(input, Input::Focus(false))
+    }
+
+    fn menu_event(&mut self, event: td_ui::menus::Event) {
+        use td_ui::menus::Outcome;
+        match self.menu.event(menu::revision(), event) {
+            Ok(Outcome::Activated(action)) => {
+                self.touch();
+                self.menu_action(action);
+            }
+            Ok(Outcome::Changed | Outcome::Dismissed | Outcome::Stale) => self.touch(),
+            Ok(Outcome::Ignored | Outcome::Consumed) => {}
+            Err(e) => {
+                self.menu.dismiss();
+                self.note(format!("the menu: {e}"));
+            }
+        }
+    }
+
+    /// What a menu item does: what its chord does, or what only the menu
+    /// offers.
+    fn menu_action(&mut self, action: menu::Action) {
+        match action {
+            menu::Action::New => self.requests.push(Request::New),
+            menu::Action::SetKey => self.open_key_dialog(),
+            menu::Action::Quit => self.requests.push(Request::Quit),
+        }
+    }
+
+    /// Opens the key dialog, modal over the window.
+    pub fn open_key_dialog(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(path) = self.key_path.clone() else {
+            return self.note(
+                "there is nowhere to store a key: neither XDG_CONFIG_HOME nor HOME is an absolute path",
+            );
+        };
+        self.cancel_pointer();
+        self.menu.dismiss();
+        self.press = None;
+        match KeyDialog::open(self.surface, &path) {
+            Ok(dialog) => {
+                self.dialog = Some(dialog);
+                self.apply_focus();
+            }
+            Err(e) => self.note(e),
+        }
+    }
+
+    /// Closes the key dialog, its entry cleared first.
+    fn close_dialog(&mut self) {
+        if let Some(mut dialog) = self.dialog.take() {
+            dialog.close();
+        }
+        self.apply_focus();
+    }
+
+    fn reply(&mut self, reply: Reply) {
+        match reply {
+            Reply::Stay(true) => self.touch(),
+            Reply::Stay(false) => {}
+            Reply::Closed => self.close_dialog(),
+            Reply::Save { secret, replace } => {
+                self.requests.push(Request::SaveKey { secret, replace });
+                self.touch();
+            }
+        }
+    }
+
+    /// An input while the key dialog is open, which is the dialog's: every
+    /// key, the pointer, and the paste it asked for. A resize and the
+    /// window's focus are the window's too.
+    fn dialog_input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        let reply = match input {
+            Input::Key { chord, repeat } => {
+                self.press = None;
+                let idle = !clipboard.pasting();
+                let reply = dialog.key(chord, repeat, clipboard);
+                // This key asked the clipboard for its text.
+                if idle && clipboard.pasting() {
+                    self.dialog_paste = true;
+                }
+                reply
+            }
+            Input::Pointer {
+                phase,
+                x,
+                y,
+                extend,
+                ..
+            } => {
+                if phase == PointerPhase::Press {
+                    self.press = Some((x, y));
+                }
+                dialog.pointer(phase, x, y, extend)
+            }
+            // Taken first, by `input`.
+            Input::Paste(_) => return,
+            Input::CancelPointer => {
+                dialog.cancel_pointer();
+                Reply::Stay(true)
+            }
+            Input::Focus(focused) => {
+                if !focused {
+                    dialog.focus_lost();
+                }
+                self.focused = focused;
+                self.apply_focus();
+                Reply::Stay(true)
+            }
+            Input::Resize(surface) => {
+                self.resize(surface);
+                return;
+            }
+            // A close never comes here: the window quits on it first.
+            Input::Wheel { .. } | Input::Hover(_) | Input::Close => Reply::Stay(false),
+        };
+        self.reply(reply);
+    }
+
+    /// The key is stored at `path`: the dialog closes, cleared, and the
+    /// status row stops asking for one.
+    pub fn key_saved(&mut self, path: &str) {
+        self.close_dialog();
+        self.keyed = true;
+        self.note(format!(
+            "the key is stored in {path}; every conversation uses it from now on"
+        ));
+    }
+
+    /// A key is stored already: the dialog asks whether to replace it.
+    pub fn key_exists(&mut self) {
+        let press = self.press;
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.ask_replace(press);
+            self.touch();
+        }
+    }
+
+    /// The key was not stored, for the reason given, which the dialog
+    /// shows; it stays open with its text.
+    pub fn key_refused(&mut self, why: String) {
+        match self.dialog.as_mut() {
+            Some(dialog) => {
+                dialog.refused(why);
+                self.touch();
+            }
+            None => self.note(why),
+        }
+    }
+
     /// A key, by its chord: the window's own first, then the focused
     /// widget's.
     pub fn key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
+        // An open dialog or menu has every key.
+        if self.dialog.is_some() {
+            return self.dialog_input(Input::Key { chord, repeat }, clipboard);
+        }
+        if self.menu.is_open() {
+            return self.menu_event(menu::event(chord, repeat));
+        }
         match chord {
+            menu::OPEN if !repeat => return self.open_menu(),
+
             "C-n" if !repeat => {
                 self.requests.push(Request::New);
                 return;
@@ -1898,6 +2225,10 @@ impl App {
         };
         let capture = match phase {
             PointerPhase::Press => {
+                if menu::bar(self.surface).rect().contains(x, y) {
+                    self.menu_event(td_ui::menus::Event::Press { x, y });
+                    return;
+                }
                 let share = self.split.share();
                 if self.split.event(split::Event::Press { x, y }) != Ok(split::Outcome::Ignored) {
                     self.capture = Some(Capture::Split(share));
@@ -2129,6 +2460,25 @@ impl Composition for App {
             self.composer.emit(clip, sink);
         }
         self.emit_status(regions.status, damage, sink);
+        menu::bar(self.surface).emit(damage, sink);
+        self.menu.emit(damage, sink);
+        if let Some(dialog) = &self.dialog {
+            dialog.emit(self.focused, damage, sink);
+        }
+    }
+}
+
+/// Where the split goes: the surface under the menu bar.
+fn body(surface: Surface) -> Rect {
+    let bounds = surface.bounds();
+    let bar = ((ROW * surface.scale.value()) as u32).min(bounds.height);
+    if bar == bounds.height {
+        return bounds;
+    }
+    Rect {
+        y: bounds.y + i64::from(bar),
+        height: bounds.height - bar,
+        ..bounds
     }
 }
 
@@ -3193,5 +3543,267 @@ pub mod tests {
         let surface = Surface::new(200, 200, Scale::default()).unwrap();
         let app = App::new(surface, None, Mode::Auto).unwrap();
         assert!(text(&app).contains("too small"));
+    }
+
+    const KEY: &str = crate::keydialog::tests::KEY;
+    const PATH: &str = "/home/me/.config/td-agent/openrouter.key";
+
+    fn press(app: &mut App, x: i64, y: i64) {
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            app.input(
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                    follow: false,
+                },
+                &mut NoClipboard,
+            );
+        }
+    }
+
+    /// The app with the key dialog open from the File menu.
+    fn keyless() -> App {
+        let mut app = app();
+        app.set_key_path(Some(PATH.into()));
+        app.set_keyed(false);
+        key(&mut app, "F10");
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert!(app.dialog().is_some());
+        app
+    }
+
+    /// Everything the window shows or says of itself.
+    fn said(app: &App) -> String {
+        format!(
+            "{}\n{}\n{}\n{:?}",
+            text(app),
+            app.status_line(),
+            app.notice().unwrap_or(""),
+            app.dialog()
+        )
+    }
+
+    #[test]
+    fn the_bar_shows_file_and_the_split_lies_under_it() {
+        let app = app();
+        assert!(text(&app).starts_with(" File"), "{}", text(&app));
+        let regions = app.regions.unwrap();
+        assert_eq!(regions.list.y, ROW as i64);
+        assert_eq!(
+            regions.status.y + i64::from(regions.status.height),
+            app.surface.height as i64
+        );
+    }
+
+    #[test]
+    fn f10_or_a_press_on_file_opens_the_menu_and_its_items_act() {
+        let mut app = app();
+        key(&mut app, "F10");
+        assert!(app.menu_open());
+        assert!(text(&app).contains("New conversation"), "{}", text(&app));
+        assert!(text(&app).contains("Set OpenRouter key\u{2026}"));
+        // The open menu takes every key: C-n is consumed, not a new
+        // conversation.
+        key(&mut app, "C-n");
+        assert!(app.take_requests().is_empty());
+        key(&mut app, "Return");
+        assert!(!app.menu_open());
+        assert_eq!(app.take_requests(), [Request::New]);
+        // The chord the item shows, with the menu closed, does the same.
+        key(&mut app, "C-n");
+        assert_eq!(app.take_requests(), [Request::New]);
+        // A press on the header opens it, and one on the third row quits.
+        press(&mut app, CELL_WIDTH as i64 + 4, 4);
+        assert!(app.menu_open());
+        let panel = app.menu.panel(0).unwrap();
+        press(&mut app, panel.x + 8, panel.y + (2 * ROW) as i64 + 4);
+        assert_eq!(app.take_requests(), [Request::Quit]);
+        // Escape and F10 close it, and a press outside closes it and
+        // goes no further.
+        for chord in ["Escape", "F10"] {
+            key(&mut app, "F10");
+            key(&mut app, chord);
+            assert!(!app.menu_open(), "{chord}");
+        }
+        key(&mut app, "F10");
+        let transcript = app.regions.unwrap().transcript;
+        press(&mut app, transcript.x + 40, transcript.y + 40);
+        assert!(!app.menu_open());
+        assert_eq!(app.focus(), Focus::Composer, "the press went no further");
+        let requests = app.take_requests();
+        assert!(
+            requests.is_empty(),
+            "the press opened nothing: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_key_the_status_row_points_to_the_dialog_until_one_is_stored() {
+        let mut app = keyless();
+        assert!(app
+            .status_line()
+            .contains("| no key: File \u{2192} Set OpenRouter key\u{2026} (F10) |"));
+        assert!(text(&app).contains("Set OpenRouter key"));
+        // The dialog is modal: the window's chords are its, consumed.
+        for chord in ["C-n", "C-PageDown", "F6", "C-t"] {
+            key(&mut app, chord);
+        }
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.focus(), Focus::Composer);
+        for c in KEY.chars() {
+            key(&mut app, &c.to_string());
+        }
+        assert!(app.composed().is_empty(), "the composer took nothing");
+        key(&mut app, "Return");
+        let requests = app.take_requests();
+        assert_eq!(
+            requests,
+            [Request::SaveKey {
+                secret: Secret::new(KEY.into()),
+                replace: false
+            }]
+        );
+        assert!(!format!("{requests:?}").contains(KEY), "{requests:?}");
+        // Refused: said in the dialog, which keeps its text.
+        app.key_refused("the directory /x is writable by its group (mode 0775)".into());
+        assert_eq!(app.dialog().unwrap().length(), KEY.len());
+        assert!(text(&app).contains("writable by its group"));
+        // Stored: the dialog closes and the row stops asking.
+        app.key_saved(PATH);
+        assert!(app.dialog().is_none());
+        assert!(!app.status_line().contains("no key"));
+        assert!(app.status_line().contains("the key is stored in"));
+        assert!(!said(&app).contains(KEY));
+    }
+
+    #[test]
+    fn a_stored_key_is_replaced_only_once_confirmed() {
+        let mut app = keyless();
+        for c in KEY.chars() {
+            key(&mut app, &c.to_string());
+        }
+        key(&mut app, "Return");
+        app.take_requests();
+        app.key_exists();
+        assert_eq!(app.dialog().unwrap().part(), "replace");
+        assert!(text(&app).contains("A key is already stored; replace it?"));
+        key(&mut app, "Tab");
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::SaveKey {
+                secret: Secret::new(KEY.into()),
+                replace: true
+            }]
+        );
+        assert!(!said(&app).contains(KEY));
+    }
+
+    #[test]
+    fn a_paste_reaches_the_dialog_that_asked_and_cancelling_clears_it() {
+        use crate::keydialog::tests::Recorder;
+        let mut app = keyless();
+        let mut clipboard = Recorder::default();
+        app.input(
+            Input::Key {
+                chord: "C-v",
+                repeat: false,
+            },
+            &mut clipboard,
+        );
+        assert_eq!(clipboard.pastes, 1);
+        // td-ui stops saying a paste is in flight before it hands it over.
+        clipboard.inflight = false;
+        app.input(Input::Paste(&format!("{KEY}\n")), &mut clipboard);
+        assert_eq!(app.dialog().unwrap().length(), KEY.len());
+        assert!(text(&app).contains(&"\u{2022}".repeat(KEY.len())));
+        // Copying is refused, and the clipboard never offered the key.
+        for chord in ["C-a", "C-c", "C-x"] {
+            app.input(
+                Input::Key {
+                    chord,
+                    repeat: false,
+                },
+                &mut clipboard,
+            );
+        }
+        assert!(clipboard.copies.is_empty());
+        assert!(text(&app).contains("a masked entry does not copy"));
+        assert!(!said(&app).contains(KEY));
+        key(&mut app, "Escape");
+        assert!(app.dialog().is_none());
+        assert!(app.take_requests().is_empty());
+        // A paste the dialog asked for that comes after it closed is
+        // dropped, never the composer's.
+        let chord = |app: &mut App, chord, clipboard: &mut Recorder| {
+            app.input(
+                Input::Key {
+                    chord,
+                    repeat: false,
+                },
+                clipboard,
+            )
+        };
+        let mut clipboard = Recorder::default();
+        let mut app = keyless();
+        chord(&mut app, "C-v", &mut clipboard);
+        chord(&mut app, "Escape", &mut clipboard);
+        assert!(app.dialog().is_none());
+        clipboard.inflight = false;
+        app.input(Input::Paste(KEY), &mut clipboard);
+        assert!(app.composed().is_empty());
+        assert!(app.notice().unwrap().contains("dropped"));
+        assert!(!said(&app).contains(KEY));
+        // One the clipboard gave up on leaves the composer's next paste
+        // the composer's.
+        let mut clipboard = Recorder::default();
+        let mut app = keyless();
+        chord(&mut app, "C-v", &mut clipboard);
+        chord(&mut app, "Escape", &mut clipboard);
+        clipboard.inflight = false;
+        chord(&mut app, "x", &mut clipboard);
+        app.input(Input::Paste("later"), &mut clipboard);
+        assert_eq!(app.composed(), "xlater");
+        // The control seam's inputs, with no clipboard, never release the
+        // dialog's paste in flight.
+        let mut clipboard = Recorder::default();
+        let mut app = keyless();
+        chord(&mut app, "C-v", &mut clipboard);
+        app.input(
+            Input::Key {
+                chord: "Escape",
+                repeat: false,
+            },
+            &mut NoClipboard,
+        );
+        app.input(Input::Focus(true), &mut NoClipboard);
+        assert!(app.dialog().is_none());
+        clipboard.inflight = false;
+        app.input(Input::Paste(KEY), &mut clipboard);
+        assert!(app.composed().is_empty());
+        assert!(app.notice().unwrap().contains("dropped"));
+        assert!(!said(&app).contains(KEY));
+        // A paste the dialog did not ask for goes nowhere while it is
+        // open, and the composer's once it is not.
+        let mut app = keyless();
+        app.input(Input::Paste("unasked"), &mut NoClipboard);
+        assert_eq!(app.dialog().unwrap().length(), 0);
+        assert!(app.composed().is_empty());
+        key(&mut app, "Escape");
+        app.input(Input::Paste("for the composer"), &mut NoClipboard);
+        assert_eq!(app.composed(), "for the composer");
+    }
+
+    #[test]
+    fn with_nowhere_to_store_a_key_the_dialog_does_not_open() {
+        let mut app = app();
+        key(&mut app, "F10");
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert!(app.dialog().is_none());
+        assert!(app.notice().unwrap().contains("nowhere to store a key"));
     }
 }

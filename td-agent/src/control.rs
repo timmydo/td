@@ -37,8 +37,9 @@ impl ErrorCode for Refusal {
     }
 }
 
-/// The window's actions, each its default chord.
-pub const BINDINGS: [Binding; 11] = [
+/// The window's actions, each its default chord; `set-key` has none, and
+/// is the File menu's item.
+pub const BINDINGS: [Binding; 13] = [
     Binding {
         name: "new",
         chord: Some("C-n"),
@@ -105,6 +106,18 @@ pub const BINDINGS: [Binding; 11] = [
         arguments: "",
         help: "Move the focus back.",
     },
+    Binding {
+        name: "menu",
+        chord: Some("F10"),
+        arguments: "",
+        help: "Open the File menu, or close it: arrows move, Return chooses, Escape closes.",
+    },
+    Binding {
+        name: "set-key",
+        chord: None,
+        arguments: "",
+        help: "File > Set OpenRouter key...: open the dialog that stores the OpenRouter API key.",
+    },
 ];
 
 /// The window as the seam drives it. A copy has no press to be offered
@@ -141,6 +154,12 @@ impl Controller for Remote<'_> {
     fn action(&mut self, name: &str, arguments: &[&str]) -> Result<driven::Outcome, Refusal> {
         if !arguments.is_empty() {
             return Err(Refusal::Protocol);
+        }
+        if name == "set-key" {
+            // Through the menu's own path, as a choice of its item.
+            let before = self.app.generation();
+            self.app.open_key_dialog();
+            return Ok(self.outcome(before));
         }
         let chord = BINDINGS
             .iter()
@@ -200,13 +219,19 @@ impl Controller for Remote<'_> {
         let state = active
             .and_then(|id| app.rows().iter().find(|r| &r.id == id))
             .map_or("none", |r| r.state.word());
+        // The key dialog says where its keyboard is and how long its
+        // entry is, never what it holds.
+        let (dialog, entry) = app
+            .dialog()
+            .map_or(("none", 0), |dialog| (dialog.part(), dialog.length()));
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tstatus={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
             app.transcript().len(),
             app.composed().len(),
+            if app.menu_open() { "open" } else { "closed" },
             app.status_line().replace(['\t', '\n'], " "),
         ))
     }
@@ -250,5 +275,85 @@ mod tests {
         assert!(driven::request(&mut remote, b"1\t22\taction\tnew\tx").contains("protocol"));
         let text = driven::request(&mut remote, b"1\t23\ttext");
         assert!(text.contains("\tok\t"), "{text}");
+    }
+
+    fn hex(text: &str) -> String {
+        text.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The File menu and the key dialog through the seam: opened, typed
+    /// into and saved, the snapshot and the text read-back never holding
+    /// the key.
+    #[test]
+    fn the_menu_and_the_key_dialog_are_driven_and_never_show_the_key() {
+        const KEY: &str = "sk-or-v1-0123456789abcdef";
+        let mut app = crate::ui::tests::app();
+        app.set_key_path(Some("/home/me/.config/td-agent/openrouter.key".into()));
+        app.set_keyed(false);
+        let mut remote = Remote { app: &mut app };
+        assert!(remote.state().unwrap().contains("menu=closed\tdialog=none"));
+        assert!(remote
+            .state()
+            .unwrap()
+            .contains("no key: File \u{2192} Set OpenRouter key\u{2026} (F10)"));
+        assert!(driven::request(&mut remote, b"1\t1\taction\tmenu").ends_with("changed"));
+        assert!(remote.state().unwrap().contains("menu=open"));
+        // Down to the second item, and chosen.
+        driven::request(
+            &mut remote,
+            format!("1\t2\tkey\t{}", hex("Down")).as_bytes(),
+        );
+        driven::request(
+            &mut remote,
+            format!("1\t3\tkey\t{}", hex("Return")).as_bytes(),
+        );
+        let state = remote.state().unwrap();
+        assert!(
+            state.contains("menu=closed\tdialog=entry\tentry=0"),
+            "{state}"
+        );
+        for (n, c) in KEY.chars().enumerate() {
+            let line = format!("1\t{}\tkey\t{}", 10 + n, hex(&c.to_string()));
+            assert!(driven::request(&mut remote, line.as_bytes()).ends_with("changed"));
+        }
+        let state = remote.state().unwrap();
+        assert!(state.contains(&format!("entry={}", KEY.len())), "{state}");
+        let text = driven::request(&mut remote, b"1\t60\ttext");
+        let shown =
+            String::from_utf8(td_ui::control::unhex(text.rsplit('\t').next().unwrap()).unwrap())
+                .unwrap();
+        assert!(shown.contains(&"\u{2022}".repeat(KEY.len())), "{shown}");
+        for leak in [state.as_str(), text.as_str(), shown.as_str()] {
+            assert!(!leak.contains("0123456789abcdef"), "{leak}");
+            assert!(!leak.contains(&hex("0123456789abcdef")), "{leak}");
+        }
+        driven::request(
+            &mut remote,
+            format!("1\t61\tkey\t{}", hex("Return")).as_bytes(),
+        );
+        assert_eq!(
+            remote.app.take_requests(),
+            [Request::SaveKey {
+                secret: crate::key::Secret::new(KEY.into()),
+                replace: false
+            }]
+        );
+        // The session stored it: the dialog closes, emptied, and the
+        // status row stops asking for a key.
+        remote
+            .app
+            .key_saved("/home/me/.config/td-agent/openrouter.key");
+        let state = remote.state().unwrap();
+        assert!(state.contains("dialog=none\tentry=0"), "{state}");
+        assert!(!state.contains("no key"), "{state}");
+        assert!(state.contains("the key is stored in"), "{state}");
+        // `set-key` opens the dialog directly.
+        assert!(driven::request(&mut remote, b"1\t70\taction\tset-key").ends_with("changed"));
+        assert!(remote.state().unwrap().contains("dialog=entry"));
+        driven::request(
+            &mut remote,
+            format!("1\t71\tkey\t{}", hex("Escape")).as_bytes(),
+        );
+        assert!(remote.state().unwrap().contains("dialog=none"));
     }
 }

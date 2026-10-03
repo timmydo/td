@@ -23,6 +23,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::frame;
+use crate::key::Secret;
 use crate::protocol::{Down, Up};
 use crate::store::{random_hex, Effect, Id, Kind, Role};
 
@@ -229,6 +230,22 @@ impl Supervisor {
             running.resuming = true;
         }
         Ok(())
+    }
+
+    /// A key the human stored: every child started from now on is sent it
+    /// first, and every running one gets it now, in a fresh `Setup`,
+    /// which a conversation takes between turns (DESIGN.md §2, §6). It
+    /// crosses the socketpairs and nothing else.
+    pub fn rekey(&mut self, key: Secret) {
+        if let Down::Setup { key: held, .. } = &mut self.setup {
+            *held = Ok(key);
+        }
+        let bytes = self.setup.encode();
+        for running in self.children.iter_mut().filter(|r| !r.failed) {
+            if frame::write(&mut running.writer, &bytes).is_err() {
+                let _ = running.writer.shutdown(std::net::Shutdown::Both);
+            }
+        }
     }
 
     /// The open conversation, when there is one.

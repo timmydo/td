@@ -12,17 +12,27 @@ license = "MIT"
 # manifest from a nested worktree, as td-news's does.
 [workspace]
 
+# The native compositor cases that store a key from the File menu's
+# dialog: the key file's walk checks from a private directory the case
+# names, since a test's `/` is shared (src/key.rs `top`). No recipe
+# enables it, and nothing does by default.
+[features]
+test-key-root = []
+
 # Its own tests and lints and nothing else of the gate while no recipe names
 # it (DESIGN.md §17; the pinned edges live in builder/src/affected.rs). The
 # control socket's tests bind under owner-checked fixtures, as td-ui's do.
 [package.metadata.td-gate]
 clippy-all-targets = true
 trusted-test-root = true
-# The window is a live Wayland client; its one native case launches it
-# under the real headless compositor (tests/control_process.rs). This
+# The window is a live Wayland client; its native cases launch it under
+# the real headless compositor (tests/control_process.rs). This
 # opt-in builds that binary for the gate and adds it as a test-only edge,
 # which builder/src/affected.rs pins beside td-news and td-ui.
 native-compositor-tests = true
+# Those cases build td-agent again with the feature, in a target of their
+# own, and run as `native_compositor::fixture::`.
+native-compositor-fixture-feature = "test-key-root"
 
 # The library is the program's modules, so the process tests can drive
 # them. It has no doc tests: the shared json module's example names the

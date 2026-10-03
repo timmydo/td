@@ -22,8 +22,9 @@ the models list, cost limits, credit and titles; td-net's streamed
 fetch; streamed replies over it, drawn as they arrive and interrupted
 by `Escape`; and the conversation tools, the first a model is given:
 the todo list, `history_search` and `history_read`, `conversations`,
-`send_message` and `report`, with the wake budget and pausing. Where
-building them
+`send_message` and `report`, with the wake budget and pausing. After
+them came the window's File menu and the dialog that stores the
+OpenRouter key from it (§4, §6). Where building them
 settled a point the design left open, the section says so under "As
 built". No recipe names td-agent yet. The decisions below that were the
 user's to make were made on 2026-10-01 and 2026-10-02:
@@ -333,6 +334,18 @@ for it is durable first. A process woken for a message is let go, as
 any background one is, when its turn ends, or at once when the message
 started none; one told to resume is kept until it logs the resumption,
 which comes after the start of any turn the resumption begins.
+
+**As built (the File menu).** A `setup` may come again, and replaces the
+first: a conversation process takes it between turns, as it takes any
+frame that comes while a turn runs, so the turn under way finishes with
+the settings it began with. Of the frames queued meanwhile it is taken
+first, so the next turn has it whatever came before it, and a pause
+behind it still goes ahead of the messages before it (§3). The window
+sends one carrying the key the
+human stored from its key dialog (§6) to every conversation process
+that has not failed, and keeps it as the `setup` every process started
+afterwards, restarts included, is sent first. The key still crosses
+nothing but the socketpairs.
 
 ## 3. The orchestrator and conversations
 
@@ -694,6 +707,81 @@ that calls tools carries a `tool calls` excerpt naming each call with
 its arguments, and each result is a `tool NAME` block, an excerpt of
 the result whose copy action copies the whole, marked `error` when it is
 one. A pause, a resumption and a cleared list are `td-agent` notices.
+
+**As built (the File menu).** A menu bar, td-ui's `chrome::Bar`, takes
+the window's top row, and the split lies under it. Its one header,
+`File`, opens td-ui's shared menu controller (td-ui/DESIGN.md, "Shared
+menu controller") in adaptive fit, as td-mail's Folder menu does. `F10`
+opens it, as it opens td-editor's menus, and so does a press on the
+header. While it is open the window routes its keys and the pointer to
+it, td-editor's set: `Up` and `Down` move, `Return` or `Space` chooses,
+`Escape` or `F10` closes it, every other chord is consumed, as is a
+hover, a press outside closes it and goes no further, and a focus loss
+or a resize closes it. It is painted after the window's frame. Its items are:
+
+- `New conversation`, shown with `C-n`, which does what `C-n` does;
+- `Set OpenRouter key…`, which opens the key dialog below; it has no
+  chord;
+- `Quit`, which closes the window as the compositor's close does; it has
+  no chord.
+
+A shortcut the menu shows is a chord the window binds, which a test
+holds. Pausing and the todo list are the open conversation's, not a
+file's, and stay chords only. The driven actions gain `menu` (`F10`)
+and `set-key`, which has no chord and opens the dialog through the
+item's own path; the driven state gains `menu` (`open` or `closed`),
+`dialog` (`none`, or the part the dialog's keyboard is on: `entry`,
+`cancel`, `save`, or `replace` while the confirmation below asks) and
+`entry`, the masked entry's length, never its text.
+
+The key dialog is modal over the window: while it is open it has every
+key and the pointer, and no widget under it shows focus. It is composed
+from td-ui's widgets as td-pass composes its PIN prompt: a bordered
+chrome panel, centred and at most 72 cells wide, holding a title, what
+it does and where the key is stored (§6), wrapped to at most six rows,
+an `entry_model` in its masked mode painted by `chrome::TextEntry`,
+three rows for a refusal or a warning, wrapped, and `chrome::Buttons`
+Cancel and Save.
+`Tab` and `S-Tab` move between the entry, Cancel and Save; `Return`
+acts on what has the keyboard, the entry's being Save; `Space` presses
+a focused button; `Escape` cancels. `C-v` and `S-Insert` ask the
+clipboard for its text, which goes to the entry trimmed of the
+whitespace around it, a trailing newline included. That paste is the
+dialog's even when it comes after the dialog closed, and is then
+dropped with a notice, never given to the composer, until the
+window's clipboard says it gave it up (the control seam's inputs never
+release it); any other paste
+that comes while the dialog is open is dropped too. `C-c`,
+`C-x`, `C-Insert` and `S-Delete` are refused by the masked entry, which
+says so, and the clipboard is never asked to take anything. A press
+and a release on one button choose it; a press on the entry puts the
+caret there and a drag selects; a press elsewhere is consumed. The
+row under the entry says why the text is not a key as it is typed or
+pasted, and why Save refused it (§6). When a key is stored already,
+td-ui's confirmation dialog asks `A key is already stored; replace
+it?`, Cancel first; it is placed centred, or else at the window's top
+or foot, wherever its Replace is not under the press that saved, as
+td-ui's confirmation contract asks. Cancel keeps the stored key and the
+dialog's text. The dialog closes when it is cancelled or the key is
+stored, and its entry is cleared first, its bytes zeroed; a write the
+window refuses keeps it open with why. A window too small for it
+refuses to open it, and one resized too small closes it, cleared, each
+with a notice.
+
+The masking is td-ui's display option and no trust boundary
+(td-ui/DESIGN.md, "Invariants"), and the dialog is not on the
+compositor's secure-attention path. It collects no secret that
+authenticates the human (principle 7's PINs and passphrases): the key
+is a bearer credential the human copies from their provider, the bytes
+the key file holds, which any process of theirs can read on the
+host-run path the dialog serves. Masking keeps it off the screen and
+out of what the window shows the driven seam; it does not stop another
+client drawing a look-alike, which is why the dialog is the host-run
+path's alone and the key on td is the portal credential (§6).
+
+Without a key the status row says `no key: File → Set OpenRouter key…
+(F10)` after the state, until one is stored, when the notice says where
+it was stored and that every conversation uses it from now on.
 
 ## 5. Model client
 
@@ -1181,6 +1269,57 @@ interrupted it and its effect is unknown, and is reported as
 interrupted; one never started is answered as not run. Neither runs
 again. A message logged without its turn's start, and not held, is
 given one, as a user message is.
+
+**As built (the File menu).** The key file can also be written, by the
+window process, from the key dialog of §4. Nothing else writes it.
+
+- **What is taken.** The entry holds at most 256 bytes. The text is a
+  key when it is one line of printable ASCII, with no spaces, at most
+  256 bytes and not empty; anything else is refused with why, naming
+  the fault and never the text. One that does not start `sk-or-` is
+  stored with a warning, since `base_url` may name another provider.
+- **The write** walks the path as the read does: every directory from
+  `/` down to `$XDG_CONFIG_HOME` is checked, by descriptor, owned by the
+  caller or root and writable by neither group nor others, before
+  anything is made, and a missing `$XDG_CONFIG_HOME` is refused, not
+  made. `td-agent` is made mode 0700 (exactly, whatever the umask,
+  set by its name beneath the checked parent, which needs no read
+  access a umask may have taken) when it is missing, and
+  `$XDG_CONFIG_HOME` synced; then the walk is taken
+  again to `td-agent`. A key path that is there and not a regular file,
+  a symbolic link included, is refused, saying to remove it; a regular
+  one is replaced only when the confirmation of §4 said so, and one
+  that comes after that check is kept: without the confirmation the
+  temporary file below is hard-linked as `openrouter.key`, which fails
+  if one is there, rather than renamed over it. The key and
+  one newline are written to `openrouter.key.tmp` beside it, made new
+  without following a link (`create_new`, `O_NOFOLLOW`), set to exactly
+  0600 by its descriptor, checked by that descriptor to be a regular
+  file of the caller's with one link, and synced; it is renamed over
+  `openrouter.key`, or linked as it and removed, and the directory
+  synced. The temporary file's name is fixed: one that is there, a link
+  or a file a save that did not finish left, is refused by name and
+  left alone, and one a failed write made is removed. A save cut short
+  between its write and its rename, by a crash or a kill, leaves the
+  key in that temporary file, mode 0600 in the 0700 directory, until
+  the human removes it, which the next save asks for. Last, the file is
+  read back through the read's own checks, which it must pass, holding
+  the key written. A refusal after the key file was replaced says that
+  it was; the window does not then hand the key on.
+- **After the write** the window hands the key to every conversation
+  process in a fresh `setup` and keeps it for every one started later
+  (§2), and asks the key's credit with it. Every refusal says what is
+  wrong, naming the path at fault where there is one, and goes to
+  standard error and to the dialog; the key goes to neither, nor to a
+  notice, the driven state, the clipboard, an argument, the environment
+  or any file but `openrouter.key` (and the temporary file a save cut
+  short leaves).
+- **On td** the key is the portal credential (above), and the file is
+  not read. td-agent runs only as `./agent` on a host until the
+  packaging increment, so there is no jailed run for the window to tell
+  apart today and the item is always shown; the packaging increment
+  hides it in the jailed run, or has it say that the key is set with
+  `td-secret set agent/openrouter`.
 
 ## 7. Workspaces
 
@@ -2627,10 +2766,73 @@ woken and answers; and an interrupt that comes while a call waits on
 the window, which lets that call finish, answers the next as not run
 and offers `C-r`, whose request carries both results.
 
-The live check is by hand. Write the key as one line to
-`$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode 0600, and run `./agent`
-from a checkout. A message to the orchestrator gets a reply, with its
-usage and cost on it. Asked to plan three steps, a model writes a todo
+**As built (the File menu).** `src/menu.rs` covers each item's action
+in order, its shortcuts being chords the window binds, `F10` and
+`Escape` closing it, other chords consumed, and a press on the header
+and on an item. `src/key.rs` covers the dialog's check and the paste's
+trimming; the write making a 0700 directory and a 0600 file holding
+the key and a newline, read back, leaving no temporary file and the
+key in no other file, and using an existing directory as it is; a
+stored key replaced only when asked, a refused one included; refusals
+by name of a group-writable ancestor (with nothing made under it), a
+missing configuration home, a link or a file where the temporary file
+goes (left as it was, the link not followed), a key path that is a
+directory or a link, and a text that is no key; the read-back's check
+of the bytes and of the read's rules; and that the fixture feature
+below moves only the walk's top. `src/keydialog.rs` covers the entry
+masked in what is drawn and in `Debug`, copy and cut refused without
+the clipboard being asked, a paste trimmed, two lines and an overlong
+paste refused whole, the message as typed and on Save, the warning,
+`Tab`, `Space`, `Return` and `Escape`, the entry cleared on cancel and
+close, buttons chosen by a press and a release on one, the replace
+confirmation (Cancel first, Replace chosen, and placed away from the
+press), the explanation's wrapping, a long refusal shown wrapped, and
+a window too small. The window's
+units cover the bar over the split, the menu's keys and pointer with
+the window's chords consumed while it is open, the status row's `no
+key` until a key is stored, the dialog's modality, a refusal kept in
+it, the replace confirmation through the window, a paste reaching the
+dialog that asked, dropped when it comes after the dialog closed or
+was not asked for, the composer's once the clipboard gave the
+dialog's up, and the composer's otherwise, the chord the menu
+shows doing what its item does, and no key path; each
+holds that the key is in no text drawn, status line, notice or `Debug`.
+`src/control.rs` drives the menu and the dialog through the seam,
+holding that `state` and `text` never carry the key; and
+`src/conversation.rs` holds that a later `setup` gives a conversation
+its key between turns and that its log never holds it, and that a
+queued `setup` is taken first while a pause still goes ahead of the
+messages before it. A umask that takes the owner's read access is not
+covered: std cannot set one without a foreign call, and it is the
+whole process's, which would race the other tests.
+
+`tests/control_process.rs` gains two native cases. In the default build,
+`F10` through the seat opens the File menu, `Down` and `Return` open the
+dialog, a key typed on the seat reaches the masked entry, which the
+window shows as bullets and the control socket's state as a length,
+`Escape` closes it emptied, and no file holds the key. A test's `/` is
+shared (the trusted-root fixture's is mode 1777, and the test's tree
+lies under `/tmp`), which the key file's walk refuses, so the case that
+saves runs in a build of its own: the gate metadata names
+`native-compositor-fixture-feature = "test-key-root"`, whose one effect
+is that the walk checks from the directory `TD_AGENT_TEST_KEY_ROOT`
+names, which the case makes canonical, rather than `/`; nothing ships
+with it. That case,
+`native_compositor::fixture::`, sends a message without a key and sees
+its turn stop for want of one; stores a key typed into the dialog,
+finding `openrouter.key` mode 0600 with one link, holding the key and
+a newline, in a directory made 0700, with no temporary file, and the
+status row no longer asking; sends again and sees the running
+orchestrator's turn go past the key, to the price check, which stops
+it with no models list fetched; and finds the key in no other file
+under the test's directory and not on standard error. The fixture
+build costs every td-agent native run a second build of the crate, in a
+target directory of its own, its library tests and its strict Clippy.
+
+The live check is by hand. Run `./agent` from a checkout, with the key
+written as one line to `$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode
+0600, or stored from File → Set OpenRouter key…. A message to the
+orchestrator gets a reply, with its usage and cost on it. Asked to plan three steps, a model writes a todo
 list, drawn above the composer; asked to tell a conversation something,
 the orchestrator sends it a message, which that conversation answers in
 a turn of its own. A new conversation's first reply is followed by a

@@ -396,11 +396,10 @@ impl Session {
     }
 
     fn next(&mut self) -> Result<Option<Down>, String> {
-        // What came meanwhile joins the queue first, so that a pause sent
-        // after messages from other conversations, while a turn ran, is
-        // taken before them and holds them (DESIGN.md §3). It goes ahead
-        // of messages only: the human's own message or retry before it
-        // keeps its place.
+        // What came meanwhile joins the queue first, so that `take` can
+        // choose: a setup first, then a pause sent after messages from
+        // other conversations, while a turn ran, before them, holding
+        // them (DESIGN.md §2, §3).
         while self.ended.is_none() {
             match self.inbox.try_recv() {
                 Ok(Inbound::Down(down)) => self.queue.push_back(down),
@@ -410,13 +409,7 @@ impl Session {
                 Err(_) => break,
             }
         }
-        let pause = self
-            .queue
-            .iter()
-            .position(|down| !matches!(down, Down::Message { .. }))
-            .filter(|at| matches!(self.queue.get(*at), Some(Down::Pause { .. })))
-            .unwrap_or(0);
-        if let Some(down) = self.queue.remove(pause) {
+        if let Some(down) = take(&mut self.queue) {
             return Ok(Some(down));
         }
         match self.ended.take() {
@@ -1784,6 +1777,26 @@ fn pieces(text: &str, most: usize) -> Vec<&str> {
     out
 }
 
+/// The frame the serve loop takes next of those that came while a turn
+/// ran. Settings come first: a key the human stored applies to the next
+/// turn whatever was queued before it (DESIGN.md §2). Then a pause goes
+/// ahead of the messages from other conversations before it, and holds
+/// them (§3), though not of the human's own message or retry; else the
+/// first in order.
+fn take(queue: &mut VecDeque<Down>) -> Option<Down> {
+    let at = queue
+        .iter()
+        .position(|down| matches!(down, Down::Setup { .. }))
+        .or_else(|| {
+            queue
+                .iter()
+                .position(|down| !matches!(down, Down::Message { .. }))
+                .filter(|at| matches!(queue.get(*at), Some(Down::Pause { .. })))
+        })
+        .unwrap_or(0);
+    queue.remove(at)
+}
+
 /// A streamed request's reply that came as one body: as a counted reply
 /// is read.
 fn whole(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Streamed {
@@ -1907,6 +1920,74 @@ mod tests {
         served.join().unwrap().unwrap();
         let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
         assert_eq!(conversation.events().len(), 3);
+    }
+
+    /// A later `Setup`, the key the human stored from the window's dialog,
+    /// replaces the first between turns: the next turn has the key.
+    #[test]
+    fn a_later_setup_hands_the_conversation_a_key() {
+        let scratch = Scratch::new("rekey");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let (mut window, theirs) = UnixStream::pair().unwrap();
+        let served = {
+            let (state, id) = (state.clone(), id.clone());
+            std::thread::spawn(move || serve(theirs, &state, &id, Some(Role::Conversation)))
+        };
+        assert!(matches!(next(&mut window), Up::Hello { .. }));
+        let outcome = |window: &mut UnixStream| loop {
+            if let Some(outcome) = finished(&next(window)) {
+                return outcome.to_string();
+            }
+        };
+        keyless(&mut window);
+        say(&mut window, D1, "one");
+        assert_eq!(outcome(&mut window), "no API key: write one");
+        let down = Down::Setup {
+            key: Ok(Secret::new("sk-or-v1-stored".into())),
+            client: Client::default(),
+        };
+        frame::write(&mut window, &down.encode()).unwrap();
+        say(&mut window, D2, "two");
+        let second = outcome(&mut window);
+        assert!(!second.starts_with("no API key"), "{second}");
+        assert!(!second.contains("sk-or-v1-stored"), "{second}");
+        drop(window);
+        served.join().unwrap().unwrap();
+        let log = std::fs::read(state.conversation(&id).join("log")).unwrap();
+        assert!(!String::from_utf8_lossy(&log).contains("sk-or-v1-stored"));
+    }
+
+    /// Queued settings go first, and a pause still goes ahead of the
+    /// messages queued before it with a setup between them.
+    #[test]
+    fn queued_settings_go_first_and_a_pause_still_holds_messages() {
+        let message = Down::Message {
+            delivery: D1.into(),
+            from: Id::random().unwrap(),
+            role: Role::Orchestrator,
+            text: "hi".into(),
+            status: None,
+        };
+        let setup = Down::Setup {
+            key: Ok(Secret::new("sk-or-v1-stored".into())),
+            client: Client::default(),
+        };
+        let pause = Down::Pause { paused: true };
+        let mut queue: VecDeque<Down> = [message.clone(), setup.clone(), pause.clone()].into();
+        assert_eq!(take(&mut queue), Some(setup));
+        assert_eq!(take(&mut queue), Some(pause));
+        assert_eq!(take(&mut queue), Some(message.clone()));
+        assert_eq!(take(&mut queue), None);
+        // The human's own message keeps its place ahead of a pause.
+        let user = Down::User {
+            delivery: D2.into(),
+            text: "mine".into(),
+        };
+        let mut queue: VecDeque<Down> =
+            [message.clone(), user.clone(), Down::Pause { paused: true }].into();
+        assert_eq!(take(&mut queue), Some(message));
+        assert_eq!(take(&mut queue), Some(user));
     }
 
     #[test]

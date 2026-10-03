@@ -20,13 +20,15 @@ fetch service: run it as ./agent from a td checkout, which serves that.\n\
 Keys: C-Return sends the composer (Return is a newline); C-r asks a\n\
 failed turn again; C-n starts a conversation; C-PageUp and C-PageDown\n\
 open the one above or below; F6 and S-F6 move the focus between the\n\
-list, the transcript and the composer. The control socket speaks td-ui's\n\
+list, the transcript and the composer; F10 opens the File menu, whose\n\
+Set OpenRouter key... stores the key. The control socket speaks td-ui's\n\
 driven protocol.\n\
 \n\
 State: $XDG_STATE_HOME/td-agent. Configuration:\n\
 $XDG_CONFIG_HOME/td-agent/config (TOML; unknown keys are refused). The\n\
 API key: one line in $XDG_CONFIG_HOME/td-agent/openrouter.key, a file\n\
-of your own, mode 0600, in directories only you and root can write.\n";
+of your own, mode 0600, in directories only you and root can write,\n\
+which File > Set OpenRouter key... writes.\n";
 
 /// `td-agent conversation ID --state-dir DIR [--create ROLE]`: the
 /// window starts these; a person does not.
@@ -76,8 +78,9 @@ fn window(args: &[String]) -> Result<(), String> {
     }
     let config = td_agent::config::load(config_path.as_deref())?;
     // The key file beside the configuration; there is no other form.
-    let key = match config_path.as_deref().and_then(td_agent::key::path) {
-        Some(path) => td_agent::key::read(&path).map_err(|problem| problem.to_string()),
+    let key_path = config_path.as_deref().and_then(td_agent::key::path);
+    let key = match key_path.as_deref() {
+        Some(path) => td_agent::key::read(path).map_err(|problem| problem.to_string()),
         None => Err(
             "no API key: neither XDG_CONFIG_HOME nor HOME is an absolute path to find it under"
                 .to_string(),
@@ -85,7 +88,7 @@ fn window(args: &[String]) -> Result<(), String> {
     };
     let state = StateDir::from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))?;
     let program = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
-    td_agent::window::run(config, key, state, program, control)
+    td_agent::window::run(config, key, key_path, state, program, control)
 }
 
 fn main() -> ExitCode {
