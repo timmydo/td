@@ -8,6 +8,8 @@ use crate::{
     nfc::{self, HeaderBudget},
     ports::Tick,
 };
+mod message_ids;
+use message_ids::IdsMode;
 mod date;
 use date::DateMode;
 mod projection;
@@ -20,6 +22,7 @@ pub enum Error {
     Selection(header_select::Error),
     Raw(header_raw::Error),
     Text(nfc::Error),
+    MessageIds(crate::header_message_ids::Error),
     Date(crate::header_date::Error),
     DateProjection(crate::header_date::project::Error),
     Json(json_string::Error),
@@ -34,6 +37,7 @@ impl std::fmt::Display for Error {
             Self::UnsupportedForm => f.write_str("unsupported header value form"),
             Self::Selection(error) => write!(f, "header value selection: {error}"),
             Self::Raw(error) => write!(f, "header value Raw: {error}"),
+            Self::MessageIds(error) => write!(f, "header value MessageIds: {error}"),
             Self::Date(error) => write!(f, "header value Date: {error}"),
             Self::DateProjection(error) => write!(f, "header value Date projection: {error}"),
             Self::Text(error) => write!(f, "header value Text: {error}"),
@@ -158,6 +162,27 @@ impl<'a, 'w> Date<'a, 'w> {
     /// Final only after Complete; an unqualified :60 produced a null value.
     pub const fn has_unverified_leap(&self) -> bool {
         self.0.unverified_leap
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.0.check_deadline(now)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.0.poll(now, output)
+    }
+}
+/// Provisional arrays of MessageIds, retaining whole-field validation.
+pub struct MessageIds<'a, 'w>(Core<'a, 'w, IdsMode>);
+impl<'a, 'w> MessageIds<'a, 'w> {
+    pub fn new(
+        input: Input<'a>,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        Core::new(input, work, budget, crate::header_message_ids::Mode::Strict).map(Self)
+    }
+    /// Final only after property Complete.
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.0.is_encoding_problem()
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         self.0.check_deadline(now)
@@ -318,10 +343,10 @@ impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
         }
         match self.phase {
             Phase::Start => {
-                let Owner::Budgets(work, budget, _) = &mut self.owner else {
+                let Owner::Budgets(work, budget, workspace) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
-                P::validate(self.name, now, work, budget)?;
+                P::validate(self.name, now, work, budget, workspace)?;
                 if self.all {
                     self.stage(now, b"[", Phase::Select)?;
                 } else {
@@ -751,3 +776,6 @@ mod text_tests;
 
 #[cfg(test)]
 mod date_tests;
+
+#[cfg(test)]
+mod message_ids_tests;

@@ -1572,6 +1572,13 @@ Initial independently landable increments:
   budgets, provisional retirement, exact field credit and allocation-free
   long conversion. Complete MessageIds property JSON remains open.
 
+- **M06ba — provisional MessageIds property values:** compose charged field
+  mode selection, whole-field conversion and nested JSON arrays with original
+  budgets. Permit only checked malformed validation to become null; preserve
+  identifier identity, escaping and diagnostic scope. Cover exact composed
+  charges, handoff guards, late refusal and allocation-free short drains.
+  Other structured forms and unpublished response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

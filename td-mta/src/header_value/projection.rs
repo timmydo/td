@@ -17,6 +17,7 @@ pub(super) trait Projection<'a, 'w> {
         now: Tick,
         work: &mut Meter,
         budget: &mut HeaderBudget,
+        workspace: &mut Self::Workspace,
     ) -> Result<(), Error>;
     fn start(
         bytes: &'a [u8],
@@ -44,7 +45,13 @@ impl<'a, 'w> Projection<'a, 'w> for RawMode {
     type Source = header_raw::Budgeted<'a, 'w>;
     type Workspace = ();
     const FORM: Form = Form::Raw;
-    fn validate(_: &str, _: Tick, _: &mut Meter, _: &mut HeaderBudget) -> Result<(), Error> {
+    fn validate(
+        _: &str,
+        _: Tick,
+        _: &mut Meter,
+        _: &mut HeaderBudget,
+        _: &mut (),
+    ) -> Result<(), Error> {
         Ok(())
     }
     fn start(
@@ -88,6 +95,7 @@ impl<'a, 'w> Projection<'a, 'w> for TextMode {
         now: Tick,
         work: &mut Meter,
         budget: &mut HeaderBudget,
+        _: &mut Self::Workspace,
     ) -> Result<(), Error> {
         let field = match name.len() {
             7 => Some("Subject"),

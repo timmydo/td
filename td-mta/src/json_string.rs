@@ -9,6 +9,7 @@ pub enum Error {
     Source(nfc::Error),
     Raw(header_raw::Error),
     Address(header_address_text::Error),
+    MessageIds(crate::header_message_ids::Error),
     Work(Stop),
     InvalidState,
 }
@@ -17,6 +18,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Source(error) => write!(f, "JSON string source: {error}"),
             Self::Raw(error) => write!(f, "JSON Raw source: {error}"),
+            Self::MessageIds(error) => write!(f, "JSON MessageIds source: {error}"),
             Self::Address(error) => write!(f, "JSON address source: {error}"),
             Self::Work(error) => write!(f, "JSON string output: {error}"),
             Self::InvalidState => f.write_str("invalid JSON string state"),

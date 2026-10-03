@@ -11,7 +11,13 @@ impl<'a, 'w> Projection<'a, 'w> for DateMode {
     type Source = Source<'a, 'w>;
     type Workspace = ();
     const FORM: Form = Form::Date;
-    fn validate(_: &str, _: Tick, _: &mut Meter, _: &mut HeaderBudget) -> Result<(), Error> {
+    fn validate(
+        _: &str,
+        _: Tick,
+        _: &mut Meter,
+        _: &mut HeaderBudget,
+        _: &mut (),
+    ) -> Result<(), Error> {
         Ok(())
     }
     fn start(

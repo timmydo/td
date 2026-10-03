@@ -3100,6 +3100,111 @@ fn header_date_projection() {
     assert_eq!(before, after, "header date projection allocated");
 }
 
+fn message_id_header_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property::{self, Context},
+        header_select::SourceEnd,
+        header_value::{Input, MessageIds, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = "🐈".repeat(4096);
+    let source = format!(
+        "References:old <{long}@b> tail\nReferences:<a@b> (bad\nReferences:<\u{fdd0}@b>\n\n"
+    );
+    let expected = format!("[[\"{long}@b\"],null,[\"�@b\"]]");
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut property_cursor =
+        header_property::Cursor::new("header:References:asMessageIds:all", Context::Email);
+    let property = loop {
+        if let header_property::Status::Complete(value) =
+            property_cursor.poll(Tick(1), &mut work).unwrap()
+        {
+            break value.unwrap();
+        }
+    };
+    let mut budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    let mut cursor = MessageIds::new(
+        Input {
+            bytes: black_box(source.as_bytes()),
+            base: 0,
+            header_limit: source.len() as u64,
+            property,
+            source_end: SourceEnd::Eof,
+        },
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut offset = 0;
+    let mut complete = false;
+    for _ in 0..1_000_000 {
+        let mut output = [0; 1];
+        let progress = cursor.poll(Tick(1), &mut output).unwrap();
+        if progress.written == 1 {
+            assert_eq!(output.first(), expected.as_bytes().get(offset));
+        }
+        offset += progress.written;
+        if matches!(progress.status, Status::Complete(_)) {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(offset, expected.len());
+    assert!(cursor.is_encoding_problem());
+    cursor.check_deadline(Tick(1)).unwrap();
+    let source = b"References:<a@b>\nReferences:<c@d>\n\n";
+    let mut cursor = MessageIds::new(
+        Input {
+            bytes: source,
+            base: 0,
+            header_limit: b"References:<a@b>\n".len() as u64 + 1,
+            property,
+            source_end: SourceEnd::Eof,
+        },
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    let mut offset = 0;
+    let mut refused = false;
+    let expected = b"[[\"a@b\"]";
+    for _ in 0..1000 {
+        let mut output = [0; 1];
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                if progress.written == 1 {
+                    assert_eq!(output.first(), expected.get(offset));
+                }
+                offset += progress.written;
+                assert!(!matches!(progress.status, Status::Complete(_)));
+            }
+            Err(error) => {
+                assert!(matches!(error, td_mta::header_value::Error::Selection(_)));
+                assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(offset, expected.len());
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MessageIds property assembly allocated");
+}
+
 fn budgeted_message_id_text() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -4821,6 +4926,7 @@ fn main() {
         header_date_projection();
         budgeted_date_projection();
         header_dates();
+        message_id_header_values();
         budgeted_message_id_text();
         budgeted_message_ids();
         budgeted_header_dates();
@@ -4950,6 +5056,7 @@ fn main() {
     header_date_projection();
     budgeted_date_projection();
     header_dates();
+    message_id_header_values();
     budgeted_message_id_text();
     budgeted_message_ids();
     budgeted_header_dates();

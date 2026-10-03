@@ -34,6 +34,43 @@ impl<'a, 'w> Budgeted<'a, 'w> {
             failure: None,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> (Charge, u64) {
+        (self.work.remaining(), self.budget.steps_remaining())
+    }
+    pub(crate) fn finish(self) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !matches!(self.cursor.phase, Phase::Complete) {
+            return Err(Error::InvalidState);
+        }
+        Ok((self.work, self.budget))
+    }
+    // Only whole-field syntax failure can become a null value.
+    pub(crate) fn finish_malformed(self) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        if self.failure != Some(Error::Malformed) || !matches!(self.cursor.phase, Phase::Validate) {
+            return Err(Error::InvalidState);
+        }
+        Ok((self.work, self.budget))
+    }
+    pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        self.check_deadline(now)?;
+        let result = self
+            .work
+            .charge(
+                now,
+                Charge {
+                    output_bytes: bytes,
+                    ..Charge::default()
+                },
+            )
+            .map_err(Error::Work);
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
     /// Final only after Complete.
     pub fn is_encoding_problem(&self) -> bool {
         self.cursor.is_encoding_problem()

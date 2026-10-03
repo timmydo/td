@@ -1078,8 +1078,19 @@ references; no NFC scratch or owned string/list is needed. Its transient
 adapter holds three references. Private unfolding turns use 127 transitions;
 public plain turns retain 256. A conversion poll stays within 160 source or
 intermediate visits, 255 aggregate steps, sixteen job records and four output
-bytes. Probe intervals cover long text, folds, repairs and refusals. Complete
-property JSON and combined worker/native/RSS qualification remain open.
+bytes. Probe intervals cover long text, folds, repairs and refusals. M06ba
+adds property JSON below; combined worker/native/RSS qualification stays open.
+
+The MessageIds property coordinator (M06ba) fits 1024 bytes inside the
+existing 16 KiB parser reservation, including inline conversion, shared
+selection/JSON framing and literal buffers. It replaces standalone conversion
+state and uses no NFC scratch or arena. Mode selection reads at most eleven
+compared bytes in its own charged turn. Overall turn bounds remain 255
+source/intermediate visits, 256 aggregate steps, sixteen job records and six
+external output bytes. Combined conversion/JSON output charges are at most
+eight bytes per poll. Probe intervals cover long arrays, malformed fields,
+repaired scalars, one-byte drains and late refusal. Combined worker/native/RSS
+qualification remains open.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also

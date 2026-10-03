@@ -2713,8 +2713,68 @@ cover folds, controls, decomposed text, noncharacters and long input; exhaust
 partial aggregate budgets through validation and replay; and pin output
 refusal, retained costs, field-credit retirement and final deadlines. Probe
 intervals exercise long Unicode values, folded tokens, noncharacter repair,
-malformed tails and terminal refusal in both registered modes. Complete
-MessageIds property JSON and unpublished response retention remain open.
+malformed tails and terminal refusal in both registered modes. Section 1.59
+adds MessageIds property JSON; unpublished response retention remains open.
+
+### 1.59 Complete provisional MessageIds header values
+
+M06ba adds `header_value::MessageIds` over the resident Input and original
+job/email budgets. Each selected field becomes an array of identifier strings
+or null; `:all` adds an outer array in wire order. Missing last/all values are
+null/[] respectively. Mode classification is part of the first active turn:
+only case-insensitive References and In-Reply-To permit obsolete phrases.
+Length selects at most one candidate; its at most eleven compared bytes and
+one aggregate step are charged before comparison. Other names use Strict.
+The shared projection validation hook retains that mode in its workspace
+across selected values; no grammar classification occurs during construction.
+
+The converter validates the whole field before emitting its first Begin, so
+the value cannot expose an array or quoted prefix from malformed syntax. A
+malformed validation outcome consumes the failed converter through a private
+checked handoff and stages null using the original budgets. This handoff
+accepts only Malformed during Validate; partial state, successful state,
+nesting or resource refusal cannot use it. The ordinary consuming handoff
+requires successful Complete. Both discard field-local prepaid credit.
+Nesting and resource errors remain errors and retire all provisional output.
+
+Each Begin opens one existing JSON string frame. Scalar events stream through
+that frame, and End closes it; quotes, backslashes and controls are escaped,
+while decomposed identifiers retain their identity and noncharacters use the
+converter's replacement diagnostic. Empty obsolete lists stage []. Between
+items, array commas and closing brackets use four inline staging bytes. A
+frame remains bound to one converter and one identifier until it completes;
+its parent cannot advance to the next item during staged-byte drainage.
+
+Conversion keeps its existing intermediate/scalar output charges. JSON
+strings and array/null literals charge every additional external byte once
+before staging; drains copy at most six prepaid bytes without recharging.
+The composed job/email totals match independent selection and conversion,
+plus name classification and exact JSON output. Source and literal work can
+report MessageIds errors; framed source/output errors retain Json(MessageIds).
+After malformed handoff, null staging uses Work/InterpretationLimit directly.
+Callers classify the underlying cause rather than one phase's wrapper.
+
+Empty-output polls perform only live admission; cached completion is inert.
+Final explicit admission can still retire the whole property. The encoding
+problem flag is final at property Complete and describes selected fields.
+The composer grants no method or HTTP publication authority: previously
+emitted values and outer-array prefixes remain an unpublished response tail.
+
+The coordinator fits 1024 bytes in the existing 16 KiB parser reservation,
+including its converter, budget references, selector, shared JSON frame and
+literal buffers. It replaces the standalone converter on this path and uses
+no NFC scratch, retained identifier string/list or arena. Turn ceilings remain
+255 source/intermediate visits, 256 aggregate steps, sixteen job records and
+six external output bytes. A scalar turn also charges its converted UTF-8
+bytes, for at most eight combined conversion/JSON output bytes per poll.
+Combined worker/native/RSS qualification is open.
+
+Tests cover widths one through eight, last/all/absence, authorized modes,
+null versus empty arrays, folds/escaping/identity, diagnostic scope, exact
+composed charges, output/aggregate cutoffs, late selection refusal and checked
+handoffs. Allocation intervals cover long values, malformed fields, repairs,
+one-byte drains and late refusal in both registered modes. Other structured
+forms and unpublished response-spool retention remain follow-on work.
 
 ## 2. Read views and change history
 
