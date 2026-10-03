@@ -1312,7 +1312,26 @@ window process, from the key dialog of §4. Nothing else writes it.
   set by its name beneath the checked parent, which needs no read
   access a umask may have taken) when it is missing, and
   `$XDG_CONFIG_HOME` synced; then the walk is taken
-  again to `td-agent`. A key path that is there and not a regular file,
+  again to `td-agent`. A `.gitignore` naming `/openrouter.key` and
+  `/openrouter.key.tmp` is made there next, unless one is, before any
+  key is: a configuration home is often a git repository of dotfiles,
+  and a key committed and pushed there is published. It names the two
+  files rather than `*`, so the `config` beside them can still be
+  committed. One already there, a link included, is the human's and left
+  as it is, whatever it says; so a new one is written whole under
+  `.gitignore.td-agent.tmp`, made new without following a link, set to
+  exactly 0644 by its descriptor so git can read it whatever the umask,
+  synced,
+  and hard-linked in, which fails rather than replace one that came
+  meanwhile, and a crash never leaves part of one to be taken for the
+  human's. That temporary name holds no secret, so one a crash left is
+  removed. A key placed by hand gets none until a save from the dialog.
+  It keeps an untracked key out of `git add`; it does not untrack one
+  already committed (`git rm --cached` does, and a key once pushed is
+  to be revoked), nor stop `git add -f`, nor bind a dotfiles tool that
+  copies files by its own rules. The directory is synced once it is
+  made, since a save may stop to ask before its own sync.
+  A key path that is there and not a regular file,
   a symbolic link included, is refused, saying to remove it; a regular
   one is replaced only when the confirmation of §4 said so, and one
   that comes after that check is kept: without the confirmation the

@@ -24,9 +24,10 @@
 //! The window also writes the file, from the File menu's key dialog
 //! (`write`): the same walk checks every directory down to the
 //! configuration home before anything is made, `td-agent` is made mode
-//! 0700 when it is missing, and the key goes into a temporary file made
-//! new, without following a link, mode 0600, which is synced and renamed
-//! over the key file; the directory is synced, and the file is read back
+//! 0700 when it is missing, a `.gitignore` naming the key file is made
+//! there unless one is, and the key goes into a temporary file made new,
+//! without following a link, mode 0600, which is synced and renamed over
+//! the key file; the directory is synced, and the file is read back
 //! through `read`'s own checks.
 
 use std::collections::VecDeque;
@@ -60,6 +61,18 @@ pub const FILE: &str = "openrouter.key";
 /// The file a write goes through, beside the key file. Its name is fixed,
 /// so one a write left behind is refused by name rather than piling up.
 pub const TEMPORARY: &str = "openrouter.key.tmp";
+/// The file a write makes beside the key, unless one is there, so that a
+/// configuration home kept in git (a dotfiles repository) leaves the key
+/// out of its commits. It names `FILE`, the one name the window writes.
+const IGNORE: &str = ".gitignore";
+/// The name it is written under before it is linked in.
+const IGNORE_TEMPORARY: &str = ".gitignore.td-agent.tmp";
+
+/// What that file holds: the key file and the temporary one, by name, so
+/// the configuration beside them can still be committed.
+fn ignored() -> String {
+    format!("# td-agent's API key: never commit it.\n/{FILE}\n/{TEMPORARY}\n")
+}
 /// The longest key the dialog takes, in bytes.
 pub const MAX_KEY: usize = 256;
 /// What an OpenRouter key starts with.
@@ -511,6 +524,14 @@ fn write_checked(
         Walk::Missing => refused(format!("{} is gone", directory.display())),
         Walk::Refused(why) => refused(why),
     })?;
+    // Before any key is in the directory, and whether or not one is
+    // replaced.
+    ignore(&reached).map_err(|e| {
+        refused(format!(
+            "making {}, which keeps the key out of git: {e}",
+            directory.join(IGNORE).display()
+        ))
+    })?;
     let target = beneath(&reached.file, name);
     match std::fs::symlink_metadata(&target) {
         Ok(meta) if !meta.file_type().is_file() => {
@@ -577,6 +598,46 @@ fn write_checked(
             ))
         })?;
     verify(path, secret, uid, top)
+}
+
+/// Makes the directory's `.gitignore`. One already there, a link
+/// included, is the human's, whatever it says, and left as it is. It is
+/// written whole under `IGNORE_TEMPORARY`, made new without following a
+/// link, synced, and linked in, which fails rather than replace one that
+/// came meanwhile; so a crash never leaves part of one for a later save
+/// to take for the human's. That name is td-agent's alone and holds no
+/// secret, so one a crash left is removed (unlinked, not followed). The
+/// directory is synced, since a save may stop before its own sync
+/// ("replace it?").
+fn ignore(reached: &Reached) -> io::Result<()> {
+    let path = beneath(&reached.file, OsStr::new(IGNORE));
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return Ok(());
+    }
+    let temporary = beneath(&reached.file, OsStr::new(IGNORE_TEMPORARY));
+    match std::fs::remove_file(&temporary) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let made = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(O_NOFOLLOW | O_NOCTTY)
+        .open(&temporary)
+        .and_then(|mut file| {
+            // Exactly 0644, whatever the umask: git must read it.
+            file.set_permissions(Permissions::from_mode(0o644))?;
+            file.write_all(ignored().as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| match std::fs::hard_link(&temporary, &path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            linked => linked,
+        });
+    let _ = std::fs::remove_file(&temporary);
+    made?;
+    opened(reached).and_then(|dir| dir.sync_all())
 }
 
 /// The new file, checked by its descriptor and filled: exactly 0600, the
@@ -921,6 +982,62 @@ mod tests {
         .unwrap();
         written(&tree, &path, "sk-or-v1-second", true).unwrap();
         assert_eq!(mode(&config.join("td-agent")), 0o755);
+    }
+
+    #[test]
+    fn a_write_leaves_a_gitignore_naming_the_key_and_keeps_one_there() {
+        let tree = Tree::new();
+        let config = tree.dir("config", 0o700);
+        let dir = config.join("td-agent");
+        let ignore = dir.join(IGNORE);
+        written(&tree, &dir.join(FILE), KEY, false).unwrap();
+        let text = std::fs::read_to_string(&ignore).unwrap();
+        assert_eq!(text, ignored());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.contains(&format!("/{FILE}").as_str()), "{text}");
+        assert!(lines.contains(&format!("/{TEMPORARY}").as_str()), "{text}");
+        assert!(!dir.join(IGNORE_TEMPORARY).exists());
+        assert_eq!(mode(&ignore), 0o644);
+        // One a crash left under the temporary name is replaced, whole.
+        std::fs::remove_file(&ignore).unwrap();
+        std::fs::write(dir.join(IGNORE_TEMPORARY), "/openro").unwrap();
+        written(&tree, &dir.join(FILE), KEY, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), ignored());
+        assert_eq!(std::fs::symlink_metadata(&ignore).unwrap().nlink(), 1);
+        assert!(!dir.join(IGNORE_TEMPORARY).exists());
+        // Made beside a key that was there before, whether it is
+        // replaced or not.
+        std::fs::remove_file(&ignore).unwrap();
+        assert_eq!(
+            written(&tree, &dir.join(FILE), KEY, false).unwrap_err(),
+            Unwritten::Exists
+        );
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), ignored());
+        // One there is the human's, kept as it is.
+        std::fs::write(&ignore, "*\n").unwrap();
+        written(&tree, &dir.join(FILE), "sk-or-v1-second", true).unwrap();
+        assert_eq!(std::fs::read(&ignore).unwrap(), b"*\n");
+        // A link there, to a file or to nothing, is neither followed nor
+        // replaced: a dangling one is not made into its target.
+        let elsewhere = tree.key("elsewhere", b"", 0o600);
+        let nowhere = tree.0.join("nowhere");
+        for target in [&elsewhere, &nowhere] {
+            std::fs::remove_file(&ignore).unwrap();
+            symlink(target, &ignore).unwrap();
+            written(&tree, &dir.join(FILE), "sk-or-v1-third", true).unwrap();
+            assert!(std::fs::symlink_metadata(&ignore)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), b"");
+        assert!(!nowhere.exists());
+        // Nothing is made where the walk to `td-agent` refuses.
+        let tree = Tree::new();
+        let dir = tree.dir("config/td-agent", 0o770);
+        let why = unwritten(written(&tree, &dir.join(FILE), KEY, false));
+        assert!(why.contains("is writable by its group"), "{why}");
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
     }
 
     #[test]
