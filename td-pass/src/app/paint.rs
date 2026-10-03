@@ -25,6 +25,32 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
     }
 }
 
+/// A `BORDER` bezel: the four bands of `outer` round `inner`, which the
+/// surface's paper already fills.
+fn bezel(outer: Rect, inner: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+    let bottom = outer.y + i64::from(outer.height);
+    let inner_bottom = inner.y + i64::from(inner.height);
+    let right = outer.x + i64::from(outer.width);
+    let inner_right = inner.x + i64::from(inner.width);
+    let band = |x: i64, y: i64, right: i64, bottom: i64| Rect {
+        x,
+        y,
+        width: u32::try_from(right - x).unwrap_or(0),
+        height: u32::try_from(bottom - y).unwrap_or(0),
+    };
+    for rect in [
+        band(outer.x, outer.y, right, inner.y),
+        band(outer.x, inner_bottom, right, bottom),
+        band(outer.x, inner.y, inner.x, inner_bottom),
+        band(inner_right, inner.y, right, inner_bottom),
+    ] {
+        // A frame narrower than two bezels leaves `inner` past its edge.
+        if let Some(rect) = rect.intersection(outer) {
+            fill(rect, BORDER, damage, sink);
+        }
+    }
+}
+
 /// `texts`, one to each row of `rect` from its top.
 fn lines(
     surface: Surface,
@@ -409,7 +435,7 @@ impl Frame<'_> {
                 });
             notebook.list.emit(list, items, damage, sink);
         }
-        fill(panes.divider, BORDER, damage, sink);
+        bezel(panes.frame, panes.pane, damage, sink);
         if let Some(entry) = panes.title {
             let placeholder = if notebook.open.is_some() { "Title" } else { "" };
             entry.emit(
@@ -420,7 +446,10 @@ impl Frame<'_> {
                 sink,
             );
         }
-        if app.open_tab().is_some() {
+        if panes.pane.width == 0 || panes.pane.height == 0 {
+            // No room inside the bezel: the editor refused the frame and
+            // would paint at its old place, over the bezel.
+        } else if app.open_tab().is_some() {
             if let Ok(scene) = app.pane.scene(&[]) {
                 scene.emit(damage, sink);
             }
@@ -435,7 +464,7 @@ impl Frame<'_> {
             line(
                 surface,
                 Rect {
-                    height: layout::row(surface) as u32,
+                    height: (layout::row(surface) as u32).min(panes.pane.height),
                     ..panes.pane
                 },
                 text,

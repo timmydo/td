@@ -31,9 +31,10 @@ pub const PIN: [&str; 2] = ["OK", "Cancel"];
 pub struct Panes {
     pub search: Option<TextEntry>,
     pub list: Option<List>,
-    /// The line between the panes.
-    pub divider: Rect,
     pub title: Option<TextEntry>,
+    /// The editor pane's outline, a bezel a scaled pixel wide round
+    /// `pane`, as the fields and the list carry theirs.
+    pub frame: Rect,
     pub pane: Rect,
     pub find: Option<TextEntry>,
 }
@@ -77,7 +78,8 @@ fn rect(x: i64, y: i64, width: i64, height: i64) -> Rect {
 
 /// The search field over the title list on the left, a third of the
 /// width; the title over the entry's text on the right, with the find
-/// field under the text while finding.
+/// field under the text while finding. Each is outlined, so the two
+/// sides meet at their outlines with no divider between.
 pub fn panes(surface: Surface, finding: bool) -> Panes {
     let body = body(surface, &NOTEBOOK);
     let s = surface.scale.value() as i64;
@@ -85,24 +87,22 @@ pub fn panes(surface: Surface, finding: bool) -> Panes {
     let width = i64::from(body.width);
     let height = i64::from(body.height);
     let left = (width / 3).max((20 * CELL_WIDTH) as i64 * s).min(width);
-    let right = left + s;
+    let right_width = width - left;
     let find_height = if finding { row } else { 0 };
+    let frame = rect(left, body.y + row, right_width, height - row - find_height);
     Panes {
         search: TextEntry::new(surface, rect(0, body.y, left, row)),
         list: List::new(surface, rect(0, body.y + row, left, height - row)),
-        divider: rect(left, body.y, s, height),
-        title: TextEntry::new(surface, rect(right, body.y, width - right, row)),
+        title: TextEntry::new(surface, rect(left, body.y, right_width, row)),
+        frame,
         pane: rect(
-            right,
-            body.y + row,
-            width - right,
-            height - row - find_height,
+            frame.x + s,
+            frame.y + s,
+            i64::from(frame.width) - 2 * s,
+            i64::from(frame.height) - 2 * s,
         ),
         find: if finding {
-            TextEntry::new(
-                surface,
-                rect(right, body.y + height - row, width - right, row),
-            )
+            TextEntry::new(surface, rect(left, body.y + height - row, right_width, row))
         } else {
             None
         },
@@ -253,24 +253,51 @@ mod tests {
 
     #[test]
     fn the_panes_share_the_body_without_overlap() {
-        let surface = Surface::new(800, 600, Scale::default()).unwrap();
-        let body = body(surface, &NOTEBOOK);
-        let split = panes(surface, true);
-        let search = split.search.unwrap().rect();
-        let list = split.list.unwrap().rect();
-        let title = split.title.unwrap().rect();
-        let find = split.find.unwrap().rect();
-        assert_eq!(search.y, body.y);
-        assert_eq!(list.y, search.y + i64::from(search.height));
-        assert_eq!(
-            list.y + i64::from(list.height),
-            body.y + i64::from(body.height)
-        );
-        assert!(search.x + i64::from(search.width) <= split.divider.x);
-        assert!(split.divider.x < title.x);
-        assert_eq!(split.pane.y, title.y + i64::from(title.height));
-        assert_eq!(find.y, split.pane.y + i64::from(split.pane.height));
-        assert!(panes(surface, false).find.is_none());
+        for scale in [1, 2] {
+            let s = i64::from(scale);
+            let surface = Surface::new(
+                800 * scale as usize,
+                600 * scale as usize,
+                Scale::new(scale).unwrap(),
+            )
+            .unwrap();
+            let body = body(surface, &NOTEBOOK);
+            let split = panes(surface, true);
+            let search = split.search.unwrap().rect();
+            let list = split.list.unwrap().rect();
+            let title = split.title.unwrap().rect();
+            let find = split.find.unwrap().rect();
+            assert_eq!(search.y, body.y);
+            assert_eq!(list.y, search.y + i64::from(search.height));
+            assert_eq!(
+                list.y + i64::from(list.height),
+                body.y + i64::from(body.height)
+            );
+            // The right side begins where the left ends and reaches the
+            // body's right; each side's outline is its own.
+            assert_eq!(search.x + i64::from(search.width), title.x);
+            let frame = split.frame;
+            assert_eq!((frame.x, frame.width), (title.x, title.width));
+            assert_eq!(frame.x + i64::from(frame.width), i64::from(body.width));
+            assert_eq!(frame.y, title.y + i64::from(title.height));
+            assert_eq!(find.y, frame.y + i64::from(frame.height));
+            // The pane lies a scaled pixel inside its outline on every side.
+            let pane = split.pane;
+            assert_eq!((pane.x, pane.y), (frame.x + s, frame.y + s));
+            assert_eq!(
+                (i64::from(pane.width), i64::from(pane.height)),
+                (
+                    i64::from(frame.width) - 2 * s,
+                    i64::from(frame.height) - 2 * s
+                )
+            );
+            let closed = panes(surface, false);
+            assert!(closed.find.is_none());
+            assert_eq!(
+                closed.frame.y + i64::from(closed.frame.height),
+                body.y + i64::from(body.height)
+            );
+        }
     }
 
     #[test]

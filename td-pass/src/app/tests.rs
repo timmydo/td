@@ -572,6 +572,109 @@ fn the_pin_field_is_masked_and_refuses_copy() {
     assert!(!format!("{:?}", prompt.pin).contains("1234"));
 }
 
+/// The fields, the list and the pane each show their bounds: the pane's
+/// bezel closes it on every side round a face that is not bezel, and the
+/// left side meets the right at their two bezels with no divider between,
+/// with an entry open and without.
+#[test]
+fn the_pane_is_outlined_like_the_fields_and_the_list() {
+    use td_ui::raster::BORDER;
+    let font = td_ui::font::pinned().unwrap();
+    let surface = Surface::new(640, 480, td_ui::raster::Scale::default()).unwrap();
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    app.input(Input::Resize(surface), &mut board);
+    let pixels = |app: &mut App| {
+        let mut pixels = vec![0u8; 640 * 480 * 4];
+        let mut raster = Raster::new(&mut pixels, &font, surface, 640 * 4).unwrap();
+        app.paint(&mut raster, surface).unwrap();
+        pixels
+    };
+    let check = |pixels: &[u8], finding: bool| {
+        let color = |x: i64, y: i64| {
+            let at = (y as usize * 640 + x as usize) * 4;
+            u32::from_le_bytes(pixels[at..at + 4].try_into().unwrap()) & 0xff_ffff
+        };
+        let border = BORDER & 0xff_ffff;
+        let panes = layout::panes(surface, finding);
+        let (frame, pane) = (panes.frame, panes.pane);
+        let (right, bottom) = (
+            frame.x + i64::from(frame.width) - 1,
+            frame.y + i64::from(frame.height) - 1,
+        );
+        let (mid_x, mid_y) = (pane.x + 40, pane.y + 40);
+        for (x, y) in [
+            (frame.x, mid_y),
+            (right, mid_y),
+            (mid_x, frame.y),
+            (mid_x, bottom),
+        ] {
+            assert_eq!(color(x, y), border, "the pane's bezel at {x},{y}");
+        }
+        for (x, y) in [(pane.x, mid_y), (mid_x, pane.y), (mid_x, mid_y)] {
+            assert_ne!(color(x, y), border, "the pane's face at {x},{y}");
+        }
+        // The title row: the search's right bezel, then the title's left.
+        let title = panes.title.unwrap().rect();
+        let y = title.y + 12;
+        assert_ne!(color(title.x - 2, y), border);
+        assert_eq!(color(title.x - 1, y), border);
+        assert_eq!(color(title.x, y), border);
+        assert_ne!(color(title.x + 1, y), border);
+        // Beside the pane: the list's right bezel, then the pane's left.
+        assert_ne!(color(frame.x - 2, mid_y), border);
+        assert_eq!(color(frame.x - 1, mid_y), border);
+    };
+    check(&pixels(&mut app), false);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "body");
+    check(&pixels(&mut app), false);
+    key(&mut app, &mut board, "C-f");
+    check(&pixels(&mut app), true);
+}
+
+/// On a window too short for the pane, neither the placeholder line nor
+/// an open entry's scene paints over the pane's lower bezel.
+#[test]
+fn a_short_pane_keeps_its_bezel() {
+    use td_ui::raster::BORDER;
+    let font = td_ui::font::pinned().unwrap();
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let full = Surface::new(640, 480, td_ui::raster::Scale::default()).unwrap();
+    app.input(Input::Resize(full), &mut board);
+    key(&mut app, &mut board, "Return");
+    let check = |app: &mut App, board: &mut Board| {
+        let mut checked = 0;
+        for height in 40..300 {
+            let surface = Surface::new(640, height, td_ui::raster::Scale::default()).unwrap();
+            app.input(Input::Resize(surface), board);
+            let frame = layout::panes(surface, false).frame;
+            // A frame with no room for a row of text inside its bezel.
+            if frame.height == 0 || frame.height >= layout::row(surface) as u32 + 2 {
+                continue;
+            }
+            let mut pixels = vec![0u8; 640 * height * 4];
+            let mut raster = Raster::new(&mut pixels, &font, surface, 640 * 4).unwrap();
+            app.paint(&mut raster, surface).unwrap();
+            let (x, y) = (frame.x + 40, frame.y + i64::from(frame.height) - 1);
+            let at = (y as usize * 640 + x as usize) * 4;
+            let color = u32::from_le_bytes(pixels[at..at + 4].try_into().unwrap());
+            assert_eq!(
+                color & 0xff_ffff,
+                BORDER & 0xff_ffff,
+                "height {height}: the bezel at {x},{y}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0);
+    };
+    check(&mut app, &mut board);
+    open(&mut app, &mut board, "Down", "body");
+    assert!(app.open_tab().is_some());
+    check(&mut app, &mut board);
+}
+
 #[test]
 fn every_phase_paints() {
     let font = td_ui::font::pinned().unwrap();

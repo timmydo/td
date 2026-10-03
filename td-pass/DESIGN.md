@@ -233,7 +233,10 @@ placement, the keys view's use, add and replace by key and by pointer,
 the refusal to revoke every key, marks that a held Space does not
 flicker, lock during a key operation, a failure's report kept past the
 view, the unsaved edits and focus kept under the view, the lists given
-their keys when the window grows, and painting the notebook, its keys
+their keys when the window grows, the pane's bezel on every side and
+its seams with the list and the search field with and without an entry
+and finding, a pane too short for a row keeping its lower bezel under
+the placeholder and an open entry, and painting the notebook, its keys
 view, its prompt and dialogs and each locked view, export into the
 folder the finder accepts, import of a chosen copy with one of its keys,
 a copy given up or unread, the finder painted, filtered and closed by
@@ -301,9 +304,14 @@ independent recovery, migration and hardware evidence.
 
 The search, title and find fields and the title list each carry td-ui's
 one-scaled-pixel bezel (td-ui/DESIGN.md, `chrome`), so a field's bounds
-show against the list under it. Not yet, in the window: the editor pane
-under the title field has no outline of its own; it should carry the
-same bezel, laid by td-pass round the pane's rectangle.
+show against the list under it. td-pass lays the same bezel round the
+editor pane: the pane's rectangle is its outline less a scaled pixel
+each side, so the pane's scene and its pointer target stop inside it.
+A pane with no room inside its bezel shows neither the scene nor the
+placeholder, since the editor refuses an empty frame and keeps its old
+one, and the placeholder is cut to the pane's height. The left side
+ends where the right begins, so the two meet at their own bezels with
+no divider between.
 
 ## Delivery and proof
 
