@@ -3163,6 +3163,44 @@ intervals cover long group/mailbox names, identities, multiple fields, scratch
 reuse and late refusal. Complete worker/native/RSS qualification and remaining
 Text grammars remain open.
 
+### 1.68 Bounded header-form dispatch
+
+M06bl adds `header_value::Cursor::new(input, scratch, work, budget)`. The
+already-authorized `Input.property.form()` selects exactly one existing Raw,
+Text, Addresses, GroupedAddresses, MessageIds, Date or URLs coordinator. A
+private inline enum retains that owner for its entire lifetime. There is no
+box, trait object, copied input or second active parser. Construction adds no
+work charge; selected constructors retain their own checked input contracts.
+The caller supplies the existing NFC scratch even for forms that do not use
+it, allowing one uniform admission path and reuse after the owner is dropped.
+
+Polling and final deadline admission forward to the selected coordinator.
+Errors retain their original variants, including unsupported Text grammar;
+dispatch does not authorize an additional grammar or reinterpret a refusal.
+The same original job/email budgets stay borrowed through selection and
+conversion. Last/all, absence, selected repair diagnostics, unverified-leap
+reporting, inert cached completion and final retirement keep their existing
+semantics. Date and URLs have no encoding-repair diagnostic; unverified-leap
+reporting is false outside Date. Diagnostics become final only on property
+Complete. Every emitted byte remains provisional under the response-spool
+contract, including a closed value before a failed final deadline check.
+
+The owner fits 2560 bytes including its discriminant, using the existing
+16 KiB parser reservation; its borrowed NFC scratch remains 3072 bytes.
+Forwarding calls exactly one coordinator per turn and adds no input visits,
+interpretation steps, job records or output charges. Existing maxima remain
+255 visits, 256 steps, sixteen job records and six copied bytes per turn.
+Addresses/GroupedAddresses charge at most nine output bytes per turn; Date
+can charge twenty-seven when rendering its timestamp and quotes. This does not
+qualify combined worker/native memory.
+
+Tests drive all seven forms through small output buffers, last/all and
+absence, fixed state, selected diagnostics, unsupported grammar, sticky
+partial-output refusal and final deadline retirement. Allocation intervals
+include construction and one-byte drains for each form, NFC overflow, scratch
+reuse and refusal. Structured Text grammars, MIME part traversal and the
+unpublished response-spool implementation remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

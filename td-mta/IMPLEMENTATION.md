@@ -1648,6 +1648,13 @@ Initial independently landable increments:
   Library tests cover scalar and framing policy; mail allocation intervals
   exercise the shared implementation. No new external dependency is added.
 
+- **M06bl — bounded header-form dispatcher:** select one existing coordinator
+  from the authorized property form and retain it inline. Preserve original
+  budgets, scratch, diagnostics and typed refusal without another parser or
+  dispatch charge. Pin all seven forms, final admission and partial-output
+  retirement, including allocation-free construction and short drains.
+  Structured Text grammars and response-spool publication remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

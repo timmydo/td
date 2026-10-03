@@ -8,6 +8,8 @@ use crate::{
     nfc::{self, HeaderBudget},
     ports::Tick,
 };
+mod dispatch;
+pub use dispatch::Cursor;
 mod list;
 use list::{IdsMode, UrlsMode};
 mod addresses;
@@ -869,3 +871,6 @@ mod addresses_tests;
 
 #[cfg(test)]
 mod grouped_tests;
+
+#[cfg(test)]
+mod dispatch_tests;

@@ -1182,6 +1182,17 @@ intervals cover long group/mailbox names, identities, multiple fields, scratch
 reuse and late selection refusal. Complete worker/native/RSS qualification and
 response-spool publication remain open.
 
+The unified header-value dispatcher (M06bl) retains exactly one selected
+coordinator in a private inline enum, within 2560 bytes including the tag.
+It replaces that selected coordinator's standalone state in the existing
+16 KiB parser region and borrows the same 3072-byte NFC scratch. No second
+parser, box, source copy or extra reservation is introduced. Its forwarding
+adds no work charges or input scans, preserving the coordinator ceilings.
+Allocation intervals include dynamic construction, one-byte drains and refusal
+for all seven forms, plus normalization overflow for Text, Addresses and
+GroupedAddresses. These component checks leave combined worker stacks, native
+allocations and whole-process RSS unqualified.
+
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
 fits within UNICODE.md's future 256-byte decoding cursor checkpoint. No

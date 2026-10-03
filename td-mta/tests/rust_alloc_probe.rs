@@ -4592,6 +4592,105 @@ fn raw_header_values() {
     assert_eq!(before, after, "Raw property assembly allocated");
 }
 
+fn dispatched_header_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property,
+        header_select::SourceEnd,
+        header_value::{Cursor, Input, Status},
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let source = format!(
+        "Subject:a{}\nTo:a{} <a@b>\nDate:1 Jan 2000 00:00 +0000\nMessage-ID:<a@b>\nList-Help:<https://x.test/>\n\n",
+        "\u{301}".repeat(512), "\u{301}".repeat(512)
+    );
+    let mut scratch = Scratch::new();
+    for key in [
+        "header:Subject:asRaw:all",
+        "header:Subject:asText:all",
+        "header:To:asAddresses:all",
+        "header:To:asGroupedAddresses:all",
+        "header:Message-ID:asMessageIds:all",
+        "header:Date:asDate:all",
+        "header:List-Help:asURLs:all",
+    ] {
+        for output_bytes in [1_000_000, 1] {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records: 2_000_000,
+                    output_bytes,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let mut key = header_property::Cursor::new(key, header_property::Context::Email);
+            let mut selected = None;
+            for _ in 0..1000 {
+                if let header_property::Status::Complete(value) =
+                    key.poll(Tick(1), &mut work).unwrap()
+                {
+                    selected = value;
+                    break;
+                }
+            }
+            let property = selected.unwrap();
+            let before = COUNTERS.snapshot();
+            let mut cursor = Cursor::new(
+                Input {
+                    bytes: black_box(source.as_bytes()),
+                    base: 0,
+                    header_limit: source.len() as u64,
+                    property,
+                    source_end: SourceEnd::Eof,
+                },
+                &mut scratch,
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            assert!(std::mem::size_of_val(&cursor) <= 2560);
+            let mut written = 0;
+            let mut complete = false;
+            let mut refused = false;
+            for _ in 0..1_000_000 {
+                let mut output = [0xa5; 1];
+                match cursor.poll(Tick(1), &mut output) {
+                    Ok(progress) => {
+                        written += progress.written;
+                        if let Status::Complete(end) = progress.status {
+                            assert_eq!(end.body_start, source.len() as u64);
+                            complete = true;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        assert_eq!(output, [0xa5]);
+                        assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            if output_bytes == 1 {
+                assert!(refused && !complete);
+                assert_eq!(written, 1);
+            } else {
+                assert!(complete && !refused);
+                assert!(!cursor.is_encoding_problem());
+                assert!(!cursor.has_unverified_leap());
+                cursor.check_deadline(Tick(1)).unwrap();
+            }
+            let after = COUNTERS.snapshot();
+            assert!(!before.invalid && !after.invalid);
+            assert_eq!(before, after, "header dispatch allocated");
+        }
+    }
+}
+
 fn date_header_values() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -5729,6 +5828,7 @@ fn main() {
         raw_header_values();
         text_header_values();
         date_header_values();
+        dispatched_header_values();
         header_properties();
         header_nfc();
         phrase_nfc();
@@ -5867,6 +5967,7 @@ fn main() {
     raw_header_values();
     text_header_values();
     date_header_values();
+    dispatched_header_values();
     header_properties();
     header_nfc();
     phrase_nfc();
