@@ -860,6 +860,14 @@ intervals cover long quoted UTF-8, domain literals, unmatched tails, empty
 items, nesting limits and work failure. Complete address/group grammar,
 text/NFC composition and response storage remain unqualified.
 
+The single addr-spec wrapper fits 288 bytes in the body parser reservation,
+including the shared identifier parser and private error latch. Its bare
+mode adds no source buffer, synthetic delimiters, arena or duplicated
+local/domain grammar. Public MessageIds state remains within 256 bytes.
+Returned raw parts charge no output. Allocation intervals cover long UTF-8,
+quoted folds, malformed tails and nesting/work refusal. Mailbox/group and
+text/NFC composition remain to be qualified.
+
 The date-time cursor fits 192 bytes in the same body parser reservation,
 including its CFWS cursor, fixed token prefix and calendar components.
 Comments, arbitrarily zero-prefixed years and unknown zone names retain no

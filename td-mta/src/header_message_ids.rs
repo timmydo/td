@@ -1,4 +1,4 @@
-//! Provisional raw segments of complete MessageIds lists; no strings are copied.
+//! Shared raw identifier grammar; public construction parses MessageIds lists.
 pub mod project;
 use crate::{
     admission::work::{Charge, Meter, Stop},
@@ -66,11 +66,12 @@ enum Phase {
     Delimited { emit: bool },
     Complete,
 }
-/// Every Begin/Part/End is provisional until Complete validates the full field.
-/// Input must end at the enclosing field value_end, excluding its final ending.
+/// Every Begin/Part/End is provisional until Complete validates the full input.
+/// Public list input ends at field value_end; private addr-spec input is one candidate.
 pub struct Cursor<'a> {
     source: &'a [u8],
     mode: Mode,
+    bare: bool,
     position: usize,
     grammar: Grammar,
     phase: Phase,
@@ -85,6 +86,7 @@ impl<'a> Cursor<'a> {
         Self {
             source,
             mode,
+            bare: false,
             position: 0,
             grammar: Grammar::Between,
             phase: Phase::Cfws,
@@ -94,6 +96,13 @@ impl<'a> Cursor<'a> {
             phrase: false,
             failure: None,
         }
+    }
+    // Enter the shared local/domain grammar without copying enclosing angles.
+    pub(crate) const fn addr_spec(source: &'a [u8]) -> Self {
+        let mut cursor = Self::new(source, Mode::Strict);
+        cursor.bare = true;
+        cursor.grammar = Grammar::LeftWord;
+        cursor
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         if let Some(error) = self.failure {
@@ -249,7 +258,11 @@ impl<'a> Cursor<'a> {
                 Ok(self.word(None, Grammar::RightTail, true))
             }
             (Grammar::RightTail, Some(b'.')) => self.punctuation(Grammar::RightAtom),
-            (Grammar::RightTail | Grammar::LiteralTail, Some(b'>')) => {
+            (Grammar::RightTail | Grammar::LiteralTail, None) if self.bare => {
+                self.phase = Phase::Complete;
+                Ok(Status::Complete)
+            }
+            (Grammar::RightTail | Grammar::LiteralTail, Some(b'>')) if !self.bare => {
                 self.advance(1)?;
                 self.grammar = Grammar::Between;
                 self.phase = Phase::Cfws;

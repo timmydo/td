@@ -1414,6 +1414,14 @@ Initial independently landable increments:
   Address/group grammar, fallback projection and display-name NFC remain
   follow-on work; boundary completion grants no SMTP or JMAP authority.
 
+- **M06af — single addr-spec grammar:** share the identifier parser's
+  local/domain states with a private bare mode requiring full-candidate
+  EOF. Preserve public MessageIds list semantics and raw addr-spec parts
+  without synthetic delimiters or a copied address. Cover obsolete CFWS,
+  quoting, UTF-8, malformed tails, exact work and allocation-free refusal.
+  Complete mailbox/group parsing, raw fallback/display projection and NFC
+  remain follow-on work; SMTP envelope validation remains separate.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

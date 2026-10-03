@@ -2064,6 +2064,70 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_single_addr_spec() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_addr_spec::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    fn drive(cursor: &mut Cursor<'_>, work: &mut Meter) -> Result<usize, Error> {
+        let mut count = 0;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1), work)? {
+                Status::Complete => return Ok(count),
+                Status::Part(extent) => {
+                    black_box(extent);
+                    count += 1;
+                }
+                Status::Yield => {}
+            }
+        }
+        panic!("addr-spec allocation probe did not finish");
+    }
+    let source = format!("{}@(x)example", "🐈".repeat(10_000));
+    let nested = "(".repeat(33);
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10_000_000,
+            records: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (source, expected) in [
+        (source.as_bytes(), Ok(3)),
+        (b"\"a\r\n b\"@[c\n\td]".as_slice(), Ok(3)),
+        (b"a@b, c@d", Err(Error::Malformed)),
+        (b"a@b>", Err(Error::Malformed)),
+        (nested.as_bytes(), Err(Error::NestingLimit)),
+    ] {
+        let mut cursor = Cursor::new(black_box(source));
+        let result = drive(&mut cursor, &mut work);
+        assert_eq!(result, expected);
+    }
+    let mut cursor = Cursor::new(b"a@b");
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 3,
+            records: 100,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut limited),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    assert_eq!(
+        drive(&mut cursor, &mut work),
+        Err(Error::Work(Stop::IoBytes))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "addr-spec parsing allocated");
+}
+
 fn header_address_boundaries() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3371,6 +3435,7 @@ fn main() {
         header_message_id_text();
         header_url_text();
         header_address_boundaries();
+        header_single_addr_spec();
         header_date_projection();
         header_dates();
         header_comments();
@@ -3480,6 +3545,7 @@ fn main() {
     header_message_id_text();
     header_url_text();
     header_address_boundaries();
+    header_single_addr_spec();
     header_date_projection();
     header_dates();
     header_comments();

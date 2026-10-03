@@ -1741,6 +1741,44 @@ and JMAP serialization remain with the enclosing owner. Tests and allocation
 intervals cover protected delimiters, escapes, empty items, unmatched tails,
 raw invalid bytes, long input, depth and sticky resource refusal.
 
+### 1.38 Resident single addr-spec grammar
+
+M06af supplies `header_addr_spec::Cursor` over one admitted immutable
+candidate slice. It enters the existing identifier parser's private bare
+address mode: start at local-part and require EOF after a complete domain
+and optional CFWS. The public MessageIds list constructor continues to
+require its enclosing angles and list grammar. No synthetic input bytes or
+second local-part/domain implementation is introduced.
+
+The parser accepts RFC 5322 addr-spec including obsolete local-part/domain
+CFWS placement, quoted local words and domain literals, plus RFC 6532 UTF-8.
+It returns provisional Part extents in the candidate slice. Concatenating
+parts preserves local/domain spelling, dots, at sign, quotes, quoted pairs,
+folds and literal brackets while removing grammatical CFWS. It does not
+unfold, unquote, normalize, decode encoded words or validate DNS/IP syntax.
+Noncharacters and valid obsolete quoted controls remain lexical data for
+later projection. Outbound SMTP validation is separate and stricter.
+
+Complete requires the entire candidate to be one addr-spec. Display names,
+outer angles, obsolete routes and comma/semicolon lists belong to the
+mailbox/group grammar and are rejected here. Invalid tails invalidate all
+provisional parts. The enclosing best-effort parser may recover Malformed
+as POLICY's raw item fallback; nesting and work errors remain resource
+refusals. Completion never authorizes a recipient or response publication.
+
+The wrapper uses the same charged turns as the identifier core: at most
+160 source-byte visits and 32 records per poll, no output bytes. Literal
+a@b costs nine visits and twelve records; its four-byte local scalar
+counterpart costs thirteen visits and twelve records. The non-Copy wrapper
+fits 288 bytes including its private error latch; existing MessageIds
+state stays within 256 bytes. Both share fixed CFWS/delimited/atom state,
+with no new arena or copied address. All errors latch across fresh meters;
+cached Complete is inert. Tests cover bare/enclosed grammar agreement,
+quoted/obsolete/Unicode data, long atoms, precise work and whole-candidate
+refusal; allocation intervals include success, malformed tails and resource
+failure. Admission, address/group assembly, decoding/NFC, JSON serialization
+and complete worker qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
