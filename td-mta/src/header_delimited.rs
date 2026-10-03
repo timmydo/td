@@ -1,39 +1,10 @@
-//! One raw quoted string or domain literal at an authorized grammar position.
+//! Mail admission adapter over the shared header lexical cursor.
 use crate::{
-    admission::work::{Charge, Meter, Stop},
-    decode_work::Work,
+    admission::work::{Meter, Stop},
+    decode_work::{Error as DecodeError, Lexical, Work},
     ports::Tick,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Kind {
-    QuotedString,
-    DomainLiteral,
-}
-impl Kind {
-    const fn opening(self) -> u8 {
-        match self {
-            Self::QuotedString => b'"',
-            Self::DomainLiteral => b'[',
-        }
-    }
-    const fn closing(self) -> u8 {
-        match self {
-            Self::QuotedString => b'"',
-            Self::DomainLiteral => b']',
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Extent {
-    pub start: usize,
-    pub end: usize,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    Yield,
-    Complete(Extent),
-}
+pub use td_header::delimited::{Extent, Kind, Status};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Malformed,
@@ -66,43 +37,20 @@ impl From<Stop> for Error {
         Self::Work(error)
     }
 }
-#[derive(Clone, Copy)]
-enum Phase {
-    Opening,
-    Content,
-    Complete,
-}
+
 /// Source ends at the enclosing field value_end, excluding its final ending.
-/// Complete validates one lexical token, not its placement or trailing field.
+/// The enclosing grammar authorizes placement and validates remaining syntax.
 pub struct Cursor<'a> {
-    source: &'a [u8],
-    kind: Kind,
-    start: usize,
-    position: usize,
-    phase: Phase,
-    escaped: bool,
-    failure: Option<Error>,
+    inner: td_header::delimited::Cursor<'a, DecodeError>,
 }
 impl<'a> Cursor<'a> {
     pub const fn new(source: &'a [u8], start: usize, kind: Kind) -> Self {
         Self {
-            source,
-            kind,
-            start,
-            position: start,
-            phase: Phase::Opening,
-            escaped: false,
-            failure: None,
+            inner: td_header::delimited::Cursor::new(source, start, kind),
         }
     }
     pub const fn position(&self) -> usize {
-        self.position
-    }
-    fn extent(&self) -> Extent {
-        Extent {
-            start: self.start,
-            end: self.position,
-        }
+        self.inner.position()
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         self.poll_with_work(now, work)
@@ -112,141 +60,18 @@ impl<'a> Cursor<'a> {
         now: Tick,
         work: &mut impl Work,
     ) -> Result<Status, Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if matches!(self.phase, Phase::Complete) {
-            return Ok(Status::Complete(self.extent()));
-        }
-        let result = self.step(now, work);
-        if let Err(error) = result {
-            self.failure = Some(error);
-        }
-        result
+        self.inner
+            .poll(&mut Lexical::new(work, now))
+            .map_err(Error::from)
     }
-    fn peek(&self, offset: usize, now: Tick, work: &mut impl Work) -> Result<Option<u8>, Error> {
-        let position = self
-            .position
-            .checked_add(offset)
-            .ok_or(Error::InvalidState)?;
-        work.charge(
-            now,
-            Charge {
-                io_bytes: u64::from(position < self.source.len()),
-                ..Charge::default()
-            },
-        )?;
-        Ok(self.source.get(position).copied())
-    }
-    fn advance(&mut self, width: usize) -> Result<(), Error> {
-        self.position = self
-            .position
-            .checked_add(width)
-            .ok_or(Error::InvalidState)?;
-        if self.position > self.source.len() {
-            return Err(Error::InvalidState);
+}
+impl From<td_header::delimited::Error<DecodeError>> for Error {
+    fn from(error: td_header::delimited::Error<DecodeError>) -> Self {
+        match error {
+            td_header::delimited::Error::Malformed => Self::Malformed,
+            td_header::delimited::Error::InvalidState => Self::InvalidState,
+            td_header::delimited::Error::Work(error) => Self::from(error),
         }
-        Ok(())
-    }
-    fn scalar_width(&self, byte: u8, now: Tick, work: &mut impl Work) -> Result<usize, Error> {
-        let width = match byte {
-            0..=127 => return Ok(1),
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => return Err(Error::Malformed),
-        };
-        let available = self
-            .source
-            .len()
-            .checked_sub(self.position)
-            .ok_or(Error::InvalidState)?
-            .min(width);
-        // The UTF-8 validator rereads the already inspected lead octet.
-        work.charge(
-            now,
-            Charge {
-                io_bytes: available as u64,
-                ..Charge::default()
-            },
-        )?;
-        let end = self
-            .position
-            .checked_add(available)
-            .ok_or(Error::InvalidState)?;
-        let bytes = self
-            .source
-            .get(self.position..end)
-            .ok_or(Error::InvalidState)?;
-        if available != width || std::str::from_utf8(bytes).is_err() {
-            return Err(Error::Malformed);
-        }
-        Ok(width)
-    }
-    fn fold_width(&self, byte: u8, now: Tick, work: &mut impl Work) -> Result<usize, Error> {
-        let width = if byte == b'\r' {
-            if self.peek(1, now, work)? != Some(b'\n') {
-                return Err(Error::Malformed);
-            }
-            2
-        } else {
-            1
-        };
-        if !matches!(self.peek(width, now, work)?, Some(b' ' | b'\t')) {
-            return Err(Error::Malformed);
-        }
-        Ok(width)
-    }
-    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
-        if self.position > self.source.len() {
-            return Err(Error::InvalidState);
-        }
-        for _ in 0..32 {
-            work.charge(
-                now,
-                Charge {
-                    records: 1,
-                    ..Charge::default()
-                },
-            )?;
-            let byte = self.peek(0, now, work)?.ok_or(Error::Malformed)?;
-            if matches!(self.phase, Phase::Opening) {
-                if byte != self.kind.opening() {
-                    return Err(Error::Malformed);
-                }
-                self.advance(1)?;
-                self.phase = Phase::Content;
-                continue;
-            }
-            if self.escaped {
-                let width = self.scalar_width(byte, now, work)?;
-                self.advance(width)?;
-                self.escaped = false;
-                continue;
-            }
-            if byte == self.kind.closing() {
-                self.advance(1)?;
-                self.phase = Phase::Complete;
-                return Ok(Status::Complete(self.extent()));
-            }
-            match byte {
-                b'\\' => {
-                    self.advance(1)?;
-                    self.escaped = true;
-                }
-                b'\r' | b'\n' => {
-                    let width = self.fold_width(byte, now, work)?;
-                    self.advance(width)?;
-                }
-                0 => return Err(Error::Malformed),
-                b'[' if self.kind == Kind::DomainLiteral => return Err(Error::Malformed),
-                _ => {
-                    let width = self.scalar_width(byte, now, work)?;
-                    self.advance(width)?;
-                }
-            }
-        }
-        Ok(Status::Yield)
     }
 }
 
@@ -254,7 +79,7 @@ impl<'a> Cursor<'a> {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::ports::Deadline;
+    use crate::{admission::work::Charge, ports::Deadline};
     fn work() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
@@ -411,9 +236,15 @@ mod tests {
         for kind in [Kind::QuotedString, Kind::DomainLiteral] {
             let source = format!(
                 "{}{}{}tail",
-                char::from(kind.opening()),
+                char::from(match kind {
+                    Kind::QuotedString => b'\"',
+                    Kind::DomainLiteral => b'[',
+                }),
                 "🐈".repeat(10_000),
-                char::from(kind.closing())
+                char::from(match kind {
+                    Kind::QuotedString => b'\"',
+                    Kind::DomainLiteral => b']',
+                })
             );
             let mut cursor = Cursor::new(source.as_bytes(), 0, kind);
             assert_eq!(cursor.poll(Tick(1), &mut work()), Ok(Status::Yield));
@@ -503,9 +334,15 @@ mod tests {
         for kind in [Kind::QuotedString, Kind::DomainLiteral] {
             let source = format!(
                 "{}{}{}",
-                char::from(kind.opening()),
+                char::from(match kind {
+                    Kind::QuotedString => b'\"',
+                    Kind::DomainLiteral => b'[',
+                }),
                 "x".repeat(100),
-                char::from(kind.closing())
+                char::from(match kind {
+                    Kind::QuotedString => b'\"',
+                    Kind::DomainLiteral => b']',
+                })
             );
             let mut cursor = Cursor::new(source.as_bytes(), 0, kind);
             assert_eq!(cursor.poll(Tick(1), &mut work()), Ok(Status::Yield));

@@ -1010,6 +1010,13 @@ and three records before any JSON. Existing source/turn bounds hold, and
 allocation intervals include all admitted grammars. Combined worker
 qualification remains open.
 
+M06bp's shared CFWS and delimited-token cursors replace the existing inline
+lexical owners; their mail facades still fit 64 bytes each. Shared state size
+depends on the caller's Copy error type. The mail error and short per-turn
+admission adapter add no heap, retained cursor, source visit or budget charge.
+Existing compositions and allocation intervals now exercise the shared
+implementation; worker/native qualification remains unchanged and open.
+
 The resident MIME field syntax owner (M06bo) fits 512 bytes in the existing
 16 KiB parser reservation, including optional inline CFWS/quoted-string
 children and original-budget borrows. It retains no parameter vector, source

@@ -594,6 +594,7 @@ mod crypto_boundary_tests {
             dependencies,
             [
                 r#"td-crypto = { path = "../td-crypto" }"#,
+                r#"td-header = { path = "../td-header" }"#,
                 r#"td-json = { path = "../td-json" }"#
             ]
         );

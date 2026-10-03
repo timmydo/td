@@ -1508,17 +1508,16 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // td-crypto has no distribution recipe either, and its one consumer is
-    // td-mta. The cargo-test preflight is everything that inspects it: its
-    // reader closure tests and lints td-crypto and td-mta through
-    // `crypto-cargo`, which enforces the pinned manifests, locks, cargo
-    // config and features, and its lock guard holds the admitted closure.
+    // td-crypto and td-header have no distribution recipe; td-mta reads both.
+    // Reader closure tests the shared crate and its mail consumer. td-header
+    // uses ordinary Cargo; only td-crypto and td-mta use `crypto-cargo`, which
+    // enforces pinned manifests, locks, Cargo config and backend features.
     // The full check added only gate 325's in-sandbox, networkless copy of
     // those same legs (the host legs are offline too: frozen, with verified
     // source replacement), a recipe-checks scope no recipe reads (so every
     // check), and the bootstrap ladder; the portable musl build is its own
     // command.
-    if p.starts_with("td-crypto/") && !p.contains("..") {
+    if (p.starts_with("td-crypto/") || p.starts_with("td-header/")) && !p.contains("..") {
         sel.add_preflight("cargo-test");
         return;
     }
@@ -4835,11 +4834,11 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// `workspace_exemption_requires_no_distribution_recipe` holds, and a crate
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
-/// whole list without the list changing. td-mta reads td-crypto and td-json,
-/// its direct dependencies. td-agent reads td-civil, td-fetch-client,
-/// td-json, td-toml and td-ui, its dependencies, and td-compositor, the test
-/// tool its `native-compositor-tests` opt-in builds (td-agent/DESIGN.md
-/// §17).
+/// whole list without the list changing. td-mta reads td-crypto, td-header
+/// and td-json, its direct dependencies. td-agent reads td-civil,
+/// td-fetch-client, td-json, td-toml and td-ui, its dependencies, and
+/// td-compositor, the test tool its `native-compositor-tests` opt-in builds
+/// (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
     (
         "td-agent",
@@ -4852,7 +4851,7 @@ const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
             "td-ui",
         ],
     ),
-    ("td-mta", &["td-crypto", "td-json"]),
+    ("td-mta", &["td-crypto", "td-header", "td-json"]),
 ];
 
 /// The subset of the derived command list a diff over `changed` can actually
@@ -9053,6 +9052,57 @@ mod tests {
     }
 
     #[test]
+    fn header_lexical_changes_run_shared_crate_and_mail_without_distro_checks() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            return;
+        };
+        if !roster.iter().any(|c| c.name == "td-header") {
+            return;
+        }
+        for path in [
+            "td-header/src/lib.rs",
+            "td-header/Cargo.toml",
+            "td-header/Cargo.lock",
+        ] {
+            let output = path_output(&root, path);
+            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            for name in ["td-header", "td-mta"] {
+                for action in ["test", "clippy"] {
+                    assert!(
+                        commands.iter().any(|command| {
+                            let leg = if name == "td-mta" {
+                                format!(" gate-crates crypto-cargo {action} --manifest-path {name}")
+                            } else {
+                                format!("cargo {action} --frozen --manifest-path {name}/Cargo.toml")
+                            };
+                            command.contains(&leg)
+                        }),
+                        "{path}: {name}/{action}"
+                    );
+                }
+            }
+            // Reader closure contains both the shared crate and its consumer;
+            // the single-crate workspace exemption deliberately does not apply.
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.contains("--workspace")),
+                "{path}"
+            );
+            assert!(!output.contains("td-builder check"), "{path}: {output}");
+            assert!(!output.contains("recipe-checks scope"), "{path}: {output}");
+        }
+        assert!(path_output(&root, "td-header/DESIGN.md").contains("Selected checks: none"));
+        for path in ["td-header-x/src/lib.rs", "td-header/../td-sh/src/main.rs"] {
+            assert!(
+                path_output(&root, path).contains("td-builder check"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
     fn mail_only_changes_run_own_tests_and_lints_without_distro_checks() {
         let root = repo_root();
         let Ok(roster) = discover_gate_crates(&root) else {
@@ -9109,7 +9159,7 @@ mod tests {
     fn mail_source_graph_changes_restore_workspace_coverage() {
         let root = std::env::temp_dir().join(format!("td-mail-graph-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
-        for name in ["td-mta", "td-crypto", "td-json", "td-authd"] {
+        for name in ["td-mta", "td-crypto", "td-header", "td-json", "td-authd"] {
             let base = root.join(name);
             std::fs::create_dir_all(base.join("src")).unwrap();
             let manifest = if crate::crypto_policy::admitted(name) {
@@ -9149,7 +9199,9 @@ mod tests {
                 (path, text)
             })
             .collect();
-        for name in names {
+        // td-header shares the recipe-free routing arm until packaging gains
+        // a consumer. Any such admission must revisit that arm too.
+        for name in names.into_iter().chain(["td-header"]) {
             for (path, text) in &texts {
                 assert!(
                     !text.contains(name),
@@ -9158,6 +9210,21 @@ mod tests {
                 );
             }
             assert!(!roster.contains(name), "{name} now enters a recipe closure");
+        }
+        if let Ok(roster) = discover_gate_crates(&root) {
+            if roster.iter().any(|krate| krate.name == "td-header") {
+                let readers = crate_readers(&root, &roster).unwrap();
+                let consumers = readers
+                    .iter()
+                    .find(|(name, _)| name == "td-header")
+                    .map(|(_, consumers)| consumers.as_slice())
+                    .unwrap_or_default();
+                assert_eq!(
+                    consumers,
+                    ["td-mta"],
+                    "td-header gained a reader; revisit its affected-check mapping"
+                );
+            }
         }
         // Each pinned edge set is sorted, as the comparison reads it.
         for (name, edges) in WORKSPACE_EXEMPT {

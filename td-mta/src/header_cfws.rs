@@ -1,25 +1,10 @@
-//! Optional structured-header CFWS; the enclosing grammar authorizes placement.
+//! Mail admission adapter over the shared header lexical cursor.
 use crate::{
-    admission::work::{Charge, Meter, Stop},
-    decode_work::Work,
+    admission::work::{Meter, Stop},
+    decode_work::{Error as DecodeError, Lexical, Work},
     ports::Tick,
 };
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Comment {
-    pub start: usize,
-    pub end: usize,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct End {
-    pub position: usize,
-    pub consumed: bool,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    Comment(Comment),
-    Yield,
-    Complete(End),
-}
+pub use td_header::cfws::{Comment, End, Status};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Malformed,
@@ -54,40 +39,21 @@ impl From<Stop> for Error {
         Self::Work(error)
     }
 }
-/// Scans one optional CFWS run, leaving the first non-CFWS byte unconsumed.
+
 /// Source ends at the enclosing field value_end, excluding its final ending.
-/// This lexical helper does not establish raw-file field boundaries.
+/// Optional CFWS leaves the first non-CFWS byte untouched.
+/// The enclosing grammar authorizes placement and validates remaining syntax.
 pub struct Cursor<'a> {
-    source: &'a [u8],
-    start: usize,
-    position: usize,
-    comment_start: usize,
-    depth: u8,
-    escaped: bool,
-    complete: bool,
-    failure: Option<Error>,
+    inner: td_header::cfws::Cursor<'a, DecodeError>,
 }
 impl<'a> Cursor<'a> {
     pub const fn new(source: &'a [u8], start: usize) -> Self {
         Self {
-            source,
-            start,
-            position: start,
-            comment_start: start,
-            depth: 0,
-            escaped: false,
-            complete: false,
-            failure: None,
+            inner: td_header::cfws::Cursor::new(source, start),
         }
     }
     pub const fn position(&self) -> usize {
-        self.position
-    }
-    fn end(&self) -> End {
-        End {
-            position: self.position,
-            consumed: self.position != self.start,
-        }
+        self.inner.position()
     }
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         self.poll_with_work(now, work)
@@ -97,166 +63,19 @@ impl<'a> Cursor<'a> {
         now: Tick,
         work: &mut impl Work,
     ) -> Result<Status, Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if self.complete {
-            return Ok(Status::Complete(self.end()));
-        }
-        let result = self.step(now, work);
-        if let Err(error) = result {
-            self.failure = Some(error);
-        }
-        result
+        self.inner
+            .poll(&mut Lexical::new(work, now))
+            .map_err(Error::from)
     }
-    fn peek(&self, offset: usize, now: Tick, work: &mut impl Work) -> Result<Option<u8>, Error> {
-        let position = self
-            .position
-            .checked_add(offset)
-            .ok_or(Error::InvalidState)?;
-        work.charge(
-            now,
-            Charge {
-                io_bytes: u64::from(position < self.source.len()),
-                ..Charge::default()
-            },
-        )?;
-        Ok(self.source.get(position).copied())
-    }
-    fn advance(&mut self, count: usize) -> Result<(), Error> {
-        self.position = self
-            .position
-            .checked_add(count)
-            .ok_or(Error::InvalidState)?;
-        if self.position > self.source.len() {
-            return Err(Error::InvalidState);
+}
+impl From<td_header::cfws::Error<DecodeError>> for Error {
+    fn from(error: td_header::cfws::Error<DecodeError>) -> Self {
+        match error {
+            td_header::cfws::Error::Malformed => Self::Malformed,
+            td_header::cfws::Error::NestingLimit => Self::NestingLimit,
+            td_header::cfws::Error::InvalidState => Self::InvalidState,
+            td_header::cfws::Error::Work(error) => Self::from(error),
         }
-        Ok(())
-    }
-    fn fold(&self, byte: u8, now: Tick, work: &mut impl Work) -> Result<Option<usize>, Error> {
-        let width = if byte == b'\r' {
-            if self.peek(1, now, work)? != Some(b'\n') {
-                return Ok(None);
-            }
-            2
-        } else {
-            1
-        };
-        Ok(matches!(self.peek(width, now, work)?, Some(b' ' | b'\t')).then_some(width))
-    }
-    fn character(&self, byte: u8, now: Tick, work: &mut impl Work) -> Result<usize, Error> {
-        let width = match byte {
-            0..=127 => return Ok(1),
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => return Err(Error::Malformed),
-        };
-        // The bounded UTF-8 validator rereads the lead already inspected above.
-        let available = self
-            .source
-            .len()
-            .checked_sub(self.position)
-            .ok_or(Error::InvalidState)?
-            .min(width);
-        work.charge(
-            now,
-            Charge {
-                io_bytes: available as u64,
-                ..Charge::default()
-            },
-        )?;
-        let end = self
-            .position
-            .checked_add(available)
-            .ok_or(Error::InvalidState)?;
-        let text = self
-            .source
-            .get(self.position..end)
-            .ok_or(Error::InvalidState)?;
-        if available != width || std::str::from_utf8(text).is_err() {
-            return Err(Error::Malformed);
-        }
-        Ok(width)
-    }
-    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
-        if self.position > self.source.len() {
-            return Err(Error::InvalidState);
-        }
-        for _ in 0..32 {
-            work.charge(
-                now,
-                Charge {
-                    records: 1,
-                    ..Charge::default()
-                },
-            )?;
-            let Some(byte) = self.peek(0, now, work)? else {
-                if self.depth != 0 {
-                    return Err(Error::Malformed);
-                }
-                self.complete = true;
-                return Ok(Status::Complete(self.end()));
-            };
-            if self.escaped {
-                let width = self.character(byte, now, work)?;
-                self.advance(width)?;
-                self.escaped = false;
-                continue;
-            }
-            if matches!(byte, b' ' | b'\t') {
-                self.advance(1)?;
-                continue;
-            }
-            if matches!(byte, b'\r' | b'\n') {
-                if let Some(width) = self.fold(byte, now, work)? {
-                    self.advance(width)?;
-                    continue;
-                }
-                if self.depth != 0 {
-                    return Err(Error::Malformed);
-                }
-                self.complete = true;
-                return Ok(Status::Complete(self.end()));
-            }
-            if byte == b'(' {
-                if self.depth == 32 {
-                    return Err(Error::NestingLimit);
-                }
-                if self.depth == 0 {
-                    self.comment_start = self.position;
-                }
-                self.depth = self.depth.checked_add(1).ok_or(Error::InvalidState)?;
-                self.advance(1)?;
-                continue;
-            }
-            if self.depth == 0 {
-                self.complete = true;
-                return Ok(Status::Complete(self.end()));
-            }
-            match byte {
-                b')' => {
-                    self.depth = self.depth.checked_sub(1).ok_or(Error::InvalidState)?;
-                    self.advance(1)?;
-                    if self.depth == 0 {
-                        return Ok(Status::Comment(Comment {
-                            start: self.comment_start,
-                            end: self.position,
-                        }));
-                    }
-                }
-                b'\\' => {
-                    self.escaped = true;
-                    self.advance(1)?;
-                }
-                0 => return Err(Error::Malformed),
-                _ => {
-                    let width = self.character(byte, now, work)?;
-                    self.advance(width)?;
-                }
-            }
-        }
-        Ok(Status::Yield)
     }
 }
 
@@ -264,7 +83,7 @@ impl<'a> Cursor<'a> {
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::ports::Deadline;
+    use crate::{admission::work::Charge, ports::Deadline};
     fn work() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),

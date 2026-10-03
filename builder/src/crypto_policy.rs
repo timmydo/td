@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
-pub(crate) const LOCAL_SOURCES: &[&str] = &["td-crypto", "td-json", "td-mta"];
+pub(crate) const LOCAL_SOURCES: &[&str] = &["td-crypto", "td-header", "td-json", "td-mta"];
 
 pub(crate) const DEPENDENCIES: &[&str] = &[
     "aws-lc-rs = { version = \"=1.18.1\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
@@ -19,7 +19,8 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "f58a9aeabc0e498dcea0c795b6bd5ad42bff6b06a101e9fd6f88f04553c017c1",
+        "td-mta" => "4d72a941fee8bad7fe1eedc8c0a488604fdf1fe8d6ff6ae5c39baf552dcde805",
+        "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
         _ => {
             return Err(format!(
@@ -33,7 +34,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "09cacf7ce066ae2fbfe36dc1da8b04a013143da91fdab1a9a593396d7b3b56ad",
+        "td-mta" => "45ddb1cc78f5c282d9de1ee7db96f23fb2d497864a0483626514d0f96af1cb59",
+        "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
         _ => {
             return Err(format!(
@@ -150,7 +152,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     let mut expected: BTreeSet<String> = ACTIVE.lines().map(str::to_owned).collect();
     let mut local = vec!["td-crypto"];
     if name == "td-mta" {
-        local.extend(["td-json", "td-mta"]);
+        local.extend(["td-header", "td-json", "td-mta"]);
     }
     for package in local {
         let path = root
@@ -289,26 +291,28 @@ mod tests {
     }
 
     #[test]
-    fn json_source_pins_refuse_dependency_changes() {
+    fn std_source_pins_refuse_dependency_changes() {
         let root = root();
-        if !root.join("td-json/Cargo.toml").exists() {
-            return;
+        for name in ["td-header", "td-json"] {
+            if !root.join(name).join("Cargo.toml").exists() {
+                continue;
+            }
+            let manifest = std::fs::read_to_string(root.join(name).join("Cargo.toml")).unwrap();
+            let lock = std::fs::read_to_string(root.join(name).join("Cargo.lock")).unwrap();
+            assert!(manifest_pin(name, &manifest).is_ok());
+            assert!(lock_pin(name, &lock).is_ok());
+            assert!(manifest_pin(
+                name,
+                &format!("{manifest}\n[dependencies]\nforeign = \"1\"\n")
+            )
+            .is_err());
+            assert!(lock_pin(
+                name,
+                &format!("{lock}\n[[package]]\nname = \"foreign\"\nversion = \"1.0.0\"\n")
+            )
+            .is_err());
+            assert!(!admitted(name));
         }
-        let manifest = std::fs::read_to_string(root.join("td-json/Cargo.toml")).unwrap();
-        let lock = std::fs::read_to_string(root.join("td-json/Cargo.lock")).unwrap();
-        assert!(manifest_pin("td-json", &manifest).is_ok());
-        assert!(lock_pin("td-json", &lock).is_ok());
-        assert!(manifest_pin(
-            "td-json",
-            &format!("{manifest}\n[dependencies]\nforeign = \"1\"\n")
-        )
-        .is_err());
-        assert!(lock_pin(
-            "td-json",
-            &format!("{lock}\n[[package]]\nname = \"foreign\"\nversion = \"1.0.0\"\n")
-        )
-        .is_err());
-        assert!(!admitted("td-json"));
     }
 
     #[test]
@@ -365,10 +369,12 @@ mod tests {
         }
         let mail = root.join("td-mta").canonicalize().unwrap();
         let json = root.join("td-json").canonicalize().unwrap();
+        let header = root.join("td-header").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\n",
+            "{graph}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\n",
             mail.display(),
-            json.display()
+            json.display(),
+            header.display()
         );
         assert!(active_graph(
             &root,
@@ -377,6 +383,18 @@ mod tests {
         )
         .is_err());
         assert!(active_graph(&root, "td-mta", &mailgraph).is_ok());
+        assert!(active_graph(
+            &root,
+            "td-mta",
+            &mailgraph.replace(&format!("td-header v0.1.0 ({})|\n", header.display()), "")
+        )
+        .is_err());
+        assert!(active_graph(
+            &root,
+            "td-mta",
+            &mailgraph.replace(&header.display().to_string(), "/wrong/header")
+        )
+        .is_err());
         assert!(active_graph(&root, "td-mta", &graph).is_err());
     }
 }

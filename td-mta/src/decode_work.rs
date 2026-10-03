@@ -96,3 +96,27 @@ impl Work for Conversion<'_> {
         self.work.charge(now, charge).map_err(Error::Work)
     }
 }
+
+/// Binds shared lexical admission to this turn's original mail work owner.
+pub(crate) struct Lexical<'w, W> {
+    work: &'w mut W,
+    now: Tick,
+}
+impl<'w, W> Lexical<'w, W> {
+    pub(crate) const fn new(work: &'w mut W, now: Tick) -> Self {
+        Self { work, now }
+    }
+}
+impl<W: Work> td_header::Work for Lexical<'_, W> {
+    type Error = Error;
+    fn charge(&mut self, charge: td_header::Charge) -> Result<(), Error> {
+        self.work.charge(
+            self.now,
+            Charge {
+                io_bytes: charge.visits,
+                records: charge.records,
+                ..Charge::default()
+            },
+        )
+    }
+}

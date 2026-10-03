@@ -1684,6 +1684,15 @@ Initial independently landable increments:
   escaped/folded values, every partial admission and allocation-free turns.
   RFC 2231 assembly, derived metadata and part traversal remain open.
 
+- **M06bp — shared bounded header lexing:** move CFWS and delimited-token
+  state into std-only td-header with caller-owned visit/record admission.
+  Preserve mail errors, complete-field slicing, deadlines, original budgets,
+  charged rereads, per-turn ceilings and fixed memory through thin adapters.
+  Remove the old grammar implementations atomically; retain mail composition
+  and allocation fixtures and add independent shared-crate lexical/refusal
+  cases. Pin the local manifest/lock and source staging without widening the
+  private crypto graph. Metadata assembly and part traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

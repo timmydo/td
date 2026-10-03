@@ -26,6 +26,7 @@ The target dependency graph is:
 
 ```text
 td-mta (library and packaging executable)
+  -> td-header (std-only bounded header lexical cursors)
   -> td-json (std-only bounded JSON string framing)
   -> td-crypto (td-owned API and private backend)
        -> rustls + aws-lc-rs + reviewed root data
@@ -47,11 +48,11 @@ Changing any pinned input requires an explicit policy update. The checkout's
 root `.cargo/config.toml` is required. Ancestor `.cargo/config.toml` files are
 accepted only when each matches that same compiled pin, allowing nested
 worktrees to use their own runner. Legacy `.cargo/config` files remain refused
-at every level. Automatic build.rs files are refused for all three local
-source packages: td-crypto, td-json and td-mta. Their exact manifests and
-locks are pinned; td-json remains an ordinary std-only roster crate. The Cargo
-config pin contains only target runner settings, for which Cargo selects the
-deepest definition. Any future pin change must recheck ancestor merging and
+at every level. Automatic build.rs files are refused for all four local
+source packages: td-crypto, td-header, td-json and td-mta. Their exact
+manifests and locks are pinned; td-header and td-json remain ordinary std-only
+roster crates. The Cargo config pin contains only target runner settings,
+for which Cargo selects the deepest definition. Any future pin change must recheck ancestor merging and
 relative path behavior; identical files with other settings need not have
 identical effective behavior. A nested worktree that changes the pin therefore
 requires matching ancestor configs too; an older worktree must rebase after an

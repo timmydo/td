@@ -1432,6 +1432,15 @@ intervals cover long Unicode comments, folds, nesting, empty matches and
 syntax/depth refusal. Full structured forms and worker integration remain
 open.
 
+M06bp moves the lexical state into std-only td-header. The public mail
+facade retains its existing errors, source authorization, position and
+polling contract. A private adapter binds each shared admission call to this
+turn's original job/email work owner and Tick; it adds no visits, records,
+steps or retained state. Shared result extents/status are re-exported. The
+shared cursor stores the original Copy admission error, so replacing the
+adapter cannot revive failure. td-header/DESIGN.md owns the common syntax and
+bounded callback contract; mail placement and protocol policy remain here.
+
 ### 1.31 Resident date-time interpretation
 
 M06x supplies `header_date::Cursor` over one complete immutable field value,
@@ -1577,6 +1586,11 @@ Unicode, exact charges, long inputs, scanner-delimited field boundaries and
 sticky failures. Allocation intervals cover both kinds, long input and
 malformed/work refusal. Complete address/MessageIds grammars and worker
 integration remain open.
+
+M06bp similarly moves delimited-token state into td-header and preserves
+this mail facade. Kind, Extent and Status are shared; the private admission
+adapter and error mapping keep the original mail resource/refusal semantics.
+The fixed 64-byte and 160-visit/32-record bounds remain unchanged.
 
 ### 1.34 Resident MessageIds list grammar
 

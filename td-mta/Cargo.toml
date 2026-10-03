@@ -13,6 +13,7 @@ clippy-all-targets = true
 
 [dependencies]
 td-crypto = { path = "../td-crypto" }
+td-header = { path = "../td-header" }
 td-json = { path = "../td-json" }
 
 [[test]]

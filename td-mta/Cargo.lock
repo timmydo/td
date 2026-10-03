@@ -197,6 +197,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-header"
+version = "0.1.0"
+
+[[package]]
 name = "td-json"
 version = "0.1.0"
 
@@ -205,6 +209,7 @@ name = "td-mta"
 version = "0.1.0"
 dependencies = [
  "td-crypto",
+ "td-header",
  "td-json",
 ]
 
