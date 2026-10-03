@@ -86,8 +86,8 @@ dropped. With a disk selected, Enter continues to the settings step
 described below and Escape there goes back to the list, keeping the drafts.
 Its library also has pure, unconnected progress and completion views. A
 live boot starts the window in the graphical session ("Live startup"); the
-release profile still waits for end-to-end installation evidence
-(increment 7).
+end-to-end installation evidence is in place for optical media, and USB
+media and activating the release profile remain (increment 7).
 
 ### Live startup
 
@@ -131,9 +131,19 @@ is not visible to it. The evidence changes nothing the wizard does; a
 command line td-setup cannot read leaves it off.
 
 `td-recipe-eval qemu-boot-live` boots the medium `build-iso` composes, from
-the same verified deployment and with a key made for the run, directly from
-its kernel and live selector with both tokens appended, the ISO attached
-read-only as a virtio disk and an empty sparse disk after it. Once
+the same verified deployment and with a key made for the run, through UEFI
+firmware as optical media, with an empty sparse disk after it. Firmware
+passes no command line on the removable-media path, so the run's private
+copy of the firmware's variables holds one boot entry, `Boot0000` first in
+`BootOrder`, naming only `\EFI\BOOT\BOOTX64.EFI`, which firmware loads from
+the first filesystem holding it, removable media first, with `audit=0`, the
+autotest tokens and the setup-input token as its load options; the kernel
+appends them to its built-in command line and the live selector hands them
+on. The entry is written in edk2's variable store layout into a copy made
+for that boot. A template OVMF would reformat (a firmware volume header of
+the wrong length, revision, kind or checksum), a store holding a variable
+edk2 has not finished writing, any boot entry, `BootOrder` or `BootNext`, or
+no erased room is refused. Once
 `TD-SETUP-LIVE-READY` is seen it drives the wizard through QEMU's emulated
 keyboard, acting only after td-setup has said the state the act is for:
 welcome, the one listed destination, a username, hostname and time zone
@@ -184,9 +194,8 @@ report `id -un`, the home a bare `cd` from `/` reaches through `HOME` with
 `pwd -P`, and `/etc/timezone` as `dana /var/home/dana Asia/Tokyo`; on the
 first boot it writes a per-run token into a file in that home and syncs,
 and each boot reports the file's contents and the home's inode from
-`ls -di .`, the second boot the same token and inode as the first. Booting
-the medium itself through firmware is still to be proven (increment 7);
-`./test-iso` boots the medium through firmware by hand.
+`ls -di .`, the second boot the same token and inode as the first.
+`./test-iso` boots a medium through firmware by hand, with no tokens.
 
 Starting the wizard grants it nothing a session program lacked: td-authd
 admits any UID-1000 peer at the intake, and on a live boot those include
@@ -1185,7 +1194,9 @@ not discover `/etc/zoneinfo` automatically.
    Increment 6 proves the flow and the firmware boots with the account,
    host and home reported, the zone named by the compositor's clock and
    shown on it, and the account's login shell keeping a file in the same
-   home across both boots; this adds booting the ISO through firmware.
+   home across both boots, and `qemu-boot-live` boots the ISO itself
+   through firmware as optical media. Booting the live medium as USB mass
+   storage in that oracle, and activating the profile, remain.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media

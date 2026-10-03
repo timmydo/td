@@ -3,16 +3,17 @@
 //! keys carry it through the destination and settings pages to the
 //! installation service's review, back, to a second review, and through
 //! the compositor's consent to an installed disk (td-install/INSTALLER.md
-//! increment 6).
+//! increment 6, and increment 7's firmware boot of the medium).
 //!
 //! The medium is `build-iso`'s, composed by the same function from the same
-//! verified store deployment and signed with a key made for this run. The
-//! boot is direct, kernel and live selector from that medium, so the
-//! autotest and wizard-evidence tokens can be appended; the ISO is attached
-//! read-only as a virtio disk, which the selector finds, mounts and
-//! authenticates, and an empty sparse disk follows it as the only eligible
-//! destination. No automated check boots this medium through firmware or
-//! optical media; `./test-iso` does so by hand.
+//! verified store deployment and signed with a key made for this run, and
+//! firmware boots it as optical media: the run's private copy of the
+//! firmware's variables holds one boot entry, the medium's removable
+//! loader with the autotest and wizard-evidence tokens as its load options,
+//! which the kernel appends to its built-in command line and the live
+//! selector hands on. The selector finds, mounts and authenticates the
+//! medium, and an empty sparse disk after it is the only eligible
+//! destination.
 //!
 //! Once the live session says the wizard is ready, every key is pressed
 //! through QEMU's emulated keyboard only after td-setup says it showed the
@@ -39,8 +40,7 @@
 //! for its clock, and its status bar, captured from the display, must end
 //! that clock in the zone's offset. The account's serial login shell must
 //! say who it is, its home and zone, and read back on the second boot the
-//! file it wrote into that same home on the first. Booting the medium itself
-//! through firmware is increment 7.
+//! file it wrote into that same home on the first.
 use super::build_iso::{live_medium, LiveMedium};
 use super::install::{
     cold_boots, image_volume_identity, installation_timeout, system_target_capacity, ColdBoots,
@@ -52,8 +52,9 @@ use super::*;
 const TD_SETUP_LIVE_MARKER: &str = td_recipe::ladder::TD_SETUP_LIVE_MARKER;
 /// The live volume is half of RAM and the stock session runs on the rest.
 const LIVE_MEMORY_MIB: &str = "4096";
-/// The destination the wizard should list: the disk after the medium.
-const TARGET_KERNEL_NAME: &str = "vdb";
+/// The destination the wizard should list: the only virtio disk, the
+/// medium being optical.
+const TARGET_KERNEL_NAME: &str = "vda";
 const USERNAME: &str = "dana";
 const HOSTNAME: &str = "td-wizard";
 /// Typed into the time zone row, which seeks the first zone it begins.
@@ -122,12 +123,12 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         autotest_wait_token(timeout),
         td_recipe::ladder::SETUP_INPUT_CMDLINE_TOKEN
     );
-    println!("   [qemu-boot-live] booting deployment {id} live from its medium");
+    println!("   [qemu-boot-live] booting deployment {id} live from its medium through firmware");
     let result = boot_source(
         &qemu,
         BootSource::LiveSetup {
-            kernel: &kernel,
-            initramfs: &live,
+            code: &code,
+            vars: &vars,
             target: &target,
             script: &script,
         },
@@ -192,7 +193,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         },
     )?;
     println!(
-        "PASS: the live medium booted its signed deployment into the graphical \
+        "PASS: the live medium, booted through firmware as optical media, \
+         booted its signed deployment into the graphical \
          session; the installer wizard, focused with td-authd's setup intake \
          bound, took physical keys through the destination and settings pages \
          to the service's review of {TARGET_KERNEL_NAME} for {USERNAME}@{HOSTNAME} \

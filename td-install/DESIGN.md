@@ -1124,13 +1124,16 @@ the new kernel's `boot_params`. Table invalidation also runs without an
 SMBIOS pointer. Normal firmware entry still consumes its initrd table,
 and EFI runtime services remain enabled across the selector handoff.
 
-Firmware passes **no command line**, so the stub's must be built in
-(`CONFIG_CMDLINE`). That costs nothing under this design and is the reason
-the design is shaped this way: the kernel on the ESP is a *fixed* stub whose
-only job is to reach `td-boot` on the Btrfs volume, and the per-deployment
-command line is the one `td-boot` already builds for its kexec. The ESP
-therefore never changes when a deployment does, which is D5 restated as a
-property of the boot flow rather than as a rule.
+Firmware passes **no command line** on the removable-media path, so the
+stub's must be built in (`CONFIG_CMDLINE`). That costs nothing under
+this design and is the reason the design is shaped this way: the kernel
+on the ESP is a *fixed* stub whose only job is to reach `td-boot` on the
+Btrfs volume, and the per-deployment command line is the one `td-boot`
+already builds for its kexec. The ESP therefore never changes when a
+deployment does, which is D5 restated as a property of the boot flow
+rather than as a rule. A boot entry naming the stub can still add load
+options, which the stub appends to the built-in line; `qemu-boot-live`
+gives a firmware-booted live medium its test tokens that way.
 
 `td-install layout DESTINATION [EFI-KERNEL SELECTOR-INITRAMFS]` can
 populate both fixed boot files while creating the GPT and ESP. Supply both

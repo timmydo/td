@@ -1376,6 +1376,24 @@ fn firefox_boot_oracles(tokens: &str) -> (bool, bool) {
     (physical_input, physical_input && !audit)
 }
 
+/// The description of the live medium's boot entry.
+const LIVE_ENTRY: &str = "td live medium";
+
+/// What a firmware-booted medium's kernel is given beyond its built-in
+/// command line: audit off, as every non-audit oracle has it, and `extra`.
+fn firmware_options(extra: &str) -> String {
+    if extra
+        .split_ascii_whitespace()
+        .any(|token| token == KERNEL_AUDIT_CMDLINE_TOKEN)
+    {
+        extra.to_string()
+    } else if extra.is_empty() {
+        KERNEL_AUDIT_OFF_CMDLINE_TOKEN.to_string()
+    } else {
+        format!("{KERNEL_AUDIT_OFF_CMDLINE_TOKEN} {extra}")
+    }
+}
+
 fn kernel_append(extra: &str) -> String {
     let audit_enabled = extra
         .split_ascii_whitespace()
@@ -4636,11 +4654,13 @@ enum BootSource<'a> {
         attachment: FirmwareAttachment,
         installation_target: Option<&'a install::TargetDisk>,
     },
-    /// A live medium booted direct, with a disposable target disk after it
-    /// and the wizard driven by `script`.
+    /// A live medium booted through firmware as optical media, its tokens
+    /// in a boot entry written into the boot's own copy of the `vars`
+    /// template; a disposable target disk follows it and `script` drives
+    /// the wizard.
     LiveSetup {
-        kernel: &'a Path,
-        initramfs: &'a Path,
+        code: &'a Path,
+        vars: &'a Path,
         target: &'a install::TargetDisk,
         script: &'a [setup_input::SetupStep],
     },
@@ -4864,8 +4884,23 @@ fn boot_source(
     // leaving the kernel's audit state off still permits unconditional seccomp
     // kill records to reach printk when CONFIG_AUDIT is compiled in.
     let append = kernel_append(plan.extra_append);
+    // Firmware passes no command line of its own; the live medium's tokens
+    // reach its kernel as a boot entry's load options, written into this
+    // boot's own copy of the variables, never the template.
+    let live_vars = match source {
+        BootSource::LiveSetup { vars, .. } => {
+            let copy = dir.join("live-vars.fd");
+            efi::copy_input(vars, &copy)?;
+            efi::boot_entry(&copy, LIVE_ENTRY, &firmware_options(plan.extra_append))?;
+            Some(copy)
+        }
+        _ => None,
+    };
     let mut cmd = Command::new(qemu);
-    let machine = if matches!(source, BootSource::Firmware { .. }) {
+    let machine = if matches!(
+        source,
+        BootSource::Firmware { .. } | BootSource::LiveSetup { .. }
+    ) {
         "q35"
     } else {
         "pc"
@@ -4903,10 +4938,7 @@ fn boot_source(
     }
     match source {
         BootSource::Direct { kernel, initramfs }
-        | BootSource::DirectReordered { kernel, initramfs }
-        | BootSource::LiveSetup {
-            kernel, initramfs, ..
-        } => {
+        | BootSource::DirectReordered { kernel, initramfs } => {
             cmd.arg("-kernel")
                 .arg(kernel)
                 .arg("-initrd")
@@ -4914,6 +4946,13 @@ fn boot_source(
                 .args(["-append", &append]);
         }
         BootSource::Firmware { code, vars, .. } => {
+            cmd.arg("-drive").arg(efi::pflash_arg(code, 0, true));
+            cmd.arg("-drive").arg(efi::pflash_arg(vars, 1, false));
+        }
+        BootSource::LiveSetup { code, .. } => {
+            let vars = live_vars
+                .as_deref()
+                .ok_or("the live boot has no variables")?;
             cmd.arg("-drive").arg(efi::pflash_arg(code, 0, true));
             cmd.arg("-drive").arg(efi::pflash_arg(vars, 1, false));
         }
@@ -4975,7 +5014,8 @@ fn boot_source(
             BootSource::Firmware {
                 attachment: FirmwareAttachment::Optical,
                 ..
-            } => {
+            }
+            | BootSource::LiveSetup { .. } => {
                 cmd.arg("-drive").arg(media::optical_drive_arg(disk.path));
             }
             BootSource::Firmware {
@@ -12687,6 +12727,13 @@ mod tests {
     }
 
     #[test]
+    fn a_firmware_boot_is_given_audit_off_unless_it_asks_for_audit() {
+        assert_eq!(firmware_options(""), "audit=0");
+        assert_eq!(firmware_options("td.autotest=1"), "audit=0 td.autotest=1");
+        assert_eq!(firmware_options("audit=1 td.x=1"), "audit=1 td.x=1");
+    }
+
+    #[test]
     fn the_setup_token_belongs_to_exactly_the_live_setup_boot() {
         let dir =
             std::env::temp_dir().join(format!("td-setup-boot-{}-{}", std::process::id(), line!()));
@@ -12711,8 +12758,8 @@ mod tests {
         };
         let kernel = Path::new("/nonexistent/bzImage");
         let live = BootSource::LiveSetup {
-            kernel,
-            initramfs: kernel,
+            code: kernel,
+            vars: kernel,
             target: &target,
             script: &script,
         };
