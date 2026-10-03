@@ -94,10 +94,12 @@ subpart, and drop NUL. Remove NUL after UTF-8 replacement so its removal
 never joins broken byte sequences. Text form unfolds an accepted line ending
 followed by SP/HTAB, removes initial SP, decodes only properly placed RFC
 2047 encoded words with known charsets, removes their encoded NUL/control
-characters, then applies NFC. Whitespace between adjacent valid encoded
-words is ignored as RFC 2047 requires. Bad placement, context-forbidden Q
-characters or an unknown charset leaves the encoded word literal; malformed
-payload of an otherwise decodable word uses replacement and resumes.
+characters, then applies NFC. Whitespace between adjacent recognized encoded
+words is ignored as RFC 2047 requires, including words whose malformed payload
+produces replacement. Whitespace before a literal token or EOF is preserved.
+For bad placement, context-forbidden Q characters or an unknown charset,
+retain the whole literal token. Malformed payload of an otherwise decodable
+word uses replacement and resumes.
 Unfolding removes the accepted line ending, not the following whitespace.
 Encoded words longer than RFC 2047's 75-character ceiling remain literal.
 Decode adjacent words separately; do not join invalid split multibyte

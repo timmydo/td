@@ -2006,6 +2006,64 @@ fn encoded_word_decoding() {
     assert_eq!(before, after, "encoded-word decoding allocated");
 }
 
+fn header_text() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_text::{Cursor, Status},
+        ports::{Deadline, Tick},
+    };
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 10000,
+            records: 10000,
+            ..Charge::default()
+        },
+    );
+    let long = "=?utf-8?Q?aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?=";
+    assert_eq!(long.len(), 76);
+    let before = COUNTERS.snapshot();
+    for (input, expected, problem) in [
+        (
+            b"  =?utf-8?Q?hello?=\r\n\t=?utf-8?B?4oKs?=  x".as_slice(),
+            "hello€  x",
+            false,
+        ),
+        (
+            b"=?utf-8?Q?=E1=QZ=80?= \r\n\t=?unknown?Q?a?=",
+            "��QZ� \t=?unknown?Q?a?=",
+            true,
+        ),
+        (b" \ta\0\xe1\x80b\xef\xbf\xbf", "\ta�b�", true),
+        (b"a =?unknown?Q?x?=", "a =?unknown?Q?x?=", false),
+        (long.as_bytes(), long, false),
+    ] {
+        let mut cursor = Cursor::new(black_box(input));
+        let mut expected = expected.chars();
+        let mut done = false;
+        for _ in 0..1000 {
+            let checkpoint = cursor;
+            let status = cursor.poll(Tick(1), &mut work).unwrap();
+            cursor = checkpoint;
+            assert_eq!(cursor.poll(Tick(1), &mut work).unwrap(), status);
+            match status {
+                Status::Scalar(value) => assert_eq!(Some(value), expected.next()),
+                Status::Yield => {}
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(expected.next(), None);
+        assert_eq!(cursor.is_encoding_problem(), problem);
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "unstructured header decoding allocated");
+}
+
 fn unicode_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2513,6 +2571,7 @@ fn main() {
         unicode_nfc();
         encoded_word_candidates();
         encoded_word_decoding();
+        header_text();
         mime_input();
         mime_headers();
         body_value();
@@ -2610,6 +2669,7 @@ fn main() {
     unicode_nfc();
     encoded_word_candidates();
     encoded_word_decoding();
+    header_text();
     mime_input();
     mime_headers();
     body_value();

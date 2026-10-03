@@ -1179,6 +1179,50 @@ a caller cannot treat candidate recognition as placement authorization or
 join charset bytes from separate words. Resident NFC composition with a
 replayable header source remains a subsequent increment.
 
+### 1.26 Resident unstructured header decoding
+
+M06s supplies `header_text::Cursor` over one immutable unstructured field
+value, excluding its final line ending. The caller must authorize the field
+and form first. This cursor is not an address/comment/parameter parser and
+must not be applied to structured fields to authorize encoded words there.
+It produces Text-form scalars before NFC; it does not yet provide the complete
+JMAP Text projection or serializer.
+
+Each poll returns at most one Scalar, Yield or Complete. Unfold CRLF or LF
+followed by SP/HTAB, preserving that whitespace; preserve other endings and
+bare CR. Remove only initial SP from the unfolded stream. Decode literal
+UTF-8 with maximal-subpart replacement, then remove NUL and replace I-JSON
+noncharacters. Other literal controls remain scalars for later JSON escaping.
+Candidate words begin at field start or after SP/HTAB and must end at the
+next such boundary or EOF. A bad suffix, an overlong token or a syntactic
+nonword stays literal, without accepting a convenient encoded prefix.
+
+Recognized words use section 1.25's independent per-word decoder. Retain
+whitespace after a word as raw offsets while scanning for the next token.
+Discard it only if that token is another recognized word; otherwise replay
+and unfold the same whitespace, preserving trailing spaces/tabs. Recognized
+malformed payloads still decode with replacement and participate in this
+adjacency rule. Removing a NUL or other decoded control does not retroactively
+create lexical boundaries or a new initial-SP trim opportunity.
+
+The copied cursor fits 208 bytes, including its borrowed source and current
+word decoder, within the future 256-byte decoding checkpoint. It owns no
+header string, candidate buffer or whitespace buffer. Candidate scans stop
+after at most 76 raw bytes; an oversized token streams literally thereafter.
+Whitespace scanning/replay advances one unfolded byte per poll. Recognition
+is a separate bounded turn, charging at most 226 records/225 byte visits;
+other turns charge source/lookahead, charset and word work as performed.
+Replay repeats those charges. Tests retain a one-MiB ASCII literal header
+within the default two-million-record job allowance.
+
+The cursor latches failures; copied checkpoints contain no meter and the
+owner must retain retirement across them. The owner brackets turns with
+clock/cancellation checks and charges output bytes separately. Cached Complete
+is inert. The final diagnostic combines literal and word decoding problems.
+NFC integration must also retain the aggregate header source/step budget,
+exact restart points and the four-checkpoint memory reservation. No complete
+normalization pipeline, worker stack or service activation is claimed here.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

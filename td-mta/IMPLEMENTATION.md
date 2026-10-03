@@ -1313,6 +1313,14 @@ Initial independently landable increments:
   deadline/exhaustion behavior and allocation-free polls. Header placement,
   whitespace suppression and normalized-header composition remain open.
 
+- **M06s — resident unstructured header decoding:** compose unfolding, initial
+  SP removal, whole-token encoded-word placement, conditional adjacent-word
+  whitespace suppression, UTF-8 replacement and scalar filtering. Retain raw
+  offsets for bounded candidate/whitespace replay without copying the header.
+  Verify long literals/gaps, default-budget maximal ASCII, copied states,
+  work/deadline failures and allocation-free turns. NFC composition and
+  structured header-form authorization/parsing remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

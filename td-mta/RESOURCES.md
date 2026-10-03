@@ -825,6 +825,13 @@ Rust allocation intervals cover Q/Base64 success, malformed-unit recovery,
 control/noncharacter filtering and copied replay without counter changes.
 No complete header pipeline or worker-stack bound is claimed.
 
+The resident unstructured header cursor fits 208 bytes, including its source,
+UTF-8 state, current word decoder and raw replay offsets, within a future
+256-byte decoding checkpoint. It uses the same decoder region with no
+candidate, whitespace or decoded-header buffer. Allocation intervals cover
+folding, words, malformed literals/payloads, whitespace retention and copied
+replay. Full normalization composition and worker-stack bounds remain open.
+
 Body charset prescan fits 64 bytes in the existing 2 KiB decoder/HTML/snippet
 state and future decoding cursor checkpoint. It borrows caller fragments
 and retains no source, body copy or output buffer. Its isolated allocation

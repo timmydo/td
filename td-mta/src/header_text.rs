@@ -1,0 +1,496 @@
+//! Unstructured header Text scalars before NFC; field/form authorization is external.
+pub use crate::encoded_word::decode::Status;
+use crate::{
+    admission::work::{Charge, Meter, Stop},
+    encoded_word::{self, Context, Word},
+    mime_charset::{Charset, Decoder, Status as Decoded},
+    ports::Tick,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    Work(Stop),
+    InvalidState,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Work(error) => write!(f, "header text work: {error}"),
+            Self::InvalidState => f.write_str("invalid header text state"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<crate::mime_charset::Error> for Error {
+    fn from(error: crate::mime_charset::Error) -> Self {
+        match error {
+            crate::mime_charset::Error::Work(stop) => Self::Work(stop),
+            crate::mime_charset::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
+impl From<crate::encoded_word::decode::Error> for Error {
+    fn from(error: crate::encoded_word::decode::Error) -> Self {
+        match error {
+            crate::encoded_word::decode::Error::Work(stop) => Self::Work(stop),
+            crate::encoded_word::decode::Error::InvalidState => Self::InvalidState,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Leading,
+    Boundary,
+    Literal,
+    Gap,
+    Candidate,
+    Recognize,
+    EmitGap,
+    Word,
+    Finish,
+    Complete,
+}
+/// Copies retain the immutable source and decoder state, never work counters.
+#[derive(Clone, Copy)]
+pub struct Cursor<'a> {
+    source: &'a [u8],
+    position: usize,
+    scan: usize,
+    token_start: usize,
+    gap_end: usize,
+    phase: Phase,
+    literal: Decoder,
+    word: Option<encoded_word::decode::Cursor<'a>>,
+    problem: bool,
+    failure: Option<Error>,
+}
+impl<'a> Cursor<'a> {
+    /// Supply one authorized unstructured field value, without its final ending.
+    pub const fn new(source: &'a [u8]) -> Self {
+        Self {
+            source,
+            position: 0,
+            scan: 0,
+            token_start: 0,
+            gap_end: 0,
+            phase: Phase::Leading,
+            literal: Decoder::new(Charset::Utf8),
+            word: None,
+            problem: false,
+            failure: None,
+        }
+    }
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.problem
+            || self.literal.is_encoding_problem()
+            || match &self.word {
+                Some(word) => word.is_encoding_problem(),
+                None => false,
+            }
+    }
+    pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if matches!(self.phase, Phase::Complete) {
+            return Ok(Status::Complete);
+        }
+        let result = self.step(now, work);
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
+    fn byte(&self, at: usize, now: Tick, work: &mut Meter) -> Result<Option<u8>, Error> {
+        if at > self.source.len() {
+            return Err(Error::InvalidState);
+        }
+        work.charge(
+            now,
+            Charge {
+                io_bytes: u64::from(at < self.source.len()),
+                ..Charge::default()
+            },
+        )
+        .map_err(Error::Work)?;
+        Ok(self.source.get(at).copied())
+    }
+    // Fold removal preserves the following whitespace. Return that octet
+    // and its complete raw extent so checkpoints need no unfolding buffer.
+    fn atom(&self, at: usize, now: Tick, work: &mut Meter) -> Result<Option<(u8, usize)>, Error> {
+        let Some(byte) = self.byte(at, now, work)? else {
+            return Ok(None);
+        };
+        let next = at.checked_add(1).ok_or(Error::InvalidState)?;
+        let after_line = match byte {
+            b'\r' if self.byte(next, now, work)? == Some(b'\n') => {
+                Some(next.checked_add(1).ok_or(Error::InvalidState)?)
+            }
+            b'\n' => Some(next),
+            _ => None,
+        };
+        if let Some(after_line) = after_line {
+            if let Some(space @ (b' ' | b'\t')) = self.byte(after_line, now, work)? {
+                return Ok(Some((
+                    space,
+                    after_line.checked_add(1).ok_or(Error::InvalidState)?,
+                )));
+            }
+        }
+        Ok(Some((byte, next)))
+    }
+    fn begin_candidate(&mut self, at: usize) {
+        self.token_start = at;
+        self.scan = at;
+        self.phase = Phase::Candidate;
+    }
+    fn reject_candidate(&mut self) {
+        self.gap_end = self.token_start;
+        self.phase = if self.position < self.gap_end {
+            Phase::EmitGap
+        } else {
+            Phase::Literal
+        };
+    }
+    fn literal_byte(
+        &mut self,
+        byte: u8,
+        next: usize,
+        now: Tick,
+        work: &mut Meter,
+    ) -> Result<Status, Error> {
+        let decoded = self.literal.poll(&[byte], false, now, work)?;
+        if decoded.consumed == 1 {
+            self.position = next;
+            if !matches!(self.phase, Phase::EmitGap) {
+                self.phase = if matches!(byte, b' ' | b'\t') {
+                    Phase::Boundary
+                } else {
+                    Phase::Literal
+                };
+            }
+        } else if decoded.consumed != 0 {
+            return Err(Error::InvalidState);
+        }
+        self.literal_status(decoded.status)
+    }
+    fn literal_status(&mut self, status: Decoded) -> Result<Status, Error> {
+        self.problem |= self.literal.is_encoding_problem();
+        match status {
+            Decoded::NeedInput => Ok(Status::Yield),
+            Decoded::Complete if matches!(self.phase, Phase::Finish) => {
+                self.phase = Phase::Complete;
+                Ok(Status::Complete)
+            }
+            Decoded::Complete => Err(Error::InvalidState),
+            Decoded::Scalar('\0') => Ok(Status::Yield),
+            Decoded::Scalar(value) => {
+                let code = u32::from(value);
+                if matches!(code, 0xfdd0..=0xfdef) || code & 0xffff >= 0xfffe {
+                    self.problem = true;
+                    Ok(Status::Scalar('\u{fffd}'))
+                } else {
+                    Ok(Status::Scalar(value))
+                }
+            }
+        }
+    }
+    fn step(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        work.charge(now, Charge::default()).map_err(Error::Work)?;
+        match self.phase {
+            Phase::Leading => {
+                match self.atom(self.position, now, work)? {
+                    Some((b' ', next)) => self.position = next,
+                    _ => self.phase = Phase::Boundary,
+                }
+                Ok(Status::Yield)
+            }
+            Phase::Boundary => {
+                match self.atom(self.position, now, work)? {
+                    Some((b'=', _)) => self.begin_candidate(self.position),
+                    Some((byte, next)) => return self.literal_byte(byte, next, now, work),
+                    None => self.phase = Phase::Finish,
+                }
+                Ok(Status::Yield)
+            }
+            Phase::Literal | Phase::EmitGap => {
+                if matches!(self.phase, Phase::EmitGap) && self.position == self.gap_end {
+                    self.phase = Phase::Literal;
+                    return Ok(Status::Yield);
+                }
+                match self.atom(self.position, now, work)? {
+                    Some((byte, next)) => self.literal_byte(byte, next, now, work),
+                    None => {
+                        self.phase = Phase::Finish;
+                        Ok(Status::Yield)
+                    }
+                }
+            }
+            Phase::Gap => {
+                match self.atom(self.scan, now, work)? {
+                    Some((b' ' | b'\t', next)) => self.scan = next,
+                    Some((b'=', _)) => self.begin_candidate(self.scan),
+                    _ => {
+                        self.token_start = self.scan;
+                        self.reject_candidate();
+                    }
+                }
+                Ok(Status::Yield)
+            }
+            Phase::Candidate => {
+                match self.atom(self.scan, now, work)? {
+                    Some((b' ' | b'\t', _)) | None => self.phase = Phase::Recognize,
+                    Some((_, next)) => {
+                        self.scan = next;
+                        if self
+                            .scan
+                            .checked_sub(self.token_start)
+                            .ok_or(Error::InvalidState)?
+                            > 75
+                        {
+                            self.reject_candidate();
+                        }
+                    }
+                }
+                Ok(Status::Yield)
+            }
+            Phase::Recognize => {
+                let token = self
+                    .source
+                    .get(self.token_start..self.scan)
+                    .ok_or(Error::InvalidState)?;
+                match Word::recognize(token, Context::Text, now, work).map_err(Error::Work)? {
+                    Some(word) => {
+                        self.word = Some(encoded_word::decode::Cursor::new(word));
+                        self.position = self.scan;
+                        self.phase = Phase::Word;
+                    }
+                    None => self.reject_candidate(),
+                }
+                Ok(Status::Yield)
+            }
+            Phase::Word => {
+                let word = self.word.as_mut().ok_or(Error::InvalidState)?;
+                let status = word.poll(now, work)?;
+                self.problem |= word.is_encoding_problem();
+                if status == Status::Complete {
+                    self.word = None;
+                    self.scan = self.position;
+                    self.phase = Phase::Gap;
+                    Ok(Status::Yield)
+                } else {
+                    Ok(status)
+                }
+            }
+            Phase::Finish => {
+                let decoded = self.literal.poll(&[], true, now, work)?;
+                self.literal_status(decoded.status)
+            }
+            Phase::Complete => Ok(Status::Complete),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+    use crate::ports::Deadline;
+    fn work() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 16 * 1024 * 1024,
+                records: 2_000_000,
+                ..Charge::default()
+            },
+        )
+    }
+    fn text(input: &[u8]) -> (String, bool) {
+        let mut cursor = Cursor::new(input);
+        assert!(std::mem::size_of_val(&cursor) <= 208);
+        let mut work = work();
+        let mut output = String::new();
+        for _ in 0..10000 {
+            let before = work.remaining();
+            let status = cursor.poll(Tick(1), &mut work).unwrap();
+            assert!(before.records - work.remaining().records <= 226);
+            assert!(before.io_bytes - work.remaining().io_bytes <= 225);
+            match status {
+                Status::Scalar(value) => output.push(value),
+                Status::Yield => {}
+                Status::Complete => {
+                    return (output, cursor.is_encoding_problem());
+                }
+            }
+        }
+        panic!("header did not finish");
+    }
+    #[test]
+    fn unfolding_trims_only_initial_spaces_and_preserves_literal_text() {
+        for (input, expected, problem) in [
+            (b"".as_slice(), "", false),
+            (b"   hello  ", "hello  ", false),
+            (b" \t hello\r\n world\n\t!", "\t hello world\t!", false),
+            (b"\r\n  hello", "hello", false),
+            (b"a\r\nb\rc\n", "a\r\nb\rc\n", false),
+            (b"a\0b\xe1\0\x80", "ab��", true),
+            (b"e\xcc\x81", "e\u{301}", false),
+            (b"\xef\xbf\xbf", "�", true),
+            (b"\xc2\x85", "\u{85}", false),
+        ] {
+            assert_eq!(text(input), (expected.to_owned(), problem), "{input:?}");
+        }
+    }
+    #[test]
+    fn words_require_whole_tokens_and_adjacent_gap_suppression_is_conditional() {
+        for (input, expected, problem) in [
+            (
+                b"=?utf-8?Q?one?= \r\n\t=?utf-8?B?dHdv?=".as_slice(),
+                "onetwo",
+                false,
+            ),
+            (b"=?utf-8?Q?one?= \r\n\ttext", "one \ttext", false),
+            (b"=?utf-8?Q?one?=\r\n =?utf-8?Q?two?=", "onetwo", false),
+            (b"=?utf-8?Q?one?=\r\n x", "one x", false),
+            (b"=?utf-8?Q?one?=\n\t=?utf-8?Q?two?=", "onetwo", false),
+            (b"=?utf-8?Q?one?= \r\n\t", "one \t", false),
+            (
+                b"=?utf-8?Q?one?=  =?unknown?Q?two?=",
+                "one  =?unknown?Q?two?=",
+                false,
+            ),
+            (b"a=?utf-8?Q?one?=", "a=?utf-8?Q?one?=", false),
+            (b"=?utf-8?Q?one?=x", "=?utf-8?Q?one?=x", false),
+            (
+                b"=?utf-8?Q?one?==?utf-8?Q?two?=",
+                "=?utf-8?Q?one?==?utf-8?Q?two?=",
+                false,
+            ),
+            (b"=?utf-8?Q?=E2=82?= =?utf-8?Q?=AC?=", "��", true),
+            (b"=?utf-8?Q?a=QZ?= =?utf-8?Q?b?=", "a�QZb", true),
+            (b"=?utf-8?Q?=00?=  x", "  x", false),
+        ] {
+            assert_eq!(text(input), (expected.to_owned(), problem), "{input:?}");
+        }
+    }
+    #[test]
+    fn long_false_tokens_and_whitespace_replay_stay_bounded() {
+        let long = format!("=?utf-8?Q?{}?=", "a".repeat(1000));
+        assert_eq!(text(long.as_bytes()), (long.clone(), false));
+        let gap = format!("=?utf-8?Q?a?={}b", " \r\n\t".repeat(300));
+        assert_eq!(
+            text(gap.as_bytes()),
+            (format!("a{}b", " \t".repeat(300)), false)
+        );
+        let source = vec![b'x'; 1024 * 1024];
+        let mut cursor = Cursor::new(&source);
+        let mut work = work();
+        let mut count = 0;
+        let mut complete = false;
+        for _ in 0..source.len() + 10 {
+            match cursor.poll(Tick(1), &mut work).unwrap() {
+                Status::Scalar('x') => count += 1,
+                Status::Scalar(_) => panic!("unexpected scalar"),
+                Status::Yield => {}
+                Status::Complete => {
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete);
+        assert_eq!(count, source.len());
+        assert_eq!(work.remaining().records, 2_000_000 - source.len() as u64);
+    }
+    #[test]
+    fn every_phase_replays_without_refunding_and_failures_retire() {
+        assert_eq!(
+            Error::Work(Stop::Records).to_string(),
+            "header text work: work record budget exhausted"
+        );
+        assert_eq!(Error::InvalidState.to_string(), "invalid header text state");
+        for input in [
+            b"  a\xe1\x80 =?utf-8?Q?e=CC=81?= \r\n\t=?utf-8?B?4oKs?=  tail".as_slice(),
+            b"=?utf-8?Q?x?= \t=?unknown?Q?x?=",
+            b"=?utf-8?Q?=E1=QZ=80?=  ",
+            b"tail\xe1\x80",
+            b"=?utf-8?Q?one?=\r\n =?utf-8?Q?two?=",
+            b"a =?unknown?Q?x?=",
+            b"=?utf-8?Q?aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?=",
+        ] {
+            let mut cursor = Cursor::new(input);
+            let mut work = work();
+            let mut done = false;
+            for _ in 0..1000 {
+                let saved = cursor;
+                let before = work.remaining();
+                let first = cursor.poll(Tick(1), &mut work).unwrap();
+                let remaining = work.remaining();
+                let problem = cursor.is_encoding_problem();
+                cursor = saved;
+                assert_eq!(cursor.poll(Tick(1), &mut work).unwrap(), first);
+                assert_eq!(cursor.is_encoding_problem(), problem);
+                assert_eq!(
+                    remaining.io_bytes - work.remaining().io_bytes,
+                    before.io_bytes - remaining.io_bytes
+                );
+                assert_eq!(
+                    remaining.records - work.remaining().records,
+                    before.records - remaining.records
+                );
+                let mut expired = saved;
+                let mut timed_work = self::work();
+                assert_eq!(
+                    expired.poll(Tick(100), &mut timed_work),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                let mut fresh = self::work();
+                let before = fresh.remaining();
+                assert_eq!(
+                    expired.poll(Tick(1), &mut fresh),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                assert_eq!(fresh.remaining(), before);
+                if first == Status::Complete {
+                    done = true;
+                    let before = work.remaining();
+                    assert_eq!(cursor.poll(Tick(100), &mut work), Ok(Status::Complete));
+                    assert_eq!(work.remaining(), before);
+                    break;
+                }
+            }
+            assert!(done);
+        }
+        for (source, io, records, stop) in [
+            (b"x".as_slice(), 0, 100, Stop::IoBytes),
+            (b"x".as_slice(), 100, 0, Stop::Records),
+            (b"=?utf-8?Q?a?=".as_slice(), 10000, 1, Stop::Records),
+        ] {
+            let mut cursor = Cursor::new(source);
+            let mut limited = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: io,
+                    records,
+                    ..Charge::default()
+                },
+            );
+            let mut failed = false;
+            for _ in 0..100 {
+                match cursor.poll(Tick(1), &mut limited) {
+                    Err(error) => {
+                        assert_eq!(error, Error::Work(stop));
+                        assert_eq!(cursor.poll(Tick(1), &mut self::work()), Err(error));
+                        failed = true;
+                        break;
+                    }
+                    Ok(Status::Complete) => panic!("capacity fixture completed"),
+                    Ok(_) => {}
+                }
+            }
+            assert!(failed);
+        }
+    }
+}
