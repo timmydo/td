@@ -1107,7 +1107,7 @@ fn source_tree(source: &Path, destination: &Path, depth: usize) -> Result<()> {
 
 fn stage_sources(root: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination).map_err(|e| format!("create portable source root: {e}"))?;
-    for package in ["td-crypto", "td-mta"] {
+    for package in crate::crypto_policy::LOCAL_SOURCES {
         let source = root.join(package);
         let staged = destination.join(package);
         fs::create_dir(&staged).map_err(|e| format!("create portable crate directory: {e}"))?;
@@ -2569,7 +2569,7 @@ mod tests {
     fn source_staging_excludes_configuration_and_refuses_links_and_missing_inputs() {
         let scratch = Scratch::create(&std::env::temp_dir(), "td-crypto-test").unwrap();
         let root = scratch.0.join("checkout");
-        for package in ["td-mta", "td-crypto"] {
+        for package in crate::crypto_policy::LOCAL_SOURCES {
             let path = root.join(package);
             fs::create_dir_all(path.join("src")).unwrap();
             fs::write(path.join("src/lib.rs"), "source").unwrap();
@@ -2642,8 +2642,14 @@ mod tests {
             fs::remove_file(&source).unwrap();
             fs::rename(&retained, &source).unwrap();
         }
-        assert!(!destination.join("td-mta/.cargo").exists());
-        assert!(!destination.join("td-mta/build.rs").exists());
+        for package in crate::crypto_policy::LOCAL_SOURCES {
+            assert_eq!(
+                fs::read(destination.join(package).join("src/lib.rs")).unwrap(),
+                b"source"
+            );
+            assert!(!destination.join(package).join(".cargo").exists());
+            assert!(!destination.join(package).join("build.rs").exists());
+        }
         fs::write(root.join("td-mta/src/lib.rs"), "changed").unwrap();
         assert_eq!(
             fs::read(destination.join("td-mta/src/lib.rs")).unwrap(),

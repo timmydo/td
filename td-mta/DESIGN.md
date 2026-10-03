@@ -249,16 +249,17 @@ Email and logs are untrusted data for an AI operator, never instructions.
 
 ## 3. Code and dependency boundaries
 
-Use `td-mta/` for the service library and installed binary named `td-mta`.
-The M03b2c packaging entry point supports only `--version` and `--help`;
-service commands arrive with their implementations. Its only direct dependency is `td-crypto = { path = "../td-crypto" }`.
-Application protocols, storage, configuration and scheduling use std plus that
-local facade. There is no separate runtime package or td-net helper executable.
-`td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend;
-`td-crypto/TLS.md` specifies the TLS policy and session contract.
-ClientConfig, ServerConfig, shared clock and public client/server sessions
-are implemented. The mail record pump composes them; admitted transport
-integration and service/resource qualification remain pending.
+Use `td-mta/` for the service library and installed binary named `td-mta`. The
+M03b2c packaging entry point supports only `--version` and `--help`; service
+commands arrive with their implementations. Its direct dependencies are the
+local `td-crypto` and `td-json` crates. Application protocols, storage,
+configuration and scheduling use std plus these local libraries. There is no
+separate runtime package or td-net helper executable. `td-crypto/DESIGN.md`
+owns the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
+specifies the TLS policy and session contract. ClientConfig, ServerConfig,
+shared clock and public client/server sessions are implemented. The mail
+record pump composes them; admitted transport integration and service/resource
+qualification remain pending.
 
 The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate
@@ -276,6 +277,15 @@ its facade.
 Mail transport adapters consume opaque td-crypto configurations/session state.
 The service's transitive lock/executable still includes the backend dependencies;
 it is not described as dependency-free once they are added.
+
+Reusable protocol-independent components belong in shared std-only td
+libraries. The bounded JSON string framer and scalar escaping live in td-json;
+mail scalar decoding, normalization, deadlines and budget adapters remain in
+td-mta. The mail hot path uses only the incremental string API, whose state
+and caller-provided output are fixed; the allocating Json value/parser API is
+not admitted there. The shared library owns no mail, clock, crypto or
+scheduler policy. New extractions must preserve the caller's bounded-work and
+memory contract.
 
 The core may contain owned tables generated from the approved, checksummed
 Unicode 17.0 inputs in UNICODE.md. They add no Cargo dependency or runtime
@@ -298,14 +308,14 @@ and regenerated table.
 These are named data dependencies, not permission to import a Unicode or
 mail parsing library.
 
-The backend admission and gate contract lives in td-crypto/DESIGN.md.
-Both packages stay in the test roster.
-The user approved Rustls with AWS-LC; M03b1 records exact transitive pins,
-features, licenses, roots and rationale; M03b2 pins the portable native inputs.
-No async runtime, web
+The backend admission and gate contract lives in td-crypto/DESIGN.md. All
+three packages stay in the test roster. The user approved Rustls with AWS-LC;
+M03b1 records exact transitive pins, features, licenses, roots and rationale;
+M03b2 pins the portable native inputs. No external async runtime, web
 framework, database, mail parser, serialization or ACME framework rides along.
-The backend increment demonstrates static musl linking and bounded TLS behavior
-before consumers depend on it; exact versions belong in the lock/review.
+The backend increment demonstrates static musl linking and bounded TLS
+behavior before consumers depend on it; exact versions belong in the
+lock/review.
 
 The portable musl artifact has a separate, host-only build manifest: pin Rust
 and its target standard library, the musl C compiler/linker and sysroot needed

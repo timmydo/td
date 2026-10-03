@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 
+pub(crate) const LOCAL_SOURCES: &[&str] = &["td-crypto", "td-json", "td-mta"];
+
 pub(crate) const DEPENDENCIES: &[&str] = &[
     "aws-lc-rs = { version = \"=1.18.1\", default-features = false, features = [\"alloc\", \"non-fips\"] }",
     "rustls = { version = \"=0.23.45\", default-features = false, features = [\"std\", \"tls12\", \"aws_lc_rs\"] }",
@@ -17,7 +19,8 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "392da7600b16c4f4686d6562baa44e329244aad42939a045d38aa39283db63f3",
+        "td-mta" => "f58a9aeabc0e498dcea0c795b6bd5ad42bff6b06a101e9fd6f88f04553c017c1",
+        "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
         _ => {
             return Err(format!(
                 "{name} has no external crypto dependency admission"
@@ -30,7 +33,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
 pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "832f4b9d3354d46a16c61806290b1e3799d72f91790a33daaec61b37695ce63a",
+        "td-mta" => "09cacf7ce066ae2fbfe36dc1da8b04a013143da91fdab1a9a593396d7b3b56ad",
+        "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
         _ => {
             return Err(format!(
                 "{name} has no external crypto dependency admission"
@@ -44,7 +48,7 @@ fn check_pin(name: &str, file: &str, text: &str, expected: &str) -> Result<(), S
     let actual = crate::sha256::hex_digest(text.as_bytes());
     if actual != expected {
         return Err(format!(
-            "{name}/{file} differs from the reviewed crypto admission pin; review the manifest, lock and feature closure before updating this policy"
+            "{name}/{file} differs from the reviewed mail/crypto source pin; review the manifest, lock and feature closure before updating this policy"
         ));
     }
     Ok(())
@@ -146,7 +150,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     let mut expected: BTreeSet<String> = ACTIVE.lines().map(str::to_owned).collect();
     let mut local = vec!["td-crypto"];
     if name == "td-mta" {
-        local.push("td-mta");
+        local.extend(["td-json", "td-mta"]);
     }
     for package in local {
         let path = root
@@ -234,7 +238,7 @@ mod tests {
         for ancestor in [&parent, &path, &nested_config] {
             std::fs::write(ancestor, format!("{config}\n[env]\nCC = \"unapproved\"\n")).unwrap();
             let error = cargo_config(&nested).unwrap_err();
-            assert!(error.contains("reviewed crypto admission pin"), "{error}");
+            assert!(error.contains("reviewed mail/crypto source pin"), "{error}");
             assert!(error.contains(&ancestor.display().to_string()), "{error}");
             std::fs::remove_file(ancestor).unwrap();
             std::fs::create_dir(ancestor).unwrap();
@@ -272,7 +276,7 @@ mod tests {
         );
         std::fs::write(&nested_config, &config).unwrap();
         assert!(cargo_config(&nested).is_ok());
-        for name in ["td-crypto", "td-mta"] {
+        for name in LOCAL_SOURCES {
             std::fs::create_dir(checkout.join(name)).unwrap();
             assert!(no_build_script(&checkout, name).is_ok());
             let script = checkout.join(name).join("build.rs");
@@ -282,6 +286,29 @@ mod tests {
             std::os::unix::fs::symlink("absent", &script).unwrap();
             assert!(no_build_script(&checkout, name).is_err());
         }
+    }
+
+    #[test]
+    fn json_source_pins_refuse_dependency_changes() {
+        let root = root();
+        if !root.join("td-json/Cargo.toml").exists() {
+            return;
+        }
+        let manifest = std::fs::read_to_string(root.join("td-json/Cargo.toml")).unwrap();
+        let lock = std::fs::read_to_string(root.join("td-json/Cargo.lock")).unwrap();
+        assert!(manifest_pin("td-json", &manifest).is_ok());
+        assert!(lock_pin("td-json", &lock).is_ok());
+        assert!(manifest_pin(
+            "td-json",
+            &format!("{manifest}\n[dependencies]\nforeign = \"1\"\n")
+        )
+        .is_err());
+        assert!(lock_pin(
+            "td-json",
+            &format!("{lock}\n[[package]]\nname = \"foreign\"\nversion = \"1.0.0\"\n")
+        )
+        .is_err());
+        assert!(!admitted("td-json"));
     }
 
     #[test]
@@ -337,7 +364,18 @@ mod tests {
             assert!(active_graph(&root, "td-crypto", &bad).is_err());
         }
         let mail = root.join("td-mta").canonicalize().unwrap();
-        let mailgraph = format!("{graph}td-mta v0.1.0 ({})|\n", mail.display());
+        let json = root.join("td-json").canonicalize().unwrap();
+        let mailgraph = format!(
+            "{graph}td-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\n",
+            mail.display(),
+            json.display()
+        );
+        assert!(active_graph(
+            &root,
+            "td-mta",
+            &format!("{graph}td-mta v0.1.0 ({})|\n", mail.display())
+        )
+        .is_err());
         assert!(active_graph(&root, "td-mta", &mailgraph).is_ok());
         assert!(active_graph(&root, "td-mta", &graph).is_err());
     }

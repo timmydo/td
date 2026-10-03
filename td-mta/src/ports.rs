@@ -575,7 +575,7 @@ mod crypto_boundary_tests {
     }
 
     #[test]
-    fn crypto_is_the_only_direct_dependency() {
+    fn direct_dependencies_are_the_reviewed_local_facades() {
         // The roster gate validates TOML shape; pin the permitted dependency
         // table here so adding even another local crate needs a design change.
         let manifest = include_str!("../Cargo.toml");
@@ -590,6 +590,12 @@ mod crypto_boundary_tests {
                 dependencies.push(line);
             }
         }
-        assert_eq!(dependencies, [r#"td-crypto = { path = "../td-crypto" }"#]);
+        assert_eq!(
+            dependencies,
+            [
+                r#"td-crypto = { path = "../td-crypto" }"#,
+                r#"td-json = { path = "../td-json" }"#
+            ]
+        );
     }
 }

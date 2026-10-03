@@ -40,6 +40,8 @@
     clippy::indexing_slicing
 )]
 
+pub mod string;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -641,29 +643,17 @@ fn write_escaped<W: fmt::Write>(s: &str, out: &mut W) -> fmt::Result {
     out.write_char('"')?;
     let mut run = 0usize;
     for (idx, c) in s.char_indices() {
-        let short = match c {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            '\u{08}' => "\\b",
-            '\u{0c}' => "\\f",
-            // Remaining C0 controls have no short form; \u00XX below.
-            c if (c as u32) < 0x20 => "",
-            _ => continue,
-        };
+        if c != '"' && c != '\\' && c > '\u{1f}' {
+            continue;
+        }
         if let Some(chunk) = s.get(run..idx) {
             out.write_str(chunk)?;
         }
-        if short.is_empty() {
-            let n = c as u32;
-            out.write_str("\\u00")?;
-            out.write_char(char::from_digit((n >> 4) & 0xf, 16).unwrap_or('0'))?;
-            out.write_char(char::from_digit(n & 0xf, 16).unwrap_or('0'))?;
-        } else {
-            out.write_str(short)?;
-        }
+        let mut encoded = [0; 6];
+        let used = string::encode(c, &mut encoded).ok_or(fmt::Error)?;
+        let escaped =
+            std::str::from_utf8(encoded.get(..used).ok_or(fmt::Error)?).map_err(|_| fmt::Error)?;
+        out.write_str(escaped)?;
         run = idx.saturating_add(c.len_utf8());
     }
     if let Some(chunk) = s.get(run..) {

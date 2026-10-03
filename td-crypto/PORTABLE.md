@@ -194,15 +194,16 @@ fetch declared fixed-output sources. Compilation runs without network access.
 The ordinary Cargo preflight still qualifies the host build; it does not
 silently claim to have run this separately provisioned portable command.
 
-The driver stages both crates' manifests, locks, `src/` and optional `tests/`,
-plus the three test-only oracle files listed below. It refuses symlinks and
-special files. It rechecks staged manifest/lock
-pins, reconstructs the verified vendor tree, and mounts these inputs read-only.
-It uses the existing source-fingerprinted static td-builder helper for namespace
-entry, host linking and failing fallback decoys. This helper is host control
-plane, not part of the installed binary. Build/output and Cargo home are private;
-no previous Cargo target directory is reused. Caller-owned source/cache trees
-must not be concurrently modified. No hostile same-uid writer boundary is claimed.
+The driver stages manifests, locks, `src/` and optional `tests/` for
+td-crypto, td-json and td-mta, plus the three test-only oracle files listed
+below. It refuses symlinks and special files. It rechecks staged manifest/lock
+pins, reconstructs the verified vendor tree, and mounts these inputs
+read-only. It uses the existing source-fingerprinted static td-builder helper for
+namespace entry, host linking and failing fallback decoys. This helper is host
+control plane, not part of the installed binary. Build/output and Cargo home
+are private; no previous Cargo target directory is reused. Caller-owned
+source/cache trees must not be concurrently modified. No hostile same-uid
+writer boundary is claimed.
 
 The namespace has only these mounts plus the Rust kit, musl headers and five
 native roles listed above. It has private `/tmp`, minimal `/dev`, private `/proc`

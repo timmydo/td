@@ -11,7 +11,7 @@ pub(crate) fn validate(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn validate_sources(root: &Path) -> Result<()> {
-    for name in ["td-crypto", "td-mta"] {
+    for name in crate::crypto_policy::LOCAL_SOURCES {
         crate::crypto_policy::no_build_script(root, name)?;
         for file in ["Cargo.toml", "Cargo.lock"] {
             let text = std::fs::read_to_string(root.join(name).join(file))

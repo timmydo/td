@@ -4062,7 +4062,7 @@ fn refuse_cargo_config_overrides(root: &Path, roster: &[GateCrate]) -> Result<()
         .any(|k| crate::crypto_policy::admitted(&k.name))
     {
         crate::crypto_policy::cargo_config(root)?;
-        for name in ["td-crypto", "td-mta"] {
+        for name in crate::crypto_policy::LOCAL_SOURCES {
             crate::crypto_policy::no_build_script(root, name)?;
         }
     }
@@ -4749,8 +4749,8 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads
-/// td-crypto, its one dependency. td-agent reads td-fetch-client, td-json,
-/// td-toml and td-ui, its dependencies, and td-compositor, the test tool its
+/// td-crypto and td-json, its direct dependencies. td-agent reads td-fetch-client,
+/// td-json, td-toml and td-ui, its dependencies, and td-compositor, the test tool its
 /// `native-compositor-tests` opt-in builds (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
     (
@@ -4763,7 +4763,7 @@ const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
             "td-ui",
         ],
     ),
-    ("td-mta", &["td-crypto"]),
+    ("td-mta", &["td-crypto", "td-json"]),
 ];
 
 /// The subset of the derived command list a diff over `changed` can actually
@@ -8809,7 +8809,7 @@ mod tests {
     fn mail_source_graph_changes_restore_workspace_coverage() {
         let root = std::env::temp_dir().join(format!("td-mail-graph-{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
-        for name in ["td-mta", "td-crypto", "td-authd"] {
+        for name in ["td-mta", "td-crypto", "td-json", "td-authd"] {
             let base = root.join(name);
             std::fs::create_dir_all(base.join("src")).unwrap();
             let manifest = if crate::crypto_policy::admitted(name) {
@@ -9872,7 +9872,7 @@ mod tests {
             "[workspace]\nmembers = [\"builder\"]\n",
         )
         .unwrap();
-        for name in ["td-crypto", "td-mta"] {
+        for name in crate::crypto_policy::LOCAL_SOURCES {
             std::fs::create_dir(temp.join(name)).unwrap();
             std::fs::copy(
                 source.join(name).join("Cargo.toml"),

@@ -45,25 +45,7 @@ impl From<nfc::Error> for Error {
         Self::Source(value)
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    Yield,
-    NeedOutput,
-    Complete,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Progress {
-    pub written: usize,
-    pub status: Status,
-}
-#[derive(Clone, Copy)]
-enum Phase {
-    Open,
-    Source,
-    Close,
-    DrainClose,
-    Complete,
-}
+pub use td_json::string::{Progress, Status};
 /// A coordinator binds one source and live meter for the frame's lifetime.
 /// Charge output before copying, including a live deadline check for zero bytes.
 /// Each poll is bounded and returns at most one scalar. Refusals retire the
@@ -195,38 +177,20 @@ impl<'c, 'a, 'w> Cursor<'c, 'a, 'w> {
         self.frame.poll(&mut self.source, now, output)
     }
 }
-/// Fixed framing state; its owner retains source identity across short borrows.
-pub(crate) struct Frame {
-    pending: [u8; 6],
-    used: usize,
-    position: usize,
-    phase: Phase,
-    failure: Option<Error>,
-}
+/// Fixed shared framing; mail keeps source selection and budget/error policy.
+pub(crate) struct Frame(td_json::string::Frame<Error>);
 impl Frame {
     pub(crate) const fn new() -> Self {
-        Self {
-            pending: [0; 6],
-            used: 0,
-            position: 0,
-            phase: Phase::Open,
-            failure: None,
-        }
+        Self(td_json::string::Frame::new())
     }
-    /// Explicit post-turn/final deadline check; refusal retires even Complete.
     pub(crate) fn check_deadline(
         &mut self,
         source: &mut impl ScalarSource,
         now: Tick,
     ) -> Result<(), Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        let result = source.charge_output(now, 0);
-        if let Err(error) = result {
-            self.failure = Some(error);
-        }
-        result
+        self.0
+            .check_admission(&mut SharedSource(source), now)
+            .map_err(shared_error)
     }
     pub(crate) fn poll(
         &mut self,
@@ -234,146 +198,31 @@ impl Frame {
         now: Tick,
         output: &mut [u8],
     ) -> Result<Progress, Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if matches!(self.phase, Phase::Complete) {
-            return Ok(Progress {
-                written: 0,
-                status: Status::Complete,
-            });
-        }
-        let result = self.step(source, now, output);
-        if let Err(error) = result {
-            self.failure = Some(error);
-        }
-        result
-    }
-    fn stage(
-        &mut self,
-        source: &mut impl ScalarSource,
-        now: Tick,
-        used: usize,
-    ) -> Result<(), Error> {
-        if used == 0 || used > self.pending.len() {
-            return Err(Error::InvalidState);
-        }
-        source.charge_output(now, used as u64)?;
-        self.used = used;
-        self.position = 0;
-        Ok(())
-    }
-    fn step(
-        &mut self,
-        source: &mut impl ScalarSource,
-        now: Tick,
-        output: &mut [u8],
-    ) -> Result<Progress, Error> {
-        self.check_deadline(source, now)?;
-        if output.is_empty() {
-            return Ok(Progress {
-                written: 0,
-                status: Status::NeedOutput,
-            });
-        }
-        if self.position < self.used {
-            let count = self
-                .used
-                .checked_sub(self.position)
-                .ok_or(Error::InvalidState)?
-                .min(output.len());
-            let end = self
-                .position
-                .checked_add(count)
-                .ok_or(Error::InvalidState)?;
-            let bytes = self
-                .pending
-                .get(self.position..end)
-                .ok_or(Error::InvalidState)?;
-            output
-                .get_mut(..count)
-                .ok_or(Error::InvalidState)?
-                .copy_from_slice(bytes);
-            self.position = end;
-            if self.position == self.used && matches!(self.phase, Phase::DrainClose) {
-                self.phase = Phase::Complete;
-            }
-            return Ok(Progress {
-                written: count,
-                status: if matches!(self.phase, Phase::Complete) {
-                    Status::Complete
-                } else {
-                    Status::Yield
-                },
-            });
-        }
-        match self.phase {
-            Phase::Open | Phase::Close => {
-                self.pending = [b'"', 0, 0, 0, 0, 0];
-                self.stage(source, now, 1)?;
-                self.phase = if matches!(self.phase, Phase::Open) {
-                    Phase::Source
-                } else {
-                    Phase::DrainClose
-                };
-            }
-            Phase::Source => match source.poll(now)? {
-                nfc::Status::Yield => {}
-                nfc::Status::Scalar(value) => {
-                    let used = encode(value, &mut self.pending)?;
-                    self.stage(source, now, used)?;
-                }
-                nfc::Status::Complete => self.phase = Phase::Close,
-            },
-            Phase::DrainClose | Phase::Complete => return Err(Error::InvalidState),
-        }
-        Ok(Progress {
-            written: 0,
-            status: Status::Yield,
-        })
+        self.0
+            .poll(&mut SharedSource(source), now, output)
+            .map_err(shared_error)
     }
 }
-fn encode(value: char, output: &mut [u8; 6]) -> Result<usize, Error> {
-    let short = match value {
-        '"' => Some(b'"'),
-        '\\' => Some(b'\\'),
-        '\u{8}' => Some(b'b'),
-        '\u{c}' => Some(b'f'),
-        '\n' => Some(b'n'),
-        '\r' => Some(b'r'),
-        '\t' => Some(b't'),
-        _ => None,
-    };
-    if let Some(byte) = short {
-        *output = [b'\\', byte, 0, 0, 0, 0];
-        return Ok(2);
+fn shared_error(error: td_json::string::Error<Error>) -> Error {
+    match error {
+        td_json::string::Error::Source(error) => error,
+        td_json::string::Error::InvalidState => Error::InvalidState,
     }
-    if value <= '\u{1f}' {
-        let code = value as u8;
-        let nibble = |value: u8| {
-            if value < 10 {
-                b'0' + value
-            } else {
-                b'a' + value - 10
-            }
-        };
-        *output = [
-            b'\\',
-            b'u',
-            b'0',
-            b'0',
-            nibble(code >> 4),
-            nibble(code & 15),
-        ];
-        return Ok(6);
+}
+struct SharedSource<'a, S>(&'a mut S);
+impl<S: ScalarSource> td_json::string::Source for SharedSource<'_, S> {
+    type Context = Tick;
+    type Error = Error;
+    fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        self.0.charge_output(now, bytes)
     }
-    let mut bytes = [0; 4];
-    let text = value.encode_utf8(&mut bytes);
-    output
-        .get_mut(..text.len())
-        .ok_or(Error::InvalidState)?
-        .copy_from_slice(text.as_bytes());
-    Ok(text.len())
+    fn poll(&mut self, now: Tick) -> Result<td_json::string::Scalar, Error> {
+        self.0.poll(now).map(|status| match status {
+            nfc::Status::Yield => td_json::string::Scalar::Yield,
+            nfc::Status::Scalar(value) => td_json::string::Scalar::Value(value),
+            nfc::Status::Complete => td_json::string::Scalar::Complete,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -448,40 +297,6 @@ mod tests {
         let source = format!("a{}", "\u{315}\u{300}".repeat(257));
         let expected = format!("\"à{}{}\"", "\u{300}".repeat(256), "\u{315}".repeat(257));
         assert_eq!(collect(&source, 1).0, expected);
-    }
-    #[test]
-    fn scalar_encoding_covers_all_unicode_without_surrogates_or_unescaped_controls() {
-        let mut output = [0; 6];
-        for code in 0..=0x10ffff {
-            let Some(value) = char::from_u32(code) else {
-                continue;
-            };
-            let used = encode(value, &mut output).unwrap();
-            let text = std::str::from_utf8(output.get(..used).unwrap()).unwrap();
-            if value <= '\u{1f}' || matches!(value, '"' | '\\') {
-                assert!(text.starts_with('\\'));
-                assert!(matches!(used, 2 | 6));
-                assert!(!text.chars().any(|ch| ch <= '\u{1f}'));
-                let decoded = if let Some(hex) = text.strip_prefix(r"\u") {
-                    char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap()
-                } else {
-                    match text {
-                        "\\\"" => '"',
-                        "\\\\" => '\\',
-                        "\\b" => '\u{8}',
-                        "\\f" => '\u{c}',
-                        "\\n" => '\n',
-                        "\\r" => '\r',
-                        "\\t" => '\t',
-                        _ => panic!("invalid JSON escape"),
-                    }
-                };
-                assert_eq!(decoded, value);
-            } else {
-                assert_eq!(text.chars().count(), 1);
-                assert_eq!(text.chars().next(), Some(value));
-            }
-        }
     }
     #[test]
     fn decoded_header_filtering_and_diagnostics_belong_to_the_source() {
@@ -614,13 +429,16 @@ mod tests {
             let mut frame = Frame::new();
             let mut output = [0xa5; 1];
             let mut complete = false;
+            let mut written = 0;
             for _ in 0..100 {
                 let progress = frame.poll(&mut source, Tick(1), &mut output).unwrap();
                 if progress.status == Status::Complete {
                     complete = true;
                     break;
                 }
-                if !final_check && frame.used == 6 && frame.position == 0 {
+                written += progress.written;
+                if !final_check && source.output == 7 {
+                    assert_eq!(written, 1);
                     break;
                 }
             }
@@ -889,13 +707,18 @@ mod tests {
         let mut source = nfc::Cursor::new("\0", &mut scratch, &mut meter, &mut budget);
         let mut cursor = Cursor::new(&mut source);
         let mut output = [0; 1];
-        loop {
-            cursor.poll(Tick(1), &mut output).unwrap();
-            if cursor.frame.used == 6 && cursor.frame.position == 1 {
+        let mut written = 0;
+        let mut reached = false;
+        for _ in 0..1000 {
+            let progress = cursor.poll(Tick(1), &mut output).unwrap();
+            written += progress.written;
+            if written == 2 {
+                assert_eq!(output, [b'\\']);
+                reached = true;
                 break;
             }
         }
-        let (position, used) = (cursor.frame.position, cursor.frame.used);
+        assert!(reached);
         assert_eq!(
             cursor.poll(Tick(1), &mut []),
             Ok(Progress {
@@ -903,7 +726,6 @@ mod tests {
                 status: Status::NeedOutput
             })
         );
-        assert_eq!((cursor.frame.position, cursor.frame.used), (position, used));
         output = [0xa5];
         let error = Error::Source(nfc::Error::Work(Stop::Deadline));
         assert_eq!(cursor.poll(Tick(100), &mut output), Err(error));

@@ -13,6 +13,7 @@ clippy-all-targets = true
 
 [dependencies]
 td-crypto = { path = "../td-crypto" }
+td-json = { path = "../td-json" }
 
 [[test]]
 name = "rust_alloc_probe"

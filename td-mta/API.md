@@ -2243,25 +2243,27 @@ a fresh meter or rewrap a copy. This differs from normalized output charging,
 which also retires the NFC source. Source-reported failures retain each
 source's existing latch.
 
-### 1.49 Reusable private JSON framing state
+### 1.49 Shared JSON framing and private mail adapters
 
-M06aq separates the existing string serializer into a crate-private `Frame`
-and `ScalarSource` seam. The existing source adapter is also crate-visible, so
-coordinators reuse its error/status mapping. Sources must bound each poll and
-check the live deadline even for zero-byte output charges. Frame owns
-quote/source/closing phase, six pending bytes, offsets and the sticky failure
-latch, within 32 bytes. It retains no source, meter, scratch or replay credit.
-One `poll` takes a short mutable source borrow and performs the same bounded
-staging/source/drain action. The source supplies scalar polling and live
-output charging; semantic filtering and diagnostics stay with the selected
-projection.
+The crate-private `Frame` and `ScalarSource` seam adapts the shared
+`td_json::string::Frame<json_string::Error>` introduced by M06bk. The shared
+crate owns framing, escaping and refusal latching; mail adapters own scalar
+decoding, NFC, clock admission and error mapping. The existing source adapter
+is also crate-visible, so coordinators reuse its error/status mapping. Sources
+must bound each poll and check the live deadline even for zero-byte output
+charges. Frame owns quote/source/closing phase, six pending bytes, offsets and
+the sticky failure latch, within 32 bytes. It retains no source, meter,
+scratch or replay credit. One `poll` takes a short mutable source borrow and
+performs the same bounded staging/source/drain action. The source supplies
+scalar polling and live output charging; semantic filtering and diagnostics
+stay with the selected projection.
 
 A containing coordinator must bind one unpolled source and its original job
 meter for the frame's whole lifetime, retain them across every short borrow,
-and abandon the complete property on drop/refusal. The private seam does not
-check source identity and cannot authorize a replacement source or meter. The
-public `json_string::Cursor` keeps its existing exclusive source borrow and
-delegates to Frame, with unchanged constructors, errors, diagnostics, output
+and abandon the complete property on drop/refusal. Neither seam checks source
+identity or authorizes a replacement source or meter. The public
+`json_string::Cursor` keeps its existing exclusive source borrow and delegates
+to Frame, with unchanged constructors, errors, diagnostics, output
 precharging, deadlines and 64-byte ceiling.
 
 An owner may now keep a Raw/address parser and Frame by value, borrowing its

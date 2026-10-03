@@ -192,17 +192,17 @@ The following increments land separately; M03 is complete only after M03b2.
 Create the local td-crypto crate by moving the existing nondeterministic
 Crypto/Entropy/Digest ports into it, with its own fixed error enum. Re-export
 the traits from mail ports and provide a total error conversion. Make the
-local path the mail crate's only direct dependency, including dev/build scope;
-keep the shared crate independent of mail types. Both crates carry standalone
-locks and join the discovered host/sandbox test and Clippy roster. No external
-backend or new primitive implementation is introduced in this increment.
+local path the sole crypto dependency, including dev/build scope; keep the
+shared crate independent of mail types. Both crates carry standalone locks and
+join the discovered host/sandbox test and Clippy roster. No external backend
+or new primitive implementation is introduced in this increment.
 
 **Acceptance:** consumer compilation proves shared trait identity and error
 conversion, including propagation of a partial-fill failure through a test
 caller using `?`. This is interface evidence, not production token handling.
-Dependency confinement rejects another direct mail dependency. The gate
-discovers both crates and the dependent mail tests when td-crypto changes.
-No test-only fake is described as a cryptographic implementation.
+Dependency confinement rejects unreviewed direct mail dependencies. The gate
+discovers both crates and the dependent mail tests when td-crypto changes. No
+test-only fake is described as a cryptographic implementation.
 
 ### M03b1 — Private backend admission and offline gates
 
@@ -210,10 +210,11 @@ Add Rustls, aws-lc-rs and roots only inside td-crypto. Keep every public type,
 error and configuration opaque to upstream types. Pin a minimal compatible
 closure with one AWS-LC version pair and explicit features. Record licenses
 and why each dependency is present. M03b2 records all portable native
-compiler/assembler/generator inputs. td-mta's lock necessarily includes this transitive closure, while its
-manifest still names only td-crypto. Amend AGENTS.md and the common host/gate
-checks atomically to admit these exact named closures and preserve the std-only
-rules for other crates. Do not exclude either crate from tests or Clippy.
+compiler/assembler/generator inputs. td-mta's lock necessarily includes this
+transitive closure, while its manifest names td-crypto as its sole crypto
+provider. Amend AGENTS.md and the common host/gate checks atomically to admit
+these exact named closures and preserve the std-only rules for other crates.
+Do not exclude either crate from tests or Clippy.
 
 Implement the source/cc build controls in `td-crypto/DESIGN.md`; M03b2
 supplies their decoy checks. Pin the required root Cargo config and require
@@ -267,13 +268,14 @@ adapters remain M07. Do not advertise serving mail from this build increment.
 
 **Acceptance:** static x86-64 musl smoke executable runs in a clean fixture;
 ELF inspection finds no interpreter or dynamic dependencies. Lock/feature
-changes, an extra direct mail dependency or an unapproved crypto dependency
-fail the gate. Public-API confinement rejects upstream type/re-export leaks.
-Offline source provisioning is reproducible and has no host libssl/td-net
-runtime dependency. Pin DESIGN section 3's portability toolchain manifest,
-including target std, C compiler/linker/sysroot and checksum/provenance evidence.
-The clean fixture builds without ambient undeclared inputs. Establish bounded
-TLS smoke behavior before any service consumer depends on the backend.
+changes, an unreviewed direct mail dependency or an unapproved crypto
+dependency fail the gate. Public-API confinement rejects upstream type
+or re-export leaks. Offline source provisioning is reproducible and has no host
+libssl/td-net runtime dependency. Pin DESIGN section 3's portability toolchain
+manifest, including target std, C compiler/linker/sysroot and
+checksum/provenance evidence. The clean fixture builds without ambient
+undeclared inputs. Establish bounded TLS smoke behavior before any service
+consumer depends on the backend.
 
 ## M04 — Bounded primitives, configuration, and event records
 
@@ -1638,6 +1640,14 @@ Initial independently landable increments:
   selection/diagnostics, admission limits and allocation-free overflow replay.
   Structured Text grammars and unpublished response retention remain open.
 
+- **M06bk — shared bounded JSON string framing:** move generic scalar escaping,
+  quote staging, backpressure and refusal latching into std-only td-json.
+  Keep mail decoding/NFC, budgets, deadlines and error adaptation local. Share
+  escaping with the existing Json writer, pin the local source graph and
+  portable staging, and preserve public mail behavior and memory ceilings.
+  Library tests cover scalar and framing policy; mail allocation intervals
+  exercise the shared implementation. No new external dependency is added.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
@@ -2046,8 +2056,9 @@ fixture inputs through the real provider; fake output is not a digest oracle.
 Fit cold/session/handshake generations, native allocations and Rust/C peak
 stack within the service ledger and measure whole-process RSS. Warm workers
 before admission and report secret-erasure limits. Any allocator hook first
-requires an UNSAFE.md amendment. No live CA/provider contact, ignored certificate
-errors, hidden second backend or additional direct mail dependency.
+requires an UNSAFE.md amendment. No live CA/provider contact, ignored
+certificate errors, hidden second backend or unreviewed direct mail
+dependency.
 
 ## M08 — Store objects, indexes, checkpoints and reclamation
 

@@ -346,10 +346,12 @@ message.
   `td-net` retains its existing reviewed vendored closure. The other named
   exception is `td-crypto`'s private Rustls/AWS-LC closure: exact manifests,
   locks, root Cargo configuration and active features are pinned in `builder/src/crypto_policy.rs`.
-  `td-mta` depends directly only on local `td-crypto`; its lock includes that
-  closure. No other roster crate may depend on either, directly or transitively.
+  `td-mta` depends directly on local `td-crypto` and std-only `td-json`; its
+  lock includes both closures. All three local manifests and locks are pinned.
+  No other roster crate may depend on `td-crypto` or `td-mta`, directly or
+  transitively; `td-json` remains an ordinary std-only shared crate.
   `td-crypto/DESIGN.md` owns offline preparation and backend confinement.
-  Any new dependency needs principle-2 sign-off.
+  Any new external dependency needs principle-2 sign-off.
 - A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`
   discovers every `td-*/Cargo.toml` at the repo root and derives both the
   dependency-free lock roster and the cargo test/clippy commands from it. Commit

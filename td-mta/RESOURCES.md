@@ -1009,13 +1009,15 @@ records before any JSON. Existing source/turn bounds hold, and allocation
 intervals include both new field classes. Combined worker qualification
 remains open.
 
-Private JSON Frame state fits 32 bytes and owns no source or work reference.
-The public borrowed adapter still fits 64 bytes; extraction does not introduce
-another simultaneous frame. A future coordinator may retain its parser and
-frame in separate fields and form short source borrows per poll. NFC's external
-workspace and existing reservation stay separate. Allocation intervals through
-the public adapter cover the same extracted framing actions; a movable test
-owner validates live-meter borrowing, not a complete worker memory bound.
+Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
+source or work reference. This is the bound with the mail error enum; generic
+Frame<E> size also depends on E. The public borrowed adapter still fits 64
+bytes; extraction does not introduce another simultaneous frame. A future
+coordinator may retain its parser and frame in separate fields and form short
+source borrows per poll. NFC's external workspace and existing reservation
+stay separate. Allocation intervals through the public adapter cover the same
+extracted framing actions; a movable test owner validates live-meter
+borrowing, not a complete worker memory bound.
 
 The parsed/fallback address text facade fits 416 bytes in the body parser
 reservation. Private purposes reuse the MessageIds conversion engine,
