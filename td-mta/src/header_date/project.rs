@@ -3,6 +3,8 @@ use super::{month_days, Date, Offset};
 use crate::{
     admission::work::{Charge, Meter, Stop},
     bounded::TextBuffer,
+    decode_work::{Error as WorkError, Work},
+    nfc::{self, HeaderBudget},
     ports::Tick,
 };
 
@@ -17,11 +19,13 @@ pub enum Outcome<'a> {
 pub enum Error {
     Capacity,
     Work(Stop),
+    InterpretationLimit,
     InvalidState,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InterpretationLimit => f.write_str("date projection interpretation limit"),
             Self::Capacity => f.write_str("date output capacity"),
             Self::Work(error) => write!(f, "date projection work: {error}"),
             Self::InvalidState => f.write_str("invalid date projection state"),
@@ -29,6 +33,16 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+
+impl From<WorkError> for Error {
+    fn from(error: WorkError) -> Self {
+        match error {
+            WorkError::Work(stop) => Self::Work(stop),
+            WorkError::InterpretationLimit => Self::InterpretationLimit,
+            WorkError::InvalidState => Self::InvalidState,
+        }
+    }
+}
 
 /// Returns 20-byte UTC or 25-byte unknown-offset text in caller storage.
 /// Revalidate public components; qualify a parsed leap second only through
@@ -39,6 +53,65 @@ pub fn render<'a>(
     now: Tick,
     work: &mut Meter,
 ) -> Result<Outcome<'a>, Error> {
+    render_with_work(date, output, now, work)
+}
+/// Uses the original job and per-email budgets; output remains provisional.
+/// This one-shot formatter retains no credit between separate projections.
+pub fn render_with_budget<'a>(
+    date: Date,
+    output: &'a mut [u8],
+    now: Tick,
+    work: &mut Meter,
+    budget: &mut HeaderBudget,
+) -> Result<Outcome<'a>, Error> {
+    render_with_work(
+        date,
+        output,
+        now,
+        &mut RenderWork {
+            work,
+            budget,
+            credit: 0,
+        },
+    )
+}
+struct RenderWork<'w> {
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: u8,
+}
+impl Work for RenderWork<'_> {
+    fn charge(&mut self, now: Tick, charge: Charge) -> Result<(), WorkError> {
+        if charge.io_bytes != 0
+            || charge.unlinks != 0
+            || (charge.records != 0 && charge.output_bytes != 0)
+        {
+            return Err(WorkError::InvalidState);
+        }
+        self.budget
+            .charge(self.work, now, 0, charge.records, &mut self.credit)
+            .map_err(|error| match error {
+                nfc::Error::Work(stop) => WorkError::Work(stop),
+                nfc::Error::InterpretationLimit => WorkError::InterpretationLimit,
+                nfc::Error::InvalidState | nfc::Error::InvalidTable => WorkError::InvalidState,
+            })?;
+        self.work
+            .charge(
+                now,
+                Charge {
+                    output_bytes: charge.output_bytes,
+                    ..Charge::default()
+                },
+            )
+            .map_err(WorkError::Work)
+    }
+}
+fn render_with_work<'a>(
+    date: Date,
+    output: &'a mut [u8],
+    now: Tick,
+    work: &mut impl Work,
+) -> Result<Outcome<'a>, Error> {
     // Component checks, at most five day steps, and fixed-width formatting.
     work.charge(
         now,
@@ -47,7 +120,7 @@ pub fn render<'a>(
             ..Charge::default()
         },
     )
-    .map_err(Error::Work)?;
+    .map_err(Error::from)?;
     if !valid_components(date) {
         return Ok(Outcome::OutOfRange);
     }
@@ -61,7 +134,7 @@ pub fn render<'a>(
                 ..Charge::default()
             },
         )
-        .map_err(Error::Work)?;
+        .map_err(Error::from)?;
     }
     let Some(date) = normalize(date) else {
         return Ok(if leap {
@@ -86,7 +159,7 @@ pub fn render<'a>(
             ..Charge::default()
         },
     )
-    .map_err(Error::Work)?;
+    .map_err(Error::from)?;
     {
         let mut text = TextBuffer::new(output);
         text.format(format_args!(
@@ -512,5 +585,245 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+mod budgeted_tests {
+    use super::*;
+    use crate::ports::Deadline;
+    fn work(output_bytes: u64) -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 2_000_000,
+                output_bytes,
+                ..Charge::default()
+            },
+        )
+    }
+    fn date() -> Date {
+        Date {
+            year: 2000,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            offset: Offset::Known(5999),
+        }
+    }
+    fn leap() -> Date {
+        Date {
+            year: 2016,
+            month: 12,
+            day: 31,
+            hour: 23,
+            minute: 59,
+            second: 60,
+            offset: Offset::Known(0),
+        }
+    }
+    fn limited(steps: u64) -> HeaderBudget {
+        let mut budget = HeaderBudget::new();
+        budget
+            .charge(
+                &mut work(1000),
+                Tick(1),
+                0,
+                budget.steps_remaining() - steps,
+                &mut 0,
+            )
+            .unwrap();
+        budget
+    }
+    #[test]
+    fn budgeted_formatting_preserves_results_and_exact_output_charges() {
+        assert!(std::mem::size_of::<RenderWork<'_>>() <= 24);
+        for (date, steps, expected) in [
+            (date(), 8, Some("1999-12-27T20:01:00Z")),
+            (
+                Date {
+                    offset: Offset::Unknown,
+                    ..date()
+                },
+                8,
+                Some("2000-01-01T00:00:00-00:00"),
+            ),
+            (leap(), 14, Some("2016-12-31T23:59:60Z")),
+            (
+                Date {
+                    offset: Offset::Unknown,
+                    ..leap()
+                },
+                14,
+                Some("2016-12-31T23:59:60-00:00"),
+            ),
+            (
+                Date {
+                    year: 2020,
+                    ..leap()
+                },
+                14,
+                None,
+            ),
+            (Date { hour: 22, ..leap() }, 14, None),
+            (
+                Date {
+                    year: u16::MAX,
+                    ..date()
+                },
+                8,
+                None,
+            ),
+            (Date { year: 0, ..date() }, 8, None),
+        ] {
+            let mut plain_output = [0xa5; 25];
+            let mut output = [0xa5; 25];
+            let mut plain_work = work(1000);
+            let plain = render(date, &mut plain_output, Tick(1), &mut plain_work).unwrap();
+            let mut work = work(1000);
+            let mut budget = HeaderBudget::new();
+            let before_steps = budget.steps_remaining();
+            let before_bytes = budget.source_bytes_remaining();
+            let value =
+                render_with_budget(date, &mut output, Tick(1), &mut work, &mut budget).unwrap();
+            assert_eq!(value, plain);
+            match value {
+                Outcome::Date(text) => assert_eq!(Some(text), expected),
+                Outcome::OutOfRange | Outcome::LeapSecondUnverified => assert_eq!(expected, None),
+            }
+            assert_eq!(output, plain_output);
+            assert_eq!(before_steps - budget.steps_remaining(), steps);
+            assert_eq!(budget.source_bytes_remaining(), before_bytes);
+            assert_eq!(work.remaining().records, 1_999_999);
+            assert_eq!(
+                work.remaining().output_bytes,
+                1000 - expected.map_or(0, str::len) as u64
+            );
+            assert_eq!(
+                work.remaining().output_bytes,
+                plain_work.remaining().output_bytes
+            );
+        }
+    }
+    #[test]
+    fn limits_capacity_and_deadline_refuse_before_output_mutation() {
+        for (date, steps) in [(date(), 7), (leap(), 13)] {
+            let mut work = work(1000);
+            let mut budget = limited(steps);
+            let mut output = [0xa5; 25];
+            assert_eq!(
+                render_with_budget(date, &mut output, Tick(1), &mut work, &mut budget),
+                Err(Error::InterpretationLimit)
+            );
+            assert_eq!(output, [0xa5; 25]);
+            assert_eq!(work.stopped(), None);
+            let spent = if date.second == 60 { 8 } else { 0 };
+            assert_eq!(budget.steps_remaining(), steps - spent);
+            assert_eq!(work.remaining().records, 2_000_000 - u64::from(spent != 0));
+            assert_eq!(work.remaining().output_bytes, 1000);
+            let before = work.remaining();
+            assert_eq!(
+                render_with_budget(date, &mut output, Tick(1), &mut work, &mut budget),
+                Err(Error::InterpretationLimit)
+            );
+            assert_eq!(work.remaining(), before);
+        }
+        let mut budget = HeaderBudget::new();
+        let before_steps = budget.steps_remaining();
+        let mut empty_records = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                output_bytes: 1000,
+                ..Charge::default()
+            },
+        );
+        let mut untouched = [0xa5; 25];
+        assert_eq!(
+            render_with_budget(
+                date(),
+                &mut untouched,
+                Tick(1),
+                &mut empty_records,
+                &mut budget
+            ),
+            Err(Error::Work(Stop::Records))
+        );
+        assert_eq!(untouched, [0xa5; 25]);
+        assert_eq!(budget.steps_remaining(), before_steps);
+        let mut work = work(19);
+        let mut output = [0xa5; 25];
+        assert_eq!(
+            render_with_budget(date(), &mut output, Tick(1), &mut work, &mut budget),
+            Err(Error::Work(Stop::OutputBytes))
+        );
+        assert_eq!(output, [0xa5; 25]);
+        assert_eq!(budget.steps_remaining(), before_steps - 8);
+        assert_eq!(work.remaining().records, 1_999_999);
+        assert_eq!(work.remaining().output_bytes, 19);
+        let mut work = self::work(1000);
+        assert_eq!(
+            render_with_budget(date(), &mut output[..19], Tick(1), &mut work, &mut budget),
+            Err(Error::Capacity)
+        );
+        assert_eq!(output, [0xa5; 25]);
+        assert_eq!(work.remaining().output_bytes, 1000);
+        assert_eq!(work.remaining().records, 1_999_999);
+        assert_eq!(budget.steps_remaining(), before_steps - 16);
+        let before_deadline = work.remaining();
+        assert_eq!(
+            render_with_budget(date(), &mut output, Tick(100), &mut work, &mut budget),
+            Err(Error::Work(Stop::Deadline))
+        );
+        assert_eq!(output, [0xa5; 25]);
+        assert_eq!(work.remaining(), before_deadline);
+        assert_eq!(budget.steps_remaining(), before_steps - 16);
+        let mut work = self::work(1000);
+        let mut budget = HeaderBudget::new();
+        let before = work.remaining();
+        let steps = budget.steps_remaining();
+        let mut adapter = RenderWork {
+            work: &mut work,
+            budget: &mut budget,
+            credit: 0,
+        };
+        assert_eq!(
+            adapter.charge(
+                Tick(1),
+                Charge {
+                    records: 8,
+                    output_bytes: 20,
+                    ..Charge::default()
+                }
+            ),
+            Err(WorkError::InvalidState)
+        );
+        assert_eq!(adapter.credit, 0);
+        assert_eq!(work.remaining(), before);
+        assert_eq!(budget.steps_remaining(), steps);
+    }
+    #[test]
+    fn repeated_projection_discards_credit_without_resetting_budgets() {
+        let mut work = work(1000);
+        let mut budget = limited(16);
+        let mut output = [0; 25];
+        for _ in 0..2 {
+            assert_eq!(
+                render_with_budget(date(), &mut output, Tick(1), &mut work, &mut budget),
+                Ok(Outcome::Date("1999-12-27T20:01:00Z"))
+            );
+        }
+        assert_eq!(budget.steps_remaining(), 0);
+        assert_eq!(work.remaining().records, 1_999_998);
+        assert_eq!(work.remaining().output_bytes, 960);
+        output.fill(0xa5);
+        assert_eq!(
+            render_with_budget(date(), &mut output, Tick(1), &mut work, &mut budget),
+            Err(Error::InterpretationLimit)
+        );
+        assert_eq!(output, [0xa5; 25]);
     }
 }

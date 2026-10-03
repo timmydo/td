@@ -1545,6 +1545,12 @@ Initial independently landable increments:
   pre-access refusal, field reuse and allocation-free long-comment parsing.
   Aggregate date formatting and complete Date property JSON remain open.
 
+- **M06aw — budgeted Date formatting:** route the existing checked formatter
+  through the same job/email budgets, preserving ordinary and pinned leap
+  outcomes. Prepay bounded interpretation, charge output exactly once and
+  preserve untouched buffers on refusal. Cover exact costs, repeated calls
+  and allocation-free formatting. Complete Date property JSON remains open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

@@ -2523,6 +2523,43 @@ allocation probe adds long valid dates, malformed tails, budget reuse and
 terminal deadline refusal in both registered modes. Date formatting under the
 aggregate budget and complete Date property JSON remain follow-on work.
 
+### 1.55 Budgeted Date formatting
+
+M06aw adds `header_date::project::render_with_budget` over copied Date
+components, caller output, a tick and the original job/email budgets. It
+shares the existing formatter through a private charging seam; plain render
+retains its original Meter charges and behavior. All outcomes from section
+1.32 remain distinct: Date, OutOfRange and LeapSecondUnverified. Aggregate
+exhaustion returns InterpretationLimit, not a null-producing parse outcome.
+
+The bounded component/calendar/formatting pass costs eight interpretation
+steps; qualifying a valid second-60 component adds six steps for the existing
+pinned-table path. Those fixed charges precede their work. One invocation
+prepays at most one 16-step job record and discards unused credit on return.
+Source-byte counters are untouched. Actual formatted output is still charged
+exactly once, before any caller-buffer write: 20 bytes for UTC Z or 25 bytes
+for unknown -00:00. Invalid or unqualified dates produce no output charge.
+Capacity and work errors also leave the output untouched, although already
+performed interpretation remains charged. Repeated calls retain the same
+budgets; the aggregate exhaustion latch and job stop remain authoritative.
+The private adapter rejects mixed interpretation/output charges before any
+debit; the formatter uses separate work and output admission points.
+
+The private work adapter fits 24 bytes of bounded transient state. It adds no
+arena, source copy or owned string; the 25-byte caller output has the same
+placement/lifetime obligation as the plain formatter. This is one bounded
+formatting call, not a complete Date property or a combined stack/RSS claim.
+Output remains provisional; the owner performs the final live deadline check
+before publishing it and retires all dependent values on enclosing failure.
+
+Tests compare plain and budgeted results, preserve known/unknown offsets and
+pinned/unverified leap outcomes, pin exact step/record/output costs, and cover
+aggregate, record, output, capacity and deadline refusals before mutation.
+Repeated projection proves credit discard without budget reset. Allocation
+intervals cover successful dates/leaps, invalid/unverified outcomes and output
+and deadline refusal in both registered modes. Complete Date property JSON and
+unpublished response-spool retention remain follow-on work.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

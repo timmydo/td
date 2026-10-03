@@ -2873,6 +2873,114 @@ fn header_delimited_tokens() {
     assert_eq!(before, after, "delimited header token scanning allocated");
 }
 
+fn budgeted_date_projection() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_date::{
+            project::{render_with_budget, Error, Outcome},
+            Date, Offset,
+        },
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let ordinary = Date {
+        year: 2000,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        offset: Offset::Known(5999),
+    };
+    let leap = Date {
+        year: 2016,
+        month: 12,
+        day: 31,
+        hour: 23,
+        minute: 59,
+        second: 60,
+        offset: Offset::Known(0),
+    };
+    let mut budget = HeaderBudget::new();
+    let mut output = [0xa5; 25];
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            records: 1000,
+            output_bytes: 1000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (date, expected) in [
+        (ordinary, "1999-12-27T20:01:00Z"),
+        (
+            Date {
+                offset: Offset::Unknown,
+                ..ordinary
+            },
+            "2000-01-01T00:00:00-00:00",
+        ),
+        (leap, "2016-12-31T23:59:60Z"),
+    ] {
+        assert_eq!(
+            render_with_budget(
+                black_box(date),
+                &mut output,
+                Tick(1),
+                &mut work,
+                &mut budget
+            ),
+            Ok(Outcome::Date(expected))
+        );
+    }
+    assert_eq!(
+        render_with_budget(
+            Date { year: 2020, ..leap },
+            &mut output,
+            Tick(1),
+            &mut work,
+            &mut budget
+        ),
+        Ok(Outcome::LeapSecondUnverified)
+    );
+    assert_eq!(
+        render_with_budget(
+            Date {
+                year: u16::MAX,
+                ..ordinary
+            },
+            &mut output,
+            Tick(1),
+            &mut work,
+            &mut budget
+        ),
+        Ok(Outcome::OutOfRange)
+    );
+    output.fill(0xa5);
+    let mut short = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            records: 1000,
+            output_bytes: 19,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        render_with_budget(ordinary, &mut output, Tick(1), &mut short, &mut budget),
+        Err(Error::Work(Stop::OutputBytes))
+    );
+    assert_eq!(output, [0xa5; 25]);
+    assert_eq!(
+        render_with_budget(ordinary, &mut output, Tick(100), &mut work, &mut budget),
+        Err(Error::Work(Stop::Deadline))
+    );
+    assert_eq!(output, [0xa5; 25]);
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted date formatting allocated");
+}
+
 fn header_date_projection() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -4488,6 +4596,7 @@ fn main() {
         header_phrase_display();
         header_single_addr_spec();
         header_date_projection();
+        budgeted_date_projection();
         header_dates();
         budgeted_header_dates();
         header_comments();
@@ -4613,6 +4722,7 @@ fn main() {
     header_phrase_display();
     header_single_addr_spec();
     header_date_projection();
+    budgeted_date_projection();
     header_dates();
     budgeted_header_dates();
     header_comments();

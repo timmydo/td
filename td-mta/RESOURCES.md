@@ -1042,7 +1042,12 @@ remain the enclosing owner's responsibility; no existing scratch partition
 is claimed by this helper. Its calendar shift is bounded to five days and
 uses scalar locals. It allocates no time-zone table or owned string. The
 complete Date form's output reservation and composed worker stack remain
-open. Pinned leap qualification adds only the static payload above.
+open. Pinned leap qualification adds only the static payload above. M06aw's
+budgeted formatter adds a transient adapter of at most 24 bytes, with the
+same 25-byte caller output obligation. It charges at most 14 aggregate steps,
+one prepaid job record and 25 output bytes, without source visits. Allocation
+intervals cover ordinary/leap formatting, invalid/unverified outcomes and
+refusal. These component bounds do not qualify the combined worker stack.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also
