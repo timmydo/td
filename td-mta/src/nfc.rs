@@ -1806,7 +1806,7 @@ mod structured_tests {
             format!(" {word}\r\n\t{word} (\\é{word}) <x>"),
             format!(" (\\é{word}) a{}\u{323}", "\u{301}".repeat(300)),
         ];
-        for grammar in [Grammar::Keywords, Grammar::ListId] {
+        for grammar in [Grammar::Keywords, Grammar::ListId, Grammar::MimeParameters] {
             let mut scratch = Scratch::new();
             for source in &sources {
                 let mut work = Meter::new(

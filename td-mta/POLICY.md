@@ -215,6 +215,17 @@ identifier bytes and any malformed suffix. It does not validate,
 canonicalize or authorize a list ID. Both grammars use the existing
 literal/encoded scalar filtering and NFC.
 
+Content-Type and Content-Disposition Text use the same fixed original
+quote/comment state, admitting encoded words only within comments. Preserve
+type/disposition tokens, parameter names, ordinary and extended values,
+percent escapes, continuation spelling, quotes and quoted pairs literally
+before the common scalar filtering and NFC. RFC 2231 decoding and the
+filename/name encoded-word compatibility rule below belong to derived part
+metadata, not this Text form. Parentheses inside quoted parameter values
+cannot open comments. Malformed quotes/comments retain their state to EOF;
+comment nesting above 32 refuses the field. This display projection does
+not validate MIME syntax or establish a boundary, charset or filename.
+
 Phrase display names omit comments and leading/trailing grammatical CFWS;
 nonempty CFWS between words becomes one SP. Adjacent raw tokens with no
 CFWS concatenate. Decode only whole atom words with RFC 2047 Phrase syntax

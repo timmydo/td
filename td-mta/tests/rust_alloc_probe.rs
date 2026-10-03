@@ -4799,20 +4799,28 @@ fn text_header_values() {
         "Keywords",
         "List-Id",
         "Content-Description",
+        "Content-Type",
+        "Content-Disposition",
         "X-Long-Header",
         "X-Custom",
     ] {
         let refused_source = format!("{field}: a\nOther: long\n\n");
         let refused_limit = field.len() as u64 + 5;
         let property_name = format!("header:{field}:asText:all");
-        let structured = matches!(field, "Keywords" | "List-Id");
+        let mime = matches!(field, "Content-Type" | "Content-Disposition");
+        let word = if mime {
+            "(=?utf-8?Q?cafe=CC=81?=)"
+        } else {
+            "=?utf-8?Q?cafe=CC=81?="
+        };
+        let structured = mime || matches!(field, "Keywords" | "List-Id");
         let extra = if structured {
             format!("{field}: \" =?utf-8?Q?literal?= \" (=?utf-8?Q?cafe=CC=81?=) < =?utf-8?Q?literal?= >\r\n")
         } else {
             String::new()
         };
         let extra_size = if structured {
-            let expected = if field == "List-Id" {
+            let expected = if field == "List-Id" || mime {
                 "\" =?utf-8?Q?literal?= \" (café) < =?utf-8?Q?literal?= >"
             } else {
                 "\" =?utf-8?Q?literal?= \" (café) < literal >"
@@ -4822,7 +4830,7 @@ fn text_header_values() {
             0
         };
         let source = format!(
-            "{field}: a{}\u{323}\r\n{field}: =?utf-8?Q?cafe=CC=81?=\r\n{extra}\r\n",
+            "{field}: a{}\u{323}\r\n{field}: {word}\r\n{extra}\r\n",
             "\u{301}".repeat(300)
         );
         let mut work = Meter::new(
@@ -4872,8 +4880,11 @@ fn text_header_values() {
             }
         }
         assert!(complete);
-        // U+1EA1 plus 300 acute marks, café, quotes and array punctuation.
-        assert_eq!(written, 3 + 600 + 5 + 7 + extra_size);
+        // U+1EA1, 300 acute marks, café, punctuation and optional MIME parentheses.
+        assert_eq!(
+            written,
+            3 + 600 + 5 + 7 + extra_size + if mime { 2 } else { 0 }
+        );
         cursor.check_deadline(Tick(1)).unwrap();
         let mut cursor = Text::new(
             Input {

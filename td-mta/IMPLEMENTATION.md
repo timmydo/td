@@ -1665,6 +1665,15 @@ Initial independently landable increments:
   MIME parameter Text grammars, part traversal and response retention remain
   open; this decoder is no structured-creation or list-identity authority.
 
+- **M06bn — MIME parameter-field Text:** admit Content-Type and
+  Content-Disposition with original comment-only encoded-word placement.
+  Preserve ordinary/extended parameter spelling and quoted syntax before
+  filtering and NFC; do not apply filename compatibility or RFC 2231
+  decoding to Text. Reuse bounded lexical state, charged NFC replay and
+  shared JSON framing. Cover short drains, quote/comment recovery, syntax
+  injection from decoded words, aggregate refusal and allocation-free output.
+  Derived parameter metadata, MIME part traversal and retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

@@ -138,6 +138,21 @@ fn selected_forms_share_scratch_and_preserve_values_occurrences_and_absence() {
 fn diagnostics_and_unsupported_grammar_remain_selected_value_policy() {
     for (key, source, expected, encoding, leap) in [
         (
+            "header:Content-Disposition:asText",
+            b"Content-Disposition:attachment (=?utf-8?Q?=FF?=); filename=\"=?utf-8?Q?no?=\"\n\n"
+                .as_slice(),
+            "\"attachment (�); filename=\\\"=?utf-8?Q?no?=\\\"\"",
+            true,
+            false,
+        ),
+        (
+            "header:Content-Type:asText",
+            b"Content-Type:text/plain (=?utf-8?Q?=FF?=); name=\"=?utf-8?Q?no?=\"\n\n".as_slice(),
+            "\"text/plain (�); name=\\\"=?utf-8?Q?no?=\\\"\"",
+            true,
+            false,
+        ),
+        (
             "header:Keywords:asText",
             b"Keywords:(=?utf-8?Q?=FF?=)\n\n".as_slice(),
             "\"(�)\"",
@@ -200,7 +215,10 @@ fn diagnostics_and_unsupported_grammar_remain_selected_value_policy() {
     let mut budget = HeaderBudget::new();
     let mut scratch = nfc::Scratch::new();
     let mut cursor = Cursor::new(
-        input(b"Content-Type:secret\n\n", "header:Content-Type:asText"),
+        input(
+            b"Content-Transfer-Encoding:secret\n\n",
+            "header:Content-Transfer-Encoding:asText",
+        ),
         &mut scratch,
         &mut work,
         &mut budget,

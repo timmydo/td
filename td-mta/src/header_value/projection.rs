@@ -106,7 +106,14 @@ impl<'a, 'w> Projection<'a, 'w> for TextMode {
                 ("Comments", crate::header_text::Grammar::Text),
                 ("Keywords", crate::header_text::Grammar::Keywords),
             ],
-            19 => &[("Content-Description", crate::header_text::Grammar::Text)],
+            12 => &[("Content-Type", crate::header_text::Grammar::MimeParameters)],
+            19 => &[
+                ("Content-Description", crate::header_text::Grammar::Text),
+                (
+                    "Content-Disposition",
+                    crate::header_text::Grammar::MimeParameters,
+                ),
+            ],
             _ => &[],
         };
         for &(field, grammar) in fields {

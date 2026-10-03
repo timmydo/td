@@ -297,7 +297,9 @@ NFC equations. M06t composes resident unstructured-header decoding with NFC
 and bounded charged replay. Keywords and List-Id Text now retain source
 punctuation while decoding original phrase/comment words with fixed lexical
 placement state and shared normalization. POLICY.md owns malformed display
-recovery. MIME parameter Text and protocol integration remain open.
+recovery. Content-Type and Content-Disposition Text decode original comment
+words while retaining parameter spelling. Derived parameter metadata, MIME
+part traversal and protocol integration remain open.
 
 The core also contains 27 positive leap insertion dates generated from the
 approved, checksummed IANA input in leap-seconds/README.md. Offline tooling

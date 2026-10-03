@@ -1185,9 +1185,11 @@ immutable unstructured field value, excluding its final line ending. The
 caller must authorize the field and form first. This entry point is not an
 address/comment/parameter parser and cannot authorize structured encoded
 words. M06bm adds a private grammar-selected constructor for Keywords and
-List-Id Text, selected only by the header-value coordinator (section 1.53).
-Both produce Text-form scalars before NFC; they provide no field selection,
-whole JMAP property publication or serializer.
+List-Id Text; M06bn adds Content-Type and Content-Disposition with
+comment-only placement. These are selected only by the header-value
+coordinator (section 1.53).
+All modes produce Text-form scalars before NFC; they provide no field
+selection, whole JMAP property publication or serializer.
 
 Each poll returns at most one Scalar, Yield or Complete. Unfold CRLF or LF
 followed by SP/HTAB, preserving that whitespace; preserve other endings and
@@ -1202,8 +1204,9 @@ spacing and alphabet; comment candidates may also be bounded by parentheses
 or a whole quoted pair. Escaped UTF-8 characters and maximal-subpart repairs
 finish before the following candidate begins. Source quotes, quoted pairs
 and comment punctuation stay literal. List-Id stops word admission at its
-first unquoted/uncommented opening angle. POLICY.md owns malformed display
-recovery and the per-field nesting limit.
+first unquoted/uncommented opening angle. MIME parameter fields admit words
+only inside original comments; quoted values and other tokens remain literal.
+POLICY.md owns malformed display recovery and the per-field nesting limit.
 
 Recognized words use section 1.25's independent per-word decoder. Retain
 whitespace after a word as raw offsets while scanning for the next token.
@@ -2457,8 +2460,10 @@ Parentheses and quotes in these fields are text, not structured comments or
 quoted strings. M06bm also admits Keywords and List-Id with original
 phrase/comment placement as specified in POLICY.md. Quotes, quoted pairs,
 comments and punctuation remain Text data, while List-Id identifier bytes
-never admit words. Other MIME fields and unknown non-X- fields still return
-UnsupportedGrammar.
+never admit words. M06bn admits Content-Type and Content-Disposition with
+comment-only word placement, preserving parameter spelling as Text data.
+RFC 2231 decoding and filename compatibility remain derived-metadata work.
+Other MIME fields and unknown non-X- fields still return UnsupportedGrammar.
 This is an implementation limit, not an invalid-property or invalidArguments
 claim; Text-form authorization alone cannot authorize encoded words in
 structured syntax. Last/all, absence, provisional output, backpressure and
@@ -2471,9 +2476,10 @@ sources; there is no trait object, heap allocation or duplicated framing state
 machine. The Text source uses the existing NFC cursor with the selected
 resident scalar grammar. It removes initial SP, unfolds while retaining
 following whitespace, decodes originally permitted encoded words and
-normalizes the filtered scalars. Keywords/List-Id add fixed lexical state;
-whole escaped UTF-8 characters (including repaired malformed prefixes) must
-finish before a subsequent word can begin. Quotes/comments remain unfolded
+normalizes the filtered scalars. Keywords/List-Id and MIME parameter fields
+add fixed lexical state; whole escaped UTF-8 characters, including repaired
+malformed prefixes, must finish before a subsequent word can begin.
+Quotes/comments remain unfolded
 source bytes rather than display-name projection. Comment nesting above 32
 refuses with an interpretation-limit error.
 Grammar admission dispatches by name length and prepays each comparison.
@@ -2481,11 +2487,15 @@ Subject/Comments keep their seven/eight visits and one step. Content-
 Description costs nineteen visits/one step. Seven-byte names try Subject,
 then List-Id (fourteen visits/two steps); eight-byte names try Comments,
 then Keywords (sixteen visits/two steps). Failed known-name comparisons
-precede a separately charged two-byte X- prefix check; other lengths check
-only that prefix. Dispatch has dimensional maxima of twenty-one visits
-(for nineteen-byte names), three steps and three job records (for seven- or
-eight-byte names), with no scan of the remaining extension name. A
-name shorter than two bytes has no byte comparison but still costs one step
+precede a separately charged two-byte X- prefix check.
+Content-Type costs twelve visits/one step; a twelve-byte miss costs fourteen
+visits/two steps including the prefix check.
+Nineteen-byte names try Content-Description then Content-Disposition,
+costing thirty-eight visits/two steps for the latter or forty visits/three
+steps after a failed match and prefix check. Dispatch has dimensional maxima
+of forty visits, three steps and three job records. Other name lengths check
+only the prefix, with no scan of the remaining extension name. A name shorter
+than two bytes has no byte comparison but still costs one step
 and one job record. Use the original job/email budgets and discard unused
 prepaid credit; empty output performs only the live deadline check until
 capacity is supplied.
@@ -2512,9 +2522,10 @@ Tests distinguish Raw identity from Text decoding/NFC, cover last/all and
 absence, repair diagnostics, encoded-word and fold handling, overflow segments
 followed by a second field, exact charges against separate selector/converter
 runs, Content-Description/X- admission, exact classification costs, partial
-job/email admission refusals, unsupported MIME-field refusal, Keywords/List-Id
-placement and escaped-character repair, comma/output exhaustion, partial
-handoff, late scan refusal and final deadline retirement.
+job/email admission refusals, unsupported-field refusal, Keywords/List-Id
+and MIME parameter-field placement and escaped-character repair,
+comma/output exhaustion, partial handoff, late scan refusal and final
+deadline retirement.
 The allocation probe covers overflow plus subsequent scratch reuse and late
 failure in both registered modes. Other parsed forms and ADMISSION.md's
 unpublished response-spool implementation remain separate.

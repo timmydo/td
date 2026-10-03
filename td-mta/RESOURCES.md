@@ -1004,10 +1004,11 @@ projection selection adds no trait object, allocation or second source. Turn
 bounds remain 255 visits, 256 aggregate steps, 16 job records and six output
 bytes. Allocation intervals cover overflow normalization, scratch reuse for
 another field and late refusal. M06bj's Content-Description/X- admission
-adds no retained state: at most twenty-one name visits, two steps and two
-records before any JSON. Existing source/turn bounds hold, and allocation
-intervals include both new field classes. Combined worker qualification
-remains open.
+adds no retained state. With M06bm's structured fields and M06bn's MIME
+parameter fields, admission costs at most forty name visits, three steps
+and three records before any JSON. Existing source/turn bounds hold, and
+allocation intervals include all admitted grammars. Combined worker
+qualification remains open.
 
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic

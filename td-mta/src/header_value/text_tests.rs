@@ -367,16 +367,16 @@ fn normalized_output_refusal_retires_the_whole_provisional_value() {
 }
 
 #[test]
-fn text_grammar_is_checked_before_output_and_cannot_authorize_structured_words() {
+fn text_grammar_is_checked_before_output_in_single_and_all_modes() {
     for key in [
-        "header:Content-Type:asText",
-        "header:Content-Disposition:asText:all",
+        "header:Content-Transfer-Encoding:asText",
+        "header:Content-Transfer-Encoding:asText:all",
         "header:Unknown:asText",
     ] {
         let mut work = work();
         let mut budget = HeaderBudget::new();
         let mut scratch = nfc::Scratch::new();
-        let source = b"Content-Type: text/plain; name=\" =?utf-8?Q?caf=C3=A9?= \"\nKeywords: \"a =?utf-8?Q?caf=C3=A9?= b\"\n\n";
+        let source = b"Content-Transfer-Encoding: secret\nUnknown: secret\n\n";
         let mut cursor =
             Text::new(input(source, key), &mut scratch, &mut work, &mut budget).unwrap();
         let mut output = [0xa5; 8];
@@ -407,6 +407,91 @@ fn text_grammar_is_checked_before_output_and_cannot_authorize_structured_words()
         let mut cursor =
             Text::new(input(source, key), &mut scratch, &mut work, &mut budget).unwrap();
         assert_eq!(drain(&mut cursor, 1), "\"café\"".as_bytes());
+    }
+}
+
+#[test]
+fn mime_parameter_text_decodes_comments_and_keeps_literal_syntax_before_nfc() {
+    for field in ["Content-Type", "Content-Disposition"] {
+        for (value, expected, problem) in [
+            (
+                r#"attachment; filename="a\" (=?utf-8?Q?no?=)""#,
+                r#"attachment; filename="a\" (=?utf-8?Q?no?=)""#,
+                false,
+            ),
+            (
+                r#"attachment; filename="a\\" (=?utf-8?Q?yes?=)"#,
+                r#"attachment; filename="a\\" (yes)"#,
+                false,
+            ),
+            (
+                "attachment; filename=\"cafe\u{301}\"",
+                "attachment; filename=\"café\"",
+                false,
+            ),
+            (
+                "text/plain; name=\"=?utf-8?Q?cafe=CC=81?=\" (=?utf-8?Q?e=CC=81?=)",
+                "text/plain; name=\"=?utf-8?Q?cafe=CC=81?=\" (é)",
+                false,
+            ),
+            (
+                "=?utf-8?Q?no?=; name= =?utf-8?Q?no?= ; name*=utf-8''caf%C3%A9",
+                "=?utf-8?Q?no?=; name= =?utf-8?Q?no?= ; name*=utf-8''caf%C3%A9",
+                false,
+            ),
+            (
+                "attachment (=?utf-8?Q?one?=\r\n\t=?utf-8?Q?two?=); filename=\"(=?utf-8?Q?no?=)\"",
+                "attachment (onetwo); filename=\"(=?utf-8?Q?no?=)\"",
+                false,
+            ),
+            (
+                "text/plain (outer(=?utf-8?Q?yes?=)tail) (\\é=?utf-8?Q?yes?=)",
+                "text/plain (outer(yes)tail) (\\éyes)",
+                false,
+            ),
+            (
+                "attachment (=?utf-8?Q?=FF?=) (=?unknown?Q?literal?=)",
+                "attachment (�) (=?unknown?Q?literal?=)",
+                true,
+            ),
+            (
+                "attachment (=?utf-8?Q?=22=29=3B?= =?utf-8?Q?still?=); filename=x",
+                "attachment (\");still); filename=x",
+                false,
+            ),
+            (
+                "text/plain (=?utf-8?Q?yes?=); name=\"unterminated (=?utf-8?Q?no?=)",
+                "text/plain (yes); name=\"unterminated (=?utf-8?Q?no?=)",
+                false,
+            ),
+            (
+                "attachment (\\=?utf-8?Q?no?=) (=?utf-8?Q?no\\thing?=)",
+                "attachment (\\=?utf-8?Q?no?=) (=?utf-8?Q?no\\thing?=)",
+                false,
+            ),
+        ] {
+            let source = format!("{field}: {value}\r\n\r\n");
+            let key = format!("header:{field}:asText");
+            let expected = td_json::Json::from(expected).to_string();
+            for width in 1..=8 {
+                let mut work = work();
+                let mut budget = HeaderBudget::new();
+                let mut scratch = nfc::Scratch::new();
+                let mut cursor = Text::new(
+                    input(source.as_bytes(), &key),
+                    &mut scratch,
+                    &mut work,
+                    &mut budget,
+                )
+                .unwrap();
+                assert_eq!(
+                    drain(&mut cursor, width),
+                    expected.as_bytes(),
+                    "{field}: {value}"
+                );
+                assert_eq!(cursor.is_encoding_problem(), problem);
+            }
+        }
     }
 }
 #[test]
@@ -515,11 +600,15 @@ fn text_grammar_admission_preserves_known_costs_and_bounds_prefix_work() {
         ("x-long-header", 2, 1, true),
         ("X-Cats!", 16, 3, true),
         ("X-Custom", 18, 3, true),
-        ("X-12345678901234567", 21, 2, true),
+        ("X-12345678901234567", 40, 3, true),
         ("X", 0, 1, false),
         ("X_Header", 18, 3, false),
-        ("Content-Type", 2, 1, false),
-        ("Content-DispositioN", 21, 2, false),
+        ("Content-Type", 12, 1, true),
+        ("cOnTeNt-TyPe", 12, 1, true),
+        ("X-Spam-Level", 14, 2, true),
+        ("Unknown12345", 14, 2, false),
+        ("Content-DispositioN", 38, 2, true),
+        ("Unknown123456789012", 40, 3, false),
         ("Unknown", 16, 3, false),
     ] {
         let mut work = work();
@@ -532,6 +621,10 @@ fn text_grammar_admission_preserves_known_costs_and_bounds_prefix_work() {
             assert!(workspace.1 == crate::header_text::Grammar::Keywords);
         } else if name == "List-Id" {
             assert!(workspace.1 == crate::header_text::Grammar::ListId);
+        } else if name.eq_ignore_ascii_case("Content-Type")
+            || name.eq_ignore_ascii_case("Content-Disposition")
+        {
+            assert!(workspace.1 == crate::header_text::Grammar::MimeParameters);
         } else {
             assert!(workspace.1 == crate::header_text::Grammar::Text);
         }
@@ -556,10 +649,13 @@ fn text_grammar_admission_preserves_known_costs_and_bounds_prefix_work() {
     }
 }
 #[test]
-fn description_and_prefix_admission_refuse_before_json_on_every_partial_allowance() {
+fn text_name_admission_refuses_before_json_on_every_partial_allowance() {
     for (field, visits, steps) in [
         ("Content-Description", 19, 1),
-        ("X-12345678901234567", 21, 2),
+        ("Content-Type", 12, 1),
+        ("X-Spam-Level", 14, 2),
+        ("Content-Disposition", 38, 2),
+        ("X-12345678901234567", 40, 3),
     ] {
         let key = format!("header:{field}:asText:all");
         let source = format!("{field}:secret\n\n");
@@ -604,50 +700,86 @@ fn description_and_prefix_admission_refuse_before_json_on_every_partial_allowanc
 
 #[test]
 fn prefix_admission_preserves_paid_comparison_when_job_budget_refuses() {
-    for (io_bytes, records, stop, paid) in [
-        (18, 2, Stop::IoBytes, 0),
-        (19, 2, Stop::IoBytes, 19),
-        (20, 2, Stop::IoBytes, 19),
-        (21, 0, Stop::Records, 0),
-        (21, 1, Stop::Records, 19),
+    for (field, cost, cases) in [
+        (
+            "X-12345678901234567",
+            19,
+            [
+                (18, 2, Stop::IoBytes, 0),
+                (19, 2, Stop::IoBytes, 19),
+                (20, 2, Stop::IoBytes, 19),
+                (37, 3, Stop::IoBytes, 19),
+                (38, 3, Stop::IoBytes, 38),
+                (39, 3, Stop::IoBytes, 38),
+                (40, 0, Stop::Records, 0),
+                (40, 1, Stop::Records, 19),
+                (40, 2, Stop::Records, 38),
+            ]
+            .as_slice(),
+        ),
+        (
+            "X-Spam-Level",
+            12,
+            [
+                (11, 2, Stop::IoBytes, 0),
+                (12, 2, Stop::IoBytes, 12),
+                (13, 2, Stop::IoBytes, 12),
+                (14, 0, Stop::Records, 0),
+                (14, 1, Stop::Records, 12),
+            ]
+            .as_slice(),
+        ),
     ] {
-        let mut work = Meter::new(
-            Deadline::after(Tick(0), 100).unwrap(),
-            Charge {
-                io_bytes,
-                records,
-                output_bytes: 100,
-                ..Charge::default()
-            },
-        );
-        let mut budget = HeaderBudget::new();
-        let mut scratch = nfc::Scratch::new();
-        let mut cursor = Text::new(
-            input(
-                b"X-12345678901234567:secret\n\n",
-                "header:X-12345678901234567:asText:all",
-            ),
-            &mut scratch,
-            &mut work,
-            &mut budget,
-        )
-        .unwrap();
-        let mut output = [0xa5; 8];
-        assert_eq!(cursor.poll(Tick(1), &mut output), Err(Error::Work(stop)));
-        assert_eq!(cursor.poll(Tick(1), &mut output), Err(Error::Work(stop)));
-        assert_eq!(output, [0xa5; 8]);
-        assert_eq!(work.stopped(), Some(stop));
-        assert_eq!(work.remaining().io_bytes, io_bytes - paid);
-        assert_eq!(work.remaining().records, records - u64::from(paid != 0));
-        assert_eq!(work.remaining().output_bytes, 100);
-        assert_eq!(budget.source_bytes_remaining(), 16 * 1024 * 1024 - paid);
-        assert_eq!(budget.steps_remaining(), 16_000_000 - u64::from(paid != 0));
+        let source = format!("{field}:secret\n\n");
+        let key = format!("header:{field}:asText:all");
+        for &(io_bytes, records, stop, paid) in cases {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes,
+                    records,
+                    output_bytes: 100,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let mut scratch = nfc::Scratch::new();
+            let mut cursor = Text::new(
+                input(source.as_bytes(), &key),
+                &mut scratch,
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            let mut output = [0xa5; 8];
+            assert_eq!(cursor.poll(Tick(1), &mut output), Err(Error::Work(stop)));
+            assert_eq!(cursor.poll(Tick(1), &mut output), Err(Error::Work(stop)));
+            assert_eq!(output, [0xa5; 8]);
+            assert_eq!(work.stopped(), Some(stop));
+            assert_eq!(work.remaining().io_bytes, io_bytes - paid);
+            assert_eq!(work.remaining().records, records - paid / cost);
+            assert_eq!(work.remaining().output_bytes, 100);
+            assert_eq!(budget.source_bytes_remaining(), 16 * 1024 * 1024 - paid);
+            assert_eq!(budget.steps_remaining(), 16_000_000 - paid / cost);
+        }
     }
 }
 
 #[test]
 fn structured_text_preserves_syntax_and_decodes_only_source_grammar_positions() {
     let cases: &[(&str, &[u8], &str, bool)] = &[
+        (
+            "Content-Type",
+            b"text/plain (\\\xe1=?utf-8?Q?yes?=); name=\"(=?utf-8?Q?no?=)\"",
+            "text/plain (\\�yes); name=\"(=?utf-8?Q?no?=)\"",
+            true,
+        ),
+        (
+            "Content-Disposition",
+            b"attachment (\\\xe1=?utf-8?Q?yes?=); filename=\"(=?utf-8?Q?no?=)\"",
+            "attachment (\\�yes); filename=\"(=?utf-8?Q?no?=)\"",
+            true,
+        ),
         (
             "List-Id",
             b" \"<\" =?utf-8?Q?yes?= <x>",
@@ -808,10 +940,17 @@ fn structured_text_preserves_syntax_and_decodes_only_source_grammar_positions() 
 
 #[test]
 fn structured_text_selection_scratch_replay_and_refusal_keep_original_budgets() {
-    for field in ["Keywords", "List-Id"] {
+    for field in ["Keywords", "List-Id", "Content-Type", "Content-Disposition"] {
+        let mime = field.starts_with("Content-");
+        let word = if mime {
+            "(=?utf-8?Q?cafe=CC=81?=)"
+        } else {
+            "=?utf-8?Q?cafe=CC=81?="
+        };
+        let decoded = if mime { "(café)" } else { "café" };
         let long = format!(" a{}\u{323}", "\u{301}".repeat(300));
-        let source = format!("{field}:{long}\r\n{field}: =?utf-8?Q?cafe=CC=81?=\r\n\r\n");
-        let expected = format!("[\"ạ{}\",\"café\"]", "\u{301}".repeat(300));
+        let source = format!("{field}:{long}\r\n{field}: {word}\r\n\r\n");
+        let expected = format!("[\"ạ{}\",\"{decoded}\"]", "\u{301}".repeat(300));
         let key = format!("header:{field}:asText:all");
         let mut scratch = nfc::Scratch::new();
         for width in 1..=8 {
@@ -851,8 +990,10 @@ fn structured_text_selection_scratch_replay_and_refusal_keep_original_budgets() 
         .unwrap();
         assert_eq!(drain(&mut admitted, 1), expected32.as_bytes());
         for first in ["\"open", "(open"] {
-            let source = format!("{field}:{first}\r\n{field}: =?utf-8?Q?yes?=\r\n\r\n");
-            let expected = td_json::Json::from(vec![first, "yes"]).to_string();
+            let word = "=?utf-8?Q?a,b?= (=?utf-8?Q?yes?=)";
+            let decoded = "=?utf-8?Q?a,b?= (yes)";
+            let source = format!("{field}:{first}\r\n{field}: {word}\r\n\r\n");
+            let expected = td_json::Json::from(vec![first, decoded]).to_string();
             let mut work = work();
             let mut budget = HeaderBudget::new();
             let mut cursor = Text::new(

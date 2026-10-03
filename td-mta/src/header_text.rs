@@ -55,6 +55,7 @@ pub(crate) enum Grammar {
     Text,
     Keywords,
     ListId,
+    MimeParameters,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Placement {
@@ -81,6 +82,8 @@ impl Placement {
             None
         } else if self.depth != 0 {
             Some(Context::Comment)
+        } else if self.grammar == Grammar::MimeParameters {
+            None
         } else {
             Some(Context::Phrase)
         }
@@ -682,7 +685,7 @@ mod structured_tests {
     use crate::ports::Deadline;
     #[test]
     fn lexical_charge_refusal_retires_even_with_a_fresh_job_meter() {
-        for grammar in [Grammar::Keywords, Grammar::ListId] {
+        for grammar in [Grammar::Keywords, Grammar::ListId, Grammar::MimeParameters] {
             let mut cursor = Cursor::with_grammar(b"x", grammar);
             let mut work = Meter::new(
                 Deadline::after(Tick(0), 100).unwrap(),
@@ -719,7 +722,7 @@ mod structured_tests {
     }
     #[test]
     fn structured_checkpoints_replay_lexical_state_without_refunding_work() {
-        for grammar in [Grammar::Keywords, Grammar::ListId] {
+        for grammar in [Grammar::Keywords, Grammar::ListId, Grammar::MimeParameters] {
             for bytes in [
                 b" \"a\\\" =?utf-8?Q?no?=\" (=?utf-8?Q?e=CC=81?= \t=?utf-8?Q?two?=) <x>".as_slice(),
                 b" (\\x=?utf-8?Q?yes?=) =?utf-8?Q?=FF?= ",
