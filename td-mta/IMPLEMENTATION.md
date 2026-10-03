@@ -1329,6 +1329,13 @@ Initial independently landable increments:
   filtering, limits, deadlines, maximal ASCII and allocation-free output
   charging. Structured forms and protocol/worker integration remain open.
 
+- **M06u — header property selection:** parse parameterized header keys and
+  convenience aliases with exact form/occurrence semantics and RFC field
+  restrictions. Preserve request capitalization in borrowed state. Verify
+  bounded long-name scans, work refusal, syntax/form errors and allocation
+  independence. Field collection, structured values and JMAP wiring remain
+  open; a permitted Text form alone does not authorize unstructured decoding.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

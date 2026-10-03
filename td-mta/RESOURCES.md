@@ -82,7 +82,10 @@ encoded-header adapters or combined service RSS.
   16 KiB state. The fixed recipient cell must hold the SMTP path plus metadata.
 - HTTPS: request bytes, 16 bytes per JSON token, 128 bytes per largest
   get/set/query result window entry, and 96 KiB framing/output scratch.
-  Escaped strings are streamed; request tokens borrow the request arena.
+  Escaped values are streamed; property keys are unescaped in place before
+  request tokens borrow the request arena. Unescaping cannot expand the UTF-8
+  byte length; the future JSON parser must validate escapes and update token
+  extents before immutable borrowing. No separate decoded-key arena is owned.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams use slots
   without pinning storage views between emissions.
@@ -836,6 +839,14 @@ composes this state into each of four NFC source checkpoints, each at most
 plus aggregate budget stays within the 1 KiB checkpoint reservation alongside
 3 KiB segment/count scratch. Combined allocation intervals cover fast and
 replay paths with charged output. Worker-stack bounds remain open.
+
+The header property selector fits 128 bytes and its borrowed result fits 48
+bytes in the HTTPS slot's existing 96 KiB framing/output scratch. It owns no
+field-name buffer or collection; decoded keys borrow the request arena
+above. Fixed alias/form tables add no per-job allocation; long request names
+scan in bounded turns. Isolated allocation intervals cover standard aliases,
+parameterized all-occurrence selection, long names and syntax/form
+rejection. Complete worker stack accounting remains open.
 
 Body charset prescan fits 64 bytes in the existing 2 KiB decoder/HTML/snippet
 state and future decoding cursor checkpoint. It borrows caller fragments

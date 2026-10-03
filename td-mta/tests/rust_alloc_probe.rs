@@ -2064,6 +2064,70 @@ fn header_text() {
     assert_eq!(before, after, "unstructured header decoding allocated");
 }
 
+fn header_properties() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        header_property::{Context, Cursor, Error, Form, Occurrence, Status},
+        ports::{Deadline, Tick},
+    };
+    let long = format!("header:{}:asDate:all", "x".repeat(100_000));
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1_000_000,
+            records: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let before = COUNTERS.snapshot();
+    for (key, form, occurrence) in [
+        ("subject", Form::Text, Occurrence::Last),
+        (
+            "header:Resent-Reply-To:asGroupedAddresses:all",
+            Form::GroupedAddresses,
+            Occurrence::All,
+        ),
+        (long.as_str(), Form::Date, Occurrence::All),
+    ] {
+        let mut cursor = Cursor::new(black_box(key), Context::Email);
+        let mut done = false;
+        for _ in 0..10_000 {
+            match cursor.poll(Tick(1), &mut work).unwrap() {
+                Status::Yield => {}
+                Status::Complete(value) => {
+                    let value = value.unwrap();
+                    assert_eq!(value.requested(), key);
+                    assert_eq!(value.form(), form);
+                    assert_eq!(value.occurrence(), occurrence);
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+    }
+    for (key, expected) in [
+        ("header:X:all:asText", Error::InvalidProperty),
+        ("header:dAtE:asText", Error::ForbiddenForm),
+    ] {
+        let mut cursor = Cursor::new(key, Context::Email);
+        let mut refused = false;
+        for _ in 0..100 {
+            if let Err(error) = cursor.poll(Tick(1), &mut work) {
+                assert_eq!(error, expected);
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused);
+    }
+    let mut body = Cursor::new("from", Context::BodyPart);
+    assert_eq!(body.poll(Tick(1), &mut work), Ok(Status::Complete(None)));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "header property selection allocated");
+}
+
 fn header_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -2645,6 +2709,7 @@ fn main() {
         mime_qp_input();
         unicode_lookups();
         unicode_nfc();
+        header_properties();
         header_nfc();
         encoded_word_candidates();
         encoded_word_decoding();
@@ -2744,6 +2809,7 @@ fn main() {
     mime_qp_input();
     unicode_lookups();
     unicode_nfc();
+    header_properties();
     header_nfc();
     encoded_word_candidates();
     encoded_word_decoding();

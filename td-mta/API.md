@@ -1274,6 +1274,56 @@ The complete official resident Unicode corpus remains the normalization
 oracle. No new allocation, dependency or unsafe surface is introduced; these
 checks do not establish whole-worker stack or service RSS qualification.
 
+### 1.28 Header property selection
+
+M06u supplies `header_property::Cursor` over one decoded, immutable JSON
+property key and explicit Email or BodyPart context. Polling returns Yield
+or Complete with a borrowed Property; Complete(None) leaves a non-header key
+to the enclosing JMAP dispatcher. The parameterized grammar is
+`header:NAME[:asFORM][:all]`, with exact-case prefix/suffix tokens and
+printable ASCII field names excluding colon. No extra field-name length
+limit is imposed. Raw and the last occurrence are defaults; `:all` retains
+every occurrence in wire order when the future collector applies the
+selection. The original requested key and its field capitalization are
+preserved. Convenience aliases use the standard canonical field names, forms
+and last-occurrence behavior only in Email context. BodyPart context
+recognizes parameterized keys; an Email convenience alias returns None so
+the body-part dispatcher can reject unsupported properties. The future JSON
+parser decodes property keys in place in the admitted request arena before
+borrowing them here; unescaping cannot expand their UTF-8 byte length. It
+must validate JSON escapes and update token extents before sharing immutable
+keys. This selector neither decodes JSON nor owns a second key copy.
+
+Raw is permitted for every field. Other forms enforce RFC 8621 sections
+4.1.2.2-7, including obsolete Resent-Reply-To and the RFC 2369 list fields.
+Fields outside RFC 5322/2369 accept every form, including List-Id and MIME
+fields. InvalidProperty reports malformed parameterized keys; ForbiddenForm
+reports a syntactically valid but disallowed combination. The JMAP boundary
+must map those user mistakes to invalidArguments for a read or
+invalidProperties for structured creation. Work and InvalidState retain
+their distinct resource/internal meanings.
+
+Authorization of Text form does not establish an unstructured field grammar
+or authorize encoded words inside parameters, quoted strings or addresses.
+This selector does not invoke the unstructured decoder. The future value
+parser must choose the correct field grammar. Header collection, last/all
+traversal, null/empty absence semantics, field-name comparisons, duplicate
+creation properties, creation placement restrictions and JSON publication
+remain enclosing responsibilities.
+
+The non-Copy cursor fits 128 bytes and a selected value fits 48 bytes; names
+borrow the source or static alias table. Name scans visit at most 32 bytes
+per poll. Prefix work, one alias/classification row, or a suffix of at most
+23 bytes are separate bounded turns. Suffix validation prepays eight scans;
+a poll charges at most 184 byte visits and 32 records, never output bytes.
+All comparisons debit the live job meter first. Length-mismatched fixed-
+table rows need no source-byte charge. Failure latches even with a fresh
+meter; cached Complete is inert. Callers bracket active polls with fresh
+clock and cancellation checks and charge subsequent scans/output separately.
+Allocation probes cover long names, convenience aliases, all-occurrence
+selection and syntax/form refusals. This does not qualify a complete worker
+stack.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
