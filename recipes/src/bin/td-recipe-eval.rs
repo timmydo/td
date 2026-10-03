@@ -294,13 +294,19 @@ fn main() {
             // stdout, which the gate prints and a reader of the list skips:
             // narrowing on a miss is the failure that hides, listing
             // everything the one that only costs time, and the gate keeps
-            // the evaluator's stderr only on failure.
+            // the evaluator's stderr only on failure. A narrowed list says
+            // why each check is on it, as `# reach: CHECK: WHY` lines.
             let reach = match args.get(2).map(String::as_str) {
                 None => None,
                 Some("--reaching") => {
                     let scope: Vec<&str> = args.iter().skip(3).map(String::as_str).collect();
                     match check_runner::checks_reaching(&scope) {
-                        Ok(set) => Some(set),
+                        Ok(set) => {
+                            for (check, why) in &set {
+                                println!("# {}{check}: {why}", check_runner::REACH_NOTE);
+                            }
+                            Some(set)
+                        }
                         Err(e) => {
                             println!("# scope miss: {e}; listing every check");
                             None
@@ -313,7 +319,7 @@ fn main() {
                 )),
             };
             for (stem, r) in catalog::all() {
-                if recipe_has_check(&r) && reach.as_ref().is_none_or(|set| set.contains(stem)) {
+                if recipe_has_check(&r) && reach.as_ref().is_none_or(|set| set.contains_key(stem)) {
                     println!("{stem}");
                 }
             }

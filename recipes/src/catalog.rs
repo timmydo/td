@@ -45,6 +45,31 @@ pub fn shared_embeds() -> &'static [&'static str] {
     registry::shared_embeds()
 }
 
+/// The recipes whose evaluation reads repository file `path` under
+/// `recipes/` directly: its own recipe and those whose code names its
+/// module, for a recipe file; the recipes that embed it, for anything else.
+/// None for a path no recipe reads this way, such as a shared module, which
+/// every recipe compiles in. Read from the sources by `build.rs`.
+pub fn recipe_file_readers(path: &str) -> Option<&'static [&'static str]> {
+    registry::recipe_file_readers()
+        .iter()
+        .find(|(p, _)| *p == path)
+        .map(|(_, stems)| *stems)
+}
+
+/// The files under `recipes/` the shared modules and the evaluator read in
+/// production code (a recipe module they name, a recipe they look up by a
+/// literal name, a file they embed): an edit to one can change any check.
+pub fn recipe_evaluator_reads() -> &'static [&'static str] {
+    registry::recipe_evaluator_reads()
+}
+
+/// The recipes whose code may read any recipe file — by a glob, a group
+/// or a catalog lookup by name — and so read every change under `recipes/`.
+pub fn recipe_wide_readers() -> &'static [&'static str] {
+    registry::recipe_wide_readers()
+}
+
 /// The outline face's recipe, whose install plan `install-fonts-plan`
 /// prints.
 pub use registry::jetbrains_mono_nerd_font as outline_face;

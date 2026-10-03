@@ -208,8 +208,8 @@ build reads what is on disk now, not the last commit. Editing `DESIGN.md`
 alone selects no checks; the profiler design is the exception and retains
 its runtime-contract checks.
 
-When every changed path lies under `td-*` crates, `ready` also scopes the
-recipe-checks gate: the changed paths travel to the gate in
+When every changed path lies under `td-*` crates or `recipes/`, `ready`
+also scopes the recipe-checks gate: the changed paths travel to the gate in
 `TD_CHECK_SCOPE`, and the gate runs only the checks whose closure builds a
 recipe that embeds or stages their crates, naming the checks it did not
 run. That can be none: a crate some recipe embeds or stages but no recipe
@@ -224,7 +224,21 @@ can build a reader only by staging what it reads, so the evaluator's own
 closure walk already reaches its checks, while the cargo narrowing's
 readers also include test-only and prose readers, and readers no recipe
 builds at all. A scope none of whose crates any recipe reads runs every
-check and says so. A scoped pass is journaled under its scope, so
+check and says so.
+
+Recipe sources scope the same way, beside crate paths or alone. A recipe
+file reaches its own recipe and the recipes whose code names its module,
+a file a recipe embeds (a `.mk`, a patch, a fixture) reaches that recipe,
+and `recipes/locks/<dir>/` reaches the recipes whose cargo lock lies
+there; each reached recipe then reaches the recipes naming its module, in
+turn. The gate runs the checks whose closure, including the builds their
+runner declares, holds a reached recipe. So a uutils bump runs the one
+check that builds uutils, not every check above the toolchain. Anything
+else under `recipes/` — the shared modules, the evaluator, `build.rs` — is
+compiled into every recipe and runs every check. The gate prints, for
+each check it runs, `reach: CHECK: WHY`, naming the recipe and path that
+reached it, so a scope that ran more than expected explains itself. A
+scoped pass is journaled under its scope, so
 `td-builder check --resume` on the same tree does not take it for a full
 one. `TD_CHECK_FULL` runs every check in full, scope or not, and
 `td-builder check recipe-checks` on its own has no scope.

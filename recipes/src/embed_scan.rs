@@ -216,17 +216,170 @@ pub(crate) fn td_dirs_named_beside_embeds(text: &str) -> Vec<String> {
             cut.push((start, start.saturating_add(literal.len())));
         }
     }
-    let kept: String = code
-        .char_indices()
+    td_dirs_named(&blank(&code, &cut))
+}
+
+/// `text` with its comments cut and its `#[cfg(test)]` modules blanked,
+/// literals kept: the code a recipe's evaluation runs, and the embeds it
+/// compiles in.
+pub(crate) fn production_code(text: &str) -> String {
+    let code = strip_comments(text);
+    let spans = cfg_test_spans(&code);
+    blank(&code, &spans)
+}
+
+/// `code` with each byte span in `spans` (inclusive ends) replaced by
+/// spaces, so what is left keeps its token boundaries.
+fn blank(code: &str, spans: &[(usize, usize)]) -> String {
+    code.char_indices()
         .map(|(i, c)| {
-            if cut.iter().any(|(s, e)| *s <= i && i <= *e) {
+            if spans.iter().any(|(s, e)| *s <= i && i <= *e) {
                 ' '
             } else {
                 c
             }
         })
-        .collect();
-    td_dirs_named(&kept)
+        .collect()
+}
+
+/// What a recipe file's production code reads of its sibling recipes: the
+/// modules among `modules` it names by a `super::`, `super::super::` or
+/// `registry::` path, sorted; and whether it may read any of them in a way
+/// this cannot follow — a glob or a group after one of those, or a catalog
+/// lookup by name (`catalog::` but not `catalog::registry::`), or `super`,
+/// or a path ending in `registry` or `catalog`, named other than as a
+/// path's head, which an alias (`use super as s;`) would hide behind
+/// (`pub(super)` excepted).
+/// Comments, test modules and literals are cut first: a test's `use
+/// super::*` names its own recipe, and a string that spells a path reads
+/// nothing. Whitespace around `::` is dropped, so a path split across lines
+/// reads as one.
+pub(crate) fn sibling_reads(text: &str, modules: &[&str]) -> (Vec<String>, bool) {
+    let code = squeeze_paths(&blank_literals(&production_code(text)));
+    let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut reads: Vec<String> = Vec::new();
+    let mut wide = false;
+    for word in ["super", "registry", "catalog"] {
+        let mut from = 0usize;
+        while let Some(i) = code.get(from..).and_then(|r| r.find(word)) {
+            let start = from.saturating_add(i);
+            from = start.saturating_add(word.len());
+            let head = code.get(..start).unwrap_or("");
+            let before = head.chars().next_back();
+            let after = code.get(from..).unwrap_or("");
+            if before.is_some_and(ident_char)
+                || after.starts_with(ident_char)
+                || after.starts_with("::")
+                || (word == "super" && before == Some('(') && after.starts_with(')'))
+                // `registry` and `catalog` are names a binding may take too;
+                // only the module itself, at a path's tail, can be aliased.
+                || (word != "super" && !head.ends_with("::"))
+            {
+                continue;
+            }
+            wide = true;
+        }
+    }
+    for prefix in ["super::", "registry::"] {
+        let mut from = 0usize;
+        while let Some(i) = code.get(from..).and_then(|r| r.find(prefix)) {
+            let start = from.saturating_add(i);
+            from = start.saturating_add(prefix.len());
+            if code
+                .get(..start)
+                .and_then(|s| s.chars().next_back())
+                .is_some_and(ident_char)
+            {
+                continue;
+            }
+            let mut rest = code.get(from..).unwrap_or("");
+            let mut depth = usize::from(prefix == "super::");
+            while let Some(r) = rest.strip_prefix("super::") {
+                rest = r;
+                depth = depth.saturating_add(1);
+            }
+            // A glob, a group, a macro's `$name`: not a name this can follow.
+            if !rest.starts_with(ident_char) {
+                wide = true;
+                continue;
+            }
+            let rest = rest.strip_prefix("r#").unwrap_or(rest);
+            let name = rest
+                .get(..rest.find(|c: char| !ident_char(c)).unwrap_or(rest.len()))
+                .unwrap_or("");
+            if modules.contains(&name) {
+                if !reads.iter().any(|r| r == name) {
+                    reads.push(name.to_string());
+                }
+            } else if depth >= 2 && name != "registry" {
+                // Past the recipe's own parent, what is not a recipe module is
+                // catalog's (`lookup`, `all`): a read by name.
+                wide = true;
+            }
+        }
+    }
+    let mut from = 0usize;
+    while let Some(i) = code.get(from..).and_then(|r| r.find("catalog::")) {
+        let start = from.saturating_add(i);
+        from = start.saturating_add("catalog::".len());
+        let bounded = !code
+            .get(..start)
+            .and_then(|s| s.chars().next_back())
+            .is_some_and(ident_char);
+        if bounded
+            && !code
+                .get(from..)
+                .is_some_and(|r| r.starts_with("registry::"))
+        {
+            wide = true;
+        }
+    }
+    reads.sort();
+    (reads, wide)
+}
+
+/// `code` with its string and char literals blanked to spaces.
+fn blank_literals(code: &str) -> String {
+    let mut literals = Vec::new();
+    let mut at = 0usize;
+    while let Some(rest) = code.get(at..).filter(|r| !r.is_empty()) {
+        if let Some(len) = literal_len_at(code, at) {
+            literals.push((at, at.saturating_add(len).saturating_sub(1)));
+            at = at.saturating_add(len.max(1));
+        } else {
+            at = at.saturating_add(rest.chars().next().map_or(1, char::len_utf8));
+        }
+    }
+    blank(code, &literals)
+}
+
+/// Whether `code` (comments cut) embeds a file by a path this cannot read:
+/// an embed marker in code, not inside a literal, that carries no literal
+/// path (a `concat!` of pieces, a macro's argument).
+pub(crate) fn has_computed_embed(code: &str) -> bool {
+    let bare = blank_literals(code);
+    let markers = ["#[path", "include_str!", "include_bytes!", "include!"]
+        .iter()
+        .map(|m| bare.matches(m).count())
+        .sum::<usize>();
+    let literal = embed_literals(code)
+        .iter()
+        .filter(|(at, _)| bare.get(*at..).is_some_and(|r| !r.starts_with(' ')))
+        .count();
+    markers > literal
+}
+
+/// `code` with the whitespace on either side of each `::` removed.
+fn squeeze_paths(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(i) = rest.find("::") {
+        out.push_str(rest.get(..i).unwrap_or("").trim_end());
+        out.push_str("::");
+        rest = rest.get(i.saturating_add(2)..).unwrap_or("").trim_start();
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether `code` (comments cut) holds any embed marker at all, with a
@@ -621,6 +774,86 @@ mod tests {
         }
         let visible = "#[cfg(test)]\n#[allow(dead_code)]\npub(crate) mod r#t;\n";
         assert_eq!(cfg_test_spans(visible).len(), 1);
+    }
+
+    /// A sibling read is a module named after `super::` (any depth) or
+    /// `registry::`; a glob, a group or a catalog lookup reads any; a test
+    /// module, a comment, a string or a non-module item reads nothing.
+    #[test]
+    fn a_recipe_reads_the_siblings_its_code_names() {
+        let modules = ["firefox", "td_login", "mail", "news", "true"];
+        let reads = |text: &str| sibling_reads(text, &modules);
+        let none: (Vec<String>, bool) = (vec![], false);
+        assert_eq!(
+            reads("fn r() { let f = super::firefox::recipe; super::super::td_login::source(); }"),
+            (vec!["firefox".to_string(), "td_login".to_string()], false)
+        );
+        assert_eq!(
+            reads("fn r() { crate::catalog::registry::r#true::recipe(); }"),
+            (vec!["true".to_string()], false)
+        );
+        assert_eq!(reads("use super::*;\n").1, true);
+        assert_eq!(reads("use super::{firefox, mail};\n").1, true);
+        assert_eq!(reads("fn r() { crate::catalog::lookup(\"x\"); }").1, true);
+        // Whitespace around `::` is no way around it.
+        assert_eq!(
+            reads("fn r() { super ::\n    super:: mail::recipe(); }"),
+            (vec!["mail".to_string()], false)
+        );
+        for text in [
+            "use super:: *;\n",
+            "use crate::catalog::registry:: {mail};\n",
+            "use super as s;\nfn r() { s::mail::recipe(); }\n",
+            "use crate::catalog::registry as reg;\n",
+            "use crate::catalog;\n",
+        ] {
+            assert!(reads(text).1, "{text}");
+        }
+        assert!(reads("macro_rules! r { ($m:ident) => { super::$m::recipe() } }\n").1);
+        for text in [
+            "fn r() { super::super::lookup(\"mail\"); }\n",
+            "fn r() { super::super::all(); }\n",
+        ] {
+            assert!(reads(text).1, "{text}");
+        }
+        assert!(!reads("fn r() { super::super::registry::mail::recipe(); }\n").1);
+        // An alias the caller passes as a module reads like one.
+        assert_eq!(
+            sibling_reads("use super::super::outline_face;\n", &["outline_face"]),
+            (vec!["outline_face".to_string()], false)
+        );
+        assert_eq!(reads("pub(super) fn r() {}\n"), none);
+        assert_eq!(reads("fn r(registry: R) { registry.catalog }\n"), none);
+        for text in [
+            "#[cfg(test)]\nmod tests {\n    use super::*;\n    fn f() { super::super::mail::recipe(); }\n}\n",
+            "// super::news::recipe\nfn r() {}\n",
+            "const S: &str = \"super::news::recipe catalog::all\";\n",
+            "fn r() { super::recipe(); xsuper::firefox::recipe(); }\n",
+        ] {
+            assert_eq!(reads(text), none, "{text}");
+        }
+    }
+
+    /// An embed whose path is computed is one this cannot follow; a literal
+    /// one, or a marker spelled inside a string, is not.
+    #[test]
+    fn a_computed_embed_path_is_told_apart() {
+        // Spelled apart: the builder refuses a composed include in any tree
+        // file (`stage0::every_literal_include_in_the_tree_resolves`).
+        let inc = ["include", "_str!"].concat();
+        for computed in [
+            format!("const A: &str = {inc}(concat!(env!(\"D\"), \"/x.mk\"));\n"),
+            "macro_rules! e { ($p:expr) => { include_bytes!($p) } }\n".to_string(),
+        ] {
+            assert!(has_computed_embed(&computed), "{computed}");
+        }
+        for literal in [
+            format!("const A: &str = {inc}(\"x.mk\");\n#[path = \"y.rs\"]\nmod y;\n"),
+            format!("const S: &str = \"{inc}(concat!(a))\";\n"),
+            "fn f() {}\n".to_string(),
+        ] {
+            assert!(!has_computed_embed(&literal), "{literal}");
+        }
     }
 
     /// A name inside a production embed's literal or a test module is

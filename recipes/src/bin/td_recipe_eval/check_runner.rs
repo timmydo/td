@@ -4350,12 +4350,26 @@ pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String
 /// readers, since a recipe that builds a reader stages what it reads.
 /// `scope` entries are top-level directory names or repository-relative
 /// paths under one.
-pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeSet<String>, String> {
+///
+/// An entry under `recipes/` names recipe sources, not a crate: a recipe
+/// file reaches its own recipe and the recipes whose code names its module,
+/// a file a recipe embeds (a `.mk`, a patch, a fixture) reaches that recipe
+/// (`catalog::recipe_file_readers`), and `recipes/locks/<dir>/...` reaches
+/// the recipes whose cargo lock lies there. Anything else under `recipes/`
+/// — a shared module, the evaluator — is read by every recipe, so it is an
+/// error, and so is a lock nothing uses. A recipe that may read any recipe
+/// (`catalog::recipe_wide_readers`) is reached by every such entry.
+///
+/// A reached recipe reaches in turn every recipe whose code names its
+/// module: their derivations are computed from it.
+///
+/// Each check comes back with why it was reached, which the gate prints.
+pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeMap<String, String>, String> {
     if scope.is_empty() {
         return Err("empty scope".to_string());
     }
     let all = catalog::all();
-    let mut reached: BTreeSet<&str> = BTreeSet::new();
+    let mut reached: BTreeMap<&str, String> = BTreeMap::new();
     for entry in scope {
         let entry = entry.trim_end_matches('/');
         if entry.is_empty()
@@ -4369,35 +4383,64 @@ pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeSet<String>, String
             ));
         }
         let dir = entry.split('/').next().unwrap_or(entry);
+        if dir == "recipes" {
+            for stem in recipe_entry_readers(entry, &all)? {
+                reached
+                    .entry(stem)
+                    .or_insert_with(|| format!("{stem} reads {entry}"));
+            }
+            // An embedded file, too, may be read by a recipe that can read
+            // any; the module step below adds them for a recipe file.
+            for stem in catalog::recipe_wide_readers() {
+                reached
+                    .entry(stem)
+                    .or_insert_with(|| format!("{stem} may read any recipe ({entry})"));
+            }
+            continue;
+        }
         let under = format!("{dir}/");
         let within = |a: &str, b: &str| {
             a == b
                 || a.strip_prefix(b).is_some_and(|r| r.starts_with('/'))
                 || b.strip_prefix(a).is_some_and(|r| r.starts_with('/'))
         };
-        let shared = catalog::shared_embeds().iter().any(|e| within(entry, e));
+        let shared = catalog::shared_embeds().iter().find(|e| within(entry, e));
         for (stem, recipe) in &all {
             let local = recipe
                 .local_source
                 .as_deref()
                 .map(|s| s.trim_start_matches("./"));
-            let reads = shared
-                || catalog::named_dirs(stem).contains(&dir)
-                || local.is_some_and(|s| s == dir || s.starts_with(&under))
+            let why = if let Some(shared) = shared {
+                Some(format!("every recipe compiles in {shared} ({entry})"))
+            } else if catalog::named_dirs(stem).contains(&dir) {
+                Some(format!("{stem} embeds {dir} ({entry})"))
+            } else if local.is_some_and(|s| s == dir || s.starts_with(&under))
                 || recipe.local_source_trees.iter().flatten().any(|s| {
                     let s = s.trim_start_matches("./");
                     s == dir || s.starts_with(&under)
-                });
-            if reads {
-                reached.insert(stem);
+                })
+            {
+                Some(format!("{stem} stages {dir} ({entry})"))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                reached.entry(stem).or_insert(why);
             }
         }
     }
     if reached.is_empty() {
         return Err(format!("no recipe reads any of {}", scope.join(" ")));
     }
+    close_over_module_readers(
+        &mut reached,
+        |stem| {
+            catalog::recipe_file_readers(&format!("recipes/src/recipes/{stem}.rs")).unwrap_or(&[])
+        },
+        catalog::recipe_wide_readers(),
+    );
     let catalog: BTreeMap<&str, Recipe> = all.iter().map(|(s, r)| (*s, r.clone())).collect();
-    let mut out = BTreeSet::new();
+    let mut out = BTreeMap::new();
     for (stem, recipe) in &all {
         if recipe.checks.as_ref().is_none_or(|c| c.is_empty()) {
             continue;
@@ -4407,11 +4450,85 @@ pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeSet<String>, String
         for root in owner_roots(stem, recipe) {
             visit_recipe(&root, &catalog, &mut visiting, &mut emitted, &mut closure)?;
         }
-        if closure.iter().any(|n| reached.contains(n.stem.as_str())) {
-            out.insert((*stem).to_string());
+        if let Some(why) = closure.iter().find_map(|n| reached.get(n.stem.as_str())) {
+            out.insert((*stem).to_string(), why.clone());
         }
     }
     Ok(out)
+}
+
+/// Add to `reached` every recipe whose code names a reached recipe's module
+/// (`readers_of` a stem) and every one that may read any recipe's (`wide`),
+/// transitively: their derivations are computed from it. Each comes with
+/// the chain that reached it.
+fn close_over_module_readers(
+    reached: &mut BTreeMap<&'static str, String>,
+    readers_of: impl Fn(&str) -> &'static [&'static str],
+    wide: &'static [&'static str],
+) {
+    let mut queue: Vec<&str> = reached.keys().copied().collect();
+    while let Some(stem) = queue.pop() {
+        let readers = readers_of(stem).iter().map(|r| (*r, "reads"));
+        let wide = wide.iter().map(|r| (*r, "may read"));
+        for (reader, how) in readers.chain(wide) {
+            if !reached.contains_key(reader) {
+                let why = reached.get(stem).cloned().unwrap_or_default();
+                reached.insert(reader, format!("{reader} {how} {stem}'s module; {why}"));
+                queue.push(reader);
+            }
+        }
+    }
+}
+
+/// How `check-list --reaching` marks a `# ` note that says why a check was
+/// reached, apart from a scope miss's note; the gate prints both but takes
+/// only the miss for a full list. `builder/src/gate_bodies.rs` keeps a copy.
+pub(crate) const REACH_NOTE: &str = "reach: ";
+
+/// The recipes a `recipes/` scope entry reaches directly, or Err where it
+/// names no recipe's own input and so may be read by all of them.
+fn recipe_entry_readers(
+    entry: &str,
+    all: &[(&'static str, Recipe)],
+) -> Result<Vec<&'static str>, String> {
+    if catalog::recipe_evaluator_reads().contains(&entry) {
+        return Err(format!(
+            "`{entry}` is read by the evaluator's own code, so by every check"
+        ));
+    }
+    let embedders = catalog::recipe_file_readers(entry).unwrap_or(&[]);
+    if let Some(rest) = entry.strip_prefix("recipes/locks/") {
+        let lock_dir = rest.split('/').next().unwrap_or(rest);
+        let under = format!("recipes/locks/{lock_dir}/");
+        let mut users: Vec<&'static str> = all
+            .iter()
+            .filter(|(_, r)| {
+                r.cargo_lock
+                    .as_deref()
+                    .is_some_and(|l| l.starts_with(&under))
+            })
+            .map(|(s, _)| *s)
+            .collect();
+        if users.is_empty() {
+            return Err(format!("no recipe's cargo lock lies under {under}"));
+        }
+        // A recipe embedding a file there reads it too.
+        users.extend(
+            embedders
+                .iter()
+                .filter(|s| !users.contains(s))
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+        return Ok(users);
+    }
+    match catalog::recipe_file_readers(entry) {
+        Some(stems) => Ok(stems.to_vec()),
+        None => Err(format!(
+            "`{entry}` is no recipe's own input: shared recipe code every recipe \
+             compiles in, or a file nothing reads"
+        )),
+    }
 }
 
 fn visit_recipe(
@@ -9888,6 +10005,78 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
     }
 
+    /// A recipe source reaches the checks whose closure, declared builds
+    /// included, holds a recipe that reads it — its own, one naming its
+    /// module, transitively, or one embedding it — and says why; shared
+    /// recipe code, a lock nothing uses or a file nothing reads refuses,
+    /// beside a reached entry too, so the gate runs every check.
+    #[test]
+    fn a_recipe_source_reaches_the_checks_of_its_readers() {
+        // uutils is in no check's owner closure, only in rust-toolchain's
+        // declared builds.
+        for scope in [
+            "recipes/src/recipes/uutils.rs",
+            "recipes/locks/uutils/Cargo.lock",
+        ] {
+            let reach = checks_reaching(&[scope]).expect(scope);
+            assert_eq!(
+                reach.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["rust-toolchain"]
+            );
+            assert!(reach["rust-toolchain"].contains(scope), "{reach:?}");
+        }
+        // td-jail-test names firefox's module; so does system-x86-64,
+        // whose module openssh-x86-64-test names in turn.
+        let firefox = checks_reaching(&["recipes/src/recipes/firefox.rs"]).unwrap();
+        assert!(firefox.contains_key("td-jail-test"), "{firefox:?}");
+        let why = &firefox["openssh-x86-64-test"];
+        assert!(why.contains("system-x86-64's module"), "{why}");
+        assert!(!firefox.contains_key("busybox-test"), "{firefox:?}");
+        // A data file reaches what builds on the recipe embedding it.
+        let mk = checks_reaching(&["recipes/src/recipes/bash-mesboot.mk"]).unwrap();
+        assert!(mk["busybox-test"].contains("bash-mesboot reads"), "{mk:?}");
+        for scope in [
+            "recipes/src/types.rs",
+            "recipes/build.rs",
+            "recipes/locks/no-such/Cargo.lock",
+            "recipes/src/recipes/no-such.mk",
+            // What the evaluator's own code reads, beside a recipe: the
+            // fixture the qemu secret path mounts, the font recipe catalog
+            // re-exports.
+            "recipes/src/fixtures/secret_vm.rs",
+            "recipes/src/recipes/jetbrains-mono-nerd-font.rs",
+        ] {
+            assert!(checks_reaching(&[scope]).is_err(), "{scope}");
+            let beside = ["recipes/src/recipes/uutils.rs", scope];
+            assert!(checks_reaching(&beside).is_err(), "{scope}");
+        }
+    }
+
+    /// The module step follows readers transitively and adds a recipe that
+    /// may read any, from a crate scope's reached recipe as from a recipe
+    /// file's, with the chain that reached each.
+    #[test]
+    fn a_module_reader_and_a_wide_reader_follow_a_reached_recipe() {
+        let readers_of = |stem: &str| -> &'static [&'static str] {
+            match stem {
+                "a" => &["b"],
+                "b" => &["c"],
+                _ => &[],
+            }
+        };
+        let mut reached = BTreeMap::from([("a", "a embeds td-x (td-x/y.rs)".to_string())]);
+        close_over_module_readers(&mut reached, readers_of, &["w"]);
+        assert_eq!(
+            reached.keys().copied().collect::<Vec<_>>(),
+            ["a", "b", "c", "w"]
+        );
+        assert_eq!(
+            reached["c"],
+            "c reads b's module; b reads a's module; a embeds td-x (td-x/y.rs)"
+        );
+        assert!(reached["w"].starts_with("w may read "), "{reached:?}");
+    }
+
     /// A compositor file the shared modules do not compile in reaches only
     /// the checks whose closure stages or embeds the compositor; its shared
     /// clock rules, its whole directory, and the boot protocol reach every
@@ -9897,15 +10086,15 @@ chmod 755 '{}'
     #[test]
     fn checks_reaching_follows_the_embeds_through_the_closure() {
         let reached = checks_reaching(&["td-compositor/src/main.rs"]).expect("reach");
-        assert!(reached.contains("td-taskmgr-test"));
-        assert!(reached.contains("td-portal-test"));
-        assert!(reached.contains("td-photo-test"));
+        assert!(reached.contains_key("td-taskmgr-test"));
+        assert!(reached.contains_key("td-portal-test"));
+        assert!(reached.contains_key("td-photo-test"));
         let toolkit = checks_reaching(&["td-ui"]).expect("sibling reach");
-        assert!(toolkit.contains("td-taskmgr-test"));
-        assert!(toolkit.contains("td-portal-test"));
-        assert!(toolkit.contains("td-photo-test"));
-        assert!(toolkit.contains("td-term-test"));
-        assert!(reached.contains("td-term-test"));
+        assert!(toolkit.contains_key("td-taskmgr-test"));
+        assert!(toolkit.contains_key("td-portal-test"));
+        assert!(toolkit.contains_key("td-photo-test"));
+        assert!(toolkit.contains_key("td-term-test"));
+        assert!(reached.contains_key("td-term-test"));
         // Both directions: every selected owner reads the crate somewhere in
         // its closure, and every check owner that does is selected — the
         // second is the one a dropped owner would fail.
@@ -9930,15 +10119,16 @@ chmod 755 '{}'
             }
             let closure = recipe_closure(&[stem]).expect("closure");
             let expected = closure.iter().any(|n| reads(&n.stem));
-            assert_eq!(
-                expected,
-                reached.contains(*stem),
-                "{stem}: reads td-compositor in its closure {expected}, selected {}",
-                reached.contains(*stem)
+            // Beyond its closure's readers, a check is reached only through
+            // a recipe whose code names a reader's module.
+            let why = reached.get(*stem);
+            assert!(
+                expected == why.is_some() || why.is_some_and(|w| w.contains("'s module")),
+                "{stem}: reads td-compositor in its closure {expected}, selected {why:?}"
             );
         }
-        assert!(!toolkit.contains("curl-x86-64-test"), "{toolkit:?}");
-        assert!(!reached.contains("curl-x86-64-test"), "{reached:?}");
+        assert!(!toolkit.contains_key("curl-x86-64-test"), "{toolkit:?}");
+        assert!(!reached.contains_key("curl-x86-64-test"), "{reached:?}");
         // What the shared modules compile in reaches every check, by its
         // file, by the directory holding it, or by a directory inside it.
         let every: BTreeSet<String> = all
@@ -9953,7 +10143,14 @@ chmod 755 '{}'
             "td-boot/src/protocol.rs",
             "td-boot",
         ] {
-            assert_eq!(checks_reaching(&[scope]).expect(scope), every, "{scope}");
+            assert_eq!(
+                checks_reaching(&[scope])
+                    .expect(scope)
+                    .into_keys()
+                    .collect::<BTreeSet<_>>(),
+                every,
+                "{scope}"
+            );
         }
         assert!(every.len() > reached.len(), "{every:?}");
         assert!(every.len() > toolkit.len(), "{every:?}");

@@ -4880,25 +4880,38 @@ fn close_over_readers(selected: &mut Vec<String>, readers: &[(String, Vec<String
     }
 }
 
-/// The recipe-checks scope of a change confined to roster crates: its
-/// changed paths, sorted, when the targets run the recipe-checks gate at
-/// all; None otherwise, which runs every check. The cargo narrowing's
-/// confinement without its reader closure: the evaluator turns the scope
-/// into checks from its own table of what each recipe stages, and a recipe
+/// The recipe-checks scope of a change confined to roster crates and recipe
+/// sources (`recipes/`): its changed paths, sorted, when the targets run
+/// the recipe-checks gate at all; None otherwise, which runs every check.
+/// The cargo narrowing's confinement without its reader closure: the
+/// evaluator turns the scope into checks from its own tables of what each
+/// recipe stages and which recipes read each recipe source, and a recipe
 /// whose crate reads another builds only if it stages that one too, so the
-/// table already follows every read a recipe build makes. Paths rather than
-/// crates, because a few single files are compiled into every recipe and
-/// the rest of their crates are not. The crates stand in for the paths
-/// where a path holds whitespace, which the space-separated variable cannot
-/// carry, or the list would outgrow `SCOPE_PATHS_MAX`: a crate covers every
-/// path under it.
+/// table already follows every read a recipe build makes. A `recipes/`
+/// path the evaluator cannot place (shared recipe code, the evaluator) is
+/// its miss, which lists every check. Paths rather than crates, because a
+/// few single files are compiled into every recipe and the rest of their
+/// crates are not. Directories stand in for the paths where a path holds
+/// whitespace, which the space-separated variable cannot carry, or the
+/// list would outgrow `SCOPE_PATHS_MAX`: a crate covers every path under
+/// it, and `recipes` alone is a miss.
 fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Vec<String>> {
     let runs_recipe_checks = targets.iter().any(|t| t == "check" || t == "recipe-checks");
-    if !runs_recipe_checks {
+    if !runs_recipe_checks || changed.is_empty() || changed.iter().any(|p| p.contains("..")) {
         return None;
     }
     let roster = discover_gate_crates(root).ok()?;
-    let mut crates = changed_roster_crates(&roster, changed)?;
+    let (sources, rest): (Vec<&String>, Vec<&String>) =
+        changed.iter().partition(|p| p.starts_with(RECIPE_SOURCES));
+    let rest: Vec<String> = rest.into_iter().cloned().collect();
+    let mut crates = if rest.is_empty() {
+        Vec::new()
+    } else {
+        changed_roster_crates(&roster, &rest)?
+    };
+    if !sources.is_empty() {
+        crates.push(RECIPE_SOURCES.trim_end_matches('/').to_string());
+    }
     let mut paths: Vec<String> = changed.to_vec();
     paths.sort();
     paths.dedup();
@@ -4913,6 +4926,10 @@ fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Ve
     crates.dedup();
     Some(crates)
 }
+
+/// Where the recipe sources live, which the evaluator maps to the checks
+/// they reach by recipe rather than by crate.
+const RECIPE_SOURCES: &str = "recipes/";
 
 /// The most bytes of changed paths the recipe-checks scope carries before
 /// it falls back to crate names: well inside one argument's and one
@@ -5986,6 +6003,40 @@ mod tests {
             None
         );
         assert_eq!(check_scope(&root, &[], &check), None);
+        // Recipe sources travel as paths beside crate paths, and stand in
+        // as `recipes`, which the evaluator takes for a miss, in the
+        // fallback; a path outside both runs everything.
+        assert_eq!(
+            check_scope(
+                &root,
+                &paths(&["recipes/src/recipes/uutils.rs", "td-sh/src/lib.rs"]),
+                &check
+            ),
+            Some(paths(&[
+                "recipes/src/recipes/uutils.rs",
+                "td-sh/src/lib.rs"
+            ]))
+        );
+        assert_eq!(
+            check_scope(
+                &root,
+                &paths(&["recipes/locks/uutils/Cargo.lock", "td-sh/a b.txt"]),
+                &check
+            ),
+            Some(paths(&["recipes", "td-sh"]))
+        );
+        assert_eq!(
+            check_scope(
+                &root,
+                &paths(&["recipes/src/recipes/uutils.rs", "DEVELOPMENT.md"]),
+                &check
+            ),
+            None
+        );
+        assert_eq!(
+            check_scope(&root, &paths(&["recipes/../builder/x.rs"]), &check),
+            None
+        );
         assert_eq!(
             check_scope(
                 &root,

@@ -16,6 +16,7 @@
 //! names the logic that runs rather than whatever the tree holds when a check
 //! starts (see `evaluator_source_fingerprint`).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
@@ -34,8 +35,9 @@ mod sha256;
 #[path = "src/embed_scan.rs"]
 mod embed_scan;
 use embed_scan::{
-    declares_out_of_line_module, has_embed_marker, strip_comments, td_dirs_embedded, td_dirs_named,
-    td_dirs_named_beside_embeds, td_files_embedded,
+    declares_out_of_line_module, embed_literals, has_computed_embed, has_embed_marker,
+    normalize_join, production_code, sibling_reads, strip_comments, td_dirs_embedded,
+    td_dirs_named, td_dirs_named_beside_embeds, td_files_embedded,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -53,6 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The named dirs are the `td-*` directories the file spells, which is how
     // a recipe embeds crate sources (`include_str!("../../../td-sh/...")`).
     let mut recipes: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut recipe_texts: BTreeMap<String, String> = BTreeMap::new();
     for entry in fs::read_dir(&recipes_dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -99,6 +102,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let text = fs::read_to_string(entry.path())?;
         recipes.push((stem.to_string(), module, td_dirs_named(&text)));
+        recipe_texts.insert(stem.to_string(), text);
     }
     recipes.sort();
     if recipes.is_empty() {
@@ -238,6 +242,60 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(out, "    &[{}]", list.join(", "))?;
     writeln!(out, "}}")?;
 
+    let evaluator = evaluator_reads(repo, &recipes)?;
+    let (file_readers, wide_readers) =
+        recipe_file_readers(repo, &recipes, &recipe_texts, &evaluator)?;
+    writeln!(
+        out,
+        "/// Each repository file a recipe's evaluation reads directly, with the"
+    )?;
+    writeln!(
+        out,
+        "/// recipes that read it: a recipe file, read by its own recipe and the"
+    )?;
+    writeln!(
+        out,
+        "/// recipes whose code names its module, or a file a recipe embeds."
+    )?;
+    writeln!(
+        out,
+        "pub fn recipe_file_readers() -> &'static [(&'static str, &'static [&'static str])] {{"
+    )?;
+    writeln!(out, "    &[")?;
+    for (path, stems) in &file_readers {
+        let stems: Vec<String> = stems.iter().map(|s| format!("{s:?}")).collect();
+        writeln!(out, "        ({path:?}, &[{}]),", stems.join(", "))?;
+    }
+    writeln!(out, "    ]")?;
+    writeln!(out, "}}")?;
+    writeln!(
+        out,
+        "/// The recipes whose code may read any recipe file (a glob, a group, a"
+    )?;
+    writeln!(out, "/// catalog lookup by name). Sorted.")?;
+    writeln!(
+        out,
+        "pub fn recipe_wide_readers() -> &'static [&'static str] {{"
+    )?;
+    let list: Vec<String> = wide_readers.iter().map(|s| format!("{s:?}")).collect();
+    writeln!(out, "    &[{}]", list.join(", "))?;
+    writeln!(out, "}}")?;
+    writeln!(
+        out,
+        "/// The files under `recipes/` the crate's shared modules and evaluator"
+    )?;
+    writeln!(
+        out,
+        "/// read in production code, which reach every check. Sorted."
+    )?;
+    writeln!(
+        out,
+        "pub fn recipe_evaluator_reads() -> &'static [&'static str] {{"
+    )?;
+    let list: Vec<String> = evaluator.files.iter().map(|s| format!("{s:?}")).collect();
+    writeln!(out, "    &[{}]", list.join(", "))?;
+    writeln!(out, "}}")?;
+
     let (fingerprint, fingerprinted) =
         evaluator_source_fingerprint(Path::new(&manifest_dir), &shared_files)?;
     writeln!(
@@ -258,6 +316,192 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("cargo:rustc-env=TD_EVALUATOR_SOURCE_FINGERPRINT={fingerprint}");
     Ok(())
+}
+
+/// Who reads each file a recipe's evaluation reads under `recipes/`, and
+/// which recipes may read any recipe file. A recipe file is read by its own
+/// recipe and by every recipe whose production code names its module
+/// (`embed_scan::sibling_reads`, a `catalog` alias of one included), since
+/// that recipe's derivation can change with it; a file a recipe embeds
+/// under `RECIPE_DIR`, `recipes/src/fixtures`, `recipes/src/probes` or
+/// `recipes/locks` is read by that recipe. A recipe whose code reads in a
+/// way this cannot follow (a glob, an alias, a computed embed path) may
+/// read any. Anything else under `recipes/` — the shared modules, the
+/// evaluator — is in no entry, which the check reach takes as reaching
+/// every check; so is a file the crate's other sources read
+/// (`EvaluatorReads`, emitted as `recipe_evaluator_reads`), though its
+/// entry stays here for the module readers the reach follows through it.
+type FileReaders = BTreeMap<String, BTreeSet<String>>;
+
+/// Where a file a recipe embeds may lie and still key only that recipe.
+const RECIPE_EMBED_DIRS: &[&str] = &[
+    RECIPE_DIR,
+    "recipes/src/fixtures/",
+    "recipes/src/probes/",
+    "recipes/locks/",
+];
+
+fn recipe_file_readers(
+    repo: &Path,
+    recipes: &[(String, String, Vec<String>)],
+    texts: &BTreeMap<String, String>,
+    evaluator: &EvaluatorReads,
+) -> Result<(FileReaders, Vec<String>), Box<dyn Error>> {
+    let mut modules: Vec<&str> = recipes.iter().map(|(_, m, _)| m.as_str()).collect();
+    modules.extend(evaluator.aliases.keys().map(String::as_str));
+    let mut readers: FileReaders = BTreeMap::new();
+    let mut wide: Vec<String> = Vec::new();
+    let mut read = |path: String, stem: &str| {
+        readers.entry(path).or_default().insert(stem.to_string());
+    };
+    for (stem, module, _) in recipes {
+        let text = texts
+            .get(stem)
+            .ok_or_else(|| format!("no text read for src/recipes/{stem}.rs"))?;
+        let own = format!("{RECIPE_DIR}{stem}.rs");
+        read(own.clone(), stem);
+        // The recipe file, then each Rust file it mounts under `recipes/`,
+        // transitively: a mounted module's code is the recipe's.
+        let mut pending: Vec<(String, String)> = vec![(own.clone(), text.clone())];
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut any_wide = false;
+        while let Some((path, text)) = pending.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let (reads, any) = sibling_reads(&text, &modules);
+            let code = production_code(&text);
+            any_wide |= any || has_computed_embed(&code);
+            for name in &reads {
+                let target = evaluator.aliases.get(name).unwrap_or(name);
+                if target == module {
+                    continue;
+                }
+                let (read_stem, _, _) = recipes
+                    .iter()
+                    .find(|(_, m, _)| m == target)
+                    .ok_or_else(|| format!("{stem}: no recipe for module {target}"))?;
+                read(format!("{RECIPE_DIR}{read_stem}.rs"), stem);
+            }
+            let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+            for (_, literal) in embed_literals(&code) {
+                let Some(embedded) = normalize_join(dir, &literal) else {
+                    continue;
+                };
+                if !RECIPE_EMBED_DIRS.iter().any(|d| embedded.starts_with(d)) || embedded == own {
+                    continue;
+                }
+                if embedded.ends_with(".rs") {
+                    match fs::read_to_string(repo.join(&embedded)) {
+                        Ok(text) => pending.push((embedded.clone(), text)),
+                        // A module this cannot read is one it cannot follow.
+                        Err(_) => any_wide = true,
+                    }
+                }
+                read(embedded, stem);
+            }
+        }
+        if any_wide {
+            wide.push(stem.clone());
+        }
+    }
+    Ok((readers, wide))
+}
+
+/// Where the recipe files live, repository-relative.
+const RECIPE_DIR: &str = "recipes/src/recipes/";
+
+/// What the crate's sources other than the recipe files (the shared
+/// modules, the evaluator) read of the recipes, in production code.
+struct EvaluatorReads {
+    /// Files they read under `recipes/`: a recipe module named after
+    /// `registry::`, a recipe looked up by a literal name, and a file they
+    /// embed. Such a file can change what any check asserts, so it keys and
+    /// reaches every check.
+    files: BTreeSet<String>,
+    /// A recipe module re-exported under another name (`pub use
+    /// registry::x as y;`), by that name, with the module it is.
+    aliases: BTreeMap<String, String>,
+}
+
+/// Watched through `walk_sources`.
+fn evaluator_reads(
+    repo: &Path,
+    recipes: &[(String, String, Vec<String>)],
+) -> Result<EvaluatorReads, Box<dyn Error>> {
+    let mut sources = Vec::new();
+    walk_sources(&repo.join("recipes/src"), &mut sources)?;
+    let mut files = BTreeSet::new();
+    let mut aliases = BTreeMap::new();
+    let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let ident = |s: &str| {
+        let s = s.strip_prefix("r#").unwrap_or(s);
+        s.get(..s.find(|c: char| !ident_char(c)).unwrap_or(s.len()))
+            .unwrap_or("")
+            .to_string()
+    };
+    for source in sources {
+        let rel = source
+            .strip_prefix(repo)?
+            .to_str()
+            .ok_or("non-UTF-8 path under recipes/src")?
+            .to_string();
+        if rel.starts_with(RECIPE_DIR) || !rel.ends_with(".rs") {
+            continue;
+        }
+        let code = production_code(&fs::read_to_string(&source)?);
+        for (prefix, literal) in [("registry::", false), ("lookup(\"", true)] {
+            let mut from = 0usize;
+            while let Some(i) = code.get(from..).and_then(|r| r.find(prefix)) {
+                from = from.saturating_add(i).saturating_add(prefix.len());
+                let rest = code.get(from..).unwrap_or("").trim_start();
+                // A group (`registry::{x, y as z}`) names each of its items.
+                let items: Vec<&str> = match rest.strip_prefix('{') {
+                    Some(group) if !literal => group
+                        .get(..group.find('}').unwrap_or(group.len()))
+                        .unwrap_or("")
+                        .split(',')
+                        .map(str::trim)
+                        .collect(),
+                    _ => vec![rest],
+                };
+                for item in items {
+                    let name = if literal {
+                        item.get(..item.find('"').unwrap_or(0))
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        ident(item)
+                    };
+                    let hit = recipes.iter().find(|(stem, module, _)| {
+                        if literal {
+                            *stem == name
+                        } else {
+                            *module == name
+                        }
+                    });
+                    let Some((stem, module, _)) = hit else {
+                        continue;
+                    };
+                    files.insert(format!("{RECIPE_DIR}{stem}.rs"));
+                    let item = item.strip_prefix("r#").unwrap_or(item);
+                    let after = item.get(name.len()..).unwrap_or("").trim_start();
+                    if let Some(alias) = after.strip_prefix("as ").filter(|_| !literal) {
+                        aliases.insert(ident(alias.trim_start()), module.clone());
+                    }
+                }
+            }
+        }
+        let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
+        for (_, literal) in embed_literals(&code) {
+            if let Some(path) = normalize_join(dir, &literal) {
+                if path.starts_with("recipes/") {
+                    files.insert(path);
+                }
+            }
+        }
+    }
+    Ok(EvaluatorReads { files, aliases })
 }
 
 /// The `shared_embeds` entry for `file`, a repository-relative path a shared

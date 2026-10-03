@@ -180,19 +180,32 @@ fn run_out(program: &str, args: &[&str], ctx: &str) -> Result<String, String> {
     run_out_env(program, args, &[], ctx)
 }
 
-/// A `check-list` output split into the evaluator's `# ` notes and the check
-/// names, one per line or several, in order. The notes ride stdout because
-/// `run_out_env` keeps stderr only for a failure.
-fn split_check_list(raw: &str) -> (Vec<&str>, Vec<&str>) {
-    let mut notes = Vec::new();
-    let mut stems = Vec::new();
+/// The `# ` note prefix `td-recipe-eval check-list --reaching` gives the
+/// line that says why a check was reached (its `REACH_NOTE`); any other
+/// note is a scope miss.
+const REACH_NOTE: &str = "reach: ";
+
+/// A `check-list` output split into the evaluator's `# reach: ` notes (why
+/// a check was reached), its other `# ` notes (a scope miss: it listed
+/// everything) and the check names, one per line or several, in order. The
+/// notes ride stdout because `run_out_env` keeps stderr only for a failure.
+fn split_check_list(raw: &str) -> CheckList<'_> {
+    let mut list = CheckList::default();
     for line in raw.lines() {
-        match line.strip_prefix("# ") {
-            Some(note) => notes.push(note.trim()),
-            None => stems.extend(line.split_whitespace()),
+        match line.strip_prefix("# ").map(str::trim) {
+            Some(note) if note.starts_with(REACH_NOTE) => list.whys.push(note),
+            Some(note) => list.misses.push(note),
+            None => list.stems.extend(line.split_whitespace()),
         }
     }
-    (notes, stems)
+    list
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct CheckList<'a> {
+    whys: Vec<&'a str>,
+    misses: Vec<&'a str>,
+    stems: Vec<&'a str>,
 }
 
 /// `run_out`, plus extra env vars set on the child (inheriting the rest of the
@@ -1727,7 +1740,11 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
                 &envs,
                 "td-recipe-eval check-list --reaching",
             )?;
-            let (notes, stems) = split_check_list(&raw);
+            let CheckList {
+                whys,
+                misses,
+                stems,
+            } = split_check_list(&raw);
             let listed = stems.join(" ");
             unreached = every
                 .split_whitespace()
@@ -1735,12 +1752,15 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
                 .map(str::to_string)
                 .collect();
             let (reached, total) = (stems.len(), every.split_whitespace().count());
-            for note in &notes {
+            for why in &whys {
+                println!(">> recipe-checks: {why}");
+            }
+            for note in &misses {
                 println!(">> recipe-checks: evaluator: {note}");
             }
             // A full list must not read as a narrowing, and a miss must say
             // it was one: the evaluator's note carries the reason.
-            if !notes.is_empty() {
+            if !misses.is_empty() {
                 println!(
                     ">> recipe-checks: the evaluator could not map a change under [{}] to \
                      the checks it reaches and listed every one; running all {total}",
@@ -4307,10 +4327,29 @@ mod tests {
                 .any(|l| l.contains("1 check(s) not reached") && l.contains("x#1")),
             "a failure still names what the scope left out: {lines:?}"
         );
-        let (notes, stems) = split_check_list("# scope miss: no recipe reads x\na\nb c\n");
-        assert_eq!(notes, vec!["scope miss: no recipe reads x"]);
-        assert_eq!(stems, vec!["a", "b", "c"]);
-        assert_eq!(split_check_list(""), (vec![], vec![]));
+        let list = split_check_list("# scope miss: no recipe reads x\na\nb c\n");
+        assert_eq!(list.misses, vec!["scope miss: no recipe reads x"]);
+        assert_eq!(list.stems, vec!["a", "b", "c"]);
+        assert!(list.whys.is_empty());
+        // A reason a check was reached is no miss.
+        let list = split_check_list("# reach: a: uutils reads recipes/x.rs\na\n");
+        assert_eq!(list.whys, vec!["reach: a: uutils reads recipes/x.rs"]);
+        assert!(list.misses.is_empty());
+        assert_eq!(split_check_list(""), CheckList::default());
+        // The evaluator's copy of the prefix is this one: a drift would take
+        // every reason for a miss and run every check.
+        let evaluator = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../recipes/src/bin/td_recipe_eval/check_runner.rs");
+        match std::fs::read_to_string(&evaluator) {
+            Ok(text) => assert!(
+                text.contains(&format!(
+                    "pub(crate) const REACH_NOTE: &str = {REACH_NOTE:?};"
+                )),
+                "{} holds another REACH_NOTE",
+                evaluator.display()
+            ),
+            Err(e) => eprintln!("SKIP: {} ({e}): builder-only tree", evaluator.display()),
+        }
     }
 
     /// A memoized pass is a pass that is counted apart and said out loud, on
