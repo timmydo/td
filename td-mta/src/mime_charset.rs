@@ -183,14 +183,14 @@ impl Decoder {
         // A scalar needs at most four source bytes; invalid continuation lookahead
         // replaces the accepted prefix and is revisited on the following turn.
         for _ in 0..4 {
-            let byte = input.get(consumed).copied();
             meter.charge(
                 now,
                 Charge {
-                    io_bytes: u64::from(byte.is_some()),
+                    io_bytes: u64::from(consumed < input.len()),
                     ..Charge::default()
                 },
             )?;
+            let byte = input.get(consumed).copied();
             let Some(byte) = byte else {
                 if !last {
                     return Ok(Progress {

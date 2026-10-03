@@ -1515,6 +1515,13 @@ Initial independently landable increments:
   before child work, repeated projections and allocation-free aggregate
   exhaustion. Remaining form grammar/conversion and publication stay open.
 
+- **M06as — aggregate Raw conversion and JSON:** own Raw decoding and private
+  prepaid credit while borrowing the live email/job budgets. Precharge byte
+  visits and transitions, preserve identity, and reuse bounded JSON framing.
+  Cover exact costs, repairs, aggregate/job/output refusal, non-copyable state
+  and allocation-free fragmented output. Whole-field ownership and publication
+  remain separate.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

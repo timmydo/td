@@ -2329,6 +2329,48 @@ the real aggregate cap refuses. Other form grammar/conversion stages still
 need aggregate integration; this increment does not enable JMAP publication or
 claim complete worker memory qualification.
 
+### 1.51 Aggregate Raw conversion and JSON output
+
+M06as adds `header_raw::Budgeted`, which owns a fresh Raw cursor and private
+step credit while exclusively borrowing the job meter and email HeaderBudget.
+It is neither Copy nor Clone; ordinary copied Raw cursors remain available
+under the original job-only API. Aggregate copies cannot duplicate credit or
+renew budgets. Its scalar output preserves the existing Raw policy: no NFC, no
+encoded-word interpretation, NUL removal after UTF-8 decoding, replacement of
+invalid maximal subparts and noncharacters, and literal folds/controls. Raw
+now owns its typed Error with Work, InterpretationLimit and InvalidState.
+
+Before each active poll, charge one owner transition. The charset work adapter
+charges one step per byte visit and scalar emission, and one for zero-byte EOF
+work. Lookahead is precharged before loading the source byte; invalid UTF-8
+lookahead is charged again when revisited. At most four visits, six aggregate
+steps and one prepaid job record occur in a poll. N ASCII bytes take N visits
+and 3N+2 steps including completion. Source-level replay cannot copy this
+wrapper's budgets or credit. Earlier successful charges survive later refusal.
+
+The wrapper fits 96 bytes, including the existing Raw state and references to
+the existing email/job budgets, inside the 2 KiB decoder/HTML/snippet
+reservation. It needs no NFC scratch or heap backing. Error latching covers
+parent admission, child decode, output and deadline refusal. Aggregate
+exhaustion is shared with later owners; job refusal retains Work(Stop). Cached
+scalar completion is inert.
+
+`json_string::Cursor::from_budgeted_raw` borrows an unpolled wrapper. The same
+private Frame and 64-byte public serializer ceiling apply. Output staging
+checks the live email/job state and charges escaped bytes/quotes once before
+copying; zero-byte checks do not consume aggregate steps or credit. Both
+source and serializer errors use Raw, including output/deadline refusal; the
+wrapper also latches those errors. Thus final serializer deadline refusal
+retires even a completed source. Every output byte remains provisional until
+the containing property succeeds. Dropping the serializer early abandons that
+property and source; rewrapping progressed state is not allowed.
+
+Tests cover literal identity, repair, bounded and exact work, aggregate/job
+refusals, non-copyable ownership and fragmented JSON. An allocation interval
+covers long one-byte JSON output and output refusal in both registered modes.
+Selection-to-value ownership, other forms and retained publication remain
+follow-on work; this component does not qualify complete worker memory.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

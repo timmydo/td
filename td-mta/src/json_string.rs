@@ -59,6 +59,7 @@ pub(crate) trait ScalarSource {
 pub(crate) enum Source<'c, 'a, 'w> {
     Normalized(&'c mut nfc::Cursor<'a, 'w>),
     Raw(&'c mut header_raw::Cursor<'a>, &'c mut Meter),
+    BudgetedRaw(&'c mut header_raw::Budgeted<'a, 'w>),
     Address(&'c mut header_address_text::Cursor<'a>, &'c mut Meter),
 }
 impl ScalarSource for Source<'_, '_, '_> {
@@ -67,6 +68,9 @@ impl ScalarSource for Source<'_, '_, '_> {
             Self::Normalized(cursor) => cursor
                 .charge_output(now, output_bytes)
                 .map_err(Error::Source),
+            Self::BudgetedRaw(cursor) => {
+                cursor.charge_output(now, output_bytes).map_err(Error::Raw)
+            }
             Self::Raw(_, work) | Self::Address(_, work) => work
                 .charge(
                     now,
@@ -86,6 +90,11 @@ impl ScalarSource for Source<'_, '_, '_> {
                 header_raw::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
                 header_raw::Status::Complete => Ok(nfc::Status::Complete),
             },
+            Self::BudgetedRaw(cursor) => match cursor.poll(now).map_err(Error::Raw)? {
+                header_raw::Status::Yield => Ok(nfc::Status::Yield),
+                header_raw::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
+                header_raw::Status::Complete => Ok(nfc::Status::Complete),
+            },
             Self::Address(cursor, work) => match cursor.poll(now, work).map_err(Error::Address)? {
                 header_address_text::Status::Yield => Ok(nfc::Status::Yield),
                 header_address_text::Status::Scalar(value) => Ok(nfc::Status::Scalar(value)),
@@ -99,6 +108,7 @@ impl Source<'_, '_, '_> {
         match self {
             Self::Normalized(cursor) => cursor.is_encoding_problem(),
             Self::Raw(cursor, _) => cursor.is_encoding_problem(),
+            Self::BudgetedRaw(cursor) => cursor.is_encoding_problem(),
             Self::Address(cursor, _) => cursor.is_encoding_problem(),
         }
     }
@@ -118,6 +128,10 @@ impl<'c, 'a, 'w> Cursor<'c, 'a, 'w> {
     /// Supply an unpolled Raw cursor and its job's live meter.
     pub fn from_raw(source: &'c mut header_raw::Cursor<'a>, work: &'c mut Meter) -> Self {
         Self::from_source(Source::Raw(source, work))
+    }
+    /// Supply an unpolled Raw owner retaining its live job and email budgets.
+    pub fn from_budgeted_raw(source: &'c mut header_raw::Budgeted<'a, 'w>) -> Self {
+        Self::from_source(Source::BudgetedRaw(source))
     }
     /// Supply an unpolled address cursor and its job's live meter.
     pub fn from_address(
@@ -600,6 +614,75 @@ mod tests {
             assert_eq!(source.calls, calls);
             assert_eq!(output, [0xa5]);
         }
+    }
+    #[test]
+    fn budgeted_raw_json_shares_live_charges_and_retires_on_output_refusal() {
+        for width in 1..=8 {
+            let input = b"e\xcc\x81\r\n\t\x01\0\xff";
+            let mut meter = work(1000);
+            let mut budget = nfc::HeaderBudget::new();
+            let mut source = header_raw::Budgeted::new(input, &mut meter, &mut budget);
+            assert!(std::mem::size_of_val(&source) <= 96);
+            let mut cursor = Cursor::from_budgeted_raw(&mut source);
+            let output = drain(&mut cursor, width);
+            assert_eq!(output, "\"e\u{301}\\r\\n\\t\\u0001�\"");
+            assert!(cursor.is_encoding_problem());
+            cursor.check_deadline(Tick(1)).unwrap();
+            assert_eq!(1000 - meter.remaining().output_bytes, output.len() as u64);
+            assert_eq!(
+                budget.source_bytes_remaining(),
+                16 * 1024 * 1024 - input.len() as u64
+            );
+        }
+        for capacity in 0..3 {
+            let mut meter = work(capacity);
+            let mut budget = nfc::HeaderBudget::new();
+            let mut source = header_raw::Budgeted::new(b"a", &mut meter, &mut budget);
+            let mut cursor = Cursor::from_budgeted_raw(&mut source);
+            let error = Error::Raw(header_raw::Error::Work(Stop::OutputBytes));
+            assert_eq!(refusal(&mut cursor, &mut [0]).0, error);
+            assert_eq!(cursor.poll(Tick(1), &mut [0]), Err(error));
+            assert_eq!(
+                source.poll(Tick(1)),
+                Err(header_raw::Error::Work(Stop::OutputBytes))
+            );
+        }
+        let mut meter = work(100);
+        let mut budget = nfc::HeaderBudget::new();
+        let mut source = header_raw::Budgeted::new(b"a", &mut meter, &mut budget);
+        let mut cursor = Cursor::from_budgeted_raw(&mut source);
+        assert_eq!(drain(&mut cursor, 1), "\"a\"");
+        let error = Error::Raw(header_raw::Error::Work(Stop::Deadline));
+        assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+        assert_eq!(
+            source.poll(Tick(1)),
+            Err(header_raw::Error::Work(Stop::Deadline))
+        );
+    }
+    #[test]
+    fn budgeted_raw_json_checks_and_fragment_drains_spend_no_extra_steps() {
+        let input = [b'a'; 17];
+        let mut meter = work(1000);
+        let before = meter.remaining();
+        let mut budget = nfc::HeaderBudget::new();
+        let mut source = header_raw::Budgeted::new(&input, &mut meter, &mut budget);
+        let mut cursor = Cursor::from_budgeted_raw(&mut source);
+        for _ in 0..100 {
+            assert_eq!(
+                cursor.poll(Tick(1), &mut []),
+                Ok(Progress {
+                    written: 0,
+                    status: Status::NeedOutput
+                })
+            );
+        }
+        assert_eq!(drain(&mut cursor, 1), "\"aaaaaaaaaaaaaaaaa\"");
+        cursor.check_deadline(Tick(1)).unwrap();
+        cursor.check_deadline(Tick(1)).unwrap();
+        assert_eq!(budget.steps_remaining(), 16_000_000 - 53);
+        assert_eq!(budget.source_bytes_remaining(), 16 * 1024 * 1024 - 17);
+        assert_eq!(before.records - meter.remaining().records, 4);
+        assert_eq!(before.output_bytes - meter.remaining().output_bytes, 19);
     }
     fn drain(cursor: &mut Cursor<'_, '_, '_>, width: usize) -> String {
         assert!(std::mem::size_of_val(cursor) <= 64);

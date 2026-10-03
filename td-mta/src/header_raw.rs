@@ -1,10 +1,38 @@
 //! Resident header Raw-form scalars; source authorization and JSON output are external.
-pub use crate::mime_charset::Error;
+pub use budgeted::Budgeted;
+mod budgeted;
 use crate::{
-    admission::work::Meter,
+    admission::work::{Meter, Stop},
+    decode_work::{Error as DecodeError, Work},
     mime_charset::{Charset, Decoder, Status as Decoded},
     ports::Tick,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    Work(Stop),
+    InterpretationLimit,
+    InvalidState,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Work(stop) => write!(f, "Raw header work: {stop}"),
+            Self::InterpretationLimit => f.write_str("Raw header interpretation limit"),
+            Self::InvalidState => f.write_str("invalid Raw header state"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<DecodeError> for Error {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Work(stop) => Self::Work(stop),
+            DecodeError::InterpretationLimit => Self::InterpretationLimit,
+            DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
@@ -43,6 +71,9 @@ impl<'a> Cursor<'a> {
     /// Decode/filter one scalar, or yield after a removed NUL. The owner brackets
     /// turns with fresh clock/cancellation checks and retains the live meter.
     pub fn poll(&mut self, now: Tick, meter: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, meter)
+    }
+    fn poll_with_work(&mut self, now: Tick, meter: &mut impl Work) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -55,12 +86,12 @@ impl<'a> Cursor<'a> {
         }
         result
     }
-    fn advance(&mut self, now: Tick, meter: &mut Meter) -> Result<Status, Error> {
+    fn advance(&mut self, now: Tick, meter: &mut impl Work) -> Result<Status, Error> {
         let input = self
             .source
             .get(self.position..)
             .ok_or(Error::InvalidState)?;
-        let decoded = self.decoder.poll(input, true, now, meter)?;
+        let decoded = self.decoder.poll_with_work(input, true, now, meter)?;
         self.position = self
             .position
             .checked_add(decoded.consumed)
@@ -105,7 +136,7 @@ mod tests {
             },
         )
     }
-    fn project(bytes: &[u8]) -> (String, bool) {
+    pub(super) fn project(bytes: &[u8]) -> (String, bool) {
         let mut cursor = Cursor::new(bytes);
         assert!(std::mem::size_of_val(&cursor) <= 64);
         let mut work = meter(10000, 10000);

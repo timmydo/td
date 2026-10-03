@@ -3272,6 +3272,77 @@ fn header_selection_budget() {
     assert_eq!(before, after, "aggregate header traversal allocated");
 }
 
+fn budgeted_raw_output() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_raw, json_string,
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let input = "e\u{301}\r\n\t\u{1}\0�".repeat(4096);
+    let expected_len = 4096 * 18 + 2;
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 2_000_000,
+            output_bytes: 1_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut limited = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1000,
+            records: 1000,
+            output_bytes: 1,
+            ..Charge::default()
+        },
+    );
+    let mut limited_budget = HeaderBudget::new();
+    let before = COUNTERS.snapshot();
+    let mut source = header_raw::Budgeted::new(black_box(input.as_bytes()), &mut work, &mut budget);
+    let mut cursor = json_string::Cursor::from_budgeted_raw(&mut source);
+    let mut output = [0; 1];
+    let mut written = 0;
+    let mut complete = false;
+    for _ in 0..1_000_000 {
+        let progress = cursor.poll(Tick(1), &mut output).unwrap();
+        written += progress.written;
+        if progress.status == json_string::Status::Complete {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!(written, expected_len);
+    cursor.check_deadline(Tick(1)).unwrap();
+    let mut source = header_raw::Budgeted::new(b"a", &mut limited, &mut limited_budget);
+    let mut cursor = json_string::Cursor::from_budgeted_raw(&mut source);
+    let error = json_string::Error::Raw(header_raw::Error::Work(Stop::OutputBytes));
+    let mut refused = false;
+    for _ in 0..100 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => assert_ne!(progress.status, json_string::Status::Complete),
+            Err(actual) => {
+                assert_eq!(actual, error);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
+    assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+    assert_eq!(
+        source.poll(Tick(1)),
+        Err(header_raw::Error::Work(Stop::OutputBytes))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "budgeted Raw JSON allocated");
+}
+
 fn header_properties() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -4190,6 +4261,7 @@ fn main() {
         header_comments();
         header_selection();
         header_selection_budget();
+        budgeted_raw_output();
         header_properties();
         header_nfc();
         phrase_nfc();
@@ -4311,6 +4383,7 @@ fn main() {
     header_comments();
     header_selection();
     header_selection_budget();
+    budgeted_raw_output();
     header_properties();
     header_nfc();
     phrase_nfc();

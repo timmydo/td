@@ -972,6 +972,16 @@ fragmenting a staged JSON scalar adds no charge. Allocation intervals cover
 Raw, both address modes and malformed-source refusal. No complete
 response/worker claim follows.
 
+The aggregate Raw owner (M06as) fits 96 bytes including its decoder state,
+references to existing email/job budgets and private step credit, within the
+existing 2 KiB decoder/HTML/snippet reservation. It is not Copy or Clone and
+allocates no scratch. Each scalar poll uses at most four source visits, six
+aggregate steps and one prepaid job record. Its borrowed JSON adapter remains
+within 64 bytes; zero-byte live checks and output charges consume no
+interpretation credit. Allocation intervals cover long one-byte serialization
+and terminal output refusal. Whole-worker stack, native allocation and RSS
+remain unqualified.
+
 Private JSON Frame state fits 32 bytes and owns no source or work reference.
 The public borrowed adapter still fits 64 bytes; extraction does not introduce
 another simultaneous frame. A future coordinator may retain its parser and
