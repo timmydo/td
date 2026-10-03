@@ -235,7 +235,9 @@ fn token_text(error: &TokenError) -> &'static str {
                 Status::PinRequired => "the security key requires a PIN",
                 Status::PinPolicy => "the PIN does not meet the security key's policy",
                 Status::NoCredential => "this security key is not enrolled in the vault",
-                Status::CredentialExcluded => "this security key is already enrolled",
+                Status::CredentialExcluded => {
+                    "this security key is already enrolled; connect a different one"
+                }
                 Status::TouchTimeout | Status::ActionTimeout => {
                     "the security key was not touched in time"
                 }
@@ -907,6 +909,12 @@ mod tests {
                 Status::PinInvalid
             )))),
             "wrong PIN"
+        );
+        assert_eq!(
+            text(Error::Token(TokenError::Failed(Transaction::Status(
+                Status::CredentialExcluded
+            )))),
+            "this security key is already enrolled; connect a different one"
         );
         assert_eq!(
             text(Error::Token(TokenError::Several)),

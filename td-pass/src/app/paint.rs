@@ -25,6 +25,31 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
     }
 }
 
+/// `texts`, one to each row of `rect` from its top.
+fn lines(
+    surface: Surface,
+    rect: Rect,
+    texts: &[String],
+    background: u32,
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    let row = layout::row(surface);
+    let height = u32::try_from(row).unwrap_or(0);
+    let mut y = rect.y;
+    for text in texts {
+        line(
+            surface,
+            Rect { y, height, ..rect },
+            text,
+            background,
+            damage,
+            sink,
+        );
+        y = y.saturating_add(row);
+    }
+}
+
 /// One line of text from a cell into `rect`, cut at its right edge.
 fn line(
     surface: Surface,
@@ -228,7 +253,7 @@ impl Composition for Frame<'_> {
         }
         Status::new(surface).emit(app.status.chars(), damage, sink);
         if let Some(prompt) = &app.prompt {
-            let view = layout::prompt(surface, prompt.ask.pin.is_some());
+            let (view, title, instruction) = super::prompt_view(surface, &prompt.ask);
             fill(view.rect, BORDER, damage, sink);
             let s = surface.scale.value() as i64;
             let inner = Rect {
@@ -238,22 +263,8 @@ impl Composition for Frame<'_> {
                 height: view.rect.height.saturating_sub(2 * s as u32),
             };
             fill(inner, CHROME, damage, sink);
-            line(
-                surface,
-                view.title,
-                prompt.ask.operation,
-                CHROME,
-                damage,
-                sink,
-            );
-            line(
-                surface,
-                view.line,
-                &super::asking(&prompt.ask),
-                CHROME,
-                damage,
-                sink,
-            );
+            lines(surface, view.title, &title, CHROME, damage, sink);
+            lines(surface, view.line, &instruction, CHROME, damage, sink);
             if let Some(entry) = view.pin {
                 entry.emit(
                     prompt

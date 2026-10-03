@@ -166,10 +166,16 @@ mode.
   the finder, closes it and acts. Only ciphertext and listings cross
   `src/files.rs`.
 - **Prompt.** A presentation asks for the named key to be connected; a
-  PIN request shows a masked field that refuses copy. The instruction
-  names the key before the operation, so a narrow row cuts the
-  operation's words rather than which key. Escape or Cancel
-  declines, which the vault reports as cancelled.
+  PIN request shows a masked field that refuses copy. The title names
+  the operation and the instruction the key and what to do with it; a
+  backup to enroll is asked for as a key not already enrolled, since a
+  token holding one of the vault's credentials refuses. Both wrap at
+  spaces to the prompt's width, a word longer than a row split, and the
+  prompt grows by the rows they take; a window too short for them all
+  keeps the field and buttons, the instruction's rows before the
+  title's, and a text cut short ends in an ellipsis. The status line
+  carries the instruction and the operation. Escape or Cancel declines,
+  which the vault reports as cancelled.
 - **Lock.** Lock forgets every document and its history, the find query,
   the titles, the fields and any pending paste, withdraws the window's
   clipboard offer, and has td-ui zero the frames it keeps: its pixels

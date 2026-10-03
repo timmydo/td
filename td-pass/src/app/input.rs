@@ -915,7 +915,7 @@ impl App {
         let Some(prompt) = &mut self.prompt else {
             return;
         };
-        let view = layout::prompt(self.surface, prompt.ask.pin.is_some());
+        let (view, ..) = prompt_view(self.surface, &prompt.ask);
         match phase {
             PointerPhase::Press => {
                 if let Some(entry) = view.pin.filter(|entry| entry.rect().contains(x, y)) {
@@ -945,7 +945,7 @@ impl App {
     fn reveal_fields(&mut self) {
         let surface = self.surface;
         if let Some(prompt) = &mut self.prompt {
-            if let Some(entry) = layout::prompt(surface, true).pin {
+            if let Some(entry) = prompt_view(surface, &prompt.ask).0.pin {
                 prompt.pin.reveal(entry);
             }
         }

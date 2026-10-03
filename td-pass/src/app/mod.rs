@@ -26,7 +26,7 @@ use td_ui::window::{Clipboard, Input, PointerPhase};
 use crate::plain::{self, Bytes, Text};
 use crate::protocol::{
     Answer, Ask, Change, Command, EntryId, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse,
-    Reply,
+    Reply, Role,
 };
 
 /// The largest title, search or find text a field holds; td-secret
@@ -2104,19 +2104,96 @@ fn matches_folded(title: &str, needle: &str) -> bool {
         })
 }
 
-/// The prompt's instruction and the status line while it waits: the key
-/// first, so a narrow row cuts the operation's words, not which key.
-fn asking(ask: &Ask) -> String {
+/// What the prompt asks of the person: the key and what to do with it.
+/// A backup is asked for as a key not already enrolled, since a token
+/// holding one of the vault's credentials refuses to enroll again.
+fn instruction(ask: &Ask) -> String {
     let key = match &ask.key {
         Some(fingerprint) => format!("the {} key {fingerprint}", ask.role.name()),
         None => format!("the key to enroll as {}", ask.role.name()),
     };
-    let what = match ask.pin {
+    match ask.pin {
+        None if ask.key.is_none() && ask.role == Role::Backup => {
+            format!("Connect {key}, not one already enrolled")
+        }
         None => format!("Connect {key}"),
         Some(PinUse::Authorize | PinUse::Enroll) => format!("Type the PIN of {key}"),
-        Some(PinUse::Proof) => format!("Type the PIN of {key} once more"),
-    };
-    format!("{what}, to {}", ask.operation)
+        Some(PinUse::Proof) => format!("Once more, type the PIN of {key}"),
+    }
+}
+
+/// The status line while a prompt waits: the instruction, then the
+/// operation, which the prompt shows as its title.
+fn asking(ask: &Ask) -> String {
+    format!("{}, to {}", instruction(ask), ask.operation)
+}
+
+/// The prompt's geometry with its title and instruction wrapped to it, so
+/// no word of either is cut. A window too short for every row keeps the
+/// field and buttons: the instruction keeps its rows before the title,
+/// each keeps one, and a text cut short ends in an ellipsis.
+fn prompt_view(surface: Surface, ask: &Ask) -> (layout::Prompt, Vec<String>, Vec<String>) {
+    let columns = layout::prompt_columns(surface);
+    let pin = ask.pin.is_some();
+    let rows = layout::prompt_text_rows(surface, pin);
+    let mut line = wrap(&instruction(ask), columns);
+    let mut title = wrap(ask.operation, columns);
+    shorten(&mut line, rows.saturating_sub(1).max(1), columns);
+    shorten(&mut title, rows.saturating_sub(line.len()).max(1), columns);
+    let view = layout::prompt(surface, pin, title.len(), line.len());
+    (view, title, line)
+}
+
+/// Keeps `rows`' first `keep`, the last of them ending in an ellipsis when
+/// any were dropped.
+fn shorten(rows: &mut Vec<String>, keep: usize, columns: usize) {
+    if rows.len() <= keep {
+        return;
+    }
+    rows.truncate(keep);
+    if let Some(last) = rows.last_mut() {
+        if last.chars().count() >= columns {
+            last.pop();
+        }
+        last.push('…');
+    }
+}
+
+/// `text` broken at spaces into rows of at most `columns` characters, a
+/// word longer than a row split across rows. No columns is one row.
+fn wrap(text: &str, columns: usize) -> Vec<String> {
+    if columns == 0 {
+        return vec![text.to_owned()];
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut width = 0;
+    for word in text.split_whitespace() {
+        let length = word.chars().count();
+        if width > 0 && width + 1 + length <= columns {
+            row.push(' ');
+            row.push_str(word);
+            width += 1 + length;
+            continue;
+        }
+        if width > 0 {
+            rows.push(std::mem::take(&mut row));
+        }
+        let mut rest = word;
+        while let Some((at, _)) = rest.char_indices().nth(columns) {
+            let Some((head, tail)) = rest.split_at_checked(at) else {
+                break;
+            };
+            rows.push(head.to_owned());
+            rest = tail;
+        }
+        row.push_str(rest);
+        width = rest.chars().count();
+    }
+    if width > 0 || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 
 #[cfg(test)]

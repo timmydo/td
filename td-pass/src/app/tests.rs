@@ -1034,7 +1034,7 @@ fn adding_a_key_goes_through_the_prompt_and_lists_the_new_key() {
     app.reply(Reply::Keys { op, keys });
     assert!(app.prompt.is_none());
     assert_eq!(notebook(&app).keys.keys.labels.len(), 3);
-    // A narrow prompt row cuts the operation's words, not the key.
+    // The status line names the key before the operation.
     assert!(asking(&Ask {
         operation: "authorize key replacement with a retained key",
         role: Role::Backup,
@@ -2275,4 +2275,142 @@ fn closing_while_swap_is_asked_about_quits_with_nothing_open() {
     key(&mut app, &mut board, "C-q");
     assert!(app.quitting());
     assert!(app.take_out().is_empty());
+}
+
+#[test]
+fn wrapping_keeps_every_word_whole_within_its_columns() {
+    let text = "create a portable vault: enroll the separate backup key";
+    let rows = wrap(text, 20);
+    assert_eq!(
+        rows,
+        [
+            "create a portable",
+            "vault: enroll the",
+            "separate backup key"
+        ]
+    );
+    assert_eq!(rows.join(" "), text);
+    // A word longer than a row is split; nothing fits, nothing is broken.
+    assert_eq!(wrap("0123456789ab cd", 5), ["01234", "56789", "ab cd"]);
+    assert_eq!(wrap("exactly five", 5), ["exact", "ly", "five"]);
+    assert_eq!(wrap("", 10), [""]);
+    assert_eq!(wrap("one two", 0), ["one two"]);
+    assert_eq!(wrap("é é é", 3), ["é é", "é"]);
+}
+
+#[test]
+fn a_prompt_shows_its_words_and_keeps_its_field_and_buttons_on_the_window() {
+    let operations = [
+        "create a portable vault: enroll the primary key",
+        "create a portable vault: enroll the separate backup key",
+        "authorize key replacement with a retained key",
+        "import a portable vault copy into this empty location",
+    ];
+    let mut asks = Vec::new();
+    for operation in operations {
+        for role in [Role::Primary, Role::Backup] {
+            for key in [None, Some("40e3e41c".to_owned())] {
+                for pin in [None, Some(PinUse::Enroll), Some(PinUse::Proof)] {
+                    asks.push(Ask {
+                        operation,
+                        role,
+                        key: key.clone(),
+                        pin,
+                    });
+                }
+            }
+        }
+    }
+    let words = |text: &str| text.replace(' ', "");
+    for (width, height) in [
+        (320, 120),
+        (320, 240),
+        (400, 600),
+        (480, 600),
+        (600, 600),
+        (800, 600),
+        (1280, 600),
+    ] {
+        let surface = Surface::new(width, height, td_ui::raster::Scale::default()).unwrap();
+        let columns = layout::prompt_columns(surface);
+        let row = layout::row(surface);
+        for ask in &asks {
+            let (view, title, line) = prompt_view(surface, ask);
+            for rows in [&title, &line] {
+                assert!(!rows.is_empty());
+                assert!(
+                    rows.iter().all(|r| r.chars().count() <= columns),
+                    "{rows:?}"
+                );
+            }
+            if height >= 600 {
+                // Room for every row: no word is cut or dropped.
+                assert_eq!(words(&title.concat()), words(ask.operation), "{width}");
+                assert_eq!(words(&line.concat()), words(&instruction(ask)), "{width}");
+            }
+            // Title, instruction, field and buttons in order, none
+            // overlapping, all within the prompt and the window.
+            assert_eq!(i64::from(view.title.height), row * title.len() as i64);
+            assert_eq!(view.line.y, view.title.y + i64::from(view.title.height));
+            assert_eq!(i64::from(view.line.height), row * line.len() as i64);
+            let mut below = view.line.y + i64::from(view.line.height);
+            if let Some(entry) = view.pin {
+                assert_eq!(entry.rect().y, below);
+                below += row;
+            } else {
+                assert!(ask.pin.is_none());
+            }
+            let buttons = view.buttons.rect();
+            assert_eq!(buttons.y, below, "{width}x{height}");
+            for part in [view.title, view.line, buttons] {
+                assert_eq!(part.intersection(view.rect), Some(part), "{width}x{height}");
+            }
+            assert_eq!(
+                view.rect.intersection(surface.bounds()),
+                Some(view.rect),
+                "{width}x{height} {ask:?}"
+            );
+        }
+    }
+    // The wording: a backup to enroll is a key not already enrolled, and
+    // the proof's PIN is asked once more; the status line adds the
+    // operation the prompt's title shows.
+    let ask = |role, key: Option<&str>, pin| Ask {
+        operation: operations[1],
+        role,
+        key: key.map(str::to_owned),
+        pin,
+    };
+    for (asked, said) in [
+        (
+            ask(Role::Backup, None, None),
+            "Connect the key to enroll as backup, not one already enrolled",
+        ),
+        (
+            ask(Role::Primary, None, None),
+            "Connect the key to enroll as primary",
+        ),
+        (
+            ask(Role::Backup, None, Some(PinUse::Enroll)),
+            "Type the PIN of the key to enroll as backup",
+        ),
+        (
+            ask(Role::Backup, None, Some(PinUse::Proof)),
+            "Once more, type the PIN of the key to enroll as backup",
+        ),
+        (
+            ask(Role::Primary, Some("40e3e41c"), Some(PinUse::Authorize)),
+            "Type the PIN of the primary key 40e3e41c",
+        ),
+    ] {
+        assert_eq!(instruction(&asked), said);
+        assert_eq!(asking(&asked), format!("{said}, to {}", operations[1]));
+    }
+    // Cut short, a text ends in an ellipsis within its columns.
+    let mut rows = wrap("one two three four five six", 9);
+    shorten(&mut rows, 2, 9);
+    assert_eq!(rows, ["one two", "three…"]);
+    let mut rows = wrap("abcdefghijk", 4);
+    shorten(&mut rows, 2, 4);
+    assert_eq!(rows, ["abcd", "efg…"]);
 }

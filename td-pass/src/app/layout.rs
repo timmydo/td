@@ -148,8 +148,8 @@ fn listing(surface: Surface, labels: &'static [&'static str]) -> Option<List> {
     )
 }
 
-/// The key prompt: a title row, an instruction row, the PIN field's row
-/// and the buttons, centred and at most sixty cells wide.
+/// The key prompt: the title's rows, the instruction's rows, the PIN
+/// field's row and the buttons, centred and at most sixty cells wide.
 #[derive(Clone, Copy, Debug)]
 pub struct Prompt {
     pub rect: Rect,
@@ -159,24 +159,51 @@ pub struct Prompt {
     pub buttons: Buttons<'static>,
 }
 
-pub fn prompt(surface: Surface, pin: bool) -> Prompt {
+/// The prompt's width, border included.
+fn prompt_width(surface: Surface) -> i64 {
+    let cell = cell(surface);
+    ((surface.width as i64) - 2 * cell).clamp(0, 60 * cell)
+}
+
+/// The characters one of the prompt's text rows shows: its width inside
+/// the border, less a cell of margin each side, as `paint::line` draws.
+pub fn prompt_columns(surface: Surface) -> usize {
+    let s = surface.scale.value() as i64;
+    ((prompt_width(surface) - 2 * s) / cell(surface) - 2).max(0) as usize
+}
+
+/// The text rows a prompt may take on `surface` beside its field, when it
+/// has one, and its buttons, so those stay on the surface; never fewer
+/// than one for the title and one for the instruction.
+pub fn prompt_text_rows(surface: Surface, pin: bool) -> usize {
+    let s = surface.scale.value() as i64;
+    let rows = ((surface.height as i64) - 2 * s) / row(surface) - if pin { 2 } else { 1 };
+    usize::try_from(rows).unwrap_or(0).max(2)
+}
+
+/// The prompt: `title_rows` naming the operation, `line_rows` of
+/// instruction, the PIN's field when it asks one, and its buttons.
+pub fn prompt(surface: Surface, pin: bool, title_rows: usize, line_rows: usize) -> Prompt {
     let row = row(surface);
     let cell = cell(surface);
     // The border's width; the rows lie inside it.
     let s = surface.scale.value() as i64;
-    let rows = if pin { 4 } else { 3 };
-    let width = ((surface.width as i64) - 2 * cell).clamp(0, 60 * cell);
+    let rows_of = |rows: usize| i64::try_from(rows.max(1)).unwrap_or(1);
+    let (title_rows, line_rows) = (rows_of(title_rows), rows_of(line_rows));
+    let field = title_rows + line_rows;
+    let rows = field + if pin { 2 } else { 1 };
+    let width = prompt_width(surface);
     let height = rows * row + 2 * s;
     let x = ((surface.width as i64) - width) / 2;
     let y = (((surface.height as i64) - height) / 2).max(0);
     let (inside, top) = (width - 2 * s, y + s);
     Prompt {
         rect: rect(x, y, width, height),
-        title: rect(x + s, top, inside, row),
-        line: rect(x + s, top + row, inside, row),
+        title: rect(x + s, top, inside, title_rows * row),
+        line: rect(x + s, top + title_rows * row, inside, line_rows * row),
         pin: TextEntry::new(
             surface,
-            rect(x + cell, top + 2 * row, width - 2 * cell, row),
+            rect(x + cell, top + field * row, width - 2 * cell, row),
         )
         .filter(|_| pin),
         buttons: Buttons::in_band(
@@ -241,8 +268,8 @@ mod tests {
     #[test]
     fn the_prompt_and_dialog_fit_the_surface() {
         let surface = Surface::new(320, 240, Scale::default()).unwrap();
-        for pin in [true, false] {
-            let prompt = prompt(surface, pin);
+        for (pin, title_rows, line_rows) in [(true, 1, 1), (false, 1, 1), (true, 2, 3)] {
+            let prompt = prompt(surface, pin, title_rows, line_rows);
             assert_eq!(prompt.pin.is_some(), pin);
             assert_eq!(
                 prompt.rect.intersection(surface.bounds()),
