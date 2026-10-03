@@ -1098,7 +1098,19 @@ reservation, replacing standalone URL state. It retains CFWS/URI state, the
 uses three references. No scratch or process allowance grows. A turn charges
 at most 160 visits, 193 aggregate steps, thirteen job records and one output
 byte. Probe intervals cover long comments/URLs, literals, NO and refusals.
-URL property JSON and combined worker/native/RSS qualification remain open.
+M06bc adds URL property JSON below; combined worker/native/RSS qualification
+remains open.
+
+The URLs property coordinator (M06bc) fits 1024 bytes in the existing 16 KiB
+parser reservation, replacing standalone URL state with shared inline list
+framing. It includes selector, URI/CFWS state, live budgets, frame and literal
+buffers; no NFC scratch, owned URL/list or arena is needed. Mode selection
+compares at most nine charged bytes. Turn ceilings remain 255 visits, 256
+steps, sixteen job records and six externally copied bytes. Combined URL/JSON
+output charge is at most four bytes per poll; the shared MessageIds path
+retains its eight-byte charge ceiling. Allocation intervals cover long URLs,
+null/NO, short drains and late refusal. Combined worker/native/RSS
+qualification remains open.
 
 The charset decoder uses at most 32 bytes of copied state, fitting the 32
 KiB conversion region's 2 KiB decoder/HTML/snippet state. A saved copy also

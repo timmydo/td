@@ -1585,6 +1585,13 @@ Initial independently landable increments:
   two-pass/IPv6 costs, partial cutoffs, field credit and allocation-free long
   input. URL property JSON and unpublished response retention remain open.
 
+- **M06bc — provisional URLs property values:** share inline list/string
+  framing with MessageIds through static adapters. Charge List-Post mode
+  selection, preserve URI spelling and checked malformed-only null handoff.
+  Cover exact composed charges, per-turn limits, partial resources, late
+  refusal and allocation-free drains. Other structured forms and unpublished
+  response retention remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

@@ -1,32 +1,27 @@
 use super::{projection::Projection, Error, Form};
 use crate::{
     admission::work::{Charge, Meter},
-    header_message_ids::{
-        self as ids,
-        project::{Budgeted, Status as Converted},
-        Mode,
-    },
     json_string::{self, Frame, Progress, ScalarSource, Status},
     nfc::{self, HeaderBudget},
     ports::Tick,
 };
-pub(super) struct IdsMode;
-impl<'a, 'w> Projection<'a, 'w> for IdsMode {
-    type Source = Source<'a, 'w>;
-    type Workspace = Mode;
-    const FORM: Form = Form::MessageIds;
+mod kind;
+use kind::{Event, Ids, Kind, Urls};
+pub(super) struct ListMode<K>(std::marker::PhantomData<K>);
+pub(super) type IdsMode = ListMode<Ids>;
+pub(super) type UrlsMode = ListMode<Urls>;
+impl<'a, 'w, K: Kind> Projection<'a, 'w> for ListMode<K> {
+    type Source = Source<'a, 'w, K>;
+    type Workspace = K::Mode;
+    const FORM: Form = K::FORM;
     fn validate(
         name: &str,
         now: Tick,
         work: &mut Meter,
         budget: &mut HeaderBudget,
-        mode: &mut Mode,
+        mode: &mut K::Mode,
     ) -> Result<(), Error> {
-        let field = match name.len() {
-            10 => Some("References"),
-            11 => Some("In-Reply-To"),
-            _ => None,
-        };
+        let field = K::candidate(name.len());
         budget.charge(
             work,
             now,
@@ -35,9 +30,9 @@ impl<'a, 'w> Projection<'a, 'w> for IdsMode {
             &mut 0,
         )?;
         *mode = if field.is_some_and(|field| name.eq_ignore_ascii_case(field)) {
-            Mode::ObsoletePhrases
+            K::SPECIAL
         } else {
-            Mode::Strict
+            K::DEFAULT
         };
         Ok(())
     }
@@ -45,10 +40,10 @@ impl<'a, 'w> Projection<'a, 'w> for IdsMode {
         bytes: &'a [u8],
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
-        mode: Mode,
+        mode: K::Mode,
     ) -> Self::Source {
         Source {
-            owner: Owner::Convert(Budgeted::new(bytes, mode, work, budget)),
+            owner: Owner::Convert(K::start(bytes, mode, work, budget)),
             mode,
             phase: Phase::First,
             next: Phase::First,
@@ -58,7 +53,9 @@ impl<'a, 'w> Projection<'a, 'w> for IdsMode {
             failure: None,
         }
     }
-    fn finish(source: Self::Source) -> Result<(&'w mut Meter, &'w mut HeaderBudget, Mode), Error> {
+    fn finish(
+        source: Self::Source,
+    ) -> Result<(&'w mut Meter, &'w mut HeaderBudget, K::Mode), Error> {
         if let Some(error) = source.failure {
             return Err(error);
         }
@@ -66,7 +63,7 @@ impl<'a, 'w> Projection<'a, 'w> for IdsMode {
             return Err(Error::InvalidState);
         }
         let (work, budget) = match source.owner {
-            Owner::Convert(cursor) => cursor.finish().map_err(Error::MessageIds)?,
+            Owner::Convert(cursor) => K::finish(cursor).map_err(Into::<Error>::into)?,
             Owner::Budgets(work, budget) => (work, budget),
             Owner::Retired => return Err(Error::InvalidState),
         };
@@ -85,14 +82,13 @@ impl<'a, 'w> Projection<'a, 'w> for IdsMode {
     }
     fn is_encoding_problem(source: &Self::Source) -> bool {
         match &source.owner {
-            Owner::Convert(cursor) => cursor.is_encoding_problem(),
+            Owner::Convert(cursor) => K::is_encoding_problem(cursor),
             _ => false,
         }
     }
 }
-#[allow(clippy::large_enum_variant)] // Inline state uses the fixed parser reservation.
-enum Owner<'a, 'w> {
-    Convert(Budgeted<'a, 'w>),
+enum Owner<'a, 'w, K: Kind> {
+    Convert(K::Cursor<'a, 'w>),
     Budgets(&'w mut Meter, &'w mut HeaderBudget),
     Retired,
 }
@@ -105,9 +101,9 @@ enum Phase {
     Drain,
     Done,
 }
-pub(super) struct Source<'a, 'w> {
-    owner: Owner<'a, 'w>,
-    mode: Mode,
+pub(super) struct Source<'a, 'w, K: Kind> {
+    owner: Owner<'a, 'w, K>,
+    mode: K::Mode,
     phase: Phase,
     next: Phase,
     bytes: [u8; 4],
@@ -115,27 +111,25 @@ pub(super) struct Source<'a, 'w> {
     position: usize,
     failure: Option<Error>,
 }
-struct Item<'c, 'a, 'w>(&'c mut Budgeted<'a, 'w>);
-impl ScalarSource for Item<'_, '_, '_> {
+struct Item<'c, 'a, 'w, K: Kind>(&'c mut K::Cursor<'a, 'w>);
+impl<K: Kind> ScalarSource for Item<'_, '_, '_, K> {
     fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), json_string::Error> {
-        self.0
-            .charge_output(now, bytes)
-            .map_err(json_string::Error::MessageIds)
+        K::charge_output(self.0, now, bytes).map_err(Into::<json_string::Error>::into)
     }
     fn poll(&mut self, now: Tick) -> Result<nfc::Status, json_string::Error> {
-        match self.0.poll(now).map_err(json_string::Error::MessageIds)? {
-            Converted::Yield => Ok(nfc::Status::Yield),
-            Converted::Scalar(value) => Ok(nfc::Status::Scalar(value)),
-            Converted::End => Ok(nfc::Status::Complete),
-            Converted::Begin | Converted::Complete => Err(json_string::Error::InvalidState),
+        match K::poll(self.0, now).map_err(Into::<json_string::Error>::into)? {
+            Event::Yield => Ok(nfc::Status::Yield),
+            Event::Scalar(value) => Ok(nfc::Status::Scalar(value)),
+            Event::End => Ok(nfc::Status::Complete),
+            Event::Begin | Event::Complete => Err(json_string::Error::InvalidState),
         }
     }
 }
-impl Source<'_, '_> {
+impl<K: Kind> Source<'_, '_, K> {
     #[cfg(test)]
     pub(super) fn remaining(&self) -> Option<(Charge, u64)> {
         match &self.owner {
-            Owner::Convert(cursor) => Some(cursor.remaining()),
+            Owner::Convert(cursor) => Some(K::remaining(cursor)),
             Owner::Budgets(work, budget) => Some((work.remaining(), budget.steps_remaining())),
             Owner::Retired => None,
         }
@@ -146,9 +140,9 @@ impl Source<'_, '_> {
             return Err(error);
         }
         let result = match &mut self.owner {
-            Owner::Convert(cursor) => cursor
-                .charge_output(now, output_bytes)
-                .map_err(Error::MessageIds),
+            Owner::Convert(cursor) => {
+                K::charge_output(cursor, now, output_bytes).map_err(Into::<Error>::into)
+            }
             Owner::Budgets(work, budget) => budget
                 .charge(work, now, 0, 0, &mut 0)
                 .map_err(Error::from)
@@ -213,9 +207,9 @@ impl Source<'_, '_> {
                 let Owner::Convert(cursor) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
-                match cursor.poll(now) {
-                    Ok(Converted::Yield) => {}
-                    Ok(Converted::Begin) => {
+                match K::poll(cursor, now) {
+                    Ok(Event::Yield) => {}
+                    Ok(Event::Begin) => {
                         let bytes = if matches!(self.phase, Phase::First) {
                             b"["
                         } else {
@@ -223,7 +217,7 @@ impl Source<'_, '_> {
                         };
                         self.stage(now, bytes, Phase::ItemStart)?;
                     }
-                    Ok(Converted::Complete) => {
+                    Ok(Event::Complete) => {
                         let bytes: &[u8] = if matches!(self.phase, Phase::First) {
                             b"[]"
                         } else {
@@ -231,19 +225,19 @@ impl Source<'_, '_> {
                         };
                         self.stage(now, bytes, Phase::Done)?;
                     }
-                    Err(ids::Error::Malformed) if matches!(self.phase, Phase::First) => {
+                    Err(error) if error == K::MALFORMED && matches!(self.phase, Phase::First) => {
                         let Owner::Convert(cursor) =
                             std::mem::replace(&mut self.owner, Owner::Retired)
                         else {
                             return Err(Error::InvalidState);
                         };
                         let (work, budget) =
-                            cursor.finish_malformed().map_err(Error::MessageIds)?;
+                            K::finish_malformed(cursor).map_err(Into::<Error>::into)?;
                         self.owner = Owner::Budgets(work, budget);
                         self.stage(now, b"null", Phase::Done)?;
                     }
-                    Err(error) => return Err(Error::MessageIds(error)),
-                    Ok(Converted::Scalar(_) | Converted::End) => return Err(Error::InvalidState),
+                    Err(error) => return Err(error.into()),
+                    Ok(Event::Scalar(_) | Event::End) => return Err(Error::InvalidState),
                 }
             }
             Phase::ItemStart => {
@@ -255,7 +249,7 @@ impl Source<'_, '_> {
                     return Err(Error::InvalidState);
                 };
                 let progress = frame
-                    .poll(&mut Item(cursor), now, output)
+                    .poll(&mut Item::<K>(cursor), now, output)
                     .map_err(Error::Json)?;
                 if progress.status == Status::Complete {
                     self.phase = Phase::Between;
@@ -309,7 +303,14 @@ impl Source<'_, '_> {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::ports::Deadline;
+    use crate::{
+        header_message_ids::{
+            self as ids,
+            project::{Budgeted, Status as Converted},
+            Mode,
+        },
+        ports::Deadline,
+    };
     fn work() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
@@ -383,11 +384,14 @@ mod tests {
             }
         }
         let mut cursor = Budgeted::new(b"<a@b>", Mode::Strict, &mut work, &mut budget);
+        let mut complete = false;
         for _ in 0..1000 {
             if cursor.poll(Tick(1)).unwrap() == Converted::Complete {
+                complete = true;
                 break;
             }
         }
+        assert!(complete);
         assert!(matches!(
             cursor.finish_malformed(),
             Err(ids::Error::InvalidState)
@@ -400,6 +404,75 @@ mod tests {
         assert!(matches!(
             cursor.finish_malformed(),
             Err(ids::Error::InvalidState)
+        ));
+    }
+    #[test]
+    fn url_handoffs_require_complete_or_whole_field_malformed_state() {
+        use crate::header_urls::{
+            Budgeted as UrlBudgeted, Error as UrlError, Mode as UrlMode, Status as UrlStatus,
+        };
+        let mut work = work();
+        let mut budget = HeaderBudget::new();
+        assert!(matches!(
+            UrlBudgeted::new(b"<x:a>", UrlMode::URLs, &mut work, &mut budget).finish(),
+            Err(UrlError::InvalidState)
+        ));
+        assert!(matches!(
+            UrlBudgeted::new(b"bad", UrlMode::URLs, &mut work, &mut budget).finish_malformed(),
+            Err(UrlError::InvalidState)
+        ));
+        for malformed in [false, true] {
+            let mut cursor = UrlBudgeted::new(b"<x:a> (bad", UrlMode::URLs, &mut work, &mut budget);
+            for _ in 0..1000 {
+                match cursor.poll(Tick(1)) {
+                    Ok(UrlStatus::Yield) => {}
+                    Err(UrlError::Malformed) => break,
+                    other => panic!("unexpected outcome: {other:?}"),
+                }
+            }
+            if malformed {
+                cursor.finish_malformed().unwrap();
+            } else {
+                assert!(matches!(cursor.finish(), Err(UrlError::Malformed)));
+            }
+        }
+        let mut cursor = UrlBudgeted::new(b"<x:a>", UrlMode::URLs, &mut work, &mut budget);
+        let mut complete = false;
+        for _ in 0..1000 {
+            if cursor.poll(Tick(1)).unwrap() == UrlStatus::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        assert!(matches!(
+            cursor.finish_malformed(),
+            Err(UrlError::InvalidState)
+        ));
+        let mut source = UrlsMode::start(b"bad", &mut work, &mut budget, UrlMode::URLs);
+        let mut frame = Frame::new();
+        for _ in 0..1000 {
+            UrlsMode::poll(&mut source, &mut frame, Tick(1), &mut [0; 1]).unwrap();
+            if matches!(source.phase, Phase::Drain) {
+                break;
+            }
+        }
+        assert!(matches!(source.owner, Owner::Budgets(_, _)));
+        assert_eq!(
+            UrlsMode::poll(&mut source, &mut frame, Tick(1), &mut [0; 1])
+                .unwrap()
+                .written,
+            1
+        );
+        assert!(matches!(UrlsMode::finish(source), Err(Error::InvalidState)));
+        let mut cursor = UrlBudgeted::new(b"<x:a>", UrlMode::URLs, &mut work, &mut budget);
+        assert_eq!(
+            cursor.check_deadline(Tick(100)),
+            Err(UrlError::Work(crate::admission::work::Stop::Deadline))
+        );
+        assert!(matches!(
+            cursor.finish_malformed(),
+            Err(UrlError::InvalidState)
         ));
     }
 }

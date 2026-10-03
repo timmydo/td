@@ -8,8 +8,8 @@ use crate::{
     nfc::{self, HeaderBudget},
     ports::Tick,
 };
-mod message_ids;
-use message_ids::IdsMode;
+mod list;
+use list::{IdsMode, UrlsMode};
 mod date;
 use date::DateMode;
 mod projection;
@@ -23,6 +23,7 @@ pub enum Error {
     Raw(header_raw::Error),
     Text(nfc::Error),
     MessageIds(crate::header_message_ids::Error),
+    URLs(crate::header_urls::Error),
     Date(crate::header_date::Error),
     DateProjection(crate::header_date::project::Error),
     Json(json_string::Error),
@@ -37,6 +38,7 @@ impl std::fmt::Display for Error {
             Self::UnsupportedForm => f.write_str("unsupported header value form"),
             Self::Selection(error) => write!(f, "header value selection: {error}"),
             Self::Raw(error) => write!(f, "header value Raw: {error}"),
+            Self::URLs(error) => write!(f, "header value URLs: {error}"),
             Self::MessageIds(error) => write!(f, "header value MessageIds: {error}"),
             Self::Date(error) => write!(f, "header value Date: {error}"),
             Self::DateProjection(error) => write!(f, "header value Date projection: {error}"),
@@ -49,6 +51,16 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::header_message_ids::Error> for Error {
+    fn from(error: crate::header_message_ids::Error) -> Self {
+        Self::MessageIds(error)
+    }
+}
+impl From<crate::header_urls::Error> for Error {
+    fn from(error: crate::header_urls::Error) -> Self {
+        Self::URLs(error)
+    }
+}
 impl From<nfc::Error> for Error {
     fn from(error: nfc::Error) -> Self {
         match error {
@@ -183,6 +195,23 @@ impl<'a, 'w> MessageIds<'a, 'w> {
     /// Final only after property Complete.
     pub const fn is_encoding_problem(&self) -> bool {
         self.0.is_encoding_problem()
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.0.check_deadline(now)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        self.0.poll(now, output)
+    }
+}
+/// Provisional arrays of validated URL strings; no fetching is authorized.
+pub struct URLs<'a, 'w>(Core<'a, 'w, UrlsMode>);
+impl<'a, 'w> URLs<'a, 'w> {
+    pub fn new(
+        input: Input<'a>,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Result<Self, Error> {
+        Core::new(input, work, budget, crate::header_urls::Mode::URLs).map(Self)
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         self.0.check_deadline(now)
@@ -779,3 +808,6 @@ mod date_tests;
 
 #[cfg(test)]
 mod message_ids_tests;
+
+#[cfg(test)]
+mod urls_tests;

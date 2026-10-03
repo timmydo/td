@@ -2815,8 +2815,61 @@ Tests compare plain/budgeted events, visits and output; pin exact two-pass and
 IPv6 costs; exhaust every partial budget through validation/replay; and cover
 pre-access refusal, field-credit isolation, job stops and final admission.
 Probe intervals cover long comments/URLs, literal parsing, malformed tails,
-NO and terminal refusal in both registered modes. URL property JSON and
-unpublished response-spool retention remain follow-on work.
+NO and terminal refusal in both registered modes. Section 1.61 adds URL
+property JSON; unpublished response-spool retention remains follow-on work.
+
+### 1.61 Complete provisional URLs header values
+
+M06bc adds `header_value::URLs` over resident Input and original job/email
+budgets. Each selected field produces a JSON array of URL strings or null;
+`:all` adds an outer array. Missing last/all values are null/[] respectively.
+The first active turn charges one aggregate step and, for a nine-byte name,
+nine comparison bytes before matching List-Post case-insensitively. Only that
+field enables the NO empty-list outcome. Other names retain URLs grammar.
+No URL is normalized, decoded, resolved, fetched or executed.
+
+URLs and MessageIds use one private list coordinator with statically selected
+adapters for modes, cursor events and typed errors. It replaces the earlier
+MessageIds-only owner, retaining its values, charges and diagnostic scope.
+A URL Byte event becomes a character only after the URL parser's complete
+ASCII syntax pass; the existing JSON frame then quotes it. That frame remains
+bound to one item until End and quote drainage. No trait object, URL string,
+owned list or additional arena is introduced.
+
+Malformed URL validation consumes a checked malformed-only handoff, which
+requires the original stored Malformed failure and that replay has not begun.
+Partial, complete, nesting and resource failures cannot use it. Successful
+handoff requires Complete with no failure. Both return the original budget
+borrows and discard private credit. The shared coordinator stages null only
+after the malformed handoff; a null that has not fully drained cannot be
+handed back as a completed value. Late failures retire all earlier output.
+
+URL parsing retains its charged replay bytes. JSON quotes, strings, array
+punctuation and null are additional output work, prepaid before staging.
+Drains copy already-paid bytes without another debit. Per-poll ceilings stay
+255 visits, 256 steps, sixteen job records and six external copied bytes;
+URL conversion plus JSON output charges at most four bytes per poll (null),
+or two for an ordinary URI byte and its JSON copy. The shared MessageIds
+path retains its eight-byte combined-charge ceiling. Parser/literal errors
+use URLs; framed errors use Json(URLs); post-malformed null staging can use
+Work/InterpretationLimit directly. No resource cause becomes malformed.
+
+Cached completion is inert and final explicit admission can retire it.
+Selection, empty output and provisional method-retention rules match the
+other property coordinators. The URLs coordinator fits 1024 bytes in the
+existing 16 KiB parser reservation, including selector, parser/URI/CFWS state,
+shared frame, original budgets and inline literals. It replaces standalone
+URL state and needs no NFC scratch. Combined worker/native/RSS qualification
+remains open.
+
+Tests cover widths one through eight, last/all/absence, NO mode boundaries,
+unchanged spellings, whitespace, literals and malformed lists. They pin
+composed costs and per-poll counters, exhaust byte/step/output cutoffs, and
+check nesting, late selection, deadline and consuming handoff refusal.
+Existing MessageIds tests cover the shared coordinator's prior behavior.
+Allocation intervals include long URLs, null/NO, short drains and late
+refusal in both registered modes. Other structured forms and unpublished
+response-spool retention remain follow-on work.
 
 ## 2. Read views and change history
 

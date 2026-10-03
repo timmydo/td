@@ -1,7 +1,7 @@
 //! Validated URL-header bytes under the original job and email budgets.
 use super::{Cursor, Error, Mode, Status};
 use crate::{
-    admission::work::Meter,
+    admission::work::{Charge, Meter},
     decode_work::{Conversion, Error as DecodeError},
     nfc::HeaderBudget,
     ports::Tick,
@@ -33,6 +33,42 @@ impl<'a, 'w> Budgeted<'a, 'w> {
             credit: 0,
             failure: None,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> (Charge, u64) {
+        (self.work.remaining(), self.budget.steps_remaining())
+    }
+    pub(crate) fn finish(self) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !self.cursor.complete {
+            return Err(Error::InvalidState);
+        }
+        Ok((self.work, self.budget))
+    }
+    pub(crate) fn finish_malformed(self) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        if self.failure != Some(Error::Malformed) || self.cursor.replay {
+            return Err(Error::InvalidState);
+        }
+        Ok((self.work, self.budget))
+    }
+    pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        self.check_deadline(now)?;
+        let result = self
+            .work
+            .charge(
+                now,
+                Charge {
+                    output_bytes: bytes,
+                    ..Charge::default()
+                },
+            )
+            .map_err(Error::Work);
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         if let Some(error) = self.failure {

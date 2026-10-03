@@ -10,6 +10,7 @@ pub enum Error {
     Raw(header_raw::Error),
     Address(header_address_text::Error),
     MessageIds(crate::header_message_ids::Error),
+    URLs(crate::header_urls::Error),
     Work(Stop),
     InvalidState,
 }
@@ -18,6 +19,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Source(error) => write!(f, "JSON string source: {error}"),
             Self::Raw(error) => write!(f, "JSON Raw source: {error}"),
+            Self::URLs(error) => write!(f, "JSON URLs source: {error}"),
             Self::MessageIds(error) => write!(f, "JSON MessageIds source: {error}"),
             Self::Address(error) => write!(f, "JSON address source: {error}"),
             Self::Work(error) => write!(f, "JSON string output: {error}"),
@@ -26,6 +28,16 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl From<crate::header_message_ids::Error> for Error {
+    fn from(error: crate::header_message_ids::Error) -> Self {
+        Self::MessageIds(error)
+    }
+}
+impl From<crate::header_urls::Error> for Error {
+    fn from(error: crate::header_urls::Error) -> Self {
+        Self::URLs(error)
+    }
+}
 impl From<nfc::Error> for Error {
     fn from(value: nfc::Error) -> Self {
         Self::Source(value)
