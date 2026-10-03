@@ -1498,6 +1498,21 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-crypto has no distribution recipe either, and its one consumer is
+    // td-mta. The cargo-test preflight is everything that inspects it: its
+    // reader closure tests and lints td-crypto and td-mta through
+    // `crypto-cargo`, which enforces the pinned manifests, locks, cargo
+    // config and features, and its lock guard holds the admitted closure.
+    // The full check added only gate 325's in-sandbox, networkless copy of
+    // those same legs (the host legs are offline too: frozen, with verified
+    // source replacement), a recipe-checks scope no recipe reads (so every
+    // check), and the bootstrap ladder; the portable musl build is its own
+    // command.
+    if p.starts_with("td-crypto/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-agent the same way until its packaging increment: no recipe, recipe
     // test or seed roster names it, and nothing reads it, so its own tests
     // and lints are all a confined edit can break (td-agent/DESIGN.md §17).
@@ -8667,6 +8682,55 @@ mod tests {
                 gate_cmds()
             );
             assert!(path_output(&root, path).contains("td-builder check check"));
+        }
+    }
+
+    /// A td-crypto change selects the cargo-test preflight over td-crypto
+    /// and its consumer td-mta, both through `crypto-cargo`, and no target
+    /// gate; a document there selects nothing, as any other; a path that
+    /// only looks like td-crypto's, or leaves it by `..`, keeps the full
+    /// check.
+    #[test]
+    fn crypto_only_changes_run_crate_and_consumer_tests_without_distro_checks() {
+        let root = repo_root();
+        let Ok(roster) = discover_gate_crates(&root) else {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        };
+        if !roster.iter().any(|c| c.name == "td-crypto") {
+            eprintln!("SKIP: td-crypto is not in the gate roster");
+            return;
+        }
+        for path in [
+            "td-crypto/src/lib.rs",
+            "td-crypto/Cargo.toml",
+            "td-crypto/Cargo.lock",
+        ] {
+            let output = path_output(&root, path);
+            for krate in ["td-crypto", "td-mta"] {
+                assert!(
+                    output.contains(&format!("--manifest-path {krate}/Cargo.toml")),
+                    "{path} selects no preflight over {krate}: {output}"
+                );
+            }
+            let commands = cargo_test_cmds(&root, &[path.to_string()]).unwrap();
+            for krate in ["td-crypto", "td-mta"] {
+                for action in ["test", "clippy"] {
+                    let leg = format!(" gate-crates crypto-cargo {action} --manifest-path {krate}");
+                    assert!(commands.iter().any(|c| c.contains(&leg)), "{path}: {leg}");
+                }
+            }
+            assert!(!output.contains("td-builder check"), "{path}: {output}");
+            assert!(!output.contains("recipe-checks scope"), "{path}: {output}");
+            assert!(!output.contains("discovered crate"), "{path}: {output}");
+        }
+        let docs = path_output(&root, "td-crypto/TLS.md");
+        assert!(docs.contains("Selected checks: none"), "{docs}");
+        for path in ["td-crypto-x/src/lib.rs", "td-crypto/../td-sh/src/main.rs"] {
+            assert!(
+                path_output(&root, path).contains("td-builder check"),
+                "{path}"
+            );
         }
     }
 
