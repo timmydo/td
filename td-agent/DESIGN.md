@@ -26,7 +26,8 @@ the todo list, `history_search` and `history_read`, `conversations`,
 them came the window's File menu and the dialog that stores the
 OpenRouter key from it (§4, §6), then the Conversation menu, which
 chooses each conversation's model, from a picker over the models list,
-and its reasoning effort (§4). Where building them
+and its reasoning effort (§4), and the system context, shown folded at
+the head of the transcript (§4). Where building them
 settled a point the design left open, the section says so under "As
 built". No recipe names td-agent yet. The decisions below that were the
 user's to make were made on 2026-10-01 and 2026-10-02:
@@ -309,7 +310,8 @@ a send, queued or refused with why, and `states` answers a query.
 delivery id, sender, sender's role, text and status), which it
 acknowledges with `delivered` once logged, or refuses; `pause` pauses
 or resumes the open conversation, and `clear_todo` clears its todo
-list. `hello` says whether the conversation is paused. The window
+list. `hello` says whether the conversation is paused, and carries
+its prefix for the transcript (§4, the system context). The window
 checks every send again, whatever the sender checked (the receiver
 exists, the crossing rules, the bounds), and writes it whole to the
 state directory's `outbox`, one file per message under its receiver's
@@ -858,6 +860,32 @@ and the configuration file is never written.
   the picker through the item's own path; the state gains `picker` (the
   selected model, `nothing`, or `none` when closed), `query` (the
   filter), `model` and `effort`.
+
+**As built (the system context).** The transcript shows what every
+request begins with. Its first message, headed `system`, is the
+conversation's prefix (§6, §13) read back: a section `system prompt`
+holding the system message's text, and a section `tools (N)` listing
+each tool's name and description, folded. The message itself is folded
+to its header, so it costs one row until the human opens it, which a
+press on its header or the transcript's fold key does, as any message's.
+Its copy gives the prefix's exact bytes, the tools' parameter schemas
+included. A `prefix` event (§6) adds another such message where it was
+logged, marked `replaced from here`, since every request after it
+begins with that one. A prefix of the older array form shows its
+messages, and one the window cannot read shows a line saying so, its
+copy still the bytes; an empty one, of a conversation that has not yet
+made a request, shows nothing, and its first request's `prefix` event
+shows it. The `hello` frame (§2) carries the prefix file's text, or
+null when it is past the 128 KiB a human's message may be, which the
+frame holds escaped; the window then says the system context is not
+shown, as it does when the file cannot be read. A conversation the
+window adopts mid-turn, whose log the window reads itself, has its
+prefix file read by the window too, within the store's 1 MiB bound on a
+prefix. The transcript drops its oldest messages first when it is
+full (the log keeps them all), so in a long conversation the system
+message goes before any other, and opening the conversation again
+shows it again. A prefix of more messages than a message holds
+sections shows the first fourteen and says how many more there are.
 
 ## 5. Model client
 

@@ -62,8 +62,11 @@ pub enum Down {
 /// From a conversation to the window.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Up {
-    /// The conversation is open: its role and title, and what opening it
-    /// found (a torn line dropped, effects interrupted). Every event of
+    /// The conversation is open: its role and title, what opening it
+    /// found (a torn line dropped, effects interrupted), and its prefix
+    /// file's text, none when that is past `MAX_TEXT`. Escaped, that
+    /// takes at most six times `MAX_TEXT` of the frame, which leaves the
+    /// rest, a quarter, for the title and interrupted ids. Every event of
     /// its log follows, in order, then each new one as it is appended.
     Hello {
         role: Role,
@@ -71,6 +74,7 @@ pub enum Up {
         torn: Option<u64>,
         interrupted: Vec<u64>,
         paused: bool,
+        prefix: Option<String>,
     },
     Event(Event),
     /// The message with this delivery id is logged and synced.
@@ -347,6 +351,7 @@ impl Up {
                 torn,
                 interrupted,
                 paused,
+                prefix,
             } => typed(
                 "hello",
                 vec![
@@ -358,6 +363,10 @@ impl Up {
                         Json::Arr(interrupted.iter().map(|s| Json::from(*s)).collect()),
                     ),
                     ("paused".into(), Json::Bool(*paused)),
+                    (
+                        "prefix".into(),
+                        prefix.as_ref().map_or(Json::Null, |p| Json::Str(p.clone())),
+                    ),
                 ],
             ),
             Self::Event(event) => typed("event", vec![("event".into(), event.to_json())]),
@@ -441,6 +450,11 @@ impl Up {
                     .get("paused")
                     .and_then(Json::as_bool)
                     .ok_or("no paused")?,
+                prefix: match value.get("prefix") {
+                    Some(Json::Null) => None,
+                    Some(Json::Str(prefix)) => Some(prefix.clone()),
+                    _ => return Err("no prefix".into()),
+                },
             },
             Some("event") => Self::Event(Event::from_json(
                 value.get("event").ok_or("an event message with no event")?,
@@ -509,6 +523,7 @@ mod tests {
                 torn: Some(3),
                 interrupted: vec![2, 5],
                 paused: false,
+                prefix: Some("\u{1}".repeat(MAX_TEXT)),
             },
             Up::Hello {
                 role: Role::Conversation,
@@ -516,6 +531,7 @@ mod tests {
                 torn: None,
                 interrupted: vec![],
                 paused: true,
+                prefix: None,
             },
             Up::Send {
                 id: 4,

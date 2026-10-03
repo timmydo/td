@@ -218,11 +218,18 @@ pub fn serve(
         torn: load.torn,
         interrupted: load.interrupted,
         paused: session.conversation.meta().paused,
+        prefix: hello_prefix(session.conversation.prefix_file()),
     });
     for event in session.conversation.events().to_vec() {
         session.send(&Up::Event(event));
     }
     session.serve()
+}
+
+/// The prefix a hello carries: none past `MAX_TEXT`, which keeps the
+/// frame within its bound however JSON escapes it.
+fn hello_prefix(prefix: &str) -> Option<String> {
+    (prefix.len() <= MAX_TEXT).then(|| prefix.to_string())
 }
 
 /// Reads the window's frames into a channel until the socketpair ends;
@@ -1917,7 +1924,15 @@ mod tests {
             let (state, id) = (state.clone(), id.clone());
             std::thread::spawn(move || serve(theirs, &state, &id, Some(Role::Conversation)))
         };
-        assert!(matches!(next(&mut window), Up::Hello { torn: None, .. }));
+        // The hello carries the prefix file, for the window's system
+        // message.
+        let Up::Hello {
+            torn: None, prefix, ..
+        } = next(&mut window)
+        else {
+            panic!("no hello")
+        };
+        assert_eq!(prefix, Some(crate::prompt::prefix(Role::Conversation)));
         keyless(&mut window);
         say(&mut window, D1, "first words\nand more");
         let Up::Event(user) = next(&mut window) else {
@@ -2044,6 +2059,14 @@ mod tests {
             [message.clone(), user.clone(), Down::Pause { paused: true }].into();
         assert_eq!(take(&mut queue), Some(message));
         assert_eq!(take(&mut queue), Some(user));
+    }
+
+    #[test]
+    fn a_hello_carries_a_prefix_up_to_the_text_bound() {
+        assert_eq!(hello_prefix("p").as_deref(), Some("p"));
+        let at_bound = "x".repeat(MAX_TEXT);
+        assert_eq!(hello_prefix(&at_bound), Some(at_bound.clone()));
+        assert_eq!(hello_prefix(&format!("{at_bound}x")), None);
     }
 
     #[test]

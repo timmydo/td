@@ -55,6 +55,9 @@ use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TodoItem};
 use crate::supervisor::Update;
 use crate::tools;
 
+/// Why a hello came without the prefix (DESIGN.md §4).
+const LONG_PREFIX: &str = "the conversation's prefix file is longer than the window is sent";
+
 /// The composer's text rows when the window has room for them.
 const COMPOSER_ROWS: usize = 6;
 /// The most rows the todo list takes when shown whole.
@@ -472,6 +475,9 @@ pub struct App {
     /// The choices asked for and not yet heard logged, oldest first: the
     /// next one builds on the last, though the process has not taken it.
     asked: VecDeque<(Option<String>, Option<String>)>,
+    /// A prefix is in force, shown or said not to be, since the
+    /// transcript was last cleared, so a later one replaces it.
+    system_shown: bool,
     /// The model picker while it is open, modal over the window.
     picker: Option<Picker>,
     /// The menu's revision: it is built again, from the state of the
@@ -554,6 +560,7 @@ impl App {
             offers: Vec::new(),
             choice: (None, None),
             asked: VecDeque::new(),
+            system_shown: false,
             picker: None,
             menu_revision: 1,
             credit: None,
@@ -879,6 +886,7 @@ impl App {
         self.meter = Meter::default();
         self.choice = (None, None);
         self.asked.clear();
+        self.system_shown = false;
         self.streaming = None;
         self.undrawn = None;
         if !self.todo.is_empty() {
@@ -890,8 +898,9 @@ impl App {
 
     /// A running conversation opened again: its log as read from the
     /// store, its process's later events to follow.
-    pub fn replay(&mut self, events: Vec<Event>) {
+    pub fn replay(&mut self, prefix: Result<&str, &str>, events: Vec<Event>) {
         self.clear_transcript();
+        self.system(prefix, false);
         for event in events {
             self.event(event);
         }
@@ -989,9 +998,11 @@ impl App {
                 torn,
                 interrupted,
                 paused,
+                prefix,
                 ..
             }) => {
                 self.clear_transcript();
+                self.system(prefix.as_deref().ok_or(LONG_PREFIX), false);
                 if let Some(row) = self.active_row() {
                     row.title = crate::store::title(&title);
                     row.state = RowState::Idle;
@@ -1276,7 +1287,8 @@ impl App {
                         .set_status(index, Some((&status, Tone::Neutral)));
                 }
             }
-            Kind::Prefix { .. } | Kind::Title { .. } | Kind::ToolCall { .. } => {}
+            Kind::Prefix { text } => self.system(Ok(&text), self.system_shown),
+            Kind::Title { .. } | Kind::ToolCall { .. } => {}
             Kind::Notice { text } => self.notice_message(&text),
             Kind::Message {
                 from,
@@ -1371,6 +1383,25 @@ impl App {
             }
         }
         self.touch();
+    }
+
+    /// The system context's message (DESIGN.md §4): the prefix in force
+    /// from here, folded, or a notice of why the window has none.
+    fn system(&mut self, prefix: Result<&str, &str>, replaced: bool) {
+        let prefix = match prefix {
+            Ok(prefix) => prefix,
+            Err(why) => {
+                self.system_shown = true;
+                return self.notice_message(&format!("the system context is not shown: {why}"));
+            }
+        };
+        let pushed = crate::system::message(prefix, replaced).and_then(|message| match message {
+            Some(message) => self.push_message(message).map(|_| self.system_shown = true),
+            None => Ok(()),
+        });
+        if let Err(e) = pushed {
+            self.note(format!("the transcript refused the system context: {e}"));
+        }
     }
 
     /// A notice of td-agent's in the transcript.
@@ -2883,6 +2914,7 @@ pub mod tests {
                 torn: Some(7),
                 interrupted: vec![],
                 paused: false,
+                prefix: Some(String::new()),
             }),
             0,
         );
@@ -2974,6 +3006,7 @@ pub mod tests {
                 torn: None,
                 interrupted: vec![2],
                 paused: false,
+                prefix: Some(String::new()),
             }),
             0,
         );
@@ -2981,6 +3014,76 @@ pub mod tests {
         assert!(app
             .notice()
             .is_some_and(|n| n.contains("interrupted 1 turn")));
+    }
+
+    /// The prefix opens the transcript as one folded system message,
+    /// and a `prefix` event adds the one in force from there.
+    #[test]
+    fn the_system_context_opens_the_transcript_folded() {
+        let mut app = app();
+        let hello = |prefix: Option<String>| {
+            Update::Up(Up::Hello {
+                role: Role::Orchestrator,
+                title: "Orchestrator".into(),
+                torn: None,
+                interrupted: vec![],
+                paused: false,
+                prefix,
+            })
+        };
+        let prefix = crate::prompt::prefix(Role::Orchestrator);
+        app.update(hello(Some(prefix.clone())), 0);
+        assert_eq!(app.transcript().len(), 1);
+        let system = app.transcript().message(0).unwrap();
+        assert_eq!(system.label(), crate::system::HEADER);
+        assert!(system.is_collapsed());
+        assert!(system.section_text(0).unwrap().contains("orchestrator"));
+        // Folded, it shows its header and none of its text.
+        let shown = text(&app);
+        assert!(shown.contains(crate::system::HEADER), "{shown}");
+        assert!(!shown.contains("system prompt"), "{shown}");
+        app.update(user(1, "hi"), 0);
+        app.update(
+            at(
+                2,
+                Kind::Prefix {
+                    text: r#"[{"role":"system","content":"be brief"}]"#.into(),
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.transcript().len(), 3);
+        let replaced = app.transcript().message(2).unwrap();
+        assert_eq!(replaced.section_text(0), Some("be brief"));
+        assert!(text(&app).contains(crate::system::REPLACED));
+        // A prefix the process did not send is said to be missing.
+        app.update(hello(None), 0);
+        assert_eq!(app.transcript().len(), 1);
+        assert!(text(&app).contains("the system context is not shown"));
+        // That prefix was in force, unshown: the next replaces it.
+        app.update(
+            at(
+                1,
+                Kind::Prefix {
+                    text: prefix.clone(),
+                },
+            ),
+            0,
+        );
+        assert!(text(&app).contains(crate::system::REPLACED));
+        // The replay of an adopted conversation shows it too, or why not.
+        app.replay(Ok(&prefix), vec![]);
+        assert_eq!(
+            app.transcript().message(0).map(|m| m.label()),
+            Some(crate::system::HEADER)
+        );
+        app.replay(Err("no such file"), vec![]);
+        assert!(text(&app).contains("the system context is not shown: no such file"));
+        // After an empty prefix, the first prefix event replaces nothing.
+        app.update(hello(Some(String::new())), 0);
+        assert_eq!(app.transcript().len(), 0);
+        app.update(at(1, Kind::Prefix { text: prefix }), 0);
+        assert!(!text(&app).contains(crate::system::REPLACED));
     }
 
     #[test]
@@ -3532,30 +3635,33 @@ pub mod tests {
         // the log as read says idle.
         app.set_active(id(1));
         let event = |seq, kind| Event { seq, time: 0, kind };
-        app.replay(vec![
-            event(
-                1,
-                Kind::User {
-                    delivery: String::new(),
-                    text: "hello".into(),
-                },
-            ),
-            event(
-                2,
-                Kind::Started {
-                    effect: crate::store::Effect::Turn,
-                    of: 1,
-                },
-            ),
-            event(
-                3,
-                Kind::Finished {
-                    started: 2,
-                    outcome: "replied".into(),
-                    retry: false,
-                },
-            ),
-        ]);
+        app.replay(
+            Ok(""),
+            vec![
+                event(
+                    1,
+                    Kind::User {
+                        delivery: String::new(),
+                        text: "hello".into(),
+                    },
+                ),
+                event(
+                    2,
+                    Kind::Started {
+                        effect: crate::store::Effect::Turn,
+                        of: 1,
+                    },
+                ),
+                event(
+                    3,
+                    Kind::Finished {
+                        started: 2,
+                        outcome: "replied".into(),
+                        retry: false,
+                    },
+                ),
+            ],
+        );
         assert_eq!(state(&app, 1), RowState::Idle);
     }
 
@@ -3596,24 +3702,27 @@ pub mod tests {
         assert_eq!(app.transcript().len(), 0, "nothing in the open transcript");
         // Opened again while it runs: the log as read shows it, running.
         app.set_active(id(2));
-        app.replay(vec![
-            Event {
-                seq: 8,
-                time: 0,
-                kind: Kind::User {
-                    delivery: String::new(),
-                    text: "from the log".into(),
+        app.replay(
+            Ok(""),
+            vec![
+                Event {
+                    seq: 8,
+                    time: 0,
+                    kind: Kind::User {
+                        delivery: String::new(),
+                        text: "from the log".into(),
+                    },
                 },
-            },
-            Event {
-                seq: 9,
-                time: 0,
-                kind: Kind::Started {
-                    effect: crate::store::Effect::Turn,
-                    of: 8,
+                Event {
+                    seq: 9,
+                    time: 0,
+                    kind: Kind::Started {
+                        effect: crate::store::Effect::Turn,
+                        of: 8,
+                    },
                 },
-            },
-        ]);
+            ],
+        );
         assert_eq!(row(&app).state, RowState::Running);
         assert!(text(&app).contains("from the log"));
         // The process's copy of an event the log gave is not shown twice.
@@ -3710,6 +3819,7 @@ pub mod tests {
                 torn: None,
                 interrupted: Vec::new(),
                 paused: false,
+                prefix: Some(String::new()),
             }),
             0,
         );

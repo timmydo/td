@@ -42,6 +42,7 @@ pub mod span;
 pub mod sse;
 pub mod store;
 pub mod supervisor;
+pub mod system;
 pub mod tools;
 pub mod ui;
 pub mod wake;

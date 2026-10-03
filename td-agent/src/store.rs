@@ -1500,6 +1500,14 @@ pub fn read_log(state: &StateDir, id: &Id) -> Result<Vec<Event>, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// The `prefix` file of conversation `id`, read without opening the
+/// conversation, as `read_log` reads its log.
+pub fn read_prefix(state: &StateDir, id: &Id) -> Result<String, String> {
+    let path = state.conversation(id).join("prefix");
+    let bytes = read_bounded(&path, MAX_PREFIX).map_err(|e| format!("{}: {e}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", path.display()))
+}
+
 /// The events of a log and the length of its whole lines: what follows
 /// the last newline is a torn line for the caller to drop. A whole line
 /// that does not parse, or a sequence that skips, is corruption and
@@ -1565,6 +1573,27 @@ pub mod tests {
             delivery: random_hex(8).unwrap(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn a_prefix_file_is_read_bounded_and_never_through_a_link() {
+        let scratch = Scratch::new("prefix");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        assert!(read_prefix(&state, &id).is_err(), "no conversation");
+        let dir = state.conversation(&id);
+        DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        std::fs::write(dir.join("prefix"), "{}").unwrap();
+        assert_eq!(read_prefix(&state, &id).unwrap(), "{}");
+        std::fs::write(dir.join("prefix"), [0xff]).unwrap();
+        assert!(read_prefix(&state, &id).unwrap_err().contains("not UTF-8"));
+        std::fs::remove_file(dir.join("prefix")).unwrap();
+        std::fs::write(scratch.0.join("elsewhere"), "{}").unwrap();
+        std::os::unix::fs::symlink(scratch.0.join("elsewhere"), dir.join("prefix")).unwrap();
+        assert!(read_prefix(&state, &id).is_err(), "followed a link");
+        std::fs::remove_file(dir.join("prefix")).unwrap();
+        std::fs::write(dir.join("prefix"), vec![b' '; MAX_PREFIX as usize + 1]).unwrap();
+        assert!(read_prefix(&state, &id).is_err(), "past the bound");
     }
 
     #[test]

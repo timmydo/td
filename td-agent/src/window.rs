@@ -264,7 +264,11 @@ impl Session {
         match self.supervisor.open(id.clone(), create) {
             Ok(Opened::Started) => {}
             Ok(Opened::Adopted) => match store::read_log(&self.state, &id) {
-                Ok(events) => self.app.replay(events),
+                Ok(events) => {
+                    let prefix = store::read_prefix(&self.state, &id);
+                    self.app
+                        .replay(prefix.as_deref().map_err(String::as_str), events);
+                }
                 Err(e) => self.app.note(format!("the conversation's log: {e}")),
             },
             Err(reason) => self.app.update(Update::Failed { reason }, store::now()),
