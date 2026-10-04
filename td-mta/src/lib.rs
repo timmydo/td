@@ -39,6 +39,7 @@ pub mod limits;
 pub mod mailbox_parents;
 pub mod mailbox_sweep;
 pub mod merge;
+pub mod mime_attribute;
 pub mod mime_base64;
 pub mod mime_charset;
 pub mod mime_fields;

@@ -867,6 +867,58 @@ fn store_read_pool() {
     }
 }
 
+fn mime_attribute() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_attribute::{Budgeted, Error, Form, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("{}*123*", "a".repeat(65_536));
+    let before = COUNTERS.snapshot();
+    for (source, form) in [
+        (
+            long.as_bytes(),
+            Form::Section {
+                index: 123,
+                encoded: true,
+            },
+        ),
+        (b"FiLeNaMe*".as_slice(), Form::Extended),
+        (b"filename*01*".as_slice(), Form::Malformed),
+        (b"filename*18446744073709551616".as_slice(), Form::Malformed),
+        (b"filename".as_slice(), Form::Ordinary),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 1_000_000,
+                records: 1_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Budgeted::new(black_box(source), &mut work, &mut budget);
+        assert!(std::mem::size_of_val(&cursor) <= 160);
+        loop {
+            if let Status::Complete(name) = cursor.poll(Tick(1)).unwrap() {
+                assert_eq!(name.form, form);
+                black_box(name);
+                assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete(name)));
+                assert_eq!(
+                    cursor.check_deadline(Tick(100)),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+                break;
+            }
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME attribute classification allocated");
+}
+
 fn mime_metadata() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6071,6 +6123,7 @@ fn main() {
         mime_headers();
         mime_fields();
         mime_metadata();
+        mime_attribute();
         body_value();
         mime_text();
         body_charset();
@@ -6212,6 +6265,7 @@ fn main() {
     mime_headers();
     mime_fields();
     mime_metadata();
+    mime_attribute();
     body_value();
     mime_text();
     body_charset();

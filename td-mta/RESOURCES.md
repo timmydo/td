@@ -1041,6 +1041,18 @@ long comments/quotes/tokens, malformed-first duplicates, defaults, nesting
 and raw-header limits. Value derivation, part traversal and combined
 worker/native/RSS qualification remain open.
 
+M06br's shared MIME attribute classifier and thin mail Cursor fit 128 bytes;
+Budgeted fits 160 in the existing 16 KiB parser reservation. Complete names
+remain borrowed source, and base extents/forms/section indices are fixed
+scalar state. No segment vector, copied name, output arena or heap allocation
+is added. Plain turns charge at most 32 visits and 32 records. Original-budget
+composition charges at most 32 visits, 64 aggregate steps and four job records
+per turn, with no output capacity charged. Final EOF admission is active;
+cached completion is inert until explicit live deadline refusal retires it.
+Allocation intervals cover constructor, long names, malformed suffixes,
+index overflow and late refusal. Value assembly, part traversal and combined
+worker/native qualification remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

@@ -284,12 +284,12 @@ The mail hot path uses only its incremental string API, whose state and
 caller-provided output are fixed; its allocating Json value/parser API is not
 admitted there. td-json owns no mail, clock, crypto or scheduler policy.
 
-The reusable CFWS and delimited-token cursors live in td-header with generic
-caller-owned admission. Mail grammar placement, scalar decoding,
-normalization, deadlines and budget adapters remain in td-mta. The shared
-lexical crate owns no field selection, display policy, clock or crypto and
-retains the existing fixed-work/source-extent contract. New extractions must
-preserve the caller's bounded-work and memory contract.
+The reusable CFWS, delimited-token and MIME parameter-name cursors live in
+td-header with generic caller-owned admission. Mail grammar placement,
+scalar decoding, normalization, deadlines and budget adapters remain in
+td-mta. The shared lexical crate owns no field selection, display policy,
+clock or crypto and retains the existing fixed-work/source-extent contract.
+New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed
 Unicode 17.0 inputs in UNICODE.md. They add no Cargo dependency or runtime

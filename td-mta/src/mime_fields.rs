@@ -248,7 +248,7 @@ impl<'a> Cursor<'a> {
             Phase::Token(token) => {
                 for _ in 0..32 {
                     match self.peek(now, work)? {
-                        Some(byte) if is_token(byte) => self.advance()?,
+                        Some(byte) if td_header::mime_token_octet(byte) => self.advance()?,
                         _ => {
                             self.finish_token(token)?;
                             break;
@@ -324,9 +324,6 @@ impl<'a> Cursor<'a> {
         }
         Ok(Status::Yield)
     }
-}
-fn is_token(byte: u8) -> bool {
-    (33..=126).contains(&byte) && !b"()<>@,;:\\\"/[]?=".contains(&byte)
 }
 
 /// Retains original job/email admission across the complete field.

@@ -1704,6 +1704,15 @@ Initial independently landable increments:
   constructor/drain/refusal. Case/value projection, RFC 2231 assembly and
   MIME part traversal remain open.
 
+- **M06br — shared MIME parameter-name classification:** put bounded RFC
+  2231 suffix spelling in std-only td-header and bind it through a thin mail
+  facade to original job/email work. Retain ordinary/extended/section or
+  malformed form with raw base extents; check numeric overflow and leading
+  zeros without a section table. Cover exact cost, fixed turns, long input,
+  replacement-callback refusal, aggregate cuts, final deadline, ownership
+  and allocation-free construction/drain. Full candidate validation, value
+  assembly and MIME part traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

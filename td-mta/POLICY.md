@@ -288,9 +288,11 @@ date/header parsing does not broaden SMTP envelope grammar. Header values
 unsupported by a form remain readable as Raw.
 
 RFC 2231 MIME parameters support percent decoding, charset/language prefixes,
-and numbered continuations beginning at zero without gaps. Duplicate segment
-numbers or malformed percent escapes invalidate that extended candidate; do
-not concatenate an attacker-selected subset. Prefer a valid extended filename,
+and numbered continuations beginning at zero without gaps or leading zeros.
+A malformed extended name (including leading zeros, numeric overflow or extra
+suffix bytes), duplicate segment numbers or malformed percent escapes
+invalidate that base name's entire extended candidate; do not concatenate an
+attacker-selected subset. Prefer a valid extended filename,
 then ordinary filename, then valid extended Content-Type name*, then ordinary
 Content-Type name. Ordinary filename/name accept properly placed RFC 2047
 encoded words as a compatibility rule. For duplicate ordinary parameters use

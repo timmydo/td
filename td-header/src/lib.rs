@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod cfws;
 pub mod delimited;
+pub mod mime_attribute;
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 /// Logical source visits and transitions, including zero-byte EOF attempts.
 pub struct Charge {
@@ -13,6 +14,17 @@ pub struct Charge {
 pub trait Work {
     type Error: Copy;
     fn charge(&mut self, charge: Charge) -> Result<(), Self::Error>;
+}
+/// One ASCII MIME token octet; placement and complete-token validity are external.
+#[inline]
+#[must_use]
+pub const fn mime_token_octet(byte: u8) -> bool {
+    match byte {
+        b'(' | b')' | b'<' | b'>' | b'@' | b',' | b';' | b':' | b'\\' | b'"' | b'/' | b'['
+        | b']' | b'?' | b'=' => false,
+        33..=126 => true,
+        _ => false,
+    }
 }
 #[cfg(test)]
 mod tests;

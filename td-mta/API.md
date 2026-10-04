@@ -3377,6 +3377,56 @@ intervals cover constructor/selection/drains/defaults and late refusals. These
 are component evidence; MIME value derivation, traversal, response retention
 and complete worker/native memory qualification remain open.
 
+### 1.71 Bounded MIME parameter-name classification
+
+M06br adds mime_attribute::Cursor as a thin mail facade over the shared
+std-only td-header classifier. The caller supplies a complete authorized
+parameter-name slice, normally replayed from a selected complete MIME field.
+The classifier grants no field, blob, value or publication authority.
+
+Name returns an original base-name Extent relative to that slice and Form:
+Ordinary, Extended, Section { index: u64, encoded: bool } or Malformed.
+Ordinary names use ASCII MIME-token syntax. At the first star, the base is
+fixed and extended attribute syntax additionally excludes apostrophe and
+percent. A bare final star is Extended. A decimal suffix has no leading
+zero except the single digit zero; one final star marks an encoded section.
+Empty bases, extra suffix bytes, invalid token bytes and checked u64 index
+overflow are Malformed. Malformed retains the base extent so a later
+candidate selector must reject that entire matching extended series.
+
+Classification preserves spelling and does not concatenate sections,
+validate duplicates/gaps, parse charset/language prefixes, percent-decode,
+unquote, decode words, normalize display text or apply fallback. An index
+within u64 is lexical evidence, not permission to allocate an index-sized
+array or to accept a missing segment. Values and candidate assembly retain
+their own complete-validation and original-budget requirements.
+
+Each plain turn checks at most 32 bytes and charges at most 32 source visits
+and 32 job records. EOF completion is a charged transition, even for an
+empty name. Work failures latch across replacement meters; cached completion
+is inert. The shared helper uses only a bounded caller Work callback, no
+mail, clock, I/O or heap ownership. Neither live owner is Clone or Copy.
+
+Budgeted retains the original job Meter and HeaderBudget, with private
+credit across all turns. Every source byte charges two aggregate steps
+(inspection and transition); final EOF charges one. Per-turn ceilings are
+32 visits, 64 aggregate steps and four job records. No output-byte capacity
+is charged. Budgeted::check_deadline binds shared check_work to zero-count
+admission through the same job/email owners and can retire cached completion.
+That refusal latches in the shared cursor; there is no second error cache.
+Plain callers use check_deadline(now, work) for fresh admission; refusal
+retires the same cursor. Cursor fits 128 bytes and Budgeted fits 160 in the
+existing 16 KiB parser region. No collection, source
+copy, heap allocation or scratch arena is introduced.
+
+Shared fixtures pin suffix forms, ordinary/extended attribute differences,
+leading zeros, overflow, long names, exact costs and every callback cut.
+Mail fixtures pin case/extents, budgeted turns and partial aggregate refusal,
+EOF deadline and cached retirement. Allocation intervals cover constructor,
+long replay, malformed spelling/overflow and late refusal. Parameter-value
+assembly, MIME part traversal and combined worker/native qualification remain
+open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
