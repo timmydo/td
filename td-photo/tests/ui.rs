@@ -140,13 +140,9 @@ fn release(controller: &mut Controller, x: u32, y: u32) -> (Outcome, Vec<Effect>
         .unwrap()
 }
 
-/// The window's key list is the table's chorded rows, in its order and
-/// words, under the chooser's own while the chooser owns the keyboard,
-/// each variant spelled as td-ui's key list spells keys; the window's
-/// `F1` and `F12` bind nothing of the session's.
-#[test]
-fn the_key_list_is_the_table_under_the_chooser_while_it_is_open() {
-    let chorded: Vec<td_ui::keys::Row> = BINDINGS
+/// The action table's chorded rows, in its order: the key list's rows.
+fn chorded() -> Vec<td_ui::keys::Row> {
+    BINDINGS
         .iter()
         .filter_map(|b| {
             Some(td_ui::keys::Row {
@@ -154,38 +150,197 @@ fn the_key_list_is_the_table_under_the_chooser_while_it_is_open() {
                 what: b.help,
             })
         })
+        .collect()
+}
+
+/// The key list's sections of the table, in `Group::ALL`'s order.
+const GROUPS: &[&str] = &[
+    "Moving around",
+    "Modes",
+    "Cull",
+    "Develop",
+    "History",
+    "Looks",
+    "Zoom",
+    "Export",
+    "Roll and window",
+];
+
+/// The list's titles: `lead`, the mode's own, first, then Modes, then the
+/// rest of `GROUPS` in order.
+fn led_by(lead: &[&'static str]) -> Vec<&'static str> {
+    let mut titles = lead.to_vec();
+    titles.push("Modes");
+    titles.extend(
+        GROUPS
+            .iter()
+            .filter(|title| !lead.contains(title) && **title != "Modes"),
+    );
+    titles
+}
+
+/// Every chorded row of the table is in exactly one of `sections`' table
+/// sections, its action's group's (found by name, as a key finds its
+/// action), in the table's order within it; the keyed rows together are
+/// the table's chorded rows, none lost or doubled, any other row keyless
+/// prose; and the list passes `keys::check`.
+fn assert_grouped(sections: &[td_ui::keys::Section]) {
+    let problems = td_ui::keys::check(sections);
+    assert!(problems.is_empty(), "{problems:#?}");
+    let table = chorded();
+    let listed: Vec<&td_ui::keys::Section> = sections
+        .iter()
+        .filter(|s| s.title != "Roll chooser")
         .collect();
+    for binding in BINDINGS {
+        let (Some(keys), Some(group)) = (
+            binding.chord,
+            Action::parse(binding.name).map(Action::group),
+        ) else {
+            continue;
+        };
+        let holding: Vec<&str> = listed
+            .iter()
+            .filter(|s| {
+                s.rows
+                    .iter()
+                    .any(|r| r.keys == keys && r.what == binding.help)
+            })
+            .map(|s| s.title)
+            .collect();
+        assert_eq!(holding, [group.title()], "{}", binding.name);
+    }
+    for section in &listed {
+        assert!(!section.rows.is_empty(), "{}", section.title);
+        let at: Vec<usize> = section
+            .rows
+            .iter()
+            .filter(|r| !r.keys.is_empty())
+            .map(|r| table.iter().position(|t| t == r).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{}", section.title);
+    }
+    let mut rows: Vec<(&str, &str)> = listed
+        .iter()
+        .flat_map(|s| s.rows.iter().map(|r| (r.keys, r.what)))
+        .filter(|(keys, _)| !keys.is_empty())
+        .collect();
+    let mut flat: Vec<(&str, &str)> = table.iter().map(|r| (r.keys, r.what)).collect();
+    rows.sort_unstable();
+    flat.sort_unstable();
+    assert_eq!(rows, flat);
+}
+
+/// The window's key list is the table's chorded rows grouped into
+/// sections, each in the table's order and words, the current mode's
+/// sections first, Modes after them, and the chooser's own keys before
+/// them all while the chooser owns the keyboard, each variant spelled as
+/// td-ui's key list spells keys; the window's `F1` and `F12` bind nothing
+/// of the session's.
+#[test]
+fn the_key_list_groups_the_table_by_mode_under_the_chooser_while_it_is_open() {
+    let titles = |c: &Controller| -> Vec<&'static str> {
+        c.key_sections().iter().map(|s| s.title).collect()
+    };
+    // The chooser, opened over the current mode, leads it, and Escape
+    // closes it back to the mode's own list.
+    let chooser_leads = |c: &mut Controller, mode: &[&'static str]| {
+        let (outcome, _) = c.action("choose", &[]).unwrap();
+        assert_eq!(outcome, Outcome::Changed);
+        c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
+            .unwrap();
+        let sections = c.key_sections();
+        let mut want = vec!["Roll chooser"];
+        want.extend(led_by(mode));
+        assert_eq!(titles(c), want);
+        assert_grouped(&sections);
+        let chooser: Vec<&str> = sections[0].rows.iter().map(|r| r.keys).collect();
+        assert!(chooser.contains(&"C-Return") && chooser.contains(&"M-Up/^"));
+        assert_eq!(key(c, "Escape"), Outcome::Changed);
+        assert_eq!(titles(c), led_by(mode));
+    };
+    let titles_of: Vec<&str> = ui::Group::ALL.iter().map(|g| g.title()).collect();
+    assert_eq!(titles_of, GROUPS);
     let mut c = Controller::new(surface(800, 600));
     let sections = c.key_sections();
-    let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
-    assert_eq!(titles, ["Actions"]);
-    assert_eq!(sections[0].rows, chorded);
-    assert_eq!(sections[0].rows.len(), 52);
-    let problems = td_ui::keys::check(&sections);
-    assert!(problems.is_empty(), "{problems:#?}");
-    assert!(sections[0]
+    assert_grouped(&sections);
+    let sizes: Vec<(&str, usize)> = sections.iter().map(|s| (s.title, s.rows.len())).collect();
+    assert_eq!(
+        sizes,
+        [
+            ("Cull", 9),
+            ("Modes", 3),
+            ("Moving around", 8),
+            ("Develop", 11),
+            ("History", 5),
+            ("Looks", 9),
+            ("Zoom", 4),
+            ("Export", 2),
+            ("Roll and window", 2),
+        ]
+    );
+    let section = |title: &str| sections.iter().find(|s| s.title == title).unwrap();
+    let keys_of =
+        |title: &str| -> Vec<&str> { section(title).rows.iter().map(|r| r.keys).collect() };
+    assert_eq!(keys_of("Modes"), ["Escape", "d", "E"]);
+    assert_eq!(keys_of("History"), ["0", "z", "t", "Backspace", ""]);
+    assert_eq!(
+        section("History").rows[4].what,
+        "Down and Up choose the step in develop."
+    );
+    assert!(keys_of("Cull").contains(&"Return"));
+    assert!(section("Looks")
         .rows
         .iter()
         .any(|r| r.keys == "C-1" && r.what.contains("first of the available looks")));
-    assert!(sections[0].rows.iter().any(|r| r.keys == "q"));
+    assert_eq!(keys_of("Roll and window"), ["o", "q"]);
     for chord in [td_ui::keys::CHORD, td_ui::theme::CHORD] {
         assert!(driven::bound(BINDINGS, chord).is_none(), "{chord}");
     }
     assert_eq!(key(&mut c, "F1"), Outcome::Ignored);
-    let (outcome, _) = c.action("choose", &[]).unwrap();
-    assert_eq!(outcome, Outcome::Changed);
-    c.set_listing(b"/".to_vec(), listing("/", &["r"], &[]), Some("r"))
-        .unwrap();
-    let sections = c.key_sections();
-    let titles: Vec<&str> = sections.iter().map(|s| s.title).collect();
-    assert_eq!(titles, ["Roll chooser", "Actions"]);
-    assert_eq!(sections[1].rows, chorded);
-    let problems = td_ui::keys::check(&sections);
-    assert!(problems.is_empty(), "{problems:#?}");
-    let chooser: Vec<&str> = sections[0].rows.iter().map(|r| r.keys).collect();
-    assert!(chooser.contains(&"C-Return") && chooser.contains(&"M-Up/^"));
-    assert_eq!(key(&mut c, "Escape"), Outcome::Changed);
-    assert_eq!(c.key_sections().len(), 1);
+    chooser_leads(&mut c, &["Cull"]);
+
+    // Develop leads with its edits, history, looks and zoom.
+    c.open("roll", b"/r", photos(5)).unwrap();
+    assert_eq!(act(&mut c, "develop", &[]), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Develop);
+    assert_eq!(
+        titles(&c),
+        [
+            "Develop",
+            "History",
+            "Looks",
+            "Zoom",
+            "Modes",
+            "Moving around",
+            "Cull",
+            "Export",
+            "Roll and window",
+        ]
+    );
+    assert_grouped(&c.key_sections());
+    chooser_leads(&mut c, &["Develop", "History", "Looks", "Zoom"]);
+
+    // The export view leads with Export.
+    assert_eq!(act(&mut c, "export-mode", &[]), Outcome::Changed);
+    assert_eq!(c.mode(), ui::Mode::Export);
+    assert_eq!(
+        titles(&c),
+        [
+            "Export",
+            "Modes",
+            "Moving around",
+            "Cull",
+            "Develop",
+            "History",
+            "Looks",
+            "Zoom",
+            "Roll and window",
+        ]
+    );
+    assert_grouped(&c.key_sections());
+    chooser_leads(&mut c, &["Export"]);
+    assert_eq!(c.mode(), ui::Mode::Export);
 }
 
 #[test]

@@ -476,6 +476,122 @@ impl Action {
             Self::Next | Self::Previous | Self::Down | Self::Up | Self::PageDown | Self::PageUp
         )
     }
+
+    /// The key list's section the action's row is shown under. Every
+    /// action names one, so a new action cannot go unlisted.
+    pub fn group(self) -> Group {
+        match self {
+            Self::Next
+            | Self::Previous
+            | Self::Down
+            | Self::Up
+            | Self::First
+            | Self::Last
+            | Self::PageDown
+            | Self::PageUp
+            | Self::Select
+            | Self::Scroll => Group::Moving,
+            Self::Pick
+            | Self::Reject
+            | Self::Unflag
+            | Self::All
+            | Self::Picks
+            | Self::Rejects
+            | Self::Unflagged
+            | Self::View
+            | Self::DeleteRejected => Group::Cull,
+            Self::Grid | Self::Develop | Self::ExportMode => Group::Modes,
+            Self::ExposeIn
+            | Self::ExposeOut
+            | Self::ExposeInFine
+            | Self::ExposeOutFine
+            | Self::Look
+            | Self::Crop
+            | Self::AdjustCrop
+            | Self::Aspect
+            | Self::Looks
+            | Self::Uncrop
+            | Self::Exposure
+            | Self::ContrastIn
+            | Self::ContrastOut
+            | Self::Contrast
+            | Self::Auto
+            | Self::AutoPicks => Group::Develop,
+            Self::Reset | Self::Undo | Self::StepToggle | Self::StepDelete => Group::History,
+            Self::LookAt(_) => Group::Looks,
+            Self::ZoomFit | Self::Zoom100 | Self::ZoomIn | Self::ZoomOut => Group::Zoom,
+            Self::Export | Self::ExportPicks | Self::Format | Self::Quality | Self::LongEdge => {
+                Group::Export
+            }
+            Self::Open | Self::Choose | Self::Quit => Group::Roll,
+        }
+    }
+}
+
+/// The key list's sections of the action table, in the order it shows
+/// them after the current mode's own and `Modes`
+/// (`Controller::key_sections`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Group {
+    Moving,
+    /// Entering develop and the export view and leaving them: in every
+    /// mode, straight after the mode's own sections.
+    Modes,
+    Cull,
+    Develop,
+    History,
+    Looks,
+    Zoom,
+    Export,
+    Roll,
+}
+
+impl Group {
+    pub const ALL: &'static [Group] = &[
+        Group::Moving,
+        Group::Modes,
+        Group::Cull,
+        Group::Develop,
+        Group::History,
+        Group::Looks,
+        Group::Zoom,
+        Group::Export,
+        Group::Roll,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Moving => "Moving around",
+            Self::Modes => "Modes",
+            Self::Cull => "Cull",
+            Self::Develop => "Develop",
+            Self::History => "History",
+            Self::Looks => "Looks",
+            Self::Zoom => "Zoom",
+            Self::Export => "Export",
+            Self::Roll => "Roll and window",
+        }
+    }
+
+    /// The mode whose key list leads with the section: develop's edits,
+    /// history, looks and zoom act only there.
+    pub fn mode(self) -> Option<Mode> {
+        match self {
+            Self::Cull => Some(Mode::Cull),
+            Self::Develop | Self::History | Self::Looks | Self::Zoom => Some(Mode::Develop),
+            Self::Export => Some(Mode::Export),
+            Self::Moving | Self::Modes | Self::Roll => None,
+        }
+    }
+
+    /// The section's prose rows after its actions': a key whose meaning
+    /// there is another action's help line.
+    pub fn prose(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::History => &[("", "Down and Up choose the step in develop.")],
+            _ => &[],
+        }
+    }
 }
 
 /// The action table: the name `action` takes, the chord the keyboard
@@ -2434,26 +2550,40 @@ impl Controller {
 
     /// The window's key list (`F1`): the chooser's keys first while it
     /// owns the keyboard, then every chorded binding in `BINDINGS`, its
-    /// chord and help line, under "Actions" (the table's name, as
-    /// `--help actions` prints it), so the list cannot drift from the
-    /// table.
+    /// chord and help line, under its action's `Group` (found by name, as
+    /// a key finds its action), in the table's order within one, then the
+    /// group's `prose`; the current mode's groups lead, `Modes` follows
+    /// them, and the rest keep `Group::ALL`'s order. The rows are the
+    /// table's, so the list cannot drift from it.
     pub fn key_sections(&self) -> Vec<keys::Section> {
         let mut sections = Vec::new();
         if self.chooser.is_some() {
             sections.push(keys::Section::new("Roll chooser", Self::CHOOSER_KEYS));
         }
-        sections.push(keys::Section {
-            title: "Actions",
-            rows: BINDINGS
+        let lead = Some(self.mode);
+        let groups = Group::ALL.iter().filter(|group| group.mode() == lead);
+        let rest = Group::ALL
+            .iter()
+            .filter(|group| group.mode() != lead && **group != Group::Modes);
+        for &group in groups.chain([&Group::Modes]).chain(rest) {
+            let mut rows: Vec<keys::Row> = BINDINGS
                 .iter()
+                .filter(|binding| Action::parse(binding.name).map(Action::group) == Some(group))
                 .filter_map(|binding| {
                     Some(keys::Row {
                         keys: binding.chord?,
                         what: binding.help,
                     })
                 })
-                .collect(),
-        });
+                .collect();
+            rows.extend(group.prose().iter().copied().map(keys::row));
+            if !rows.is_empty() {
+                sections.push(keys::Section {
+                    title: group.title(),
+                    rows,
+                });
+            }
+        }
         sections
     }
 

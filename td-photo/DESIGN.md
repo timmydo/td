@@ -744,11 +744,28 @@ window, all speaking the toolkit's one vocabulary.
   agent's (`open`; `choose`, `o`, is the person's way to one).
   `td-photo --help actions` prints the table so an agent can read it
   instead of guessing. The live window's `F1` key list shows the same
-  table's chorded rows, each chord with its help line, as one section
-  titled Actions (`Controller::key_sections`; the table has no grouping
-  of its own to split it by), under the chooser's own keys while the
-  chooser owns the keyboard; `F1` and `F12` are the window's and bind
-  no action (see Window).
+  table's chorded rows, each chord with its help line, grouped into
+  sections (`Controller::key_sections`). `Action::group`, an exhaustive
+  match, names each action's `Group`, so an action cannot be added
+  unlisted, and a row finds its group by its binding's name through
+  `Action::parse`, as a key finds its action; the table itself keeps its
+  order and words, which `--help actions` and the socket's `actions`
+  share. `Group::ALL` is the sections' order: Moving around (the
+  cursor's moves and pages, 8 rows), Modes (`Escape` back to the grid,
+  `d` into develop, `E` into the export view, 3), Cull (the flags, the
+  filters, the single view, `delete-rejected`, 9), Develop (the
+  exposure, contrast, crop, look palette and Auto keys, `auto-picks`,
+  11), History (`reset`, `undo` and the step keys, then a prose row:
+  `Down` and `Up` choose the step in develop, 5), Looks (`C-1`..`C-9`,
+  9), Zoom (4), Export (`e`, `C-e`, 2), and Roll and window (`choose`,
+  `quit`, 2). Within a section the table's rows keep its order, a
+  group's prose (`Group::prose`) after them. The current mode's
+  sections lead (`Group::mode`: Cull's for cull, Develop, History, Looks
+  and Zoom for develop, Export's for the export view), Modes, whose keys
+  act in every mode, comes straight after them, and the rest follow in
+  that order; the chooser's own keys come before them all while the
+  chooser owns the keyboard; `F1` and `F12` are the window's and bind no
+  action (see Window).
 
 ## Files
 
@@ -1745,9 +1762,10 @@ routed as td-ui/DESIGN.md "Key list" says every window routes it: the
 window takes it from the keyboard alone, after `F12`, and opens the list
 with `Controller::key_sections` as they are then (the chooser's keys, a
 `(keys, what)` slice beside `chooser_key`, first while it is open, then
-the action table's chorded rows) and the window's own `F1` and `F12`;
-every variant passes `keys::check`. A left press on the mode strip's
-Help (`Controller::help_button`, where the surface holds it and the
+the action table's chorded rows in their sections, the mode's first and
+Modes next, as Driving says) and the window's own `F1` and `F12`; every
+variant passes `keys::check`. A left press on the mode strip's Help
+(`Controller::help_button`, where the surface holds it and the
 status row does not cover it) opens it the same way, the window taking
 the press from the live pointer before the session hears it and its
 release reaching nobody; the model, which the control socket and the
@@ -2249,9 +2267,15 @@ reported as moved without it, the rest going on, and the real mover refusing
 a taken name and finishing its own interrupted move.
 
 `tests/ui.rs` holds the action table to `driven::check` and to its alignment
-with `Action`, its chorded rows to the key list's section (the chooser's
-keys first while it is open, `F1` and `F12` binding no action, each
-variant passing `keys::check`), and the
+with `Action`, its chorded rows to the key list's sections (each keyed
+row in exactly one, its action's group's by name, in the table's order
+within it, the keyed rows together the table's chorded rows, keyless
+prose aside; the sections' titles, order, sizes and the Modes and
+History rows; the cull, develop and export views each led by their
+mode's sections, Modes next; the chooser's keys first while it is open,
+over the grid, develop and the export view, and the mode's order back
+after `Escape`; `F1` and `F12` binding no action; each variant passing
+`keys::check`), and the
 error codes to the code grammar; drives `ui::Controller`
 in-process (the state before a roll and after, walking with every step and page,
 `select`, the filters and the cursor they keep or move, the single view and back
