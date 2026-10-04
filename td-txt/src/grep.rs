@@ -758,53 +758,67 @@ fn stray_note(b: u8) -> String {
     }
 }
 
-/// GNU's `try_fgrep_pattern` (grep.c:2389-2456): can this pattern set be handed to
-/// the fixed-string matcher? Read over the patterns joined by newlines, as GNU
-/// reads them, so a `\` before the join is the `\<newline>` that refuses.
+/// Whether every pattern is a plain string, so the set can go to the
+/// fixed-string matcher, as GNU grep hands it. The patterns are read joined
+/// by newlines, so a pattern ending in `\` meets the next one as `\<newline>`
+/// and refuses. A refusal is any metacharacter of the dialect, or an escape
+/// that is an operator or assertion in it; any other escape just makes its
+/// byte literal.
 fn all_literal(ere: bool, pats: &[&Vec<u8>]) -> bool {
+    // Special unescaped in both dialects, and only in an ERE.
+    const META: &[u8] = b"$*.[^";
+    const ERE_META: &[u8] = b"(+?{|";
+    // Escapes that are operators in both: back-references, the word and
+    // space classes, the anchors, and the `\<newline>` of two patterns.
+    const ESCAPED_OPS: &[u8] = b"123456789BSWbsw<>`'\n";
+    // Escapes a BRE reads as operators -- `\)` among them, so the regex
+    // compiler rather than this decides what an unmatched one means.
+    const BRE_ESCAPED_OPS: &[u8] = b"()+?{|";
     let joined = pats
         .iter()
         .map(|p| p.as_slice())
         .collect::<Vec<_>>()
         .join(&b'\n');
-    let mut i = 0;
-    while let Some(&c) = joined.get(i) {
-        match c {
-            b'$' | b'*' | b'.' | b'[' | b'^' => return false,
-            // Literal in a BRE, operators in an ERE.
-            b'(' | b'+' | b'?' | b'{' | b'|' if ere => return false,
-            b'\\' => {
-                match joined.get(i + 1) {
-                    // An operator or an assertion in both dialects.
-                    Some(
-                        b'\n'
-                        | b'B'
-                        | b'S'
-                        | b'W'
-                        | b'\''
-                        | b'<'
-                        | b'b'
-                        | b's'
-                        | b'w'
-                        | b'`'
-                        | b'>'
-                        | b'1'..=b'9',
-                    ) => return false,
-                    // A BRE's operators, where an ERE reads the escape as making
-                    // them literal. `\)` rides with them so GEAcompile can
-                    // complain about it rather than this deciding.
-                    Some(b'(' | b'+' | b'?' | b'{' | b'|' | b')') if !ere => return false,
-                    // Any other escape drops out, leaving the byte literal.
-                    Some(_) => i += 2,
-                    None => i += 1,
-                }
-                continue;
-            }
-            _ => {}
+    let mut bytes = joined.iter();
+    while let Some(&c) = bytes.next() {
+        let refuses = if c == b'\\' {
+            bytes
+                .next()
+                .is_some_and(|e| ESCAPED_OPS.contains(e) || (!ere && BRE_ESCAPED_OPS.contains(e)))
+        } else {
+            META.contains(&c) || (ere && ERE_META.contains(&c))
+        };
+        if refuses {
+            return false;
         }
-        i += 1;
     }
     true
+}
+
+/// A shorter end for the span `start..end` under `-w`: the longest
+/// non-empty match anchored at `start` within a window, if it ends before
+/// `end`. The window reaches `end - 1 - from` bytes into the LINE although
+/// `from` is where the SEARCH began -- GNU grep measures it so -- so once
+/// `-o` has consumed part of the line the window can close over the span
+/// and nothing shorter is found: why `word_match` passes over `b` in
+/// `a b c`.
+fn shorter_at(
+    re: &Regex,
+    line: &[u8],
+    start: usize,
+    end: usize,
+    from: usize,
+    steps: &mut u64,
+) -> Result<Option<usize>, Error> {
+    if end <= start {
+        return Ok(None);
+    }
+    let window = end.saturating_sub(1).saturating_sub(from);
+    let len = re.match_anchored(line, window, start, steps)?;
+    // Strictly shorter, so the walk at one start always ends.
+    Ok(len
+        .filter(|&len| len > 0 && start + len < end)
+        .map(|len| start + len))
 }
 
 fn is_word(b: u8) -> bool {
@@ -1008,85 +1022,56 @@ impl Grep {
         Ok(best)
     }
 
-    /// GNU's `-w` retry loop (grep/src/dfasearch.c:528-567), which is what decides
-    /// the SPAN once the line is already selected. It is not a search for any
-    /// word-bounded span — that is `Want::Selection`'s question, and the two
-    /// disagree: `grep -o -w '..\?'` prints `a` and `c` of `a b c`, passing the
-    /// perfectly word-bounded `b` that selection would have found.
+    /// The span `-w` reports once a line is selected, as GNU grep picks it.
+    /// It is not a search for any word-bounded span -- that is
+    /// `Want::Selection`'s question, and the two disagree: `grep -o -w '..\?'`
+    /// prints `a` and `c` of `a b c`, passing the word-bounded `b` that
+    /// selection would find.
     ///
-    /// Given a match that is not word-bounded, GNU tries a SHORTER one anchored at
-    /// the same start, and only when there is none does it advance the start by one
-    /// and search again. Two details of that decide the divergences:
+    /// Each start is taken in turn, beginning with the leftmost-longest match
+    /// from `from`. At a start, a span that is not word-bounded gives way to a
+    /// shorter, non-empty match anchored there (see `shorter_at`), until one is
+    /// word-bounded or none is shorter; then the next start is the
+    /// leftmost-longest match from one byte on. An empty match the search
+    /// itself returns is a candidate; an empty shorter one is not.
     ///
-    /// The shrink window is cut at `s + len - from`, an offset measured from the
-    /// SEARCH START but applied to a buffer beginning at the LINE start. Under `-o`
-    /// the two part company as the line is consumed, so the window closes over the
-    /// match and shrinking stops working once `len <= from`. That is why `b` above
-    /// is skipped: at its start the greedy `b ` is not word-bounded, and the `b`
-    /// that would be is past the window.
-    ///
-    /// And an EMPTY shrink does not count (`0 < shorter_len`), where an empty match
-    /// `re_search` itself reports does.
-    ///
-    /// A pattern LIST is where this is still not GNU. Without a backreference
-    /// GEAcompile hands the newline-joined list to glibc as ONE regex
-    /// (dfasearch.c:236-295), so GNU runs this loop once over the union while
-    /// td-txt runs it per pattern and takes the leftmost-longest of the answers.
-    /// A start whose union span cannot be shrunk into a word can still be
-    /// word-bounded for one pattern alone, so the two differ — see the xfail
-    /// block in spec/grep-cli.test.txt. Selection is unaffected, the wrapped dfa
-    /// over the union asking what the per-pattern scan asks.
+    /// A pattern LIST is where this is still not GNU: GNU runs this over the
+    /// patterns without a backreference joined as one regex (each with one
+    /// apart), td-txt per pattern, taking the leftmost-longest of the
+    /// answers. A start whose union span cannot be shrunk into a word can
+    /// still be word-bounded for one pattern alone -- see the xfail block in
+    /// spec/grep-cli.test.txt. Selection is unaffected.
     fn word_match(
         &self,
         re: &Regex,
         line: &[u8],
         from: usize,
     ) -> Result<Option<(usize, usize)>, Error> {
-        // ONE budget for the whole slide, not one per search — see
-        // `Regex::search_budgeted`.
-        // ONE budget for the whole slide, not one per search — see
+        // ONE budget for the whole walk, not one per search -- see
         // `Regex::search_budgeted`.
         let steps = &mut 0u64;
-        // Always leftmost-then-LONGEST, even where the caller would have settled for
-        // a boolean: the shrink walks DOWN from the longest span, so entering the
-        // loop with a shorter one would start it somewhere GNU never does.
-        let Some(caps) = re.search_budgeted(line, from, steps)? else {
-            return Ok(None);
-        };
-        let (mut s, mut e) = (caps.start(), caps.end());
+        let mut search_from = from;
         loop {
-            if word_start_ok(line, s) && word_end_ok(line, e) {
-                return Ok(Some((s, e)));
-            }
-            // GNU's `len > 0`, and its `--len` BEFORE the call: the window ends one
-            // byte short of this match, so what comes back is strictly shorter. The
-            // width saturates rather than relying on that guard for its own sake —
-            // `e - 1` under it is only non-negative because `e > s`.
-            let shorter = match e > s {
-                true => {
-                    let width = e.saturating_sub(1).saturating_sub(from);
-                    re.match_anchored(line, width, s, steps)?
-                }
-                false => None,
+            // Always leftmost-then-LONGEST, even where the caller would settle
+            // for a boolean: shrinking starts from the longest span.
+            let Some(caps) = re.search_budgeted(line, search_from, steps)? else {
+                return Ok(None);
             };
-            match shorter {
-                // `len > 0` is GNU's. The second half is this crate's: a shrink
-                // that did not SHORTEN is not one, and without the test the loop
-                // spins on a span it keeps rediscovering. It cannot fire, the
-                // window being cut strictly inside the match — which is the point,
-                // since that makes termination structural rather than a property
-                // of the arithmetic above it.
-                Some(len) if len > 0 && s + len < e => e = s + len,
-                _ => {
-                    if s == line.len() {
-                        return Ok(None);
-                    }
-                    let Some(caps) = re.search_budgeted(line, s + 1, steps)? else {
-                        return Ok(None);
-                    };
-                    (s, e) = (caps.start(), caps.end());
+            let start = caps.start();
+            let mut end = caps.end();
+            loop {
+                if word_start_ok(line, start) && word_end_ok(line, end) {
+                    return Ok(Some((start, end)));
+                }
+                match shorter_at(re, line, start, end, from, steps)? {
+                    Some(shorter) => end = shorter,
+                    None => break,
                 }
             }
+            if start == line.len() {
+                return Ok(None);
+            }
+            search_from = start + 1;
         }
     }
 
@@ -1863,11 +1848,12 @@ fn synonymous(a: &[u8], b: &[u8]) -> bool {
 /// way GNU's `getopt_long` accepts one (`grep --ignore-c`), an exact name
 /// always winning over being a prefix of a longer one.
 ///
-/// GNU's `long_options[]` (grep.c:504), order intact. A name is here to be
-/// RESOLVED, which is not the same as being served: most of these are refused
-/// by the dispatch. Every GNU long name is here but `--unix-byte-offsets`,
-/// whose divergence is a status rather than a diagnostic, so tabling it would
-/// change the wording and leave the difference.
+/// GNU grep's long option names, in the order its getopt reports them. A
+/// name is here to be RESOLVED, which is not the same as being served: most
+/// of these are refused by the dispatch. Every GNU long name is here but
+/// `--unix-byte-offsets`, whose divergence is a status rather than a
+/// diagnostic, so tabling it would change the wording and leave the
+/// difference.
 /// This is the order an ambiguity lists its possibilities in, so the table is
 /// OUTPUT rather than housekeeping: sorted by name it answers `--d` with
 /// `--dereference-recursive` first, which GNU never prints.
