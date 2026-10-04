@@ -195,9 +195,10 @@ volume with it (MEDIA.md "Live boot"). The second is the source-built static
 `cryptsetup` that [ENCRYPTION.md](ENCRYPTION.md) approves for LUKS2: the
 installer formats with it, and the selector and deployment initramfs open
 the volume with it. Its key material reaches it only through a descriptor,
-never argv or the environment. Nothing execs it yet; the landing that first
-does carries the same build-time binding D7 requires of `mkfs.btrfs`, and
-ships its debug companion with it.
+never argv or the environment. Nothing execs it yet. The landing that first
+does, ENCRYPTION.md increment 5's formatting, execs `/bin/cryptsetup` from
+the verified root, carries the same build-time binding D7 requires of
+`mkfs.btrfs`, and ships its debug companion with it.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create
@@ -849,6 +850,70 @@ The caller still binds stable trusted sources, an absolute td-boot and a
 mountpoint nothing else uses. This is the one-process publication the
 installation service's execution needs; it does not activate that execution.
 
+### Device-bound formatting
+
+A service started with the device-bound storage operand (INSTALLER.md
+"Installation service core") executes a consented installation as
+"Executing a consented installation" says, except as follows.
+[ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting" owns the volume
+format, its parameters and the operand's activation boundary.
+
+No plaintext volume image exists. The settings, account and trusted key
+are staged as a directory tree in the workspace before the first write,
+as on the unencrypted path; they hold no secret. The scratch image and
+its admission ("Prepared volume image admission") remain only for the
+unencrypted path. After the layout's writes and their sync barriers, the
+formatter binds the loop over the volume's extent as "Publishing through a
+loop over the claim" does, and then, on that loop:
+
+1. draws the recovery key and the first-boot protector secret from
+   `/dev/random` through td-protector;
+2. runs `luksFormat` with ENCRYPTION.md's parameters;
+3. adds keyslot 1 with `luksAddKey --new-key-slot 1` and the same PBKDF
+   parameters, the recovery passphrase authorizing it;
+4. seals the protector under the first-boot policy and imports token 0
+   with `token import --token-id 0 --json-file=-`;
+5. opens the mapping `td-install-` followed by the workspace's name, with
+   the recovery passphrase;
+6. runs `mkfs.btrfs` on the mapping, with the volume's length less 16 MiB
+   as `--byte-count`, the plan's UUID, the label, `--rootdir` over the
+   staged tree and the `@var` subvolume, as on the unencrypted path;
+7. runs `td-boot install` on the mapping, then closes it.
+
+Verifying boot then also requires, while the loop is bound, that
+`open --test-passphrase` succeeds for keyslot 0 with the recovery
+passphrase and for keyslot 1 with the protector secret, and that the
+header, read back through the claim by td-protector's reader, carries
+exactly the token imported, which `verify_first_boot_object` accepts. The
+protector secret is then zeroed and the loop released as before. The
+service then holds the recovery key for its installer's type-back
+(INSTALLER.md "Installation service protocol") and reports complete only
+after it. Nothing names a partition of the destination: cryptsetup,
+mkfs.btrfs and td-boot see only the loop and the mapping.
+
+Every cryptsetup child runs `/bin/cryptsetup` from the verified root with a
+cleared environment, its output captured and its error inherited. Key
+material reaches it only by descriptor. The first secret travels on
+standard input as `--key-file=-`, written whole and then closed. The
+second, the new key `luksAddKey` takes as its key file, travels through a
+pipe created with std: td-install writes the secret, closes the write end,
+keeps the read end and names it to the child as
+`/proc/<td-install pid>/fd/N`, so cryptsetup reads exactly the secret and
+end of file. A secret is at most 48 bytes, under any pipe's capacity, so
+the write never blocks. No argv element or environment variable carries key
+material; a descriptor path names no secret. This adds no `unsafe` and no
+syscall to UNSAFE.md: pipes and children are std's and the device-mapper
+requests are cryptsetup's own.
+
+The cost of formatting in place is the refusal order. A failing mkfs,
+which the unencrypted path meets before the first write, is here a write
+failure after layout. On this path every failure after the first write,
+and the loss of the installer before its type-back, withdraws the
+installation: the table is invalidated as at verifying boot, and the
+volume's first 16 MiB are zeroed through the claim, so no keyslot of an
+unfinished installation stays openable. The outcome keeps its stage's
+code; a withdrawal that itself fails is reported as at verifying boot.
+
 ### Payload fit
 
 A review is presented only for a disk that holds what installing its
@@ -881,12 +946,16 @@ untouched. Past that point the payloads td-boot publishes are bound only
 by their digests; a source that changes size afterwards meets ENOSPC
 during publication.
 
+A device-bound plan first subtracts the 16 MiB LUKS2 header and keyslots
+area (ENCRYPTION.md "Device-bound formatting") from the volume, for this
+fit and for the layout's minimum volume size.
+
 Scratch is not sized here. The execution's workspace under `/run` holds
 the kernel copy, the selector and a sparse volume image whose blocks are
-mkfs's metadata and the staged settings. A shortage there is met before
-the first write: as insufficient space where this process meets it, and
-as write failed where mkfs.btrfs reports only its status, with the disk
-untouched either way.
+mkfs's metadata and the staged settings; a device-bound execution holds no
+volume image. A shortage there is met before the first write: as
+insufficient space where this process meets it, and as write failed where
+mkfs.btrfs reports only its status, with the disk untouched either way.
 
 ### Executing a consented installation
 

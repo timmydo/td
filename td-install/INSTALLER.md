@@ -383,6 +383,18 @@ leaves progress, failure, an unknown outcome or completion; Return on
 completion asks only for the restart. A reported completion or failure
 stands when the connection ends.
 
+A device-bound installation reaches completion through its recovery-key
+phase ("Device-bound records"). The window asks for the key once and shows
+its eight groups, saying that it is shown only now, that no copy is kept,
+and that it is the only way back if the TPM, firmware measurements or boot
+chain change. Return then asks for it back on a field that admits digits,
+spaces and hyphens; a group whose value or check digit fails is named
+before anything is sent, and a key the service refuses as a mismatch is
+shown and asked again. The window holds the key, in memory only, until the
+service reports complete, and may show it again until then; the restart
+is offered only after completion. A connection lost during the phase
+shows that the installation was withdrawn, since the service withdraws it.
+
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are
 descriptions, not proof of device authenticity. Exclude the installation
@@ -462,7 +474,9 @@ shared references or copied scalar values. Equality compares every
 field, including optional labels and nonce. A clone is the same
 proposal, never a fresh consent or retry. The v1 record describes whole-
 disk erasure, unencrypted storage and automatic login; these policies
-are not caller-selectable flags.
+are not caller-selectable flags. The device-bound records below name the
+storage the service's own operand chose; a request still cannot choose
+it.
 
 The public `DestinationObservation` names each unvalidated input field;
 `Destination::new` validates and copies it. Construction and decoding admit
@@ -648,30 +662,68 @@ publication. An installer that asked for execution and then sees idle, or
 loses the channel, shows the outcome as unknown, never success. Nothing
 retries a destructive operation after a reconnect or restart.
 
+### Device-bound records
+
+The landing that adds them, in ENCRYPTION.md increment 5, changes these
+records at once: the greeting becomes `TDINS04\n`, the consent channel's
+`TDINA02\n` and the plan's magic `TDPLAN02`.
+
+- The plan gains one storage byte after the removable flag: 0 unencrypted
+  or 1 device-bound, any other value refused. The service sets it from
+  its storage operand; a propose request carries none. The review page
+  and the consent channel's review report, which gains the same byte
+  after the deployment digest, show it.
+- Running phase 6, recovery key, follows verifying boot on a device-bound
+  installation: everything is written and verified, and the service holds
+  the recovery key.
+- Request `0x08` recovery key, a review nonce, is admitted only in that
+  phase for that nonce. Its first admission is answered by reply `0x86`
+  recovery key: the nonce and the key's 48 ASCII digits. Every later ask
+  is refused as 16 recovery key sent, so the service sends it once.
+- Request `0x09` confirm recovery, a review nonce and the 48 digits typed
+  back, is admitted only in that phase after the key was sent. The service
+  compares the digits with the key it holds: equal, it zeroes the key and
+  the installation is complete, answered with status; different, it is
+  refused as 17 recovery key mismatch and the phase continues.
+- Failure 6, recovery unconfirmed: the installer was lost during that
+  phase, and the installation was withdrawn (DESIGN.md "Device-bound
+  formatting").
+
+The phase has no deadline: a person may take as long as writing the key
+down needs. Withdraw stays refused as busy while it runs.
+
 ## Installation service core
 
-`td-install serve <td-boot> <deployment-directory> <trusted-key>
-<verified-root> <td-firstboot>` is the service core for one installer. Its
-five operands are absolute control-plane inputs bound by its caller, never
-by the installer, and must be present and of their kind: `td-boot` and
-`td-firstboot` executable files, the deployment directory and verified root
-directories, the key a file. It requires effective uid 0 (a sanity gate
-against a misplaced start, not proof of privilege), the installer's channel
-on standard input and td-authd's consent channel on standard output: each a
-connected Unix stream socket, found as such in `/proc/net/unix`, since a
-datagram or sequenced-packet peer would truncate frames and need not close,
-and not one socket on both. That table lists only serve's own network
-namespace, so its caller must create the sockets there, and every row naming
-a socket must agree, since a bound name can forge one. It clears an
-inherited non-blocking flag on each, and refuses before sending a byte
-otherwise. Nothing it runs writes to standard output: every child's is
-captured or null. It then speaks the installation service protocol on
+`td-install serve [--storage device-bound] <td-boot> <deployment-directory>
+<trusted-key> <verified-root> <td-firstboot>` is the service core for one
+installer. Its five operands are absolute control-plane inputs bound by its
+caller, never by the installer, and must be present and of their kind:
+`td-boot` and `td-firstboot` executable files, the deployment directory and
+verified root directories, the key a file. It requires effective uid 0 (a
+sanity gate against a misplaced start, not proof of privilege), the
+installer's channel on standard input and td-authd's consent channel on
+standard output: each a connected Unix stream socket, found as such in
+`/proc/net/unix`, since a datagram or sequenced-packet peer would truncate
+frames and need not close, and not one socket on both. That table lists only
+serve's own network namespace, so its caller must create the sockets there,
+and every row naming a socket must agree, since a bound name can forge one.
+It clears an inherited non-blocking flag on each, and refuses before sending
+a byte otherwise. Nothing it runs writes to standard output: every child's
+is captured or null. It then speaks the installation service protocol on
 standard input until the peer closes between frames, and exits; a malformed
 frame or message ends it without a reply. Until an installation starts, the
 review and its claim end with the installer's channel; a started
 installation runs to its finished report first. td-authd starts it for each
 installer on a live boot (td-authd/DESIGN.md "Whole-disk installation
 intake").
+
+The leading `--storage device-bound` operand, the only storage operand,
+makes every installation of this service device-bound
+([ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting", which owns its
+activation boundary); without it, storage is unencrypted. td-authd never
+passes it. With it, serve opens the TPM before sending a byte and refuses
+to start, with a diagnostic, unless it is usable: PCR_Read of PCRs 4 and
+9 in the SHA-256 bank answers that bank, and neither value is zero.
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot

@@ -10,10 +10,11 @@ ENCRYPTION.md makes disk-specific: which PCRs a protector names, the
 release cap, and the protector secret. It is pure `std`, depends only on
 td-tpm, forbids `unsafe` and adds no syscall surface to `UNSAFE.md`.
 
-Nothing here is a persisted volume format. The td-typed LUKS2 tokens that
-carry sealed protectors, their bounded reader, keyslot naming, the
-first-boot transition and the recovery flow belong to increments 5 and 6,
-which amend this document with the token format they add.
+Increment 5 adds the two persisted formats the installer writes and the
+selector reads: the recovery key's encoding and the td LUKS2 token, with
+the bounded reader that finds tokens in a LUKS2 header before the cap.
+Keyslot changes, the first-boot transition and the recovery flow belong
+to increment 6.
 
 ## Policies
 
@@ -96,8 +97,70 @@ local digest, then requires the sealed object's public area to carry that
 digest as its authPolicy with the fixed sealed attributes. It then loads
 the public and private pair under the storage primary with td-tpm's
 `load_and_flush`, so the TPM verifies the private area's integrity, and
-flushes both. Nothing is unsealed: the live selector has already capped
-PCR 12.
+flushes both. Nothing is unsealed: the installer never unseals the
+first-boot protector, and from increment 6 the live selector has already
+capped PCR 12.
+
+## Recovery key
+
+A recovery key is 16 bytes from `/dev/random`, read as `Secret` is. They
+are eight big-endian 16-bit values, each written as five decimal digits,
+`00000` to `65535`, followed by one Damm check digit over those five: the
+standard order-10 quasigroup table, starting from zero. That makes eight
+groups of six digits, 48 digits and 128 bits. Damm detects every
+single-digit substitution and every adjacent transposition within a group.
+
+The keyslot passphrase is the 48 ASCII digits with no separator. The
+display form joins the groups with hyphens. Entry admits spaces and
+hyphens only between groups and around the whole, and refuses, naming
+the group where it can, a character other than a digit, space or hyphen,
+a separator inside a group, a digit count other than 48, a value above
+65535 and a wrong check digit. A key, its passphrase and its display form
+are zeroed on drop and are neither `Debug`, `Display` nor `Clone`.
+
+## LUKS2 tokens
+
+A td token is a LUKS2 token object with exactly these five keys:
+
+```text
+{"type":"td-protector","keyslots":["N"],"role":"ROLE",
+ "public":"HEX","private":"HEX"}
+```
+
+`keyslots` holds one keyslot number, 0 to 31, as LUKS2 writes it: a
+decimal string without leading zeros. `role` is `first-boot` or
+`device-bound`. `public` and `private` are the sealed object's
+TPM2B_PUBLIC and TPM2B_PRIVATE contents in lowercase hexadecimal, bounded
+to 256 and 512 bytes. A missing, extra or duplicated key, another type in
+any field, or a value outside these bounds refuses the token. Other token
+types are ignored.
+
+The reader reads the header copy cryptsetup will use, by cryptsetup's own
+rule, before any C parser runs. A copy is valid when its binary header has
+its position's magic, version 2, its own offset in `hdr_offset`, a
+`hdr_size` from 16 KiB to 4 MiB and, for the secondary, an offset equal to
+that size, and when the SHA-256 over the binary header with its checksum
+field zeroed and the whole JSON area equals the stored checksum; a copy
+the medium ends inside is invalid, and any other read error refuses. The
+secondary is read at the primary's `hdr_size` when the primary is valid,
+and otherwise at the first of cryptsetup's fixed secondary offsets that
+holds a valid copy. Of two valid copies the higher `seqid` is used. Copies
+with equal `seqid` must agree in `hdr_size`, label, checksum algorithm,
+UUID, subsystem and JSON area, or the reader refuses them as disagreeing;
+agreeing, the primary is used. A checksum algorithm other than `sha256`
+refuses the header rather than the copy, so that td never picks a
+different copy than cryptsetup would.
+
+The used copy's `hdr_size` must be one of the nine powers of two
+cryptsetup formats, and its JSON area must hold one JSON object followed
+only by NUL bytes, parsing without a duplicate key. Its `tokens` and
+`keyslots` objects are keyed by numbers 0 to 31, each token names
+keyslots that exist, and at most four td tokens are present: a first-boot
+and a device-bound protector, one superseded and one an interrupted
+transition left. td's checks of the used copy refuse rather than fall
+back to the other: cryptsetup's own JSON validation is wider than td's,
+so a copy that fails only cryptsetup's makes the two choose differently,
+and the keyslot td's token names then fails to open and reaches recovery.
 
 ## Bounds
 

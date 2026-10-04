@@ -128,20 +128,34 @@ protectors unchanged. Nothing reseals automatically, because that would
 adopt a changed boot chain without its owner's decision. The live medium
 can open the volume with the recovery key for data access.
 
-The recovery key is at least 128 random bits, encoded in grouped decimal
-digits with a check digit per group so that entry does not depend on the
-keyboard layout. The installer displays it once on its completion screen,
-requires it to be typed back, and stores no copy. After sealing and before
-declaring success, the installer verifies that the recovery keyslot and the
-first-boot keyslot each open the volume, the latter with the secret it
-still holds, that the sealed object's public authPolicy equals the
-PCR-12-at-zero policy computed in a trial session, and that the TPM loads
-the sealed object under the storage primary. The live selector has
-already capped PCR 12, so the first-boot protector's first TPM release is
-on the installed first boot, and the typed-back recovery key covers its
-failure. The review discloses that the recovery key is the only way back if
-the TPM, firmware measurements or boot chain change. Recovery cannot be
-declined in this tier.
+The recovery key is 128 random bits read from `/dev/random`, encoded in
+grouped decimal digits with a check digit per group so that entry does not
+depend on the keyboard layout ([td-protector](../td-protector/DESIGN.md)
+"Recovery key" owns the encoding). Its keyslot passphrase is the 48 digits
+without separators, so stock cryptsetup opens the volume with it from any
+medium. The installer displays it once on its completion screen, requires
+it to be typed back, and stores no copy. Completion waits for the
+type-back. If the installer is lost before it, the installation is
+withdrawn like any failure after layout (DESIGN.md "Device-bound
+formatting"), because recovery cannot be declined in this tier.
+
+The installer seals the first-boot protector on the live medium under
+td-protector's first-boot policy. Sealing reads no PCR, and TPM2_Create
+does not evaluate the policy, so the seal does not depend on PCR 12's
+value at that moment. The installer never unseals that protector. Until
+increment 6 adds the live selector's cap, a live boot leaves PCR 12 at
+zero; only the test-only reach of increment 5 (below) runs there. After
+sealing and before declaring success, the installer verifies that the
+recovery keyslot and the first-boot keyslot each open the volume
+(`--test-passphrase`), the latter with the secret it still holds. It then
+reads the token back from the header through td's reader and runs
+td-protector's `verify_first_boot_object` on it: the sealed object's
+public authPolicy equals the PCR-12-at-zero policy computed in a trial
+session, and the TPM loads the sealed object under the storage primary.
+The first-boot protector's first TPM release is therefore on the
+installed first boot, and the typed-back recovery key covers its failure.
+The review discloses that the recovery key is the only way back if the
+TPM, firmware measurements or boot chain change.
 
 td has no selector-update operation. One that is added must specify a
 crash-safe protector transition for both ESP files before it ships; until
@@ -159,6 +173,10 @@ Without a usable TPM 2.0, the installer offers no device-bound volume and no
 passphrase substitute. A usable TPM has a SHA-256 PCR bank, and the live
 boot shows PCR 4 and PCR 9 measured. The review discloses that storage will
 be unencrypted, and installation proceeds only under that disclosed plan.
+Before activation, the service started with the device-bound operand
+probes for a usable TPM and refuses to start without one; it never falls
+back to an unencrypted volume. The default wizard's unencrypted disclosure
+changes only at activation (increment 7).
 
 Upgrading to the protected tier enrolls and verifies its protectors, then
 re-encrypts the volume online to a fresh volume key, keeping only those
@@ -169,6 +187,46 @@ device-bound system, which with automatic login and `su` is anyone at the
 keyboard. Such prior compromise is outside Scope, so a protected-tier
 claim on an upgraded volume is no stronger than the device-bound system's
 integrity before the upgrade.
+
+## Device-bound formatting
+
+Increment 5 formats device-bound volumes without activating them. Until
+increment 7, `td-install serve` formats one only when its caller passes the
+control-plane storage operand (INSTALLER.md "Installation service core").
+td-authd never passes it; the encrypted-installation oracle does. No
+review, wizard page or request selects it: storage policy is not a
+caller-selectable flag. The default installation stays unencrypted, and no
+text may describe disk confidentiality as shipped. Increment 7 deletes the
+operand in the landing that makes the tier the default.
+
+The volume is formatted with exactly these parameters, the device being a
+loop over the volume's extent (DESIGN.md "Device-bound formatting"):
+
+```text
+cryptsetup luksFormat --batch-mode --type luks2 --cipher aes-xts-plain64
+  --key-size 512 --sector-size 4096 --hash sha256 --pbkdf pbkdf2
+  --pbkdf-force-iterations 1000 --use-random --luks2-metadata-size 16384
+  --luks2-keyslots-size 16744448 --offset 32768 --uuid PLAN-UUID
+  --label td-system --key-slot 0 --key-file=- DEVICE
+```
+
+Each LUKS2 header copy is 16 KiB and the keyslots area fills the rest of
+the first 16 MiB, where the data segment starts (`--offset` counts
+512-byte sectors): cryptsetup's default layout, stated so that no version
+change moves it. Volume fit and the minimum volume size subtract those
+16 MiB. The protected-tier upgrade re-encrypts online with checksum
+resilience, whose hotzone lives in the keyslots area, so the layout keeps
+no data-shift reserve. The LUKS2 UUID is the plan's volume UUID, which the
+Btrfs filesystem inside and the prepared selector also carry, and the
+label is `td-system`. The volume key is generated inside cryptsetup from
+`/dev/random` and never leaves it.
+
+Keyslot 0 holds the recovery key and keyslot 1 the first-boot protector,
+added with the same PBKDF parameters. Token 0 carries the sealed
+first-boot protector, naming keyslot 1, in td-protector's token format
+("LUKS2 tokens"). Key material reaches cryptsetup only through
+descriptors, never argv or the environment; DESIGN.md "Device-bound
+formatting" owns the mechanism.
 
 ## Authentication and recovery
 
@@ -295,12 +353,17 @@ same-uid process may impersonate the trusted UI or approve a request.
    measurement runs over the same client; the LUKS2 token format is
    increments 5 and 6.
 5. Add installer formatting, the first-boot protector, the recovery key,
-   the no-TPM disclosure and crash-safe enrollment; preserve file-image
-   testing and the single deployment publisher. Replace the retained
-   plaintext scratch-image path for private material, account for header and
-   re-encryption space, and identify backing devices without `/dev/vda` pins.
-   Carry D6's cryptsetup binding: the image check names the binary and its
-   debug companion.
+   the no-TPM refusal and crash-safe enrollment, reachable only through the
+   service's storage operand ("Device-bound formatting"); preserve
+   file-image testing and the single deployment publisher. The encrypted
+   path keeps no plaintext scratch image, accounts for header and
+   re-encryption space, and identifies backing devices without `/dev/vda`
+   pins. Its commits, in order: the recovery-key codec; the token codec
+   and bounded LUKS2 header reader in td-protector; the plan and protocol
+   records (INSTALLER.md); the TPM probe; formatting with D6's cryptsetup
+   binding, whose image check names the binary and its debug companion;
+   the completion page's display and type-back; and the
+   encrypted-installation oracle.
 6. Add selector release, the PCR 12 cap in the installed and live
    selectors (amending MEDIA.md), the first-boot transition, the
    recovery flow with its confirmed reseal, the volatile `kexec` handoff and
@@ -337,6 +400,20 @@ release. Install without a TPM and show the unencrypted disclosure in the
 consented plan. Record ciphertext/header checks and the absence of the
 volume key, protector secrets and recovery key from the ESP, logs, scratch
 artifacts and command lines.
+
+Increment 5's encrypted-installation oracle is separate from the
+always-run integration tier and provisioned like `qemu-secret-system`,
+with an explicit swtpm path; without one it is an unprovisioned skip. Its
+guest drives the service with the device-bound operand onto a disposable
+disk, as both of its peers, typing the displayed recovery key back. It
+then opens the volume with that recovery key and checks the ciphertext
+(no Btrfs superblock or staged plaintext in the data segment), the token
+read back through td's reader, and the published deployment. It checks
+that no recovery key or protector secret appears on the ESP, in the
+workspace or in any `/proc/*/cmdline` sampled while cryptsetup runs. It
+derives the destination's partition devices from the kernel's block
+inventory, never from `/dev/vda` literals. A no-TPM leg requires the
+operand's refusal with the disk unchanged.
 
 For the protected tier, require a real encrypted read/write roundtrip and
 reboot persistence; wrong PIN, missing token and changed boot measurements
