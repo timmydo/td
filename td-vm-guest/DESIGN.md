@@ -12,9 +12,8 @@ This mode has no root operation and adds no unsafe surface. The separate
 root power mode below has no Git or credential job. A running process is
 not a claim that a workspace is ready.
 
-The image's typed terminal authority already resolves the primary task
-directory. The separate direct compositor development launcher still uses
-`/home/tester/src/td-vm/work`; that path is outside this helper cutover.
+The image's typed terminal authority resolves the primary task directory;
+the direct compositor development launcher has no task terminal.
 
 The compositor owns the VM carrier and writes one public 32-digit lowercase
 hexadecimal instance ID to `/run/td-compositor/1000/vm-git-identity`. The helper

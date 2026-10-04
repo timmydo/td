@@ -10,9 +10,8 @@ that evidence, run on demand rather than by `check` or `ready`; it boots
 the medium as USB storage, `./test-iso` boots it as optical media by hand,
 and `qemu-boot-media` and `qemu-install-system` boot their own media both
 ways. Version 1 fixes the keyboard layout at `us`: a choice of layout waits
-for a keyboard catalog, a later increment. Within version 1's scope remains
-moving the remaining home-path consumers onto the installed account
-("Media, boot and persistence").
+for a keyboard catalog, a later increment. Every home-path consumer now
+follows the installed account ("Media, boot and persistence").
 
 ## Version 1
 
@@ -917,14 +916,14 @@ deployment bytes. The installed account retains the existing single-human
 UID/GID allocation; user-selected names must not collide with system or
 application accounts. Account databases, home paths, application grants,
 service configuration and automatic login must agree before the session
-starts. Existing `/home/tester` assumptions need an atomic cutover in the
-installed profile. Grant preparation and jail admission already share a
-validated UID-1000 account lookup; remaining home-path consumers still
-need that cutover. Authd's Claude workspace mapping
-and task directory and the jail's Firefox download probe use the same
-primary-account lookup. The compositor sends typed launch requests without
-paths in the installed authority profile; its direct development launcher
-still has its separate fixed task directory. The stock account is `tester`.
+starts. No shipped program assumes the stock account's name or
+`/home/tester`: grant preparation, jail admission, authd's Claude workspace
+mapping and task directory, the jail's Firefox download probe and the
+guest helper's workspace share one validated UID-1000 account lookup. The
+compositor sends typed launch requests without paths, and its direct
+development launcher offers no task terminal; a compositor source check
+pins that none of its sources names `/home/tester`. The stock
+account is `tester`.
 The stock console uses `td-login login-primary`, and human-UID service
 commands use `td-login exec-primary`. Both selectors resolve the current
 UID-1000 account and retain td-login's existing authorization and credential

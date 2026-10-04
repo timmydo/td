@@ -1062,25 +1062,6 @@ mod tests {
         let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
         assert_eq!(parsed.socket, launch.socket);
         assert_eq!(parsed.ready_socket, ready_socket);
-        let (program, arguments, task_ready) =
-            launcher::launch_command(&launch, launcher::LaunchRequest::TaskTerminal, 9).unwrap();
-        assert_eq!(program, launch.terminal);
-        let arguments: Vec<String> = arguments
-            .into_iter()
-            .map(|argument| argument.into_string().unwrap())
-            .collect();
-        assert_eq!(
-            arguments,
-            [
-                "run".to_string(),
-                "--socket".into(),
-                launch.socket.to_string_lossy().into_owned(),
-                "--ready-socket".into(),
-                task_ready.to_string_lossy().into_owned(),
-                "--working-directory".into(),
-                launcher::TASK_DIRECTORY.into(),
-            ]
-        );
         // The usage string is hand-written and the parser is not, so the
         // thing that can drift is what it TELLS an operator.
         let flags = "run --socket PATH --ready-socket PATH";
@@ -1099,7 +1080,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xe2a5b1cae8d2876b;
+    const AUTHORITY_FINGERPRINT: u64 = 0x72d5c16b7d772088;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xbad9a1ce43bb1449;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1545,6 +1526,22 @@ unsafe impl Send for MappedRegion {}"#;
         assert_eq!(occurrences(production(SYS), "SOL_SOCKET as usize"), 1);
         assert_eq!(occurrences(production(SYS), "as *mut [u32; 3]"), 1);
         assert_eq!(occurrences(production(SYS), "as *mut u32"), 1);
+    }
+
+    /// The person's account is the installed one, whatever its name: no
+    /// source names the stock VM's home. Whole files, since production
+    /// modules may follow a test module (vm_wire.rs), and the needle is
+    /// built so this test does not name it.
+    #[test]
+    fn no_source_names_the_stock_account_home() {
+        let home = ["/home/", "tester"].concat();
+        for (name, source) in [("main.rs", MAIN), ("sys.rs", SYS)]
+            .iter()
+            .chain(OTHER.iter())
+            .chain(IMPORTERS.iter())
+        {
+            assert!(!source.contains(&home), "{name}");
+        }
     }
 
     #[test]

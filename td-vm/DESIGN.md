@@ -1648,9 +1648,8 @@ only, not process exec, Wayland mapping or terminal readiness. A missing
 reply may follow admission, so the manager never describes that outcome
 as a safe automatic retry.
 
-The separate direct compositor development launcher still uses
-`/home/tester/src/td-vm/work`; it does not use the image's typed terminal
-authority. That fixed path remains outside the guest-helper home cutover.
+The direct compositor development launcher, which does not use the
+image's typed terminal authority, has no task terminal.
 
 The `workspace` request has revision zero and contains `TDVM-CLONE-1`, then
 exactly eleven LF-separated fields with a final LF: instance ID, task branch,

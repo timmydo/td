@@ -87,10 +87,6 @@ impl Launcher {
         }
     }
 
-    pub fn launch_task(&self) -> Result<(), String> {
-        self.launch_selected(Program::Task)
-    }
-
     pub fn launch_selected(&self, terminal: Program) -> Result<(), String> {
         match self.send.try_send(Work::Program(terminal)) {
             Ok(()) => Ok(()),
@@ -539,7 +535,7 @@ mod tests {
             receive.try_recv(),
             Ok(Work::Program(Program::Home))
         ));
-        assert!(launcher.launch_task().is_ok());
+        assert!(launcher.launch_selected(Program::Task).is_ok());
         assert!(matches!(
             receive.try_recv(),
             Ok(Work::Program(Program::Task))

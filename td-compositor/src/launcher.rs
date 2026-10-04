@@ -30,7 +30,6 @@ const ROW_RISE: usize = 8;
 const ROW_HEIGHT: usize = 32;
 /// A row's label is one row of text cells, so this tall.
 const LABEL_HEIGHT: usize = CELL_HEIGHT;
-pub(crate) const TASK_DIRECTORY: &str = "/home/tester/src/td-vm/work";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LauncherAction {
@@ -50,7 +49,6 @@ pub enum LauncherAction {
 pub enum LaunchRequest {
     UiDemo,
     Terminal,
-    TaskTerminal,
     TaskManager,
     Editor,
     Photo,
@@ -66,7 +64,7 @@ impl LaunchRequest {
             Self::Editor => Some(crate::authority::Program::Editor),
             Self::Photo => Some(crate::authority::Program::Photo),
             Self::Review => Some(crate::authority::Program::Review),
-            Self::UiDemo | Self::Terminal | Self::TaskTerminal => None,
+            Self::UiDemo | Self::Terminal => None,
         }
     }
 }
@@ -289,10 +287,6 @@ impl LaunchBackend {
             Self::Direct(processes) => processes.launch(request),
             Self::Authority(authority) if request == LaunchRequest::Terminal => {
                 authority.launch()?;
-                Ok(Vec::new())
-            }
-            Self::Authority(authority) if request == LaunchRequest::TaskTerminal => {
-                authority.launch_task()?;
                 Ok(Vec::new())
             }
             Self::Authority(authority) => match request.authority_program() {
@@ -758,23 +752,15 @@ pub(crate) fn launch_command(
             ready.clone(),
             ready,
         ),
-        (LaunchRequest::Terminal | LaunchRequest::TaskTerminal, _) => {
-            (options.terminal.clone(), ready.clone(), ready)
-        }
+        (LaunchRequest::Terminal, _) => (options.terminal.clone(), ready.clone(), ready),
     };
-    let mut arguments = vec![
+    let arguments = vec![
         OsString::from("run"),
         OsString::from("--socket"),
         options.socket.as_os_str().to_os_string(),
         OsString::from("--ready-socket"),
         published_ready.as_os_str().to_os_string(),
     ];
-    if request == LaunchRequest::TaskTerminal {
-        arguments.extend([
-            OsString::from("--working-directory"),
-            OsString::from(TASK_DIRECTORY),
-        ]);
-    }
     Ok((program, arguments, tracked_ready))
 }
 
@@ -1135,13 +1121,6 @@ mod tests {
             launch_command(&options, LaunchRequest::Terminal, 9).unwrap();
         assert_eq!(terminal, PathBuf::from("/bin/td-term"));
         assert_eq!(terminal_arguments.first(), Some(&OsString::from("run")));
-        let (_, task_arguments, _) =
-            launch_command(&options, LaunchRequest::TaskTerminal, 10).unwrap();
-        assert!(task_arguments.windows(2).any(|pair| pair
-            == [
-                OsString::from("--working-directory"),
-                OsString::from("/home/tester/src/td-vm/work"),
-            ]));
 
         let direct = LaunchOptions {
             socket: options.socket.clone(),
@@ -1467,11 +1446,7 @@ mod authority_entry_tests {
         launcher.set_authority(false);
         launcher.apply(LauncherAction::Open);
         assert_eq!(launcher.matched_labels().len(), 3);
-        for request in [
-            LaunchRequest::UiDemo,
-            LaunchRequest::Terminal,
-            LaunchRequest::TaskTerminal,
-        ] {
+        for request in [LaunchRequest::UiDemo, LaunchRequest::Terminal] {
             assert!(request.authority_program().is_none());
         }
     }
