@@ -742,6 +742,18 @@ fn process_tree_snapshot(root: u32) -> Vec<(u32, u64)> {
     tree
 }
 
+/// What a gate body has published that it holds beyond its `granted` bytes
+/// (see `check_memory::borrow_permit`): 0 when it published nothing or
+/// nothing readable, and never more than the host pool issues beyond them.
+fn borrowed_bytes(file: &Path, granted: u64) -> u64 {
+    let pool = crate::check_memory::pool_bytes().unwrap_or(crate::check_memory::MAX_WORK_BYTES);
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(pool.saturating_sub(granted))
+}
+
 fn process_tree_rss_bytes(root: u32) -> u64 {
     process_tree_snapshot(root)
         .into_iter()
@@ -1027,6 +1039,7 @@ fn run_gate(
             return Outcome::Failed;
         }
     };
+    let borrowed_file = log_path.with_extension("borrowed");
     let gate_request_lock = if grant_held {
         match crate::check_memory::create_gate_request_lock() {
             Ok(path) => Some(path),
@@ -1123,6 +1136,11 @@ fn run_gate(
         for (k, v) in &g.extra_env {
             cmd.env(k, v);
         }
+        // Where the body says what it holds beyond its grant; the watchdog
+        // below adds it to the tree budget. Fresh per gate, so a previous
+        // body's figure cannot loosen this one's budget.
+        let _ = std::fs::remove_file(&borrowed_file);
+        cmd.env(crate::check_memory::BORROWED_BYTES_FILE_ENV, &borrowed_file);
         // Own process group: the tree watchdog kills the ordinary tree by pgid
         // plus a descendant snapshot for nested process groups, and a gate's
         // children must never share the runner's group.
@@ -1162,12 +1180,13 @@ fn run_gate(
         let pgid = child.id();
         let stop = std::sync::atomic::AtomicBool::new(false);
         let breached = std::sync::atomic::AtomicBool::new(false);
+        let breach_borrowed_mib = std::sync::atomic::AtomicU64::new(0);
         let timed_out = std::sync::atomic::AtomicBool::new(false);
         let watch_rss = tree_mem_mib > 0;
         let status = std::thread::scope(|ws| {
             let watchdog = (watch_rss || timeout_secs > 0).then(|| {
                 ws.spawn(|| {
-                    let budget = tree_mem_mib.saturating_mul(1024 * 1024);
+                    let granted = tree_mem_mib.saturating_mul(1024 * 1024);
                     // Held as a DURATION compared against `elapsed`, not as an
                     // Instant: `Instant + Duration` panics when the sum is
                     // unrepresentable, and this crate may not panic — a watchdog
@@ -1187,20 +1206,29 @@ fn run_gate(
                     // so nothing is added at all.
                     let mut tick: u32 = 0;
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        if watch_rss
-                            && tick.is_multiple_of(5)
-                            && process_tree_rss_bytes(pgid) > budget
-                        {
-                            breached.store(true, std::sync::atomic::Ordering::Relaxed);
-                            kill_process_tree(
-                                pgid,
-                                &format!(
-                                    "gate {} exceeded its {tree_mem_mib} MiB tree memory budget \
-                                     (gate-run watchdog)",
-                                    g.name
-                                ),
-                            );
-                            return;
+                        if watch_rss && tick.is_multiple_of(5) {
+                            // Read on both sides of the walk, the larger kept: a
+                            // borrowed check that ends during the walk is still in
+                            // it, and its bytes must still be in the budget.
+                            let before = borrowed_bytes(&borrowed_file, granted);
+                            let rss = process_tree_rss_bytes(pgid);
+                            let borrowed = before.max(borrowed_bytes(&borrowed_file, granted));
+                            if rss > granted.saturating_add(borrowed) {
+                                let borrowed_mib = borrowed / (1024 * 1024);
+                                breach_borrowed_mib
+                                    .store(borrowed_mib, std::sync::atomic::Ordering::Relaxed);
+                                breached.store(true, std::sync::atomic::Ordering::Relaxed);
+                                kill_process_tree(
+                                    pgid,
+                                    &format!(
+                                        "gate {} exceeded its {tree_mem_mib} MiB tree memory \
+                                         budget plus {borrowed_mib} MiB borrowed (gate-run \
+                                         watchdog)",
+                                        g.name
+                                    ),
+                                );
+                                return;
+                            }
                         }
                         // The TREE, not only the child: a hang is usually in a
                         // grandchild (a test binary under cargo under sh), and
@@ -1414,10 +1442,12 @@ fn run_gate(
             None => child.wait(),
         };
         if breached.load(std::sync::atomic::Ordering::Relaxed) {
+            let borrowed_mib = breach_borrowed_mib.load(std::sync::atomic::Ordering::Relaxed);
             let _ = writeln!(
                 logf,
                 "gate-run: FAIL: gate {} — process-tree RSS exceeded the {tree_mem_mib} MiB \
-                 hosted grant; the whole descendant tree was killed",
+                 hosted grant plus {borrowed_mib} MiB borrowed; the whole descendant tree was \
+                 killed",
                 g.name
             );
         }
@@ -1497,6 +1527,8 @@ fn run_gate(
     if let Some(path) = gate_request_lock {
         let _ = std::fs::remove_file(path);
     }
+    let _ = std::fs::remove_file(&borrowed_file);
+    let _ = std::fs::remove_file(borrowed_file.with_extension("borrowed.tmp"));
     timing_event(timing, &g.name, "END");
     outcome
 }

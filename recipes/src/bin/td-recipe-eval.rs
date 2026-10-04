@@ -15,10 +15,11 @@
 //!   build-run TARGET [OUTPUT_STEM ...]
 //!                         build a catalog target through the same Rust recipe
 //!                         runner and print machine-readable local output paths
-//!   check-history [CHECK...] | --record CHECK OUTCOME SECS
+//!   check-history [CHECK...] | --record CHECK OUTCOME SECS | --durations
 //!                         per check, from this machine's check history: runs
 //!                         executed and memoized, median and longest wall time,
-//!                         and the last run's outcome and why it ran
+//!                         and the last run's outcome and why it ran;
+//!                         `--durations` prints `CHECK<TAB>SECS` medians only
 //!   oracle-memo ORACLE [--forget KEY | --record KEY]
 //!                         the integration tier's result memo: `hit KEY` when
 //!                         ORACLE passed here with every input it boots

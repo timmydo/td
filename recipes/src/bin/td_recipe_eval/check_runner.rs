@@ -2394,6 +2394,10 @@ fn append_check_history(path: &Path, line: &str) -> Result<(), String> {
 /// `check-history --record CHECK OUTCOME SECS` appends one record instead:
 /// how `td-builder check integration` keeps its steps' times beside the
 /// recipe checks'.
+///
+/// `check-history --durations` prints `CHECK<TAB>SECS` per check that has
+/// executed, its median executed wall time, for the recipe-checks gate to
+/// start the longest first; nothing at all when there is no history.
 pub fn check_history_cli(args: &[String]) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let home = env::var_os("HOME").map(PathBuf::from);
@@ -2404,15 +2408,25 @@ pub fn check_history_cli(args: &[String]) -> Result<(), String> {
             .map_or(0, |d| d.as_secs());
         return append_check_history(&path, &recorded_history_line(record, at)?);
     }
+    let durations = args.first().is_some_and(|a| a == "--durations");
+    if durations && args.len() > 1 {
+        return Err("usage: check-history --durations (no other arguments)".to_string());
+    }
     let mut text = fs::read_to_string(path.with_extension("jsonl.1")).unwrap_or_default();
     match fs::read_to_string(&path) {
         Ok(t) => text.push_str(&t),
-        Err(e) if e.kind() == io::ErrorKind::NotFound && !text.is_empty() => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound && (durations || !text.is_empty()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             println!("no check history yet at {}", path.display());
             return Ok(());
         }
         Err(e) => return Err(format!("read {}: {e}", path.display())),
+    }
+    if durations {
+        for (check, secs) in check_history_durations(&text) {
+            println!("{check}\t{secs:.1}");
+        }
+        return Ok(());
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2421,6 +2435,43 @@ pub fn check_history_cli(args: &[String]) -> Result<(), String> {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Each check's median executed wall time over the history's `text`: a pass
+/// or a failure, not a memo answer or a host gap, which ran nothing.
+fn check_history_durations(text: &str) -> BTreeMap<String, f64> {
+    let mut executed: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(record) = td_engine::json::parse(line) else {
+            continue;
+        };
+        let field = |k: &str| match record.get(k) {
+            Some(td_engine::json::Json::Str(s)) | Some(td_engine::json::Json::Num(s)) => {
+                Some(s.clone())
+            }
+            _ => None,
+        };
+        let (Some(check), Some(outcome), Some(secs)) = (
+            field("check"),
+            field("outcome"),
+            field("secs")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s >= 0.0),
+        ) else {
+            continue;
+        };
+        if outcome == "pass" || outcome == "fail" {
+            executed.entry(check).or_default().push(secs);
+        }
+    }
+    executed
+        .into_iter()
+        .filter_map(|(check, mut secs)| {
+            secs.sort_by(f64::total_cmp);
+            let median = secs.get(secs.len() / 2).copied()?;
+            Some((check, median))
+        })
+        .collect()
 }
 
 /// The summary `check_history_cli` prints, from the history's `text`.
@@ -11659,6 +11710,23 @@ chmod 755 '{}'
         assert_eq!(rows[2], "(1 unreadable history line(s) skipped)");
         let only = summarize_check_history(&text, &["a".to_string()], 300);
         assert_eq!(only.len(), 2, "{only:?}");
+        // The gate's order reads executed runs only, the upper median of an
+        // even count.
+        let mut with_junk = text.clone();
+        with_junk.push_str("{\"check\":\"neg#1\",\"outcome\":\"pass\",\"secs\":-5}\n");
+        with_junk.push_str("{\"check\":\"nan#1\",\"outcome\":\"pass\",\"secs\":\"NaN\"}\n");
+        with_junk.push_str("{\"check\":\"inf#1\",\"outcome\":\"pass\",\"secs\":\"inf\"}\n");
+        let junk = check_history_durations(&with_junk);
+        assert_eq!(
+            junk.keys().collect::<Vec<_>>(),
+            vec!["a#1", "b#1"],
+            "a negative or non-finite time is no time at all: {junk:?}"
+        );
+        let durations = check_history_durations(&text);
+        assert_eq!(
+            durations.into_iter().collect::<Vec<_>>(),
+            vec![("a#1".to_string(), 10.0), ("b#1".to_string(), 50.0)]
+        );
 
         let dir = env::temp_dir().join(format!("td-check-history-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);

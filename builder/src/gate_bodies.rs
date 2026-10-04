@@ -1821,12 +1821,41 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
         }
     }
 
+    // Longest first, by what each took when it last executed here: the gate
+    // ends when its longest check does, so that check must not start last.
+    // Best effort — without a history the list order stands.
+    let durations = run_out_env(
+        &eval_s,
+        &["check-history", "--durations"],
+        &envs,
+        "td-recipe-eval check-history --durations",
+    )
+    .map(|text| parse_check_durations(&text))
+    .unwrap_or_default();
+    let order = longest_first(&work, &durations);
     let width = recipe_check_width(work.len());
-    println!(
-        ">> recipe-checks: {} check(s), {width} at a time",
-        work.len()
-    );
-    let results = run_recipe_checks_concurrently(&work, width, &eval, &eval_s, &stage0_base)?;
+    let borrowing = recipe_check_borrowing(width, work.len());
+    if borrowing > 0 {
+        println!(
+            ">> recipe-checks: {} check(s), {width} at a time on the gate's grant and up to \
+             {borrowing} more on host memory no check holds, longest first",
+            work.len()
+        );
+    } else {
+        println!(
+            ">> recipe-checks: {} check(s), {width} at a time, longest first",
+            work.len()
+        );
+    }
+    let results = run_recipe_checks_concurrently(
+        &work,
+        &order,
+        width,
+        borrowing,
+        &eval,
+        &eval_s,
+        &stage0_base,
+    )?;
 
     // The blocks were printed as each check landed, in completion order. This is
     // the ordered ACCOUNT: it tallies the verdict over the work list, so the
@@ -2174,18 +2203,157 @@ fn recipe_check_width_for_budget(budget: Option<u64>, work: usize) -> usize {
     width.min(work.max(1))
 }
 
-/// Run the work list `width`-at-a-time, returning one result per item IN ORDER.
+/// The tokens one borrowing worker holds while its check runs: one check's
+/// peak, as `RECIPE_CHECK_PEAK_BYTES` sizes it.
+const RECIPE_CHECK_PEAK_TOKENS: usize = 4;
+
+/// How many workers may run checks on borrowed memory beside the `width` the
+/// gate's grant pays for (`check_memory::borrow_permit`). None outside the
+/// check host, or when gate-run gave the body no place to publish what it
+/// borrows, since its tree watchdog would then kill the gate for holding it.
+fn recipe_check_borrowing(width: usize, work: usize) -> usize {
+    if std::env::var_os(crate::check_memory::HOST_CHILD_ENV).is_none()
+        || std::env::var_os(crate::check_memory::BORROWED_BYTES_FILE_ENV).is_none()
+    {
+        return 0;
+    }
+    recipe_check_borrowing_for(width, work, crate::gates::nproc()).min(
+        crate::check_memory::borrowable_grants(RECIPE_CHECK_PEAK_TOKENS),
+    )
+}
+
+/// The CPUs bound the whole width: each check builds with the jobs its 4 GiB
+/// pays for, so more checks than that divides into would only queue for CPU.
+/// Tokens bound it again as each worker borrows.
+fn recipe_check_borrowing_for(width: usize, work: usize, cpus: usize) -> usize {
+    let jobs = crate::check_memory::jobs_for_budget(RECIPE_CHECK_PEAK_BYTES, cpus).max(1);
+    (cpus / jobs).max(width).min(work).saturating_sub(width)
+}
+
+/// `CHECK<TAB>SECS` lines from `td-recipe-eval check-history --durations`;
+/// a line that does not parse is left out.
+fn parse_check_durations(text: &str) -> std::collections::BTreeMap<String, f64> {
+    text.lines()
+        .filter_map(|line| {
+            let (check, secs) = line.split_once('\t')?;
+            Some((check.to_string(), secs.trim().parse::<f64>().ok()?))
+        })
+        .collect()
+}
+
+/// The positions of `work` in the order to start them: longest recorded
+/// first, and a check with no record before every recorded one, since what
+/// it costs is unknown. Ties keep the list order.
+fn longest_first(
+    work: &[(String, usize)],
+    durations: &std::collections::BTreeMap<String, f64>,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..work.len()).collect();
+    let secs = |i: usize| {
+        work.get(i)
+            .and_then(|(spec, index)| durations.get(&format!("{spec}#{index}")))
+            .copied()
+            .unwrap_or(f64::INFINITY)
+    };
+    order.sort_by(|a, b| secs(*b).total_cmp(&secs(*a)));
+    order
+}
+
+/// What this body holds beyond its grant, published to the file gate-run's
+/// watchdog reads before a borrowed check starts and after it has ended, so
+/// the published figure never trails the memory the checks may use.
+struct BorrowLedger {
+    file: Option<PathBuf>,
+    held: std::sync::Mutex<u64>,
+}
+
+impl BorrowLedger {
+    fn from_env() -> Self {
+        BorrowLedger {
+            file: std::env::var_os(crate::check_memory::BORROWED_BYTES_FILE_ENV).map(PathBuf::from),
+            held: std::sync::Mutex::new(0),
+        }
+    }
+
+    /// Add `delta` (or take it away) and publish the new total. Replaced
+    /// whole, through a rename, so the watchdog never reads half a number.
+    fn adjust(&self, delta: u64, add: bool) -> Result<(), String> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or("no borrowed-bytes file to publish to")?;
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let next = if add {
+            held.saturating_add(delta)
+        } else {
+            held.saturating_sub(delta)
+        };
+        let tmp = file.with_extension("borrowed.tmp");
+        std::fs::write(&tmp, next.to_string())
+            .and_then(|()| std::fs::rename(&tmp, file))
+            .map_err(|e| format!("publish borrowed bytes to {}: {e}", file.display()))?;
+        *held = next;
+        Ok(())
+    }
+}
+
+/// One borrowed check's tokens, published while held: dropping it
+/// unpublishes them before the permit releases them, on every way out of
+/// the worker, an unwinding panic included.
+struct Borrowed<'a> {
+    ledger: &'a BorrowLedger,
+    bytes: u64,
+    _permit: crate::check_memory::MemoryPermit,
+}
+
+impl Borrowed<'_> {
+    fn publish(
+        ledger: &BorrowLedger,
+        permit: crate::check_memory::MemoryPermit,
+    ) -> Result<Borrowed<'_>, String> {
+        let bytes = permit.bytes();
+        ledger.adjust(bytes, true)?;
+        Ok(Borrowed {
+            ledger,
+            bytes,
+            _permit: permit,
+        })
+    }
+}
+
+impl Drop for Borrowed<'_> {
+    fn drop(&mut self) {
+        // A failed write leaves the budget looser, never tighter.
+        let _ = self.ledger.adjust(self.bytes, false);
+    }
+}
+
+/// Run the work list `width`-at-a-time on the gate's grant, plus up to
+/// `borrowing` more on borrowed memory, starting them in `order` and
+/// returning one result per item IN WORK ORDER.
 ///
 /// Threads take from a shared cursor rather than being handed a fixed slice: the
 /// checks are wildly uneven (a Rust toolchain build against a `hello` package), so
 /// a static split would leave workers idle behind one long straggler.
 fn run_recipe_checks_concurrently(
     work: &[(String, usize)],
+    order: &[usize],
     width: usize,
+    borrowing: usize,
     eval: &Path,
     eval_s: &str,
     stage0_base: &str,
 ) -> Result<Vec<(CheckOutcome, std::time::Duration)>, String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut sorted = order.to_vec();
+    sorted.sort_unstable();
+    if !sorted.iter().copied().eq(0..work.len()) {
+        return Err(format!(
+            "FAIL: recipe-checks' start order is not one start per check ({} for {})",
+            order.len(),
+            work.len()
+        ));
+    }
     let next = std::sync::atomic::AtomicUsize::new(0);
     type Slot = Option<Result<(CheckOutcome, std::time::Duration), String>>;
     let slots: Vec<std::sync::Mutex<Slot>> =
@@ -2196,46 +2364,97 @@ fn run_recipe_checks_concurrently(
     let worker_budget = crate::check_memory::request_job_budget()
         .unwrap_or(RECIPE_CHECK_PEAK_BYTES)
         / u64::try_from(width).unwrap_or(1).max(1);
+    let ledger = BorrowLedger::from_env();
+    let borrowed_runs = std::sync::atomic::AtomicUsize::new(0);
+
+    // One check, start to slot: the step every worker repeats.
+    let run_one = |slot: usize, budget: u64| {
+        let Some((spec, index)) = work.get(slot) else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let done = run_recipe_check(eval, spec, *index, eval_s, stage0_base, budget);
+        let took = started.elapsed();
+        // Printed HERE, as each check lands, rather than after the whole
+        // set: a gate that shows nothing for ten minutes is one nobody can
+        // tell from a hung one, and the run this replaced streamed. The
+        // ORDER is completion order and so varies with load; the ordered
+        // account is the summary the caller builds from `slots`.
+        // A POISONED pen is still taken (`into_inner`): poisoning means
+        // some worker panicked mid-report, and dropping every later
+        // check's block on account of it would turn one panic into a gate
+        // whose log is silently missing most of its output. td-builder
+        // UNWINDS — `panic = "abort"` is another crate's setting — so this
+        // is reachable rather than theoretical.
+        {
+            let _held = pen.lock().unwrap_or_else(|e| e.into_inner());
+            report_finished_check(spec, *index, done.as_ref(), took);
+        }
+        // Only the VERDICT and its wall time are kept. The output has
+        // been printed, and 26 checks' captured logs held to the end of
+        // the gate is exactly the memory the slot pool's admission is
+        // trying to bound — a noisy failure can emit a great deal of it.
+        let verdict = done.map(|d| (d.outcome, took));
+        if let Some(cell) = slots.get(slot) {
+            if let Ok(mut g) = cell.lock() {
+                *g = Some(verdict);
+            }
+        }
+    };
 
     std::thread::scope(|scope| {
         for _worker in 0..width {
-            let (pen, next, slots) = (&pen, &next, &slots);
+            let (next, run_one) = (&next, &run_one);
             scope.spawn(move || loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some((spec, index)) = work.get(i) else {
+                let Some(&slot) = order.get(next.fetch_add(1, Relaxed)) else {
                     return;
                 };
-                let started = std::time::Instant::now();
-                let done = run_recipe_check(eval, spec, *index, eval_s, stage0_base, worker_budget);
-                let took = started.elapsed();
-                // Printed HERE, as each check lands, rather than after the whole
-                // set: a gate that shows nothing for ten minutes is one nobody can
-                // tell from a hung one, and the run this replaced streamed. The
-                // ORDER is completion order and so varies with load; the ordered
-                // account is the summary the caller builds from `slots`.
-                // A POISONED pen is still taken (`into_inner`): poisoning means
-                // some worker panicked mid-report, and dropping every later
-                // check's block on account of it would turn one panic into a gate
-                // whose log is silently missing most of its output. td-builder
-                // UNWINDS — `panic = "abort"` is another crate's setting — so this
-                // is reachable rather than theoretical.
-                {
-                    let _held = pen.lock().unwrap_or_else(|e| e.into_inner());
-                    report_finished_check(spec, *index, done.as_ref(), took);
+                run_one(slot, worker_budget);
+            });
+        }
+        // A borrowing worker takes a check only once it holds tokens for it,
+        // and publishes them before the check starts. It gives up when the
+        // list is spoken for, which also ends a wait for tokens.
+        for _worker in 0..borrowing {
+            let (next, run_one, ledger, borrowed_runs, pen) =
+                (&next, &run_one, &ledger, &borrowed_runs, &pen);
+            scope.spawn(move || loop {
+                let exhausted = || next.load(Relaxed) >= order.len();
+                if exhausted() {
+                    return;
                 }
-                // Only the VERDICT and its wall time are kept. The output has
-                // been printed, and 26 checks' captured logs held to the end of
-                // the gate is exactly the memory the slot pool's admission is
-                // trying to bound — a noisy failure can emit a great deal of it.
-                let verdict = done.map(|d| (d.outcome, took));
-                if let Some(cell) = slots.get(i) {
-                    if let Ok(mut g) = cell.lock() {
-                        *g = Some(verdict);
+                // A refusal other than the list running out is said once, so
+                // a host that never lends reads as that and not as idleness.
+                let borrowed =
+                    crate::check_memory::borrow_permit(RECIPE_CHECK_PEAK_TOKENS, &exhausted)
+                        .and_then(|permit| Borrowed::publish(ledger, permit));
+                let borrowed = match borrowed {
+                    Ok(borrowed) => borrowed,
+                    Err(e) => {
+                        if !exhausted() {
+                            let _held = pen.lock().unwrap_or_else(|e| e.into_inner());
+                            println!(">> recipe-checks: a borrowing worker stopped: {e}");
+                        }
+                        return;
                     }
-                }
+                };
+                let Some(&slot) = order.get(next.fetch_add(1, Relaxed)) else {
+                    return;
+                };
+                borrowed_runs.fetch_add(1, Relaxed);
+                // Unpublished by the drop, once the check's processes are gone.
+                run_one(slot, borrowed.bytes);
+                drop(borrowed);
             });
         }
     });
+    let borrowed_runs = borrowed_runs.load(Relaxed);
+    if borrowed_runs > 0 {
+        println!(
+            ">> recipe-checks: {borrowed_runs} of {} check(s) ran on borrowed host memory",
+            work.len()
+        );
+    }
 
     let mut out = Vec::with_capacity(work.len());
     for (i, cell) in slots.iter().enumerate() {
@@ -4148,6 +4367,60 @@ mod tests {
         );
     }
 
+    /// Borrowing fills the CPUs at the jobs one check's 4 GiB pays for, never
+    /// past the work, and adds nothing when the grant already fills them.
+    #[test]
+    fn borrowing_is_bounded_by_the_cpus_and_the_work() {
+        assert_eq!(recipe_check_borrowing_for(2, 61, 16), 6);
+        assert_eq!(recipe_check_borrowing_for(2, 3, 16), 1);
+        assert_eq!(recipe_check_borrowing_for(2, 61, 4), 0);
+        assert_eq!(recipe_check_borrowing_for(8, 61, 16), 0);
+        assert_eq!(recipe_check_borrowing_for(1, 61, 1), 0);
+    }
+
+    /// The longest recorded check starts first, an unrecorded one before it,
+    /// and equal times keep the list order.
+    #[test]
+    fn checks_start_longest_first() {
+        let work: Vec<(String, usize)> = ["a", "b", "rust", "new", "c"]
+            .iter()
+            .map(|s| (s.to_string(), 1))
+            .collect();
+        let durations = parse_check_durations(
+            "a#1\t10.0\nb#1\t5.0\nrust#1\t600.0\nc#1\t10.0\nbad line\nx#1\tnope\n",
+        );
+        assert_eq!(durations.len(), 4);
+        assert_eq!(longest_first(&work, &durations), vec![3, 2, 0, 4, 1]);
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(longest_first(&work, &none), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The published figure is what the watchdog adds: a running total,
+    /// replaced whole, and never below zero.
+    #[test]
+    fn the_borrow_ledger_publishes_a_running_total() {
+        let dir = std::env::temp_dir().join(format!("td-rc-borrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("recipe-checks.borrowed");
+        let ledger = BorrowLedger {
+            file: Some(file.clone()),
+            held: std::sync::Mutex::new(0),
+        };
+        ledger.adjust(4, true).unwrap();
+        ledger.adjust(4, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "8");
+        ledger.adjust(4, false).unwrap();
+        ledger.adjust(9, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "0");
+        let unpublished = BorrowLedger {
+            file: None,
+            held: std::sync::Mutex::new(0),
+        };
+        assert!(unpublished.adjust(4, true).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The summary names the longest checks first, breaks ties by name, stops
     /// at the cap, sums every executed check, and says nothing when none ran.
     #[test]
@@ -4215,7 +4488,13 @@ mod tests {
         std::fs::set_permissions(&script, perm).unwrap();
 
         let work: Vec<(String, usize)> = (1..=9).map(|i| ("spec".to_string(), i)).collect();
-        let got = run_recipe_checks_concurrently(&work, 4, &script, "e", "s").unwrap();
+        // Started in REVERSE, so the results being in work order is the
+        // pool's doing and not the start order's. No borrowing: gate 325
+        // runs this inside a hosted gate, whose real tokens a test must not
+        // take.
+        let reversed: Vec<usize> = (0..work.len()).rev().collect();
+        let got =
+            run_recipe_checks_concurrently(&work, &reversed, 4, 0, &script, "e", "s").unwrap();
 
         assert_eq!(got.len(), work.len(), "one result per work item");
         for (i, (outcome, _took)) in got.iter().enumerate() {
@@ -4233,7 +4512,19 @@ mod tests {
 
         // And the verdict is width-INDEPENDENT: the same work at width 1 gives
         // the same answers in the same places.
-        let serial = run_recipe_checks_concurrently(&work, 1, &script, "e", "s").unwrap();
+        let in_order: Vec<usize> = (0..work.len()).collect();
+        let serial =
+            run_recipe_checks_concurrently(&work, &in_order, 1, 0, &script, "e", "s").unwrap();
+        assert!(
+            run_recipe_checks_concurrently(&work, &in_order[1..], 1, 0, &script, "e", "s").is_err(),
+            "an order that leaves a check out must not run as a full list"
+        );
+        let mut doubled = in_order.clone();
+        doubled[1] = 0;
+        assert!(
+            run_recipe_checks_concurrently(&work, &doubled, 1, 0, &script, "e", "s").is_err(),
+            "an order that starts one check twice must not run"
+        );
         let verdicts = |r: &[(CheckOutcome, std::time::Duration)]| {
             r.iter().map(|(o, _)| *o).collect::<Vec<_>>()
         };

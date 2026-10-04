@@ -38,6 +38,10 @@ pub const RESERVE_BYTES_ENV: &str = "TD_CHECK_HOST_RESERVE_BYTES";
 pub const JOB_BUDGET_ENV: &str = "TD_CHECK_JOB_BUDGET_BYTES";
 pub const GATE_GRANT_HELD_ENV: &str = "TD_CHECK_HOST_GATE_GRANT_HELD";
 pub const GATE_REQUEST_LOCK_ENV: &str = "TD_CHECK_HOST_GATE_REQUEST_LOCK";
+/// The file a gate body publishes the bytes it holds beyond its own grant
+/// in (`borrow_permit`); gate-run's tree watchdog adds them to the gate's
+/// budget. A body without it borrows nothing.
+pub const BORROWED_BYTES_FILE_ENV: &str = "TD_GATE_BORROWED_BYTES_FILE";
 
 const MIN_RESERVE_BYTES: u64 = 2 * GIB;
 const MAX_RESERVE_BYTES: u64 = 8 * GIB;
@@ -296,6 +300,43 @@ pub fn gate_permit(aborted: &dyn Fn() -> bool) -> Result<MemoryPermit, String> {
 
 pub fn build_permit(aborted: &dyn Fn() -> bool) -> Result<MemoryPermit, String> {
     gate_permit(aborted)
+}
+
+/// Borrow `tokens` beyond a running gate's grant from tokens nothing holds,
+/// leaving a new request's base grant and one gate grant free, so another
+/// worktree's check is always admitted and runs its first gate; its further
+/// concurrent gates may wait behind a borrowed check.
+pub fn borrow_permit(tokens: usize, aborted: &dyn Fn() -> bool) -> Result<MemoryPermit, String> {
+    let pool = TokenPool::from_env()?;
+    pool.acquire(tokens, borrow_reserve()?, aborted)
+}
+
+/// The tokens a borrower leaves free: one base grant and one gate grant.
+fn borrow_reserve() -> Result<usize, String> {
+    Ok(parse_env_usize(BASE_TOKENS_ENV)?.saturating_add(parse_env_usize(GATE_TOKENS_ENV)?))
+}
+
+/// How many `tokens`-sized borrows the pool can admit at once beside the
+/// borrower's own request (its base and gate grants) and the reserve
+/// `borrow_permit` leaves: 0 outside the check host.
+pub fn borrowable_grants(tokens: usize) -> usize {
+    let (Ok(count), Ok(reserve)) = (parse_env_usize(TOKEN_COUNT_ENV), borrow_reserve()) else {
+        return 0;
+    };
+    borrowable_grants_for(count, reserve, tokens)
+}
+
+fn borrowable_grants_for(count: usize, reserve: usize, tokens: usize) -> usize {
+    count
+        .saturating_sub(reserve.saturating_mul(2))
+        .checked_div(tokens)
+        .unwrap_or(0)
+}
+
+/// The most the host pool issues in all, when this is a hosted run.
+pub fn pool_bytes() -> Option<u64> {
+    let count = u64::try_from(parse_env_usize(TOKEN_COUNT_ENV).ok()?).ok()?;
+    Some(count.saturating_mul(TOKEN_BYTES))
 }
 
 pub fn create_gate_request_lock() -> Result<PathBuf, String> {
@@ -666,6 +707,12 @@ mod tests {
     fn jobs_follow_memory_before_cpu() {
         assert_eq!(jobs_for_budget(1, 16), 1);
         assert_eq!(jobs_for_budget(4 * GIB, 16), 2);
+        // The 32-token host: a request's 4+8 held and 4+8 left free leave
+        // room for two 4-token borrows; a smaller pool for none.
+        assert_eq!(borrowable_grants_for(32, 12, 4), 2);
+        assert_eq!(borrowable_grants_for(24, 12, 4), 0);
+        assert_eq!(borrowable_grants_for(64, 12, 4), 10);
+        assert_eq!(borrowable_grants_for(32, 12, 0), 0);
         assert_eq!(jobs_for_budget(64 * GIB, 3), 3);
     }
 

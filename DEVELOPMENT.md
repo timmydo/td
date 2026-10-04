@@ -117,6 +117,22 @@ and records them; the summary shows the last run's. A small check's
 time is mostly `build`: re-planning and staging its whole closure from
 stage0, already-built rungs included.
 
+The gate starts its checks longest first, by each check's median executed
+time in that history (`check-history --durations`), with a check that has
+none starting before every recorded one: the gate ends when its longest
+check does. It runs one check per 4 GiB of its own grant, and on the check
+host it adds workers that each borrow 4 GiB of tokens no request holds,
+only while a new request's base grant and one gate grant stay free, so
+another worktree's check is always admitted and runs its first gate; its
+further concurrent gates may wait behind a borrowed check. The borrowers
+are as many as the pool can admit beside this request's own grants and
+that reserve, and the CPUs hold at the jobs a 4 GiB check gets: two on a
+32-token host, none when another worktree's check holds the slack. A
+borrower takes a check only once it holds its tokens, and the gate
+publishes what it borrows to the file gate-run's tree-memory watchdog adds
+to the gate's budget (`TD_GATE_BORROWED_BYTES_FILE`); without that file it
+borrows nothing.
+
 The memo does not see the host — its qemu, kernel, or toolchain — so after
 such a change, or when a recorded pass is in doubt, run everything:
 
