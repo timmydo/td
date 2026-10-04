@@ -3998,6 +3998,66 @@ to it, preserving fresh live admission and cached-completion semantics.
 These compositional hooks add no arena, wire output, descriptors or traversal
 claim. RESOURCES.md retains the previous public work/layout bounds.
 
+### 1.85 Complete resident MIME traversal
+
+M06cf adds mime_traversal::Cursor over one complete authorized resident
+entity, checked absolute base, configured structural bounds and caller
+Part slots. SourceEnd::Prefix refuses before parsing. The constructor checks
+only the relevant depth/part/header bounds; full startup resource planning
+and source authorization remain the caller's responsibilities. Depth counts
+the root as one, parts count containers and leaves, and recognized entity
+headers count exactly once across the parse, excluding separators/body and
+an enclosing delimiter's accepted preceding ending.
+
+Fixed frames retain each active immutable boundary and its private scanner.
+Before child headers begin, the parent scanner finds the child's ending and
+clips its source. That realizes outermost-boundary precedence, including
+prefix collisions, without decoded punctuation or a growing active-boundary
+list. Each parent resumes its original scanner after the child finishes.
+Preamble/epilogue stay in raw extents but never become children. An opening
+followed immediately by another delimiter yields an empty child, clamping
+the ending at its start. Missing closes end the last child at enclosing
+extent EOF with MISSING_CLOSE. Without any valid opening, or with an absent
+or protocol-invalid selected boundary, return NotParsable. Known base64/QP
+on multipart also returns NotParsable; no decoded structural locator stage
+is invented. Unknown transfer encodings use identity with UNKNOWN_ENCODING.
+
+Part cells report checked entity/body/type-field source extents, preorder
+ordinal, parent ordinal (zero for root), depth, coarse Media, Encoding,
+exact size and bounded diagnostics. Field type extents preserve complete
+original spelling for later metadata projection; defaults have zero extents.
+Media is a traversal classification, not a complete normalized MIME type.
+Leaves count exact stable transfer-decoded octets; containers count their
+identity body extents, including own delimiters and child headers, rather
+than summing child sizes. Base64/QP reuse their fixed decoders and original
+work/output admission. Charset, Unicode and display filters cannot affect
+sizes. message/rfc822 and message/global remain leaves; a digest child with
+no valid type defaults to message/rfc822.
+
+The cursor exclusively borrows original Meter/HeaderBudget and owns
+prepaid credit throughout all entities and phases. Every active turn
+freshly checks admission and funds bounded structural work; source
+reads, parameter replay, comparisons, retained boundary bytes, decoded
+counting bytes and descriptor copies spend the same original counters.
+Raw body scanning does not consume header interpretation allowance.
+Structural limits, backing capacity and resource refusal are typed and
+sticky. No partial descriptor list is exposed; parts/header_bytes appear
+only after healthy Complete and disappear on explicit late refusal.
+Backing slots are not wiped on refusal or abandonment; after borrows end
+they may contain provisional cells, which confer no completion or
+authorization. The caller publishes only a healthy completion. Cached
+Complete is inert. check_deadline and finish(now) require fresh original
+admission; finish returns passive slots and the same original budgets. A
+failed consuming finish releases its borrows and retains no result;
+original budgets stay caller-owned without reset, and any recorded
+budget refusal remains sticky. Copied passive cells cannot be revoked
+and grant no blob ID, partId, source authorization or publication
+authority.
+
+RESOURCES.md qualifies bounded resident state/turns and Rust allocations.
+Complete part metadata/JSON, body-list derivation, authenticated locator
+issuance, streaming inputs, worker/native stack and RSS remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

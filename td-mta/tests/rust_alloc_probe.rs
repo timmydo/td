@@ -1229,6 +1229,169 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn resident_mime_traversal() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        limits::Limits,
+        mime_traversal::{Cursor, Error, Part, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    fn meter() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records: 10_000_000,
+                output_bytes: 10_000_000,
+                ..Charge::default()
+            },
+        )
+    }
+    fn drain(cursor: &mut Cursor<'_, '_>) -> Result<(), Error> {
+        for _ in 0..100_000 {
+            if cursor.poll(Tick(1))? == Status::Complete {
+                return Ok(());
+            }
+        }
+        panic!("traversal allocation fixture did not finish")
+    }
+    let long_qp = format!(
+        "Content-Transfer-Encoding: quoted-printable\n\na{}b",
+        " ".repeat(5000)
+    );
+    let nested = concat!(
+        "Content-Type: multipart/mixed;boundary=a\n\n--a\n",
+        "Content-Type: multipart/digest;boundary=b\n\n--b\n\nFrom: inside\n\nbody\n--b--\n",
+        "--a\nContent-Transfer-Encoding: base64\n\nYWJj\n--a--"
+    );
+    let bad_nesting = format!(
+        "Content-Type: {}text/plain{}\n\n",
+        "(".repeat(33),
+        ")".repeat(33)
+    );
+    let mut backing = [Part::default(); 64];
+    let before = COUNTERS.snapshot();
+    for source in [
+        b"".as_slice(),
+        b"\nbody",
+        nested.as_bytes(),
+        long_qp.as_bytes(),
+        b"Content-Type: multipart/mixed;boundary=x\n\n--x\n--x--",
+        b"Content-Type: multipart/mixed;boundary=x\n\n--x\n\nbody",
+        b"Content-Transfer-Encoding: base64\n\nYQ!",
+        b"Content-Transfer-Encoding: quoted-printable\n\nx=",
+    ] {
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let identity = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+        let mut cursor = Cursor::new(
+            black_box(source),
+            17,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut backing,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(cursor.parts().unwrap().is_none());
+        drain(&mut cursor).unwrap();
+        assert!(!cursor.parts().unwrap().unwrap().is_empty());
+        let (parts, work, budget) = cursor.finish(Tick(1)).unwrap();
+        black_box(parts);
+        assert_eq!(
+            identity,
+            (std::ptr::from_ref(work), std::ptr::from_ref(budget))
+        );
+    }
+    for source in [
+        b"Content-Type: multipart/mixed;boundary=x\n\n--x--".as_slice(),
+        b"Content-Type: multipart/mixed;boundary=x\nContent-Transfer-Encoding: base64\n\n",
+        bad_nesting.as_bytes(),
+    ] {
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(
+            black_box(source),
+            0,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut backing,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let error = drain(&mut cursor).unwrap_err();
+        assert_eq!(cursor.parts(), Err(error));
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert!(cursor.finish(Tick(1)).is_err());
+    }
+    for kind in 0..4 {
+        let mut caps = Charge {
+            io_bytes: 10000,
+            records: 10000,
+            output_bytes: 10000,
+            ..Charge::default()
+        };
+        let stop = match kind {
+            0 => {
+                caps.io_bytes = 0;
+                Stop::IoBytes
+            }
+            1 => {
+                caps.records = 0;
+                Stop::Records
+            }
+            2 => {
+                caps.output_bytes = 0;
+                Stop::OutputBytes
+            }
+            _ => Stop::Deadline,
+        };
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), if kind == 3 { 1 } else { 100 }).unwrap(),
+            caps,
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(
+            black_box(nested.as_bytes()),
+            0,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut backing,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(drain(&mut cursor), Err(Error::Work(stop)));
+        assert_eq!(cursor.parts(), Err(Error::Work(stop)));
+        assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(stop)));
+        assert!(cursor.finish(Tick(1)).is_err());
+    }
+    let mut work = meter();
+    let mut budget = HeaderBudget::new();
+    let mut cursor = Cursor::new(
+        black_box(nested.as_bytes()),
+        0,
+        SourceEnd::Eof,
+        &Limits::default(),
+        &mut backing,
+        &mut work,
+        &mut budget,
+    )
+    .unwrap();
+    drain(&mut cursor).unwrap();
+    assert!(matches!(
+        cursor.finish(Tick(100)),
+        Err(Error::Work(Stop::Deadline))
+    ));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "resident MIME traversal allocated");
+}
+
 fn resident_mime_delimiters() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -7583,6 +7746,7 @@ fn main() {
         mime_filename_retention();
         mime_protocol_parameters();
         resident_mime_delimiters();
+        resident_mime_traversal();
         body_value();
         mime_text();
         body_charset();
@@ -7735,6 +7899,7 @@ fn main() {
     mime_filename_retention();
     mime_protocol_parameters();
     resident_mime_delimiters();
+    resident_mime_traversal();
     body_value();
     mime_text();
     body_charset();

@@ -340,6 +340,19 @@ fresh allowance is introduced. Detached lexical progress is not authority:
 the enclosing owner pins source/boundary identity, prepaid header credit,
 sticky retirement, provisional retention and fresh final publication.
 
+M06cf composes complete resident MIME traversal with fixed explicit frames,
+parent-first child clipping and caller-backed compact descriptors. Root
+headers count once; every child spends the remaining aggregate entity-header
+cap and original email interpretation/job admission. Outer delimiters bound
+an entire child before its headers or inner delimiters are interpreted, so
+outermost active prefixes win. Missing closes diagnose their containers;
+absent/invalid boundaries, no opening or encoded multipart refuse structure.
+Descriptors stay hidden until the entire parse succeeds and are passive
+source evidence. Fresh handoff returns original budgets, never blob IDs.
+Leaf sizing uses stable transfer decoding without charset/NFC or attached
+message recursion. Full metadata projection, locators, worker integration
+and native/RSS qualification remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in

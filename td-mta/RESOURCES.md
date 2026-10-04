@@ -1259,6 +1259,55 @@ checkpoint replay, parser arena or descriptor reservation is introduced.
 Moving private progress preserves state and has no allocation or admission
 effect. A future traversal must qualify its simultaneous core/frame layout.
 
+M06cf's resident traversal cursor plus HeaderBudget fits the existing 16 KiB
+parser/boundary reservation, including 64 simultaneous explicit frames,
+phase-exclusive metadata/parameter progress, one transfer decoder and 32
+counting bytes. A Part fits the existing 64-byte descriptor cell; backing
+is separate, bounded by configured mime_parts, and supplied by the caller.
+Variable metadata remains source extents. Root/child recognized headers
+share the configured aggregate header_bytes count, while replay/selection
+share the original 16 MiB source-visit/16-million-step HeaderBudget and its
+prepaid credit. No stage, output arena or descriptor pool is added.
+
+The measured x86-64 host layout is Cursor 11928 bytes, HeaderBudget 24
+bytes and Part 56 bytes: 11952 parser bytes leave 4432 bytes of the existing
+16 KiB reservation. The committed const assertion keeps the target-independent
+ceiling; these host sizes are not native stack/RSS measurements.
+
+One poll advances one phase and funds one structural job record. Conservative
+ceilings are 352 I/O/header visits, 512 aggregate interpretation steps,
+32 job records and 96 output bytes per turn. Raw delimiter work retains its
+separate 128-body-byte turn and original I/O charging. Transfer size counting
+uses a 32-byte reusable output window and at most 256 decoder transitions;
+retained descriptor copies also fund their actual cell bytes. Identity sizes
+come directly from checked extents without an unnecessary byte scan. No
+charset or NFC workspace overlaps traversal state.
+
+Parent-first clipping re-visits each container body at every enclosing
+container, so total delimiter visits scale with the sum of container body
+lengths (bounded by structural depth times encoded size). Each raw 128-byte
+turn spends two job records: traversal plus scanner. A nearly 32 MiB leaf
+inside 31 containers needs about 16.3 million delimiter records before
+metadata/decoding; structural admission alone does not promise completion
+under ADMISSION.md's default two-million-record foreground cap. All visits
+and records spend that same original job allowance. Deterministic work-cap
+refusal is a method failure under ADMISSION.md section 3/response policy,
+never a successful partial tree or fabricated notParsable syntax. Raw
+preservation and metadata-only recovery remain available. No budget is raised
+or renewed here; worker wiring must choose the existing validated job budget.
+
+Size counting also spends original output allowance for discarded decoded
+bytes, as the existing decoders require, in addition to descriptor retention.
+This dimension measures emitted/staged work rather than wire response bytes
+alone. Foreground integration must account for it without a fresh meter.
+
+Tests pin full depth 64 and 4096 cells, aggregate entity-header and email
+interpretation cuts, original work cuts, fresh deadlines and passive handoff.
+Rust allocation intervals cover resident nested/digest trees, empty and
+missing-close parts, long QP replay, malformed transfer and source syntax,
+work refusal and late handoff. This is resident Rust state/allocation evidence,
+not a native compiler stack, portable provider, whole worker or RSS claim.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

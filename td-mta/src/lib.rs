@@ -51,6 +51,7 @@ pub mod mime_metadata;
 pub mod mime_parameter;
 pub mod mime_qp;
 pub mod mime_text;
+pub mod mime_traversal;
 pub mod mime_unfold;
 pub mod mime_value;
 pub mod nfc;

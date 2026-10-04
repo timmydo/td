@@ -1835,6 +1835,14 @@ Initial independently landable increments:
   to td-header. Qualify public equivalence and movable private progress;
   explicit-frame traversal and simultaneous memory qualification remain open.
 
+- **M06cf — complete resident structure:** compose fixed-frame traversal,
+  parent-first clipping, root/child aggregate header counts, preorder passive
+  cells and exact transfer sizes. Qualify outer-prefix precedence, same-length
+  suspended boundaries, digest defaults, no implicit attached recursion,
+  missing-close diagnostics, structural/original-work cuts and fresh handoff.
+  Keep cells hidden until complete success. Retained part metadata, JSON/body
+  lists, locator issuance and streaming/worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
