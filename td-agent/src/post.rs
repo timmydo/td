@@ -1,7 +1,8 @@
 //! Messages between conversations, the window process's side (DESIGN.md
-//! §3, §6): it routes them. A conversation's `send_message` or `report`
-//! reaches the window as a `Send`, is checked again here (the receiver
-//! exists, the crossing rules, the bounds) and queued in the state
+//! §3, §6): it routes them. A conversation's `send_message`, which the
+//! human allowed on a card in its own process, reaches the window as a
+//! `Send`, is checked again here (both ends exist, the sender is not the
+//! receiver, the bounds) and queued in the state
 //! directory's `outbox`, one file per message under its receiver, written
 //! whole before the sender hears it was queued. Each poll hands what is
 //! queued to its receiver's process, starting one in the background for a
@@ -27,7 +28,9 @@ const MAX_FILE: u64 = 256 * 1024;
 /// The most conversations a `States` answer names.
 const MAX_STATES: usize = 1000;
 
-/// A message queued for its receiver.
+/// A message queued for its receiver. Its `role` and `status` are a
+/// sender's from before there were only conversations, which an outbox
+/// may still hold: the orchestrator, or a report's status.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Queued {
     pub to: Id,
@@ -118,21 +121,14 @@ impl Outbox {
     }
 
     /// Queues a message, written whole before this returns.
-    pub fn post(
-        &mut self,
-        to: Id,
-        from: Id,
-        role: Role,
-        text: String,
-        status: Option<String>,
-    ) -> Result<(), String> {
+    pub fn post(&mut self, to: Id, from: Id, text: String) -> Result<(), String> {
         let message = Queued {
             delivery: store::random_hex(16)?,
             to,
             from,
-            role,
+            role: Role::Conversation,
             text,
-            status,
+            status: None,
             order: self.next,
         };
         let dir = self.dir.join(message.to.as_str());
@@ -224,7 +220,6 @@ fn read(to: &Id, name: &str, path: &std::path::Path) -> Result<Queued, String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry {
     pub id: Id,
-    pub role: Role,
     /// Its state as `conversations` names it.
     pub state: String,
     /// Its process failed: nothing wakes it until the human opens it.
@@ -232,29 +227,28 @@ pub struct Entry {
 }
 
 /// Whether a message from `from` to `to` may be queued (DESIGN.md §3),
-/// checked again in the window whatever the sender checked.
+/// checked again in the window whatever the sender checked. The crossing
+/// itself is the human's, decided on a card in the sender's process.
 fn check(
     outbox: &Outbox,
     directory: &[Entry],
     from: &Id,
     to: &Id,
     text: &str,
-    status: Option<&str>,
 ) -> Result<(), String> {
-    let role = |id: &Id| directory.iter().find(|e| &e.id == id).map(|e| e.role);
-    let sender = role(from).ok_or("the sending conversation is unknown to the window")?;
-    let receiver = role(to).ok_or_else(|| format!("there is no conversation {to}"))?;
-    tools::crossing(from, sender, to, receiver, Op::Message)?;
+    let known = |id: &Id| directory.iter().any(|e| &e.id == id);
+    if !known(from) {
+        return Err("the sending conversation is unknown to the window".into());
+    }
+    if !known(to) {
+        return Err(format!("there is no conversation {to}"));
+    }
+    tools::crossing(from, to, Op::Message)?;
     if text.trim().is_empty() || text.len() > tools::MAX_MESSAGE {
         return Err(format!(
             "a message is between 1 and {} bytes",
             tools::MAX_MESSAGE
         ));
-    }
-    if let Some(status) = status {
-        if receiver != Role::Orchestrator || !tools::REPORT_STATUSES.contains(&status) {
-            return Err("a report goes to the orchestrator, with a status it knows".into());
-        }
     }
     if outbox.count(to) >= tools::MAX_UNDELIVERED {
         return Err(format!(
@@ -303,26 +297,9 @@ impl Post {
         directory: &[Entry],
     ) -> Option<String> {
         match update {
-            Update::Up(Up::Send {
-                id,
-                to,
-                text,
-                status,
-            }) => {
-                let queued = check(&self.outbox, directory, from, to, text, status.as_deref())
-                    .and_then(|()| {
-                        let role = directory
-                            .iter()
-                            .find(|e| &e.id == from)
-                            .map_or(Role::Conversation, |e| e.role);
-                        self.outbox.post(
-                            to.clone(),
-                            from.clone(),
-                            role,
-                            text.clone(),
-                            status.clone(),
-                        )
-                    });
+            Update::Up(Up::Send { id, to, text }) => {
+                let queued = check(&self.outbox, directory, from, to, text)
+                    .and_then(|()| self.outbox.post(to.clone(), from.clone(), text.clone()));
                 supervisor.answer(
                     from,
                     &Down::Sent {
@@ -410,10 +387,9 @@ mod tests {
         }
     }
 
-    fn entry(n: u8, role: Role) -> Entry {
+    fn entry(n: u8) -> Entry {
         Entry {
             id: id(n),
-            role,
             state: "idle".into(),
             failed: false,
         }
@@ -426,30 +402,18 @@ mod tests {
         receivers(&state, &[1, 2]);
         let (mut outbox, problems) = Outbox::load(&state);
         assert!(problems.is_empty(), "{problems:?}");
+        outbox.post(id(1), id(2), "first".into()).unwrap();
         outbox
-            .post(
-                id(1),
-                id(2),
-                Role::Conversation,
-                "first".into(),
-                Some("done".into()),
-            )
+            .post(id(1), id(3), "second \"quoted\"".into())
             .unwrap();
-        outbox
-            .post(
-                id(1),
-                id(3),
-                Role::Conversation,
-                "second \"quoted\"".into(),
-                None,
-            )
-            .unwrap();
-        outbox
-            .post(id(2), id(1), Role::Orchestrator, "third".into(), None)
-            .unwrap();
+        outbox.post(id(2), id(1), "third".into()).unwrap();
         let (mut again, problems) = Outbox::load(&state);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(again.queued(), outbox.queued());
+        assert!(again
+            .queued()
+            .iter()
+            .all(|q| q.role == Role::Conversation && q.status.is_none()));
         assert_eq!(again.count(&id(1)), 2);
         let first = again.queued()[0].delivery.clone();
         again.delivered(&id(1), &first).unwrap();
@@ -459,8 +423,30 @@ mod tests {
         let (third, _) = Outbox::load(&state);
         let texts: Vec<&str> = third.queued().iter().map(|q| q.text.as_str()).collect();
         assert_eq!(texts, ["second \"quoted\"", "third"]);
-        assert_eq!(third.queued()[1].role, Role::Orchestrator);
         assert_eq!(third.next, 4, "orders keep rising");
+    }
+
+    /// A message an outbox from before peers holds, from the orchestrator
+    /// or a report, is read back with its role and status.
+    #[test]
+    fn an_older_outboxs_report_is_read_back_whole() {
+        let scratch = Scratch::new("older");
+        let state = scratch.state();
+        receivers(&state, &[1]);
+        let dir = state.root().join("outbox").join(id(1).as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = format!("{:020}-{}", 7, "d".repeat(32));
+        let text = format!(
+            r#"{{"from":"{}","role":"orchestrator","text":"done here","status":"done"}}"#,
+            id(2)
+        );
+        std::fs::write(dir.join(file), text).unwrap();
+        let (outbox, problems) = Outbox::load(&state);
+        assert!(problems.is_empty(), "{problems:?}");
+        let queued = &outbox.queued()[0];
+        assert_eq!(queued.role, Role::Orchestrator);
+        assert_eq!(queued.status.as_deref(), Some("done"));
+        assert_eq!(outbox.next, 8);
     }
 
     /// A deleted receiver's messages go, from memory and from disk; the
@@ -473,9 +459,7 @@ mod tests {
         let (outbox, _) = Outbox::load(&state);
         let mut post = Post::new(outbox);
         for (to, text) in [(1, "kept"), (2, "gone"), (2, "gone too")] {
-            post.outbox
-                .post(id(to), id(3), Role::Conversation, text.into(), None)
-                .unwrap();
+            post.outbox.post(id(to), id(3), text.into()).unwrap();
         }
         post.forget(&id(2)).unwrap();
         assert_eq!(post.outbox().count(&id(2)), 0);
@@ -488,9 +472,7 @@ mod tests {
         post.forget(&id(4)).unwrap();
         // What a failed removal left for a receiver since deleted goes at
         // the next load.
-        post.outbox
-            .post(id(1), id(3), Role::Conversation, "late".into(), None)
-            .unwrap();
+        post.outbox.post(id(1), id(3), "late".into()).unwrap();
         std::fs::remove_dir_all(state.conversation(&id(1))).unwrap();
         let (again, problems) = Outbox::load(&state);
         assert!(problems.is_empty(), "{problems:?}");
@@ -502,37 +484,22 @@ mod tests {
     fn a_message_is_checked_again_by_the_window() {
         let scratch = Scratch::new("check");
         let (mut outbox, _) = Outbox::load(&scratch.state());
-        let directory = [
-            entry(1, Role::Orchestrator),
-            entry(2, Role::Conversation),
-            entry(3, Role::Conversation),
-        ];
-        let ok = |outbox: &Outbox, from: u8, to: u8, status: Option<&str>| {
-            check(outbox, &directory, &id(from), &id(to), "hi", status)
-        };
-        assert!(ok(&outbox, 1, 2, None).is_ok());
-        assert!(ok(&outbox, 2, 1, None).is_ok());
-        assert!(ok(&outbox, 2, 1, Some("done")).is_ok());
-        assert!(ok(&outbox, 2, 3, None).unwrap_err().contains("crossing"));
-        assert!(ok(&outbox, 2, 2, None).unwrap_err().contains("itself"));
-        assert!(ok(&outbox, 2, 9, None)
-            .unwrap_err()
-            .contains("no conversation"));
-        assert!(ok(&outbox, 9, 1, None).unwrap_err().contains("unknown"));
-        assert!(ok(&outbox, 1, 2, Some("done"))
-            .unwrap_err()
-            .contains("report"));
-        assert!(ok(&outbox, 2, 1, Some("finished"))
-            .unwrap_err()
-            .contains("report"));
+        let directory = [entry(1), entry(2), entry(3)];
+        let ok =
+            |outbox: &Outbox, from: u8, to: u8| check(outbox, &directory, &id(from), &id(to), "hi");
+        assert!(ok(&outbox, 1, 2).is_ok());
+        assert!(ok(&outbox, 2, 1).is_ok());
+        assert!(ok(&outbox, 2, 3).is_ok());
+        assert!(ok(&outbox, 2, 2).unwrap_err().contains("itself"));
+        assert!(ok(&outbox, 2, 9).unwrap_err().contains("no conversation"));
+        assert!(ok(&outbox, 9, 1).unwrap_err().contains("unknown"));
         let long = "x".repeat(tools::MAX_MESSAGE + 1);
-        assert!(check(&outbox, &directory, &id(2), &id(1), &long, None).is_err());
+        assert!(check(&outbox, &directory, &id(2), &id(1), &long).is_err());
+        assert!(check(&outbox, &directory, &id(2), &id(1), " \n").is_err());
         for _ in 0..tools::MAX_UNDELIVERED {
-            outbox
-                .post(id(1), id(2), Role::Conversation, "x".into(), None)
-                .unwrap();
+            outbox.post(id(1), id(2), "x".into()).unwrap();
         }
-        let full = ok(&outbox, 2, 1, None).unwrap_err();
+        let full = ok(&outbox, 2, 1).unwrap_err();
         assert!(full.contains("16 messages undelivered"), "{full}");
     }
 }

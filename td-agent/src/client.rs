@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn a_body_is_the_head_the_prefix_and_the_logs_messages() {
-        let prefix = crate::prompt::prefix(crate::store::Role::Conversation, 0);
+        let prefix = crate::prompt::prefix(0);
         let details = r#"[ {"type":"reasoning.encrypted","data":"q\/w=="} ]"#;
         let events = vec![
             event(
@@ -1408,8 +1408,9 @@ mod tests {
         }
         assert!(messages(&later, true)[0].contains("[received 2026-10-03T"));
         assert!(!messages(&later, false)[0].contains("[received"));
-        assert!(timed(&crate::prompt::prefix(Role::Conversation, 0)));
+        assert!(timed(&crate::prompt::prefix(0)));
         assert!(!timed("{\"tools\":[],\"messages\":[]}"));
+        // An older log's message from the orchestrator replays as sent.
         assert_eq!(
             label(&from, Role::Orchestrator, None),
             "[a message from the orchestrator, not from the person]"

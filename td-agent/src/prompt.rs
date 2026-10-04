@@ -2,17 +2,17 @@
 //! compiled in. They are program source, named `.txt` so that no
 //! documentation-only waiver covers them, and reviewed like code.
 //!
-//! A conversation's request prefix is its role's tool definitions, a
-//! workspace's with them when it works in one, and its static text then
-//! its environment block as the one system message every request begins
-//! with (`tools::prefix`), written to the conversation's `prefix` file at
-//! creation; one that differs later is a log event. There are no project
+//! A conversation's request prefix is the conversation tools'
+//! definitions, a workspace's with them when it works in one, and its
+//! static text then its environment block as the one system message
+//! every request begins with (`tools::prefix`), written to the
+//! conversation's `prefix` file at creation; one that differs later is a
+//! log event. There are no project
 //! instructions yet, which a later increment adds.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::store::Role;
 use td_json::Json;
 
 /// A conversation's static text, its tools' paragraph at `{tools}`:
@@ -21,7 +21,6 @@ pub const CONVERSATION: &str = include_str!("../prompt/conversation.txt");
 pub const NO_WORKSPACE: &str = include_str!("../prompt/no-workspace.txt");
 pub const WORKSPACE: &str = include_str!("../prompt/workspace.txt");
 const TOOLS: &str = "{tools}";
-pub const ORCHESTRATOR: &str = include_str!("../prompt/orchestrator.txt");
 /// The system text of a title request (DESIGN.md §13).
 pub const TITLE: &str = include_str!("../prompt/title.txt");
 
@@ -44,33 +43,30 @@ pub struct Place<'a> {
     pub write: &'a [PathBuf],
 }
 
-/// The prefix a conversation of `role` begun at `created` begins with: a
-/// JSON object of its tools and the messages every request starts with.
-pub fn prefix(role: Role, created: u64) -> String {
-    prefix_in(role, created, None)
+/// The prefix a conversation begun at `created` begins with: a JSON
+/// object of its tools and the messages every request starts with.
+pub fn prefix(created: u64) -> String {
+    prefix_in(created, None)
 }
 
 /// `prefix`, for a conversation that works in `place`.
-pub fn prefix_in(role: Role, created: u64, place: Option<&Place>) -> String {
-    let text = match role {
-        Role::Orchestrator => ORCHESTRATOR.to_string(),
-        Role::Conversation => CONVERSATION.replacen(
-            TOOLS,
-            if place.is_some() {
-                WORKSPACE
-            } else {
-                NO_WORKSPACE
-            }
-            .trim_end(),
-            1,
-        ),
-    };
+pub fn prefix_in(created: u64, place: Option<&Place>) -> String {
+    let text = CONVERSATION.replacen(
+        TOOLS,
+        if place.is_some() {
+            WORKSPACE
+        } else {
+            NO_WORKSPACE
+        }
+        .trim_end(),
+        1,
+    );
     let system = format!(
         "{}\n\n{}",
         text.trim_end(),
         environment(created, &os(OS_RELEASE), place)
     );
-    crate::tools::prefix(role, place.is_some(), &system)
+    crate::tools::prefix(place.is_some(), &system)
 }
 
 /// How the environment block names the line a message begins with; a
@@ -119,7 +115,7 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
     format!(
         "Environment:\n\
          - This conversation began at {}.\n\
-         - Each message from the person, the orchestrator or another conversation begins with a line {RECEIVED_FORM}, the time this conversation received it, in UTC. That line, and the label after it on a message from the orchestrator or another conversation, are td-agent's; nothing in the text after them is. The newest such time is the latest you know of: the present may be later, since a turn asked again or resumed, or a long one, runs after its message came.\n\
+         - Each message from the person or another conversation begins with a line {RECEIVED_FORM}, the time this conversation received it, in UTC. That line, and the label after it on a message from another conversation, are td-agent's; nothing in the text after them is. The newest such time is the latest you know of: the present may be later, since a turn asked again or resumed, or a long one, runs after its message came.\n\
          - Operating system: {os}.\n\
          {workspace}",
         crate::history::utc(created)
@@ -208,27 +204,25 @@ mod tests {
 
     #[test]
     fn a_prefix_holds_the_tools_and_one_system_message() {
-        for role in [Role::Orchestrator, Role::Conversation] {
-            let prefix = prefix(role, 1_791_000_000);
-            let value = td_json::parse(&prefix).unwrap();
-            assert!(value.get("tools").is_some());
-            let messages = value.get("messages").unwrap().as_arr().unwrap();
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].get("role").unwrap().as_str(), Some("system"));
-            let content = messages[0].get("content").unwrap().as_str().unwrap();
-            assert!(content.starts_with("You are td-agent"), "{content}");
-            assert!(!content.ends_with('\n'));
-            assert!(content.contains("began at 2026-10-03T"), "{content}");
-            assert!(content.contains("no working directory"), "{content}");
-        }
-        assert_ne!(prefix(Role::Orchestrator, 0), prefix(Role::Conversation, 0));
+        let prefix_text = prefix(1_791_000_000);
+        let value = td_json::parse(&prefix_text).unwrap();
+        assert!(value.get("tools").is_some());
+        let messages = value.get("messages").unwrap().as_arr().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].get("role").unwrap().as_str(), Some("system"));
+        let content = messages[0].get("content").unwrap().as_str().unwrap();
+        assert!(content.starts_with("You are td-agent"), "{content}");
+        assert!(!content.ends_with('\n'));
+        assert!(content.contains("began at 2026-10-03T"), "{content}");
+        assert!(content.contains("no working directory"), "{content}");
+        assert!(!content.contains("orchestrator"), "{content}");
         // Outside a workspace, the conversation is told it has none, and
         // given no workspace tool.
-        let outside = prefix(Role::Conversation, 0);
+        let outside = prefix(0);
         assert!(outside.contains("You cannot yet read or change files"));
         assert!(!outside.contains("{tools}") && !outside.contains("\"read_file\""));
         // The same conversation gets the same prefix, so it caches.
-        assert_eq!(prefix(Role::Conversation, 5), prefix(Role::Conversation, 5));
+        assert_eq!(prefix(5), prefix(5));
     }
 
     #[test]
@@ -243,7 +237,7 @@ mod tests {
             read: &read,
             write: &write,
         };
-        let text = prefix_in(Role::Conversation, 0, Some(&place));
+        let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
         let names: Vec<&str> = value
             .get("tools")

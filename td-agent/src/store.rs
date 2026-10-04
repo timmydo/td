@@ -49,8 +49,10 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(3);
 /// A title's longest form, in characters.
 pub const MAX_TITLE: usize = 80;
 
-/// What a conversation is: the orchestrator is always present and pinned
-/// first (DESIGN.md §3); every other conversation is one.
+/// What a conversation was created as. Every conversation td-agent makes
+/// now is a `Conversation`; an `Orchestrator`, which td-agent once made at
+/// startup, is read from an older state directory and is an ordinary
+/// conversation like any other (DESIGN.md §3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Role {
     Orchestrator,
@@ -119,6 +121,26 @@ pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// The time now in milliseconds since the epoch, by which conversations
+/// are ordered by activity.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// When conversation `meta` was last active, in milliseconds since the
+/// epoch: when its log last changed, else when it was made.
+pub fn activity(state: &StateDir, meta: &Meta) -> u64 {
+    std::fs::metadata(state.conversation(&meta.id).join("log"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(meta.created.saturating_mul(1000), |d| {
+            u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// The state directory and the paths under it.
@@ -1389,7 +1411,7 @@ impl Conversation {
                 // rewritten; a later prefix is a log event.
                 create_file(
                     &dir.join("prefix"),
-                    crate::prompt::prefix(role, meta.created).as_bytes(),
+                    crate::prompt::prefix(meta.created).as_bytes(),
                 )?;
                 create_file(&dir.join("log"), b"")?;
                 replace(&dir, "meta", meta.to_json().to_string().as_bytes())?;
@@ -2013,7 +2035,7 @@ pub mod tests {
         let dir = state.conversation(&id);
         assert_eq!(
             std::fs::read_to_string(dir.join("prefix")).unwrap(),
-            crate::prompt::prefix(Role::Conversation, read_meta(&dir).unwrap().created)
+            crate::prompt::prefix(read_meta(&dir).unwrap().created)
         );
 
         let log = std::fs::read_to_string(dir.join("log")).unwrap();

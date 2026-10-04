@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::host::{Call, Client};
 use crate::jail::{self, Policy, Programs};
 use crate::shell;
-use crate::store::{Event, Id, Kind, Role, StateDir};
+use crate::store::{Event, Id, Kind, StateDir};
 use crate::tools::{self, Args};
 use crate::workspace::{self, Shared, Workspace};
 
@@ -142,8 +142,8 @@ impl Bench {
 
     /// The digests a conversation's log holds, as a process starting
     /// again takes them up: each result that kept one, of the call its
-    /// assistant message made, for a conversation of `role`.
-    pub fn restore(&mut self, role: Role, events: &[Event]) {
+    /// assistant message made.
+    pub fn restore(&mut self, events: &[Event]) {
         for event in events {
             let Kind::ToolResult {
                 reply,
@@ -165,7 +165,7 @@ impl Bench {
                     _ => None,
                 });
             if let Some(Ok(Args::Host { call, .. })) =
-                call.map(|c| tools::parse_in(role, true, &c.name, &c.arguments))
+                call.map(|c| tools::parse_in(true, &c.name, &c.arguments))
             {
                 self.record(&call, Some(digest));
             }
@@ -292,7 +292,7 @@ mod tests {
             event(7, result(3, "e", Some("d2"), false)),
         ];
         let mut bench = Bench::default();
-        bench.restore(Role::Conversation, &events);
+        bench.restore(&events);
         let edit = |path: &str| Call::Edit {
             path: path.into(),
             old: "y".into(),

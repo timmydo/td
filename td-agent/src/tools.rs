@@ -10,21 +10,19 @@
 //! - `todo_write` replaces the conversation's todo list whole.
 //! - `history_search` and `history_read` reach a conversation's whole log
 //!   (`history`).
-//! - `conversations` lists the conversations; `send_message` and `report`
-//!   send one a message, which the window routes.
+//! - `conversations` lists the conversations; `send_message` sends one a
+//!   message, which the window routes.
 //! - `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` and
 //!   `shell` read and change the workspace (`host::Call`).
 //!
-//! The orchestrator has all of them but `report`, which is a message to
-//! the orchestrator itself. Every read or message §11 makes a crossing is
-//! refused until the crossings are decided (increment 13). There are no
-//! workspaces yet, so every conversation outside one counts as a
-//! workspace of its own: the orchestrator reads and messages anyone, any
-//! conversation messages the orchestrator, and nothing else crosses.
+//! Every conversation has the same tools: there is no orchestrator. Each
+//! counts as a workspace of its own, so reading another's log or
+//! messaging another is a crossing, which the human decides on a card
+//! (§11) in either mode, and `crossing_card` draws.
 
 use crate::history::Searchable;
 use crate::host::Call;
-use crate::store::{Id, Role, Status, TodoItem};
+use crate::store::{Id, Status, TodoItem};
 use crate::{files, shell};
 use td_json::Json;
 
@@ -33,8 +31,7 @@ pub const MAX_ARGUMENTS: usize = 256 * 1024;
 /// The most items a todo list holds, and the most bytes each item's text.
 pub const MAX_TODO_ITEMS: usize = 50;
 pub const MAX_TODO_BYTES: usize = 500;
-/// The most a message between conversations, or a report's summary, may
-/// run to (DESIGN.md §3).
+/// The most a message between conversations may run to (DESIGN.md §3).
 pub const MAX_MESSAGE: usize = 32 * 1024;
 /// The most messages a receiver holds undelivered.
 pub const MAX_UNDELIVERED: usize = 16;
@@ -48,8 +45,6 @@ pub const READ_COUNT: usize = 20;
 pub const MAX_READ_COUNT: usize = 100;
 pub const READ_BYTES: usize = 32 * 1024;
 pub const MAX_READ_BYTES: usize = 256 * 1024;
-/// A `report`'s statuses.
-pub const REPORT_STATUSES: [&str; 3] = ["in_progress", "done", "blocked"];
 
 /// A conversation tool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +54,6 @@ pub enum Tool {
     HistoryRead,
     Conversations,
     SendMessage,
-    Report,
     ReadFile,
     WriteFile,
     EditFile,
@@ -68,6 +62,16 @@ pub enum Tool {
     Sed,
     Shell,
 }
+
+/// The tools every conversation has, in the order the prefix defines
+/// them.
+const CONVERSATION: &[Tool] = &[
+    Tool::TodoWrite,
+    Tool::HistorySearch,
+    Tool::HistoryRead,
+    Tool::Conversations,
+    Tool::SendMessage,
+];
 
 /// The tools a workspace adds (DESIGN.md §12), run by the tool host in
 /// the workspace's jail, in the order the prefix defines them.
@@ -89,7 +93,6 @@ impl Tool {
             Self::HistoryRead => "history_read",
             Self::Conversations => "conversations",
             Self::SendMessage => "send_message",
-            Self::Report => "report",
             Self::ReadFile => "read_file",
             Self::WriteFile => "write_file",
             Self::EditFile => "edit_file",
@@ -100,10 +103,10 @@ impl Tool {
         }
     }
 
-    /// The tools a conversation of `role` has, with a workspace's when it
-    /// works in one.
-    pub fn all(role: Role, workspace: bool) -> Vec<Self> {
-        let mut tools = Self::of(role).to_vec();
+    /// The tools a conversation has, with a workspace's when it works in
+    /// one.
+    pub fn all(workspace: bool) -> Vec<Self> {
+        let mut tools = CONVERSATION.to_vec();
         if workspace {
             tools.extend_from_slice(WORKSPACE);
         }
@@ -119,32 +122,8 @@ impl Tool {
         )
     }
 
-    /// The tools a conversation of `role` has, in the order the prefix
-    /// defines them.
-    pub fn of(role: Role) -> &'static [Self] {
-        match role {
-            Role::Orchestrator => &[
-                Self::Conversations,
-                Self::SendMessage,
-                Self::HistorySearch,
-                Self::HistoryRead,
-                Self::TodoWrite,
-            ],
-            Role::Conversation => &[
-                Self::TodoWrite,
-                Self::HistorySearch,
-                Self::HistoryRead,
-                Self::Conversations,
-                Self::SendMessage,
-                Self::Report,
-            ],
-        }
-    }
-
-    fn find(role: Role, workspace: bool, name: &str) -> Option<Self> {
-        Self::all(role, workspace)
-            .into_iter()
-            .find(|t| t.name() == name)
+    fn find(workspace: bool, name: &str) -> Option<Self> {
+        Self::all(workspace).into_iter().find(|t| t.name() == name)
     }
 }
 
@@ -202,10 +181,10 @@ fn schema(properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
     ])
 }
 
-const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`, or `orchestrator`. This conversation's own log when left out or empty.";
+const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`; this conversation's own log when left out or empty. The person approves each search or read of another conversation's log before it is made, and may refuse it.";
 
 /// One tool's definition as the request carries it.
-fn definition(tool: Tool, role: Role) -> Json {
+fn definition(tool: Tool) -> Json {
     let (description, parameters) = match tool {
         Tool::TodoWrite => (
             "Replace this conversation's todo list with the items given, whole. Use it for work of three or more steps: write the plan, keep exactly one item in_progress while you work on it, and mark items done or cancelled as they end. The person sees the list above the composer. At most 50 items of at most 500 bytes of text each, and at most one in_progress. An empty list clears it.".to_string(),
@@ -270,18 +249,14 @@ fn definition(tool: Tool, role: Role) -> Json {
             ),
         ),
         Tool::Conversations => (
-            match role {
-                Role::Orchestrator => "List the conversations td-agent holds: each one's id, role, workspace, state (idle, running, paused, failed), background processes, cost and last activity, with its title and the todo item it has in progress.",
-                Role::Conversation => "List the conversations td-agent holds: each one's id, role, workspace, state (idle, running, paused, failed), background processes, cost and last activity. The title and the todo item in progress are shown for this conversation only, since other workspaces' models wrote them.",
-            }
-            .to_string(),
+            "List the conversations td-agent holds, the most recently active first: each one's id, workspace, state (idle, running, paused, failed), background processes, cost and last activity. The title and the todo item in progress are shown for this conversation only, since other conversations' models wrote them.".to_string(),
             schema(Vec::new(), &[]),
         ),
         Tool::SendMessage => (
-            "Send a message to another conversation, by its id from `conversations`, or `orchestrator`. It is delivered between that conversation's turns, labelled with this conversation as its source, and starts a turn there; any reply comes back to you the same way, later, so do not wait for one. At most 32 KiB, and a conversation holds at most 16 messages undelivered. Messaging a conversation of another workspace is a crossing and is refused for now.".to_string(),
+            "Send a message to another conversation, by its id from `conversations`. The person approves each message before it is sent, and may refuse it. It is delivered between that conversation's turns, labelled with this conversation as its source, and starts a turn there; any reply comes back to you the same way, later, so do not wait for one. At most 32 KiB, and a conversation holds at most 16 messages undelivered.".to_string(),
             schema(
                 vec![
-                    ("to", property("string", "The receiving conversation's id, or `orchestrator`.")),
+                    ("to", property("string", "The receiving conversation's id.")),
                     ("text", property("string", "The message.")),
                 ],
                 &["to", "text"],
@@ -375,16 +350,6 @@ fn definition(tool: Tool, role: Role) -> Json {
                 &["command"],
             ),
         ),
-        Tool::Report => (
-            "Report to the orchestrator: a status and a summary of what was done, what is left, and anything the person must decide. Use it when the work is done, when it is blocked, and at points the orchestrator should know of. It is delivered as a message to the orchestrator.".to_string(),
-            schema(
-                vec![
-                    ("status", one_of("Where the work stands.", &REPORT_STATUSES)),
-                    ("summary", property("string", "What was done, what is left, and what needs a decision.")),
-                ],
-                &["status", "summary"],
-            ),
-        ),
     };
     Json::Obj(vec![
         ("type".into(), Json::Str("function".into())),
@@ -399,15 +364,12 @@ fn definition(tool: Tool, role: Role) -> Json {
     ])
 }
 
-/// The request prefix of a conversation of `role` (DESIGN.md §13): its
-/// tools, a workspace's with them when it works in one, and their
-/// settings, then the messages every request begins with, `messages`
-/// last so a request appends to it.
-pub fn prefix(role: Role, workspace: bool, system: &str) -> String {
-    let tools = Tool::all(role, workspace)
-        .into_iter()
-        .map(|tool| definition(tool, role))
-        .collect();
+/// A conversation's request prefix (DESIGN.md §13): its tools, a
+/// workspace's with them when it works in one, and their settings, then
+/// the messages every request begins with, `messages` last so a request
+/// appends to it.
+pub fn prefix(workspace: bool, system: &str) -> String {
+    let tools = Tool::all(workspace).into_iter().map(definition).collect();
     Json::Obj(vec![
         ("tools".into(), Json::Arr(tools)),
         (
@@ -421,33 +383,21 @@ pub fn prefix(role: Role, workspace: bool, system: &str) -> String {
     .to_string()
 }
 
-/// A conversation a call names.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Target {
-    Orchestrator,
-    Id(Id),
-}
-
-impl Target {
-    /// The conversation `text` names; a refusal quotes it, cut to 64
-    /// characters, and adds `hint`.
-    fn parse(text: &str, member: &str, hint: &str) -> Result<Self, String> {
-        if text == "orchestrator" {
-            return Ok(Self::Orchestrator);
-        }
-        Id::parse(text).map(Self::Id).ok_or_else(|| {
-            let quoted: String = text.chars().take(64).collect();
-            let cut = if quoted.len() < text.len() { "\u{2026}" } else { "" };
-            format!("`{member}` is {quoted:?}{cut}, not a conversation id (32 lowercase hexadecimal digits from `conversations`) or `orchestrator`{hint}")
-        })
-    }
+/// The conversation `text` names; a refusal quotes it, cut to 64
+/// characters, and adds `hint`.
+fn conversation_id(text: &str, member: &str, hint: &str) -> Result<Id, String> {
+    Id::parse(text).ok_or_else(|| {
+        let quoted: String = text.chars().take(64).collect();
+        let cut = if quoted.len() < text.len() { "\u{2026}" } else { "" };
+        format!("`{member}` is {quoted:?}{cut}, not a conversation id (32 lowercase hexadecimal digits from `conversations`){hint}")
+    })
 }
 
 /// `history_search`'s arguments.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Search {
     pub query: String,
-    pub conversation: Option<Target>,
+    pub conversation: Option<Id>,
     pub kinds: Vec<Searchable>,
     pub limit: usize,
 }
@@ -455,7 +405,7 @@ pub struct Search {
 /// `history_read`'s arguments.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Read {
-    pub conversation: Option<Target>,
+    pub conversation: Option<Id>,
     pub from: u64,
     pub offset: u64,
     pub count: usize,
@@ -470,12 +420,8 @@ pub enum Args {
     Read(Read),
     Conversations,
     Send {
-        to: Target,
+        to: Id,
         text: String,
-    },
-    Report {
-        status: String,
-        summary: String,
     },
     /// A workspace tool's, for the tool host; `acts` when the human
     /// decides it first. A write's or an edit's expected digest is the
@@ -668,11 +614,11 @@ fn number(
 
 /// The log a history tool reads: another conversation's, or, when the
 /// member is left out, null, empty or blank, the caller's own.
-fn log_target(members: &[(String, Json)], name: &str) -> Result<Option<Target>, String> {
+fn log_target(members: &[(String, Json)], name: &str) -> Result<Option<Id>, String> {
     text(members, name)?
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .map(|t| Target::parse(t, name, " (left out, it is this conversation's own log)"))
+        .map(|t| conversation_id(t, name, " (left out, it is this conversation's own log)"))
         .transpose()
 }
 
@@ -746,20 +692,17 @@ fn todo(given: &[(String, Json)]) -> Result<Vec<TodoItem>, String> {
     Ok(list)
 }
 
-/// A call to `name` with `arguments` from a conversation of `role`: its
-/// arguments parsed, or why they cannot be, which the call is answered
-/// with and nothing is done.
-pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
-    parse_in(role, false, name, arguments)
+/// A call to `name` with `arguments` from a conversation: its arguments
+/// parsed, or why they cannot be, which the call is answered with and
+/// nothing is done.
+pub fn parse(name: &str, arguments: &str) -> Result<Args, String> {
+    parse_in(false, name, arguments)
 }
 
 /// `parse`, for a conversation that works in a workspace when `workspace`.
-pub fn parse_in(role: Role, workspace: bool, name: &str, arguments: &str) -> Result<Args, String> {
-    let tool = Tool::find(role, workspace, name).ok_or_else(|| {
-        let names: Vec<&str> = Tool::all(role, workspace)
-            .iter()
-            .map(|t| t.name())
-            .collect();
+pub fn parse_in(workspace: bool, name: &str, arguments: &str) -> Result<Args, String> {
+    let tool = Tool::find(workspace, name).ok_or_else(|| {
+        let names: Vec<&str> = Tool::all(workspace).iter().map(|t| t.name()).collect();
         format!(
             "there is no tool named {name:?}; the tools are {}",
             names.join(", ")
@@ -851,7 +794,7 @@ pub fn parse_in(role: Role, workspace: bool, name: &str, arguments: &str) -> Res
                     .map(str::trim)
                     .filter(|t| !t.is_empty())
                     .ok_or_else(|| "`to` is missing or empty".to_string())
-                    .and_then(|t| Target::parse(t, "to", ""))?,
+                    .and_then(|t| conversation_id(t, "to", ""))?,
                 text: message_text(m, "text")?,
             }
         }
@@ -865,20 +808,6 @@ pub fn parse_in(role: Role, workspace: bool, name: &str, arguments: &str) -> Res
             call: host_call(tool, &value)?,
             acts: tool.acts(),
         },
-        Tool::Report => {
-            let m = members(tool_name, &value, &["status", "summary"])?;
-            let status = required(m, "status")?;
-            if !REPORT_STATUSES.contains(&status) {
-                return Err(format!(
-                    "`status` {status:?} is not one of {}",
-                    REPORT_STATUSES.join(", ")
-                ));
-            }
-            Args::Report {
-                status: status.to_string(),
-                summary: message_text(m, "summary")?,
-            }
-        }
     })
 }
 
@@ -889,39 +818,17 @@ pub enum Op {
     Message,
 }
 
-/// Whether a conversation (`caller`, of `caller_role`) may read or message
-/// `target` (of `target_role`) without a crossing (DESIGN.md §3, §11), or
-/// why it is refused. Crossings are decided from increment 13 and refused
-/// until then. Every conversation counts as a workspace of its own until
-/// then, two in one directory included.
-pub fn crossing(
-    caller: &Id,
-    caller_role: Role,
-    target: &Id,
-    target_role: Role,
-    op: Op,
-) -> Result<(), String> {
-    const UNTIL: &str = "crossings are decided by approval from a later increment of td-agent, and until then every one is refused; do not try to reach it another way";
-    if caller == target {
-        return match op {
-            Op::Read => Ok(()),
-            Op::Message => Err("a conversation does not send messages to itself".into()),
-        };
+/// Whether `caller` reading or messaging `target` crosses between
+/// workspaces, which the human decides on a card (DESIGN.md §3, §11), or
+/// why it is refused outright. Every conversation counts as a workspace
+/// of its own, two in one directory included.
+pub fn crossing(caller: &Id, target: &Id, op: Op) -> Result<bool, String> {
+    if caller != target {
+        return Ok(true);
     }
-    if caller_role == Role::Orchestrator {
-        return Ok(());
-    }
-    match (op, target_role) {
-        (Op::Message, Role::Orchestrator) => Ok(()),
-        (Op::Read, Role::Orchestrator) => Err(format!(
-            "reading the orchestrator's log is a crossing for a workspace, since it holds every workspace's reports; {UNTIL}"
-        )),
-        (Op::Read, Role::Conversation) => Err(format!(
-            "reading another workspace's conversation is a crossing, and a conversation outside any workspace counts as a workspace of its own; {UNTIL}"
-        )),
-        (Op::Message, Role::Conversation) => Err(format!(
-            "messaging another workspace's conversation is a crossing, and a conversation outside any workspace counts as a workspace of its own; {UNTIL}. Report to the orchestrator instead"
-        )),
+    match op {
+        Op::Read => Ok(false),
+        Op::Message => Err("a conversation does not send messages to itself".into()),
     }
 }
 
@@ -956,7 +863,8 @@ pub fn mark(status: Status) -> &'static str {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Listed {
     pub id: Id,
-    pub role: Role,
+    /// Its workspace as the window's list names it, none outside one.
+    pub workspace: Option<String>,
     pub state: String,
     pub cost: u64,
     pub activity: u64,
@@ -964,11 +872,10 @@ pub struct Listed {
     pub doing: Option<String>,
 }
 
-/// The `conversations` result for `caller`, of `caller_role`: the
-/// harness-written fields for every conversation, and the model-written
-/// ones only for the caller's own workspace, or for every one to the
-/// orchestrator (DESIGN.md §3); `omitted` more were left out.
-pub fn listing(caller: &Id, caller_role: Role, entries: &[Listed], omitted: usize) -> String {
+/// The `conversations` result for `caller`: the harness-written fields
+/// for every conversation, and the model-written ones only for the
+/// caller's own (DESIGN.md §3); `omitted` more were left out.
+pub fn listing(caller: &Id, entries: &[Listed], omitted: usize) -> String {
     let mut out = format!("{} conversations", entries.len() + omitted);
     if omitted > 0 {
         out.push_str(&format!(
@@ -976,24 +883,24 @@ pub fn listing(caller: &Id, caller_role: Role, entries: &[Listed], omitted: usiz
             entries.len()
         ));
     }
-    out.push_str(match caller_role {
-        Role::Orchestrator => ":",
-        Role::Conversation => {
-            "; titles and items in progress are shown for this conversation only, since other workspaces' models wrote them:"
-        }
-    });
+    out.push_str(
+        "; titles and items in progress are shown for this conversation only, since other conversations' models wrote them:",
+    );
     for entry in entries {
         let own = &entry.id == caller;
         out.push_str(&format!(
-            "\n{} {}{} | workspace none | {} | background 0 | cost {} | active {}",
+            "\n{}{} | workspace {} | {} | background 0 | cost {} | active {}",
             entry.id,
-            entry.role.word(),
             if own { " (this conversation)" } else { "" },
+            entry
+                .workspace
+                .as_deref()
+                .map_or("none".to_string(), visible),
             entry.state,
             crate::cost::show(entry.cost),
             crate::history::utc(entry.activity),
         ));
-        if own || caller_role == Role::Orchestrator {
+        if own {
             out.push_str(&format!("\n  title: {}", entry.title));
             if let Some(doing) = &entry.doing {
                 out.push_str(&format!("\n  in progress: {doing}"));
@@ -1211,6 +1118,56 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
     (title.to_string(), card.done())
 }
 
+/// What a crossing would do with the other conversation.
+pub enum Reach<'a> {
+    Message(&'a str),
+    Search(&'a str),
+    Read {
+        from: u64,
+        offset: u64,
+        count: usize,
+        max_bytes: usize,
+    },
+}
+
+/// The card that asks the human whether this conversation may reach
+/// conversation `target`, which its model titled `title` (DESIGN.md §3,
+/// §11): the message whole, or what a search or read asks for and where
+/// what it finds goes.
+pub fn crossing_card(target: &Id, title: &str, reach: Reach) -> (String, Vec<String>) {
+    const DISCLOSES: &str = "What it finds, tool output included, comes into this conversation's context and so to this conversation's model provider.";
+    let mut card = Lines::default();
+    card.line(format!("Conversation {target}, titled {}", visible(title)));
+    let heading = match reach {
+        Reach::Message(text) => {
+            card.line("gets this message, labelled as from this conversation, not from you, and starting a turn there:".into());
+            card.text("", text, PART_LINES * 2);
+            "Send a message to another conversation"
+        }
+        Reach::Search(query) => {
+            card.line(format!(
+                "has its whole log searched for: {}",
+                visible(query)
+            ));
+            card.line(DISCLOSES.into());
+            "Search another conversation's log"
+        }
+        Reach::Read {
+            from,
+            offset,
+            count,
+            max_bytes,
+        } => {
+            card.line(format!(
+                "has its log read: up to {count} events and {max_bytes} bytes from event {from}, {offset} bytes in."
+            ));
+            card.line(DISCLOSES.into());
+            "Read another conversation's log"
+        }
+    };
+    (heading.to_string(), card.done())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -1221,9 +1178,9 @@ mod tests {
     }
 
     #[test]
-    fn the_prefix_defines_each_roles_tools_before_its_messages() {
-        for role in [Role::Orchestrator, Role::Conversation] {
-            let text = prefix(role, false, "system text");
+    fn the_prefix_defines_the_tools_before_its_messages() {
+        {
+            let text = prefix(false, "system text");
             assert!(text.ends_with("]}"), "{text}");
             let value = td_json::parse(&text).unwrap();
             let names: Vec<&str> = value
@@ -1234,8 +1191,16 @@ mod tests {
                 .iter()
                 .map(|t| t.get_path(&["function", "name"]).unwrap().as_str().unwrap())
                 .collect();
-            let expected: Vec<&str> = Tool::of(role).iter().map(|t| t.name()).collect();
-            assert_eq!(names, expected);
+            assert_eq!(
+                names,
+                [
+                    "todo_write",
+                    "history_search",
+                    "history_read",
+                    "conversations",
+                    "send_message"
+                ]
+            );
             // `require_parameters` would route a request carrying either
             // to no endpoint of a model that does not list it; `auto` is
             // the default, and parallel calls need no asking.
@@ -1246,17 +1211,13 @@ mod tests {
             };
             assert_eq!(members.last().unwrap().0, "messages");
             // The same text every time: the prefix is fixed.
-            assert_eq!(text, prefix(role, false, "system text"));
+            assert_eq!(text, prefix(false, "system text"));
         }
-        assert!(!Tool::of(Role::Orchestrator).contains(&Tool::Report));
     }
 
     #[test]
     fn a_workspace_adds_its_tools_and_their_calls_go_to_the_host() {
-        let names: Vec<&str> = Tool::all(Role::Conversation, true)
-            .iter()
-            .map(|t| t.name())
-            .collect();
+        let names: Vec<&str> = Tool::all(true).iter().map(|t| t.name()).collect();
         assert_eq!(
             names[names.len() - 7..],
             [
@@ -1270,12 +1231,12 @@ mod tests {
             ]
         );
         // The tool host's tools are offered only in a workspace.
-        let outside = parse(Role::Conversation, "shell", r#"{"command":"ls"}"#).unwrap_err();
+        let outside = parse("shell", r#"{"command":"ls"}"#).unwrap_err();
         assert!(
             outside.starts_with("there is no tool named \"shell\""),
             "{outside}"
         );
-        let call = |name: &str, args: &str| parse_in(Role::Conversation, true, name, args);
+        let call = |name: &str, args: &str| parse_in(true, name, args);
         assert_eq!(
             call("shell", r#"{"command":"ls -l","timeout_ms":null}"#).unwrap(),
             Args::Host {
@@ -1492,7 +1453,6 @@ mod tests {
         };
         let call = |items: &[String]| {
             parse(
-                Role::Conversation,
                 "todo_write",
                 &format!(r#"{{"items":[{}]}}"#, items.join(",")),
             )
@@ -1536,7 +1496,6 @@ mod tests {
             .unwrap_err()
             .contains("more than one line"));
         let extra = parse(
-            Role::Conversation,
             "todo_write",
             r#"{"items":[{"content":"a","status":"pending","id":"1"}]}"#,
         )
@@ -1553,28 +1512,19 @@ mod tests {
             (r#"{}"#, "`items` is missing"),
             (r#"{"items":[],"more":1}"#, "takes no `more`"),
         ] {
-            let e = parse(Role::Conversation, "todo_write", arguments).unwrap_err();
+            let e = parse("todo_write", arguments).unwrap_err();
             assert!(e.contains(said), "{arguments}: {e}");
         }
         let big = format!(r#"{{"items":[],"x":"{}"}}"#, "a".repeat(MAX_ARGUMENTS));
-        assert!(parse(Role::Conversation, "todo_write", &big)
-            .unwrap_err()
-            .contains("bound"));
-        let unknown = parse(Role::Conversation, "read_file", "{}").unwrap_err();
+        assert!(parse("todo_write", &big).unwrap_err().contains("bound"));
+        let unknown = parse("read_file", "{}").unwrap_err();
         assert!(unknown.contains("no tool named \"read_file\""), "{unknown}");
-        // The orchestrator has no report.
-        assert!(parse(
-            Role::Orchestrator,
-            "report",
-            r#"{"status":"done","summary":"x"}"#
-        )
-        .is_err());
+        // There is no report, nor any orchestrator to send one to.
+        let report = parse("report", r#"{"status":"done","summary":"x"}"#).unwrap_err();
+        assert!(report.contains("no tool named \"report\""), "{report}");
         // No arguments at all is an empty object.
-        assert_eq!(
-            parse(Role::Conversation, "conversations", "").unwrap(),
-            Args::Conversations
-        );
-        assert!(parse(Role::Conversation, "conversations", r#"{"all":true}"#).is_err());
+        assert_eq!(parse("conversations", "").unwrap(), Args::Conversations);
+        assert!(parse("conversations", r#"{"all":true}"#).is_err());
         for (arguments, said) in [
             (r#"{"query":"  "}"#, "no terms"),
             (r#"{"query":"a","limit":0}"#, "outside 1 to 100"),
@@ -1586,7 +1536,7 @@ mod tests {
                 "`conversation` is \"bob\", not a conversation id",
             ),
         ] {
-            let e = parse(Role::Conversation, "history_search", arguments).unwrap_err();
+            let e = parse("history_search", arguments).unwrap_err();
             assert!(e.contains(said), "{arguments}: {e}");
         }
         for (arguments, said) in [
@@ -1595,12 +1545,22 @@ mod tests {
             (r#"{"from":1,"count":101}"#, "outside 1 to 100"),
             (r#"{"from":1,"max_bytes":262145}"#, "outside 1 to 262144"),
         ] {
-            let e = parse(Role::Conversation, "history_read", arguments).unwrap_err();
+            let e = parse("history_read", arguments).unwrap_err();
             assert!(e.contains(said), "{arguments}: {e}");
         }
         for (arguments, said) in [
-            (r#"{"to":"orchestrator"}"#, "`text` is missing"),
-            (r#"{"to":"orchestrator","text":" "}"#, "empty"),
+            (
+                r#"{"to":"00000000000000000000000000000001"}"#,
+                "`text` is missing",
+            ),
+            (
+                r#"{"to":"00000000000000000000000000000001","text":" "}"#,
+                "empty",
+            ),
+            (
+                r#"{"to":"orchestrator","text":"hi"}"#,
+                "`to` is \"orchestrator\", not a conversation id",
+            ),
             (r#"{"text":"hi"}"#, "`to` is missing"),
             // A blank or null receiver is never a default one.
             (r#"{"to":"","text":"hi"}"#, "`to` is missing or empty"),
@@ -1611,34 +1571,22 @@ mod tests {
                 "`to` is \"bob\", not a conversation id",
             ),
         ] {
-            let e = parse(Role::Conversation, "send_message", arguments).unwrap_err();
+            let e = parse("send_message", arguments).unwrap_err();
             assert!(e.contains(said), "{arguments}: {e}");
         }
         let long = format!(
-            r#"{{"to":"orchestrator","text":"{}"}}"#,
+            r#"{{"to":"00000000000000000000000000000001","text":"{}"}}"#,
             "x".repeat(MAX_MESSAGE + 1)
         );
-        assert!(parse(Role::Conversation, "send_message", &long)
+        assert!(parse("send_message", &long)
             .unwrap_err()
             .contains("at most 32768"));
-        let status = parse(
-            Role::Conversation,
-            "report",
-            r#"{"status":"finished","summary":"x"}"#,
-        )
-        .unwrap_err();
-        assert!(status.contains("in_progress, done, blocked"), "{status}");
     }
 
     #[test]
     fn arguments_parse_with_their_defaults() {
         assert_eq!(
-            parse(
-                Role::Conversation,
-                "history_search",
-                r#"{"query":"build failed"}"#
-            )
-            .unwrap(),
+            parse("history_search", r#"{"query":"build failed"}"#).unwrap(),
             Args::Search(Search {
                 query: "build failed".into(),
                 conversation: None,
@@ -1653,7 +1601,7 @@ mod tests {
             r#"{"query":"build failed","conversation":null}"#,
         ] {
             assert_eq!(
-                parse(Role::Conversation, "history_search", arguments).unwrap(),
+                parse("history_search", arguments).unwrap(),
                 Args::Search(Search {
                     query: "build failed".into(),
                     conversation: None,
@@ -1667,12 +1615,11 @@ mod tests {
             (r#"{"from":1,"conversation":"   "}"#, None),
             (r#"{"from":1,"conversation":null}"#, None),
             (
-                r#"{"from":1,"conversation":" orchestrator "}"#,
-                Some(Target::Orchestrator),
+                r#"{"from":1,"conversation":" 00000000000000000000000000000007 "}"#,
+                Some(id(7)),
             ),
         ] {
-            let Args::Read(read) = parse(Role::Conversation, "history_read", arguments).unwrap()
-            else {
+            let Args::Read(read) = parse("history_read", arguments).unwrap() else {
                 panic!("{arguments}")
             };
             assert_eq!(read.conversation, conversation, "{arguments}");
@@ -1680,19 +1627,18 @@ mod tests {
         // A refusal says what leaving it out means, and quotes a long
         // value cut.
         let long = format!(r#"{{"query":"a","conversation":"{}"}}"#, "x".repeat(300));
-        let e = parse(Role::Conversation, "history_search", &long).unwrap_err();
+        let e = parse("history_search", &long).unwrap_err();
         assert!(e.contains(&format!("{:?}\u{2026}", "x".repeat(64))), "{e}");
         assert!(
             e.contains("left out, it is this conversation's own log"),
             "{e}"
         );
         // A null required member is missing.
-        let e = parse(Role::Conversation, "history_search", r#"{"query":null}"#).unwrap_err();
+        let e = parse("history_search", r#"{"query":null}"#).unwrap_err();
         assert!(e.contains("`query` is missing"), "{e}");
         let other = format!("{}", id(7));
         assert_eq!(
             parse(
-                Role::Orchestrator,
                 "history_read",
                 &format!(
                     r#"{{"conversation":"{other}","from":3,"offset":10,"count":5,"max_bytes":100}}"#
@@ -1700,7 +1646,7 @@ mod tests {
             )
             .unwrap(),
             Args::Read(Read {
-                conversation: Some(Target::Id(id(7))),
+                conversation: Some(id(7)),
                 from: 3,
                 offset: 10,
                 count: 5,
@@ -1708,7 +1654,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(Role::Conversation, "history_read", r#"{"from":1}"#).unwrap(),
+            parse("history_read", r#"{"from":1}"#).unwrap(),
             Args::Read(Read {
                 conversation: None,
                 from: 1,
@@ -1719,63 +1665,65 @@ mod tests {
         );
         assert_eq!(
             parse(
-                Role::Conversation,
-                "report",
-                r#"{"status":"done","summary":"built"}"#
-            )
-            .unwrap(),
-            Args::Report {
-                status: "done".into(),
-                summary: "built".into()
-            }
-        );
-        assert_eq!(
-            parse(
-                Role::Orchestrator,
                 "send_message",
                 &format!(r#"{{"to":"{other}","text":"go"}}"#)
             )
             .unwrap(),
             Args::Send {
-                to: Target::Id(id(7)),
+                to: id(7),
                 text: "go".into()
             }
         );
     }
 
     #[test]
-    fn crossings_are_refused_until_they_are_decided() {
-        let (orchestrator, a, b) = (id(1), id(2), id(3));
-        use Role::{Conversation as C, Orchestrator as O};
-        // Its own log, and anything for the orchestrator.
-        assert!(crossing(&a, C, &a, C, Op::Read).is_ok());
-        assert!(crossing(&orchestrator, O, &a, C, Op::Read).is_ok());
-        assert!(crossing(&orchestrator, O, &a, C, Op::Message).is_ok());
-        assert!(crossing(&a, C, &orchestrator, O, Op::Message).is_ok());
-        // Everything else crosses.
-        let e = crossing(&a, C, &orchestrator, O, Op::Read).unwrap_err();
-        assert!(
-            e.contains("reading the orchestrator's log is a crossing"),
-            "{e}"
-        );
-        let e = crossing(&a, C, &b, C, Op::Read).unwrap_err();
-        assert!(
-            e.contains("another workspace's conversation is a crossing"),
-            "{e}"
-        );
-        assert!(e.contains("refused"), "{e}");
-        let e = crossing(&a, C, &b, C, Op::Message).unwrap_err();
-        assert!(e.contains("messaging another workspace's"), "{e}");
-        assert!(crossing(&a, C, &a, C, Op::Message)
+    fn reaching_another_conversation_is_a_crossing_and_its_own_log_is_not() {
+        let (a, b) = (id(2), id(3));
+        assert_eq!(crossing(&a, &a, Op::Read), Ok(false));
+        assert_eq!(crossing(&a, &b, Op::Read), Ok(true));
+        assert_eq!(crossing(&a, &b, Op::Message), Ok(true));
+        assert_eq!(crossing(&b, &a, Op::Message), Ok(true));
+        assert!(crossing(&a, &a, Op::Message)
             .unwrap_err()
             .contains("itself"));
     }
 
+    /// A crossing's card names the other conversation, its title made
+    /// visible, and shows a message whole or says where a read's findings
+    /// go.
     #[test]
-    fn the_listing_shows_model_written_fields_to_their_own_and_the_orchestrator() {
-        let entry = |n: u8, role: Role| Listed {
+    fn a_crossing_card_shows_what_crosses() {
+        let (title, lines) =
+            crossing_card(&id(3), "Fix\u{202e}the build", Reach::Message("one\ntwo"));
+        assert_eq!(title, "Send a message to another conversation");
+        assert_eq!(
+            lines[0],
+            format!("Conversation {}, titled Fix<U+202E>the build", id(3))
+        );
+        assert_eq!(lines[2..], ["one", "two"]);
+        let (title, lines) = crossing_card(&id(3), "t", Reach::Search("build\tfailed"));
+        assert_eq!(title, "Search another conversation's log");
+        assert!(lines[1].ends_with("build<U+0009>failed"), "{lines:?}");
+        assert!(lines[2].contains("model provider"), "{lines:?}");
+        let reach = Reach::Read {
+            from: 4,
+            offset: 7,
+            count: 20,
+            max_bytes: 100,
+        };
+        let (title, lines) = crossing_card(&id(3), "t", reach);
+        assert_eq!(title, "Read another conversation's log");
+        assert!(
+            lines[1].contains("up to 20 events and 100 bytes from event 4, 7 bytes in"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_listing_shows_model_written_fields_to_their_own_alone() {
+        let entry = |n: u8, workspace: Option<&str>| Listed {
             id: id(n),
-            role,
+            workspace: workspace.map(str::to_string),
             state: "idle".into(),
             cost: 0,
             activity: 0,
@@ -1783,11 +1731,11 @@ mod tests {
             doing: Some(format!("doing {n}")),
         };
         let entries = [
-            entry(1, Role::Orchestrator),
-            entry(2, Role::Conversation),
-            entry(3, Role::Conversation),
+            entry(1, None),
+            entry(2, Some("scratch")),
+            entry(3, Some("/home/u/notes\n")),
         ];
-        let mine = listing(&id(2), Role::Conversation, &entries, 0);
+        let mine = listing(&id(2), &entries, 0);
         assert!(
             mine.contains("title 2") && mine.contains("doing 2"),
             "{mine}"
@@ -1795,17 +1743,27 @@ mod tests {
         for hidden in ["title 1", "doing 1", "title 3", "doing 3"] {
             assert!(!mine.contains(hidden), "{hidden} in {mine}");
         }
-        assert!(mine.contains(&format!("{} orchestrator", id(1))), "{mine}");
         assert!(
-            mine.contains(&format!("{} conversation (this conversation)", id(2))),
+            mine.contains(&format!("{} | workspace none", id(1))),
             "{mine}"
         );
-        let all = listing(&id(1), Role::Orchestrator, &entries, 2);
-        for shown in ["title 1", "title 2", "doing 3"] {
-            assert!(all.contains(shown), "{shown} not in {all}");
-        }
         assert!(
-            all.starts_with("5 conversations, the 3 most recently active shown:"),
+            mine.contains(&format!(
+                "{} (this conversation) | workspace scratch",
+                id(2)
+            )),
+            "{mine}"
+        );
+        // A workspace's name is the human's, and shown made visible.
+        assert!(
+            mine.contains(&format!("{} | workspace /home/u/notes<U+000A> |", id(3))),
+            "{mine}"
+        );
+        let all = listing(&id(1), &entries, 2);
+        assert!(all.contains("title 1"), "{all}");
+        assert!(!all.contains("title 2"), "{all}");
+        assert!(
+            all.starts_with("5 conversations, the 3 most recently active shown; titles"),
             "{all}"
         );
     }

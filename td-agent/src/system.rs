@@ -97,12 +97,11 @@ pub fn message(prefix: &str, replaced: bool) -> Result<Option<Message>, String> 
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::store::Role;
 
     #[test]
     fn a_prefix_shows_its_system_prompt_and_tools_folded() {
-        for role in [Role::Orchestrator, Role::Conversation] {
-            let prefix = crate::prompt::prefix(role, 0);
+        {
+            let prefix = crate::prompt::prefix(0);
             let message = message(&prefix, false).unwrap().unwrap();
             assert_eq!(message.label(), HEADER);
             assert!(message.is_collapsed());
@@ -116,7 +115,7 @@ mod tests {
                 .unwrap();
             assert_eq!(message.section_text(0), Some(content));
             let tools = message.section_text(1).unwrap();
-            for tool in crate::tools::Tool::of(role) {
+            for tool in crate::tools::Tool::all(false) {
                 assert!(tools.contains(&format!("{}: ", tool.name())), "{tools}");
             }
         }

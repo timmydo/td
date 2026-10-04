@@ -2,9 +2,9 @@
 
 data: {"id":"gen-1759400404-sEnDtOdO00000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"toolu_st_01","type":"function","function":{"name":"send_message","arguments":""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
 
-data: {"id":"gen-1759400404-sEnDtOdO00000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"{\"to\":\"orchestrat"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+data: {"id":"gen-1759400404-sEnDtOdO00000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"{\"to\":\"aaaaaaaaaaaaaaaa"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
 
-data: {"id":"gen-1759400404-sEnDtOdO00000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"or\",\"text\":\"Start"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
+data: {"id":"gen-1759400404-sEnDtOdO00000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"aaaaaaaaaaaaaaaa\",\"text\":\"Start"}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
 
 data: {"id":"gen-1759400404-sEnDtOdO00000001","provider":"Anthropic","model":"anthropic/claude-sonnet-5.5","object":"chat.completion.chunk","created":1759400400,"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"function":{"arguments":"ing on the plan.\""}}]},"finish_reason":null,"native_finish_reason":null,"logprobs":null}]}
 

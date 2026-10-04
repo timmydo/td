@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use td_ui::control_socket::Socket;
 use td_ui::control_worker::Worker;
@@ -304,7 +304,7 @@ impl Session {
     fn opened(&mut self, opened: Result<Opened, String>) {
         let Some(id) = self.supervisor.open_id().cloned() else {
             if let Err(reason) = opened {
-                self.app.update(Update::Failed { reason }, store::now());
+                self.app.update(Update::Failed { reason }, store::now_ms());
             }
             return;
         };
@@ -318,7 +318,7 @@ impl Session {
                 }
                 Err(e) => self.app.note(format!("the conversation's log: {e}")),
             },
-            Err(reason) => self.app.update(Update::Failed { reason }, store::now()),
+            Err(reason) => self.app.update(Update::Failed { reason }, store::now_ms()),
         }
     }
 
@@ -352,9 +352,8 @@ impl Session {
         };
         self.app.add_row(Row {
             id: id.clone(),
-            role: Role::Conversation,
             title: Role::Conversation.first_title().to_string(),
-            activity: store::now(),
+            activity: store::now_ms(),
             state: RowState::Starting,
             paused: false,
             workspace: workspace.as_ref().map(Workspace::label),
@@ -439,7 +438,7 @@ impl Session {
                 _ => {}
             }
             if self.supervisor.open_id() == Some(&id) {
-                self.app.update(update, now);
+                self.app.update(update, store::now_ms());
             } else if let Update::Refused { text, reason } = &update {
                 // No composer of its own to go back to: said, and kept
                 // whole on standard error.
@@ -456,7 +455,7 @@ impl Session {
                 };
                 self.app.note(note);
             } else {
-                self.app.background(&id, &update, now);
+                self.app.background(&id, &update, store::now_ms());
             }
         }
         let directory = self.app.directory();
@@ -506,11 +505,9 @@ impl Session {
 
     /// Deletes conversation `id` for good (DESIGN.md §4): its process
     /// ends, what was queued for it goes, then its directory; the window
-    /// opens the orchestrator in its place when it was the one open.
+    /// opens the most recently active one left in its place when it was
+    /// the one open.
     fn delete(&mut self, id: &Id) {
-        if self.app.orchestrator().as_ref() == Some(id) {
-            return self.app.note("the orchestrator is not deleted");
-        }
         // The window's open conversation, whether or not its process runs.
         let was_open = self.app.active() == Some(id);
         let held = self.supervisor.remove(id);
@@ -547,9 +544,9 @@ impl Session {
         self.app.remove_row(id);
         self.app.note(said);
         if was_open {
-            if let Some(orchestrator) = self.app.orchestrator() {
-                self.app.set_active(orchestrator.clone());
-                self.open(orchestrator, None);
+            if let Some(next) = self.app.most_recent() {
+                self.app.set_active(next.clone());
+                self.open(next, None);
             }
         }
     }
@@ -693,11 +690,7 @@ impl Session {
             .iter()
             .filter_map(|m| Some((m.id.clone(), m.context_length?)))
             .collect();
-        self.app.set_models(
-            &self.client.model,
-            &self.client.orchestrator_model,
-            contexts,
-        );
+        self.app.set_models(&self.client.model, contexts);
         let offers = models.models.iter().map(Offer::of).collect();
         self.app.set_offers(offers, &self.client.reasoning_effort);
     }
@@ -823,15 +816,9 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
     let rows = metas
         .into_iter()
         .map(|meta| {
-            // A conversation was last active when its log last changed.
-            let activity = std::fs::metadata(state.conversation(&meta.id).join("log"))
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(meta.created, |d| d.as_secs());
+            let activity = store::activity(state, &meta);
             Row {
                 id: meta.id,
-                role: meta.role,
                 title: meta.title,
                 activity,
                 state: RowState::Closed,
@@ -844,10 +831,10 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
 }
 
 /// Runs the window process over the state directory until the window
-/// closes: it takes the window lock, opens the orchestrator, creating it
-/// the first time, and serves `control` when given. `key` is the API key,
-/// or why there is none, which every turn then says; `key_path` is where
-/// the key dialog stores one.
+/// closes: it takes the window lock, opens the most recently active
+/// conversation when there is one, and serves `control` when given.
+/// `key` is the API key, or why there is none, which every turn then
+/// says; `key_path` is where the key dialog stores one.
 pub fn run(
     config: Config,
     key: Result<Secret, String>,
@@ -879,7 +866,7 @@ pub fn run(
     }
     if !config.notes.is_empty() {
         app.note(format!(
-            "{} configuration key(s) are read by later increments; see standard error",
+            "{} configuration key(s) are read by later increments, or no more; see standard error",
             config.notes.len()
         ));
     }
@@ -896,10 +883,6 @@ pub fn run(
     if let Some(problem) = problems.last() {
         app.note(format!("the store: {problem}"));
     }
-    let orchestrator = rows
-        .iter()
-        .find(|r| r.role == Role::Orchestrator)
-        .map(|r| r.id.clone());
     app.set_rows(rows);
     let mut client = config.client.clone();
     // Workspaces, and the shared directories each gets, admitted once
@@ -946,7 +929,7 @@ pub fn run(
             eprintln!("td-agent: the default model: {e}");
         }
     }
-    app.set_models(&client.model, &client.orchestrator_model, Vec::new());
+    app.set_models(&client.model, Vec::new());
     app.set_offers(Vec::new(), &client.reasoning_effort);
     app.set_limits(client.limits);
     let setup = Down::Setup {
@@ -1000,25 +983,10 @@ pub fn run(
         let _ = fetcher.jobs.send(Job::Models);
         fetcher.credit(Instant::now());
     }
-    match orchestrator {
-        Some(id) => {
-            session.app.set_active(id.clone());
-            session.open(id, None);
-        }
-        None => {
-            let id = Id::random()?;
-            session.app.add_row(Row {
-                id: id.clone(),
-                role: Role::Orchestrator,
-                title: Role::Orchestrator.first_title().to_string(),
-                activity: store::now(),
-                state: RowState::Starting,
-                paused: false,
-                workspace: None,
-            });
-            session.app.set_active(id.clone());
-            session.open(id, Some(Role::Orchestrator));
-        }
+    // Nothing is made here: with none yet, the human starts one.
+    if let Some(id) = session.app.most_recent() {
+        session.app.set_active(id.clone());
+        session.open(id, None);
     }
     let typeface = td_ui::pinned_face::load_or_note(
         "td-agent",

@@ -1,8 +1,9 @@
 //! `$XDG_CONFIG_HOME/td-agent/config`, TOML (DESIGN.md §15). Every key the
 //! design lists is known here: the ones built so far are parsed and
 //! checked, each other one is accepted by name and reported as read by the
-//! increment that first uses it, and an unknown key, `limits` included, is
-//! refused by name. A missing file is every default.
+//! increment that first uses it, a retired one is accepted and said to be
+//! read no more, and an unknown key, `limits` included, is refused by
+//! name. A missing file is every default.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,7 @@ use td_toml::Toml;
 
 /// Where models are asked for (DESIGN.md §5).
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
-/// The model a conversation and the orchestrator use by default.
+/// The model a conversation uses by default.
 pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5.5";
 /// The cheap model titles come from (DESIGN.md §13).
 pub const DEFAULT_TITLE_MODEL: &str = "anthropic/claude-haiku-4.5";
@@ -31,7 +32,6 @@ pub struct Client {
     /// to its `/chat/completions`, `/models` and `/key`.
     pub base_url: String,
     pub model: String,
-    pub orchestrator_model: String,
     pub title_model: String,
     pub reasoning_effort: String,
     /// `provider.data_collection`: whether providers that may keep or
@@ -48,7 +48,6 @@ impl Default for Client {
         Self {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
-            orchestrator_model: DEFAULT_MODEL.into(),
             title_model: DEFAULT_TITLE_MODEL.into(),
             reasoning_effort: DEFAULT_EFFORT.into(),
             allow_data_collection: false,
@@ -65,10 +64,6 @@ impl Client {
         Json::Obj(vec![
             ("base_url".into(), Json::Str(self.base_url.clone())),
             ("model".into(), Json::Str(self.model.clone())),
-            (
-                "orchestrator_model".into(),
-                Json::Str(self.orchestrator_model.clone()),
-            ),
             ("title_model".into(), Json::Str(self.title_model.clone())),
             (
                 "reasoning_effort".into(),
@@ -124,7 +119,6 @@ impl Client {
         let client = Self {
             base_url: base_url(text("base_url")?)?,
             model: model_id("model", text("model")?)?,
-            orchestrator_model: model_id("orchestrator_model", text("orchestrator_model")?)?,
             title_model: model_id("title_model", text("title_model")?)?,
             reasoning_effort: effort(text("reasoning_effort")?)?,
             allow_data_collection: data_collection(text("data_collection")?)?,
@@ -155,14 +149,6 @@ impl Client {
             },
         };
         Ok(client)
-    }
-
-    /// The model a conversation of `role` talks to.
-    pub fn model_for(&self, role: crate::store::Role) -> &str {
-        match role {
-            crate::store::Role::Orchestrator => &self.orchestrator_model,
-            crate::store::Role::Conversation => &self.model,
-        }
     }
 }
 
@@ -264,13 +250,14 @@ enum Use {
     Read,
     /// Accepted by name; the DESIGN.md §18 increment given reads it.
     Later(u8),
+    /// Accepted by name; the DESIGN.md §18 step named reads it.
+    Step(&'static str),
 }
 
 /// Every key DESIGN.md §15 lists, in its order.
-const KEYS: [(&str, Use); 28] = [
+const KEYS: &[(&str, Use)] = &[
     ("base_url", Use::Read),
     ("model", Use::Read),
-    ("orchestrator_model", Use::Read),
     ("title_model", Use::Read),
     ("classifier_fast_model", Use::Later(13)),
     ("classifier_model", Use::Later(13)),
@@ -284,6 +271,7 @@ const KEYS: [(&str, Use); 28] = [
     ("max_cost_per_day", Use::Read),
     ("workspace_root", Use::Read),
     ("shared", Use::Read),
+    ("template", Use::Step("the templates step")),
     ("remotes", Use::Later(11)),
     ("network", Use::Later(15)),
     ("network_allowlist", Use::Later(15)),
@@ -298,8 +286,15 @@ const KEYS: [(&str, Use); 28] = [
     ("compact_model", Use::Later(16)),
 ];
 
+/// Keys no longer read, accepted with a note of why, so a file written
+/// for an earlier td-agent still loads (DESIGN.md §15).
+const RETIRED: &[(&str, &str)] = &[(
+    "orchestrator_model",
+    "there is no orchestrator: every conversation uses `model`, or the model chosen for it",
+)];
+
 /// Keys refused with a reason of their own rather than as unknown.
-const REFUSED: [(&str, &str); 1] = [(
+const REFUSED: &[(&str, &str)] = &[(
     "limits",
     "there is no `limits` key until resource limits land (DESIGN.md §8, §15)",
 )];
@@ -427,6 +422,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if let Some((_, why)) = REFUSED.iter().find(|(name, _)| *name == key) {
             return Err(format!("`{key}`: {why}"));
         }
+        if let Some((_, why)) = RETIRED.iter().find(|(name, _)| *name == key) {
+            config
+                .notes
+                .push(format!("`{key}` is accepted and read no more: {why}"));
+            continue;
+        }
         match KEYS.iter().find(|(name, _)| *name == key) {
             None => {
                 return Err(format!(
@@ -439,6 +440,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             Some((_, Use::Later(increment))) => config.notes.push(format!(
                 "`{key}` is accepted and not read yet: increment {increment} reads it"
+            )),
+            Some((_, Use::Step(step))) => config.notes.push(format!(
+                "`{key}` is accepted and not read yet: {step} reads it"
             )),
             Some((_, Use::Read)) => {}
         }
@@ -455,7 +459,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
     for (key, slot) in [
         ("model", &mut client.model),
-        ("orchestrator_model", &mut client.orchestrator_model),
         ("title_model", &mut client.title_model),
     ] {
         if let Some(id) = text(key)? {
@@ -550,6 +553,21 @@ mod tests {
         assert!(parse("mode = 1").unwrap_err().contains("mode"));
     }
 
+    /// A retired key loads with a note, whatever its value, and sets
+    /// nothing.
+    #[test]
+    fn a_retired_key_is_noted_and_not_read() {
+        let config = parse("orchestrator_model = \"c/d\"\nmodel = \"a/b\"\n").unwrap();
+        assert_eq!(config.client.model, "a/b");
+        assert_eq!(config.notes.len(), 1);
+        assert!(config
+            .notes
+            .first()
+            .unwrap()
+            .starts_with("`orchestrator_model` is accepted and read no more"));
+        assert_eq!(parse("orchestrator_model = 1\n").unwrap().notes.len(), 1);
+    }
+
     #[test]
     fn unknown_keys_and_limits_are_refused_by_name() {
         let e = parse("modle = \"auto\"").unwrap_err();
@@ -610,12 +628,19 @@ mod tests {
 
     #[test]
     fn every_listed_key_is_accepted_and_the_unread_ones_said() {
+        // DESIGN.md §15's example, whole.
         let example = "model = \"anthropic/claude-sonnet-5.5\"\nmode = \"auto\"\n\
                        max_cost_per_day = 25\n\n[[shared]]\npath = \"~/Downloads\"\n\n\
-                       [[shared]]\npath = \"~/src/reference\"\nwrite = false\n";
+                       [[shared]]\npath = \"~/src/reference\"\nwrite = false\n\n\
+                       [[template]]\nname = \"td\"\n\n[[template.repos]]\n\
+                       remote = \"https://github.com/timmydo/td\"\nbase = \"main\"\n\
+                       branch = \"agent\"\nsparse = [\"td-agent\", \"td-ui\"]\n";
         let config = parse(example).unwrap();
         assert_eq!(config.mode, Mode::Auto);
-        assert!(config.notes.is_empty(), "{:?}", config.notes);
+        assert_eq!(
+            config.notes,
+            ["`template` is accepted and not read yet: the templates step reads it"]
+        );
         assert_eq!(
             config.shared(Path::new("/home/u")),
             [
@@ -642,6 +667,12 @@ mod tests {
                         "`{key}` is accepted and not read yet: increment {n} reads it"
                     )]
                 ),
+                Use::Step(step) => assert_eq!(
+                    config.unwrap(),
+                    [format!(
+                        "`{key}` is accepted and not read yet: {step} reads it"
+                    )]
+                ),
             }
         }
     }
@@ -650,7 +681,7 @@ mod tests {
     fn the_model_clients_keys_are_read_and_checked() {
         let config = parse(
             "base_url = \"https://example.test/api/v1/\"\nmodel = \"a/b\"\n\
-             orchestrator_model = \"c/d\"\ntitle_model = \"e/f\"\n\
+             title_model = \"e/f\"\n\
              reasoning_effort = \"high\"\ndata_collection = \"allow\"\n\
              max_cost_per_turn = 0.5\nmax_cost_per_conversation = \"none\"\n\
              max_cost_per_day = 0\n",
@@ -662,10 +693,7 @@ mod tests {
         assert_eq!(parse("mode = \"ask\"\n").unwrap().model_key, None);
         let client = &config.client;
         assert_eq!(client.base_url, "https://example.test/api/v1");
-        assert_eq!(
-            (client.model.as_str(), client.orchestrator_model.as_str()),
-            ("a/b", "c/d")
-        );
+        assert_eq!(client.model, "a/b");
         assert_eq!(client.title_model, "e/f");
         assert_eq!(client.reasoning_effort, "high");
         assert!(client.allow_data_collection);
@@ -677,8 +705,6 @@ mod tests {
                 day: Some(0)
             }
         );
-        assert_eq!(client.model_for(crate::store::Role::Orchestrator), "c/d");
-        assert_eq!(client.model_for(crate::store::Role::Conversation), "a/b");
         // The settings cross the socketpair and come back the same.
         assert_eq!(&Client::from_json(&client.to_json()).unwrap(), client);
         for (line, said) in [

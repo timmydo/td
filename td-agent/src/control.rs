@@ -147,7 +147,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "delete-conversation",
         chord: None,
         arguments: "",
-        help: "Conversation > Delete conversation...: ask whether to delete the open conversation for good; Cancel is focused first. The orchestrator is never deleted.",
+        help: "Conversation > Delete conversation...: ask whether to delete the open conversation for good; Cancel is focused first.",
     },
     Binding {
         name: "export-diagnostics",
@@ -503,12 +503,12 @@ mod tests {
             usable: true,
             reasoning: true,
         };
-        app.set_offers(vec![offer("m/orch"), offer("m/conv")], "medium");
+        app.set_offers(vec![offer("m/default"), offer("m/conv")], "medium");
         let mut remote = Remote { app: &mut app };
         let state = remote.state().unwrap();
         assert!(
             state.contains(
-                "picker=none\tpicking=none\tquery=\tconfirm=none\tmodel=m/orch\teffort=medium\tdefault=m/conv\t"
+                "picker=none\tpicking=none\tquery=\tconfirm=none\tmodel=m/default\teffort=medium\tdefault=m/default\t"
             ),
             "{state}"
         );
@@ -516,7 +516,7 @@ mod tests {
         assert!(remote
             .state()
             .unwrap()
-            .contains("picker=m/orch\tpicking=conversation\tquery="));
+            .contains("picker=m/default\tpicking=conversation\tquery="));
         for (n, c) in ["c", "o", "n", "v"].iter().enumerate() {
             let line = format!("1\t{}\tkey\t{}", 10 + n, hex(c));
             assert!(driven::request(&mut remote, line.as_bytes()).ends_with("changed"));

@@ -60,7 +60,7 @@ use crate::store::{
     self, Basis, Call, Conversation, Effect, Event, Held, Id, Kind, Purpose, Role, StateDir,
     Status, TodoItem, LOCK_WAIT,
 };
-use crate::tools::{self, Args, Listed, Op, Target};
+use crate::tools::{self, Args, Listed, Op, Reach};
 use crate::wake;
 use crate::workspace::Workspace;
 
@@ -231,10 +231,6 @@ pub fn serve_in(
     workspace: Option<Workspace>,
 ) -> Result<(), String> {
     let (conversation, load) = match (create, workspace) {
-        // Its tools and text are a conversation's (DESIGN.md §7).
-        (Some(Role::Orchestrator), Some(_)) => {
-            return Err("the orchestrator works in no workspace".into())
-        }
         (Some(role), workspace) => Conversation::create(state, id, role, workspace, LOCK_WAIT)?,
         (None, None) => Conversation::open(state, id, None, LOCK_WAIT)?,
         (None, Some(_)) => return Err("a workspace is given only to a new conversation".into()),
@@ -271,10 +267,8 @@ pub fn serve_in(
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
-    let role = session.conversation.meta().role;
-    session.bench.restore(role, session.conversation.events());
+    session.bench.restore(session.conversation.events());
     session.send(&Up::Hello {
-        role: session.conversation.meta().role,
         title: session.conversation.meta().title.clone(),
         torn: load.torn,
         interrupted: load.interrupted,
@@ -566,8 +560,7 @@ impl Session {
         self.resume()?;
         // Titled by its first message, or by the next one should the
         // title not have been written then, until a title model's.
-        let untitled = self.conversation.meta().role == Role::Conversation
-            && self.conversation.meta().title == Role::Conversation.first_title();
+        let untitled = self.conversation.meta().title == Role::Conversation.first_title();
         let user = self.conversation.append(Kind::User {
             delivery: delivery.clone(),
             text: text.clone(),
@@ -682,6 +675,8 @@ impl Session {
     /// A turn a message from another conversation began does not count,
     /// since the title quotes the human's first message (§13).
     fn first_reply(&self, turn: u64) -> bool {
+        // One made as the orchestrator, by an older td-agent, keeps the
+        // title it was made with.
         if self.conversation.meta().role != Role::Conversation {
             return false;
         }
@@ -847,17 +842,12 @@ impl Session {
             Ok(key) => key,
             Err(why) => return Ok(Outcome::stop(why)),
         };
-        let role = self.conversation.meta().role;
         // The human's choice for this conversation, else the default:
-        // the configuration's, or the window's for a conversation (§4).
+        // the configuration's, or the window's (§4).
         let meta = self.conversation.meta();
         let (chosen, chosen_effort) = (meta.model.clone(), meta.effort.clone());
-        let setting = match (&chosen, role) {
-            (Some(_), _) => CHOSEN,
-            (None, Role::Orchestrator) => "`orchestrator_model`",
-            (None, Role::Conversation) => DEFAULT,
-        };
-        let name = chosen.unwrap_or_else(|| client.model_for(role).to_string());
+        let setting = if chosen.is_some() { CHOSEN } else { DEFAULT };
+        let name = chosen.unwrap_or_else(|| client.model.clone());
         let reasoning_effort = chosen_effort.unwrap_or_else(|| client.reasoning_effort.clone());
         let model = match self.model(setting, &name, &client) {
             Ok(model) => model,
@@ -1111,7 +1101,6 @@ impl Session {
                 _ => None,
             })
             .unwrap_or_default();
-        let role = self.conversation.meta().role;
         let workspace = self.conversation.meta().workspace.is_some();
         for (at, call) in calls.iter().enumerate() {
             self.hear();
@@ -1139,12 +1128,11 @@ impl Session {
                 .seq;
             // Durable before it runs: a restart never runs it again.
             self.sync()?;
-            let (answer, beside) =
-                match tools::parse_in(role, workspace, &call.name, &call.arguments) {
-                    Ok(Args::Host { call, acts }) => self.host(started, call, acts)?,
-                    Ok(args) => (self.run(args)?, Beside::default()),
-                    Err(why) => (Err(why), Beside::default()),
-                };
+            let (answer, beside) = match tools::parse_in(workspace, &call.name, &call.arguments) {
+                Ok(Args::Host { call, acts }) => self.host(started, call, acts)?,
+                Ok(args) => (self.run(started, args)?, Beside::default()),
+                Err(why) => (Err(why), Beside::default()),
+            };
             let (content, error) = match answer {
                 Ok(content) => (content, false),
                 Err(why) => (format!("error: {why}"), true),
@@ -1204,7 +1192,7 @@ impl Session {
     fn expected_prefix(&mut self, client: &Client) -> Result<String, String> {
         let meta = self.conversation.meta().clone();
         let Some(workspace) = &meta.workspace else {
-            return Ok(crate::prompt::prefix(meta.role, meta.created));
+            return Ok(crate::prompt::prefix(meta.created));
         };
         let state = StateDir::at(self.state.clone());
         let policy = self
@@ -1221,11 +1209,7 @@ impl Session {
             read: &policy.read,
             write: &policy.write,
         };
-        Ok(crate::prompt::prefix_in(
-            meta.role,
-            meta.created,
-            Some(&place),
-        ))
+        Ok(crate::prompt::prefix_in(meta.created, Some(&place)))
     }
 
     /// Runs a workspace tool's call, the `ToolCall` record `started`, in
@@ -1241,7 +1225,8 @@ impl Session {
     ) -> Result<(Result<String, String>, Beside), String> {
         let failed = |why: String| Ok((Err(why), Beside::default()));
         if acts {
-            match self.decide(started, &call)? {
+            let (title, details) = tools::card(&call);
+            match self.decide(started, title, details)? {
                 Some(true) => {}
                 Some(false) => return failed(CALL_REFUSED.into()),
                 None => return failed(CALL_UNDECIDED.into()),
@@ -1303,12 +1288,17 @@ impl Session {
     }
 
     /// Asks the human whether the call `started` may run, on a card the
-    /// window draws (DESIGN.md §11), and waits for the answer however
-    /// long it takes, hearing the window meanwhile: whether it may, or
-    /// none when the turn was interrupted or the window closed first, the
-    /// card then withdrawn. The decision is logged.
-    fn decide(&mut self, started: u64, call: &host::Call) -> Result<Option<bool>, String> {
-        let (title, details) = tools::card(call);
+    /// window draws (DESIGN.md §11) with `title` and `details`, and waits
+    /// for the answer however long it takes, hearing the window
+    /// meanwhile: whether it may, or none when the turn was interrupted
+    /// or the window closed first, the card then withdrawn. The decision
+    /// is logged.
+    fn decide(
+        &mut self,
+        started: u64,
+        title: String,
+        details: Vec<String>,
+    ) -> Result<Option<bool>, String> {
         self.send(&Up::Ask {
             call: started,
             title,
@@ -1358,9 +1348,10 @@ impl Session {
         Ok(allow)
     }
 
-    /// Runs one call: the tool's answer, or why it failed, which the model
-    /// is told; an error of the log's own ends the process.
-    fn run(&mut self, args: Args) -> Result<Result<String, String>, String> {
+    /// Runs one call, the `ToolCall` record `started`: the tool's answer,
+    /// or why it failed, which the model is told; an error of the log's
+    /// own ends the process.
+    fn run(&mut self, started: u64, args: Args) -> Result<Result<String, String>, String> {
         Ok(match args {
             Args::Todo(items) => {
                 let text = tools::todo_text(&items);
@@ -1370,21 +1361,40 @@ impl Session {
                 })?;
                 Ok(text)
             }
-            Args::Search(search) => self.with_log(search.conversation, |events| {
-                Ok(history::search(
-                    events,
-                    &search.query,
-                    &search.kinds,
-                    search.limit,
-                ))
-            }),
-            Args::Read(read) => self.with_log(read.conversation, |events| {
-                history::read(events, read.from, read.offset, read.count, read.max_bytes)
-            }),
+            Args::Search(search) => {
+                let reach = Reach::Search(&search.query);
+                match self.cross(started, search.conversation.as_ref(), Op::Read, reach)? {
+                    Ok(other) => self.with_log(other.as_ref(), |events| {
+                        Ok(history::search(
+                            events,
+                            &search.query,
+                            &search.kinds,
+                            search.limit,
+                        ))
+                    }),
+                    Err(why) => Err(why),
+                }
+            }
+            Args::Read(read) => {
+                let reach = Reach::Read {
+                    from: read.from,
+                    offset: read.offset,
+                    count: read.count,
+                    max_bytes: read.max_bytes,
+                };
+                match self.cross(started, read.conversation.as_ref(), Op::Read, reach)? {
+                    Ok(other) => self.with_log(other.as_ref(), |events| {
+                        history::read(events, read.from, read.offset, read.count, read.max_bytes)
+                    }),
+                    Err(why) => Err(why),
+                }
+            }
             Args::Conversations => self.conversations(),
-            Args::Send { to, text } => self.post(to, text, None),
-            Args::Report { status, summary } => {
-                self.post(Target::Orchestrator, summary, Some(status))
+            Args::Send { to, text } => {
+                match self.cross(started, Some(&to), Op::Message, Reach::Message(&text))? {
+                    Ok(_) => self.post(to, text),
+                    Err(why) => Err(why),
+                }
             }
             // `answer` runs these through `host`, with their record.
             Args::Host { .. } => Err("a workspace tool runs only in the jail".into()),
@@ -1396,59 +1406,65 @@ impl Session {
         StateDir::at(self.state.clone()).list().0
     }
 
-    /// The conversation `target` names, checked against the crossings of
-    /// `op`: `None` for this one.
-    fn resolve(&self, target: Target, op: Op) -> Result<Option<Id>, String> {
-        let metas = self.metas();
-        let (id, role) = match target {
-            Target::Orchestrator => metas
-                .iter()
-                .find(|m| m.role == Role::Orchestrator)
-                .map(|m| (m.id.clone(), m.role))
-                .ok_or("there is no orchestrator")?,
-            Target::Id(id) => {
-                let role = metas
-                    .iter()
-                    .find(|m| m.id == id)
-                    .map(|m| m.role)
-                    .ok_or_else(|| format!("there is no conversation {id}"))?;
-                (id, role)
-            }
+    /// Whether the call `started` may reach conversation `target` for
+    /// `op`, as `reach` says (DESIGN.md §3, §11): another conversation,
+    /// when one the store holds and the human allows it on a card; none
+    /// when it is this one or none is named; else why not, which the call
+    /// is answered with. An error of the log's own ends the process.
+    fn cross(
+        &mut self,
+        started: u64,
+        target: Option<&Id>,
+        op: Op,
+        reach: Reach,
+    ) -> Result<Result<Option<Id>, String>, String> {
+        let Some(target) = target else {
+            return Ok(Ok(None));
         };
-        let me = self.conversation.meta();
-        tools::crossing(&me.id, me.role, &id, role, op)?;
-        Ok((id != me.id).then_some(id))
+        let me = self.conversation.meta().id.clone();
+        match tools::crossing(&me, target, op) {
+            Ok(true) => {}
+            Ok(false) => return Ok(Ok(None)),
+            Err(why) => return Ok(Err(why)),
+        }
+        let Some(meta) = self.metas().into_iter().find(|m| &m.id == target) else {
+            return Ok(Err(format!("there is no conversation {target}")));
+        };
+        let (title, details) = tools::crossing_card(target, &meta.title, reach);
+        match self.decide(started, title, details)? {
+            Some(true) => {}
+            Some(false) => return Ok(Err(CALL_REFUSED.into())),
+            None => return Ok(Err(CALL_UNDECIDED.into())),
+        }
+        // An interrupt that came with the decision, or before it.
+        self.hear();
+        if self.interrupt {
+            return Ok(Err(CALL_SKIPPED.into()));
+        }
+        Ok(Ok(Some(meta.id)))
     }
 
-    /// `read` over the log `target` names, this conversation's own when
-    /// none.
+    /// `read` over the log of conversation `other`, this conversation's
+    /// own when none.
     fn with_log(
         &self,
-        target: Option<Target>,
+        other: Option<&Id>,
         read: impl FnOnce(&[Event]) -> Result<String, String>,
     ) -> Result<String, String> {
-        let other = match target {
-            None => None,
-            Some(target) => self.resolve(target, Op::Read)?,
-        };
         match other {
             None => read(self.conversation.events()),
-            Some(id) => read(&store::read_log(&StateDir::at(self.state.clone()), &id)?),
+            Some(id) => read(&store::read_log(&StateDir::at(self.state.clone()), id)?),
         }
     }
 
-    /// `send_message` and `report`: the message queued by the window for
-    /// its receiver, or why not.
-    fn post(&mut self, to: Target, text: String, status: Option<String>) -> Result<String, String> {
-        let to = self
-            .resolve(to, Op::Message)?
-            .ok_or("a conversation does not send messages to itself")?;
+    /// `send_message`, the human having allowed it: the message queued by
+    /// the window for its receiver, or why not.
+    fn post(&mut self, to: Id, text: String) -> Result<String, String> {
         let id = self.ask_id();
         self.send(&Up::Send {
             id,
             to: to.clone(),
             text,
-            status: status.clone(),
         });
         // Unanswered, the window may still have queued it before closing
         // or while this gave up: the model is not invited to send twice.
@@ -1458,10 +1474,7 @@ impl Session {
                 format!("{why}, so whether the message was queued is unknown; it may yet be delivered, so do not send it again unless an answer that needs it does not come")
             })?;
         match answer {
-            Down::Sent { refusal: None, .. } => Ok(match status {
-                Some(_) => "reported to the orchestrator; it reads the report between its turns".to_string(),
-                None => format!("queued for conversation {to}; it is delivered between that conversation's turns, and any reply comes back here as a message, later"),
-            }),
+            Down::Sent { refusal: None, .. } => Ok(format!("queued for conversation {to}; it is delivered between that conversation's turns, and any reply comes back here as a message, later")),
             Down::Sent {
                 refusal: Some(why),
                 ..
@@ -1483,24 +1496,17 @@ impl Session {
         let state_dir = StateDir::at(self.state.clone());
         let me = self.conversation.meta().clone();
         // Ordered and bounded first, so only the logs listed are read: the
-        // orchestrator first, then the most recently active.
+        // most recently active first.
+        // By the millisecond, then by id, as the window's list orders them.
         let mut metas: Vec<(store::Meta, u64)> = self
             .metas()
             .into_iter()
             .map(|meta| {
-                let activity = std::fs::metadata(state_dir.conversation(&meta.id).join("log"))
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(meta.created, |d| d.as_secs());
+                let activity = store::activity(&state_dir, &meta);
                 (meta, activity)
             })
             .collect();
-        metas.sort_by(|(a, at), (b, bt)| {
-            (b.role == Role::Orchestrator)
-                .cmp(&(a.role == Role::Orchestrator))
-                .then(bt.cmp(at))
-        });
+        metas.sort_by(|(a, at), (b, bt)| bt.cmp(at).then(a.id.cmp(&b.id)));
         let omitted = metas.len().saturating_sub(MAX_LISTED);
         metas.truncate(MAX_LISTED);
         let mut entries: Vec<Listed> = Vec::with_capacity(metas.len());
@@ -1525,14 +1531,14 @@ impl Session {
             entries.push(Listed {
                 state: state.to_string(),
                 cost: accounts::spent(events),
-                activity,
+                activity: activity / 1000,
                 title: meta.title.clone(),
                 doing: doing(events),
+                workspace: meta.workspace.as_ref().map(Workspace::label),
                 id: meta.id,
-                role: meta.role,
             });
         }
-        Ok(tools::listing(&me.id, me.role, &entries, omitted))
+        Ok(tools::listing(&me.id, &entries, omitted))
     }
 
     /// A message from another conversation, which the window routed:
@@ -1559,18 +1565,18 @@ impl Session {
             self.send(&Up::Refused { delivery, reason });
             return Ok(());
         }
-        let elsewhere = self.orchestrator_wrote();
         let events = self.conversation.events();
-        // A report is a notification another workspace's own budget bounds.
+        // A report, which an outbox from before peers may still hold, was
+        // a notification its sender's own budget bounded.
         let counts = status.is_none();
         let held = if self.conversation.meta().paused {
             Some(Held::Paused)
-        } else if counts && wake::spent(events, elsewhere) >= wake::BUDGET {
+        } else if counts && wake::spent(events) >= wake::BUDGET {
             Some(Held::Budget)
         } else {
             None
         };
-        let tell = held == Some(Held::Budget) && !wake::told(events, elsewhere);
+        let tell = held == Some(Held::Budget) && !wake::told(events);
         let logged = self
             .conversation
             .append(Kind::Message {
@@ -1608,28 +1614,6 @@ impl Session {
         match started {
             Some(started) => self.turn(started.seq),
             None => Ok(()),
-        }
-    }
-
-    /// When the human last wrote to the orchestrator, for the wake budget;
-    /// `None` for the orchestrator itself, whose own log says.
-    fn orchestrator_wrote(&self) -> Option<u64> {
-        if self.conversation.meta().role == Role::Orchestrator {
-            return None;
-        }
-        let orchestrator = self
-            .metas()
-            .into_iter()
-            .find(|m| m.role == Role::Orchestrator)?;
-        match store::read_log(&StateDir::at(self.state.clone()), &orchestrator.id) {
-            Ok(events) => events.iter().rev().find_map(|e| match e.kind {
-                Kind::User { .. } => Some(e.time),
-                _ => None,
-            }),
-            Err(e) => {
-                eprintln!("td-agent: the wake budget could not read the orchestrator's log: {e}");
-                None
-            }
         }
     }
 
@@ -1675,10 +1659,7 @@ impl Session {
                 counts |= status.is_none();
             }
         }
-        let spent = counts && {
-            let elsewhere = self.orchestrator_wrote();
-            wake::spent(self.conversation.events(), elsewhere) >= wake::BUDGET
-        };
+        let spent = counts && wake::spent(self.conversation.events()) >= wake::BUDGET;
         let started = match newest.filter(|_| !spent) {
             Some(of) => Some(
                 self.conversation
@@ -2185,10 +2166,7 @@ mod tests {
             panic!("no hello")
         };
         let created = state.list().0.first().unwrap().created;
-        assert_eq!(
-            prefix,
-            Some(crate::prompt::prefix(Role::Conversation, created))
-        );
+        assert_eq!(prefix, Some(crate::prompt::prefix(created)));
         keyless(&mut window);
         say(&mut window, D1, "first words\nand more");
         let Up::Event(user) = next(&mut window) else {

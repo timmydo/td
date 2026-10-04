@@ -79,14 +79,12 @@ pub const DEFAULT_MODEL: &str = "Default model\u{2026}";
 pub const DELETE: &str = "Delete conversation\u{2026}";
 
 /// What the Conversation menu shows: whether a conversation is open, its
-/// effort, whether its model takes one, and whether it can be deleted
-/// (any but the orchestrator).
+/// effort, and whether its model takes one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct State<'a> {
     pub open: bool,
     pub effort: &'a str,
     pub reasoning: bool,
-    pub deletable: bool,
 }
 
 pub type Menu = Controller<'static, Action, u64>;
@@ -144,7 +142,7 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
     });
     nodes.push(Node {
         parent: Some(conversation),
-        row: row(DELETE, "", state.open && state.deletable, false),
+        row: row(DELETE, "", state.open, false),
         item: Item::Action(Action::Delete),
     });
     let help = nodes.len();
@@ -192,7 +190,6 @@ mod tests {
         open: true,
         effort: "high",
         reasoning: true,
-        deletable: true,
     };
 
     fn surface() -> Surface {
@@ -267,13 +264,8 @@ mod tests {
             ..OPENED
         };
         assert!(enabled(plain, MODEL) && !enabled(plain, EFFORT));
-        // The orchestrator is not deleted; nor is anything with none open.
+        // Any conversation open is deleted; nothing is with none open.
         assert!(enabled(OPENED, DELETE) && !enabled(closed, DELETE));
-        let orchestrator = State {
-            deletable: false,
-            ..OPENED
-        };
-        assert!(!enabled(orchestrator, DELETE));
         // The default is chosen with or without one open.
         assert!(enabled(closed, DEFAULT_MODEL) && enabled(OPENED, DEFAULT_MODEL));
     }

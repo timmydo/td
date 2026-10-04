@@ -3,15 +3,15 @@
 td-agent is td's agent harness: one td-ui window whose left side lists
 conversations and whose right side is the active conversation or a new
 one, driving language models reached through a pay-per-token API key
-(OpenRouter first). One conversation is the **orchestrator**: the human
-talks to it, and it creates **workspaces** for new work, each a set of
-sparse git worktrees with its own conversation, and sends updates to
-existing ones. A workspace conversation's tool calls execute in a jail
-whose policy belongs to the workspace. It is a coding agent first and a
-general assistant second, on the same loop. This document is the
-normative contract for the program and the starting point for successive
-agents; the root `AGENTS.md` and `DEVELOPMENT.md` still govern changes and
-submission.
+(OpenRouter first). Every conversation is a peer: the human creates each
+one with a **workspace** from a template, an empty scratch directory, a
+directory of theirs or a set of sparse git worktrees, and conversations
+message and read one another only as the human allows. A conversation's
+tool calls execute in a jail whose policy belongs to its workspace. It
+is a coding agent first and a general assistant second, on the same
+loop. This document is the normative contract for the program and the
+starting point for successive agents; the root `AGENTS.md` and
+`DEVELOPMENT.md` still govern changes and submission.
 
 ## Status
 
@@ -21,28 +21,34 @@ and `./agent`; the model client over `td-fetch 1`, with the key file,
 the models list, cost limits, credit and titles; td-net's streamed
 fetch; streamed replies over it, drawn as they arrive and interrupted
 by `Escape`; and the conversation tools, the first a model is given:
-the todo list, `history_search` and `history_read`, `conversations`,
-`send_message` and `report`, with the wake budget and pausing. After
-them came the window's File menu and the dialog that stores the
-OpenRouter key from it (§4, §6), then the Conversation menu, which
-chooses each conversation's model, from a picker over the models list,
-and its reasoning effort (§4), the system context, shown folded at
-the head of the transcript, and the diagnostics export (§4). Where
-building them
-settled a point the design left open, the section says so under "As
-built". No recipe names td-agent yet. The decisions below that were the
-user's to make were made on 2026-10-01 and 2026-10-02:
+the todo list, `history_search` and `history_read`, `conversations`
+and `send_message`, with the wake budget and pausing. After them came
+the window's File menu and the dialog that stores the OpenRouter key
+from it (§4, §6), then the Conversation menu, which chooses each
+conversation's model, from a picker over the models list, and its
+reasoning effort (§4), the system context, shown folded at the head of
+the transcript, and the diagnostics export (§4); then increments 9 and
+10, the tool host and the `workspace` jail, with directory and scratch
+workspaces whose file and shell tools run in `ask` mode, and then the
+peers step of §18, which made every conversation a peer (§3). Where
+building them settled a point the design left open, the section says so
+under "As built". No recipe names td-agent yet. The decisions below that
+were the user's to make were made on 2026-10-01, 2026-10-02 and
+2026-10-04:
 
 - **Use:** both coding and general assistance, coding first.
 - **Run target:** an unjailed checkout launch on a development host first
   (`./agent`, the `./news` and `./mail` shape of APPLICATIONS.md §X.7), so
   the harness can be exercised against OpenRouter at once; packaging as a
   jailed td application follows as its own increment.
-- **Coordination:** a central orchestrator creates workspaces for new work
-  and sends updates to existing workspace conversations (§3).
-- **Workspaces:** several sparse-checkout git worktrees per workspace, with
-  asynchronous fetch, from the first workspace increment (§7). Agents can
-  commit and push (§9).
+- **Coordination:** no orchestrator. Every conversation is a peer with
+  the same tools and prompt; the human creates each and can archive or
+  delete any; and reading or messaging another conversation is a
+  crossing the human decides on a card (§3).
+- **Workspaces:** every new conversation chooses a workspace template,
+  Empty, Directory… or one configured with several sparse-checkout git
+  worktrees and asynchronous fetch (§7, §15). Creating a workspace is
+  the human's act, never a model's. Agents can commit and push (§9).
 - **Processes:** one subprocess per conversation, under which, on a
   host, every process that conversation causes runs (§2). The first
   increments set no resource limits, and nothing in them may prevent
@@ -188,14 +194,14 @@ to start, every jail instance the conversation uses: its own file-tool
 instance, `shell`, `grep`, `sed`, snapshot, background and maintenance
 instances, forks included. Workspace maintenance that no turn asks for
 (the periodic remote-tracking update, the counts `conversations` shows,
-the check before closing, §7) runs in the workspace's own conversation
-process; when that conversation has no process, the window process
-starts one for the purpose, without the key, and it exits when the work
-is done; if the human opens the conversation
-meanwhile, the window process hands that process the key and it goes on
-as the conversation's process. A card goes up the socketpair as a
-request and its answer comes back down. The orchestrator is a
-conversation process with no jail instances.
+the check before archiving or deleting, §7) runs in the workspace's own
+conversation process; when that conversation has no process, the window
+process starts one for the purpose, without the key, and it exits when
+the work is done; if the human opens the conversation meanwhile, the
+window process hands that process the key and it goes on as the
+conversation's process. A card goes up the socketpair as a request and
+its answer comes back down. A conversation with no workspace has no
+jail instances.
 
 **State shared across conversations** is the window process's: the
 human's rules, `deny everywhere` included, and each repository's
@@ -250,8 +256,9 @@ would hold its conversation's lock against the next.
   the frame and log-line bounds; the window and the conversation process
   each refuse a longer one by name.
 - **The child** is `td-agent conversation <id> --state-dir <dir>
-  [--create <role>]`, with its end of the socketpair as standard input
-  and output. It replays its log up the socketpair (a `hello`, then every
+  [--create …]`, `--create` making the conversation in the workspace it
+  names (§7), with its end of the socketpair as standard input and
+  output. It replays its log up the socketpair (a `hello`, then every
   event), and exits when the socketpair closes. A turn is whole in the
   log before the window hears of it, so a window that closes the
   socketpair mid-turn interrupts nothing, and the child exits as it
@@ -305,18 +312,19 @@ only the deltas after it opened, until the logged reply replaces them.
 A background conversation's deltas are dropped.
 
 **As built (increment 8).** The window routes messages between
-conversations. Up, `send` carries a `send_message` or `report` (an id
-of the sender's, the receiver's id, the text, and a report's status),
-and `query` asks for the states the window knows; down, `sent` answers
-a send, queued or refused with why, and `states` answers a query.
-`message` hands a receiver a message from another conversation (its
-delivery id, sender, sender's role, text and status), which it
-acknowledges with `delivered` once logged, or refuses; `pause` pauses
-or resumes the open conversation, and `clear_todo` clears its todo
-list. `hello` says whether the conversation is paused, and carries
-its prefix for the transcript (§4, the system context). The window
-checks every send again, whatever the sender checked (the receiver
-exists, the crossing rules, the bounds), and writes it whole to the
+conversations. Up, `send` carries a `send_message` the human allowed
+(an id of the sender's, the receiver's id and the text), and `query`
+asks for the states the window knows; down, `sent` answers a send,
+queued or refused with why, and `states` answers a query. `message`
+hands a receiver a message from another conversation (its delivery id,
+sender and text, and the sender's role and a report's status where an
+older outbox file holds them, §3), which it acknowledges with
+`delivered` once logged, or refuses; `pause` pauses or resumes the open
+conversation, and `clear_todo` clears its todo list. `hello` says
+whether the conversation is paused, and carries its prefix for the
+transcript (§4, the system context). The window checks every send
+again, whatever the sender checked (the receiver exists and is not the
+sender, the bounds, at most 16 undelivered), and writes it whole to the
 state directory's `outbox`, one file per message under its receiver's
 id, named by a rising order and its delivery id, before the sender hears
 it was queued. Each poll hands what is queued to its receiver's process,
@@ -355,123 +363,113 @@ that has not failed, and keeps it as the `setup` every process started
 afterwards, restarts included, is sent first. The key still crosses
 nothing but the socketpairs.
 
-## 3. The orchestrator and conversations
+## 3. Conversations
 
-The orchestrator is a conversation like any other in its log and model
-client, with three differences: it is always present, pinned at the top of
-the list; it has no jail and no file tools; and its tools act on
-workspaces and conversations rather than files.
+Every conversation is a peer. Each has the same log and model client,
+the same system prompt and the same conversation tools; what tells one
+from another is its workspace, chosen from a template when the human
+creates it (§7), and the human's choices for it: its model and effort
+(§4), whether it is paused and whether it is archived. td-agent creates
+no conversation by itself, and the human can archive or delete any of
+them (§4). A workspace adds its own tools, the file, shell and git
+tools of §12, and its own paragraph and environment block (§13); the
+tools below are every conversation's. Creating a workspace is the
+human's act, through a template; no model creates, archives or deletes
+a workspace or a conversation.
 
-**Its tools:**
+**Coordination.** Every conversation has `conversations`,
+`send_message`, `history_search`, `history_read` and `todo_write`
+(§12):
 
-- `create_workspace {name, task, repos: [{remote, base, branch, sparse:
-  [paths]}], model?, network?, unshared?}`: creates a workspace (§7) and its
-  conversation, which starts on `task` as soon as each base commit is
-  fetched while its worktrees are still being checked out. A remote must
-  be admitted (§7); `network` may name `off` or `allowlist`, never `open`
-  (§10).
-- `conversations`, `send_message`, `history_search` and `history_read`,
-  which every conversation has (below and §12), reaching every
-  conversation without a crossing. For the orchestrator `conversations`
-  also gives each workspace's worktree states, branch, commits ahead of
-  and behind its base, and last report.
-- `todo_write`, its plan across workspaces (§12).
-- `fetch {remote?}`: an immediate store fetch (§7).
-- `close_workspace {name}`: archives the conversation and removes the
-  worktrees once they are reported clean and pushed, or the human
-  confirms what would be lost (§7).
-- `ask_user {question, options?}`: a structured question, answered on a
-  card.
-
-**Its inputs.** The human's messages, messages from other conversations
-(below), and notifications queued from workspaces: a conversation's
-`report` (§12), a turn that finished, failed or is waiting for approval,
-a worktree that became ready or failed, and a base branch that advanced
-after a store fetch. A notification wakes the orchestrator for a turn of
-its own unless the human has paused it, so work proceeds while the human
-is away and pauses where a human card is open.
-
-**Its trust.** Everything a workspace conversation says to it, reports
-and excerpts alike, is untrusted content: a workspace's model read
-untrusted input before writing it. The orchestrator can therefore pass an
-injection from one workspace to another, and the design does not pretend
-otherwise. What bounds that is that the orchestrator holds no authority a
-workspace lacks: it cannot answer a card, change a workspace's rules,
-network policy or limits beyond the configured defaults, admit a remote,
-or push. Every crossing is decided per workspace by §11, whoever asked for
-it. Nor can it shed a restriction by starting over: the human's "deny
-everywhere" rules apply to every workspace it creates, and while any
-workspace has dropped to `ask` mode, creating another goes to the human. A
-message from the orchestrator reaches a workspace's model as a user-role
-message labelled with its source, and reaches the classifier only in its
-untrusted field (§11).
-
-The human can open any workspace conversation and talk to it directly, and
-create a workspace by hand through the same card the orchestrator's
-`create_workspace` fills in.
-
-**Between conversations.** Every conversation can see the others and
-message them, not only through the orchestrator:
-
-- `conversations`: each conversation's id, workspace, state (idle,
+- `conversations`: every conversation's id, workspace, state (idle,
   running, waiting for approval, paused, failed), background process
-  count, cost and last activity, which td-agent itself writes.
-  Model-written fields, the title, the todo item in progress (§12) and
-  background command lines, are shown only for the caller's own
-  workspace, and to the orchestrator for every workspace, so the listing
-  is not a channel between workspaces.
+  count, cost and last activity, which td-agent itself writes, most
+  recently active first; with repository workspaces (increment 11),
+  each worktree's state as well. Model-written fields, the title, the
+  todo item in progress (§12) and background command lines, and what
+  comes from refs a jail wrote, a worktree's branch and its commits
+  ahead of and behind its base, are shown only for the caller itself,
+  so the listing is not a channel between conversations.
 - `send_message {to, text}`: queues a message for another conversation,
   which the window process routes. A message is delivered between turns:
   when the receiver's running turn ends, or at once if it is idle, it
   starts a turn as a user-role message labelled with its sender. Messages
   are asynchronous; a reply is a `send_message` back, which reaches the
-  sender the same way. `report` (§12) is a `send_message` to the
-  orchestrator with a status. A message is at most 32 KiB and a receiver
-  holds at most 16 undelivered; a send beyond either, or to an archived
-  or closed conversation, fails with a result that says which.
-- `history_search` and `history_read` (§12) take another conversation's
-  id.
+  sender the same way. A message is at most 32 KiB and a receiver holds
+  at most 16 undelivered; a send beyond either, to the sender itself, or
+  to a conversation that is archived or that the store does not hold,
+  fails with a result that says which.
+- `history_search` and `history_read` (§12) read the caller's own log,
+  or, with `conversation` naming another, that one's.
+- `todo_write`: the conversation's own plan (§12).
 
-A message from another conversation is untrusted content, whoever sent
-it, and reaches the receiver's classifier only in its untrusted field
-(§11); it is never the human's authority. Reading another conversation's
-log brings that conversation's content, its tool output included, into
-the reader's context and so to the reader's provider and anything the
-reader may later publish. So:
+**Crossings.** A message from another conversation is untrusted content,
+whoever sent it, and reaches the receiver's classifier only in its
+untrusted field (§11); it is never the human's authority. Reading
+another conversation's log brings that conversation's content, its tool
+output included, into the reader's context and so to the reader's
+provider and anything the reader may later publish. For both, every
+conversation counts as a workspace of its own, a fork included. So:
 
-- a workspace conversation reads and messages every conversation of its
-  own workspace (the workspace's conversation, its forks, and theirs),
-  and messages the orchestrator, without a crossing;
-- reading the orchestrator's log is a crossing for a workspace, since
-  that log holds every workspace's reports and whatever the orchestrator
-  read from them;
-- reading or messaging another workspace's conversation is a crossing
-  (§11), whose `discloses` question covers carrying content to a
-  workspace that can publish where the source cannot. An "always" answer
-  admits that direction and that operation only: allowing A to read B
-  lets neither B read A nor A message B;
-- the orchestrator reads and messages every conversation without a
-  crossing, since relaying is its work. It can therefore carry content
-  from one workspace to another, which §11's residual risks state; the
-  per-pair crossing stops a workspace reaching another directly, not
-  through the orchestrator.
+- a conversation reads and searches its own log without a crossing;
+- reading or searching another conversation's log, and messaging
+  another conversation, is a crossing, which the human decides on a
+  card (§11) before it happens, in `ask` and `auto` mode alike. The
+  card names the other conversation by its id and title and shows, for
+  a message, its text, as long as §11 lets a card part run and saying
+  what it leaves out; for a read or a search, the page or the query
+  asked for, and that the other log, tool output included, comes into
+  this conversation's context and so to its model's provider. A refusal
+  is the call's answer, telling the model not to reach the same result
+  another way;
+- the conversation process enforces the decision, as it does for
+  `write_file`, `edit_file`, `sed` and `shell`. The window's post
+  office checks every message again, whatever the sender checked: the
+  receiver exists, it is not the sender, the size bounds, and at most
+  16 undelivered;
+- increment 13 brings the rest of §11's design. An "always" answer
+  admits one operation in one direction for one pair: allowing A to
+  read B lets neither B read A nor A message B. In `auto` mode the
+  classifier decides a crossing, its `discloses` question covering
+  content carried to a conversation that can publish where the source
+  cannot. Until then every crossing is the human's, in both modes.
+
+**Trust.** No conversation holds authority another lacks. None can
+answer a card, create, archive or delete a conversation or workspace,
+change a workspace's rules, network policy or limits, admit a remote, or
+push except as §11 decides for its own workspace. A model can carry an
+injection it read into another conversation, by a message or by being
+read, and the design does not pretend otherwise; what bounds it is that
+the carrying is itself a crossing, that the injection gains no authority
+by it, and that what it can do there is what that conversation's
+workspace allows, decided there by §11. The human's "deny everywhere"
+rules bind every workspace, present and future (§11). The human can open
+any conversation and talk to it directly.
+
+**Notifications.** td-agent's own news of a workspace goes to that
+workspace's conversation and to the window, which shows it, and to no
+other conversation. A worktree that became ready or failed and a base
+branch that advanced after a store fetch (§7) are notices logged in the
+workspace's conversation between turns; a turn that finished, failed or
+is waiting for approval is the window's to show, on the conversation's
+row and as a notice when the conversation is not the one open. A
+worktree that became ready or failed wakes its idle conversation; a base
+branch advancing waits for its next turn. Nothing wakes a model on
+another conversation's behalf.
 
 **Wakes.** Two models can wake each other indefinitely, and so can a
 model and its own background processes. Every turn started by a message
 from another conversation or by a background exit notice counts against
 the receiver's wake budget, derived from the log: after twenty since the
-human last wrote to that conversation or to the orchestrator, those
-deliveries queue without starting turns and the human is notified. Two
-kinds of turn do not count, because something else bounds them: a firing
-of a schedule the human approved, bounded by its own times, and the
-orchestrator's notifications from workspaces, each caused by a
-workspace's own turn, bounded by that workspace's budget, or by a
-checkout or fetch, which no model can repeat at will. A base branch
-advancing wakes the orchestrator but is only a notice to a workspace
-conversation, waiting for its next turn. The human can pause any
-conversation; a paused conversation starts no turn until resumed,
-messages and notices to it queue, and schedule firings to it are skipped
-(below). Every turn is reserved against the cost limits as any other.
+human last wrote to that conversation, those deliveries queue without
+starting turns and the human is notified. Two kinds of turn do not
+count, because something else bounds them: a firing of a schedule the
+human approved, bounded by its own times, and a worktree's notice,
+caused by a checkout, which no model can repeat at will. The human can
+pause any conversation; a paused conversation starts no turn until
+resumed, messages and notices to it queue, and schedule firings to it
+are skipped (below). Every turn is reserved against the cost limits as
+any other.
 
 Conversations in another td-agent state directory, and other agent
 harnesses' sessions on the machine, are out of reach in this design.
@@ -489,20 +487,20 @@ increments of §18:
   names or macros; day of week 0 to 7, both 0 and 7 Sunday; when both
   day fields are restricted, either matching suffices, as in cron) or a
   single local time written `YYYY-MM-DDTHH:MM`, in the zone `TZ` names or
-  else `/etc/localtime`; a target conversation, the orchestrator by
-  default; the message text; and `catch_up`, default false;
+  else `/etc/localtime`; a target conversation, which is required and
+  has no default; the message text; and `catch_up`, default false;
 - the human creates one through a card or the composer. A model asks for
-  one with `schedule {cron | at, text, to?, catch_up?}`, which is a
+  one with `schedule {cron | at, text, to, catch_up?}`, which is a
   human-only crossing in both modes, because a schedule spends money
-  unattended; the card shows the next three times it fires and the
-  catch-up choice. The approval is stored with the schedule, binding its
-  target, times and text, and each firing gives the classifier that
-  record as the human's standing decision to run this task at this time;
-  it does not make a model-written text the human's instruction.
-  `schedules` lists, and `cancel_schedule` cancels, only the schedules
-  targeting the caller's own conversation, the orchestrator's covering
-  all; cancelling any other is the human's;
-- a schedule whose target is archived or closed stops firing and is
+  unattended; the card shows the target, the next three times it fires
+  and the catch-up choice. The approval is stored with the schedule,
+  binding its target, times and text, and each firing gives the
+  classifier that record as the human's standing decision to run this
+  task at this time; it does not make a model-written text the human's
+  instruction. `schedules` lists, and `cancel_schedule` cancels, only
+  the schedules targeting the caller's own conversation; cancelling any
+  other is the human's;
+- a schedule whose target is archived or deleted stops firing and is
   shown as such until the human removes it;
 - schedules live in the state directory, written by the window process,
   and fire only while it runs; there is no system timer or service.
@@ -521,46 +519,38 @@ increments of §18:
   A firing to a conversation the human has paused is skipped and logged
   the same way.
 
-**As built (increment 8).** There are no workspaces yet, so every
-conversation is a workspace of its own and the orchestrator is the only
-other party it reaches. The orchestrator has `conversations`,
-`send_message`, `history_search`, `history_read` and `todo_write`; a
-conversation has `todo_write`, `history_search`, `history_read`,
-`conversations`, `send_message` and `report`. The crossing rules are
-`tools::crossing`, applied by the caller and again by the window: a
-conversation reads its own log, and the orchestrator reads and messages
-every conversation; any conversation messages the orchestrator; reading
-the orchestrator's log, and reading or messaging another conversation,
-are refused, saying that crossings are decided from a later increment
-and are not to be reached another way. No conversation messages
-itself. Archived and closed conversations do not exist until
-`close_workspace` (increment 11): a send to an id the store does not
-hold is refused by name, and the archived and closed checks join with
-them. A report's status is `in_progress`, `done` or `blocked`, and a
-report goes to the orchestrator alone. `conversations` lists at most
-200, the orchestrator first and then the most recently active, with
-how many more there are.
+**As built (increment 8).** Every conversation has `todo_write`,
+`history_search`, `history_read`, `conversations` and `send_message`, a
+workspace's tools after them (§12). The crossing rules are those above:
+a conversation reads its own log, and every read of another's and every
+message to another is a crossing, decided as "As built (peers)" says.
+No conversation messages itself. Archived conversations do not exist
+until the archive step (§18): a send to an id the store does not hold is
+refused by name, and the archived check joins it then. `conversations`
+lists at most 200, the most recently active first, with how many more
+there are.
 
 - **A message** reaches its receiver's model as a user-role message whose
-  first line is its label: `[a message from the orchestrator, not from
-  the person]`, `[a message from conversation ID, not from the person]`
-  or `[a report from conversation ID, status S, not from the person]`.
-  The receiver logs it as a `message` event (§6) and decides there and
-  then, between turns, whether it starts one.
+  first line is its label, `[a message from conversation ID, not from
+  the person]`. The receiver logs it as a `message` event (§6) and
+  decides there and then, between turns, whether it starts one. A
+  message logged, or queued in the outbox, by an older td-agent keeps
+  the label it was given, byte for byte, whenever a request carries it
+  again: `[a message from the orchestrator, not from the person]` for
+  one whose sender's role was `orchestrator`, and `[a report from
+  conversation ID, status S, not from the person]` for a `report`, its
+  status `in_progress`, `done` or `blocked`.
 - **The wake budget** is counted from the receiver's log: the first turn
-  of each message from another conversation, not a report, after the
-  human's last message in that log and after their last message to the
-  orchestrator, read from its log by time, a turn in the same second as
-  that message counting as before it. A turn the human asks again
-  (`C-r`) does not count. A report does not count: it is the
-  orchestrator's notification of a conversation's own turn, which that
-  conversation's budget bounds; nor does the orchestrator's own budget
-  stop it. Past twenty, a message is logged `held` without starting a
-  turn, and the first held since the budget was renewed adds a notice
-  saying so, which the window also shows when the conversation is in
-  the background. A held message is in the log, so the next turn's
-  request carries it; the human writing to the conversation or to the
-  orchestrator renews the budget.
+  of each message from another conversation after the human's last
+  message in that log. A turn the human asks again (`C-r`) does not
+  count, nor does a report an older log holds: it was the notification
+  of its sender's own turn, which the sender's budget bounded. Past
+  twenty, a message is logged `held` without starting a turn, and the
+  first held since the budget was renewed adds a notice saying so, which
+  the window also shows when the conversation is in the background. A
+  held message is in the log, so the next turn's request carries it; the
+  human writing to the conversation renews the budget, and nothing else
+  does.
 - **Pausing** is `C-S-p` on the open conversation (§4). It is logged as
   a `pause` event and kept in `meta`, which an open puts right from the
   log's last `pause` should a process have died between the two, so it
@@ -574,25 +564,55 @@ how many more there are.
   resumes a paused conversation, logging the resumption, and is
   answered as always.
 
+**As built (peers).** No conversation is created at startup: the window
+opens the most recently active conversation, or none when the store
+holds none, and the human starts one with `C-n` (§4). Every conversation
+has the same tools and the same system prompt (§13), a workspace's tools
+and paragraph aside. Crossings are cards in both modes: the conversation
+process asks the window, as it does for a change (§11, "As built
+(increment 10)"), waits, and runs the read or sends the message only
+when the human allowed it; a refusal, or a card withdrawn, is the call's
+answer. `report` is gone, and a model that calls it is answered as for
+any tool it was not given. An old orchestrator conversation, whose
+`meta` says role `orchestrator`, is an ordinary conversation with no
+workspace, kept, listed, opened and deleted like any other; its prefix
+differs from the one written now, so it takes the new one as a `prefix`
+event before its next request (§6). The `role` stays in `meta` and in
+logged `message` events only as data, so old logs and outbox files keep
+reading and old messages keep their labels; nothing else decides by it
+but that one made as the orchestrator keeps its title, the title model
+never asked.
+`conversations` lists by last activity alone, to the millisecond and
+then by id as the window's list does, at most 200.
+`orchestrator_model` is retired: a configuration that sets it loads,
+with a note that the key is no longer read (§15). The wake budget is
+renewed only by the human's message to that conversation.
+
 ## 4. Window and layout
 
 td-agent is a td-ui widget window (td-ui/DESIGN.md, "Widget window"). A
 horizontal `split::Controller` divides it. The preferred share persists in
 the state directory, which the toolkit's widget leaves to the consumer.
 
-**Left: conversations.** The orchestrator first, then the workspaces, most
-recently active first, as a tree table (td-ui/DESIGN.md, "Shared tree
-table"): each workspace row shows its name, conversation state (idle,
-running, waiting for approval, failed) and branch, and opens to its
-worktrees with their state (fetching, checking out, ready, failed), any
-forked conversations, and its background processes (§12). A row waiting
-for approval is marked distinctly, so a run left in the background is
-visible from the list.
+**Left: conversations.** Every conversation, most recently active
+first and none pinned, as a tree table (td-ui/DESIGN.md, "Shared tree
+table"): each row shows its title, its workspace (the template's name or
+the directory), conversation state (idle, running, waiting for approval,
+failed) and branch, and opens to its worktrees with their state
+(fetching, checking out, ready, failed), any forked conversations, and
+its background processes (§12). A row waiting for approval is marked
+distinctly, so a run left in the background is visible from the list,
+and the notifications of §3 are shown on their conversation's row. A
+row's context menu (the context menus step of §18) archives the
+conversation or deletes it (below); archiving hides it from the list,
+which shows archived conversations when the human asks, each with a
+context menu that unarchives it. A repository workspace's worktrees go
+with either as §7 says.
 
 **Right: the active conversation.** From top to bottom:
 
-- the transcript, a message list (below). It holds user, orchestrator and
-  assistant messages; reasoning, collapsed to one line until opened; tool
+- the transcript, a message list (below). It holds user and assistant
+  messages; reasoning, collapsed to one line until opened; tool
   calls as blocks with their arguments, status and a bounded excerpt of
   their result; verdicts; messages from other conversations and
   schedules, labelled with their source; and a divider where compaction
@@ -627,11 +647,11 @@ Everything else the list draws (wrapping, collapsing, scrolling and paging)
 is the list's own, under the same raster and typeface contracts as the
 toolkit's other widgets.
 
-**Keys.** `C-n` new workspace card, `C-PageUp`/`C-PageDown` previous/next
-conversation, `Escape` interrupt the running turn. A card never takes focus
-by itself, so a `y` typed into the composer as a card appears answers
-nothing; the human focuses the card (`C-Space` or the pointer) and then
-answers `y` or `n`.
+**Keys.** `C-n` new conversation, through the template chooser of §7,
+`C-PageUp`/`C-PageDown` previous/next conversation, `Escape` interrupt
+the running turn. A card never takes focus by itself, so a `y` typed
+into the composer as a card appears answers nothing; the human focuses
+the card (`C-Space` or the pointer) and then answers `y` or `n`.
 
 The window is operable through td-ui's driven control socket (td-ui/DESIGN.md,
 "The semantic seam"), which is how the native compositor tests and an
@@ -642,21 +662,20 @@ jail instance is ever given that directory.
 The window is the window process's alone; conversation processes draw
 nothing (§2).
 
-**As built (increment 4).** There are no workspaces yet, so each
-conversation counts as a workspace of its own: the list is the
-orchestrator, then every other conversation, most recently active first,
+**As built (increment 4).** Each conversation counts as a workspace of
+its own: the list is every conversation, most recently active first,
 with the state of the open one (`starting`, `idle`, `restarting` or
 `failed`; a closed one shows none), and `C-n` starts a conversation
-rather than a workspace card. `F6` and `S-F6` move the focus between the
-list, the transcript and the composer, and `Return` on a list row opens
-it. The transcript holds what td-ui's message list bounds it to (16 MiB
-of text); past that it drops its oldest messages an eighth at a time and
-says so, and the log keeps every one. The status row is the state, a
-notice when there is one, `no model`, the mode, `no limits` and `0
-background`. The split's share is the file `layout` in the state
-directory. The driven control socket is opt-in, `--control-socket PATH`,
-and its actions are `new`, `previous`, `next`, `send`, `focus-next` and
-`focus-previous`.
+with no workspace until the templates step makes it open the chooser of
+§7. `F6` and `S-F6` move the focus between the list, the transcript
+and the composer, and `Return` on a list row opens it. The transcript
+holds what td-ui's message list bounds it to (16 MiB of text); past that
+it drops its oldest messages an eighth at a time and says so, and the
+log keeps every one. The status row is the state, a notice when there is
+one, `no model`, the mode, `no limits` and `0 background`. The split's
+share is the file `layout` in the state directory. The driven control
+socket is opt-in, `--control-socket PATH`, and its actions are `new`,
+`previous`, `next`, `send`, `focus-next` and `focus-previous`.
 
 **As built (increment 5).** A row's state may also be `running`, while
 a turn is under way. A reply shows as an `assistant` message: its
@@ -709,13 +728,14 @@ again; `C-S-t` clears it, which the conversation logs. `C-S-p` pauses or
 resumes the open conversation (§3); the list and the status row say
 `paused` while it is. `C-p` stays the composer's. The driven actions
 are `pause`, `todo` and `clear-todo`. The transcript shows a message
-from another conversation under its sender, a report with its status,
-and one held with the verdict `held: paused` or `held: wake budget`; it
-gets the status of the turn it starts as a human message does. A reply
-that calls tools carries a `tool calls` excerpt naming each call with
-its arguments, and each result is a `tool NAME` block, an excerpt of
-the result whose copy action copies the whole, marked `error` when it is
-one. A pause, a resumption and a cleared list are `td-agent` notices.
+from another conversation under its sender, a report an older log
+holds with its status, and one held with the verdict `held: paused` or
+`held: wake budget`; it gets the status of the turn it starts as a human
+message does. A reply that calls tools carries a `tool calls` excerpt
+naming each call with its arguments, and each result is a `tool NAME`
+block, an excerpt of the result whose copy action copies the whole,
+marked `error` when it is one. A pause, a resumption and a cleared list
+are `td-agent` notices.
 
 **As built (the File menu).** A menu bar, td-ui's `chrome::Bar`, takes
 the window's top row, and the split lies under it. Its headers, `File`,
@@ -824,11 +844,11 @@ before the input and reports it after, and `Session` answers
 choice they leave is cleared before the window's next input.
 
 **As built (the Conversation menu).** Each conversation has its own
-model and reasoning effort. The configuration's `model` (or
-`orchestrator_model`) and `reasoning_effort` (§15) are what a
-conversation starts with and keeps until the human chooses otherwise,
-and a choice is the open conversation's alone: it moves to no other,
-and the configuration file is never written. The default model, which
+model and reasoning effort. The configuration's `model` and
+`reasoning_effort` (§15) are what every conversation starts with and
+keeps until the human chooses otherwise, and a choice is the open
+conversation's alone: it moves to no other, and the configuration file
+is never written. The default model, which
 a conversation with no model of its own uses, can be chosen from the
 window too (below).
 
@@ -886,17 +906,16 @@ window too (below).
   `model`: the window sends every conversation's process a fresh
   `Setup`, which it takes between turns as it takes a key, so new
   conversations and those with no model of their own use it from their
-  next turn. The orchestrator keeps `orchestrator_model`. What it is
-  set over is the configuration's `model` key as the file says it at
-  that moment, read again, or that the key is left out, so a change to
-  td-agent's built-in default is no edit. At start the saved default
-  holds while that key is unchanged; a `model` edited since is the
-  newer and wins, and the window forgets the saved default and says so
-  in a notice. The configuration file is not written.
+  next turn. What it is set over is the configuration's `model` key as
+  the file says it at that moment, read again, or that the key is left
+  out, so a change to td-agent's built-in default is no edit. At start
+  the saved default holds while that key is unchanged; a `model` edited
+  since is the newer and wins, and the window forgets the saved default
+  and says so in a notice. The configuration file is not written.
 - **Refusals** that name where a model was set (§5) say `the
-  conversation's model (Conversation → Model…)` for a chosen one,
-  `orchestrator_model` for the orchestrator's otherwise, and `` `model`
-  or the default model (Conversation → Default model…) `` for another's.
+  conversation's model (Conversation → Model…)` for a chosen one, and
+  `` `model` or the default model (Conversation → Default model…) ``
+  otherwise.
 - **The status row** names the open conversation's model and then its
   effort (`anthropic/claude-sonnet-5.5 medium`), or `no reasoning` for
   a model that does not take one, and its context length is looked up
@@ -935,9 +954,9 @@ shows it again. A prefix of more messages than a message holds
 sections shows the first fourteen and says how many more there are.
 
 **As built (deleting a conversation).** Conversation → `Delete
-conversation…` deletes the open conversation for good. It is off for the
-orchestrator, which is the one conversation always there, and with none
-open.
+conversation…` deletes the open conversation for good, whichever it is;
+it is off only with none open. The context menus step puts it on a
+row's context menu too (§4, Left).
 
 - **The question** is td-ui's confirmation dialog (td-ui/DESIGN.md),
   modal and centred over the window's body: it names the conversation
@@ -949,16 +968,16 @@ open.
   dialog, or a window too small for it closes it with nothing deleted.
   While it is open it has every key and the pointer, and a paste is
   dropped with a notice.
-- **The deletion** is the window's, and never the orchestrator's, in
-  this order: the conversation's processes, open, in the background or
-  retiring, are killed and waited for; its
-  ledger reservations go; then the
-  store deletes its directory (§6). The store takes the conversation's
+- **The deletion** is the window's, and never a model's, in this order:
+  the conversation's processes, open, in the background or retiring,
+  are killed and waited for; its ledger reservations go; then the store
+  deletes its directory (§6). The store takes the conversation's
   lock first, so it never deletes under a writer, holds it to the end,
   and renames the directory out of the list before removing it; one
   whose directory was never made is deleted already. Only then does
   what the outbox holds for it go. The window drops its row and, when it
-  was the one open, opens the orchestrator. A deletion refused before
+  was the one open, opens the most recently active conversation left,
+  or none. A deletion refused before
   the rename says why, and the conversation stays whole: the human's
   messages it had not acknowledged are parked for its next process and
   the outbox keeps the others'. Once renamed it is deleted; files a
@@ -1090,13 +1109,13 @@ usage.
 
 **Usage and cost.** The final response, or the final chunk when
 streaming, carries `usage`, including `cost` in credits. It is recorded per
-request and summed per turn, per conversation and across the orchestrator
-and its workspaces. `GET /api/v1/key` supplies the remaining credit for the
+request and summed per turn, per conversation and across conversations.
+`GET /api/v1/key` supplies the remaining credit for the
 status row. `GET /api/v1/models` is fetched at startup and cached in the
 state directory. It supplies `context_length`,
 `top_provider.max_completion_tokens`, `pricing`, and
 `supported_parameters`; a model lacking `tools` or `max_tokens` is
-refused for a workspace or the orchestrator with that reason.
+refused for a conversation with that reason.
 
 **Spending limits.** Cost is known only after a response, so limits are
 enforced by reservation. Before every request (acting, classifier,
@@ -1394,7 +1413,8 @@ removed; a listing skips it, and the window at its start finishes a
 removal whose lock nobody holds), holding:
 
 - `meta`: title, workspace, model, mode, parent conversation when forked,
-  and creation time.
+  creation time, whether it is archived, and a `role` kept only as data
+  (§3).
 - `prefix`: the exact bytes of the request prefix (§13), written once at
   creation and never rewritten. A later td-agent whose prompt or tool
   definitions differ appends a new prefix as a log event instead, which
@@ -1515,9 +1535,9 @@ a whole reply is quoted in the title request.
 ones and read as false. New events:
 
 - `message`: a message from another conversation, with its delivery id,
-  sender, sender's role, text, a report's status, and `held` (`paused`
-  or `budget`) when it started no turn; its delivery id is logged once,
-  as a user message's is.
+  sender, sender's role (data only, §3), text, the status of a report an
+  older td-agent sent, and `held` (`paused` or `budget`) when it started
+  no turn; its delivery id is logged once, as a user message's is.
 - `tool_call`: the reply it belongs to, the call's id and tool, logged
   and synced before the call runs.
 - `tool_result`: the reply, the call's id and tool, the `tool_call` it
@@ -1618,9 +1638,59 @@ window process, from the key dialog of §4. Nothing else writes it.
 
 ## 7. Workspaces
 
-A workspace is a directory of git worktrees, a policy, and one
-conversation. It is created by the orchestrator's `create_workspace`, or
-by the human through the same card, and lives until closed.
+A workspace is what a conversation's tools work in, a policy, and one
+conversation: a private empty directory, a directory of the human's, or
+a directory of sparse git worktrees. It is made when the human creates
+its conversation, from a template, and lives until that conversation is
+archived or deleted (Archiving and deleting, below). Creating one is the
+human's act; no model creates a workspace, and nothing a model says
+chooses a template. A conversation made before templates may have no
+workspace, and then has no file, shell or git tools.
+
+**Templates.** Every new conversation starts from a workspace template
+the human chooses. `C-n` and File → `New conversation…` open a chooser,
+td-ui's finder as the model picker uses it (§4), listing the built-ins
+first and then the configuration's `[[template]]` entries (§15) in the
+order written; `Return` creates the conversation from the one selected
+and `Escape` creates nothing.
+
+- **Empty** is always listed: a private, empty scratch directory in the
+  conversation's jail directory, with the file and shell tools and no
+  git checkouts, for general assistance or scratch work (Empty and
+  directory workspaces, below).
+- **Directory…** is always listed: the folder chooser, over a directory
+  of the human's, admitted per §8.
+- **A configured template** is listed by its `name`. It names the git
+  repositories to check out, each a remote, a base, a branch and sparse
+  paths; the shared directories its workspaces bind, when it names
+  them, in place of the configured `shared` list; and, later, its
+  network policy (§10). A
+  template that names no repository makes an Empty workspace with its
+  own shared directories.
+
+Choosing is the decision: no card follows it but a remote's admission
+(below). A template's repositories are prepared by increment 11's git
+worker (below); until it lands, a template that names any is refused at
+creation, saying that repository workspaces come with increment 11, and
+nothing is made. The conversation starts on the human's first message,
+which can be sent at once. Two workspaces made from one template work
+on branches of the same name, each in a repository of its own (below),
+and a push names the remote branch it writes (§9).
+
+The templates step builds the chooser, `[[template]]` and the two
+built-ins, which replace File's two workspace items (As built
+(increment 10, workspaces), below); increment 11 builds what a
+template's `repos` asks for: the store, the git worker, workspace
+repositories and their worktrees, everything from Layout to Keeping
+current below, and the workspace card.
+
+**The workspace card.** A repository workspace has a card of its own,
+shown in its conversation once its bases are fetched and kept behind its
+status row: it lists each repository's `.td-agent/rules`, shows the
+project instructions beside the mark that trusts them (§11, §13), and
+recommends against opening the tree in tools that execute on open
+(§8). It decides nothing about the creation, which the human's choice
+of template already made.
 
 **Layout.**
 
@@ -1656,50 +1726,59 @@ $XDG_DATA_HOME/td-agent/
   add`; `set`, `init` and `disable` write configuration and fail there.
 - The workspace tree's root is `workspace_root` (default `~/td-agent`),
   admitted like any source (§8).
+- A workspace's `<name>` is made by td-agent from its template's name
+  and its conversation's id, so that no two workspaces share one.
 
 **Admitted remotes.** A remote is the human's decision: a URL, or a host
 with a path prefix matched on whole path segments after normalization, in
 `remotes` in configuration or added through a card.
 Only `https` and `ssh` transports are admitted, never `file`, a local path,
-`ext` or plain `http`. A `create_workspace` naming any other remote is a
-human-only crossing in both modes (§11), because cloning it runs outside
-any jail with the human's credentials and bypasses the egress relay. Branch
-and base names are checked as git ref names before use and passed after
-`--end-of-options`.
+`ext` or plain `http`. Naming a remote in a template does not admit it:
+choosing a template whose remote is not admitted asks the human, on a
+card in both modes, to admit it, saying that cloning it runs outside any
+jail with the human's credentials and bypasses the egress relay;
+refused, nothing is made. A remote of another transport is refused
+outright. Branch and base names are checked as git ref names before use
+and passed after `--end-of-options`.
 
-**Asynchronous from the first increment.** `create_workspace` returns at
-once. Each worktree then moves through `fetching` (clone or fetch of the
-store), `checking-out` (workspace repository, worktree, sparse checkout,
-done in a maintenance instance, §9) and `ready`, or `failed` with the
-reason. Several worktrees, and several workspaces, prepare at once,
-bounded by `fetch_concurrency`. The conversation's first model request
-waits only for `fetching`: its project instructions and the repository's
-`.td-agent/rules` are read from each base commit in the store by the git
-worker outside any jail, with `cat-file` on the trusted store (§13); they
-are upstream's content at the base and need no checkout. A tool call
-that touches a worktree still checking out gets a result that names its
-state, and the conversation and the orchestrator are each notified when
-it becomes ready. A jail instance binds a worktree only once it is ready;
-the long-lived file-tool instance is replaced whenever the set of ready
-worktrees changes.
+**Asynchronous from the first increment.** Creating a conversation from
+a repository template returns at once. Each worktree then moves through
+`fetching` (clone or fetch of the store), `checking-out` (workspace
+repository, worktree, sparse checkout, done in a maintenance instance,
+§9) and `ready`, or `failed` with the reason. Several worktrees, and
+several workspaces, prepare at once, bounded by `fetch_concurrency`. The
+conversation's first model request waits only for `fetching`: its
+project instructions and the repository's `.td-agent/rules` are read
+from each base commit in the store by the git worker outside any jail,
+with `cat-file` on the trusted store (§13); they are upstream's content
+at the base and need no checkout. A tool call that touches a worktree
+still checking out gets a result that names its state, and the
+conversation is notified when it becomes ready or fails, which the
+window shows too (§3, Notifications). A jail instance binds a worktree
+only once it is ready; the long-lived file-tool instance is replaced
+whenever the set of ready worktrees changes.
 
 **Keeping current.** The git worker fetches each store remote in the
 background every `fetch_interval` (default ten minutes) and on demand
-(`fetch` from the orchestrator, `git_fetch` from a workspace). It then
-updates each workspace repository's remote-tracking refs from the store in
-a maintenance instance, so a workspace sees new upstream commits without
-any network in its jail, and notifies the orchestrator and each workspace
-conversation whose base advanced. Rebasing is the conversation's own work.
+(`git_fetch` from a workspace's conversation, §9). It then updates each
+workspace repository's remote-tracking refs from the store in a
+maintenance instance, so a workspace sees new upstream commits without
+any network in its jail, and notifies each workspace conversation whose
+base advanced, which the window shows too. Rebasing is the
+conversation's own work.
 
-**Directory and scratch workspaces.** A human may instead admit an
-existing directory that is not a git repository, or ask for a scratch
-workspace under the jail directory for a general-assistant conversation.
-Neither has git management. A directory whose top holds a `.git` is
-refused with a pointer to a repository workspace.
+**Empty and directory workspaces.** The Empty template makes a scratch
+workspace under the jail directory, for a general-assistant conversation
+or scratch work; Directory… admits an existing directory of the human's
+that is not a git repository. Neither has git management. A directory
+whose top holds a `.git` is refused with a pointer to a repository
+template.
 
-**As built (increment 10, workspaces).** File → New scratch
-conversation, and File → New conversation in a directory…, which opens
-td-ui's finder over the human's folders (Return enters one, Backspace
+**As built (increment 10, workspaces).** File has two workspace items,
+which the templates step folds into the chooser as its built-ins: New
+scratch conversation, which becomes Empty, and New conversation in a
+directory…, which becomes Directory… and opens td-ui's finder over the
+human's folders (Return enters one, Backspace
 goes up, Control+Return chooses the one listed; a repository's top is
 marked `git`, a link `link`, hidden names left out). The window admits
 the directory when it is chosen, before the conversation exists, and
@@ -1717,8 +1796,9 @@ holding the instances' `home/`, a scratch workspace's `scratch/`, and
 `specs/`, which its process clears whenever it starts. A directory
 workspace is the human's and is never removed. Deleting the
 conversation renames its jail directory out of the way and removes it
-on a thread of its own, with the walk Closing describes; the window's
-start does the same for one left without its conversation or cut short.
+on a thread of its own, with the walk Archiving and deleting describes;
+the window's start does the same for one left without its conversation
+or cut short.
 The walk goes through directory descriptors opened without following a
 link, so a process still running in the tree cannot turn it out of the
 tree, and holds at most 256 open, moving a deeper directory up within
@@ -1730,18 +1810,32 @@ home directory rather than a `~/Downloads` that a workspace reaches.
 The model's tools in a workspace are §12's (As built (increment 10,
 the tools)), each change and command decided by the human (§11).
 
-**Closing.** `close_workspace` stops the workspace's instances, then asks a
-maintenance instance whether each worktree is clean and each branch's tip
-has been pushed. That answer is jail-controlled, so a workspace that
-reports anything uncommitted, untracked or unpushed, or whose answer
-cannot be read, is closed only on the human's confirmation listing what
-would be lost. td-agent then removes the workspace tree
-`~/td-agent/<name>/` with its worktrees, the workspace repository, the
-publish repository and the workspace's jail HOME with a
-walk of its own that never follows a symbolic link and restores the
-owner's permissions on a directory the jail left unreadable before
-descending; it never runs `git worktree remove`, which would run git over
-jail-written content. The store is left alone.
+**Archiving and deleting.** The human archives or deletes a conversation
+from its row in the list (§4); no model can. Archiving keeps the
+conversation's log and hides it from the list until unarchived; it
+stops the conversation's processes, its background ones included
+(§12), and its schedules (§3). Deleting removes the conversation for
+good (§4, As built (deleting a conversation)). A scratch workspace goes
+with a deleted conversation and stays with an archived one; a directory
+workspace is the human's and is never removed.
+
+A repository workspace goes with either, since its repositories keep
+the store from pruning (§9). Archiving or deleting its conversation
+stops the workspace's instances, then asks a maintenance instance
+whether each worktree is clean and each branch's tip has been pushed.
+That answer is jail-controlled, so a workspace that reports anything
+uncommitted, untracked or unpushed, or whose answer cannot be read, is
+removed only on the human's confirmation listing what would be lost;
+declined, the conversation is neither archived nor deleted. td-agent
+then removes the workspace tree `~/td-agent/<name>/` with its
+worktrees, the workspace repository, the publish repository and the
+workspace's jail HOME with a walk of its own that never follows a
+symbolic link and restores the owner's permissions on a directory the
+jail left unreadable before descending; it never runs `git worktree
+remove`, which would run git over jail-written content. The store is
+left alone. An unarchived conversation whose repository workspace was
+removed keeps its log; its file, shell and git tools then refuse,
+saying the workspace went with the archive.
 
 ## 8. The workspace jail
 
@@ -1780,9 +1874,9 @@ Every instance has:
   human can hand the agent files; the agent hands files back in the
   workspace tree, which the human reads. A directory configured
   read-write joins every workspace that shares it, so it is a channel
-  between workspaces and is the human's explicit choice. A workspace may
-  leave out any shared directory, through `create_workspace`'s `unshared`
-  list or the workspace card, which narrows and needs no decision.
+  between workspaces and is the human's explicit choice. A template may
+  name its own shared directories in place of the configured list
+  (§7, §15), which is the human's choice as the list is.
 - **System:** the system's executable and library trees and a selective
   `/etc`, read-only, and td-agent's own tool host and td-txt, read-only.
   No cgroupfs, no `/sys`.
@@ -2101,7 +2195,7 @@ launching process with `SIGKILL` and find no process of its instance
 left, the command it was running included.
 
 **Unconfined workspaces.** The one way to run tools without a jail is a
-choice the human makes when creating a directory or scratch workspace;
+choice the human makes when creating an Empty or Directory… workspace;
 repository workspaces are always jailed. It is shown in the status row and
 the list, every action in it goes to the human (§11), and it is still
 given only the pipe and the scrubbed environment. Its commands can reach
@@ -2135,15 +2229,15 @@ workspace's own conversation process (§2).
   command that touches a workspace repository: checking out a worktree
   td-agent created (§8) and its sparse patterns, updating remote-tracking
   refs from the store (bound read-only), gc, the ahead-and-behind counts
-  `conversations` shows, the cleanliness check before closing, and exporting a
-  commit for a push. Its git reads no configuration the model can write:
-  `HOME` is an empty read-only directory, `GIT_CONFIG_NOSYSTEM=1`,
-  `GIT_CONFIG_GLOBAL=/dev/null`, hooks and fsmonitor are forced off on
-  the command line as in the repository's configuration, and `GIT_DIR`
-  and `GIT_WORK_TREE` are set, so a nested `.git` the model made cannot
-  steer discovery. Everything it
-  reports is still jail-controlled data, since the refs and objects it
-  reads are the model's, and is shown as such.
+  `conversations` shows, the cleanliness check before archiving or
+  deleting, and exporting a commit for a push. Its git reads no
+  configuration the model can write: `HOME` is an empty read-only
+  directory, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+  hooks and fsmonitor are forced off on the command line as in the
+  repository's configuration, and `GIT_DIR` and `GIT_WORK_TREE` are set,
+  so a nested `.git` the model made cannot steer discovery. Everything
+  it reports is still jail-controlled data, since the refs and objects
+  it reads are the model's, and is shown as such.
 
 Every outside invocation is fixed in shape:
 
@@ -2211,9 +2305,11 @@ always go to the human. Another push is the classifier's in `auto` mode
 and the human's in `ask` mode. The tool pushes only `refs/heads/`, so
 branch deletion and tags are not expressible through it.
 
-**Fetching** is `git_fetch {worktree}`: an immediate store fetch and
-remote-tracking update for that workspace, which moves data in from an
-admitted remote and needs no approval.
+**Fetching** is `git_fetch {worktree}`, a repository workspace's tool:
+an immediate store fetch and remote-tracking update for that workspace,
+which moves data in from an admitted remote and needs no approval. It is
+the only fetch a model asks for; the background fetch of §7 does the
+rest.
 
 **Object lifetime.** Workspace and publish repositories borrow the
 store's objects, and store gc cannot see their refs, so the store never
@@ -2245,7 +2341,8 @@ A workspace has one of three network policies, shown in the status row:
   until the human admits its registry. Another
   destination is a crossing (§11): the connection waits while it is
   decided, and an "always" answer adds it to this workspace's allowlist.
-- `open`: any destination the relay will reach. Only the human sets it.
+- `open`: any destination the relay will reach. Only the human sets it,
+  on a card or in a template (§7).
 
 An allowlisted host is a standing decision by the human, and one that
 accepts uploads remains a possible channel out; the card that adds one
@@ -2292,13 +2389,11 @@ flag lets injected text lower its own bar.
 
 | Action | `ask` mode | `auto` mode |
 |---|---|---|
-| reads, grep, glob, todo, question, report, git_fetch | run | run |
+| reads, grep, glob, todo, question, git_fetch | run | run |
 | listing, reading, waiting on and killing own background processes | run | run |
 | history of its own conversation; `conversations` | run | run |
-| reading or messaging a conversation of its own workspace; messaging the orchestrator | run | run |
-| orchestrator: fetch, ask_user, reading or messaging any conversation | run | run |
 | file edits, sed, shell (background and local commits included) inside the jail | human | run |
-| reading or messaging another workspace's conversation; reading the orchestrator's log | human | classifier |
+| reading or messaging another conversation (§3) | human | classifier |
 | `schedule` | human | human |
 | network to a destination on the workspace allowlist | run | run |
 | network to another destination, policy `allowlist` | human | classifier |
@@ -2306,11 +2401,15 @@ flag lets injected text lower its own bar.
 | git_push to a protected branch, forced, or a scan match | human | human |
 | `request_directory`, read-only | human | classifier |
 | `request_directory`, read-write | human | human |
-| orchestrator: create a workspace on an admitted remote, within defaults | human | run |
-| orchestrator: create a workspace on any other remote, or beyond defaults | human | human |
-| orchestrator: close a workspace not reported clean and pushed | human | human |
 | network policy `open`, shared directories, limits, remotes, rules, modes | human | human |
 | anything in an unconfined workspace, reads included | human | human |
+
+Creating a conversation and its workspace from a template, and archiving
+or deleting one, are the human's own acts (§7), never a model's, so the
+table has no row for them; admitting a template's remote and confirming
+what removing a workspace would lose are the human's cards there. A
+crossing between conversations is the human's in both modes until
+increment 13 brings the classifier's row and "always" answers (§3).
 
 **Order.** Deny rules first, and they always win. Then ask rules, the
 human's and the workspace's. Then the human-only rows, which no rule can
@@ -2350,7 +2449,7 @@ which costs attention but never safety; the workspace card lists them.
 Allow rules come only from the human, written by a card's "always"
 actions. A deny written by "always deny" applies, at the human's choice
 on the card, to this workspace or to every workspace, present and future,
-so that the orchestrator cannot shed it by creating a new workspace. A
+so that no conversation sheds it by working in a new workspace. A
 repository's own `.td-agent/rules`, read from the base commit (§7), may add
 deny and ask rules and nothing else, so a hostile checkout can narrow what
 runs but never widen it. A boundary the human states ("don't push")
@@ -2365,10 +2464,8 @@ arguments go to the human whatever the table says, as opencode's
 it decides runs only when both of its stages allow. Both see the same
 state, built from separated, labelled fields:
 
-- the human's messages: in the workspace conversation, and in the
-  orchestrator conversation up to and since the workspace's creation, so
-  that a task the orchestrator wrote can be traced to what the human
-  asked;
+- the human's messages in the workspace's conversation; a task another
+  conversation sent is in the untrusted field below, never here;
 - the project instructions of §13, only for a workspace the human marked
   trusted, labelled as project text and not the human's authority;
 - the workspace's policy: network policy and allowlist, admitted remotes,
@@ -2399,9 +2496,10 @@ shape it.
    (whether the action sends workspace content to a destination that is
    neither an admitted remote nor on the workspace's allowlist; a push to
    an admitted remote is therefore not by itself a disclosure). Content
-   carried to another workspace, by a message or a read, is a disclosure
-   when the receiving workspace's remotes, allowlist or network policy
-   reach a destination the source's do not, and the state says which.
+   carried to another conversation, by a message or a read, is a
+   disclosure when the receiving workspace's remotes, allowlist, network
+   policy or model provider reach a destination the source's do not, and
+   the state says which.
 2. **The reasoning stage** is a chat model named in configuration
    (`classifier_model`; the shipped default a bring-your-own-policy safety
    model such as `openai/gpt-oss-safeguard-20b`), given the same state and
@@ -2426,9 +2524,8 @@ result with an instruction not to work around it. The circuit breaker
 counts only actions the table gives the classifier: after three
 consecutive such actions it did not allow, or twenty in a workspace, the
 workspace drops to `ask` mode and says why; a human allow does not reset
-the run, and only the human restores `auto`, and while any workspace is
-dropped, the orchestrator's workspace creation goes to the human. Every
-verdict, with Jev's probabilities, is in the log.
+the run, and only the human restores `auto`. Every verdict, with Jev's
+probabilities, is in the log.
 
 **Taint.** At most two of untrusted input, sensitive access and outbound
 action should coexist without supervision. Every workspace holds its
@@ -2447,11 +2544,13 @@ hidden:
   a connection's destination but never the bytes sent;
 - a push publishes whatever the branch holds, which the model wrote after
   reading untrusted input; the evidence and scan narrow that, not close it;
-- the orchestrator relays text between workspaces, so an injection read in
-  one can be written into another's task, and content one workspace may
-  not send another directly can reach it through the orchestrator's
-  reads and messages, which cross nothing (§3); it reaches the classifier
-  only in the untrusted field, and the human's global denies follow it;
+- a crossing the human or the classifier allows carries text from one
+  conversation to another, so an injection read in one can be written
+  into another's context; and a log holds what its conversation read
+  from others, so allowing C to read B also lets C see what B read of A.
+  Each step is a crossing of its own (§3); the text reaches the
+  classifier only in the untrusted field, and the human's global denies
+  follow it;
 - a read-only directory's contents reach the provider and the workspace
   once granted, which is why the credential locations of §8 are refused
   outright rather than left to the classifier.
@@ -2461,7 +2560,8 @@ is rendered as text in the message list, so it cannot draw one. A card
 shows the exact action (for a push, the commit id, remote, branch and
 evidence), the boundary it crosses, and the classifier's reason when there
 is one. Its choices are: allow once, deny, always allow in this
-workspace, always deny in this workspace, and always deny everywhere.
+workspace, always deny in this workspace, and always deny everywhere; a
+crossing's "always" answers name its pair and direction instead (§3).
 These approvals are not td elevation (principle 7). They govern what a
 workspace's jail and the git worker may do, grant nothing beyond the
 human's own authority, and carry no secure-attention claim. An action
@@ -2469,48 +2569,54 @@ needing elevation is out of td-agent's reach by design.
 
 **As built (increment 10).** There is only `ask` mode, and the human
 rows that arise are a workspace's `write_file`, `edit_file`, `sed` and
-`shell`. For each, the conversation process sends the window `{"type":
+`shell`, and every conversation's crossings (§3, As built (peers)). For
+each, the conversation process sends the window `{"type":
 "ask", "call", "title", "details"}`, `call` the call's `tool_call`
 record, and waits without a deadline, hearing the window meanwhile; the
 window answers `{"type": "decision", "call", "allow"}`. A card shows the
 exact action in td-agent's own lines, what runs before what it runs
 over: the command with its directory and timeout, a file with its whole
-new content, the text an edit replaces and its replacement, or a sed
-script and then its files. Each part shows at most 80 lines or 48 KiB (a
-command or a file 160), each line at most 2 KiB, and the card at most
-240 lines or 128 KiB, saying what it leaves out, so that no part pushes
-another off the card. Control characters, every whitespace character but
-a plain space, a tab included, and the invisible and bidirectional
-characters show as `<U+XXXX>`, so that nothing that looks like a space
+new content, the text an edit replaces and its replacement, a sed
+script and then its files, or a crossing's other conversation, by id
+and title, with the message it would send or the page or query it would
+read and that the other log comes into this conversation's context and
+so to its model's provider. Each part shows at most 80 lines or 48 KiB
+(a command, a file or a message 160), each line at most 2 KiB, and the
+card at most 240 lines or 128 KiB, saying what it leaves out, so that no
+part pushes another off the card. Control characters, every whitespace
+character but a plain space, a tab included, and the invisible and
+bidirectional characters show as `<U+XXXX>`, so that nothing that looks like a space
 can hide where `sh` ends a word and one command cannot pass for another
 that way; letters that look alike are not told apart. The window shows
 the open conversation's first card as td-ui's confirmation dialog, at
 most 100 cells by 24 rows, whenever nothing else is modal and it has the
 keyboard, `Cancel` focused, so `Return` alone refuses, as `Escape` does;
 `Allow` lets the call run. A card takes no key or press until 750 ms
-have passed with none, so what the human was typing or clicking does
-not decide it.
-Losing the keyboard sets the card aside, deciding nothing, and it comes
-back with the keyboard. Another conversation's card waits, its row
-saying `asks you`, until that conversation is opened; one the window
-cannot draw, in a window too small, waits and says so once. The choices
-are allow once and deny; the "always" choices come with rules (increment
-13). An interrupt, or the window closing, withdraws the card (`{"type":
-"withdraw", "call"}`) and the call is answered as not run, as is an
-allowed call whose interrupt came with its decision; a conversation
-process that restarts, fails or is deleted takes its cards with it. Each
-decision is an `approval` event before the call runs or is answered:
-`allow` or `deny` by `human`, or `withdrawn` by `td-agent` with why. A
-refusal reaches the model as the call's error, telling it not to reach
-the same result another way and to ask how the person would like to go
-on.
+have passed with none, so what the human was typing or clicking does not
+decide it. Losing the keyboard sets the card aside, deciding nothing,
+and it comes back with the keyboard. Another conversation's card waits,
+its row saying `asks you`, until that conversation is opened; one the
+window cannot draw, in a window too small, waits and says so once. The
+choices are allow once and deny; the "always" choices come with rules
+(increment 13). An interrupt, or the window closing, withdraws the card
+(`{"type": "withdraw", "call"}`) and the call is answered as not run, as
+is an allowed call whose interrupt came with its decision; a
+conversation process that restarts, fails or is deleted takes its cards
+with it. Each decision is an `approval` event before the call runs or is
+answered: `allow` or `deny` by `human`, or `withdrawn` by `td-agent`
+with why. A refusal reaches the model as the call's error, telling it
+not to reach the same result another way and to ask how the person would
+like to go on.
 
 ## 12. Tools
 
-A workspace conversation's tools are small and non-overlapping, following
+A conversation's tools are small and non-overlapping, following
 Anthropic's guidance on writing tools for agents: fewer tools, natural
 identifiers, actionable errors. Their definitions are fixed text in the
-prefix.
+prefix. Every conversation has the conversation tools, `todo_write`,
+the history tools, `conversations`, `send_message`, `question` and the
+schedule tools; its workspace adds the file, shell, process, directory
+and git tools, as far as the workspace has what they act on.
 
 - **`read_file {path, offset?, limit?}`**: line-numbered output, at most
   2,000 lines or 100 KiB. A partial view says so and names the next
@@ -2559,8 +2665,8 @@ prefix.
 - **`schedule`**, **`schedules`** and **`cancel_schedule`**: later, with
   schedules (§3).
 - **`question {question, options?}`**: asks the human on a card and
-  returns the answer, as opencode's `question` does.
-- **`report {status, summary}`**: sends a report to the orchestrator.
+  returns the answer, as opencode's `question` does; every conversation
+  has it, from a later increment (§18).
 - **`request_directory {path, write?}`**: asks for an extra host directory
   bound into this workspace's later instances, admitted per §8 and decided
   per §11.
@@ -2607,7 +2713,7 @@ for `timeout_ms` when the call gives one, at most 24 hours.
   MiB), dropping the oldest beyond that; a read from before the retained
   range starts at its beginning and says how many bytes were dropped.
   The output is kept after the process ends and across restarts, until
-  the conversation is archived or closed; `history_search` does not
+  the conversation is archived or deleted; `history_search` does not
   cover it, though the exit notice's tail, being in the log, is.
 - `process_wait {id, timeout_ms}`: returns when the process exits or the
   timeout passes (at most ten minutes), with its state and the tail of
@@ -2619,8 +2725,8 @@ one exits, a notice with its status and output tail is delivered between
 turns like a message (§3) and wakes the conversation if idle. Background
 processes are listed under their conversation in the window's tree, each
 with a kill action and its output viewable read-only, and the status row
-counts them. They end when killed, when their conversation is closed or
-archived, or when their conversation process exits; none survives
+counts them. They end when killed, when their conversation is archived
+or deleted, or when their conversation process exits; none survives
 td-agent, and on restart the log records each still running as lost. A
 background process keeps its conversation process running (§2). Each
 instance has its own network namespace, so a server one call starts is
@@ -2637,11 +2743,11 @@ items of `pending`, `in_progress`, `done` or `cancelled`, at most one in
 progress and at most 50 items of 500 bytes each, the semantics of Codex's
 `update_plan` and Claude Code's `TodoWrite`. The static text asks for one
 on work of three or more steps. Each write is a log event, so the list
-survives restarts and compaction (§14). It is drawn above the composer;
-`conversations` (§3) shows each conversation's item in progress, so the
-orchestrator and the human can follow work without reading transcripts;
-and the human can clear it. It has no effect outside the conversation and
-needs no approval. The orchestrator's list is its plan across workspaces.
+survives restarts and compaction (§14). It is drawn above the composer,
+so the human can follow work without reading the transcript;
+`conversations` (§3) shows a conversation its own item in progress and
+no other's; and the human can clear it. It has no effect outside the
+conversation and needs no approval.
 
 **The conversation's log.** The model's context is a view of the log
 (§6): compaction prunes and summarizes it (§14), and tool results are cut
@@ -2649,15 +2755,16 @@ for the model. The log itself keeps everything, and two tools reach it:
 
 - `history_search {query, conversation?, kinds?, limit?}`: events whose
   text contains every one of the query's terms, case-insensitively, newest
-  first; `kinds` narrows to user, orchestrator and conversation messages,
-  schedule firings, notifications and notices, assistant text, tool
-  calls, full tool results, approvals or compactions. In either tool, an
-  approval shows the model only its outcome and who decided it (a rule,
-  the classifier or the human), never Jev's probabilities or the
-  reasoning stage's reason, so an injected model cannot tune against the
-  classifier.
-  Each hit carries its sequence number, kind, time and a bounded excerpt
-  around the first match; at most `limit` hits (default 20, at most 100).
+  first; `kinds` narrows to user messages, messages from other
+  conversations (and an older log's from the orchestrator, which the
+  kind `orchestrator` names), schedule firings, notifications and
+  notices, assistant text, tool calls, full tool results, approvals or compactions. In
+  either tool, an approval shows the model only its outcome and who
+  decided it (a rule, the classifier or the human), never Jev's
+  probabilities or the reasoning stage's reason, so an injected model
+  cannot tune against the classifier. Each hit carries its sequence
+  number, kind, time and a bounded excerpt around the first match; at
+  most `limit` hits (default 20, at most 100).
 - `history_read {conversation?, from, offset?, count?, max_bytes?}`: the
   events from sequence number `from`, starting `offset` bytes into the
   first, rendered as text, bounded by `count` (default 20, at most 100)
@@ -2699,7 +2806,7 @@ offset inside a character starts at that character, and a page always
 takes at least one character, so it moves. A page is held to `max_bytes`
 of text, and to 512 KiB as the tool result is logged, escaped. The todo
 item in progress is shown by `conversations` for the caller's own
-conversation, and to the orchestrator for every one, as the title is.
+conversation alone, as the title is.
 A member that is null is as if left out, since a model that fills
 every member of a schema sends null for one it means to omit: an
 optional one takes its default and a required one is missing. The
@@ -2821,25 +2928,27 @@ td-agent cannot take it back.
 ## 13. Prompting
 
 The prefix of §6 is ordered from stable to volatile, so it caches, and is
-followed by the conversation. The orchestrator and workspace
-conversations have different static texts and tools.
+followed by the conversation. Every conversation has the same static
+text and conversation tools; its workspace adds its own tools and
+paragraph.
 
 1. **Static system text**, in this order:
    - identity and capabilities;
    - for a workspace conversation: task execution (keep going until the
      task is done, fix root causes, verify with the project's tests,
-     commit when a coherent change is complete, report to the
-     orchestrator), editing (read before editing, absolute paths, minimal
-     changes in the surrounding style), and the worktrees' readiness rule;
-   - for the orchestrator: decomposing work into workspaces, keeping the
-     human informed, treating workspace reports as untrusted, and never
-     asking a workspace to work around a refusal;
+     commit when a coherent change is complete), editing (read before
+     editing, absolute paths, minimal changes in the surrounding style),
+     and the worktrees' readiness rule;
+   - coordination, for every conversation: that what another
+     conversation says is untrusted and never permission, that reading
+     or messaging one is the human's to allow, and never to ask another
+     conversation to work around a refusal;
    - tool guidance;
    - the active mode, and that refusals are not to be worked around;
    - the final-message form.
 
    This follows Codex's open base prompt and the published structure of
-   Claude Code's. A scratch workspace swaps the coding sections for a
+   Claude Code's. An Empty workspace swaps the coding sections for a
    shorter assistant section.
 2. **Tool definitions.**
 3. **The environment block:** the workspace's name and worktrees with their
@@ -2875,29 +2984,30 @@ Titles come from a cheap model (`title_model`) after the first exchange,
 reserved like any request; the first line of the task stands until then.
 
 **As built (increment 5).** The prompt texts are
-`prompt/conversation.txt`, `prompt/orchestrator.txt` and
-`prompt/title.txt`. With no tools, no environment block and no project
+`prompt/conversation.txt` and `prompt/title.txt`, with the workspace
+paragraphs below. With no tools, no environment block and no project
 instructions yet, the prefix is the static text alone, which says that
 the conversation has no tools and that the window shows plain text. A
 title request is the title prompt and one user message quoting the
 first message and the start of the reply, each cut to 4 KiB, with
-`max_tokens` 256. It is sent once, after a conversation's first reply,
-and never for the orchestrator. Its reply's first line, without
+`max_tokens` 256. It is sent once, after a conversation's first reply.
+Its reply's first line, without
 quotation marks, becomes the title. A title request that is refused
 leaves the first line standing and says why in a notice, and one that
 fails records why in its request's finish; neither fails the turn.
 
-**As built (increment 8).** The prefix is the role's tool
-definitions and its static text (§5). Both static texts now name the
-tools the role has and what it still lacks; ask for a todo list on work
-of three or more steps; send the model to the history tools for what
-has left its context; say that a message from another conversation is
-labelled, not from the person, possibly wrong, and never permission;
-say that messages are delivered later and not to wait for a reply; and
-say that a refused crossing is not to be worked around. A
-conversation's text asks it to `report` to the orchestrator when the
-orchestrator gave it work; the orchestrator's asks it to weigh reports,
-and that each message it sends can start a turn that costs money.
+**As built (increment 8).** The prefix is the conversation's tool
+definitions and its static text (§5), the same for every conversation
+but for a workspace's tools and paragraph. The static text names the
+tools the conversation has and what it still lacks; asks for a todo
+list on work of three or more steps; sends the model to the history
+tools for what has left its context; says that a message from another
+conversation is labelled, not from the person, possibly wrong, and
+never permission; that reading another conversation or messaging it is
+the person's to allow, on a card, and that a refused crossing is not to
+be worked around; that messages are delivered later and not to wait for
+a reply; and that each message it sends can start a turn that costs
+money.
 
 **As built (the environment block and message times).** The system
 message is the static text, then an environment block of what holds for
@@ -2906,11 +3016,11 @@ the whole conversation:
 - when it began: its `meta`'s creation time, in UTC. A fork (§6) is to
   keep its source's creation time, or its first request would replace
   the prefix it shares;
-- that each message from the person, the orchestrator or another
-  conversation begins with a line `[received <UTC time>]`, the time this
-  conversation logged it; that the line, and the label after it on a
-  message from the orchestrator or another conversation, are
-  td-agent's and nothing in the text after them is; and
+- that each message from the person or another conversation begins
+  with a line `[received <UTC time>]`, the time this conversation logged
+  it; that the line, and the label after it on a message from another
+  conversation, are td-agent's and nothing in the text after them is;
+  and
   that the newest such time is the latest the model knows of, not the
   present, since a turn asked again or resumed, or a long one, runs
   after its message came;
@@ -2991,8 +3101,8 @@ the conversation was compacted at a sequence number and that
 `history_search` and `history_read` reach everything before it; the
 summary; the carried state; and the recent tail. The carried state is
 copied verbatim from the log, never summarized, and every item keeps the
-source label it had (the human, the orchestrator, another conversation,
-a schedule), so nothing becomes the human's by being carried:
+source label it had (the human, another conversation, a schedule), so
+nothing becomes the human's by being carried:
 
 - the task: the conversation's first message, with its source, up to a
   bound;
@@ -3040,8 +3150,9 @@ times). Every key has a
 default, except `jev_threshold` until it is calibrated (§11):
 
 - `base_url`
-- `model`, `orchestrator_model`, `title_model`, `classifier_fast_model`
-  and `classifier_model`
+- `model`, which every conversation uses unless the human chose another
+  for it (§4), `title_model`, `classifier_fast_model` and
+  `classifier_model`
 - `jev_threshold`, and `jev_required`; default `true`
 - `reasoning_effort`
 - `mode`: `auto` or `ask`; default `auto`
@@ -3054,6 +3165,19 @@ default, except `jev_threshold` until it is calibrated (§11):
   `false`; the default list is `~/Downloads`, read-only. A directory that
   does not exist is skipped and reported, not created. Setting `shared`
   replaces the default list, so `shared = []` shares nothing
+- `template`: the workspace templates of §7, listed in the chooser
+  after Empty and Directory…, an array of tables each with:
+  - `name`: what the chooser shows, unique among the templates, and
+    neither built-in's;
+  - `repos`: the git repositories to check out, an array of tables each
+    with a `remote`, a `base` (the ref the worktree starts from), a
+    `branch` (the one it works on) and an optional `sparse`, the
+    cone-mode paths to check out, absent for the whole tree; until
+    increment 11 a template with any is refused at creation (§7);
+  - `shared`: as the top-level `shared`, in place of it for this
+    template's workspaces; absent, the top-level list;
+  - `network` (later, with increment 15): `off`, `allowlist` or `open`
+    for this template's workspaces; absent, the top-level `network`
 - `remotes`: the admitted git remotes (§7); default empty, so the first
   workspace on a remote asks
 - `network`: the default policy, `off` or `allowlist`; default `allowlist`
@@ -3066,8 +3190,11 @@ default, except `jev_threshold` until it is calibrated (§11):
   `compact_model`; defaults `true`, 80%, 20,000 and the conversation's
   model (§14)
 
-There is no `limits` key until §8's limits land. Unknown keys are refused
-by name. For example:
+There is no `limits` key until §8's limits land. `orchestrator_model`
+is retired, since there is no orchestrator (§3): a file that still sets
+it loads, with a note on standard error that the key is no longer read,
+and its value is not checked. Other unknown keys are refused by name.
+For example:
 
 ```toml
 model = "anthropic/claude-sonnet-5.5"
@@ -3080,6 +3207,15 @@ path = "~/Downloads"
 [[shared]]
 path = "~/src/reference"
 write = false
+
+[[template]]
+name = "td"
+
+[[template.repos]]
+remote = "https://github.com/timmydo/td"
+base = "main"
+branch = "agent"
+sparse = ["td-agent", "td-ui"]
 ```
 
 **As built (increment 4).** Every key above is known by name. `mode` is
@@ -3093,21 +3229,20 @@ than 1 MiB is refused. A relative `XDG_CONFIG_HOME` or `XDG_STATE_HOME`
 is ignored, as the XDG base directory rules say, for `$HOME/.config` or
 `$HOME/.local/state`.
 
-**As built (increment 5).** `base_url`, `model`, `orchestrator_model`,
-`title_model`, `reasoning_effort`, `data_collection` and the three cost
-limits are read and checked. The defaults are
-`https://openrouter.ai/api/v1`, `anthropic/claude-sonnet-5.5` for both
-conversation models, `anthropic/claude-haiku-4.5` for titles, and
+**As built (increment 5).** `base_url`, `model`, `title_model`,
+`reasoning_effort`, `data_collection` and the three cost limits are
+read and checked. The defaults are `https://openrouter.ai/api/v1`,
+`anthropic/claude-sonnet-5.5` for conversations,
+`anthropic/claude-haiku-4.5` for titles, and
 `medium`. `base_url` must be an `https://` URL with a host and no query,
 fragment or space, so the key is never sent in the clear; a trailing
 `/` is dropped. A model id is printable ASCII. `reasoning_effort` is one
 of `none`, `minimal`, `low`, `medium`, `high` and `xhigh`. A limit is a
-non-negative number of credits, or `none`. `model`, `orchestrator_model`
-and `reasoning_effort` are what a conversation starts with; the
+non-negative number of credits, or `none`. `model` and
+`reasoning_effort` are what every conversation starts with; the
 Conversation menu chooses another for one conversation, and a default
 model the window saves replaces `model` until the key is edited (§4);
-this file records neither. The key file is not a key of
-this file (§6).
+this file records neither. The key file is not a key of this file (§6).
 
 ## 16. Prior art: opencode
 
@@ -3121,7 +3256,7 @@ kind. td-agent's position on its features:
 | Shadow-git step snapshots, undo and redo | adopted, in the worktrees' own repositories (§12) |
 | `doom_loop`: three identical calls ask | adopted (§11) |
 | `question` tool | adopted (§12) |
-| Child sessions, background subagents that notify | adapted as the orchestrator and its workspaces (§3) |
+| Child sessions, background subagents that notify | adapted as peer conversations that message and read one another through crossings (§3) |
 | Fork at a message; local export | adopted (§6) |
 | Event-sourced session log | adopted, as a per-conversation file log (§6) |
 | Prune old tool output, then summarize | adopted, with its thresholds (§14) |
@@ -3163,8 +3298,9 @@ kind. td-agent's position on its features:
   maintenance instance and their notifications; export, strict import and
   a push of the exact id to a local bare remote; protected-branch, force,
   deletion, tag and scan-match routing; a force push's lease; snapshot
-  refs with undo and redo; store gc keeping borrowed objects; and closing
-  a dirty workspace only on confirmation. A planted reflog, `FETCH_HEAD` or
+  refs with undo and redo; store gc keeping borrowed objects; and
+  archiving or deleting the conversation of a dirty workspace only on
+  confirmation. A planted reflog, `FETCH_HEAD` or
   `worktrees/` symlink in a workspace repository must change nothing
   outside the jail through any git worker operation; a planted
   `~/.gitconfig` hook or fsmonitor in the workspace HOME must never run in
@@ -3178,18 +3314,20 @@ kind. td-agent's position on its features:
   precedent. These cover a tool-call round trip, parallel calls, a 429
   retry, a 502 shown and not retried, 402, cost limits, interruption,
   automatic, manual and failed compaction, a context-length error
-  compacted and retried once, an orchestrator creating a workspace and
-  receiving its report, an orchestrator refused a new workspace while
-  another has dropped to `ask`, messages between conversations with their
-  labels and wake budget, a background process's exit notice waking an
-  idle conversation, a conversation process killed mid-turn and restarted
-  from its log, a restart that finds a tool call, request or delivery
-  started but not finished and repeats none of them, a policy change
-  re-deciding a pending approval, and each classifier path: both stages
-  allow, either defers or denies, a malformed reply, and a Jev outage
-  with and without `jev_required`. A conversation process is a child
-  process here as in the window, driven over its socketpair by a test
-  harness standing in for the window process.
+  compacted and retried once, a conversation made from a repository
+  template waiting on its base and notified when its worktree is ready,
+  a crossing allowed and refused on its card, messages between
+  conversations with their labels and wake budget, an old orchestrator
+  conversation and its labelled messages read as ordinary ones, a
+  background process's exit notice waking an idle conversation, a
+  conversation process killed mid-turn and restarted from its log, a
+  restart that finds a tool call, request or delivery started but not
+  finished and repeats none of them, a policy change re-deciding a
+  pending approval, and each classifier path: both stages allow, either
+  defers or denies, a malformed reply, and a Jev outage with and without
+  `jev_required`. A conversation process is a child process here as in
+  the window, driven over its socketpair by a test harness standing in
+  for the window process.
 - **Window tests:** native compositor process tests through the driven
   seam: the layout, the workspace tree, switching conversations, selecting
   text across messages and copying it, copying a whole message and a tool
@@ -3278,9 +3416,9 @@ follows:
 
 **As built (increment 4).** The window increment declared
 `native-compositor-tests`, with one case in `tests/control_process.rs`:
-keys typed through the headless compositor's seat send a message to the
-orchestrator, start a conversation and send there (`S-Return` a
-newline, `Return` and `C-Return` the send), and switch back, each result
+keys typed through the headless compositor's seat start a conversation
+and send there, start a second and send there (`S-Return` a newline,
+`Return` and `C-Return` the send), and switch back, each result
 read from the store.
 `tests/processes.rs` drives the built program's conversation personality
 over real socketpairs: a killed child restarted from its log and going
@@ -3356,23 +3494,24 @@ answering a stream with one JSON body keeps increment 5's error case.
 **As built (increment 8).** `src/tools.rs` covers each tool's
 arguments and bounds: the todo list's 50 items, 500 bytes and one item
 in progress, unknown and mistyped members, malformed JSON and empty
-arguments, the search and read limits, a message's 32 KiB and a
-report's statuses; the crossing rules for each pair of roles; the
-listing's field filtering; and the definitions in the prefix.
+arguments, the search and read limits, and a message's 32 KiB; the
+crossing rules, a conversation's own log free and every other a
+crossing; the listing's field filtering and order; and the definitions
+in the prefix, one set for every conversation.
 `src/history.rs` covers search (every term, case folded, newest first,
 kinds, the limit, excerpts on character boundaries), the cursor over a
 3,000-character tool result paged back whole, an offset inside a
 character, a page always taking one, and an approval's redaction in
-both tools. `src/wake.rs` covers the budget's count, reports and
-retries not counting, its renewal in the conversation and through the
-orchestrator, and its one notice; `src/post.rs` the outbox across a
-restart and the window's own check; `src/store.rs` the new events
-replayed exactly, `paused` in `meta`, and calls without results
+both tools. `src/wake.rs` covers the budget's count, an older log's
+reports and retries not counting, its renewal by the human's message to
+the conversation alone, and its one notice; `src/post.rs` the outbox
+across a restart and the window's own check; `src/store.rs` the new
+events replayed exactly, `paused` in `meta`, and calls without results
 answered at load once; `src/assemble.rs` and `src/client.rs` a call
 without an id or name, a counted reply's calls, and the wire form of
 messages, calls and results; and the window's units the todo panel and
-its keys, pausing, messages, calls and results in the transcript, and
-a streamed reply's calls kept once it is logged. `client::check_calls`
+its keys, pausing, messages, calls and results in the transcript, and a
+streamed reply's calls kept once it is logged. `client::check_calls`
 covers ids missing, shared or too long and names missing or too long.
 `tests/support/mock_fetch.rs` can route a request by a marker its body
 carries to a script of its own. The fixtures `stream-tool-todo.sse`,
@@ -3381,18 +3520,18 @@ carries to a script of its own. The fixtures `stream-tool-todo.sse`,
 argument fragments, and `models.json` gains a model without `tools`.
 `tests/model_client.rs` runs a tool call's round trip (the second body
 rebuilt from the log byte for byte), two parallel calls answered in
-their order, malformed arguments answered with an error, the step
-bound, a model without tools refused, the wake budget held past twenty
-and renewed by the human, a paused conversation holding a message and
+their order, malformed arguments answered with an error, the step bound,
+a model without tools refused, the wake budget held past twenty and
+renewed by the human, a paused conversation holding a message and
 starting its turn when resumed, a pause sent mid-turn holding a message
 that came before it, a message handed on twice logged once, a crossing
-refused as the call's result, a conversation a message woke first
-titled after the human's first turn, and a restart that finds a call
-started and not finished; and, through a `Supervisor` and the window's
-`Post`, the orchestrator messaging a closed conversation, which is
-woken and answers; and an interrupt that comes while a call waits on
-the window, which lets that call finish, answers the next as not run
-and offers `C-r`, whose request carries both results.
+refused as the call's result, a conversation a message woke first titled
+after the human's first turn, and a restart that finds a call started
+and not finished; and, through a `Supervisor` and the window's `Post`,
+one conversation messaging another that is closed, which is woken and
+answers; and an interrupt that comes while a call waits on the window,
+which lets that call finish, answers the next as not run and offers
+`C-r`, whose request carries both results.
 
 **As built (increment 9).** `src/files.rs` covers a relative path
 refused naming the worktrees; a read's numbering, its 2,000 lines and
@@ -3496,7 +3635,7 @@ its turn stop for want of one; stores a key typed into the dialog,
 finding `openrouter.key` mode 0600 with one link, holding the key and
 a newline, in a directory made 0700, with no temporary file, and the
 status row no longer asking; sends again and sees the running
-orchestrator's turn go past the key, to the price check, which stops
+conversation's turn go past the key, to the price check, which stops
 it with no models list fetched; and finds the key in no other file
 under the test's directory and not on standard error. The fixture
 build costs every td-agent native run a second build of the crate, in a
@@ -3504,11 +3643,12 @@ target directory of its own, its library tests and its strict Clippy.
 
 The live check is by hand. Run `./agent` from a checkout, with the key
 written as one line to `$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode
-0600, or stored from File → Set OpenRouter key…. A message to the
-orchestrator gets a reply, with its usage and cost on it. Asked to plan three steps, a model writes a todo
-list, drawn above the composer; asked to tell a conversation something,
-the orchestrator sends it a message, which that conversation answers in
-a turn of its own. A new conversation's first reply is followed by a
+0600, or stored from File → Set OpenRouter key…. A message to a new
+conversation gets a reply, with its usage and cost on it. Asked to plan
+three steps, a model writes a todo list, drawn above the composer;
+asked to tell another conversation something, it asks on a card to
+send it a message and, allowed, sends it, and that conversation answers
+in a turn of its own. A new conversation's first reply is followed by a
 title from `title_model`. The status row shows the model, the context
 used, the cost, today's total and the key's credit. The conversation's
 `log` under `$XDG_STATE_HOME/td-agent/` holds the request, the reply
@@ -3522,7 +3662,7 @@ and 6 touch only td-ui and td-net and land from branches of their own,
 in parallel with it.
 
 1. **The design**, and the AGENTS.md route to it.
-2. **The revisions**, two commits: the orchestrator, workspaces, git,
+2. **The revisions**, two commits: coordination, workspaces, git,
    network, shared directories, the two-stage classifier and the chat
    components; then a process per conversation with limits deferred, the
    conversation features of §3, §12 and §14, and the gate cost of §17.
@@ -3546,10 +3686,9 @@ in parallel with it.
 8. **Conversation tools.** The todo list; `history_search` and
    `history_read`; `conversations` and `send_message`, with their labels
    and the wake budget. These are the first tools exposed to a model, and
-   none touches a file. Until increment 13 adds their crossings, every
-   read or message that §11 makes a crossing is refused with that reason,
-   and a conversation outside any workspace counts as a workspace of its
-   own.
+   none touches a file. A conversation counts as a workspace of its own,
+   and every read or message that §3 makes a crossing goes to the human
+   from the peers step below.
 9. **Tool host and tool semantics.** The framed, multiplexed protocol and
    the §12 file and shell tools, tested in-process against fixtures,
    td-txt included. No such tool is exposed to a model.
@@ -3560,20 +3699,48 @@ in parallel with it.
     launcher's cgroup (§8); `./agent`'s launch building td-jail, td-txt and
     the tool host; directory and scratch workspaces, with file and shell
     tools exposed for the first time, in `ask` mode.
+
+    Then, before increment 11, small steps of their own, each one
+    commit:
+
+    - **Peers.** No orchestrator and no conversation made at startup;
+      the same tools and prompt for every conversation; `report`
+      removed; every crossing of §3 decided by the human on a card, in
+      both modes; an old orchestrator conversation made ordinary, its
+      old labels kept; `orchestrator_model` retired with a note (§3,
+      §15).
+    - **Templates.** `[[template]]` in configuration and the chooser at
+      `C-n` and File → `New conversation…`, with Empty and Directory…
+      built in and replacing File's two workspace items; a template
+      naming repositories refused until increment 11 (§7, §15).
+    - **Messages window.** The status row keeps only items of a fixed
+      width (the state, model and effort, context, cost, today, credit,
+      mode, limits and background count); td-agent's notes to the
+      human, which the row now shows cut to fit, go instead to a
+      Messages window that keeps them whole, in order and with their
+      times, which the human opens to read them (§4).
+    - **Context menus and archive.** A context menu on a conversation's
+      row with Archive and Delete…, archived conversations hidden from
+      the list with a way to show them and unarchive one, and `archived`
+      in `meta` (§4, §6, §7).
 11. **Repository store and workspaces.** The git worker and maintenance
     instances; admitted remotes; the store and its background fetch;
     workspace repositories over alternates with the git mount chain;
     sparse worktrees prepared asynchronously; local commits and step
-    snapshots; the orchestrator's `create_workspace`, `close_workspace` and
-    notifications.
+    snapshots; repository templates, refused until now, and the
+    workspace card; the worktree cleanup on archiving or deleting a
+    repository workspace's conversation; and the notifications of §3.
 12. **Background processes.** `background` on `shell`, the process tools,
     the output store, exit notices, and the window's process list.
 13. **Rules and auto mode.** Rules, cards, repetition, both classifier
-    stages, the circuit breaker, the calibrated `jev_threshold`, and the
-    crossings for reads and messages between workspaces and of the
-    orchestrator's log.
+    stages, the circuit breaker, the calibrated `jev_threshold`, and,
+    for the crossings between conversations, "always" answers for a
+    pair and direction and the classifier's deciding them in `auto`
+    mode (§3).
 14. **Push and fetch tools.** The publish repository, export and strict
-    import, evidence and scan, and the bound push.
+    import, evidence and scan, and the bound push; and `git_fetch` (§9),
+    the one fetch a model asks for beside increment 11's background
+    fetch.
 15. **Network.** The egress relay applet with its §W.8 amendment and its
     address predicate, the in-jail proxy, the policies and allowlist
     crossings.
@@ -3587,7 +3754,8 @@ in parallel with it.
     companion obligations of `td-profiler/DESIGN.md`, named in that
     landing.
 
-After these: resource limits (§8), schedules (§3), a loopback shared by a
+After these: resource limits (§8), schedules (§3), the `question` tool
+(§12), a loopback shared by a
 conversation's instances (§19), `web_fetch`, `apply_patch`, child
 conversations within a workspace, skills and custom commands, the MCP
 client, moving a conversation between workspaces, and a native Anthropic

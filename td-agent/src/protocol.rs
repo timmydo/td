@@ -72,7 +72,6 @@ pub enum Up {
     /// rest, a quarter, for the title and interrupted ids. Every event of
     /// its log follows, in order, then each new one as it is appended.
     Hello {
-        role: Role,
         title: String,
         torn: Option<u64>,
         interrupted: Vec<u64>,
@@ -111,13 +110,12 @@ pub enum Up {
         reasoning: String,
         content: String,
     },
-    /// `send_message` or `report`: queue `text` for conversation `to`,
-    /// with a report's status. The window answers with `Sent`.
+    /// `send_message`, the human having allowed it: queue `text` for
+    /// conversation `to`. The window answers with `Sent`.
     Send {
         id: u64,
         to: Id,
         text: String,
-        status: Option<String>,
     },
     /// `conversations`: what state is each conversation in? The window
     /// answers with `States`.
@@ -376,7 +374,6 @@ impl Up {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::Hello {
-                role,
                 title,
                 torn,
                 interrupted,
@@ -385,7 +382,6 @@ impl Up {
             } => typed(
                 "hello",
                 vec![
-                    ("role".into(), Json::Str(role.word().into())),
                     ("title".into(), Json::Str(title.clone())),
                     ("torn".into(), torn.map_or(Json::Null, Json::from)),
                     (
@@ -440,18 +436,12 @@ impl Up {
                     ("content".into(), Json::Str(content.clone())),
                 ],
             ),
-            Self::Send {
-                id,
-                to,
-                text,
-                status,
-            } => typed(
+            Self::Send { id, to, text } => typed(
                 "send",
                 vec![
                     ("id".into(), Json::from(*id)),
                     ("to".into(), Json::Str(to.to_string())),
                     ("text".into(), Json::Str(text.clone())),
-                    ("status".into(), optional(status)),
                 ],
             ),
             Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
@@ -478,11 +468,6 @@ impl Up {
         let value = td_json::parse_slice(bytes).map_err(|e| e.to_string())?;
         Ok(match value.get("type").and_then(Json::as_str) {
             Some("hello") => Self::Hello {
-                role: value
-                    .get("role")
-                    .and_then(Json::as_str)
-                    .and_then(Role::parse)
-                    .ok_or("no role")?,
                 title: string(&value, "title")?,
                 torn: value.get("torn").and_then(Json::as_u64),
                 interrupted: value
@@ -532,7 +517,6 @@ impl Up {
                 id: number(&value, "id")?,
                 to: Id::parse(&string(&value, "to")?).ok_or("a malformed receiver")?,
                 text: string(&value, "text")?,
-                status: maybe(&value, "status")?,
             },
             Some("query") => Self::Query {
                 id: number(&value, "id")?,
@@ -582,7 +566,6 @@ mod tests {
         assert_eq!(Down::decode(&bytes).unwrap(), down);
         for up in [
             Up::Hello {
-                role: Role::Orchestrator,
                 title: "Orchestrator".into(),
                 torn: Some(3),
                 interrupted: vec![2, 5],
@@ -590,7 +573,6 @@ mod tests {
                 prefix: Some("\u{1}".repeat(MAX_TEXT)),
             },
             Up::Hello {
-                role: Role::Conversation,
                 title: "t".into(),
                 torn: None,
                 interrupted: vec![],
@@ -601,13 +583,11 @@ mod tests {
                 id: 4,
                 to: Id::parse(&"b".repeat(32)).unwrap(),
                 text: "\u{1}".repeat(crate::tools::MAX_MESSAGE),
-                status: Some("done".into()),
             },
             Up::Send {
                 id: 5,
                 to: Id::parse(&"b".repeat(32)).unwrap(),
                 text: "hi".into(),
-                status: None,
             },
             Up::Query { id: 6 },
             Up::Ask {

@@ -42,7 +42,7 @@ const KEY_B: u32 = 48;
 const KEY_Y: u32 = 21;
 const KEY_N: u32 = 49;
 const KEY_F10: u32 = 68;
-const KEY_PAGEUP: u32 = 104;
+const KEY_PAGEDOWN: u32 = 109;
 const KEY_DOWN: u32 = 108;
 const KEY_RIGHT: u32 = 106;
 const KEY_U: u32 = 22;
@@ -245,10 +245,6 @@ struct AgentProcess {
     socket: Option<PathBuf>,
 }
 impl AgentProcess {
-    fn start(directory: &Directory, display: &Path) -> Self {
-        Self::launch(directory, display, false, &[])
-    }
-
     fn launch(directory: &Directory, display: &Path, control: bool, env: &[(&str, &Path)]) -> Self {
         // A case may have put state there first.
         let home = directory.0.join("home");
@@ -419,39 +415,52 @@ fn wait<T>(agent: &AgentProcess, what: &str, mut ready: impl FnMut() -> Option<T
     }
 }
 
-/// The window opens the orchestrator, creating it; `hi` and Return sends
-/// it to the orchestrator's log; Control-N starts a conversation, where
-/// `yo`, Shift-Return and `o` sent with Control-Return log `yo` and `o`
-/// on two lines and title it `yo`; Control-PageUp opens the
-/// orchestrator again in a fresh process, which goes on from its log.
-/// Every step is a chord through the compositor's seat, and every result
-/// is read from the store.
+/// The window opens with no conversation and makes none; Control-N
+/// starts one, where `hi` and Return send `hi` to its log and title it;
+/// Control-N starts another, where `yo`, Shift-Return and `o` sent with
+/// Control-Return log `yo` and `o` on two lines and title it `yo`, and
+/// lists it first; Control-PageDown opens the first again in a fresh
+/// process, which goes on from its log. Every step is a chord through
+/// the compositor's seat, and every result is read from the store.
 #[test]
 #[ignore = "ready supplies the disposable native compositor"]
 fn messages_typed_into_the_window_land_in_each_conversations_log() {
     let compositor_directory = Directory::new();
     let mut compositor = Compositor::start(&compositor_directory);
     let client_directory = Directory::new();
-    let agent = AgentProcess::start(&client_directory, &compositor.directory.join("wayland-0"));
+    let agent = AgentProcess::launch(
+        &client_directory,
+        &compositor.directory.join("wayland-0"),
+        true,
+        &[],
+    );
     wait(&agent, "the td-agent window maps with the keyboard", || {
         compositor.focused("td-agent").then_some(())
     });
-    let orchestrator = |users: &[&str]| {
+    let first = |users: &[&str]| {
         (
-            "orchestrator".to_string(),
-            "Orchestrator".to_string(),
+            "conversation".to_string(),
+            "hi".to_string(),
             users.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
         )
     };
-    wait(&agent, "the orchestrator is created", || {
-        (agent.conversations() == [orchestrator(&[])]).then_some(())
+    wait(&agent, "the window opens no conversation", || {
+        agent
+            .state()
+            .contains("conversations=0\tactive=none")
+            .then_some(())
     });
+    assert!(agent.conversations().is_empty());
 
+    compositor.chord(&[KEY_LEFTCTRL], KEY_N);
+    wait(&agent, "Control-N starts a conversation", || {
+        (agent.conversations().len() == 1).then_some(())
+    });
     compositor.chord(&[], KEY_H);
     compositor.chord(&[], KEY_I);
     compositor.chord(&[], KEY_ENTER);
-    wait(&agent, "hi lands in the orchestrator's log", || {
-        (agent.conversations() == [orchestrator(&["hi"])]).then_some(())
+    wait(&agent, "hi lands in its log, titled", || {
+        (agent.conversations() == [first(&["hi"])]).then_some(())
     });
 
     compositor.chord(&[KEY_LEFTCTRL], KEY_N);
@@ -468,15 +477,18 @@ fn messages_typed_into_the_window_land_in_each_conversations_log() {
         vec!["yo\no".to_string()],
     );
     wait(&agent, "yo lands in a new conversation, titled", || {
-        (agent.conversations() == [conversation.clone(), orchestrator(&["hi"])]).then_some(())
+        (agent.conversations() == [first(&["hi"]), conversation.clone()]).then_some(())
     });
 
-    compositor.chord(&[KEY_LEFTCTRL], KEY_PAGEUP);
+    // The newer is listed first, so the first is below it.
+    compositor.chord(&[KEY_LEFTCTRL], KEY_PAGEDOWN);
     compositor.chord(&[], KEY_X);
     compositor.chord(&[KEY_LEFTCTRL], KEY_ENTER);
-    wait(&agent, "x lands after hi in the orchestrator's log", || {
-        (agent.conversations() == [conversation.clone(), orchestrator(&["hi", "x"])]).then_some(())
-    });
+    wait(
+        &agent,
+        "x lands after hi in the first conversation's log",
+        || (agent.conversations() == [first(&["hi", "x"]), conversation.clone()]).then_some(()),
+    );
 
     drop(agent);
     compositor.stop();
@@ -571,11 +583,16 @@ fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
     wait(&agent, "the td-agent window maps with the keyboard", || {
         compositor.focused("td-agent").then_some(())
     });
-    wait(&agent, "the orchestrator is open", || {
-        let state = agent.state();
-        (!state.contains("active=none") && state.contains("model=anthropic/claude-sonnet-5.5"))
-            .then_some(())
-    });
+    compositor.chord(&[KEY_LEFTCTRL], KEY_N);
+    wait(
+        &agent,
+        "Control-N starts a conversation and opens it",
+        || {
+            let state = agent.state();
+            (!state.contains("active=none") && state.contains("model=anthropic/claude-sonnet-5.5"))
+                .then_some(())
+        },
+    );
     compositor.chord(&[], KEY_F10);
     compositor.chord(&[], KEY_RIGHT);
     wait(&agent, "Right moves to the Conversation menu", || {
@@ -649,7 +666,7 @@ mod fixture {
 
     /// A key typed into the dialog and saved with Return is stored as
     /// `config/td-agent/openrouter.key`, mode 0600, in a directory made
-    /// mode 0700; the status row stops asking for one; the orchestrator's
+    /// mode 0700; the status row stops asking for one; the conversation's
     /// process, running all along, is handed it, so its next turn no
     /// longer stops for want of a key; and the key is in no other file
     /// the window or its conversations wrote, nor on standard error.
@@ -677,7 +694,8 @@ mod fixture {
         wait(&agent, "the td-agent window maps with the keyboard", || {
             compositor.focused("td-agent").then_some(())
         });
-        wait(&agent, "the orchestrator is created", || {
+        compositor.chord(&[KEY_LEFTCTRL], KEY_N);
+        wait(&agent, "Control-N starts a conversation", || {
             (agent.conversations().len() == 1).then_some(())
         });
         // Without a key, a turn stops for want of one.
@@ -727,7 +745,7 @@ mod fixture {
         assert_eq!(dir.permissions().mode() & 0o7777, 0o700);
         assert!(!config.join("td-agent/openrouter.key.tmp").exists());
 
-        // The running orchestrator has the key: its next turn goes on past
+        // The running conversation has the key: its next turn goes on past
         // it, to the price check, which stops it, the models list never
         // fetched here.
         compositor.chord(&[], KEY_X);

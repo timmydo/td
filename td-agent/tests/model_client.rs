@@ -65,8 +65,8 @@ struct Harness {
     /// Every reservation asked for and every cost reported.
     reserved: Vec<(u64, u64)>,
     spent: Vec<(u64, u64)>,
-    /// Every message sent through the window: to, text and status.
-    sent: Vec<(Id, String, Option<String>)>,
+    /// Every message sent through the window: to and text.
+    sent: Vec<(Id, String)>,
     /// Every streamed delta: its request, reasoning and text.
     deltas: Vec<(u64, String, String)>,
     /// Events `until_text` heard, which the next `turn` begins with.
@@ -186,13 +186,8 @@ impl Harness {
             Up::Spent { id, amount } => self.spent.push((*id, *amount)),
             // The window queues a message and knows no conversation's
             // state.
-            Up::Send {
-                id,
-                to,
-                text,
-                status,
-            } => {
-                self.sent.push((to.clone(), text.clone(), status.clone()));
+            Up::Send { id, to, text } => {
+                self.sent.push((to.clone(), text.clone()));
                 self.down(&Down::Sent {
                     id: *id,
                     refusal: None,
@@ -585,7 +580,8 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert!(!body.contains_key("parallel_tool_calls"));
     assert_eq!(body["tools.0.type"], "function");
     assert_eq!(body["tools.0.function.name"], "todo_write");
-    assert_eq!(body["tools.5.function.name"], "report");
+    assert_eq!(body["tools.4.function.name"], "send_message");
+    assert!(!body.contains_key("tools.5.type"), "no report");
     // `require_parameters` routes only to an endpoint that lists every
     // parameter sent, so each member, but those it does not route on, is
     // one the model lists; the title's as well.
@@ -1160,7 +1156,7 @@ fn spending_limits_refuse_a_request_before_it_is_sent() {
     // A model with no price, while a limit is set.
     let mut h = Harness::new("unpriced", Role::Orchestrator, Vec::new());
     h.setup(Client {
-        orchestrator_model: "openrouter/auto".into(),
+        model: "openrouter/auto".into(),
         ..Client::default()
     });
     h.say("hello");
@@ -1178,7 +1174,7 @@ fn spending_limits_refuse_a_request_before_it_is_sent() {
         vec![Reply::sse("stream-sonnet.sse")],
     );
     h.setup(Client {
-        orchestrator_model: "openrouter/auto".into(),
+        model: "openrouter/auto".into(),
         limits: Limits {
             turn: None,
             conversation: None,
@@ -1218,7 +1214,7 @@ fn a_model_without_reasoning_is_not_asked_for_it() {
         vec![Reply::sse("stream-sonnet.sse")],
     );
     h.setup(Client {
-        orchestrator_model: "meta-llama/llama-4-small".into(),
+        model: "meta-llama/llama-4-small".into(),
         allow_data_collection: true,
         ..Client::default()
     });
@@ -1833,7 +1829,7 @@ fn the_step_bound_ends_a_turn_that_keeps_calling_tools() {
 fn a_model_without_tools_is_refused_by_name() {
     let mut h = Harness::new("no-tools", Role::Orchestrator, Vec::new());
     h.setup(Client {
-        orchestrator_model: "example/no-tools".into(),
+        model: "example/no-tools".into(),
         ..Client::default()
     });
     h.say("hello");
@@ -1842,7 +1838,10 @@ fn a_model_without_tools_is_refused_by_name() {
         outcome.starts_with("example/no-tools takes no tools"),
         "{outcome}"
     );
-    assert!(outcome.contains("orchestrator_model"), "{outcome}");
+    assert!(
+        outcome.contains("`model` or the default model"),
+        "{outcome}"
+    );
     assert!(!kinds(&events).contains(&"request"));
     assert!(h.mock.requests().is_empty());
     // `max_tokens` bounds what a request may cost, so it is sent always,
@@ -2124,9 +2123,9 @@ fn a_call_started_and_not_finished_is_answered_as_interrupted_after_a_restart() 
     );
 }
 
-/// The orchestrator sends a conversation a message through the window,
-/// which queues it, starts the receiver's process, and hands it on: the
-/// receiver's turn answers it.
+/// A conversation sends another a message through the window, the human
+/// allowing it on a card, and the window queues it, starts the receiver's
+/// process, and hands it on: the receiver's turn answers it.
 #[test]
 fn a_message_between_two_conversations_wakes_the_receiver() {
     use td_agent::post::{Entry, Outbox, Post};
@@ -2150,14 +2149,21 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
         ],
     );
     mock.route(
-        "[a message from the orchestrator, not from the person]",
+        &format!(
+            "[a message from conversation {}, not from the person]",
+            "a".repeat(32)
+        ),
         vec![Reply::sse("stream-gemini.sse")],
+    );
+    mock.route(
+        "Write a title for the conversation",
+        vec![Reply::ok("title.json")],
     );
     Models::from_provider(&fixture("models.json"))
         .unwrap()
         .save(state.root())
         .unwrap();
-    let orchestrator = Id::parse(&"a".repeat(32)).unwrap();
+    let sender = Id::parse(&"a".repeat(32)).unwrap();
     let receiver = Id::parse(&"b".repeat(32)).unwrap();
     let setup = Down::Setup {
         key: Ok(Secret::new(KEY.into())),
@@ -2165,7 +2171,7 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
     };
     let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), setup)
         .env("XDG_RUNTIME_DIR", &runtime);
-    // The receiver exists, closed; the orchestrator is open.
+    // The receiver exists, closed; the sender is open.
     assert_eq!(
         supervisor
             .open(receiver.clone(), Some(Role::Conversation))
@@ -2173,7 +2179,7 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
         Opened::Started
     );
     supervisor
-        .open(orchestrator.clone(), Some(Role::Orchestrator))
+        .open(sender.clone(), Some(Role::Conversation))
         .unwrap();
     let directory = || -> Vec<Entry> {
         state
@@ -2182,7 +2188,6 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
             .into_iter()
             .map(|meta| Entry {
                 id: meta.id,
-                role: meta.role,
                 state: "idle".into(),
                 failed: false,
             })
@@ -2196,6 +2201,7 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
         .unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let mut finished: Vec<Id> = Vec::new();
+    let mut cards = Vec::new();
     while finished.len() < 2 {
         assert!(Instant::now() < deadline, "finished: {finished:?}");
         let entries = directory();
@@ -2209,6 +2215,17 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
                         refusal: None,
                     },
                 ),
+                // The human allows the message.
+                Update::Up(Up::Ask { call, title, .. }) => {
+                    cards.push((id.clone(), title.clone()));
+                    supervisor.answer(
+                        &id,
+                        &Down::Decision {
+                            call: *call,
+                            allow: true,
+                        },
+                    );
+                }
                 Update::Up(Up::Event(Event {
                     kind: Kind::Finished { outcome, .. },
                     ..
@@ -2223,6 +2240,13 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(finished.contains(&receiver), "{finished:?}");
+    assert_eq!(
+        cards,
+        [(
+            sender.clone(),
+            "Send a message to another conversation".to_string()
+        )]
+    );
     assert!(post.outbox().queued().is_empty(), "acknowledged and gone");
     drop(supervisor);
     let log = td_agent::store::read_log(&state, &receiver).unwrap();
@@ -2236,13 +2260,13 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
     assert_eq!(
         (from, *role, text.as_str()),
         (
-            &orchestrator,
-            Role::Orchestrator,
+            &sender,
+            Role::Conversation,
             "Please summarise the sparse checkout notes."
         )
     );
-    let sender = td_agent::store::read_log(&state, &orchestrator).unwrap();
-    let results = results(&sender);
+    let sent = td_agent::store::read_log(&state, &sender).unwrap();
+    let results = results(&sent);
     assert_eq!(results.len(), 1);
     assert!(!results[0].2, "{}", results[0].1);
     assert!(results[0].1.starts_with("queued for conversation"));
@@ -2311,10 +2335,11 @@ fn a_message_delivered_twice_is_logged_once() {
     assert_eq!(conversation.events().len(), events.len());
 }
 
-/// A conversation's message to another conversation is a crossing,
-/// refused as the call's result; the turn goes on.
+/// A conversation's message to another conversation is a crossing, which
+/// the human decides on a card showing it whole; refused, that is the
+/// call's result, the turn goes on, and nothing reaches the window.
 #[test]
-fn a_crossing_is_refused_as_the_calls_result() {
+fn a_crossing_asks_the_person_and_a_refusal_is_the_calls_result() {
     let mut h = Harness::new(
         "crossing",
         Role::Conversation,
@@ -2337,18 +2362,108 @@ fn a_crossing_is_refused_as_the_calls_result() {
     );
     h.setup(Client::default());
     h.say("Tell the other conversation.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Send a message to another conversation");
+    assert_eq!(
+        details,
+        [
+            format!("Conversation {other}, titled New conversation"),
+            "gets this message, labelled as from this conversation, not from you, and starting a turn there:".to_string(),
+            "Please summarise the sparse checkout notes.".to_string(),
+        ]
+    );
+    h.down(&Down::Decision { call, allow: false });
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     let results = results(&events);
     assert_eq!(results.len(), 1);
     let (_, content, error) = &results[0];
     assert!(error);
-    assert!(content.contains("is a crossing"), "{content}");
     assert!(
-        content.contains("do not try to reach it another way"),
+        content.contains("the person refused this call"),
         "{content}"
     );
     assert!(h.sent.is_empty(), "never handed to the window");
+    let approvals: Vec<&Kind> = events
+        .iter()
+        .chain(&h.heard)
+        .map(|e| &e.kind)
+        .filter(|k| matches!(k, Kind::Approval { .. }))
+        .collect();
+    assert!(
+        matches!(approvals[..], [Kind::Approval { outcome, by, .. }] if outcome == "deny" && by == "human"),
+        "{approvals:?}"
+    );
+}
+
+/// Reading another conversation's log is a crossing, asked on a card
+/// that says what is read: allowed, the page is that log's; refused, the
+/// result says so and holds none of it.
+#[test]
+fn a_read_of_another_log_asks_the_person_first() {
+    for allow in [true, false] {
+        let mut h = Harness::new(
+            if allow {
+                "read-allowed"
+            } else {
+                "read-refused"
+            },
+            Role::Conversation,
+            vec![
+                Reply::sse("stream-tool-read-other.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                Reply::ok("title.json"),
+            ],
+        );
+        // The other conversation, with a message of its own.
+        let other = Id::parse(&"b".repeat(32)).unwrap();
+        let (mut conversation, _) = Conversation::open(
+            &h.state,
+            &other,
+            Some(Role::Conversation),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        conversation
+            .append(Kind::User {
+                delivery: "d".repeat(32),
+                text: "the plan for the other work".into(),
+            })
+            .unwrap();
+        conversation.sync().unwrap();
+        drop(conversation);
+        h.setup(Client::default());
+        h.say("What did the other conversation say?");
+        let (call, title, details) = h.until_ask();
+        assert_eq!(title, "Read another conversation's log");
+        assert_eq!(
+            details[0],
+            format!("Conversation {other}, titled New conversation")
+        );
+        assert!(
+            details[1].contains("up to 5 events and 32768 bytes from event 1, 0 bytes in"),
+            "{details:?}"
+        );
+        assert!(details[2].contains("model provider"), "{details:?}");
+        h.down(&Down::Decision { call, allow });
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied");
+        let results = results(&events);
+        assert_eq!(results.len(), 1);
+        let (_, content, error) = &results[0];
+        assert_eq!(*error, !allow, "{content}");
+        assert_eq!(
+            content.contains("the plan for the other work"),
+            allow,
+            "{content}"
+        );
+        if !allow {
+            assert!(
+                content.contains("the person refused this call"),
+                "{content}"
+            );
+        }
+    }
 }
 
 /// A conversation a message woke first is titled after the human's first
@@ -2392,23 +2507,27 @@ fn an_interrupt_between_calls_answers_the_rest_as_not_run() {
             Reply::ok("title.json"),
         ],
     );
-    // The orchestrator the first call messages.
-    let orchestrator = Id::parse(&"a".repeat(32)).unwrap();
+    // The conversation the first call messages, which the human allows.
+    let other = Id::parse(&"a".repeat(32)).unwrap();
     drop(
         Conversation::open(
             &h.state,
-            &orchestrator,
-            Some(Role::Orchestrator),
+            &other,
+            Some(Role::Conversation),
             Duration::from_secs(3),
         )
         .unwrap(),
     );
     h.setup(Client::default());
-    h.say("Plan it and tell the orchestrator.");
+    h.say("Plan it and tell the other conversation.");
     // Answered by hand: the interrupt comes while the send waits.
     let mut events = Vec::new();
     let (outcome, retry) = loop {
         let up = h.next();
+        if let Up::Ask { call, .. } = up {
+            h.down(&Down::Decision { call, allow: true });
+            continue;
+        }
         if let Up::Send { id, .. } = up {
             h.down(&Down::Interrupt);
             h.down(&Down::Sent { id, refusal: None });

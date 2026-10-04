@@ -15,13 +15,14 @@ const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20      td-agent --help\n\
 \n\
 td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
-conversations, the orchestrator first, beside the open one. Each message\n\
-is a turn with the configured model through OpenRouter, by way of td's\n\
-fetch service: run it as ./agent from a td checkout, which serves that.\n\
+conversations, the most recently active first, beside the open one.\n\
+Each message is a turn with the configured model through OpenRouter, by\n\
+way of td's fetch service: run it as ./agent from a td checkout, which\n\
+serves that.\n\
 \n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\
-C-Return sends from outside a dialog); C-r asks a\n\
-failed turn again; C-n starts a conversation; C-PageUp and C-PageDown\n\
+C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
+C-n starts a conversation; C-PageUp and C-PageDown\n\
 open the one above or below; F6 and S-F6 move the focus between the\n\
 list, the transcript and the composer; F10 opens the menus: File's\n\
 Set OpenRouter key... stores the key and Export diagnostics writes an\n\

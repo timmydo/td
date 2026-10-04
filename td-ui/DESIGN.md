@@ -2938,7 +2938,7 @@ on a leaf, at scales 1-4.
 `messages::Controller` is a chat transcript over one rectangle, built
 for td-agent's conversations (`td-agent/DESIGN.md` §4) and general to
 any program that shows one. It owns its messages and their layout. A
-`Message` is a header label (its role or source: user, orchestrator,
+`Message` is a header label (its role or source: user, a peer,
 assistant, a tool's name), an optional status shown after the label and
 an optional verdict shown before the copy button, each in a `Tone`'s ink
 (a verdict with its mark, a tick, a cross or a dot), and up to

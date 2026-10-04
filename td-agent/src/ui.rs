@@ -4,10 +4,9 @@
 //! on the right the active conversation's transcript, a td-ui message
 //! list, over the composer, td-ui's editor pane, and a status row.
 //!
-//! The list holds the orchestrator first and then every other
-//! conversation, most recently active first. Each conversation is a row
-//! of its own; one with a workspace (DESIGN.md §7) names it in the status
-//! row.
+//! The list holds every conversation, most recently active first. Each
+//! conversation is a row of its own; one with a workspace (DESIGN.md §7)
+//! names it in the status row.
 //!
 //! What the window must do outside itself (open a conversation, start a
 //! new one, send a message, ask a failed turn again, save the split) it
@@ -178,10 +177,9 @@ struct Streaming {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Row {
     pub id: Id,
-    pub role: Role,
     pub title: String,
-    /// When it was last active, in seconds since the epoch: what the list
-    /// orders the conversations by.
+    /// When it was last active, in milliseconds since the epoch: what the
+    /// list orders the conversations by, then their ids.
     pub activity: u64,
     pub state: RowState,
     /// The human paused it: messages from other conversations wait.
@@ -503,8 +501,8 @@ pub struct App {
     /// A request whose reply the transcript could not draw as it came:
     /// its deltas are dropped, and its reply shown once logged.
     undrawn: Option<u64>,
-    /// The models a conversation and the orchestrator use.
-    models: (String, String),
+    /// The model a conversation with none of its own uses.
+    default_model: String,
     /// Each model's context length, as the models list gives it.
     contexts: Vec<(String, u64)>,
     /// The configuration's reasoning effort.
@@ -624,7 +622,7 @@ impl App {
             meter: Meter::default(),
             streaming: None,
             undrawn: None,
-            models: (String::new(), String::new()),
+            default_model: String::new(),
             contexts: Vec::new(),
             effort: String::new(),
             offers: Vec::new(),
@@ -713,7 +711,6 @@ impl App {
             .iter()
             .map(|row| Entry {
                 id: row.id.clone(),
-                role: row.role,
                 state: match row.word() {
                     "" => "idle",
                     word => word,
@@ -812,19 +809,12 @@ impl App {
     }
 
     /// The open conversation's model: the human's choice, else the
-    /// default for its role.
+    /// default.
     pub fn model(&self) -> &str {
         if let Some(model) = &self.choice.0 {
             return model;
         }
-        let row = self
-            .active
-            .as_ref()
-            .and_then(|id| self.rows.iter().find(|r| &r.id == id));
-        match row.map(|r| r.role) {
-            Some(Role::Orchestrator) => &self.models.1,
-            _ => &self.models.0,
-        }
+        &self.default_model
     }
 
     /// The open conversation's reasoning effort: the human's choice, else
@@ -870,24 +860,22 @@ impl App {
         self.no_workspaces = why;
     }
 
-    /// The orchestrator's id, when the list holds it.
-    pub fn orchestrator(&self) -> Option<Id> {
-        self.rows
-            .iter()
-            .find(|r| r.role == Role::Orchestrator)
-            .map(|r| r.id.clone())
+    /// The most recently active conversation's id, when the list holds
+    /// any.
+    pub fn most_recent(&self) -> Option<Id> {
+        self.rows.first().map(|r| r.id.clone())
     }
 
     /// The default model is now `model`.
     pub fn set_default_model(&mut self, model: &str) {
-        self.models.0 = model.to_string();
+        self.default_model = model.to_string();
         self.touch();
     }
 
     /// The default model: the one a conversation with no model of its
     /// own uses.
     pub fn default_model(&self) -> &str {
-        &self.models.0
+        &self.default_model
     }
 
     /// What the open picker chooses: `default`, `conversation`, or
@@ -919,13 +907,8 @@ impl App {
     }
 
     /// The models the status row names, and their context lengths.
-    pub fn set_models(
-        &mut self,
-        conversation: &str,
-        orchestrator: &str,
-        contexts: Vec<(String, u64)>,
-    ) {
-        self.models = (conversation.to_string(), orchestrator.to_string());
+    pub fn set_models(&mut self, default: &str, contexts: Vec<(String, u64)>) {
+        self.default_model = default.to_string();
         self.contexts = contexts;
         self.touch();
     }
@@ -1169,7 +1152,7 @@ impl App {
     }
 
     /// What a conversation that is not open said: only its state and
-    /// activity show, in its row.
+    /// activity show, in its row; `now` is in milliseconds.
     pub fn background(&mut self, id: &Id, update: &Update, now: u64) {
         let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) else {
             return;
@@ -1243,7 +1226,8 @@ impl App {
         self.rows.iter_mut().find(|r| &r.id == id)
     }
 
-    /// What the open conversation's process said, or what became of it.
+    /// What the open conversation's process said, or what became of it;
+    /// `now` is in milliseconds.
     pub fn update(&mut self, update: Update, now: u64) {
         match update {
             Update::Up(Up::Hello {
@@ -1928,15 +1912,11 @@ impl App {
         Ok(streaming.index)
     }
 
-    /// Orders the rows, the orchestrator first and then the most recently
-    /// active, and gives the list a model of them.
+    /// Orders the rows, the most recently active first, and gives the
+    /// list a model of them.
     fn refresh_list(&mut self) {
-        self.rows.sort_by(|a, b| {
-            (b.role == Role::Orchestrator)
-                .cmp(&(a.role == Role::Orchestrator))
-                .then(b.activity.cmp(&a.activity))
-                .then(a.id.cmp(&b.id))
-        });
+        self.rows
+            .sort_by(|a, b| b.activity.cmp(&a.activity).then(a.id.cmp(&b.id)));
         let tree: Vec<TreeRow<usize>> = (0..self.rows.len())
             .map(|id| TreeRow {
                 id,
@@ -2432,16 +2412,10 @@ impl App {
         }
         let revision = self.menu_revision.wrapping_add(1);
         let model = self.model();
-        let deletable = self
-            .active
-            .as_ref()
-            .and_then(|id| self.rows.iter().find(|r| &r.id == id))
-            .is_some_and(|r| r.role != Role::Orchestrator);
         let state = menu::State {
             open: self.active.is_some(),
             effort: self.effort(),
             reasoning: self.reasoning(model),
-            deletable,
         };
         match menu::menu(self.surface, state, revision) {
             Ok(menu) => {
@@ -2486,10 +2460,9 @@ impl App {
     }
 
     /// Opens the model picker for the default model, which a conversation
-    /// with no model of its own uses (DESIGN.md §4), the orchestrator
-    /// aside.
+    /// with no model of its own uses (DESIGN.md §4).
     pub fn open_default_picker(&mut self) {
-        let current = self.models.0.clone();
+        let current = self.default_model.clone();
         self.show_picker(crate::picker::DEFAULT_TITLE, &current, true);
     }
 
@@ -2665,7 +2638,7 @@ impl App {
 
     /// Asks whether to delete the open conversation, as Conversation →
     /// Delete conversation… does: modal over the window's body, `Cancel`
-    /// first. The orchestrator is never deleted.
+    /// first.
     pub fn open_delete(&mut self) {
         if self.modal() {
             return;
@@ -2673,11 +2646,6 @@ impl App {
         let Some(row) = self.active_row() else {
             return self.note("no conversation is open to delete");
         };
-        if row.role == Role::Orchestrator {
-            return self.note(
-                "the orchestrator is not deleted: it is the one conversation that is always there",
-            );
-        }
         let (id, title, workspace) = (row.id.clone(), row.title.clone(), row.workspace.clone());
         self.cancel_pointer();
         self.menu.dismiss();
@@ -3415,10 +3383,9 @@ pub mod tests {
         Id::parse(&format!("{n:032x}")).unwrap()
     }
 
-    fn row(n: u8, role: Role, activity: u64) -> Row {
+    fn row(n: u8, activity: u64) -> Row {
         Row {
             id: id(n),
-            role,
             title: format!("title {n}"),
             activity,
             state: RowState::Closed,
@@ -3430,13 +3397,9 @@ pub mod tests {
     pub fn app() -> App {
         let surface = Surface::new(1024, 640, Scale::default()).unwrap();
         let mut app = App::new(surface, None, Mode::Auto).unwrap();
-        app.set_models("m/conv", "m/orch", vec![("m/orch".into(), 200_000)]);
+        app.set_models("m/default", vec![("m/default".into(), 200_000)]);
         app.set_offers(Vec::new(), "medium");
-        app.set_rows(vec![
-            row(2, Role::Conversation, 50),
-            row(1, Role::Orchestrator, 10),
-            row(3, Role::Conversation, 90),
-        ]);
+        app.set_rows(vec![row(2, 50), row(1, 100), row(3, 90)]);
         app.set_active(id(1));
         app
     }
@@ -3521,14 +3484,17 @@ pub mod tests {
     }
 
     #[test]
-    fn the_orchestrator_is_first_then_the_most_recently_active() {
+    fn the_list_is_the_most_recently_active_first() {
         let app = app();
         let order: Vec<&Id> = app.rows().iter().map(|r| &r.id).collect();
         assert_eq!(order, [&id(1), &id(3), &id(2)]);
         let shown = text(&app);
-        let (first, rest) = shown.split_once("title 1").unwrap();
-        assert!(first.contains("Conversation"), "{shown}");
-        assert!(rest.find("title 3") < rest.find("title 2"), "{shown}");
+        let at = |title: &str| shown.find(title).unwrap();
+        assert!(
+            at("title 1") < at("title 3") && at("title 3") < at("title 2"),
+            "{shown}"
+        );
+        assert_eq!(app.most_recent(), Some(id(1)));
     }
 
     #[test]
@@ -3536,11 +3502,10 @@ pub mod tests {
         let mut app = app();
         assert_eq!(
             app.status_line(),
-            "starting | m/orch medium | ctx 0/200k | cost $0.0000 | mode auto | no limits | 0 background"
+            "starting | m/default medium | ctx 0/200k | cost $0.0000 | mode auto | no limits | 0 background"
         );
         app.update(
             Update::Up(Up::Hello {
-                role: Role::Orchestrator,
                 title: "Orchestrator".into(),
                 torn: Some(7),
                 interrupted: vec![],
@@ -3553,7 +3518,7 @@ pub mod tests {
         app.set_credit(Some("credit $7.5000".into()));
         assert_eq!(
             app.status_line(),
-            "idle | dropped a torn final log line of 7 bytes | m/orch medium | ctx 0/200k | cost $0.0000 \
+            "idle | dropped a torn final log line of 7 bytes | m/default medium | ctx 0/200k | cost $0.0000 \
              | today $0.2500 | credit $7.5000 | mode auto | no limits | 0 background"
         );
         // Each total against its limit, where one is set.
@@ -3564,15 +3529,15 @@ pub mod tests {
             "{}",
             app.status_line()
         );
-        // A conversation's own model, and none known of its length.
+        // Another conversation with no model of its own has the default.
         key(&mut app, "C-PageDown");
         assert!(
-            app.status_line().contains("| m/conv medium | ctx - |"),
+            app.status_line().contains("| m/default medium |"),
             "{}",
             app.status_line()
         );
         assert!(
-            text(&app).contains("| m/conv medium | ctx - |"),
+            text(&app).contains("| m/default medium |"),
             "{}",
             text(&app)
         );
@@ -3645,7 +3610,6 @@ pub mod tests {
         // A restart's hello starts the transcript over for the replay.
         app.update(
             Update::Up(Up::Hello {
-                role: Role::Orchestrator,
                 title: "Orchestrator".into(),
                 torn: None,
                 interrupted: vec![2],
@@ -3667,7 +3631,6 @@ pub mod tests {
         let mut app = app();
         let hello = |prefix: Option<String>| {
             Update::Up(Up::Hello {
-                role: Role::Orchestrator,
                 title: "Orchestrator".into(),
                 torn: None,
                 interrupted: vec![],
@@ -3675,13 +3638,13 @@ pub mod tests {
                 prefix,
             })
         };
-        let prefix = crate::prompt::prefix(Role::Orchestrator, 0);
+        let prefix = crate::prompt::prefix(0);
         app.update(hello(Some(prefix.clone())), 0);
         assert_eq!(app.transcript().len(), 1);
         let system = app.transcript().message(0).unwrap();
         assert_eq!(system.label(), crate::system::HEADER);
         assert!(system.is_collapsed());
-        assert!(system.section_text(0).unwrap().contains("orchestrator"));
+        assert!(system.section_text(0).unwrap().contains("You are td-agent"));
         // Folded, it shows its header and none of its text.
         let shown = text(&app);
         assert!(shown.contains(crate::system::HEADER), "{shown}");
@@ -4458,7 +4421,6 @@ pub mod tests {
         let mut app = app();
         app.update(
             Update::Up(Up::Hello {
-                role: Role::Orchestrator,
                 title: "t".into(),
                 torn: None,
                 interrupted: Vec::new(),
@@ -4990,7 +4952,7 @@ pub mod tests {
             reasoning,
         };
         vec![
-            offer("m/orch", true),
+            offer("m/default", true),
             offer("m/conv", true),
             offer("m/plain", false),
         ]
@@ -5041,7 +5003,7 @@ pub mod tests {
         // The status row names the open conversation's workspace.
         app.add_row(Row {
             workspace: Some("scratch".into()),
-            ..row(9, Role::Conversation, 1)
+            ..row(9, 1)
         });
         app.set_active(id(9));
         assert!(
@@ -5083,7 +5045,7 @@ pub mod tests {
         );
         assert_eq!(app.effort(), "high");
         assert!(
-            app.status_line().contains("| m/orch high |"),
+            app.status_line().contains("| m/default high |"),
             "{}",
             app.status_line()
         );
@@ -5101,7 +5063,7 @@ pub mod tests {
         // model; typing filters and Return chooses, the effort kept.
         app.menu_action(menu::Action::Model);
         let picker = app.picker().unwrap();
-        assert_eq!(picker.selected(), Some("m/orch"));
+        assert_eq!(picker.selected(), Some("m/default"));
         for c in ["p", "l", "a"] {
             key(&mut app, c);
         }
@@ -5146,7 +5108,7 @@ pub mod tests {
         assert!(app.picker().is_some());
         app.set_active(id(2));
         assert!(app.picker().is_none());
-        assert_eq!((app.model(), app.effort()), ("m/conv", "medium"));
+        assert_eq!((app.model(), app.effort()), ("m/default", "medium"));
     }
 
     /// Two choices made before the conversation logs the first: the
@@ -5364,17 +5326,20 @@ pub mod tests {
         );
     }
 
-    /// Deletion asks first, Cancel focused, and never takes the
-    /// orchestrator; the session carries it out and the row goes.
+    /// Deletion asks first, Cancel focused, and takes any conversation,
+    /// one that was the orchestrator included; the session carries it out
+    /// and the row goes.
     #[test]
     fn a_conversation_is_deleted_only_after_the_question() {
         let mut app = app();
+        app.remove_row(&id(1));
+        assert!(app.active().is_none());
         app.open_delete();
         assert!(app.confirm().is_none());
         assert!(app
             .notice()
             .unwrap()
-            .contains("the orchestrator is not deleted"));
+            .contains("no conversation is open to delete"));
         app.refresh_menu();
         let delete = |app: &App| {
             (0..)
@@ -5422,7 +5387,14 @@ pub mod tests {
         app.remove_row(&id(2));
         assert!(app.active().is_none());
         assert!(app.rows().iter().all(|r| r.id != id(2)));
-        assert_eq!(app.orchestrator(), Some(id(1)));
+        // An orchestrator from an older state directory is asked about
+        // like any other.
+        app.add_row(row(4, 200));
+        app.set_active(id(4));
+        app.open_delete();
+        key(&mut app, "Tab");
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Delete(id(4))]);
     }
 
     /// Conversation → Default model… opens the picker on the default,
