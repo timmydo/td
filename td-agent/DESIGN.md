@@ -173,6 +173,36 @@ standing decision of the human's or decided under §11 when asked for.
 Publication with the human's credentials happens only through the git
 worker's push, bound to a commit the human or classifier approved.
 
+**The review command** stands apart from those parties: `td-agent review
+[--model MODEL] [--effort LEVEL] [--max-tokens N] [--] [FILE]` is the
+same binary run by a person or an agent from a shell, with no window,
+conversation or jail, for one model's review of one git commit in td's
+review workflow (DEVELOPMENT.md, Code review), where it is meant to take
+an external reviewer CLI's place. It reads the commit's text as `git
+show` prints it from FILE or standard input (an interactive one is
+refused), at most 4 MiB (a larger one is refused, not cut, since a
+review of part of a commit says nothing of the rest), and sends it in
+one streamed request through the fetch service with the configured API,
+model and key, as a turn is sent, but asking no Anthropic model to cache
+it, since no later request shares its prompt. `--effort` is sent only
+when given and refused for a model the list says takes no reasoning;
+`--max-tokens` defaults to 32768, room for reasoning at `high`, cut to
+the model's own limit. A fixed system instruction asks for a reply that
+begins `REVIEWING: <subject> (<commit id>)` and then gives prioritized
+findings, and quotes the commit in the user message between `<commit
+NONCE>` and `</commit NONCE>`, a random 128-bit nonce per request, so the
+commit's text cannot close its quotation; a commit holding them is
+refused. The review is written to standard output as it streams, and the
+model and provider that served it, its tokens, its cost and its
+reservation to standard error. It exits non-zero unless the reply
+stopped with something said: an error, a stream that ends without its
+finish, a reply cut at its token limit, filtered or empty is no review.
+A rate-limited request is asked again as a turn's is. Its cost is
+bounded as §5 says. It keeps nothing, executes nothing the model says,
+and has no tools: a reviewer that reads the rest of the tree is a later
+step. The commit goes to the provider because the person ran the
+command on it.
+
 **One process per conversation.** The window process, `td-agent`, is the
 one the human starts. It owns the window, the configuration, a lock on the
 state directory that refuses a second window process, the index of
@@ -1188,6 +1218,18 @@ whose reservation would carry the turn's accumulated cost past
 or the day's total past `max_cost_per_day`, is not sent; the turn stops
 and says which limit. A model without pricing cannot be reserved against
 and is refused while a limit is set.
+
+The review command (§2) has no conversation and no day's ledger, which
+the window process alone keeps: each review fetches the models list and
+reserves from it as a turn does, its prompt estimated at one token per
+three ASCII bytes and one per byte of anything else, at the highest
+prompt rate, its `max_tokens` at the highest completion rate, and the
+per-request fee; it is not sent when that alone passes
+`max_cost_per_turn`, or when the model is unlisted or unpriced while
+that limit is set. Without that limit, a list that cannot be had leaves
+the model unlisted rather than refusing the review. What it spends is not added to the day's total; it
+is said on standard error, and the provider's own key limit is the
+bound across reviews.
 
 **Errors.** 401 and 402 are shown and stop the turn. 429 retries with
 bounded exponential backoff, honouring `Retry-After`, at most three times:
@@ -3973,6 +4015,26 @@ title from `title_model`. The status row shows the model, the context
 used, the cost, today's total and the key's credit. The conversation's
 `log` under `$XDG_STATE_HOME/td-agent/` holds the request, the reply
 with its `reasoning_details`, and the usage.
+
+For the review command, `src/review.rs` covers its options (each once,
+`-` naming the input, `--` before a FILE starting with `-`, an option's
+value never another option, bounds and refusals), the input's bound and
+an empty input refused, its prompt estimate (a third of ASCII bytes,
+every other byte whole), its plan (the default and the model's own
+completion limit, a worst case past `max_cost_per_turn` refused, an
+unlisted or unpriced model refused while that limit is set and planned
+without one, effort refused for a model without reasoning), the
+request's body (the model, no cache request, effort only when asked, the
+instruction naming the markers and the commit id, the commit quoted
+between them, a commit holding them refused), a stream as OpenRouter
+sends it (a processing comment, an event split across chunks, the finish
+then the usage) written as it comes with its model and provider named,
+and as no review: `[DONE]` or an end with no finish, an error inside the
+stream, an error reply said by its status and message, a 429 asked
+again `client::RETRIES` times after the provider's `Retry-After` and
+not when it asks for longer than td-agent waits, a counted reply with
+no finish, and one that stopped empty, was
+cut at its limit or was filtered.
 
 ## 18. Increments
 

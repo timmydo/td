@@ -12,6 +12,7 @@ use td_agent::store::{Id, Role, StateDir};
 use td_agent::workspace::Workspace;
 
 const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
+\x20      td-agent review [--model MODEL] [--effort LEVEL] [--max-tokens N] [--] [FILE]\n\
 \x20      td-agent --help\n\
 \n\
 td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
@@ -42,7 +43,11 @@ State: $XDG_STATE_HOME/td-agent. Configuration:\n\
 $XDG_CONFIG_HOME/td-agent/config (TOML; unknown keys are refused). The\n\
 API key: one line in $XDG_CONFIG_HOME/td-agent/openrouter.key, a file\n\
 of your own, mode 0600, in directories only you and root can write,\n\
-which File > Set OpenRouter key... writes.\n";
+which File > Set OpenRouter key... writes.\n\
+\n\
+td-agent review reviews the git commit in FILE (or standard input) as\n\
+`git show` prints it, with the same configuration and key, and writes\n\
+the review to standard output; td-agent review --help says more.\n";
 
 /// `td-agent conversation ID --state-dir DIR [--create ROLE [--workspace
 /// WORKSPACE]]`: the window starts these; a person does not.
@@ -119,6 +124,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((first, rest)) if first == "conversation" => conversation(rest),
+        Some((first, rest)) if first == "review" => td_agent::review::run(rest),
         Some((first, rest)) if first == "tool-host" => td_agent::toolhost::Config::parse(rest)
             .and_then(|config| {
                 td_agent::toolhost::serve(std::io::stdin(), std::io::stdout(), config)

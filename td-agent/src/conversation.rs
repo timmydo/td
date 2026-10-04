@@ -900,6 +900,7 @@ impl Session {
                     max_tokens,
                     effort,
                     client: &client,
+                    cache: true,
                 });
                 let body = client::turn_body(&head, prefix_text, &messages)?;
                 Ok((head, body))

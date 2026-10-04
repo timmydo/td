@@ -20,7 +20,9 @@
 //! host (DESIGN.md §2, §12) is a third personality, `toolhost`, which
 //! serves `host`'s protocol and performs the file tools (`files`) and
 //! the process tools (`shell`). The git worker's outside half, admitted
-//! remotes and the store (DESIGN.md §7, §9), is `git`.
+//! remotes and the store (DESIGN.md §7, §9), is `git`. `review` is a
+//! fourth personality, run from the command line: one model's review of
+//! one commit, with no window.
 //!
 //! `unsafe` is forbidden for the whole crate (DESIGN.md §2).
 
@@ -52,6 +54,7 @@ pub mod picker;
 pub mod post;
 pub mod prompt;
 pub mod protocol;
+pub mod review;
 #[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;

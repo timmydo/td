@@ -66,6 +66,9 @@ pub struct Params<'a> {
     /// `reasoning.effort`, when the model takes the parameter.
     pub effort: Option<&'a str>,
     pub client: &'a Client,
+    /// Whether an Anthropic model is asked to cache the prompt: a turn's
+    /// is resent, a review's never is.
+    pub cache: bool,
 }
 
 /// `provider`: never routed to a provider that would drop a parameter,
@@ -111,7 +114,7 @@ pub fn head(params: &Params<'_>) -> String {
     }
     pairs.push(("provider".into(), provider(params.client)));
     // Anthropic's models cache only where asked (DESIGN.md §5).
-    if params.model.starts_with("anthropic/") {
+    if params.cache && params.model.starts_with("anthropic/") {
         pairs.push((
             "cache_control".into(),
             Json::Obj(vec![("type".into(), Json::Str("ephemeral".into()))]),
@@ -844,6 +847,7 @@ mod tests {
             max_tokens: 16384,
             effort: Some("medium"),
             client: &client,
+            cache: true,
         };
         assert_eq!(
             head(&params),
@@ -861,6 +865,7 @@ mod tests {
             max_tokens: 100,
             effort: None,
             client: &allow,
+            cache: true,
         };
         assert_eq!(
             head(&params),
