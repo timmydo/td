@@ -867,6 +867,91 @@ fn store_read_pool() {
     }
 }
 
+fn mime_parameter_octets() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_fields::Kind,
+        mime_parameter::{Attribute, BudgetedOctets, Error, OctetStatus},
+        mime_value::Role,
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let mut long = format!("attachment;x{}=ignored", "x".repeat(4096));
+    for index in (0..16).rev() {
+        long.push_str(&format!(";filename*{index}=value"));
+    }
+    let before = COUNTERS.snapshot();
+    for (source, expected, rejected) in [
+        (long.as_bytes(), [0, 0, 80], false),
+        (
+            b"attachment;filename*=utf-8'en'%E2%82%AC%00".as_slice(),
+            [5, 2, 4],
+            false,
+        ),
+        (
+            b"attachment;filename*1*=%82%AC;filename*0*=utf-8''%E2",
+            [5, 0, 3],
+            false,
+        ),
+        (
+            b"attachment;filename*0*=utf-8''secret;filename*1*=%xx;filename=saved",
+            [0, 0, 5],
+            true,
+        ),
+        (b"attachment;filename*=utf-8''%xx", [0, 0, 0], true),
+        (b"attachment;x=missing", [0, 0, 0], false),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records: 10_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = BudgetedOctets::new(
+            black_box(source),
+            Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut work,
+            &mut budget,
+        );
+        assert!(std::mem::size_of_val(&cursor) <= 1120);
+        let mut counts = [0usize; 3];
+        loop {
+            match cursor.poll(Tick(1)).unwrap() {
+                OctetStatus::Yield => {}
+                OctetStatus::Octet { role, value } => {
+                    black_box(value);
+                    *counts
+                        .get_mut(match role {
+                            Role::Charset => 0,
+                            Role::Language => 1,
+                            Role::Data => 2,
+                        })
+                        .unwrap() += 1;
+                }
+                OctetStatus::Complete(selection) => {
+                    assert_eq!(counts, expected);
+                    assert_eq!(selection.invalid_extended, rejected);
+                    black_box(selection);
+                    assert_eq!(cursor.poll(Tick(100)), Ok(OctetStatus::Complete(selection)));
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100)),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+                    break;
+                }
+            }
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME parameter octet replay allocated");
+}
+
 fn mime_parameter() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6295,6 +6380,7 @@ fn main() {
         mime_attribute();
         mime_value();
         mime_parameter();
+        mime_parameter_octets();
         body_value();
         mime_text();
         body_charset();
@@ -6439,6 +6525,7 @@ fn main() {
     mime_attribute();
     mime_value();
     mime_parameter();
+    mime_parameter_octets();
     body_value();
     mime_text();
     body_charset();

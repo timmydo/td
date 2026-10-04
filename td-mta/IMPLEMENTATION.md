@@ -1745,6 +1745,16 @@ Initial independently landable increments:
   ownership and allocation-free construction/replay. Derived octet drain,
   charset/display/boundary projection and MIME traversal remain open.
 
+- **M06bv — validated MIME parameter octet replay:** validate a complete
+  family before emitting any provisional octets; reuse one inline selector
+  for exact-value or per-index field replay under the original allowances.
+  Preserve role ordering, raw plans and rejected-family diagnostics, and
+  refuse replay failure without another fallback. Keep word placement bound
+  to original spelling. Qualify mixed sections, invalid later values, every
+  validation/replay budget cut, final admission, Unicode fixed turns and
+  allocation-free construction/drain. Charset/display/boundary projection,
+  MIME traversal and full-worker qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

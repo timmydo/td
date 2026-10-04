@@ -309,6 +309,16 @@ extents and passive rejection evidence; no section table or decoded output.
 POLICY.md owns precedence and fallback. All derived output remains provisional
 until a later charged drain and conversion completes. This selector fits the
 existing parser reservation; ancestor frames must not each retain one.
+The octet owner reuses that inline selector for complete validation and then
+charged replay, retaining its original budgets and credit throughout. It
+accepts source/kind/attribute rather than a caller-manufactured plan; rejected
+family octets never escape selection. The complete field grammar proves an
+ordinary value before replay: it shares td-header's delimited quoted-string
+and MIME token rules with mime_value's Ordinary validator. Replay rechecks
+that complete spelling before octets. Replay failure retires all provisional
+output and cannot choose a second fallback. Charset/language/data roles are
+lexical evidence only; original-source placement and metadata publication
+remain with later owners.
 New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed

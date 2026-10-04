@@ -1100,6 +1100,26 @@ late sticky refusal are allocation-probe intervals. Ancestor frames do not
 multiply this owner. Derived output retention, full-worker composition and
 native/RSS qualification remain open.
 
+M06bv's parameter Octets owner fits 1088 bytes and BudgetedOctets 1120 in
+the existing parser region. One inline Cursor serves complete validation and
+charged replay sequentially; neither a second retained selector nor output
+backing is added. Original allowances/private credit persist across the
+inline reset. The same 160 visits/33 plain records and 160 visits/256 steps/
+16 budgeted job-record turn limits hold. Exact-value replay validates and
+projects the selected extent; numbered replay repeats full field lookup for
+every index. Its additional charged quadratic cost can exhaust the shared
+allowance on a family that selection alone accepts; every later projection
+then refuses under that exhausted allowance. The same pinned 400-section
+fixture emits six provisional Data octets before consuming all 16,000,000
+steps, with 10,006,514 source visits left from 16,777,216. The drain then
+refuses and none of that prefix is complete output. These numbers qualify
+that exact spelling, not a universal section threshold. Bytes are provisional
+until
+charged drain completion. Constructor, long replay, rejected/fallback and
+empty families, and late refusal are Rust-allocation intervals. Complete
+worker stack composition, output retention, native/RSS and traversal remain
+open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

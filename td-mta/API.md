@@ -3568,6 +3568,50 @@ HeaderBudget and private credit. Constructor, long replay, invalid/fallback
 and late refusal are allocation-probe intervals. Display/boundary/charset
 projection, MIME traversal and worker/native qualification remain open.
 
+### 1.75 Validated MIME parameter octet replay
+
+M06bv adds mime_parameter::Octets and BudgetedOctets. Construct them from
+one immutable complete field, field kind and trusted Attribute, never a
+caller-manufactured Plan. One inline Cursor first validates the entire
+family as in section 1.74, discarding all octet events. Only after complete
+selection does that same inline state reset for charged replay. The live
+Meter/HeaderBudget and private credit never reset.
+
+Ordinary and single extended values replay their exact selected raw extent.
+Numbered values replay the whole field for each increasing index and keep
+uniqueness, syntax and mode checks. All replay reads are charged. A rejected
+extended family produces only its selected ordinary fallback; bytes or labels
+from the rejected family cannot escape the validation phase. Missing values
+complete without octets. A replay refusal retires the entire derived output;
+replay cannot choose a second fallback or complete a truncated family.
+
+OctetStatus yields at most one Charset, Language or Data octet per turn. Its
+role carries lexical evidence only. Original-case and empty/unknown labels
+remain intact. Mixed sections retain one ordered Data stream, so a later
+charset state may span them; complete percent triplets remain section local.
+All-unencoded series emit Data only. No decoded data gains RFC 2047 placement
+authority; the final Selection preserves ordinary raw extents for a later
+original-source compatibility path. Do not run a Text placement recognizer on
+unquoted, percent-decoded or joined output.
+
+Every emitted byte is provisional until charged OctetStatus::Complete returns
+the original Selection and its passive rejection diagnostic. Output retention,
+charset choice and conversion, filtering/NFC, boundary admission and metadata
+publication remain the caller's later responsibilities. An unknown/empty label
+is not a charset default; POLICY.md specifies later replacement recovery.
+
+Owners are neither Clone nor Copy. Octets fits 1088 bytes and BudgetedOctets
+1120 in the existing 16 KiB parser reservation, with no copied source, section
+vector, owned label or decoded backing. The selector's fixed turn limits
+remain 160 visits and 33 plain records, or 160 visits, 256 aggregate steps and
+16 budgeted job records. Resetting inline replay state adds no work allowance.
+Cached completion is inert; explicit zero-count check_deadline uses the same
+live allowances and latches refusal after completion or replacement meters.
+Allocation intervals cover constructor, complete selection, long replay,
+fallback, empty/rejected families and sticky late refusal. These are resident
+parser/Rust-allocation claims; full-worker, native/RSS and traversal
+qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
