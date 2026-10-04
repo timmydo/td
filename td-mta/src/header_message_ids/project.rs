@@ -30,6 +30,7 @@ enum Phase {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Purpose {
     MessageIds(Mode),
+    ContentId,
     AddrSpec,
     Fallback,
 }
@@ -64,6 +65,12 @@ impl<'a> Cursor<'a> {
             encoding_problem: false,
             failure: None,
         }
+    }
+    pub(crate) fn content_id(source: &'a [u8]) -> Self {
+        let mut cursor = Self::new(source, Mode::Strict);
+        cursor.purpose = Purpose::ContentId;
+        cursor.parser = Parser::content_id(source);
+        cursor
     }
     pub(crate) fn addr_spec(source: &'a [u8]) -> Self {
         let mut cursor = Self::new(source, Mode::Strict);
@@ -122,6 +129,7 @@ impl<'a> Cursor<'a> {
                 if self.parser.poll_with_work(now, work)? == Parsed::Complete {
                     self.parser = match self.purpose {
                         Purpose::MessageIds(mode) => Parser::new(self.source, mode),
+                        Purpose::ContentId => Parser::content_id(self.source),
                         Purpose::AddrSpec => Parser::addr_spec(self.source),
                         Purpose::Fallback => return Err(Error::InvalidState),
                     };

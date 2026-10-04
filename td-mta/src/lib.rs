@@ -43,6 +43,7 @@ pub mod mime_attribute;
 pub mod mime_base64;
 pub mod mime_body_lists;
 pub mod mime_charset;
+pub mod mime_content_id;
 pub mod mime_delimiter;
 pub mod mime_fields;
 pub mod mime_filename;

@@ -1873,6 +1873,13 @@ Initial independently landable increments:
   Rust allocation. Part-header selection/retention, JSON and worker/native/RSS
   remain open.
 
+- **M06ck — Content-ID values:** reuse strict identifier syntax and full-value
+  validation/replay through a private single-identifier purpose. Bind original
+  owners and retain conversion policy, work and provisional-event retirement.
+  Qualify literal single/multiple identifiers, malformed tails, owner handoff,
+  allowance/deadline cuts and Rust allocation. First-valid selection, retained
+  metadata/JSON and worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

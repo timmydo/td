@@ -1403,6 +1403,23 @@ nesting refusal, job-record exhaustion and deadline retirement after
 completion. HeaderBudget refusal and mid-parse deadline cuts have unit
 coverage; worker/native/RSS remain unqualified.
 
+M06ck's Content-ID adapter plus HeaderBudget fits 512 bytes in the existing
+16 KiB parser reservation. It wraps the existing budgeted identifier
+converter; no second parser, heap list, output backing or NFC scratch is
+created. Private purpose tags change grammar placement, not state capacity.
+Each poll stays within 160 source/intermediate visits, 255 header steps,
+sixteen job records and four output bytes. Both intermediate unfolding bytes
+and scalar UTF-8 bytes are charged; retained output admission is separate.
+Syntax validates the full single-identifier value before any projection event.
+
+Literal mail fixtures pin projection, original owner identity and aggregate
+accounting, multiple-identifier rejection, malformed/nested tails, all
+header/job/output allowance cuts, every live deadline turn and fresh handoff.
+Warm/measured Rust allocation intervals cover long Unicode success, repaired
+noncharacters, multiple-identifier/nesting refusal, job-record/output refusal
+and original handoff. Header cuts and live/late deadlines have unit coverage;
+worker/native/RSS remain unqualified.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

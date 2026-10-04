@@ -377,6 +377,15 @@ nesting and late refusals retire every event; no locale, charset, selected
 metadata or publication authority follows. First-valid part-header selection
 and retained language JSON remain separate.
 
+M06ck adds one complete Content-ID value through the existing identifier
+validation/replay and text conversion engines. Its private purpose admits
+exactly one bracketed identifier; ordinary MessageIds lists keep their
+existing behavior. The mail adapter borrows original work/header owners,
+retains sticky failure and performs fresh consuming handoff. CFWS and outer
+angles are omitted, while token spelling, folds and Unicode diagnostics use
+the existing conversion policy. Selected-header retention, JSON, reference
+resolution and publication remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

@@ -287,6 +287,21 @@ for RFC 2369's nonposting marker. These forms never fetch a URL. RFC
 date/header parsing does not broaden SMTP envelope grammar. Header values
 unsupported by a form remain readable as Raw.
 
+Content-ID field values require exactly one bracketed identifier under the
+existing strict resident MessageIds token/CFWS grammar, as the single msg-id
+in RFC 2045 section 7. Validate the complete value before projecting text;
+empty values, multiple identifiers, phrases and malformed tails reject the
+whole value. Unbracketed values and local-only labels such as <logo> are
+malformed, even if some clients use them; no permissive fallback is selected.
+Remove outside-token CFWS and surrounding angle brackets for
+RFC 8621 section 4.1.4's cid value. Preserve quoted spelling, escapes,
+original case and decomposed Unicode; existing identifier conversion unfolds
+inside tokens and replaces noncharacters with an encoding diagnostic.
+Encoded words stay literal. A parsed label establishes no uniqueness,
+reference resolution, URL access, source authorization or publication proof.
+Raw headers remain available; first-valid selection and retained output
+admission are separate.
+
 Content-Language field values use RFC 3282 section 2's ABNF comma-separated
 list and RFC 3066 section 2.1 tag spelling, with CFWS around contiguous tags.
 Empty elements (leading, trailing or repeated commas) are rejected; the older

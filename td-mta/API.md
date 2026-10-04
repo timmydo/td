@@ -4188,6 +4188,32 @@ RESOURCES.md qualifies fixed state/turns and Rust allocation. Automatic
 part-header selection/retention, body JSON/value projection, authenticated
 locators and streaming/worker/native/RSS remain open.
 
+### 1.90 Budgeted Content-ID values
+
+M06ck adds mime_content_id::Cursor over one caller-authorized complete
+resident field value. Private purposes reuse header_message_ids syntax and
+project::Budgeted validation/replay, unfolding and scalar conversion. Exactly
+one identifier is required; the public MessageIds constructors still parse
+lists. The adapter maps every inner error to a field-specific Error enum
+and Content-ID diagnostic. Full-value syntax or nesting refusal precedes every Begin/Scalar/End
+event. Later admission failure retires all provisional output. The adapter
+omits outer angle brackets and CFWS between tokens, preserving quoted/escaped
+spelling and the existing Unicode diagnostic policy without NFC or encoded
+word decoding. Intermediate unfolding bytes and final scalar UTF-8 bytes
+both spend original output work; this helper emits no JSON.
+
+The non-Copy/non-Clone cursor keeps the original Meter/HeaderBudget and
+private credit. Each bounded child turn uses the existing conversion limits.
+Cached Complete is inert; is_complete is passive and is_encoding_problem
+returns a diagnostic only while completion remains healthy. check_deadline
+and consuming finish freshly admit original owners; late refusal hides
+completion and the diagnostic. finish checks admission before completeness,
+returns the same owners on success and gives InvalidState for a healthy
+premature handoff. No allowance is refunded or renewed.
+
+Selection, retained backing, body metadata/JSON, CID reference resolution,
+authenticated locators and streaming/worker/native/RSS remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

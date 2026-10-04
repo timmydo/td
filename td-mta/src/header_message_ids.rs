@@ -83,6 +83,7 @@ enum Phase {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Purpose {
     MessageIds,
+    ContentId,
     AddrSpec,
     Phrase,
     RouteDomain,
@@ -117,6 +118,11 @@ impl<'a> Cursor<'a> {
             phrase: false,
             failure: None,
         }
+    }
+    pub(crate) const fn content_id(source: &'a [u8]) -> Self {
+        let mut cursor = Self::new(source, Mode::Strict);
+        cursor.purpose = Purpose::ContentId;
+        cursor
     }
     // Enter the shared local/domain grammar without copying enclosing angles.
     pub(crate) const fn addr_spec(source: &'a [u8]) -> Self {
@@ -277,7 +283,11 @@ impl<'a> Cursor<'a> {
                 self.phase = Phase::Complete;
                 Ok(Status::Complete)
             }
-            (Grammar::Between, Some(b'<')) if self.purpose == Purpose::MessageIds => {
+            // ContentId admits only its first identifier.
+            (Grammar::Between, Some(b'<'))
+                if self.purpose == Purpose::MessageIds
+                    || (self.purpose == Purpose::ContentId && !self.any) =>
+            {
                 self.advance(1)?;
                 self.grammar = Grammar::LeftWord;
                 self.phase = Phase::Cfws;
@@ -332,7 +342,7 @@ impl<'a> Cursor<'a> {
                 Ok(Status::Complete)
             }
             (Grammar::RightTail | Grammar::LiteralTail, Some(b'>'))
-                if self.purpose == Purpose::MessageIds =>
+                if matches!(self.purpose, Purpose::MessageIds | Purpose::ContentId) =>
             {
                 self.advance(1)?;
                 self.grammar = Grammar::Between;

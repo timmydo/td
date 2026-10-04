@@ -28,6 +28,16 @@ impl<'a, 'w> Budgeted<'a, 'w> {
     ) -> Self {
         Self::with_cursor(Cursor::new(source, mode), work, budget)
     }
+    pub(crate) fn content_id(
+        source: &'a [u8],
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+    ) -> Self {
+        Self::with_cursor(Cursor::content_id(source), work, budget)
+    }
+    pub(crate) fn is_complete(&self) -> bool {
+        self.failure.is_none() && matches!(self.cursor.phase, Phase::Complete)
+    }
     pub(crate) fn addr_spec(
         source: &'a [u8],
         work: &'w mut Meter,

@@ -1229,6 +1229,94 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn content_id_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_content_id::{Cursor, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("({0})<{0}@b>", "🐈".repeat(4096));
+    let nested = format!("<a@b>{}", "(".repeat(33));
+    let before = COUNTERS.snapshot();
+    for (source, expected, records, output) in [
+        (
+            b"(x)<a@b> (tail)".as_slice(),
+            None,
+            100_000_000,
+            100_000_000,
+        ),
+        (long.as_bytes(), None, 100_000_000, 100_000_000),
+        ("<\u{fdd0}@b>".as_bytes(), None, 100_000_000, 100_000_000),
+        (
+            b"<a@b><c@d>",
+            Some(Error::Malformed),
+            100_000_000,
+            100_000_000,
+        ),
+        (
+            nested.as_bytes(),
+            Some(Error::NestingLimit),
+            100_000_000,
+            100_000_000,
+        ),
+        (b"<a@b>", Some(Error::Work(Stop::Records)), 0, 100_000_000),
+        (
+            b"<a@b>",
+            Some(Error::Work(Stop::OutputBytes)),
+            100_000_000,
+            0,
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records,
+                output_bytes: output,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(source, &mut work, &mut budget);
+        let mut terminal = false;
+        for _ in 0..1_000_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield | Status::Begin | Status::End) => {}
+                Ok(Status::Scalar(value)) => {
+                    std::hint::black_box(value);
+                }
+                Ok(Status::Complete) => {
+                    assert_eq!(expected, None);
+                    assert!(cursor.is_complete());
+                    assert!(cursor.is_encoding_problem().is_some());
+                    assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+                    cursor.check_deadline(Tick(1)).unwrap();
+                    terminal = true;
+                    break;
+                }
+                Err(error) => {
+                    assert_eq!(expected, Some(error));
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                    assert_eq!(cursor.is_encoding_problem(), None);
+                    terminal = true;
+                    break;
+                }
+            }
+        }
+        assert!(terminal);
+        if expected.is_none() {
+            cursor.finish(Tick(1)).unwrap();
+        } else {
+            assert_eq!(cursor.finish(Tick(1)).err(), expected);
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Content-ID conversion allocated");
+}
+
 fn content_language_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -8019,6 +8107,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        content_id_values();
         content_language_values();
         body_value();
         mime_text();
@@ -8175,6 +8264,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    content_id_values();
     content_language_values();
     body_value();
     mime_text();
