@@ -77,6 +77,16 @@ impl Outbox {
             let Some(to) = receiver.file_name().to_str().and_then(Id::parse) else {
                 continue;
             };
+            // Messages a failed removal left for a receiver since deleted
+            // (DESIGN.md §4) go now.
+            if let Err(e) = std::fs::symlink_metadata(state.conversation(&to)) {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    if let Err(e) = std::fs::remove_dir_all(receiver.path()) {
+                        problems.push(format!("{}: {e}", receiver.path().display()));
+                    }
+                    continue;
+                }
+            }
             for entry in std::fs::read_dir(receiver.path())
                 .into_iter()
                 .flatten()
@@ -151,6 +161,18 @@ impl Outbox {
         self.next = self.next.saturating_add(1);
         self.queued.push(message);
         Ok(())
+    }
+
+    /// Conversation `to` is deleted: what was queued for it goes, from
+    /// memory and from the state directory.
+    pub fn forget(&mut self, to: &Id) -> Result<(), String> {
+        self.queued.retain(|q| &q.to != to);
+        let dir = self.dir.join(to.as_str());
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", dir.display())),
+        }
     }
 
     /// `to` logged delivery `delivery`, or refused it: it is queued no
@@ -257,6 +279,12 @@ impl Post {
             outbox,
             stuck: Vec::new(),
         }
+    }
+
+    /// Conversation `id` is deleted: nothing is queued or stuck for it.
+    pub fn forget(&mut self, id: &Id) -> Result<(), String> {
+        self.stuck.retain(|stuck| stuck != id);
+        self.outbox.forget(id)
     }
 
     pub fn outbox(&self) -> &Outbox {
@@ -374,6 +402,14 @@ mod tests {
         Id::parse(&format!("{n:032x}")).unwrap()
     }
 
+    /// The store holds these conversations, so the outbox keeps their
+    /// messages across a load.
+    fn receivers(state: &StateDir, ns: &[u8]) {
+        for &n in ns {
+            std::fs::create_dir_all(state.conversation(&id(n))).unwrap();
+        }
+    }
+
     fn entry(n: u8, role: Role) -> Entry {
         Entry {
             id: id(n),
@@ -387,6 +423,7 @@ mod tests {
     fn the_outbox_keeps_messages_in_order_across_a_restart() {
         let scratch = Scratch::new("outbox");
         let state = scratch.state();
+        receivers(&state, &[1, 2]);
         let (mut outbox, problems) = Outbox::load(&state);
         assert!(problems.is_empty(), "{problems:?}");
         outbox
@@ -424,6 +461,41 @@ mod tests {
         assert_eq!(texts, ["second \"quoted\"", "third"]);
         assert_eq!(third.queued()[1].role, Role::Orchestrator);
         assert_eq!(third.next, 4, "orders keep rising");
+    }
+
+    /// A deleted receiver's messages go, from memory and from disk; the
+    /// others' stay.
+    #[test]
+    fn a_deleted_receiver_is_forgotten() {
+        let scratch = Scratch::new("forget");
+        let state = scratch.state();
+        receivers(&state, &[1, 2]);
+        let (outbox, _) = Outbox::load(&state);
+        let mut post = Post::new(outbox);
+        for (to, text) in [(1, "kept"), (2, "gone"), (2, "gone too")] {
+            post.outbox
+                .post(id(to), id(3), Role::Conversation, text.into(), None)
+                .unwrap();
+        }
+        post.forget(&id(2)).unwrap();
+        assert_eq!(post.outbox().count(&id(2)), 0);
+        assert!(!state.root().join("outbox").join(id(2).as_str()).exists());
+        let (again, problems) = Outbox::load(&state);
+        assert!(problems.is_empty(), "{problems:?}");
+        let texts: Vec<&str> = again.queued().iter().map(|q| q.text.as_str()).collect();
+        assert_eq!(texts, ["kept"]);
+        // Forgetting one with nothing queued is nothing.
+        post.forget(&id(4)).unwrap();
+        // What a failed removal left for a receiver since deleted goes at
+        // the next load.
+        post.outbox
+            .post(id(1), id(3), Role::Conversation, "late".into(), None)
+            .unwrap();
+        std::fs::remove_dir_all(state.conversation(&id(1))).unwrap();
+        let (again, problems) = Outbox::load(&state);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(again.queued().is_empty());
+        assert!(!state.root().join("outbox").join(id(1).as_str()).exists());
     }
 
     #[test]

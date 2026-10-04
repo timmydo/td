@@ -28,6 +28,8 @@ const O_NOFOLLOW: i32 = 0o400000;
 const MAX_META: u64 = 64 * 1024;
 /// The longest `prefix` read back.
 pub const MAX_PREFIX: u64 = 1024 * 1024;
+/// The name a conversation's directory takes while it is deleted.
+const DELETING: &str = ".deleting-";
 /// The longest log loaded; a longer one is refused rather than read.
 pub const MAX_LOG: u64 = 256 * 1024 * 1024;
 /// What a log keeps free past an accepted message, for the records that
@@ -189,6 +191,61 @@ impl StateDir {
             )),
             Err(TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
         }
+    }
+
+    /// Deletes conversation `id` for good (DESIGN.md §6). Its process
+    /// must have ended: the conversation's lock is taken first, waiting a
+    /// moment for a process just killed to exit, and held to the end. The
+    /// directory is renamed out of the list, then removed. An error means
+    /// the conversation is untouched; once renamed it is deleted, and a
+    /// removal that failed, which the `Some` says, the window's
+    /// `sweep_deleted` finishes at its next start.
+    pub fn delete(&self, id: &Id) -> Result<Option<String>, String> {
+        let dir = self.conversation(id);
+        // One whose directory was never made, or is gone, is deleted.
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+            Ok(_) => {}
+        }
+        let lock = lock_conversation(&dir, Duration::from_secs(2))?;
+        let gone = self.conversations().join(format!("{DELETING}{id}"));
+        std::fs::rename(&dir, &gone).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let removed = File::open(self.conversations())
+            .and_then(|d| d.sync_all())
+            .and_then(|()| match std::fs::remove_dir_all(&gone) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                removed => removed,
+            })
+            .map_err(|e| format!("{}: {e}", gone.display()));
+        drop(lock);
+        Ok(removed.err())
+    }
+
+    /// Finishes the deletions a crash or a failed removal left, by the
+    /// window alone, at its start (DESIGN.md §6); one whose lock is held
+    /// is under way and left. What could not be removed is named.
+    pub fn sweep_deleted(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.conversations()) else {
+            return problems;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(gone) = name.to_str().filter(|n| n.starts_with(DELETING)) else {
+                continue;
+            };
+            let path = entry.path();
+            if let Ok(lock) = lock_conversation(&path, Duration::ZERO) {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => problems.push(format!("{gone}: {e}")),
+                }
+                drop(lock);
+            }
+        }
+        problems
     }
 
     /// Every conversation the store holds, by its `meta`, with what could
@@ -1594,6 +1651,44 @@ pub mod tests {
         std::fs::remove_file(dir.join("prefix")).unwrap();
         std::fs::write(dir.join("prefix"), vec![b' '; MAX_PREFIX as usize + 1]).unwrap();
         assert!(read_prefix(&state, &id).is_err(), "past the bound");
+    }
+
+    /// A conversation is deleted only once its writer is gone; a deletion
+    /// a crash cut short is finished by the next listing.
+    #[test]
+    fn a_conversation_is_deleted_whole_and_a_cut_deletion_finished() {
+        let scratch = Scratch::new("delete");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let kept = Id::random().unwrap();
+        let (conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        Conversation::open(&state, &kept, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        // Its writer holds the lock: refused, and nothing moved.
+        let refused = state.delete(&id).unwrap_err();
+        assert!(refused.contains("already has its writer"), "{refused}");
+        assert!(state.conversation(&id).exists());
+        drop(conversation);
+        assert_eq!(state.delete(&id).unwrap(), None);
+        assert!(!state.conversation(&id).exists());
+        let listed: Vec<Id> = state.list().0.into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, std::slice::from_ref(&kept));
+        // One never made, or gone, is deleted already.
+        assert_eq!(state.delete(&id).unwrap(), None);
+        // A deletion cut short is out of the list; one under way holds
+        // its lock, and the window's sweep leaves it.
+        let cut = state.conversations().join(format!("{DELETING}{kept}"));
+        std::fs::rename(state.conversation(&kept), &cut).unwrap();
+        let (metas, problems) = state.list();
+        assert!(metas.is_empty() && problems.is_empty(), "{problems:?}");
+        assert!(cut.exists(), "a listing removes nothing");
+        let held = lock_conversation(&cut, Duration::ZERO).unwrap();
+        assert!(state.sweep_deleted().is_empty());
+        assert!(cut.exists());
+        // One a crash cut short is finished.
+        drop(held);
+        assert!(state.sweep_deleted().is_empty());
+        assert!(!cut.exists());
     }
 
     #[test]

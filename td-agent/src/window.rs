@@ -227,6 +227,7 @@ impl Session {
                 }
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
                 Request::Export => self.export(),
+                Request::Delete(id) => self.delete(&id),
                 Request::Quit => self.quit = true,
             }
         }
@@ -384,6 +385,55 @@ impl Session {
         self.app.set_today(today);
         self.fetched();
         self.exported();
+    }
+
+    /// Deletes conversation `id` for good (DESIGN.md §4): its process
+    /// ends, what was queued for it goes, then its directory; the window
+    /// opens the orchestrator in its place when it was the one open.
+    fn delete(&mut self, id: &Id) {
+        if self.app.orchestrator().as_ref() == Some(id) {
+            return self.app.note("the orchestrator is not deleted");
+        }
+        // The window's open conversation, whether or not its process runs.
+        let was_open = self.app.active() == Some(id);
+        let held = self.supervisor.remove(id);
+        // Its process has ended, as a crash ends one.
+        self.ledger.forget(id);
+        let unremoved = match self.state.delete(id) {
+            Ok(unremoved) => unremoved,
+            Err(e) => {
+                eprintln!("td-agent: deleting {id}: {e}");
+                self.app
+                    .note(format!("the conversation was not deleted: {e}"));
+                // Untouched: the human's messages are parked again, the
+                // outbox still holds the others', and opening it again
+                // starts its process.
+                self.supervisor.park(id.clone(), held);
+                if was_open {
+                    self.open(id.clone(), None);
+                }
+                return;
+            }
+        };
+        let mut said = String::from("the conversation is deleted");
+        if let Some(problem) = unremoved {
+            eprintln!("td-agent: deleting {id}: {problem}");
+            said.push_str(&format!(
+                "; what is left of its files goes at the next start: {problem}"
+            ));
+        }
+        if let Err(e) = self.post.forget(id) {
+            eprintln!("td-agent: the outbox: {e}");
+            said.push_str(&format!("; the outbox: {e}"));
+        }
+        self.app.remove_row(id);
+        self.app.note(said);
+        if was_open {
+            if let Some(orchestrator) = self.app.orchestrator() {
+                self.app.set_active(orchestrator.clone());
+                self.open(orchestrator, None);
+            }
+        }
     }
 
     /// Starts the diagnostics export (DESIGN.md §4) on a thread, into
@@ -603,7 +653,8 @@ impl Handler for Session {
 
 /// The conversations the store holds, as the list shows them, closed.
 fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
-    let (metas, problems) = state.list();
+    let (metas, mut problems) = state.list();
+    problems.extend(state.sweep_deleted());
     let rows = metas
         .into_iter()
         .map(|meta| {

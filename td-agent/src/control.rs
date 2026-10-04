@@ -37,8 +37,9 @@ impl ErrorCode for Refusal {
     }
 }
 
-/// The window's actions, each its default chord; `set-key`, `model` and
-/// `export-diagnostics` have none, and are menu items.
+/// The window's actions, each its default chord; `set-key`, `model`,
+/// `export-diagnostics` and `delete-conversation` have none, and are menu
+/// items.
 pub const BINDINGS: &[Binding] = &[
     Binding {
         name: "new",
@@ -125,6 +126,12 @@ pub const BINDINGS: &[Binding] = &[
         help: "Conversation > Model...: open the picker of the open conversation's model: type to filter, Return chooses, Escape cancels.",
     },
     Binding {
+        name: "delete-conversation",
+        chord: None,
+        arguments: "",
+        help: "Conversation > Delete conversation...: ask whether to delete the open conversation for good; Cancel is focused first. The orchestrator is never deleted.",
+    },
+    Binding {
         name: "export-diagnostics",
         chord: None,
         arguments: "",
@@ -168,11 +175,15 @@ impl Controller for Remote<'_> {
             return Err(Refusal::Protocol);
         }
         // Through the menu's own paths, as a choice of its item.
-        if matches!(name, "set-key" | "model" | "export-diagnostics") {
+        if matches!(
+            name,
+            "set-key" | "model" | "export-diagnostics" | "delete-conversation"
+        ) {
             let before = self.app.generation();
             match name {
                 "set-key" => self.app.open_key_dialog(),
                 "model" => self.app.open_picker(),
+                "delete-conversation" => self.app.open_delete(),
                 _ => self.app.export_diagnostics(),
             }
             return Ok(self.outcome(before));
@@ -246,13 +257,14 @@ impl Controller for Remote<'_> {
             (picker.selected().unwrap_or("nothing"), picker.query())
         });
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tquery={query}\tmodel={}\teffort={}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tstatus={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
             app.transcript().len(),
             app.composed().len(),
             if app.menu_open() { "open" } else { "closed" },
+            app.confirm().map_or("none", |confirm| confirm.focus()),
             app.model(),
             app.effort(),
             app.status_line().replace(['\t', '\n'], " "),
@@ -385,6 +397,30 @@ mod tests {
         assert_eq!(remote.app.take_requests(), [Request::Export]);
     }
 
+    /// `delete-conversation` asks, and the state says where the
+    /// question's keyboard is.
+    #[test]
+    fn deletion_is_driven_through_its_question() {
+        let mut app = crate::ui::tests::app();
+        app.set_active(crate::ui::tests::id(2));
+        let mut remote = Remote { app: &mut app };
+        assert!(
+            driven::request(&mut remote, b"1\t1\taction\tdelete-conversation").ends_with("changed")
+        );
+        assert!(remote.state().unwrap().contains("confirm=cancel"));
+        driven::request(&mut remote, format!("1\t2\tkey\t{}", hex("Tab")).as_bytes());
+        assert!(remote.state().unwrap().contains("confirm=delete"));
+        driven::request(
+            &mut remote,
+            format!("1\t3\tkey\t{}", hex("Return")).as_bytes(),
+        );
+        assert!(remote.state().unwrap().contains("confirm=none"));
+        assert_eq!(
+            remote.app.take_requests(),
+            [Request::Delete(crate::ui::tests::id(2))]
+        );
+    }
+
     /// `model` opens the picker, whose selection and filter the state
     /// says; typed into and chosen, it asks for the conversation's model.
     #[test]
@@ -400,7 +436,7 @@ mod tests {
         let mut remote = Remote { app: &mut app };
         let state = remote.state().unwrap();
         assert!(
-            state.contains("picker=none\tquery=\tmodel=m/orch\teffort=medium"),
+            state.contains("picker=none\tquery=\tconfirm=none\tmodel=m/orch\teffort=medium"),
             "{state}"
         );
         assert!(driven::request(&mut remote, b"1\t1\taction\tmodel").ends_with("changed"));

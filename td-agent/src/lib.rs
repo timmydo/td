@@ -25,6 +25,7 @@ pub mod accounts;
 pub mod assemble;
 pub mod client;
 pub mod config;
+pub mod confirm;
 pub mod control;
 pub mod conversation;
 pub mod cost;

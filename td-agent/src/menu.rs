@@ -40,6 +40,8 @@ pub enum Action {
     /// when the live pointer or keyboard chose this, never the control
     /// socket (`App::input_live`).
     Keys,
+    /// Ask whether to delete the open conversation.
+    Delete,
 }
 
 /// The File menu's items: label, the chord shown beside it (one that
@@ -59,14 +61,18 @@ pub const HELP: &[(&str, &str, Action)] = &[(keys::ITEM, keys::CHORD, Action::Ke
 pub const MODEL: &str = "Model\u{2026}";
 /// The Conversation menu's submenu of efforts.
 pub const EFFORT: &str = "Effort";
+/// The Conversation menu's item that asks to delete the open one.
+pub const DELETE: &str = "Delete conversation\u{2026}";
 
 /// What the Conversation menu shows: whether a conversation is open, its
-/// effort, and whether its model takes one.
+/// effort, whether its model takes one, and whether it can be deleted
+/// (any but the orchestrator).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct State<'a> {
     pub open: bool,
     pub effort: &'a str,
     pub reasoning: bool,
+    pub deletable: bool,
 }
 
 pub type Menu = Controller<'static, Action, u64>;
@@ -117,6 +123,11 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         row: row(level, "", true, level == state.effort),
         item: Item::Action(Action::Effort(level)),
     }));
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(DELETE, "", state.open && state.deletable, false),
+        item: Item::Action(Action::Delete),
+    });
     let help = nodes.len();
     nodes.push(Node {
         parent: None,
@@ -162,6 +173,7 @@ mod tests {
         open: true,
         effort: "high",
         reasoning: true,
+        deletable: true,
     };
 
     fn surface() -> Surface {
@@ -236,6 +248,13 @@ mod tests {
             ..OPENED
         };
         assert!(enabled(plain, MODEL) && !enabled(plain, EFFORT));
+        // The orchestrator is not deleted; nor is anything with none open.
+        assert!(enabled(OPENED, DELETE) && !enabled(closed, DELETE));
+        let orchestrator = State {
+            deletable: false,
+            ..OPENED
+        };
+        assert!(!enabled(orchestrator, DELETE));
     }
 
     #[test]

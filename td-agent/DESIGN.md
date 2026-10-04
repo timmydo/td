@@ -320,8 +320,10 @@ id, named by a rising order and its delivery id, before the sender hears
 it was queued. Each poll hands what is queued to its receiver's process,
 starting one in the background for a conversation that has none and has
 not failed, and a message's file is removed only when its receiver
-acknowledges or refuses it. So once queued, a restart of the receiver or
-the window neither loses nor repeats a message: a receiver restarted
+acknowledges or refuses it, or is deleted (§4); a load drops what is
+queued for a receiver the store no longer holds. So once queued, a
+restart of the receiver or the window neither loses nor repeats a
+message: a receiver restarted
 from its log is handed its unacknowledged messages again, and logs each
 delivery id once. A sender that hears no answer, the window closing or
 not answering in 30 s, tells its model that whether the message was
@@ -909,6 +911,41 @@ message goes before any other, and opening the conversation again
 shows it again. A prefix of more messages than a message holds
 sections shows the first fourteen and says how many more there are.
 
+**As built (deleting a conversation).** Conversation → `Delete
+conversation…` deletes the open conversation for good. It is off for the
+orchestrator, which is the one conversation always there, and with none
+open.
+
+- **The question** is td-ui's confirmation dialog (td-ui/DESIGN.md),
+  modal and centred over the window's body: it names the conversation
+  by title and id and says that its log, todo list, cost record and the
+  messages waiting for it are removed from the machine, that what it
+  sent to other conversations stays in theirs, and that this cannot be
+  undone. `Cancel` is focused first, so `Return` alone deletes nothing;
+  `Tab` reaches `Delete`. `Escape`, opening another conversation, the key
+  dialog, or a window too small for it closes it with nothing deleted.
+  While it is open it has every key and the pointer, and a paste is
+  dropped with a notice.
+- **The deletion** is the window's, and never the orchestrator's, in
+  this order: the conversation's processes, open, in the background or
+  retiring, are killed and waited for; its
+  ledger reservations go; then the
+  store deletes its directory (§6). The store takes the conversation's
+  lock first, so it never deletes under a writer, holds it to the end,
+  and renames the directory out of the list before removing it; one
+  whose directory was never made is deleted already. Only then does
+  what the outbox holds for it go. The window drops its row and, when it
+  was the one open, opens the orchestrator. A deletion refused before
+  the rename says why, and the conversation stays whole: the human's
+  messages it had not acknowledged are parked for its next process and
+  the outbox keeps the others'. Once renamed it is deleted; files a
+  removal left are removed at the window's next start, and messages the
+  outbox could not remove at its next load.
+- **Driven.** The actions gain `delete-conversation`, which has no chord
+  and asks through the item's own path; the state gains `confirm`
+  (`none`, or where the question's keyboard is: `details`, `cancel` or
+  `delete`).
+
 **As built (the diagnostics export).** File → `Export diagnostics`
 writes one archive a human can attach to a report: everything td-agent
 keeps that bears on what it did, and never the key file.
@@ -1328,7 +1365,10 @@ worker outside any jail (§9).
 
 **The conversation store** is `$XDG_STATE_HOME/td-agent/` on a host, and
 the application's persistent state directory on td. No jail instance ever
-sees it. Each conversation is a directory named by a random id, holding:
+sees it. Each conversation is a directory named by a random id (one the
+human deleted (§4) is renamed `.deleting-<id>` under its lock and then
+removed; a listing skips it, and the window at its start finishes a
+removal whose lock nobody holds), holding:
 
 - `meta`: title, workspace, model, mode, parent conversation when forked,
   and creation time.

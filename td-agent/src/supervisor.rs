@@ -114,8 +114,9 @@ pub struct Supervisor {
     setup: Down,
     children: Vec<Running>,
     open: Option<Id>,
-    /// Children whose socketpair was closed, reaped as they exit.
-    retiring: Vec<(Child, Instant)>,
+    /// Children whose socketpair was closed, by conversation, reaped as
+    /// they exit.
+    retiring: Vec<(Id, Child, Instant)>,
     /// Messages a closed conversation had not acknowledged, sent again
     /// when it is opened again; its process logs each delivery id once.
     parked: Vec<(Id, Vec<(String, String)>)>,
@@ -347,13 +348,14 @@ impl Supervisor {
     /// window's outbox keeps the other conversations' messages.
     fn retire(&mut self, mut running: Running) {
         let _ = running.writer.shutdown(std::net::Shutdown::Both);
-        if !running.pending.is_empty() {
-            self.parked.push((running.id, running.pending));
-        }
         if running.child.try_wait().ok().flatten().is_none() {
-            self.retiring
-                .push((running.child, Instant::now() + EXIT_WAIT));
+            self.retiring.push((
+                running.id.clone(),
+                running.child,
+                Instant::now() + EXIT_WAIT,
+            ));
         }
+        self.park(running.id, running.pending);
     }
 
     fn spawn(
@@ -458,7 +460,7 @@ impl Supervisor {
         // A child told to go that has not gone by its deadline is killed:
         // it would hold its conversation's lock against the next one.
         let now = Instant::now();
-        self.retiring.retain_mut(|(child, deadline)| {
+        self.retiring.retain_mut(|(_, child, deadline)| {
             if child.try_wait().ok().flatten().is_some() {
                 return false;
             }
@@ -557,6 +559,45 @@ impl Supervisor {
         }
     }
 
+    /// Ends conversation `id`'s processes, open, in the background or
+    /// retiring, and waits for them, so its directory can go (DESIGN.md
+    /// §4, deleting a conversation). The human's messages it had not
+    /// acknowledged are handed back, oldest first, to be parked again
+    /// should the deletion fail.
+    pub fn remove(&mut self, id: &Id) -> Vec<(String, String)> {
+        if self.open.as_ref() == Some(id) {
+            self.open = None;
+        }
+        let mut held = Vec::new();
+        if let Some(at) = self.parked.iter().position(|(parked, _)| parked == id) {
+            held = self.parked.swap_remove(at).1;
+        }
+        if let Some(at) = self.at(id) {
+            let mut running = self.children.swap_remove(at);
+            let _ = running.child.kill();
+            let _ = running.child.wait();
+            held.extend(running.pending);
+        }
+        for (_, child, _) in self.retiring.iter_mut().filter(|(of, _, _)| of == id) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.retiring.retain(|(of, _, _)| of != id);
+        held
+    }
+
+    /// Keeps the human's messages `id` had not acknowledged for its next
+    /// process.
+    pub fn park(&mut self, id: Id, pending: Vec<(String, String)>) {
+        if pending.is_empty() {
+            return;
+        }
+        match self.parked.iter_mut().find(|(parked, _)| *parked == id) {
+            Some((_, held)) => held.extend(pending),
+            None => self.parked.push((id, pending)),
+        }
+    }
+
     /// Kills the open conversation's process, as a crash would.
     pub fn kill(&mut self) {
         if let Some(running) = self.opened() {
@@ -652,7 +693,7 @@ impl Drop for Supervisor {
             }
         }
         let deadline = Instant::now() + EXIT_WAIT;
-        for (child, _) in &mut self.retiring {
+        for (_, child, _) in &mut self.retiring {
             while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }

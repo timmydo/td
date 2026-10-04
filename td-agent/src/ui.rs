@@ -45,6 +45,7 @@ use td_ui::window::{Clipboard, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::config::Mode;
+use crate::confirm::Confirm;
 use crate::cost;
 use crate::key::Secret;
 use crate::keydialog::{KeyDialog, Reply};
@@ -203,6 +204,8 @@ pub enum Request {
     SaveKey { secret: Secret, replace: bool },
     /// Write the diagnostics archive, from File → Export diagnostics.
     Export,
+    /// Delete this conversation for good, as the human confirmed.
+    Delete(Id),
     /// Close the window, from File → Quit.
     Quit,
     /// The open conversation's model and effort as the human chose them,
@@ -483,6 +486,10 @@ pub struct App {
     system_shown: bool,
     /// The model picker while it is open, modal over the window.
     picker: Option<Picker>,
+    /// The question before a conversation is deleted, while it is open,
+    /// modal over the window; its revision counts the questions asked.
+    confirm: Option<Confirm>,
+    confirm_revision: u64,
     /// The menu's revision: it is built again, from the state of the
     /// moment, each time it opens.
     menu_revision: u64,
@@ -569,6 +576,8 @@ impl App {
             asked: VecDeque::new(),
             system_shown: false,
             picker: None,
+            confirm: None,
+            confirm_revision: 0,
             menu_revision: 1,
             credit: None,
             today: None,
@@ -775,6 +784,32 @@ impl App {
         self.picker.as_ref()
     }
 
+    /// The orchestrator's id, when the list holds it.
+    pub fn orchestrator(&self) -> Option<Id> {
+        self.rows
+            .iter()
+            .find(|r| r.role == Role::Orchestrator)
+            .map(|r| r.id.clone())
+    }
+
+    /// The question before a deletion, while it is open.
+    pub fn confirm(&self) -> Option<&Confirm> {
+        self.confirm.as_ref()
+    }
+
+    /// Conversation `id` is deleted: its row goes, and the transcript with
+    /// it when it was the one open.
+    pub fn remove_row(&mut self, id: &Id) {
+        self.rows.retain(|row| &row.id != id);
+        self.background_turns.retain(|(of, _)| of != id);
+        if self.active.as_ref() == Some(id) {
+            self.active = None;
+            self.clear_transcript();
+        }
+        self.refresh_list();
+        self.touch();
+    }
+
     /// The models the status row names, and their context lengths.
     pub fn set_models(
         &mut self,
@@ -854,8 +889,9 @@ impl App {
     /// Shows conversation `id`, its transcript empty until its process
     /// replays its log, and every other conversation closed.
     pub fn set_active(&mut self, id: Id) {
-        // A model is chosen for the conversation the picker opened over.
-        if self.picker.take().is_some() {
+        // A model is chosen, and a deletion asked, for the conversation
+        // the picker or the question opened over.
+        if self.picker.take().is_some() | self.confirm.take().is_some() {
             self.apply_focus();
         }
         // The conversation left goes on in the background while its turn
@@ -1747,6 +1783,12 @@ impl App {
                 self.note("the window is now too small for the model picker, which is closed");
             }
         }
+        if let Some(confirm) = self.confirm.as_mut() {
+            if !confirm.resize(self.surface, body(self.surface)) {
+                self.close_confirm();
+                self.note("the window is now too small for the question, which is closed: nothing was deleted");
+            }
+        }
         if let Some(dialog) = self.dialog.as_mut() {
             if !dialog.resize(self.surface) {
                 self.close_dialog();
@@ -1817,7 +1859,11 @@ impl App {
     fn apply_focus(&mut self) {
         // A modal dialog has the keyboard: no widget under it shows focus.
         let on = |f: Focus| {
-            self.focused && self.dialog.is_none() && self.picker.is_none() && self.focus == f
+            self.focused
+                && self.dialog.is_none()
+                && self.picker.is_none()
+                && self.confirm.is_none()
+                && self.focus == f
         };
         let list_focus = if on(Focus::List) {
             tree_table::Focus::Rows
@@ -1952,6 +1998,9 @@ impl App {
         if self.picker.is_some() {
             return self.picker_input(input);
         }
+        if self.confirm.is_some() {
+            return self.confirm_input(input);
+        }
         if self.menu.is_open() && self.menu_input(&input) {
             return;
         }
@@ -2019,6 +2068,9 @@ impl App {
         }
         if self.picker.is_some() {
             return self.note("a paste that came while the model picker was open is dropped");
+        }
+        if self.confirm.is_some() {
+            return self.note("a paste that came while the deletion question was open is dropped");
         }
         if self.focus == Focus::Composer {
             match self.composer.insert(text) {
@@ -2131,6 +2183,7 @@ impl App {
             menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
             menu::Action::Model => self.open_picker(),
+            menu::Action::Delete => self.open_delete(),
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
             // The list is the window's: `input_live` reports the choice.
             menu::Action::Keys => self.keys_chosen = true,
@@ -2146,10 +2199,16 @@ impl App {
         }
         let revision = self.menu_revision.wrapping_add(1);
         let model = self.model();
+        let deletable = self
+            .active
+            .as_ref()
+            .and_then(|id| self.rows.iter().find(|r| &r.id == id))
+            .is_some_and(|r| r.role != Role::Orchestrator);
         let state = menu::State {
             open: self.active.is_some(),
             effort: self.effort(),
             reasoning: self.reasoning(model),
+            deletable,
         };
         match menu::menu(self.surface, state, revision) {
             Ok(menu) => {
@@ -2182,7 +2241,7 @@ impl App {
     /// Opens the model picker for the open conversation, modal over the
     /// window's body.
     pub fn open_picker(&mut self) {
-        if self.picker.is_some() || self.dialog.is_some() {
+        if self.picker.is_some() || self.dialog.is_some() || self.confirm.is_some() {
             return;
         }
         if self.active.is_none() {
@@ -2240,6 +2299,89 @@ impl App {
         }
     }
 
+    /// Asks whether to delete the open conversation, as Conversation →
+    /// Delete conversation… does: modal over the window's body, `Cancel`
+    /// first. The orchestrator is never deleted.
+    pub fn open_delete(&mut self) {
+        if self.picker.is_some() || self.dialog.is_some() || self.confirm.is_some() {
+            return;
+        }
+        let Some(row) = self.active_row() else {
+            return self.note("no conversation is open to delete");
+        };
+        if row.role == Role::Orchestrator {
+            return self.note(
+                "the orchestrator is not deleted: it is the one conversation that is always there",
+            );
+        }
+        let (id, title) = (row.id.clone(), row.title.clone());
+        self.cancel_pointer();
+        self.menu.dismiss();
+        self.confirm_revision = self.confirm_revision.wrapping_add(1);
+        match Confirm::open(
+            self.surface,
+            body(self.surface),
+            id,
+            &title,
+            self.confirm_revision,
+        ) {
+            Ok(confirm) => {
+                self.confirm = Some(confirm);
+                self.apply_focus();
+                self.touch();
+            }
+            Err(e) => self.note(e),
+        }
+    }
+
+    fn close_confirm(&mut self) {
+        self.confirm = None;
+        self.apply_focus();
+        self.touch();
+    }
+
+    /// An input while the question is open, which is the question's: every
+    /// key and the pointer. A resize and the window's focus are the
+    /// window's too.
+    fn confirm_input(&mut self, input: Input<'_>) {
+        match input {
+            Input::Resize(surface) => return self.resize(surface),
+            Input::Focus(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.cancel_pointer();
+                    // td-ui's question is cancelled when the window loses
+                    // the keyboard: nothing is deleted.
+                    let cancelled = self
+                        .confirm
+                        .as_mut()
+                        .is_some_and(|c| c.input(&input) == crate::confirm::Reply::Closed);
+                    if cancelled {
+                        self.confirm = None;
+                        self.touch();
+                    }
+                }
+                return self.apply_focus();
+            }
+            _ => {}
+        }
+        let Some(confirm) = self.confirm.as_mut() else {
+            return;
+        };
+        match confirm.input(&input) {
+            crate::confirm::Reply::Stay(changed) => {
+                if changed {
+                    self.touch();
+                }
+            }
+            crate::confirm::Reply::Closed => self.close_confirm(),
+            crate::confirm::Reply::Confirmed(id) => {
+                self.close_confirm();
+                self.requests.push(Request::Delete(id));
+            }
+        }
+    }
+
     /// Asks for the diagnostics archive, as File → Export diagnostics does.
     pub fn export_diagnostics(&mut self) {
         self.requests.push(Request::Export);
@@ -2261,8 +2403,10 @@ impl App {
         self.press = None;
         match KeyDialog::open(self.surface, &path) {
             Ok(dialog) => {
-                // One modal at a time: the dialog replaces the picker.
+                // One modal at a time: the dialog replaces the picker and
+                // the question.
                 self.picker = None;
+                self.confirm = None;
                 self.dialog = Some(dialog);
                 self.apply_focus();
             }
@@ -2414,6 +2558,9 @@ impl App {
         }
         if self.picker.is_some() {
             return self.picker_input(Input::Key { chord, repeat });
+        }
+        if self.confirm.is_some() {
+            return self.confirm_input(Input::Key { chord, repeat });
         }
         if self.menu.is_open() {
             return self.menu_event(menu::event(chord, repeat));
@@ -2811,6 +2958,9 @@ impl Composition for App {
         if let Some(picker) = &self.picker {
             picker.emit(damage, sink);
         }
+        if let Some(confirm) = &self.confirm {
+            confirm.emit(damage, sink);
+        }
         if let Some(dialog) = &self.dialog {
             dialog.emit(self.focused, damage, sink);
         }
@@ -2907,7 +3057,11 @@ pub mod tests {
             })
             .collect();
         assert_eq!(sections[0].rows, chorded);
-        assert_eq!(sections[0].rows.len(), crate::control::BINDINGS.len() - 3);
+        let chorded_count = crate::control::BINDINGS
+            .iter()
+            .filter(|b| b.chord.is_some())
+            .count();
+        assert_eq!(sections[0].rows.len(), chorded_count);
         assert!(sections[0].rows.iter().any(|r| r.keys == "C-n"));
         assert!(sections[1].rows.iter().any(|r| r.keys == "C-v/S-Insert"));
         key(&mut app, "F6");
@@ -4581,6 +4735,67 @@ pub mod tests {
         app.set_key_path(Some(PATH.into()));
         app.open_key_dialog();
         assert!(app.picker().is_none() && app.dialog().is_some());
+    }
+
+    /// Deletion asks first, Cancel focused, and never takes the
+    /// orchestrator; the session carries it out and the row goes.
+    #[test]
+    fn a_conversation_is_deleted_only_after_the_question() {
+        let mut app = app();
+        app.open_delete();
+        assert!(app.confirm().is_none());
+        assert!(app
+            .notice()
+            .unwrap()
+            .contains("the orchestrator is not deleted"));
+        app.refresh_menu();
+        let delete = |app: &App| {
+            (0..)
+                .map_while(|n| app.menu.model().node(n).copied())
+                .find(|n| n.row.label == menu::DELETE)
+                .unwrap()
+                .row
+                .enabled
+        };
+        assert!(!delete(&app));
+        app.set_active(id(2));
+        app.refresh_menu();
+        assert!(delete(&app));
+        // Return alone is Cancel; Escape too.
+        for chord in ["Return", "Escape"] {
+            app.menu_action(menu::Action::Delete);
+            assert_eq!(app.confirm().unwrap().focus(), "cancel");
+            key(&mut app, "C-n");
+            assert!(app.take_requests().is_empty(), "keys are the question's");
+            key(&mut app, chord);
+            assert!(app.confirm().is_none(), "{chord}");
+            assert!(app.take_requests().is_empty(), "{chord}");
+        }
+        // Tab to Delete, and Return asks the session.
+        app.open_delete();
+        key(&mut app, "Tab");
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Delete(id(2))]);
+        // Losing the keyboard cancels it, an armed Delete with it.
+        app.open_delete();
+        key(&mut app, "Tab");
+        app.input(Input::Focus(false), &mut NoClipboard);
+        assert!(app.confirm().is_none());
+        app.input(Input::Focus(true), &mut NoClipboard);
+        key(&mut app, "Return");
+        assert!(app
+            .take_requests()
+            .iter()
+            .all(|r| !matches!(r, Request::Delete(_))));
+        // Opening another conversation closes the question.
+        app.open_delete();
+        app.set_active(id(3));
+        assert!(app.confirm().is_none());
+        app.set_active(id(2));
+        app.remove_row(&id(2));
+        assert!(app.active().is_none());
+        assert!(app.rows().iter().all(|r| r.id != id(2)));
+        assert_eq!(app.orchestrator(), Some(id(1)));
     }
 
     #[test]

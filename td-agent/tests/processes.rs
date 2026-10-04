@@ -344,3 +344,65 @@ fn a_message_sent_just_before_switching_away_runs_its_turn() {
     supervisor.poll();
     assert!(supervisor.background().is_empty());
 }
+
+/// Deleting a conversation (DESIGN.md §4): its live process is ended and
+/// waited for, so its lock is free and its directory goes; the list no
+/// longer holds it, and a second delete has nothing to remove.
+#[test]
+fn a_deleted_conversation_loses_its_process_and_its_directory() {
+    let scratch = Scratch::new("delete");
+    let state = scratch.state();
+    let id = Id::random().unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    supervisor
+        .open(id.clone(), Some(Role::Conversation))
+        .unwrap();
+    let mut heard = Vec::new();
+    supervisor.send("before".into()).unwrap();
+    until(&mut supervisor, &mut heard, |h| delivered(h) == 1);
+    let pid = supervisor.pid().unwrap();
+    // While its process holds the lock, the store refuses.
+    assert!(state
+        .delete(&id)
+        .unwrap_err()
+        .contains("already has its writer"));
+    assert!(
+        supervisor.remove(&id).is_empty(),
+        "its message was answered"
+    );
+    assert_eq!(supervisor.open_id(), None);
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "its process lives"
+    );
+    assert_eq!(state.delete(&id).unwrap(), None);
+    assert!(!state.conversation(&id).exists());
+    assert!(state.list().0.iter().all(|meta| meta.id != id));
+    assert_eq!(state.delete(&id).unwrap(), None);
+}
+
+/// A conversation left is retired, its process told to go; deleting it
+/// at once ends that process too, so its lock is free without waiting.
+#[test]
+fn deleting_a_conversation_just_left_ends_its_retiring_process() {
+    let scratch = Scratch::new("delete-retiring");
+    let state = scratch.state();
+    let (left, other) = (Id::random().unwrap(), Id::random().unwrap());
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    supervisor
+        .open(left.clone(), Some(Role::Conversation))
+        .unwrap();
+    let mut heard = Vec::new();
+    until(&mut supervisor, &mut heard, |h| {
+        h.iter().any(|u| matches!(u, Update::Up(Up::Hello { .. })))
+    });
+    supervisor
+        .open(other.clone(), Some(Role::Conversation))
+        .unwrap();
+    assert!(supervisor.remove(&left).is_empty());
+    let started = Instant::now();
+    assert_eq!(state.delete(&left).unwrap(), None);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!state.conversation(&left).exists());
+    assert_eq!(supervisor.open_id(), Some(&other));
+}
