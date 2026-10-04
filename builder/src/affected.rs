@@ -7859,6 +7859,81 @@ mod tests {
         }
     }
 
+    /// The other half of that boundary: no code a recipe check runs asks
+    /// td-builder for a host-only verb or applet, so none reaches a host-only
+    /// module through the dispatch without naming it. No file under the
+    /// evaluator or the engine crate, of any kind (a recipe embeds `.mk`,
+    /// `.kaem` and table files), and no builder engine file but the dispatch
+    /// itself, spells a hyphenated one as a token, in a literal, a shell
+    /// string or a raw string alike; a Rust file's comments are dropped
+    /// first. `engine_set.rs` is the list, `check_host.rs` forwards a request
+    /// and `run_record.rs` names the verbs it records; none spawns one. The
+    /// bare-word verbs
+    /// (`check`, `ready`) are ordinary words and are held by the dispatch
+    /// half alone.
+    #[test]
+    fn no_recipe_or_engine_source_spells_a_host_only_verb() {
+        let root = repo_root();
+        if !root.join("recipes/src").is_dir() {
+            eprintln!("SKIP: no recipes tree (builder-only sandbox)");
+            return;
+        }
+        let verbs: Vec<&str> = crate::engine_set::HOST_ONLY_VERBS
+            .iter()
+            .copied()
+            .filter(|v| v.contains('-'))
+            .collect();
+        assert!(verbs.len() >= 10, "{verbs:?}");
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        for dir in ["recipes/src", "engine/src"] {
+            walk(&root.join(dir), &mut files);
+        }
+        let src = root.join("builder/src");
+        let mut builder = Vec::new();
+        collect_rs_files(&src, &mut builder);
+        let engine = builder.into_iter().filter(|f| {
+            let rel = f.strip_prefix(&src).unwrap().to_str().unwrap();
+            !crate::engine_set::is_host_only(rel)
+                && !["main.rs", "engine_set.rs", "check_host.rs", "run_record.rs"].contains(&rel)
+        });
+        files.extend(engine);
+        assert!(files.len() > 150, "{} files", files.len());
+        let token = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            let text = if f.extension().is_some_and(|e| e == "rs") {
+                lex(&text)
+            } else {
+                text
+            };
+            for verb in &verbs {
+                let spelled = text.match_indices(verb).any(|(at, _)| {
+                    let before = text.get(..at).and_then(|b| b.chars().last());
+                    let after = text.get(at + verb.len()..).and_then(|a| a.chars().next());
+                    !before.is_some_and(token) && !after.is_some_and(token)
+                });
+                assert!(
+                    !spelled,
+                    "{} spells host-only verb {verb}: a check could run code the memo \
+                     key does not see",
+                    f.display()
+                );
+            }
+        }
+    }
+
     /// Byte ranges of every bracket group, STRING-AWARE: a `[` or `]` inside a
     /// string literal is data, and counting it would desynchronise the depth
     /// and hand back a span belonging to a different argv.

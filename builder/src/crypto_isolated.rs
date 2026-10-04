@@ -137,6 +137,18 @@ pub(crate) fn read_output(path: &Path, name: &str, limit: u64) -> Result<String>
     String::from_utf8(bytes).map_err(|e| format!("portable {name} output is not UTF-8: {e}"))
 }
 
+/// `main`'s argv0 dispatch of the linker applet, whole, so `main` names this
+/// host-only module in its dispatch arm alone (engine_set.rs).
+pub(crate) fn host_linker_applet(args: &[String]) -> std::process::ExitCode {
+    let linked = host_linker(args.get(1..).unwrap_or(&[])).map(|()| 0);
+    crate::applet_exit("td-crypto-host-linker", linked)
+}
+
+/// The decoy applet's dispatch, as [`host_linker_applet`].
+pub(crate) fn decoy_applet() -> std::process::ExitCode {
+    crate::applet_exit("td-crypto-decoy", decoy().map(|()| 0))
+}
+
 pub(crate) fn host_linker(args: &[String]) -> Result<()> {
     require_namespace(&["/cc/bin/gcc", "/binutils/bin/ld"])?;
     let mut command = Command::new("/cc/bin/gcc");

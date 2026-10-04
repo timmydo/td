@@ -98,7 +98,9 @@ the owning recipe and of any recipe its runner declares it also builds
 the seed patches, committed cargo locks and local-source trees, the
 builder's engine sources — what a build can execute, with the seed digest
 table AND the local-source roster it compiles in, and not its routing,
-check loop or gates, which no check runs — and the evaluator's own
+check loop, gates, isolated crypto-crate build or host commands
+(`host-run`, `install-apps`, `install-fonts`), which no check runs
+(`engine_set::HOST_ONLY`) — and the evaluator's own
 sources, with the script that builds it for the gate and the crate files
 its shared modules compile in (`catalog::shared_embeds`), each as
 fingerprinted when its binary was built (`td-builder engine-fingerprint`

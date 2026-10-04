@@ -9706,19 +9706,17 @@ fn main() -> ExitCode {
     let applet = Path::new(args.first().map_or("", String::as_str))
         .file_name()
         .and_then(|n| n.to_str());
-    match applet {
-        Some("td-crypto-host-linker") => {
-            return applet_exit(
-                "td-crypto-host-linker",
-                crypto_isolated::host_linker(args.get(1..).unwrap_or(&[])).map(|()| 0),
-            )
-        }
-        Some("td-crypto-decoy") => {
-            return applet_exit("td-crypto-decoy", crypto_isolated::decoy().map(|()| 0))
-        }
-        Some("mount") => return applet_exit("mount", run_mount_applet(&args)),
-        Some("flock") => return applet_exit("flock", run_flock_applet(&args)),
-        _ => {}
+    // The crypto arms end in `.into()`, not `Some(..)`: host-only modules
+    // may be named only as `Some("verb") => module::` (engine_set.rs).
+    let applet_code: Option<ExitCode> = match applet {
+        Some("td-crypto-host-linker") => crypto_isolated::host_linker_applet(&args).into(),
+        Some("td-crypto-decoy") => crypto_isolated::decoy_applet().into(),
+        Some("mount") => Some(applet_exit("mount", run_mount_applet(&args))),
+        Some("flock") => Some(applet_exit("flock", run_flock_applet(&args))),
+        _ => None,
+    };
+    if let Some(code) = applet_code {
+        return code;
     }
     // Keep host scheduling in the dispatch: ready only owns branch validation.
     // Empty selections finish before admission or run-record creation.

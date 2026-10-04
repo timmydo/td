@@ -6,11 +6,14 @@
 //! nothing while an edit to anything a build runs re-keys everything.
 //!
 //! A host-only file is one the binary reaches only through a verb no check
-//! invokes — `ready`, `affected-checks`, `check`, `check-rung`, `gate-run`,
-//! `gate-body`, `gate-crates` — and never from an engine module: `main.rs`
-//! names each only in the arm that dispatches its verb, and no other engine
-//! file names one at all. `affected.rs` pins both directions, over the
-//! shipped half of every file, in `engine_sources_never_name_a_host_only_module`.
+//! invokes (`HOST_ONLY_VERBS`: the check spine, the isolated crypto-crate
+//! build, the host commands) or an argv0 applet only that build binds — and
+//! never from an engine module: `main.rs` names each only in the arm that
+//! dispatches its verb or applet, and no other engine file names one at all.
+//! `affected.rs` pins both directions, over the shipped half of every file,
+//! in `engine_sources_never_name_a_host_only_module`, and that no evaluator,
+//! engine-crate or builder engine source spells a hyphenated verb or applet
+//! in `no_recipe_or_engine_source_spells_a_host_only_verb`.
 //! A helper both sides need lives on the engine side and the host imports it:
 //! the repo root in `repo.rs`, the daemon dir in `build_daemon.rs`, the lock
 //! checksums in `cargo_lock.rs`, the CPU count in `check_memory.rs`, the host
@@ -43,11 +46,20 @@
 pub const HOST_ONLY: &[&str] = &[
     "affected.rs",
     "check_loop.rs",
+    "crypto_api.rs",
+    "crypto_build.rs",
+    "crypto_headers.rs",
+    "crypto_isolated.rs",
+    "crypto_policy.rs",
+    "crypto_portable.rs",
     "gate_bodies.rs",
     "gate_defs/",
     "gate_lint.rs",
     "gate_timing.rs",
     "gates.rs",
+    "host_run.rs",
+    "install_apps.rs",
+    "install_fonts.rs",
     "integration.rs",
     "ready.rs",
 ];
@@ -64,7 +76,13 @@ pub const HOST_ONLY_VERBS: &[&str] = &[
     "gate-body",
     "gate-crates",
     "gate-run",
+    "host-run",
+    "install-apps",
+    "install-fonts",
     "ready",
+    // argv0 applets the isolated crypto build binds into its own sandbox.
+    "td-crypto-decoy",
+    "td-crypto-host-linker",
 ];
 
 /// Whether `rel`, a `/`-separated path under `builder/src`, is host-only:
