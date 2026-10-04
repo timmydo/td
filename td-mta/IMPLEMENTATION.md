@@ -1843,6 +1843,14 @@ Initial independently landable increments:
   Keep cells hidden until complete success. Retained part metadata, JSON/body
   lists, locator issuance and streaming/worker/native/RSS remain open.
 
+- **M06cg — retained selected part headers:** compose first-valid selection,
+  lowercase type/disposition, exact charset and NFC filename into separate
+  caller windows. Serialize after traversal, preserve original owners and
+  selected-empty/family diagnostics, and hide the complete result until every
+  phase succeeds. Qualify aggregate/job cuts, capacities, defaults, duplicates,
+  fresh handoff and Rust allocations. Content-ID/language/location, body lists,
+  JSON, locators and streaming/worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

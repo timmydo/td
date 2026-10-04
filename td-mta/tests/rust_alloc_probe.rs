@@ -1229,6 +1229,86 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn resident_part_headers() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        mime_metadata::Context,
+        mime_part_headers::{Backing, Cursor, Entity, Status},
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let source = concat!(
+        "Content-Type: TEXT/PLAIN;charset=utf-8;name=type\n",
+        "Content-Disposition: INLINE;filename*=utf-8''e%CC%81\n\nbody"
+    )
+    .as_bytes();
+    let before = COUNTERS.snapshot();
+    for (source, failed) in [(source, false), (b"\n".as_slice(), false), (source, true)] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut h = [0; 64];
+        let mut c = [0; 32];
+        let mut n = [0; 64];
+        let mut cursor = Cursor::new(
+            Entity {
+                source,
+                base: 0,
+                source_end: td_mta::header_select::SourceEnd::Eof,
+                header_limit: 1024,
+                context: Context::Normal,
+            },
+            Backing {
+                heads: if failed { &mut [] } else { &mut h },
+                charset: &mut c,
+                filename: &mut n,
+            },
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut done = false;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(cursor.value().is_none()),
+                Ok(Status::Complete) => {
+                    assert!(!failed);
+                    done = true;
+                    break;
+                }
+                Err(error) => {
+                    assert!(failed);
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    assert!(cursor.value().is_none());
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        if !failed {
+            assert!(cursor.value().is_some());
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            let value = cursor.finish(Tick(1)).unwrap().0;
+            black_box(value);
+        }
+    }
+    assert_eq!(
+        before,
+        COUNTERS.snapshot(),
+        "resident part headers allocated"
+    );
+}
+
 fn resident_mime_traversal() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -7747,6 +7827,7 @@ fn main() {
         mime_protocol_parameters();
         resident_mime_delimiters();
         resident_mime_traversal();
+        resident_part_headers();
         body_value();
         mime_text();
         body_charset();
@@ -7900,6 +7981,7 @@ fn main() {
     mime_protocol_parameters();
     resident_mime_delimiters();
     resident_mime_traversal();
+    resident_part_headers();
     body_value();
     mime_text();
     body_charset();

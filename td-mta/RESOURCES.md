@@ -1308,6 +1308,46 @@ missing-close parts, long QP replay, malformed transfer and source syntax,
 work refusal and late handoff. This is resident Rust state/allocation evidence,
 not a native compiler stack, portable provider, whole worker or RSS claim.
 
+M06cg's retained part-header cursor plus HeaderBudget fits the existing
+16 KiB parser reservation. It runs after traversal releases that
+reservation; its phase-exclusive child owns the original job/header
+budgets and borrows one original 3072-byte NFC Scratch in the existing
+conversion partition. Complete selected fields and token ranges borrow
+resident source; no copied field string, input-sized state or additional
+descriptor is retained.
+
+Backing's heads, charset and filename are separate caller-reserved
+windows in existing admitted output/text backing. Head capacity needs
+the complete type and optional disposition token bytes (including the
+one canonical slash); heads_capacity_bound adds a checked fourteen-byte
+default floor to recognized raw entity-header bytes, so empty/digest
+defaults remain representable. Charset capacity follows selected Data
+bytes; filename capacity can use the existing checked
+mime_filename::capacity_bound of the larger selected disposition/type
+field-value byte length. Capacity shortfall fails the entire projection;
+windows never grow. Retaining many Views requires the caller's aggregate
+output reservation, not a per-part renewed allowance.
+
+Head copying funds one interpretation step for each bounded transition,
+including absent slots, plus one step per copied byte (at most 33 steps
+in a head-copy turn). It processes at most 32 bytes per turn and charges
+source visits, interpretation steps and output before each copy. Other
+turns use the existing metadata, protocol and filename child bounds;
+phase transitions do no input-sized work. Public child handoffs abandon
+unused prepaid credit without refunding any counters; they never
+recreate job/header budgets or scratch. Raw headers reported by replay
+are not counted again as new structural bytes. Literal slash/default
+bytes are conservatively charged as visits too; this bounded overcharge
+avoids a separate generated-byte funding path. Every visit, lowercasing
+and emitted retained byte spends original admission.
+
+Tests cover first-valid/default/digest selection, casing, selected-empty
+name, invalid/absent/unknown charset, long tokens, all five allowance
+cuts, every live deadline turn, all three window capacities and fresh
+original handoff. The dedicated warm/measured Rust probe covers
+completion, defaults and sticky capacity retirement. No native compiler
+stack, whole worker or RSS is claimed.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

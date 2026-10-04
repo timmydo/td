@@ -353,6 +353,15 @@ Leaf sizing uses stable transfer decoding without charset/NFC or attached
 message recursion. Full metadata projection, locators, worker integration
 and native/RSS qualification remain separate.
 
+M06cg composes retained selected part headers after traversal releases its
+parser state. Original job/header budgets and conversion scratch survive
+selection, lowercase token output, exact charset and normalized filename
+projection. Separate caller windows retain complete passive views only after
+all phases succeed. Duplicate/default/parameter choice remains the existing
+policy; replay counts work without counting the same raw headers twice.
+Content-ID/language/location, body-list/JSON composition, authenticated
+locators and streaming/worker qualification remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in

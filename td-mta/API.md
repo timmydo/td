@@ -4058,6 +4058,52 @@ RESOURCES.md qualifies bounded resident state/turns and Rust allocations.
 Complete part metadata/JSON, body-list derivation, authenticated locator
 issuance, streaming inputs, worker/native stack and RSS remain open.
 
+### 1.86 Retained selected part headers
+
+M06cg adds mime_part_headers::Cursor. Entity supplies the exact
+authorized complete resident entity, absolute base, original per-section
+header limit and normal/digest-child context. Captured prefixes are
+refused; source identity, enclosing clipping and actual authorization
+remain caller duties. Replay does not grant a new source or structural
+header allowance. Its returned header_bytes describes the same
+recognized bytes already counted by traversal, not additional message
+headers.
+
+The cursor composes first-valid metadata selection, bounded lowercase
+head copying, selected protocol charset and normalized filename
+precedence. Backing supplies separate fixed heads, charset and filename
+windows. Heads holds the complete lowercase type/subtype followed by the
+optional lowercase disposition without a separator; View slices
+distinguish them. Charset spelling and its Absent/Invalid/Present,
+known-label and qualifier diagnostics are retained. A default type has
+no selected charset field and therefore no charset_end; a selected type
+without a charset has an explicit Absent end. Unknown valid labels
+remain Present with no known_charset, never a substituted default. These
+are selected-field evidence, not the final JMAP charset property;
+POLICY.md's implicit us-ascii rule and RFC 8621 section 4.1.4's
+non-text null charset property mapping remain downstream. Filename preserves disposition filename before type name,
+selected-empty presence, NFC and the existing independent
+decoding/family diagnostics.
+
+No bytes are exposed before all phases complete. check_deadline and
+consuming finish require fresh original admission. finish returns the
+passive View and original Meter/HeaderBudget/Scratch; subsequent
+metadata can spend these same owners while backing remains borrowed.
+Cached Complete is inert. All child work/interpretation refusals map to
+Admission; other errors retain their child context. Any syntax,
+capacity, work or interpretation refusal retires the whole result;
+neither a later duplicate nor a fallback may mask a resource failure.
+Backing is not wiped on refusal/abandonment; provisional cells and
+copied completed Views carry no completion, source, locator or
+publication authority on their own.
+
+This is a serialized projection after traversal releases its parser
+state, not a second simultaneous traversal frame set. Content-ID,
+language/location, body-list/JSON composition, authenticated locators,
+streaming and worker/native stack/RSS qualification remain open.
+RESOURCES.md qualifies its fixed state and Rust allocation checks
+separately.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

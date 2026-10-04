@@ -64,8 +64,8 @@ pub struct Retained<'w> {
     pub end: End,
     value: Option<&'w [u8]>,
 }
-impl Retained<'_> {
-    pub const fn value(&self) -> Option<&[u8]> {
+impl<'w> Retained<'w> {
+    pub const fn value(&self) -> Option<&'w [u8]> {
         self.value
     }
 }
