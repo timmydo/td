@@ -23,7 +23,9 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
             "test-iso requires a graphical host display (DISPLAY or WAYLAND_DISPLAY)".into(),
         );
     }
-    let accelerator = acceleration()?;
+    let plan = crate::checks::accel::headless_from_env()?;
+    eprintln!("test-iso: {}", crate::checks::accel::describe(&plan));
+    let accelerator = plan.names;
     let scratch = private_scratch()?;
     let disk = scratch.dir.join("destination.raw");
     let file = OpenOptions::new()
@@ -156,28 +158,6 @@ fn open_iso(iso: &Path) -> Result<File, String> {
         ));
     }
     Ok(opened)
-}
-
-fn acceleration() -> Result<&'static [&'static str], String> {
-    let kvm = std::env::consts::ARCH == "x86_64"
-        && OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/kvm")
-            .is_ok();
-    let forced = match env::var("TD_QEMU_ACCEL") {
-        Ok(value) => value,
-        Err(env::VarError::NotPresent) => String::new(),
-        Err(error) => return Err(format!("TD_QEMU_ACCEL: {error}")),
-    };
-    match forced.trim() {
-        "tcg" => Ok(&["tcg"]),
-        "kvm" if kvm => Ok(&["kvm"]),
-        "kvm" => Err("TD_QEMU_ACCEL=kvm requires usable x86-64 /dev/kvm".into()),
-        "" if kvm => Ok(&["kvm", "tcg"]),
-        "" => Ok(&["tcg"]),
-        _ => Err(format!("TD_QEMU_ACCEL={forced:?} must be kvm or tcg")),
-    }
 }
 
 fn private_scratch() -> Result<Scratch, String> {

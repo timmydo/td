@@ -2,6 +2,7 @@ use td_recipe::types::CheckRunner;
 
 use crate::check_runner::RecipeCheckRunner;
 
+pub(crate) mod accel;
 mod basic;
 // bundle is NOT a CheckRunner variant either: it builds the distro and writes a
 // redistributable demo VM, which needs host qemu-img and a writable destination.

@@ -270,12 +270,15 @@ in the check history as `integration:STEP` (`td-recipe-eval
 check-history integration`). On its own it runs only those steps; beside
 gate goals, as `affected-checks` selects it (`td-builder check check
 recipe-checks integration`), it runs after the gates pass and says so
-when they do not. It needs the host's qemu, and OVMF for the last two
-(found beside qemu or in /usr/share/OVMF, or named by `TD_QEMU_EFI_CODE`
-and `TD_QEMU_EFI_VARS`). An oracle the host cannot run is an
-unprovisioned skip; when none could run the tier exits 69, which `ready`
-does not take for a pass. It keeps no verdict journal, so each run boots
-again.
+when they do not. Every boot uses KVM when this user can open `/dev/kvm`
+(membership in the `kvm` group, from a login started after joining it),
+with TCG behind it, and says which; `TD_QEMU_ACCEL=tcg` pins software
+emulation, several times slower. It needs the host's qemu, and OVMF for
+the last two (found beside qemu or in /usr/share/OVMF, or named by
+`TD_QEMU_EFI_CODE` and `TD_QEMU_EFI_VARS`). An oracle the host cannot
+run is an unprovisioned skip; when none could run the tier exits 69,
+which `ready` does not take for a pass. It keeps no verdict journal, so
+each run boots again.
 
 It belongs to main: after a landing, an agent on a provisioned host runs
 `td-builder check integration` on main, and a red one is healed as any

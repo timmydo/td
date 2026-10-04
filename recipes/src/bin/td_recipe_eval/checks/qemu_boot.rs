@@ -647,7 +647,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, initramfs) = build_kernel(runner)?;
 
     println!(
-        "   [qemu-boot] {qemu} boots the td-source-built bzImage under TCG with the busybox initramfs\n              kernel:    {}\n              initramfs: {}",
+        "   [qemu-boot] {qemu} boots the td-source-built bzImage with the busybox initramfs\n              kernel:    {}\n              initramfs: {}",
         bzimage.display(),
         initramfs.display()
     );
@@ -682,7 +682,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         ));
     }
     println!(
-        "PASS: linux-x86-64 boots under qemu (TCG) — the td-source-built kernel reaches userspace and \
+        "PASS: linux-x86-64 boots under qemu — the td-source-built kernel reaches userspace and \
          runs the static busybox userland ({MARKER} on ttyS0)"
     );
     Ok(())
@@ -702,7 +702,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
     let disk = build_probe_image(runner)?;
 
     println!(
-        "   [qemu-boot-erofs] {qemu} boots the td-source-built bzImage under TCG with a read-only erofs virtio-blk disk\n              kernel:    {}\n              initramfs: {}\n              erofs img: {}",
+        "   [qemu-boot-erofs] {qemu} boots the td-source-built bzImage with a read-only erofs virtio-blk disk\n              kernel:    {}\n              initramfs: {}\n              erofs img: {}",
         bzimage.display(),
         initramfs.display(),
         disk.display()
@@ -738,7 +738,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         ));
     }
     println!(
-        "PASS: linux-x86-64 mounts a td-written erofs image READ-ONLY over virtio-blk under qemu (TCG) — \
+        "PASS: linux-x86-64 mounts a td-written erofs image READ-ONLY over virtio-blk under qemu — \
          the source-built EROFS_FS + VIRTIO_BLK kernel reads the store-shaped root back ({EROFS_MARKER} on ttyS0)"
     );
     Ok(())
@@ -779,7 +779,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
 
     println!(
-        "   [qemu-boot-system] {qemu} exercises transactional install, boot-attempt rollback, and corrupt-current fallback under TCG: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> greeter\n              shim kernel:    {}\n              initramfs:      {}\n              Btrfs volume:   {}\n              initial:        {}\n              candidate:      {}",
+        "   [qemu-boot-system] {qemu} exercises transactional install, boot-attempt rollback, and corrupt-current fallback: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> greeter\n              shim kernel:    {}\n              initramfs:      {}\n              Btrfs volume:   {}\n              initial:        {}\n              candidate:      {}",
         bzimage.display(),
         init_cpio.display(),
         volume.display(),
@@ -2683,7 +2683,7 @@ pub(crate) fn run_session(runner: &RecipeCheckRunner) -> Result<(), String> {
     let wait_token = autotest_wait_token(boot_timeout());
     let tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token}");
     println!(
-        "   [qemu-boot-session] {qemu} boots one fresh offline system session under TCG\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
+        "   [qemu-boot-session] {qemu} boots one fresh offline system session\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
         bzimage.display(), init_cpio.display(), disk.display()
     );
     let result = boot(
@@ -2757,7 +2757,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, init_cpio, disk, btrfs) = build_persistent_system(runner)?;
 
     println!(
-        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, td-netd resolves + reaches {}:{}, Git reads HEAD from {} over verified HTTPS, and Firefox loads {}\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
+        "   [qemu-boot-net] {qemu} boots the recipe-built deployment with a user-mode NIC; /etc/netup DHCP-configures the link, td-netd resolves + reaches {}:{}, Git reads HEAD from {} over verified HTTPS, and Firefox loads {}\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
         td_recipe::ladder::NETTEST_DEFAULT_HOST,
         td_recipe::ladder::NETTEST_DEFAULT_PORT,
         GIT_HTTPS_TEST_URL,
@@ -2893,7 +2893,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
 }
 
 /// `qemu-boot-kexec` (Phase-0 kexec spike): the operator proof that the source-built
-/// kernel can kexec_file_load(2) a SECOND kernel start under qemu TCG — the mechanism
+/// kernel can kexec_file_load(2) a SECOND kernel start under qemu — the mechanism
 /// the image-based boot uses to self-boot a refreshed image. It boots the
 /// `kexec-spike-x86-64` outer bzImage + outer initramfs; the outer /init prints STAGE1
 /// then execs td-kexec to load and reboot(KEXEC) into the inner kernel + inner
@@ -2908,15 +2908,15 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, initramfs) = build_spike(runner)?;
 
     println!(
-        "   [qemu-boot-kexec] {qemu} boots the td-source-built bzImage under TCG, then the outer /init td-kexecs a SECOND kernel start\n              kernel:    {}\n              initramfs: {}",
+        "   [qemu-boot-kexec] {qemu} boots the td-source-built bzImage, then the outer /init td-kexecs a SECOND kernel start\n              kernel:    {}\n              initramfs: {}",
         bzimage.display(),
         initramfs.display()
     );
 
     // Key on STAGE2 and kill on it. 512 MiB so the outer kernel + outer initramfs AND
     // the kexec-loaded inner kernel + inner initramfs all fit at the instant the jump
-    // happens (a tiny allnoconfig kernel would fit in less, but headroom is free under
-    // TCG and an OOM at the kexec would be a confusing failure).
+    // happens (a tiny allnoconfig kernel would fit in less, but headroom is free and
+    // an OOM at the kexec would be a confusing failure).
     let result = boot(
         &qemu,
         &bzimage,
@@ -2965,7 +2965,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
         "STAGE1 (scrolled out of the console tail)"
     };
     println!(
-        "PASS: kexec-spike-x86-64 kexecs under qemu (TCG) — the td-source-built kernel boots, td-kexec \
+        "PASS: kexec-spike-x86-64 kexecs under qemu — the td-source-built kernel boots, td-kexec \
          kexec_file_load(2)+reboot(KEXEC)s a SECOND kernel start ({stage1} -> {KEXEC_STAGE2_MARKER} on ttyS0)"
     );
     Ok(())
@@ -4703,6 +4703,15 @@ fn validate_writable_usb_image(disk: &BootDisk<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Say once per process which accelerator the boots use (`accel::describe`).
+fn announce_accel(accel: &crate::checks::accel::AccelPlan) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    println!("   [qemu] {}", crate::checks::accel::describe(accel));
+}
+
 fn boot_source(
     qemu: &str,
     source: BootSource<'_>,
@@ -4822,8 +4831,9 @@ fn boot_source(
         .try_clone()
         .map_err(|e| format!("clone diag fd: {e}"))?;
 
-    // -M pc + TCG: no KVM needed (the sandbox denies /dev/kvm and the host may not
-    //   expose it either; TCG always works and a tiny kernel boots fast).
+    // -accel: `accel::from_env`, KVM when this host can hand it over with TCG
+    //   behind it, which always works; `TD_QEMU_ACCEL=tcg` pins software
+    //   emulation, the accelerator these oracles' timings were first tuned under.
     // -cpu Nehalem: the default `qemu64` model has neither SSE4.2 nor POPCNT, and a
     //   modern userland binary that assumes the x86-64-v2 baseline dies on the first
     //   such instruction with SIGILL. Firefox's conservative distro build stays
@@ -4901,6 +4911,8 @@ fn boot_source(
         }
         _ => None,
     };
+    let accel = crate::checks::accel::headless_from_env()?;
+    announce_accel(&accel);
     let mut cmd = Command::new(qemu);
     let machine = if matches!(
         source,
@@ -4910,21 +4922,17 @@ fn boot_source(
     } else {
         "pc"
     };
-    cmd.args([
-        "-M",
-        machine,
-        "-accel",
-        "tcg",
-        "-cpu",
-        "Nehalem",
-        "-m",
-        plan.mem,
-        "-no-reboot",
-    ])
-    .args(["-display", "none", "-monitor", "none"])
-    .args(["-no-user-config", "-vga", "none"])
-    .args(["-device", "virtio-vga"])
-    .args(["-device", "virtio-tablet-pci"]);
+    cmd.args(["-M", machine]);
+    for name in accel.names {
+        cmd.args(["-accel", name]);
+    }
+    // A named model under both accelerators, so the guest ISA does not follow
+    // the host's CPU; KVM still adds its paravirt leaves (`run.rs`).
+    cmd.args(["-cpu", "Nehalem", "-m", plan.mem, "-no-reboot"])
+        .args(["-display", "none", "-monitor", "none"])
+        .args(["-no-user-config", "-vga", "none"])
+        .args(["-device", "virtio-vga"])
+        .args(["-device", "virtio-tablet-pci"]);
     match &serial_path {
         // A socket the oracle types into, QEMU waiting for it so no console
         // byte is sent before, and logging ttyS0 to the same console file.

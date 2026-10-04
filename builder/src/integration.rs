@@ -30,7 +30,7 @@ const STEPS: &[Step] = &[
     Step {
         name: "qemu-boot-system",
         argv: &["qemu-boot-system"],
-        proves: "the system image boots under TCG to its services and session",
+        proves: "the system image boots to its services and session",
     },
     Step {
         name: "qemu-boot-live",

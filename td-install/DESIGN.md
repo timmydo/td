@@ -1720,7 +1720,8 @@ The initial `td-recipe-eval qemu-boot-uefi [linux-x86-64]` increment
 proves the firmware entry and initrd handoff with the recipe's tiny
 BusyBox initramfs. It builds and runs the source-built `td-install` on
 an exclusively created private 6 GiB sparse disk, populating the ESP
-from the kernel recipe. It starts q35/TCG with cold per-run variables
+from the kernel recipe. It starts q35, on KVM when usable and TCG
+otherwise (`checks/accel.rs`), with cold per-run variables
 and the disk writable, and requires the real userspace marker without
 `-kernel`, `-initrd` or `-append`. The same disk must pass a second cold
 boot with another fresh variables copy and the disk read-only. A second

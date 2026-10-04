@@ -904,7 +904,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
 /// `td-recipe-eval qemu-boot-kexec [kexec-spike-x86-64]` — the Phase-0 kexec spike proof.
 /// Builds the `kexec-spike-x86-64` two-kernel artifact (a bootable bzImage + an outer
 /// initramfs embedding static busybox, td-kexec, a second-boot bzImage, and a nested inner
-/// initramfs) and boots it under host qemu (TCG): the outer /init prints STAGE1 then execs
+/// initramfs) and boots it under host qemu: the outer /init prints STAGE1 then execs
 /// td-kexec to kexec_file_load(2)+reboot(KEXEC) the inner kernel, whose /init prints STAGE2.
 /// It asserts STAGE2 reached (the kexec worked). Host-side (never a gated check) for the
 /// same reason `qemu-boot` is: the gate sandbox has no host qemu. See checks/qemu_boot.rs.

@@ -2051,6 +2051,7 @@ const BOOT_FILES: &[&str] = &[
     "recipes/src/recipes/system-x86-64.rs",
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
     "recipes/src/bin/td_recipe_eval/checks/qemu_boot/",
+    "recipes/src/bin/td_recipe_eval/checks/accel.rs",
     "builder/src/integration.rs",
 ];
 
