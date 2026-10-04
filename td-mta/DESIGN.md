@@ -443,6 +443,13 @@ grammar can remain literal, but work/internal refusal never falls back. The
 helper owns no original allowance or field/word/URI authority. Complete mail
 composition, presence, retained metadata and publication remain open.
 
+M06cs binds the shared URI spelling selector to original job/header owners,
+with no new CFWS grammar or field authority. Every probe/replay remains
+charged; consuming fresh handoff returns the same owners and slice offsets
+for the next phase. Empty or invalid URI spelling can complete selection
+without granting URI/presence validity. Complete Content-Location word/literal
+composition, retained metadata and publication remain separate work.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

@@ -51,6 +51,7 @@ pub mod mime_headers;
 pub mod mime_input;
 pub mod mime_language;
 pub mod mime_location_literal;
+pub mod mime_location_selection;
 pub mod mime_location_word;
 pub mod mime_metadata;
 pub mod mime_parameter;

@@ -1939,6 +1939,14 @@ Initial independently landable increments:
   presence/word placement, retained metadata and worker/native/RSS remain
   open.
 
+- **M06cs — original-owner URI spelling selection:** compose the shared
+  boundary selector with the same Meter/HeaderBudget and fresh consuming
+  handoff of owners plus offsets. Fixtures pin exact source ranges, complete
+  refusal at every header/job/deadline cut, cached/fresh retirement and
+  bounded four-byte-comment turns. Empty/invalid URI spelling remains a
+  later phase's decision; word placement, complete Content-Location
+  projection and retained metadata remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

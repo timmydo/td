@@ -4369,6 +4369,30 @@ job/header owners, freshly admit before retaining the range and rebase offsets
 to its authorized field/message. This does not activate a complete
 Content-Location reader or metadata/publication authority.
 
+### 1.98 Original-owner URI spelling selection
+
+M06cs adds mime_location_selection::Cursor around the shared spelling
+selector. Caller supplies one complete immutable field-value slice excluding
+its final ending and authorizes POLICY.md's surrounding-CFWS preference.
+It returns source-relative Spelling offsets, including empty ranges, without
+proving URI/fold validity, encoded-word placement, field presence, duplicate
+selection or metadata/publication authority. Invalid URI bytes can complete
+this boundary phase; later readers validate their selected spelling.
+
+The live cursor retains exactly the original job Meter and HeaderBudget,
+charging every shared visit/record and replay through those owners. A live
+poll checks fresh original admission before parsing; cached Complete is
+inert. check_deadline retires completed offsets after refusal. Consuming
+finish(now) freshly admits before returning both original owners and the
+range. Admission refusal precedes premature-state failure. Consuming refusal
+drops this cursor's borrows; enclosing caller scopes retain ownership of
+the root Meter/HeaderBudget allocations. The error does not carry new
+allowances or recoverable cursor progress. No growing value
+copy or replacement allowance is introduced. The cursor is neither Copy nor
+Clone. A future composer must keep the returned owners for subsequent
+placement, decoding and retention; this is not a complete Content-Location
+reader.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -1726,6 +1726,18 @@ leading syntax/nesting errors, callback refusal and fresh final retirement.
 No new arena or source-sized scratch is reserved. Original owner integration
 and worker/native/RSS qualification remain open.
 
+M06cs's mail URI spelling selector plus HeaderBudget fits 256 bytes in the
+existing parser region; its actual private-error shared state fits 160 bytes.
+A poll visits at most 160 source bytes, spends at most 192 interpretation
+steps and 12 job records, with no conversion output. All probes and replay
+use original allowances and prepaid credit. Consuming handoff freshly admits
+and returns those same owners without new grants. Up to 15 unused prepaid
+steps are discarded at handoff; the next phase may need one additional job
+record compared with a ceiling over combined step counts. Allocation intervals cover
+long whitespace/comments, optional-tail recovery, syntax/nesting/job refusal,
+healthy handoff and late retirement. No extra arena or selected-value copy
+is allocated. Whole-field projection and worker/native/RSS remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
