@@ -19,7 +19,8 @@
 //! messages they send between conversations through `post`. The tool
 //! host (DESIGN.md §2, §12) is a third personality, `toolhost`, which
 //! serves `host`'s protocol and performs the file tools (`files`) and
-//! the process tools (`shell`).
+//! the process tools (`shell`). The git worker's outside half, admitted
+//! remotes and the store (DESIGN.md §7, §9), is `git`.
 //!
 //! `unsafe` is forbidden for the whole crate (DESIGN.md §2).
 
@@ -38,6 +39,7 @@ pub mod cost;
 pub mod diagnostics;
 pub mod files;
 pub mod frame;
+pub mod git;
 pub mod history;
 pub mod host;
 pub mod jail;
