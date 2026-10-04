@@ -1,13 +1,13 @@
 //! Strict resident RFC 2369 lists; complete validation precedes URL bytes.
 mod budgeted;
-pub use budgeted::Budgeted;
-mod uri;
 use crate::{
     admission::work::{Charge, Meter, Stop},
-    decode_work::{Error as DecodeError, Work},
+    decode_work::{Error as DecodeError, Lexical, Work},
     header_cfws,
     ports::Tick,
 };
+pub use budgeted::Budgeted;
+use td_header::uri;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     URLs,
@@ -35,6 +35,15 @@ impl From<DecodeError> for Error {
             DecodeError::Work(stop) => Self::Work(stop),
             DecodeError::InterpretationLimit => Self::InterpretationLimit,
             DecodeError::InvalidState => Self::InvalidState,
+        }
+    }
+}
+impl From<uri::Error<DecodeError>> for Error {
+    fn from(error: uri::Error<DecodeError>) -> Self {
+        match error {
+            uri::Error::Malformed => Self::Malformed,
+            uri::Error::Work(error) => Self::from(error),
+            uri::Error::InvalidState => Self::InvalidState,
         }
     }
 }
@@ -82,11 +91,12 @@ pub struct Cursor<'a> {
     position: usize,
     grammar: Grammar,
     cfws: Option<header_cfws::Cursor<'a>>,
-    uri: uri::Validator,
+    uri: uri::Validator<DecodeError>,
     replay: bool,
     complete: bool,
     failure: Option<Error>,
 }
+const _: () = assert!(std::mem::size_of::<uri::Validator<DecodeError>>() <= 128);
 impl<'a> Cursor<'a> {
     pub const fn new(source: &'a [u8], mode: Mode) -> Self {
         Self {
@@ -257,7 +267,7 @@ impl<'a> Cursor<'a> {
                         Ok(Status::Yield)
                     }
                     _ => {
-                        self.uri.push(byte, now, work)?;
+                        self.uri.push(byte, &mut Lexical::new(work, now))?;
                         if self.replay {
                             work.charge(
                                 now,

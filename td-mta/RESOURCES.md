@@ -1420,6 +1420,18 @@ noncharacters, multiple-identifier/nesting refusal, job-record/output refusal
 and original handoff. Header cuts and live/late deadlines have unit coverage;
 worker/native/RSS remain unqualified.
 
+M06cl's shared URI validator with mail's error fits 128 bytes and requires a
+scheme. It replaces the prior private validator inside URL state in the
+existing 16 KiB parser reservation. Original URL and budgeted-state ceilings
+and per-turn work remain unchanged. Input octets are admitted by the same
+outer mail grammar; IPv6 closure funds 64 records before a <=45-byte local
+std parse. No copied source or renewed budget is introduced. The shared feed
+API's 64-record parse is separate from resident lexical poll maxima. Shared
+literal URI, malformed authority/percent tail and sticky callback refusal
+fixtures qualify generic syntax. Existing full wrapped mail suites pin exact
+two-pass/IPv6 costs, bounded turns and warm/measured Rust allocations.
+Relative values and worker/native/RSS remain unqualified.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

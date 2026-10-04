@@ -226,3 +226,30 @@ nor Clone. Enclosing field-name/colon syntax, selected-value ownership and
 output retention admission remain external.
 Normative grammar: https://www.rfc-editor.org/rfc/rfc3282.html#section-2
 and https://www.rfc-editor.org/rfc/rfc3066.html#section-2.1.
+
+uri::Validator consumes already admitted ASCII octets of one URI with a
+required scheme under RFC 3986 section 3, including fragments. This is the
+URI rule; section 4.3's narrower absolute-URI rule excludes fragments. It
+retains fixed scheme/hierarchy, authority/userinfo/host/port,
+path/query/fragment and percent-triplet state. No scheme policy,
+relative-reference parsing, header whitespace/CFWS, resolution, fetching,
+source bounds or output authority follows. Empty hierarchies and empty
+generic authorities remain permitted. Percent triplets retain spelling and
+are never decoded; non-ASCII input fails. Query and fragment brackets
+require percent spelling; raw [ and ] reject under this generic URI grammar.
+
+The caller funds each bounded feed and EOF decision before providing an
+owned octet or calling finish. A feed performs one fixed state transition;
+IPv6-literal closure additionally prepays 64 records before inspecting at
+most 45 retained bytes with std's IPv6 parser. This is a feed validator, not
+one of the resident 32-record poll cursors. IPvFuture spelling is checked
+incrementally. With mail's fixed error the validator fits 128 bytes and
+allocates nothing. It owns no source slice, work handle, output collection,
+clock or admission identity. Syntax and internal work refusals latch across
+replacement callbacks; successful finish is cached and inert, and further
+feed retires success with InvalidState. check_work freshly admits zero-count
+work and retires completion on refusal. It grants no enclosing complete
+source proof. Live state is neither Copy nor Clone; enclosing callers retain
+their original allowances and latch their own refused source reads.
+
+Normative grammar: https://www.rfc-editor.org/rfc/rfc3986.html#section-3.

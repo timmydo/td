@@ -4214,6 +4214,23 @@ premature handoff. No allowance is refunded or renewed.
 Selection, retained backing, body metadata/JSON, CID reference resolution,
 authenticated locators and streaming/worker/native/RSS remain open.
 
+### 1.91 Shared URI syntax with a required scheme
+
+M06cl moves header_urls' private URI validator to td_header::uri::Validator.
+The existing header_urls and Budgeted APIs keep their URL-list and ListPost
+semantics, validation before output, original allowances, diagnostics and
+charges. Mail binds shared work to the same original decode-work adapter and
+maps shared malformed/work/invariant errors back to its existing variants.
+IPv6 closure still prepays 64 records before its fixed local parse. No
+relative URI, Content-Location value or scheme-specific policy is added.
+
+The shared validator owns only fixed syntax and a bounded IPv6 byte array;
+its work/syntax refusal is sticky, and cached finish performs no work. Mail
+continues funding source reads and parent transitions before feed, binding
+fresh final admission and retiring the enclosing owner after refusal. The
+shared spelling result is passive and grants no I/O/publication authority.
+RESOURCES.md scopes shared state and consumer accounting qualification.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

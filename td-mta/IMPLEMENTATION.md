@@ -1880,6 +1880,13 @@ Initial independently landable increments:
   allowance/deadline cuts and Rust allocation. First-valid selection, retained
   metadata/JSON and worker/native/RSS remain open.
 
+- **M06cl — shared URI syntax:** atomically move the existing URI
+  validator to std-only td-header with generic admission. Keep mail's list
+  grammar, original owners, exact charges and typed error mapping. Shared
+  literal syntax and sticky/prepaid refusal fixtures plus the consumer suites
+  qualify the move. Relative Content-Location values, selected metadata and
+  worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

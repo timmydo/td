@@ -386,6 +386,13 @@ angles are omitted, while token spelling, folds and Unicode diagnostics use
 the existing conversion policy. Selected-header retention, JSON, reference
 resolution and publication remain separate.
 
+M06cl moves the existing URI syntax validator into std-only td-header,
+retaining its required scheme and allowed fragments. Mail retains URL-list
+placement, whitespace, complete-field validation/replay, original job/email
+admission and typed errors. Internal IPv6 parsing keeps the same prepaid
+work and bounded buffer. No second URI parser remains in mail; relative
+Content-Location spelling and its projection are subsequent work.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

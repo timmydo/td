@@ -10,6 +10,7 @@ pub mod mime_protocol;
 pub mod mime_value;
 pub mod projection;
 pub mod resident;
+pub mod uri;
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 /// Logical source visits and transitions, including zero-byte EOF attempts.
 pub struct Charge {
