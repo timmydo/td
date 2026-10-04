@@ -46,17 +46,15 @@ enum Event {
     End,
 }
 #[derive(Clone, Copy)]
-struct Transfer<'a> {
-    word: Word<'a>,
+struct Transfer {
     position: u8,
     pending: [u8; 3],
     next: u8,
     len: u8,
 }
-impl<'a> Transfer<'a> {
-    const fn new(word: Word<'a>) -> Self {
+impl Transfer {
+    const fn new() -> Self {
         Self {
-            word,
             position: 0,
             pending: [0; 3],
             next: 0,
@@ -79,7 +77,12 @@ impl<'a> Transfer<'a> {
         self.next = self.next.checked_add(1).ok_or(DecodeError::InvalidState)?;
         Ok(Event::Byte(byte))
     }
-    fn poll(&mut self, now: Tick, work: &mut impl Work) -> Result<Event, DecodeError> {
+    fn poll(
+        &mut self,
+        word: Word<'_>,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Event, DecodeError> {
         work.charge(
             now,
             Charge {
@@ -90,15 +93,14 @@ impl<'a> Transfer<'a> {
         if self.next < self.len {
             return self.take();
         }
-        let input = self
-            .word
+        let input = word
             .payload()
             .get(usize::from(self.position)..)
             .ok_or(DecodeError::InvalidState)?;
         if input.is_empty() {
             return Ok(Event::End);
         }
-        match self.word.encoding() {
+        match word.encoding() {
             Encoding::Q => {
                 work.charge(
                     now,
@@ -199,20 +201,27 @@ pub enum Status {
     Yield,
     Complete,
 }
-/// Copies retain source/decoder state, not work. The owner keeps failure retirement.
+/// Private payload-free progress. The owner supplies the same recognized logical
+/// word each turn, retains source/placement and retires enclosing refusal.
 #[derive(Clone, Copy)]
-pub struct Cursor<'a> {
-    transfer: Transfer<'a>,
+pub(crate) struct Progress {
+    transfer: Transfer,
+    label: crate::mime_charset::Charset,
+    encoding: Encoding,
+    length: usize,
     charset: Decoder,
     pending: Option<Event>,
     problem: bool,
     complete: bool,
     failure: Option<DecodeError>,
 }
-impl<'a> Cursor<'a> {
-    pub const fn new(word: Word<'a>) -> Self {
+impl Progress {
+    pub(crate) const fn new(word: Word<'_>) -> Self {
         Self {
-            transfer: Transfer::new(word),
+            transfer: Transfer::new(),
+            label: word.charset(),
+            encoding: word.encoding(),
+            length: word.payload().len(),
             charset: Decoder::new(word.charset()),
             pending: None,
             problem: false,
@@ -221,14 +230,12 @@ impl<'a> Cursor<'a> {
         }
     }
     /// Final only at completion. Dropping encoded controls is not an error.
-    pub const fn is_encoding_problem(&self) -> bool {
+    pub(crate) const fn is_encoding_problem(&self) -> bool {
         self.problem || self.charset.is_encoding_problem()
-    }
-    pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
-        self.poll_with_work(now, work).map_err(Error::from)
     }
     pub(crate) fn poll_with_work(
         &mut self,
+        word: Word<'_>,
         now: Tick,
         work: &mut impl Work,
     ) -> Result<Status, DecodeError> {
@@ -238,13 +245,18 @@ impl<'a> Cursor<'a> {
         if self.complete {
             return Ok(Status::Complete);
         }
-        let result = self.step(now, work);
+        let result = self.step(word, now, work);
         if let Err(error) = result {
             self.failure = Some(error);
         }
         result
     }
-    fn step(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, DecodeError> {
+    fn step(
+        &mut self,
+        word: Word<'_>,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, DecodeError> {
         work.charge(
             now,
             Charge {
@@ -252,10 +264,16 @@ impl<'a> Cursor<'a> {
                 ..Charge::default()
             },
         )?;
+        if word.charset() != self.label
+            || word.encoding() != self.encoding
+            || word.payload().len() != self.length
+        {
+            return Err(DecodeError::InvalidState);
+        }
         let event = match self.pending {
             Some(event) => event,
             None => {
-                let event = self.transfer.poll(now, work)?;
+                let event = self.transfer.poll(word, now, work)?;
                 self.pending = Some(event);
                 event
             }
@@ -291,7 +309,7 @@ impl<'a> Cursor<'a> {
                 Event::Fault => {
                     self.problem = true;
                     self.pending = None;
-                    self.charset = Decoder::new(self.transfer.word.charset());
+                    self.charset = Decoder::new(self.label);
                     Ok(Status::Scalar('\u{fffd}'))
                 }
                 Event::End => {
@@ -302,12 +320,202 @@ impl<'a> Cursor<'a> {
         }
     }
 }
+/// Copies retain source/decoder state, not work. The owner keeps failure retirement.
+#[derive(Clone, Copy)]
+pub struct Cursor<'a> {
+    word: Word<'a>,
+    progress: Progress,
+}
+impl<'a> Cursor<'a> {
+    pub const fn new(word: Word<'a>) -> Self {
+        Self {
+            word,
+            progress: Progress::new(word),
+        }
+    }
+    /// Final only at completion. Dropping encoded controls is not an error.
+    pub const fn is_encoding_problem(&self) -> bool {
+        self.progress.is_encoding_problem()
+    }
+    pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
+        self.poll_with_work(now, work).map_err(Error::from)
+    }
+    pub(crate) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, DecodeError> {
+        self.progress.poll_with_work(self.word, now, work)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use crate::{encoded_word::Context, ports::Deadline};
+    #[test]
+    fn payload_free_progress_reuses_admitted_relocated_word_views() {
+        assert!(std::mem::size_of::<Progress>() <= 48);
+        assert!(std::mem::size_of::<Cursor<'_>>() <= 128);
+        for token in [
+            b"=?utf-8?Q?e=CC=81?=".as_slice(),
+            b"=?utf-8?Q?=C3=xx=A9?=",
+            b"=?ascii?B?Zm9v?=",
+            b"=?ascii?B?Zh==Zm8=?=",
+            b"=?utf-8?Q?=EF=B7=90=00=09x?=",
+        ] {
+            let first = token.to_vec();
+            let second = token.to_vec();
+            assert_ne!(first.as_ptr(), second.as_ptr());
+            let first_word = Word::recognize(&first, Context::Text, Tick(1), &mut work())
+                .unwrap()
+                .unwrap();
+            let second_word = Word::recognize(&second, Context::Text, Tick(1), &mut work())
+                .unwrap()
+                .unwrap();
+            let mut cursor = Cursor::new(first_word);
+            let mut progress = Progress::new(first_word);
+            let mut borrowed = work();
+            let mut detached = work();
+            let mut complete = false;
+            for turn in 0..1000 {
+                let word = if turn % 2 == 0 {
+                    first_word
+                } else {
+                    second_word
+                };
+                let actual = progress.poll_with_work(word, Tick(1), &mut detached);
+                let expected = cursor.poll_with_work(Tick(1), &mut borrowed);
+                assert_eq!(actual, expected);
+                assert_eq!(detached.remaining(), borrowed.remaining());
+                assert_eq!(progress.is_encoding_problem(), cursor.is_encoding_problem());
+                if actual == Ok(Status::Complete) {
+                    complete = true;
+                    let before = detached.remaining();
+                    assert_eq!(
+                        progress.poll_with_work(
+                            Word::recognize(b"=?ascii?Q?z?=", Context::Text, Tick(1), &mut work())
+                                .unwrap()
+                                .unwrap(),
+                            Tick(100),
+                            &mut detached
+                        ),
+                        Ok(Status::Complete)
+                    );
+                    assert_eq!(detached.remaining(), before);
+                    break;
+                }
+            }
+            assert!(complete);
+        }
+    }
+    #[test]
+    fn detached_word_shape_mismatch_and_work_refusal_are_sticky() {
+        let word = Word::recognize(b"=?ascii?Q?ab?=", Context::Text, Tick(1), &mut work())
+            .unwrap()
+            .unwrap();
+        for token in [
+            b"=?ascii?Q?a?=".as_slice(),
+            b"=?utf-8?Q?ab?=",
+            b"=?ascii?B?ab?=",
+        ] {
+            let other = Word::recognize(token, Context::Text, Tick(1), &mut work())
+                .unwrap()
+                .unwrap();
+            let mut progress = Progress::new(word);
+            let mut owner = work();
+            let before = owner.remaining();
+            assert_eq!(
+                progress.poll_with_work(other, Tick(1), &mut owner),
+                Err(DecodeError::InvalidState)
+            );
+            assert_eq!(before.records - owner.remaining().records, 1);
+            assert_eq!(before.io_bytes, owner.remaining().io_bytes);
+            let before = owner.remaining();
+            assert_eq!(
+                progress.poll_with_work(word, Tick(1), &mut owner),
+                Err(DecodeError::InvalidState)
+            );
+            assert_eq!(owner.remaining(), before);
+            let mut expired = Progress::new(word);
+            let mut owner = work();
+            assert_eq!(
+                expired.poll_with_work(other, Tick(100), &mut owner),
+                Err(DecodeError::Work(Stop::Deadline))
+            );
+            let mut replacement = work();
+            let before = replacement.remaining();
+            assert_eq!(
+                expired.poll_with_work(word, Tick(1), &mut replacement),
+                Err(DecodeError::Work(Stop::Deadline))
+            );
+            assert_eq!(replacement.remaining(), before);
+        }
+        let mut progress = Progress::new(word);
+        let mut owner = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100,
+                records: 0,
+                ..Charge::default()
+            },
+        );
+        assert_eq!(
+            progress.poll_with_work(word, Tick(1), &mut owner),
+            Err(DecodeError::Work(Stop::Records))
+        );
+        let mut replacement = work();
+        let before = replacement.remaining();
+        assert_eq!(
+            progress.poll_with_work(word, Tick(1), &mut replacement),
+            Err(DecodeError::Work(Stop::Records))
+        );
+        assert_eq!(replacement.remaining(), before);
+    }
+    #[test]
+    fn private_checkpoint_replay_preserves_state_and_original_work() {
+        let word = Word::recognize(b"=?ascii?B?Zm9v?=", Context::Text, Tick(1), &mut work())
+            .unwrap()
+            .unwrap();
+        let mut progress = Progress::new(word);
+        let mut owner = work();
+        assert_eq!(
+            progress.poll_with_work(word, Tick(1), &mut owner),
+            Ok(Status::Scalar('f'))
+        );
+        let mut replay = progress;
+        let mut complete = false;
+        for _ in 0..100 {
+            let before = owner.remaining();
+            let actual = progress.poll_with_work(word, Tick(1), &mut owner);
+            let after = owner.remaining();
+            let expected = replay.poll_with_work(word, Tick(1), &mut owner);
+            let replayed = owner.remaining();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                before.records - after.records,
+                after.records - replayed.records
+            );
+            assert_eq!(
+                before.io_bytes - after.io_bytes,
+                after.io_bytes - replayed.io_bytes
+            );
+            if actual == Ok(Status::Complete) {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        let mut failed = Progress::new(word);
+        let mut refused = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge::default());
+        let error = failed.poll_with_work(word, Tick(1), &mut refused);
+        assert_eq!(error, Err(DecodeError::Work(Stop::Records)));
+        let mut copied = failed;
+        let before = owner.remaining();
+        assert_eq!(copied.poll_with_work(word, Tick(1), &mut owner), error);
+        assert_eq!(owner.remaining(), before);
+    }
     fn work() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
@@ -489,9 +697,9 @@ mod tests {
             cursor.poll(Tick(1), &mut work),
             Err(Error::Work(Stop::IoBytes))
         );
-        assert_eq!(cursor.transfer.position, 4);
-        assert_eq!(cursor.transfer.next, 1);
-        assert_eq!(cursor.transfer.len, 3);
+        assert_eq!(cursor.progress.transfer.position, 4);
+        assert_eq!(cursor.progress.transfer.next, 1);
+        assert_eq!(cursor.progress.transfer.len, 3);
         assert_eq!(
             cursor.poll(Tick(1), &mut self::work()),
             Err(Error::Work(Stop::IoBytes))

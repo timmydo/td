@@ -1902,6 +1902,15 @@ Initial independently landable increments:
   preprocessing. Content-Location CFWS/encoded-word composition, retained
   metadata and worker/native/RSS remain open.
 
+- **M06co — private encoded-word progress:** split fixed transfer/charset
+  state from its borrowed Word without changing public behavior or charges.
+  The owner supplies the same immutable recognized logical payload each turn;
+  shape mismatch is a sticky admitted invariant error. Paired relocated views
+  pin event, diagnostic and exact-work correspondence; fixtures cover shape,
+  first-work and expired admission refusal. Existing public allocation and
+  composition suites retain their bounds. Content-Location fixed scratch,
+  placement/CFWS policy, retained metadata and worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

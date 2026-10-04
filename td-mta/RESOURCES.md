@@ -1675,6 +1675,21 @@ Rust allocation intervals cover Q/Base64 success, malformed-unit recovery,
 control/noncharacter filtering and copied replay without counter changes.
 No complete header pipeline or worker-stack bound is claimed.
 
+M06co's private payload-free encoded-word Progress fits 48 bytes. On the
+64-bit host it is 40 bytes; the public wrapper grows from 72 to 80 bytes
+while remaining within 128 bytes and existing enclosing cursor ceilings.
+The usize payload length preserves the const constructor and comes only
+from recognition's at-most-75-octet Word, matching u8 transfer positions.
+The same decoder region and checkpoint ceilings apply; no scratch buffer or
+second header arena is added here. Each admitted turn checks charset,
+encoding and length before payload access, within the existing first record
+charge. Public Q/Base64 repair, charset/control/noncharacter filtering and
+exact visits/records remain unchanged. Relocated equal-word fixtures pin
+scalar, diagnostic and work correspondence, not byte identity or enclosing
+source admission. Existing warm/measured allocation intervals exercise the
+public wrapper's migrated core; they do not qualify a future scratch-backed
+Content-Location pipeline or complete worker/native/RSS bounds.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

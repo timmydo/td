@@ -4275,6 +4275,27 @@ removal. It does not implement Content-Location CFWS, complete URI labels,
 encoded-word decoding or first-valid metadata selection. Existing mail URL
 forms retain their grammar and work. Worker/native/RSS remain open.
 
+### 1.94 Private payload-free encoded-word progress
+
+M06co separates private transfer/charset progress from the public borrowed
+encoded_word::decode::Cursor. The public cursor retains its recognized Word
+and delegates; signatures, scalar filtering, repair diagnostics, cached
+completion, sticky refusal and exact work remain unchanged. No field or
+encoded-word placement policy changes.
+
+Private Progress retains no payload borrow, clock or allowance. Its enclosing
+owner supplies the same recognized immutable logical word on every turn,
+allowing fixed scratch bytes to relocate without self references. Word
+recognition and placement stay separately admitted under original budgets.
+An admitted turn rejects changed charset, transfer encoding or payload length
+as InvalidState before payload access. Those checks do not bind byte content:
+the enclosing owner must keep logical bytes immutable through completion.
+Work/deadline refusal precedes shape checking and remains sticky across fresh
+callbacks. Cached Complete is inert; final admission belongs to the original
+live enclosing owner. Existing source-bound checkpoints may copy pure progress
+without copying or replacing admission. No public source-free decoder or
+Content-Location composition is introduced.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

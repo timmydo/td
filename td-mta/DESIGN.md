@@ -408,6 +408,13 @@ erases spacing, and parentheses are URI characters. Gaps between octet
 offsets show removed whitespace but grant no placement proof; callers
 separately rebase those offsets to their field/message.
 
+M06co separates private encoded-word transfer/charset progress from its
+borrowed Word wrapper. Public consumers retain their source and original
+budgets; progress can also follow caller-owned fixed scratch across moves,
+provided the same recognized logical bytes remain immutable. Shape checks
+cover charset, encoding and length, not byte identity or placement. This
+supplies no new field grammar or Content-Location label authority.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or
