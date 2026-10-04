@@ -314,11 +314,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
         self.outcome(result)
     }
     fn range(&self, start: u64, end: u64) -> Result<&'a [u8], Error> {
-        let start = usize::try_from(start.checked_sub(self.base).ok_or(Error::InvalidRange)?)
-            .map_err(|_| Error::InvalidRange)?;
-        let end = usize::try_from(end.checked_sub(self.base).ok_or(Error::InvalidRange)?)
-            .map_err(|_| Error::InvalidRange)?;
-        self.source.get(start..end).ok_or(Error::InvalidRange)
+        td_header::resident::slice(self.source, self.base, start..end).ok_or(Error::InvalidRange)
     }
     fn head(&self, selected: mime_metadata::Selected, second: bool) -> Result<&'a [u8], Error> {
         let raw = self.range(selected.field.value_start, selected.field.value_end)?;

@@ -197,21 +197,9 @@ impl<'a> Cursor<'a> {
         Ok(Status::Yield)
     }
     fn compare(&mut self, field: Field, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
-        let start = usize::try_from(
-            field
-                .name_start
-                .checked_sub(self.base)
-                .ok_or(Error::InvalidState)?,
-        )
-        .map_err(|_| Error::InvalidState)?;
-        let end = usize::try_from(
-            field
-                .name_end
-                .checked_sub(self.base)
-                .ok_or(Error::InvalidState)?,
-        )
-        .map_err(|_| Error::InvalidState)?;
-        let name = self.source.get(start..end).ok_or(Error::InvalidState)?;
+        let name =
+            td_header::resident::slice(self.source, self.base, field.name_start..field.name_end)
+                .ok_or(Error::InvalidState)?;
         let wanted = self.property.name().as_bytes();
         if name.len() != wanted.len() {
             work.charge(

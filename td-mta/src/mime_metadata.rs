@@ -220,11 +220,7 @@ impl<'a> Cursor<'a> {
         }
     }
     fn range(&self, start: u64, end: u64) -> Result<&'a [u8], Error> {
-        let start = usize::try_from(start.checked_sub(self.base).ok_or(Error::InvalidState)?)
-            .map_err(|_| Error::InvalidState)?;
-        let end = usize::try_from(end.checked_sub(self.base).ok_or(Error::InvalidState)?)
-            .map_err(|_| Error::InvalidState)?;
-        self.source.get(start..end).ok_or(Error::InvalidState)
+        td_header::resident::slice(self.source, self.base, start..end).ok_or(Error::InvalidState)
     }
     fn result(&self) -> Result<Selection, Error> {
         let default = match self.context {

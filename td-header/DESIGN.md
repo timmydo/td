@@ -1,12 +1,13 @@
 # Bounded header and MIME lexical primitives
 
-This std-only crate owns resident lexical syntax, not protocol or admission
-policy. It has no dependencies, clock, crypto, I/O or source ownership. The
-enclosing grammar supplies a complete immutable field-value or
-parameter-name/value slice or one logical delimiter line, any required exact
-start offset, and permission for the lexical token at that location. The MIME
-line matcher owns no body traversal, transfer decoding, active-boundary
-precedence or source authorization.
+This std-only crate owns resident lexical syntax and passive source-view
+helpers, not protocol or admission policy. It has no dependencies, clock,
+crypto, I/O or source ownership. Lexical cursors receive from their
+enclosing grammar a complete immutable field-value or parameter-name/value
+slice or one logical delimiter line, any required exact start offset, and
+permission for the lexical token at that location. The MIME line matcher
+owns no body traversal, transfer decoding, active-boundary precedence or
+source authorization.
 
 cfws scans optional comments and folding whitespace, leaves the first
 non-CFWS byte untouched, and returns original top-level comment extents.
@@ -192,3 +193,15 @@ owner needing a refusal checks that contract before calling State.
 It has no borrowed source, clock or admission handle. Line wraps State and
 pins its borrowed boundary identity. Neither detached progress nor a reset
 can authorize a source extent or recover a retired live mail owner.
+
+resident::slice maps one absolute half-open extent into an immutable caller
+window using checked base subtraction, checked usize conversion and slice
+bounds. Reversed, before-base, beyond-window and unrepresentable extents
+return None. Any empty in-window range, including at either endpoint, is
+valid. It checks only the selected extent, not whether the complete window
+has an absolute endpoint representable in u64. It reads and copies no
+octets, allocates nothing and retains no state, source identity, admission
+or publication authority. The caller binds its source, maps failure to its
+existing typed error, and funds all later byte access under its original
+owners. Consumers map their admitted header/MIME extents through this shared
+view helper; enclosing lexical and protocol decisions remain external.

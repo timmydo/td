@@ -402,17 +402,9 @@ impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
         Ok(())
     }
     fn begin_value(&mut self, field: Field) -> Result<(), Error> {
-        let start = field
-            .value_start
-            .checked_sub(self.base)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or(Error::InvalidState)?;
-        let end = field
-            .value_end
-            .checked_sub(self.base)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or(Error::InvalidState)?;
-        let bytes = self.input.get(start..end).ok_or(Error::InvalidState)?;
+        let bytes =
+            td_header::resident::slice(self.input, self.base, field.value_start..field.value_end)
+                .ok_or(Error::InvalidState)?;
         let Owner::Budgets(work, budget, workspace) =
             std::mem::replace(&mut self.owner, Owner::Retired)
         else {

@@ -4149,6 +4149,19 @@ scratch partition is claimed for them. Automatic traversal/metadata
 coordination, JSON/body values, remaining part headers, authenticated
 locators and streaming/worker/native/RSS remain open.
 
+### 1.88 Shared checked resident extents
+
+M06ci moves absolute resident slice mapping into td-header::resident::slice.
+Header selection/value composition, MIME metadata, selected part headers and
+traversal use it atomically, preserving their prior
+InvalidState/InvalidRange mapping and original source/budget ownership. It
+checks half-open selected extents, including base subtraction and usize
+conversion, without inspecting or copying bytes. Any empty in-window range
+is valid; before-base, reversed and out-of-window extents fail. The returned
+view is passive and carries no lexical, source or publication proof. Callers
+fund each subsequent read and retain complete-source admission. This adds no
+cursor, work allowance, memory reservation or dependency.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

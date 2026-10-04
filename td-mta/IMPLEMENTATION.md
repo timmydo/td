@@ -1859,6 +1859,13 @@ Initial independently landable increments:
   remaining part headers, JSON, locators and streaming/worker/native/RSS remain
   open.
 
+- **M06ci — shared resident extents:** extract passive absolute slice
+  mapping into std-only td-header and atomically migrate header
+  selection/value composition, metadata, part headers and traversal.
+  Preserve consumer error mapping and original source/budget owners. Shared
+  literal bounds fixtures and the consumer suite qualify the migration;
+  automatic coordination and worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
