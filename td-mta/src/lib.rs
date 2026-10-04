@@ -48,6 +48,7 @@ pub mod mime_fields;
 pub mod mime_filename;
 pub mod mime_headers;
 pub mod mime_input;
+pub mod mime_language;
 pub mod mime_metadata;
 pub mod mime_parameter;
 pub mod mime_part_headers;

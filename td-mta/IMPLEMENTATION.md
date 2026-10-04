@@ -1866,6 +1866,13 @@ Initial independently landable increments:
   literal bounds fixtures and the consumer suite qualify the migration;
   automatic coordination and worker/native/RSS remain open.
 
+- **M06cj — Content-Language values:** compose shared CFWS/tag spelling into
+  bounded complete-value list syntax, preserving ordered original-case tag
+  extents. Bind original job/email budgets, sticky refusal and fresh handoff.
+  Qualify literal RFC lists, malformed tails, all allowance/deadline cuts and
+  Rust allocation. Part-header selection/retention, JSON and worker/native/RSS
+  remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

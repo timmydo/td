@@ -1229,6 +1229,67 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn content_language_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_language::{Cursor, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("({})en{}", "🐈".repeat(1024), "-abcdefgh".repeat(1024));
+    let nested = format!("en {}x{}", "(".repeat(33), ")".repeat(33));
+    let before = COUNTERS.snapshot();
+    for (source, expected, records) in [
+        (b"en-US, fr (tail)".as_slice(), None, 100_000_000),
+        (long.as_bytes(), None, 100_000_000),
+        (b"en,", Some(Error::Malformed), 100_000_000),
+        (nested.as_bytes(), Some(Error::NestingLimit), 100_000_000),
+        (b"en", Some(Error::Work(Stop::Records)), 0),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(source, &mut work, &mut budget);
+        let mut done = false;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(!cursor.is_complete()),
+                Ok(Status::Tag(extent)) => {
+                    std::hint::black_box(extent);
+                }
+                Ok(Status::Complete) => {
+                    assert_eq!(expected, None);
+                    assert!(cursor.is_complete());
+                    assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+                    cursor.check_deadline(Tick(1)).unwrap();
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100)),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert!(!cursor.is_complete());
+                    done = true;
+                    break;
+                }
+                Err(error) => {
+                    assert_eq!(Some(error), expected);
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    assert!(!cursor.is_complete());
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+    }
+    assert_eq!(COUNTERS.snapshot(), before);
+}
+
 fn mime_body_list_selection() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -7958,6 +8019,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        content_language_values();
         body_value();
         mime_text();
         body_charset();
@@ -8113,6 +8175,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    content_language_values();
     body_value();
     mime_text();
     body_charset();

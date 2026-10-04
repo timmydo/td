@@ -205,3 +205,24 @@ or publication authority. The caller binds its source, maps failure to its
 existing typed error, and funds all later byte access under its original
 owners. Consumers map their admitted header/MIME extents through this shared
 view helper; enclosing lexical and protocol decisions remain external.
+
+language_list validates one complete Content-Language field value under
+RFC 3282 section 2 and RFC 3066 section 2.1 spelling. It composes the existing
+passive Tag and bounded CFWS cursors. Require one or more comma-separated
+tags, with CFWS before/after each complete tag; tag octets remain contiguous.
+Emit original-case tag extents in order, preserving duplicates and excluding
+comments/whitespace. Tag events remain provisional until the whole value
+completes, and every event retires after later malformed syntax, nesting or
+work refusal. There is no registry lookup, preference/quality syntax, locale
+selection, charset inference or metadata/publication authority.
+
+A poll invokes at most one bounded CFWS turn or one admitted tag/separator
+read, including charged EOF attempts. Visits/records stay within the shared
+160/32 maxima. With mail's fixed error, cursor state fits 192 bytes; it owns
+no growing tag list or output buffer. Healthy cached Complete is inert;
+check_work freshly admits zero-count work and retires cached success after
+refusal, sticky across replacement callbacks. Live cursors are neither Copy
+nor Clone. Enclosing field-name/colon syntax, selected-value ownership and
+output retention admission remain external.
+Normative grammar: https://www.rfc-editor.org/rfc/rfc3282.html#section-2
+and https://www.rfc-editor.org/rfc/rfc3066.html#section-2.1.

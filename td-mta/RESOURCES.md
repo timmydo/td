@@ -1384,6 +1384,25 @@ malformed tree, work and capacity failure and late retirement. State/cell
 ceilings are independent of native compiler stack, complete worker, portable
 provider or RSS evidence.
 
+M06cj's Content-Language cursor plus HeaderBudget fits 256 bytes in the
+existing 16 KiB parser reservation. Its shared lexical cursor with mail's
+fixed error fits 192 bytes; CFWS and passive Tag are inline, with no recursive call or
+per-tag heap storage. Each poll visits at most 160 source bytes and spends at
+most 192 header steps and 12 original job records, with private retained
+credit. EOF and repeated lookahead are charged; no output bytes are spent by
+passive raw extent events. Enclosing retention/publication must fund any
+stored descriptors or projected strings separately.
+
+Shared literal RFC examples and complete-value refusal fixtures qualify the
+syntax, including long tags/comments and every callback cut. Mail fixtures
+pin original owner identity, exact aggregate accounting, all header/job cuts,
+every live deadline turn and fresh completion refusal. A long four-byte UTF-8
+comment reaches exactly 160 visits, 192 header steps and 12 job records in a
+turn. Warm/measured Rust allocation intervals cover success, syntax and
+nesting refusal, job-record exhaustion and deadline retirement after
+completion. HeaderBudget refusal and mid-parse deadline cuts have unit
+coverage; worker/native/RSS remain unqualified.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

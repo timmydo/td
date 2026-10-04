@@ -370,6 +370,13 @@ results stay hidden until all tree validation/work completes. Original job
 and email budgets survive fresh completion. No locator or wire authority is
 introduced; automatic composition and body JSON remain separate.
 
+M06cj adds bounded Content-Language field-value parsing with the original job
+and email budgets. Shared CFWS and passive tag spelling produce ordered
+original-case extents, provisional until whole-list success. Malformed tails,
+nesting and late refusals retire every event; no locale, charset, selected
+metadata or publication authority follows. First-valid part-header selection
+and retained language JSON remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

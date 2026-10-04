@@ -4162,6 +4162,32 @@ view is passive and carries no lexical, source or publication proof. Callers
 fund each subsequent read and retain complete-source admission. This adds no
 cursor, work allowance, memory reservation or dependency.
 
+### 1.89 Budgeted Content-Language values
+
+M06cj adds mime_language::Cursor over one caller-authorized complete resident
+field value. The std-only td-header::language_list engine composes existing
+CFWS and passive tag spelling; tags preserve original case, order and
+duplicates. At least one comma-separated tag is required. CFWS is outside
+contiguous tags; malformed/empty tails and excess comment depth reject the
+whole value. This is field-value syntax, not field discovery, selected-header
+metadata, locale/charset inference or new header-form dispatcher policy.
+
+Every returned Tag extent is provisional and must be retired if later syntax
+or original admission fails. No output backing or wire/publication proof is
+created. Caller retention remains separately admitted. The non-Copy/non-Clone
+mail cursor exclusively borrows the original Meter/HeaderBudget and private
+credit, funding source/EOF visits and transitions before access. No copied
+or replacement allowance can resume it. Cached Complete is inert; is_complete
+is passive. check_deadline and consuming finish freshly admit original owners;
+a late refusal retires completion and all earlier events. Healthy finish
+returns those same owners without refund or renewal. finish checks admission
+before completeness: an expired premature finish returns Work(Deadline),
+while a healthy premature finish returns InvalidState.
+
+RESOURCES.md qualifies fixed state/turns and Rust allocation. Automatic
+part-header selection/retention, body JSON/value projection, authenticated
+locators and streaming/worker/native/RSS remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -287,6 +287,17 @@ for RFC 2369's nonposting marker. These forms never fetch a URL. RFC
 date/header parsing does not broaden SMTP envelope grammar. Header values
 unsupported by a form remain readable as Raw.
 
+Content-Language field values use RFC 3282 section 2's ABNF comma-separated
+list and RFC 3066 section 2.1 tag spelling, with CFWS around contiguous tags.
+Empty elements (leading, trailing or repeated commas) are rejected; the older
+RFC 822 list shorthand's empty-element allowance is not accepted here.
+Require at least one tag and validate the complete selected value; a valid
+prefix does not survive a malformed tail or interpretation refusal. Preserve
+order, duplicates and original case as passive metadata; no registry, locale
+preference, quality weight or charset inference follows. Raw headers remain
+available. Field discovery, duplicate-field selection and retained JSON
+composition must separately establish their complete-source/output authority.
+
 RFC 2231 MIME parameters support percent decoding, charset/language prefixes,
 and numbered continuations beginning at zero without gaps or leading zeros.
 A malformed extended name (including leading zeros, numeric overflow or extra
