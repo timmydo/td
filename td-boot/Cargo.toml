@@ -20,9 +20,13 @@ license = "MIT"
 name = "td-boot"
 path = "src/main.rs"
 
+[dependencies]
+td-tpm = { path = "../td-tpm" }
+
 # td-boot is a TARGET-built guest program outside the control-plane workspace.
 # It has zero external dependencies. The target recipe compiles this source and
-# the shared engine SHA-256, SHA-512 and ed25519 sources directly with rustc.
+# the shared engine SHA-256, SHA-512 and ed25519 sources directly with rustc,
+# linking the sibling td-tpm client compiled first as an rlib.
 
 [lints.rust]
 unsafe_code = "forbid"

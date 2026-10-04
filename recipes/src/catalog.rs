@@ -333,10 +333,27 @@ mod tests {
                 );
             }
             if stem == "td-boot" {
-                assert_eq!(remap_sources.len(), 2, "td-boot must build two roots");
-                assert_ne!(
-                    remap_sources.first(),
-                    remap_sources.get(1),
+                // Its td-tpm rlib, then the binary, under each of two roots.
+                assert_eq!(
+                    remap_sources.len(),
+                    4,
+                    "td-boot must build its library and binary at two roots"
+                );
+                let mut roots = remap_sources.clone();
+                roots.sort();
+                roots.dedup();
+                assert_eq!(roots.len(), 2, "td-boot must build two roots");
+                for root in &roots {
+                    assert_eq!(
+                        remap_sources.iter().filter(|seen| *seen == root).count(),
+                        2,
+                        "td-boot must build its library and binary under each root"
+                    );
+                }
+                let (first, second) = (roots.first(), roots.get(1));
+                assert!(
+                    first.map(|r| &r.0) != second.map(|r| &r.0)
+                        && first.map(|r| &r.1) != second.map(|r| &r.1),
                     "td-boot's reproducibility oracle must vary both remap inputs"
                 );
             }

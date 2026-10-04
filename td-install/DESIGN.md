@@ -1188,9 +1188,12 @@ for measurement or kexec.
 
 The selector reads PCR 11 through root's `/dev/tpmrm0` and requires zero,
 extends the event's SHA-256 digest once, then requires exact readback of
-`SHA256(zero32 || event_digest)`. Packets admit only the SHA-256 bank and
-three-byte selection naming PCR 11. An unsupported TPM, malformed reply,
-nonzero initial PCR, uncertain extension or readback mismatch refuses kexec.
+`SHA256(zero32 || event_digest)`. It runs over the shared td-tpm client
+([td-tpm/DESIGN.md](../td-tpm/DESIGN.md)): commands select only PCR 11 in
+the SHA-256 bank, and a reply naming another bank or PCR, or anything but
+the exact empty extension reply, is refused. An unsupported TPM, malformed
+reply, nonzero initial PCR, uncertain extension or readback mismatch
+refuses kexec.
 It never resets a PCR or retries an extension. A failed handoff requires a
 cold boot; it cannot measure another candidate on the already-used PCR.
 The ordinary verified selection and fallback happen before measurement.

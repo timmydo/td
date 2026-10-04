@@ -308,7 +308,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/sha256.rs",
-        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it and td-firstboot link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
+        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot and td-boot link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
     ),
     (
         "engine/src/crc32.rs",
@@ -379,6 +379,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-secret.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-firstboot.rs"),
+    ("td-tpm/src", "recipes/src/recipes/td-boot.rs"),
     (
         "recipes/src/fixtures",
         "recipes/src/recipes/td-secret-vm-test.rs",
@@ -2504,7 +2505,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // avoid, so the correspondence is asserted rather than remembered.
     //
     // One row per source tree and recipe that stages it: a tree compiled into
-    // several recipes (td-tpm's into td-secret and td-firstboot) has a row for
+    // several recipes (td-tpm's into td-secret, td-firstboot and td-boot) has a row for
     // each. td-install joined td-boot with the recipe that builds it, and a
     // crate MISSING from this roster is the failure it exists for — so the
     // roster is checked against the tree below.

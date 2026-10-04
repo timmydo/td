@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "td-boot"
 version = "0.1.0"
+dependencies = [
+ "td-tpm",
+]
+
+[[package]]
+name = "td-tpm"
+version = "0.1.0"

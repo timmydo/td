@@ -21,7 +21,7 @@
 mod sha256;
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
 pub const NO_SESSIONS: u16 = 0x8001;
@@ -66,19 +66,25 @@ pub trait Transport {
 pub struct Device(File);
 impl Device {
     pub fn open() -> Result<Self, String> {
+        Self::open_io().map_err(|e| e.to_string())
+    }
+
+    /// As `open`, keeping the OS error kind for a caller that reports it.
+    pub fn open_io() -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(O_NOFOLLOW)
             .open("/dev/tpmrm0")
-            .map_err(|e| format!("open TPM resource manager: {e}"))?;
-        if !file
+            .map_err(|e| io::Error::new(e.kind(), format!("open TPM resource manager: {e}")))?;
+        let metadata = file
             .metadata()
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_char_device()
-        {
-            return Err("TPM resource manager is not a character device".into());
+            .map_err(|e| io::Error::new(e.kind(), format!("stat TPM resource manager: {e}")))?;
+        if !metadata.file_type().is_char_device() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TPM resource manager is not a character device",
+            ));
         }
         Ok(Self(file))
     }
@@ -807,7 +813,8 @@ mod tests {
         }
     }
 
-    /// td-boot's hand-assembled PCR 11 read and extend are these bytes.
+    /// td-boot's selector PCR 11 measurement sends these bytes; its own
+    /// tests pin them too.
     #[test]
     fn single_pcr_read_and_extend_send_the_selector_command_bytes() {
         let mut body = Vec::new();

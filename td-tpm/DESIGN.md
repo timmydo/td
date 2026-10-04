@@ -3,13 +3,13 @@
 td-tpm is td's shared TPM 2.0 client. AGENTS.md principle 2 puts code
 two crates need in one sibling crate, so td-secret's credential stores
 and the disk protector of `td-install/ENCRYPTION.md` increment 4 run
-over this crate instead of each carrying a copy. td-boot's PCR 11
-measurement still hand-assembles its PCR_Read and PCR_Extend commands
-until the disk-protector increment migrates it onto this crate; the
-client's unit tests pin those exact bytes. It is pure `std`, depends on
-no crate, compiles the engine's SHA-256 as shared source, and forbids
-`unsafe`; it adds no syscall surface to `UNSAFE.md`. The device is opened
-through safe file I/O.
+over this crate instead of each carrying a copy. td-boot's selector
+PCR 11 measurement reads, extends and reads back through `read_pcr` and
+`extend_pcr`; the client's unit tests and td-boot's pin those exact
+command bytes. It is pure `std`, depends on no crate, compiles the
+engine's SHA-256 as shared source, and forbids `unsafe`; it adds no
+syscall surface to `UNSAFE.md`. The device is opened through safe file
+I/O.
 
 ## API boundary
 
@@ -18,7 +18,9 @@ The crate owns the protocol and nothing a consumer persists or decides:
 - **Transport.** `Transport` exchanges one complete command for one
   reply. `Device` opens `/dev/tpmrm0` without following links and
   refuses anything but a character device; the kernel resource manager
-  owns the connection lifetime. Tests substitute scripted transports.
+  owns the connection lifetime. `Device::open_io` is the same open
+  keeping the OS error kind, which td-boot reports. Tests substitute
+  scripted transports.
 - **Commands.** `Client::call` marshals one command with at most one
   session: an empty password session or a policy session with a fresh
   32-byte caller nonce from `/dev/urandom`. A command is sized and

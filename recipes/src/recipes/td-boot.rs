@@ -5,7 +5,10 @@ use crate::types::{Recipe, Step};
 // source reuses the engine's dependency-free SHA-256 implementation, and its
 // ed25519 VERIFIER — which reaches its hash as `crate::sha512`, so the two
 // arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
-// and must not be: this binary verifies and never signs.
+// and must not be: this binary verifies and never signs. Its PCR 11 measurement
+// runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), compiled
+// first as an rlib with the binary's profile and passed by `--extern`; td-tpm
+// includes the same engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
@@ -14,6 +17,7 @@ const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
 const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
+const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
@@ -45,6 +49,9 @@ pub fn recipe() -> Recipe {
         },
         Step::MkDir {
             path: "{src}/engine/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-tpm/src".into(),
         },
         Step::WriteFile {
             path: "{src}/td-boot/src/main.rs".into(),
@@ -86,6 +93,11 @@ pub fn recipe() -> Recipe {
             content: ED25519_RS.into(),
             exec: false,
         },
+        Step::WriteFile {
+            path: "{src}/td-tpm/src/lib.rs".into(),
+            content: TPM_RS.into(),
+            exec: false,
+        },
         Step::MkDir {
             path: "{root}/eh".into(),
         },
@@ -105,11 +117,48 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    // Each root compiles its own td-tpm rlib under the same roots, so the
+    // two-root oracle below covers the library as well as the binary.
+    let library = |root: &str| {
+        let source = format!("{root}/source");
+        let output = format!("{root}/libtd_tpm.rlib");
+        let lib = format!("{source}/td-tpm/src/lib.rs");
+        target_rustc_at_roots(
+            &source,
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                "td_tpm",
+                "-C",
+                "opt-level=2",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-C",
+                "panic=abort",
+                "-o",
+                &output,
+                &lib,
+            ],
+            root,
+            &source,
+        )
+        .env("PATH", &path)
+        .env("SOURCE_DATE_EPOCH", "1")
+    };
     let compile = |root: &str| {
         let source = format!("{root}/source");
         let directory = format!("{source}/td-boot/src");
         let output = format!("{root}/bin/td-boot");
         let main = format!("{source}/td-boot/src/main.rs");
+        let tpm = format!("td_tpm={root}/libtd_tpm.rlib");
         target_rustc_at_roots(
             &directory,
             rustc,
@@ -126,6 +175,8 @@ pub fn recipe() -> Recipe {
                 "relocation-model=static",
                 "-C",
                 "panic=abort",
+                "--extern",
+                &tpm,
                 &linker,
                 "-L",
                 glib,
@@ -147,8 +198,10 @@ pub fn recipe() -> Recipe {
     // different source and build roots, then built independently. Their
     // canonical remaps, deterministic build ID, runtime strip, and companion
     // transform must all converge byte for byte.
-    steps.push(compile("{root}/profile-repro-a"));
-    steps.push(compile("{root}/profile-repro-b"));
+    for root in ["{root}/profile-repro-a", "{root}/profile-repro-b"] {
+        steps.push(library(root));
+        steps.push(compile(root));
+    }
     steps.push(Step::compare_files(
         "{root}/profile-repro-a/bin/td-boot",
         "{root}/profile-repro-b/bin/td-boot",
