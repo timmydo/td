@@ -955,6 +955,370 @@ pub(crate) mod tests {
         key.encode().unwrap()
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The envelopes and the policy digest are persisted formats (DESIGN.md);
+    /// these literals move only with a deliberate format revision.
+    #[test]
+    fn sealed_and_bound_envelopes_keep_their_encoded_bytes() {
+        let sealed = fixture(1000);
+        let key = SealedKey::decode(&sealed).unwrap();
+        let bound = BoundKey {
+            binding: [9; 32],
+            key: key.clone(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            [
+                hex(&crypto::digest(&sealed)),
+                hex(&key.policy_digest()),
+                hex(&crypto::digest(&bound)),
+            ],
+            [
+                "44e78107e7fc6b3b04bbd9c6012ff4dd77e870c780e449ff316ef128d25e5115",
+                // TPM2 PolicyPCR(SHA-256, PCR 7, [6; 32]) then
+                // PolicyCommandCode(Unseal) from the zero digest.
+                "ee2145ba1675359be7e16f37ac26258720226007456eed056b0b16ede976c3e9",
+                "9c6c3f7fc953dd7e0e2b4c1d5531026af2bf366af8b080aecbf080b9087db7b5",
+            ]
+        );
+    }
+
+    /// A scripted TPM: canned, well-formed replies to the seal and unseal
+    /// command profile, with PolicyPCR, PolicyCommandCode and the Unseal
+    /// authPolicy check evaluated as the TPM does. Every command is recorded
+    /// with its caller nonce zeroed, the client's only random field.
+    struct ScriptedTpm {
+        log: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+        next: u32,
+        sessions: Vec<(u32, [u8; 32])>,
+        objects: Vec<(u32, Vec<u8>, Vec<u8>)>,
+    }
+
+    impl ScriptedTpm {
+        fn new(log: &std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>) -> Self {
+            Self {
+                log: log.clone(),
+                next: 0,
+                sessions: Vec::new(),
+                objects: Vec::new(),
+            }
+        }
+
+        fn session(&mut self, handle: u32) -> &mut [u8; 32] {
+            &mut self
+                .sessions
+                .iter_mut()
+                .find(|(value, _)| *value == handle)
+                .expect("unknown policy session")
+                .1
+        }
+
+        fn creation(out: &mut Vec<u8>) {
+            put_blob(out, &[]).unwrap();
+            put_blob(out, &[0x0c; 32]).unwrap();
+            put16(out, 0x8021);
+            put32(out, OWNER);
+            put_blob(out, &[0x0d; 32]).unwrap();
+        }
+    }
+
+    impl Transport for ScriptedTpm {
+        fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
+            let code = u32::from_be_bytes(command[6..10].try_into().unwrap());
+            let handles = match code {
+                PCR_READ => 0,
+                START_AUTH_SESSION => 2,
+                _ => 1,
+            };
+            let mut recorded = command.to_vec();
+            let mut at = 10 + 4 * handles;
+            let handle =
+                (handles == 1).then(|| u32::from_be_bytes(command[10..14].try_into().unwrap()));
+            let mut session = None;
+            if u16::from_be_bytes([command[0], command[1]]) == SESSIONS {
+                let size = u32::from_be_bytes(command[at..at + 4].try_into().unwrap()) as usize;
+                let auth = u32::from_be_bytes(command[at + 4..at + 8].try_into().unwrap());
+                let nonce = usize::from(u16::from_be_bytes([command[at + 8], command[at + 9]]));
+                if auth != PASSWORD {
+                    assert_eq!(nonce, 32);
+                    recorded[at + 10..at + 10 + nonce].fill(0);
+                    session = Some(auth);
+                }
+                at += 4 + size;
+            }
+            let mut input = Reader(&command[at..]);
+            if code == START_AUTH_SESSION {
+                assert_eq!(&command[at..at + 2], [0, 32]);
+                recorded[at + 2..at + 34].fill(0);
+            }
+            self.log.borrow_mut().push(recorded);
+            self.next += 1;
+            let mut out_handle = None;
+            let mut out = Vec::new();
+            match code {
+                PCR_READ => {
+                    assert_eq!(input.u32().unwrap(), 1);
+                    assert_eq!(input.u16().unwrap(), SHA256);
+                    assert_eq!(input.u8().unwrap(), 3);
+                    let mask = input.take(3).unwrap();
+                    input.end().unwrap();
+                    put32(&mut out, 0x55);
+                    put32(&mut out, 1);
+                    put16(&mut out, SHA256);
+                    out.push(3);
+                    out.extend_from_slice(mask);
+                    let bits = u32::from_le_bytes([mask[0], mask[1], mask[2], 0]);
+                    put32(&mut out, bits.count_ones());
+                    for index in (0..24).filter(|index| bits & (1 << index) != 0) {
+                        put_blob(&mut out, &[index as u8 + 0x40; 32]).unwrap();
+                    }
+                }
+                START_AUTH_SESSION => {
+                    assert_eq!(input.blob().unwrap().len(), 32);
+                    assert!(input.blob().unwrap().is_empty());
+                    assert!(matches!(input.u8().unwrap(), 0x01 | 0x03));
+                    assert_eq!(input.u16().unwrap(), ALG_NULL);
+                    assert_eq!(input.u16().unwrap(), SHA256);
+                    input.end().unwrap();
+                    let handle = 0x0300_0000 + self.next;
+                    self.sessions.push((handle, [0; 32]));
+                    out_handle = Some(handle);
+                    put_blob(&mut out, &[0x0e; 32]).unwrap();
+                }
+                POLICY_PCR => {
+                    let digest = input.blob().unwrap().to_vec();
+                    let mut selection = Vec::new();
+                    put32(&mut selection, input.u32().unwrap());
+                    put16(&mut selection, input.u16().unwrap());
+                    selection.push(input.u8().unwrap());
+                    selection.extend_from_slice(input.take(3).unwrap());
+                    input.end().unwrap();
+                    assert_eq!(selection[..7], [0, 0, 0, 1, 0, 0x0b, 3]);
+                    let state = self.session(handle.unwrap());
+                    let mut bytes = state.to_vec();
+                    put32(&mut bytes, POLICY_PCR);
+                    bytes.extend_from_slice(&selection);
+                    bytes.extend_from_slice(&digest);
+                    *state = crypto::digest(&bytes);
+                }
+                POLICY_COMMAND_CODE => {
+                    let state = self.session(handle.unwrap());
+                    let mut bytes = state.to_vec();
+                    put32(&mut bytes, POLICY_COMMAND_CODE);
+                    bytes.extend_from_slice(input.take(4).unwrap());
+                    input.end().unwrap();
+                    *state = crypto::digest(&bytes);
+                }
+                POLICY_GET_DIGEST => {
+                    let state = *self.session(handle.unwrap());
+                    put_blob(&mut out, &state).unwrap();
+                }
+                CREATE_PRIMARY => {
+                    assert_eq!(handle, Some(OWNER));
+                    assert_eq!(input.blob().unwrap(), [0; 4]);
+                    let template = input.blob().unwrap();
+                    // The fixed storage template precedes its unique field.
+                    let mut public = template[..22].to_vec();
+                    put_blob(&mut public, &crypto::digest(template)).unwrap();
+                    put_blob(&mut public, &[0x0f; 32]).unwrap();
+                    out_handle = Some(0x8000_0000 + self.next);
+                    put_blob(&mut out, &public).unwrap();
+                    Self::creation(&mut out);
+                    let mut name = SHA256.to_be_bytes().to_vec();
+                    name.extend_from_slice(&crypto::digest(&public));
+                    put_blob(&mut out, &name).unwrap();
+                }
+                CREATE => {
+                    let mut sensitive = Reader(input.blob().unwrap());
+                    assert!(sensitive.blob().unwrap().is_empty());
+                    let data = sensitive.blob().unwrap();
+                    let template = input.blob().unwrap();
+                    let mut public = template[..template.len() - 2].to_vec();
+                    put_blob(&mut public, &crypto::digest(data)).unwrap();
+                    let mut private = b"scripted:".to_vec();
+                    private.extend_from_slice(data);
+                    put_blob(&mut out, &private).unwrap();
+                    put_blob(&mut out, &public).unwrap();
+                    Self::creation(&mut out);
+                }
+                LOAD => {
+                    let private = input.blob().unwrap();
+                    let public = input.blob().unwrap();
+                    input.end().unwrap();
+                    let mut fields = Reader(public);
+                    fields.take(8).unwrap();
+                    let policy = fields.blob().unwrap().to_vec();
+                    let handle = 0x8000_0000 + self.next;
+                    let data = private.strip_prefix(b"scripted:").unwrap().to_vec();
+                    self.objects.push((handle, policy, data));
+                    out_handle = Some(handle);
+                    let mut name = SHA256.to_be_bytes().to_vec();
+                    name.extend_from_slice(&crypto::digest(public));
+                    put_blob(&mut out, &name).unwrap();
+                }
+                UNSEAL => {
+                    let session = session.unwrap();
+                    let digest = *self.session(session);
+                    self.sessions.retain(|(value, _)| *value != session);
+                    let (_, policy, data) = self
+                        .objects
+                        .iter()
+                        .find(|(value, ..)| Some(*value) == handle)
+                        .unwrap();
+                    assert_eq!(policy, &digest, "Unseal policy failure");
+                    put_blob(&mut out, data).unwrap();
+                }
+                FLUSH_CONTEXT => {
+                    let handle = handle.unwrap();
+                    self.sessions.retain(|(value, _)| *value != handle);
+                    self.objects.retain(|(value, ..)| *value != handle);
+                }
+                _ => panic!("unscripted TPM command {code:#x}"),
+            }
+            let tag = u16::from_be_bytes([command[0], command[1]]);
+            let mut response = tag.to_be_bytes().to_vec();
+            put32(&mut response, 0);
+            put32(&mut response, 0);
+            if let Some(handle) = out_handle {
+                put32(&mut response, handle);
+            }
+            if tag == SESSIONS {
+                put32(&mut response, out.len() as u32);
+                response.extend_from_slice(&out);
+                if session.is_some() {
+                    put_blob(&mut response, &[0x0b; 32]).unwrap();
+                    response.push(0);
+                } else {
+                    put_blob(&mut response, &[]).unwrap();
+                    response.push(1);
+                }
+                put_blob(&mut response, &[]).unwrap();
+            } else {
+                response.extend_from_slice(&out);
+            }
+            let size = response.len() as u32;
+            response[2..6].copy_from_slice(&size.to_be_bytes());
+            Ok(response)
+        }
+    }
+
+    /// The client's command stream is the other half of the persisted
+    /// contract: what the TPM is asked to create, load and authorize. These
+    /// literals move only with a deliberate protocol change.
+    #[test]
+    fn seal_and_unseal_send_their_recorded_command_stream() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let client = || Client::new(ScriptedTpm::new(&log));
+        let mut phases = Vec::new();
+        let mut mark = |log: &std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>| {
+            let codes: Vec<u32> = log.borrow()[phases.iter().sum::<usize>()..]
+                .iter()
+                .map(|command| u32::from_be_bytes(command[6..10].try_into().unwrap()))
+                .collect();
+            phases.push(codes.len());
+            codes
+        };
+        let sealed = client()
+            .seal(1000, Pcrs::parse("7").unwrap(), &[0x21; 32])
+            .unwrap();
+        let seal = mark(&log);
+        assert_eq!(client().unseal(&sealed).unwrap(), [0x21; 32]);
+        let unseal = mark(&log);
+        let binding = [0x5a; 32];
+        let bound = client()
+            .seal_bound(1001, Pcrs::parse("0,7,15").unwrap(), &[0x22; 32], &binding)
+            .unwrap();
+        let seal_bound = mark(&log);
+        assert_eq!(client().unseal_bound(&bound, &binding).unwrap(), [0x22; 32]);
+        let unseal_bound = mark(&log);
+        assert_eq!(
+            [seal, unseal, seal_bound, unseal_bound],
+            [
+                vec![
+                    PCR_READ,
+                    START_AUTH_SESSION,
+                    POLICY_PCR,
+                    POLICY_COMMAND_CODE,
+                    POLICY_GET_DIGEST,
+                    CREATE_PRIMARY,
+                    CREATE,
+                    FLUSH_CONTEXT,
+                    FLUSH_CONTEXT,
+                ],
+                vec![
+                    CREATE_PRIMARY,
+                    LOAD,
+                    START_AUTH_SESSION,
+                    POLICY_PCR,
+                    POLICY_COMMAND_CODE,
+                    POLICY_GET_DIGEST,
+                    UNSEAL,
+                    FLUSH_CONTEXT,
+                    FLUSH_CONTEXT,
+                ],
+                vec![
+                    PCR_READ,
+                    START_AUTH_SESSION,
+                    POLICY_PCR,
+                    POLICY_COMMAND_CODE,
+                    POLICY_GET_DIGEST,
+                    CREATE_PRIMARY,
+                    FLUSH_CONTEXT,
+                    CREATE_PRIMARY,
+                    CREATE,
+                    FLUSH_CONTEXT,
+                    FLUSH_CONTEXT,
+                ],
+                vec![
+                    CREATE_PRIMARY,
+                    LOAD,
+                    START_AUTH_SESSION,
+                    POLICY_PCR,
+                    POLICY_COMMAND_CODE,
+                    POLICY_GET_DIGEST,
+                    UNSEAL,
+                    FLUSH_CONTEXT,
+                    FLUSH_CONTEXT,
+                ],
+            ]
+        );
+        let mut at = 0;
+        let per_phase: Vec<String> = phases
+            .iter()
+            .map(|count| {
+                let commands = log.borrow()[at..at + count].concat();
+                at += count;
+                hex(&crypto::digest(&commands))
+            })
+            .collect();
+        assert_eq!(
+            per_phase,
+            [
+                "96d0325775f566d09fe058cafc60d14a37b613b24e51f667800e052834eb1759",
+                "c6416d5eaafeeb3c238bd2c3e22b29bb7afc502a79f29a71d756b947df0aa932",
+                "5ea50bcaa42f5506c327d2753e9d9549deb7920269c7226bf7a0ffa4ca31797b",
+                "4fb3301ea764d1dd003d6c33d6b414b0a800701758b1de02fe0d49a0d776a5c5",
+            ]
+        );
+        let stream = log.borrow().concat();
+        assert_eq!(
+            [
+                hex(&crypto::digest(&stream)),
+                hex(&crypto::digest(&sealed.encode().unwrap())),
+                hex(&crypto::digest(&bound.encode().unwrap())),
+            ],
+            [
+                "0579a58b4e1c69d60bff76270daa9ec467414e9736b89850a9d94737e3077c47",
+                "438cfbef071ead971dc309d733c3b9f88995f20455d08187f99e0556b673b880",
+                "eeae7fd20137180abc7c6a397feac122d8d309ff32dd6ac35833b4c15f515cbe",
+            ]
+        );
+    }
+
     #[test]
     fn selections_and_malformed_envelopes_are_refused() {
         for value in ["", "16", "32", "0,0", "-1", "7,", "7 8", " 7"] {
