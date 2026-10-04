@@ -29,7 +29,7 @@ Permissive terms, which ask that the notice travel with the code.
 | `td-mta/unicode/17.0.0/`, `td-mta/src/unicode_tables.rs` | Unicode Character Database, and tables generated from it | Unicode, Inc. | Unicode-3.0 (`td-mta/unicode/17.0.0/license.txt`) |
 | `td-mta/leap-seconds/leap-seconds.list` | leap-second table | IERS, as distributed with tzdata | public domain |
 | `td-civil/src/tzif.rs` (`days_from_civil`, `civil_from_days`) | the day-count conversions | Howard Hinnant's published algorithms | public domain |
-| `td-photo/src/camera.rs` (the Nikon Z 8 entry) | black and white levels and the XYZ-to-camera matrix, mode `14bit-compressed` | RawSpeed, `data/cameras.xml` | CC-BY-SA-3.0 (<https://creativecommons.org/licenses/by-sa/3.0/>); to be re-sourced from the camera's own metadata |
+| `td-photo/src/camera.rs` (the Nikon Z 8 entry) | black and white levels and the XYZ-to-camera matrix, mode `14bit-compressed` | RawSpeed, `data/cameras.xml` | CC-BY-SA-3.0 (<https://creativecommons.org/licenses/by-sa/3.0/>) |
 
 The programs that embed the Unifont data print its notices with
 `--font-license` where they offer that flag (td-dua, td-editor, td-setup,
