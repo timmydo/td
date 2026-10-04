@@ -2884,7 +2884,7 @@ fn lock_ladder(path: &Path, mode: LadderLock) -> Result<File, String> {
 
 /// A plain EXCLUSIVE flock, waiting silently — the commit locks, which have no shared
 /// mode at all, and the whole-tree ladder operations that already announce themselves.
-fn lock_file(path: &Path) -> Result<File, String> {
+pub(crate) fn lock_file(path: &Path) -> Result<File, String> {
     let file = open_lock_file(path)?;
     file.lock()
         .map_err(|e| format!("lock {}: {e}", path.display()))?;

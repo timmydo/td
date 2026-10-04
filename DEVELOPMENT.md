@@ -176,6 +176,16 @@ costs a rebuild, never a wrong build: the cache is content-addressed, and a
 missing rung cold-climbs on its next use. The dry run prints what a window
 would reclaim before it does.
 
+Beside the ladder's records, `td-shell-cache/` keeps what the
+rust-toolchain check's `td shell` proof built (ripgrep, fd, uutils), so a
+rerun over an unchanged package is a content-addressed hit, committed into
+that run's own store as a build would be, rather than a ten-minute
+rebuild; a miss rebuilds on an emptied `newstore`, never beside the build
+it replaces. The check holds it exclusively while it runs, saying so when
+it waits, and empties it when the toolchain the packages link changes, so
+it holds one toolchain's builds; two worktrees on different toolchains
+empty it in turn. `gc-store` leaves it and `clear-store` drops it.
+
 Fetched and host-generated seeds are pinned by the seed digest table the
 evaluator compiles in (`seed/seed-digests.txt`); regenerate it after a pin,
 seed patch, or stage0 source change and commit it with the change:

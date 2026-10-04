@@ -5481,6 +5481,19 @@ fn build_recipe(
         // provenance depended on having been built THIS run would make intake a
         // function of cache state rather than of what produced the bytes.
         write_step_receipt_sidecar(scratch, &expect, &regs);
+        // And a persistent store that lacks the output gets what a build would
+        // have committed: a caller whose SCRATCH outlives its store (the
+        // rust-toolchain check's `td shell`, re-run into a fresh store) reads
+        // the output from there. One that already registers it (a ladder
+        // rung this run built) is left alone rather than re-hashed.
+        if let Some((ps, pd)) = persist {
+            let registered = read_registered_paths(Path::new(pd))?;
+            if !regs.iter().all(|r| registered.contains(&r.store_path)) {
+                std::fs::write(scratch.join("registration"), registration_text(&regs))
+                    .map_err(|e| e.to_string())?;
+                commit_scratch_to_store(scratch, ps, Path::new(pd))?;
+            }
+        }
         println!("CACHE=hit");
         return Ok(regs);
     }
@@ -5537,6 +5550,14 @@ fn build_recipe(
         );
     }
     eprintln!("td-builder: build-recipe: assembled {drv_path}");
+    // A miss builds from its declared inputs alone. The build namespace mounts
+    // all of SCRATCH/newstore, and a SCRATCH kept across runs (`td shell`'s
+    // cache) still holds the realization this one replaces, which would be
+    // there to use undeclared.
+    // Through the scratch remover: a build may leave a directory without
+    // owner write, which a plain recursive remove cannot empty.
+    crate::sandbox::remove_scratch_tree(&scratch.join("newstore"))
+        .map_err(|e| format!("clear {}/newstore: {e}", scratch.display()))?;
     // td realizes it (no guix-daemon). With a td-owned source store, the source is
     // staged from td's own store + closure read from the td DB (no daemon interning);
     // with a td-owned builder, the drv's builder is staged from td's store + its
@@ -15003,6 +15024,39 @@ daemon build START (2/2 active)
         write_step_receipt_sidecar(&d, &expect, std::slice::from_ref(&reg));
         authenticate_recipe_output_db(&dbp).unwrap();
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A scratch cache HIT commits to the persistent store as a build does.
+    /// The rust-toolchain check keeps `td shell`'s scratch across runs but
+    /// gives each run a fresh store, so a hit that committed nothing would
+    /// leave the product proof without its binaries. Counted in the source,
+    /// as the pin below is, since nothing here can drive `build_recipe`.
+    #[test]
+    fn a_cache_hit_commits_to_the_persistent_store_as_a_build_does() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once("mod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        assert_eq!(
+            body.matches("commit_scratch_to_store(scratch, ps, Path::new(pd))?")
+                .count(),
+            2,
+            "expected the build and the cache hit to commit into the persistent store"
+        );
+        // And a miss in a kept SCRATCH builds on an empty newstore, which the
+        // build namespace mounts whole: cleared before the one realization.
+        let clear = body
+            .find("crate::sandbox::remove_scratch_tree(&scratch.join(\"newstore\"))")
+            .expect("build_recipe clears newstore before a miss realizes");
+        let next_realize = body
+            .get(clear..)
+            .and_then(|rest| rest.find("let regs = realize_drv("))
+            .expect("the realization follows the clear");
+        assert!(
+            next_realize < 1024,
+            "newstore must be cleared just before build_recipe's realization"
+        );
     }
 
     /// Every scratch `td.db` writer is PAIRED with a sidecar writer.

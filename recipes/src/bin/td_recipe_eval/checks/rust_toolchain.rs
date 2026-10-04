@@ -166,7 +166,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         busybox_base,
     )?;
     println!(
-        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo/Clippy contain no stage0 artifacts; td shell builds and runs ripgrep/fd/uutils against td GCC/glibc with /gnu/store absent"
+        "PASS: rust-toolchain: source-built Rust 1.96.0 rustc/std/Cargo/Clippy contain no stage0 artifacts; td shell builds (or reuses from its cache) and runs ripgrep/fd/uutils against td GCC/glibc with /gnu/store absent"
     );
     Ok(())
 }
@@ -230,7 +230,33 @@ fn prove_td_shell_userland(
          glibc-x86-64 {TD_STORE_DIR}/{glibc_base} td-recipe-output\n\
          busybox-x86-64 {TD_STORE_DIR}/{busybox_base} td-recipe-output\n"
     );
-    fs::write(&native_lock, lock).map_err(|e| format!("write {}: {e}", native_lock.display()))?;
+    fs::write(&native_lock, &lock).map_err(|e| format!("write {}: {e}", native_lock.display()))?;
+
+    // `td shell`'s build cache outlives the run, beside the ladder, so an
+    // unchanged package is a content-addressed hit rather than a rebuild;
+    // the hit is committed into this run's own store as a build would be.
+    // Held exclusively: checks share the ladder, and two `td shell`s must
+    // not build into one cache. Emptied when the toolchain moves, since
+    // every package's derivation moves with it.
+    let lw = runner.ladder_work_dir();
+    let shell_cache = lw.join(SHELL_CACHE_DIR);
+    let shell_cache_lock = lw.join(format!("{SHELL_CACHE_DIR}.lock"));
+    // A peer's proof can hold it for a cold build; say so rather than sit
+    // silent. The probe is only the message: `lock_file` takes the lock.
+    let busy = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&shell_cache_lock)
+        .is_ok_and(|probe| matches!(probe.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    if busy {
+        eprintln!(
+            "   [product] waiting for another check's td shell proof to release {}",
+            shell_cache_lock.display()
+        );
+    }
+    let _shell_cache_lock = crate::check_runner::lock_file(&shell_cache_lock)?;
+    reset_shell_cache_on_toolchain_change(&shell_cache, &lock)?;
 
     let dbs = runner.recipe_output_dbs(build_out)?;
     let dbs = dbs
@@ -318,7 +344,7 @@ fn prove_td_shell_userland(
         .env("TMPDIR", tmp_s)
         .env("PATH", "")
         .env("TD_RECIPE_EVAL", evaluator_s)
-        .env("TD_SHELL_CACHE", product.join("packages"))
+        .env("TD_SHELL_CACHE", &shell_cache)
         .env("TD_SHELL_VENDOR_ROOT", vendor_s)
         .env("TD_SHELL_REPO_ROOT", repo_s)
         .env("TD_SHELL_NATIVE_STORE", tdstore_s)
@@ -366,9 +392,31 @@ fn prove_td_shell_userland(
         ));
     }
     println!(
-        "   [product] td shell built ripgrep {rg_version}, fd {fd_version}, and uutils {uutils_version} with source-built stage2 and ran all three under own-root /td/store"
+        "   [product] td shell built (or reused from its cache) ripgrep {rg_version}, fd {fd_version}, and uutils {uutils_version} with source-built stage2 and ran all three under own-root /td/store"
     );
     Ok(())
+}
+
+/// `td shell`'s persistent build cache for the product proof, under the
+/// ladder work dir: `clear-store` drops it with the rest, `gc-store` leaves it.
+const SHELL_CACHE_DIR: &str = "td-shell-cache";
+
+/// The toolchain lock the cache's builds were made against, in the cache.
+const SHELL_CACHE_STAMP: &str = "toolchain.lock";
+
+/// Empty `cache` unless it was filled against exactly `toolchain`, then
+/// record `toolchain`: a build against another toolchain is another
+/// derivation, which the cache would only hold beside the current one.
+fn reset_shell_cache_on_toolchain_change(cache: &Path, toolchain: &str) -> Result<(), String> {
+    let stamp = cache.join(SHELL_CACHE_STAMP);
+    if fs::read_to_string(&stamp).is_ok_and(|held| held == toolchain) {
+        return Ok(());
+    }
+    // Made writable first: the realized trees in it may hold directories a
+    // build left without owner write.
+    crate::check_runner::remove_path_if_exists(cache)?;
+    fs::create_dir_all(cache).map_err(|e| format!("create {}: {e}", cache.display()))?;
+    fs::write(&stamp, toolchain).map_err(|e| format!("write {}: {e}", stamp.display()))
 }
 
 fn path_str(path: &Path) -> Result<&str, String> {
@@ -588,6 +636,42 @@ mod tests {
 
         fs::remove_file(script).unwrap();
         fs::remove_file(elf).unwrap();
+    }
+
+    /// The shell cache survives an unchanged toolchain and is emptied, then
+    /// re-stamped, when the toolchain moves or it was never stamped.
+    #[test]
+    fn the_shell_cache_is_kept_only_for_its_own_toolchain() {
+        let cache =
+            std::env::temp_dir().join(format!("td-rust-shell-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache);
+        fs::create_dir_all(cache.join("ripgrep")).unwrap();
+        super::reset_shell_cache_on_toolchain_change(&cache, "tc-1\n").unwrap();
+        assert!(
+            !cache.join("ripgrep").exists(),
+            "an unstamped cache is emptied"
+        );
+        fs::create_dir_all(cache.join("ripgrep")).unwrap();
+        super::reset_shell_cache_on_toolchain_change(&cache, "tc-1\n").unwrap();
+        assert!(
+            cache.join("ripgrep").exists(),
+            "the same toolchain keeps it"
+        );
+        // A realized tree may hold a directory without owner write.
+        let sealed = cache.join("ripgrep/newstore/out");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(sealed.join("rg"), b"x").unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o555)).unwrap();
+        super::reset_shell_cache_on_toolchain_change(&cache, "tc-2\n").unwrap();
+        assert!(
+            !cache.join("ripgrep").exists(),
+            "another toolchain empties it"
+        );
+        assert_eq!(
+            fs::read_to_string(cache.join(super::SHELL_CACHE_STAMP)).unwrap(),
+            "tc-2\n"
+        );
+        fs::remove_dir_all(cache).unwrap();
     }
 
     /// The proof exercises exactly the builds the runner declares, so the
