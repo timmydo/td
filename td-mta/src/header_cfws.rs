@@ -47,6 +47,15 @@ pub struct Cursor<'a> {
     inner: td_header::cfws::Cursor<'a, DecodeError>,
 }
 impl<'a> Cursor<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<td_header::cfws::Checkpoint<'a, DecodeError>, Error> {
+        self.inner.checkpoint().map_err(Error::from)
+    }
+    pub(crate) fn resume(checkpoint: td_header::cfws::Checkpoint<'a, DecodeError>) -> Self {
+        Self {
+            inner: checkpoint.resume(),
+        }
+    }
+
     pub const fn new(source: &'a [u8], start: usize) -> Self {
         Self {
             inner: td_header::cfws::Cursor::new(source, start),

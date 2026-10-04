@@ -59,9 +59,18 @@ whose output admission/copy still belongs to the caller before publication.
 Dropping a cursor releases its exclusive borrow but proves no erasure.
 
 Standalone fixtures qualify stable ordering, equal-class blocking, short and
-long segment replay, one/32-transition quanta, the three-cell fixture admission sweep,
-cached/fresh refusal, workspace layout and live ownership. Mail keeps its
+long segment replay, one/32-transition quanta, the three-cell fixture
+admission sweep, cached/fresh refusal, workspace layout and live ownership.
+Mail keeps its
 pinned Unicode/source fixtures, decomposition checkpoint adversaries,
 aggregate/job deadlines, allocation intervals and existing resource ceilings.
 No generic engine fixture claims full Unicode database or whole-worker,
 native/RSS or retained-output qualification.
+
+Mail qualifies its fixed header source and its larger MIME parameter display
+source separately. Parameter checkpoints retain pure nested lexical/family/
+charset/word state under one original live context; they do not widen the
+header-source enum. Each consumer's normative resources name its own source,
+owner, temporary-overlap and scratch bounds. Shared diagnostic inspection is
+not used to recover final parameter metadata; the original live context
+retains that passive result and clears it on any refusal.

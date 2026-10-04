@@ -48,7 +48,51 @@ pub struct Cursor<'a> {
     problem: bool,
     failure: Option<Error>,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct Checkpoint<'a> {
+    octets: super::OctetsCheckpoint<'a>,
+    attribute: Attribute,
+    phase: Phase,
+    label: Label,
+    held: Option<(Role, u8)>,
+    decoder: Option<Decoder>,
+    selection: Option<Selection>,
+    eof: bool,
+    problem: bool,
+}
+
 impl<'a> Cursor<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<Checkpoint<'a>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            octets: self.octets.checkpoint()?,
+            attribute: self.attribute,
+            phase: self.phase,
+            label: self.label,
+            held: self.held,
+            decoder: self.decoder,
+            selection: self.selection,
+            eof: self.eof,
+            problem: self.problem,
+        })
+    }
+    pub(crate) fn resume(checkpoint: Checkpoint<'a>) -> Self {
+        Self {
+            octets: Octets::resume(checkpoint.octets),
+            attribute: checkpoint.attribute,
+            phase: checkpoint.phase,
+            label: checkpoint.label,
+            held: checkpoint.held,
+            decoder: checkpoint.decoder,
+            selection: checkpoint.selection,
+            eof: checkpoint.eof,
+            problem: checkpoint.problem,
+            failure: None,
+        }
+    }
+
     #[must_use]
     pub const fn new(source: &'a [u8], kind: Kind, attribute: Attribute) -> Self {
         Self {

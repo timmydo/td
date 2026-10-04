@@ -60,7 +60,39 @@ pub struct Cursor<'a, E: Copy> {
     result: Option<Name>,
     failure: Option<Error<E>>,
 }
+/// Pure lexical progress only; never an allowance or validity proof.
+#[derive(Clone, Copy)]
+pub struct Checkpoint<'a, E: Copy> {
+    source: &'a [u8],
+    position: usize,
+    base_end: Option<usize>,
+    base_valid: bool,
+    token_valid: bool,
+    suffix: Suffix,
+    index: u64,
+    result: Option<Name>,
+    marker: std::marker::PhantomData<E>,
+}
+
 impl<'a, E: Copy> Cursor<'a, E> {
+    /// Capture healthy pure progress; refusal never produces a checkpoint.
+    pub fn checkpoint(&self) -> Result<Checkpoint<'a, E>, Error<E>> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            position: self.position,
+            base_end: self.base_end,
+            base_valid: self.base_valid,
+            token_valid: self.token_valid,
+            suffix: self.suffix,
+            index: self.index,
+            result: self.result,
+            marker: std::marker::PhantomData,
+        })
+    }
+
     #[must_use]
     pub const fn new(source: &'a [u8]) -> Self {
         Self {
@@ -162,6 +194,23 @@ impl<'a, E: Copy> Cursor<'a, E> {
             self.position = self.position.checked_add(1).ok_or(Error::InvalidState)?;
         }
         Ok(Status::Yield)
+    }
+}
+
+impl<'a, E: Copy> Checkpoint<'a, E> {
+    /// Reconstruct lexical progress; each subsequent access must be admitted.
+    pub fn resume(self) -> Cursor<'a, E> {
+        Cursor {
+            source: self.source,
+            position: self.position,
+            base_end: self.base_end,
+            base_valid: self.base_valid,
+            token_valid: self.token_valid,
+            suffix: self.suffix,
+            index: self.index,
+            result: self.result,
+            failure: None,
+        }
     }
 }
 

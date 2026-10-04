@@ -1,4 +1,5 @@
 //! Provisional display scalars from original MIME parameter source; NFC is external.
+pub mod normalized;
 mod ordinary;
 use super::{scalars, Attribute, Error, Plan};
 use crate::{
@@ -42,7 +43,59 @@ pub struct Cursor<'a> {
     problem: bool,
     failure: Option<Error>,
 }
+// Pure replay state stays inline within the parser reservation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy)]
+enum CheckpointPhase<'a> {
+    Literal(scalars::Checkpoint<'a>),
+    Ordinary(ordinary::Checkpoint<'a>),
+    Finish,
+    Complete,
+}
+#[derive(Clone, Copy)]
+struct Checkpoint<'a> {
+    source: &'a [u8],
+    phase: CheckpointPhase<'a>,
+    result: Option<Decoded>,
+    problem: bool,
+}
 impl<'a> Cursor<'a> {
+    fn checkpoint(&self) -> Result<Checkpoint<'a>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            phase: match &self.phase {
+                Phase::Literal(cursor) => CheckpointPhase::Literal(cursor.checkpoint()?),
+                Phase::Ordinary(cursor) => CheckpointPhase::Ordinary(cursor.checkpoint()),
+                Phase::Finish => CheckpointPhase::Finish,
+                Phase::Complete => CheckpointPhase::Complete,
+                Phase::Failed => return Err(Error::InvalidState),
+            },
+            result: self.result,
+            problem: self.problem,
+        })
+    }
+    fn resume(checkpoint: Checkpoint<'a>) -> Self {
+        Self {
+            source: checkpoint.source,
+            phase: match checkpoint.phase {
+                CheckpointPhase::Literal(progress) => {
+                    Phase::Literal(scalars::Cursor::resume(progress))
+                }
+                CheckpointPhase::Ordinary(progress) => {
+                    Phase::Ordinary(ordinary::Cursor::resume(progress))
+                }
+                CheckpointPhase::Finish => Phase::Finish,
+                CheckpointPhase::Complete => Phase::Complete,
+            },
+            result: checkpoint.result,
+            problem: checkpoint.problem,
+            failure: None,
+        }
+    }
+
     #[must_use]
     pub const fn new(source: &'a [u8], kind: Kind, attribute: Attribute) -> Self {
         Self {
@@ -243,6 +296,107 @@ mod tests {
                 WordStatus::Yield => {}
                 WordStatus::Complete => return (out, c.is_encoding_problem()),
             }
+        }
+    }
+
+    #[test]
+    fn pure_checkpoints_preserve_every_display_event_and_charge_trace() {
+        for source in [
+            b"attachment;filename=\"=?utf-8?Q?e?= =?utf-8?Q?=CC=81?=\"".as_slice(),
+            b"attachment;filename*1*=%81;filename*0*=utf-8''e%CC",
+            b"attachment;filename=saved;filename*=utf-8''%xx",
+            b"attachment;x=missing",
+            b"attachment;filename=first;filename=second;filename*=utf-8'en'%xx",
+        ] {
+            let mut cursor = Cursor::new(source, Kind::ContentDisposition, Attribute::Filename);
+            let mut completed = false;
+            for _ in 0..10000 {
+                let snapshot = cursor.checkpoint().unwrap();
+                let mut original = work();
+                let before = original.remaining();
+                let event = cursor.poll(Tick(1), &mut original).unwrap();
+                let mut restored = Cursor::resume(snapshot);
+                let mut replay = work();
+                assert_eq!(restored.poll(Tick(1), &mut replay), Ok(event));
+                assert_eq!(replay.remaining(), original.remaining());
+
+                let mut reference_work = work();
+                let mut reference_budget = crate::nfc::HeaderBudget::new();
+                let reference_start = (
+                    reference_budget.source_bytes_remaining(),
+                    reference_budget.steps_remaining(),
+                );
+                assert_eq!(
+                    Cursor::resume(snapshot).poll_with_work(
+                        Tick(1),
+                        &mut decode_work::Parsing::new(
+                            &mut reference_work,
+                            &mut reference_budget,
+                            &mut 0
+                        )
+                    ),
+                    Ok(event)
+                );
+                let reference_cost = (
+                    reference_start.0 - reference_budget.source_bytes_remaining(),
+                    reference_start.1 - reference_budget.steps_remaining(),
+                );
+                for mut credit in [0, 1, 15] {
+                    let mut replay = work();
+                    let mut budget = crate::nfc::HeaderBudget::new();
+                    budget.charge(&mut replay, Tick(1), 21, 37, &mut 0).unwrap();
+                    let before_steps = budget.steps_remaining();
+                    let before_bytes = budget.source_bytes_remaining();
+                    let before_records = replay.remaining().records;
+                    let initial_credit = u64::from(credit);
+                    let mut restored = Cursor::resume(snapshot);
+                    assert_eq!(
+                        restored.poll_with_work(
+                            Tick(1),
+                            &mut decode_work::Parsing::new(&mut replay, &mut budget, &mut credit)
+                        ),
+                        Ok(event)
+                    );
+                    assert_eq!(
+                        before_bytes - budget.source_bytes_remaining(),
+                        reference_cost.0
+                    );
+                    assert_eq!(before_steps - budget.steps_remaining(), reference_cost.1);
+                    let records = reference_cost.1.saturating_sub(initial_credit).div_ceil(16);
+                    assert_eq!(before_records - replay.remaining().records, records);
+                    assert_eq!(
+                        u64::from(credit),
+                        initial_credit + records * 16 - reference_cost.1
+                    );
+                }
+                let visits = before.io_bytes - original.remaining().io_bytes;
+                let records = before.records - original.remaining().records;
+                for flavor in 0..2 {
+                    for amount in 0..if flavor == 0 { visits } else { records } {
+                        let mut cut = Meter::new(
+                            Deadline::after(Tick(0), 100).unwrap(),
+                            Charge {
+                                io_bytes: if flavor == 0 { amount } else { visits },
+                                records: if flavor == 1 { amount } else { records },
+                                ..Charge::default()
+                            },
+                        );
+                        let mut failed = Cursor::resume(snapshot);
+                        let error = failed.poll(Tick(1), &mut cut).err().unwrap();
+                        assert_eq!(failed.checkpoint().err(), Some(error));
+                        let mut fresh = work();
+                        let prior = fresh.remaining();
+                        assert_eq!(failed.poll(Tick(1), &mut fresh), Err(error));
+                        assert_eq!(failed.check_deadline(Tick(1), &mut fresh), Err(error));
+                        assert_eq!(fresh.remaining(), prior);
+                    }
+                }
+                if matches!(event, Status::Complete(_)) {
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(completed);
         }
     }
     #[test]

@@ -288,11 +288,21 @@ admitted there. td-json owns no mail, clock, crypto or scheduler policy.
 The deterministic NFC ordering/composition engine lives in td-nfc. Pure
 source/decoder/decomposition checkpoints and fixed Unicode tables remain
 caller-owned; a separate live context binds the original Meter, HeaderBudget,
-private credit and real supplied Tick. The shared engine holds an exclusive borrow of
+private credit and the real Tick supplied for each poll. The shared engine
+holds an exclusive borrow of
 fixed scratch, four pure checkpoints and fixed positions, flags, bitmaps
 and sticky failure. Existing mail source/cursor/scratch
 ceilings and charge counts remain unchanged. Different future source types
 must qualify their own bounds without widening existing header sources.
+
+MIME parameter display NFC uses a separate qualified source over private
+pure lexical/field/family/octet/scalar/display checkpoints. Its live owner
+retains original work/header budgets and private credit; the real supplied
+Tick is fixed within each poll, without being stored in checkpoints;
+copying replay progress duplicates none of them. This composition fits the
+existing parser/conversion reservations and preserves the smaller header
+source enum. Completion remains provisional metadata, with filename
+precedence/retention and complete MIME traversal still separate increments.
 
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,

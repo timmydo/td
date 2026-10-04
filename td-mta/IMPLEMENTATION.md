@@ -1796,6 +1796,15 @@ Initial independently landable increments:
   qualification and add standalone engine contracts. Parameter checkpoints/NFC,
   retention, selected boundary metadata and traversal remain open.
 
+- **M06ca — original-source parameter NFC:** add opaque pure lexical and
+  private composite checkpoints; bind them to shared normalization under the
+  original work/header/credit and scratch owners, using the supplied Tick
+  for each call. Preserve whole-family
+  validation, compatibility placement, scalar filtering and sticky refusal.
+  Qualify the larger separate source within existing parser/conversion
+  reservations without widening header-source ceilings. Filename precedence,
+  retention, selected boundary metadata and traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

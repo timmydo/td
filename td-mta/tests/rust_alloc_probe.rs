@@ -867,6 +867,178 @@ fn store_read_pool() {
     }
 }
 
+fn mime_parameter_nfc() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_fields::Kind,
+        mime_parameter::{
+            display::normalized::{Cursor, Error, Status},
+            Attribute,
+        },
+        nfc::{self, HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        "attachment;filename=\"a{}{}x\"",
+        "\u{301}".repeat(257),
+        "\u{327}".repeat(257)
+    );
+    assert!(std::mem::size_of::<Cursor<'_, '_>>() + std::mem::size_of::<HeaderBudget>() <= 4608);
+    let before = COUNTERS.snapshot();
+    for (source, bytes, problem, rejected) in [
+        (long.as_bytes(), 1029, false, false),
+        (
+            b"attachment;filename*=utf-8''e%CC%81".as_slice(),
+            2,
+            false,
+            false,
+        ),
+        (
+            b"attachment;filename*1*=%81;filename*0*=utf-8''e%CC",
+            2,
+            false,
+            false,
+        ),
+        (
+            b"attachment;filename=\"=?utf-8?Q?e?= =?utf-8?Q?=CC=81?=\"",
+            2,
+            false,
+            false,
+        ),
+        (
+            b"attachment;filename=saved;filename*=utf-8''%xx",
+            5,
+            false,
+            true,
+        ),
+        (b"attachment;filename*=utf-8''%FF", 3, true, false),
+        (b"attachment;x=missing", 0, false, false),
+    ] {
+        for healthy in [true, false] {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records: 100_000_000,
+                    output_bytes: 100_000_000,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let mut cursor = Cursor::new(
+                black_box(source),
+                Kind::ContentDisposition,
+                Attribute::Filename,
+                &mut scratch,
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            let mut produced = 0;
+            loop {
+                match cursor.poll(Tick(1)).unwrap() {
+                    Status::Yield => {}
+                    Status::Scalar(value) => {
+                        cursor
+                            .charge_output(Tick(1), value.len_utf8() as u64)
+                            .unwrap();
+                        produced += value.len_utf8();
+                        black_box(value);
+                    }
+                    Status::Complete(decoded) => {
+                        assert_eq!(produced, bytes);
+                        assert_eq!(decoded.is_encoding_problem, problem);
+                        assert_eq!(decoded.selection.invalid_extended, rejected);
+                        if healthy {
+                            cursor.check_deadline(Tick(1)).unwrap();
+                            let (original_work, original_budget, original_scratch) =
+                                cursor.finish(Tick(1)).unwrap();
+                            assert!(original_work.remaining().io_bytes > 0);
+                            assert!(original_budget.steps_remaining() > 0);
+                            black_box(original_scratch);
+                            break;
+                        }
+                        assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete(decoded)));
+                        let error = Error::Normalization(nfc::Error::Work(Stop::Deadline));
+                        assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+                        assert_eq!(cursor.poll(Tick(1)), Err(error));
+                        assert_eq!(cursor.charge_output(Tick(1), 0), Err(error));
+                        assert!(matches!(cursor.finish(Tick(1)), Err(e) if e == error));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for (charge, expected) in [
+        (
+            Charge {
+                io_bytes: 0,
+                records: 100_000,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+            Stop::IoBytes,
+        ),
+        (
+            Charge {
+                io_bytes: 100_000,
+                records: 0,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+            Stop::Records,
+        ),
+        (
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                output_bytes: 0,
+                ..Charge::default()
+            },
+            Stop::OutputBytes,
+        ),
+    ] {
+        let mut work = Meter::new(Deadline::after(Tick(0), 100).unwrap(), charge);
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut cursor = Cursor::new(
+            b"attachment;filename*=utf-8''e%CC%81",
+            Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut scratch,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let error = loop {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Scalar(c)) => {
+                    if let Err(error) = cursor.charge_output(Tick(1), c.len_utf8() as u64) {
+                        break error;
+                    }
+                }
+                Ok(Status::Complete(_)) => panic!("allocation probe cut completed"),
+                Err(error) => break error,
+            }
+        };
+        let stop = match error {
+            Error::Parameter(td_mta::mime_parameter::Error::Work(stop))
+            | Error::Normalization(nfc::Error::Work(stop)) => stop,
+            other => panic!("unexpected parameter NFC refusal: {other}"),
+        };
+        assert_eq!(stop, expected);
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+        assert!(matches!(cursor.finish(Tick(1)), Err(e) if e == error));
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME parameter normalization allocated");
+}
+
 fn mime_parameter_display() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6690,6 +6862,7 @@ fn main() {
         mime_parameter_octets();
         mime_parameter_scalars();
         mime_parameter_display();
+        mime_parameter_nfc();
         body_value();
         mime_text();
         body_charset();
@@ -6838,6 +7011,7 @@ fn main() {
     mime_parameter_octets();
     mime_parameter_scalars();
     mime_parameter_display();
+    mime_parameter_nfc();
     body_value();
     mime_text();
     body_charset();

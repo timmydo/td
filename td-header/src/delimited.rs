@@ -71,7 +71,35 @@ pub struct Cursor<'a, E: Copy> {
     escaped: bool,
     failure: Option<Error<E>>,
 }
+/// Pure lexical progress only; never an allowance or validity proof.
+#[derive(Clone, Copy)]
+pub struct Checkpoint<'a, E: Copy> {
+    source: &'a [u8],
+    kind: Kind,
+    start: usize,
+    position: usize,
+    phase: Phase,
+    escaped: bool,
+    marker: std::marker::PhantomData<E>,
+}
+
 impl<'a, E: Copy> Cursor<'a, E> {
+    /// Capture healthy pure progress; refusal never produces a checkpoint.
+    pub fn checkpoint(&self) -> Result<Checkpoint<'a, E>, Error<E>> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            kind: self.kind,
+            start: self.start,
+            position: self.position,
+            phase: self.phase,
+            escaped: self.escaped,
+            marker: std::marker::PhantomData,
+        })
+    }
+
     pub const fn new(source: &'a [u8], start: usize, kind: Kind) -> Self {
         Self {
             source,
@@ -222,5 +250,20 @@ impl<'a, E: Copy> Cursor<'a, E> {
             }
         }
         Ok(Status::Yield)
+    }
+}
+
+impl<'a, E: Copy> Checkpoint<'a, E> {
+    /// Reconstruct lexical progress; each subsequent access must be admitted.
+    pub fn resume(self) -> Cursor<'a, E> {
+        Cursor {
+            source: self.source,
+            kind: self.kind,
+            start: self.start,
+            position: self.position,
+            phase: self.phase,
+            escaped: self.escaped,
+            failure: None,
+        }
     }
 }

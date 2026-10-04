@@ -53,6 +53,19 @@ pub struct Cursor<'a> {
     inner: td_header::mime_attribute::Cursor<'a, decode_work::Error>,
 }
 impl<'a> Cursor<'a> {
+    pub(crate) fn checkpoint(
+        &self,
+    ) -> Result<td_header::mime_attribute::Checkpoint<'a, decode_work::Error>, Error> {
+        self.inner.checkpoint().map_err(Error::from)
+    }
+    pub(crate) fn resume(
+        checkpoint: td_header::mime_attribute::Checkpoint<'a, decode_work::Error>,
+    ) -> Self {
+        Self {
+            inner: checkpoint.resume(),
+        }
+    }
+
     #[must_use]
     pub const fn new(name: &'a [u8]) -> Self {
         Self {

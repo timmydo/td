@@ -159,7 +159,93 @@ pub struct Cursor<'a> {
     result: Selection,
     failure: Option<Error>,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct Checkpoint<'a> {
+    source: &'a [u8],
+    kind: mime_fields::Kind,
+    attribute: Attribute,
+    phase: Phase,
+    pass: Pass,
+    fields: Option<mime_fields::Checkpoint<'a>>,
+    name: Option<td_header::mime_attribute::Checkpoint<'a, decode_work::Error>>,
+    value: Option<td_header::mime_value::Checkpoint<'a, decode_work::Error>>,
+    parameter: Option<Parameter>,
+    classified: Option<mime_attribute::Name>,
+    ordinary: Option<Parameter>,
+    family: Family,
+    count: u64,
+    max: u64,
+    found: Option<(Parameter, bool)>,
+    duplicate: bool,
+    initial_encoded: bool,
+    replay: bool,
+    result: Selection,
+}
+
 impl<'a> Cursor<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<Checkpoint<'a>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            kind: self.kind,
+            attribute: self.attribute,
+            phase: self.phase,
+            pass: self.pass,
+            fields: self
+                .fields
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+            name: self
+                .name
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+            value: self
+                .value
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+            parameter: self.parameter,
+            classified: self.classified,
+            ordinary: self.ordinary,
+            family: self.family,
+            count: self.count,
+            max: self.max,
+            found: self.found,
+            duplicate: self.duplicate,
+            initial_encoded: self.initial_encoded,
+            replay: self.replay,
+            result: self.result,
+        })
+    }
+    pub(crate) fn resume(checkpoint: Checkpoint<'a>) -> Self {
+        Self {
+            source: checkpoint.source,
+            kind: checkpoint.kind,
+            attribute: checkpoint.attribute,
+            phase: checkpoint.phase,
+            pass: checkpoint.pass,
+            fields: checkpoint.fields.map(mime_fields::Cursor::resume),
+            name: checkpoint.name.map(mime_attribute::Cursor::resume),
+            value: checkpoint.value.map(mime_value::Cursor::resume),
+            parameter: checkpoint.parameter,
+            classified: checkpoint.classified,
+            ordinary: checkpoint.ordinary,
+            family: checkpoint.family,
+            count: checkpoint.count,
+            max: checkpoint.max,
+            found: checkpoint.found,
+            duplicate: checkpoint.duplicate,
+            initial_encoded: checkpoint.initial_encoded,
+            replay: checkpoint.replay,
+            result: checkpoint.result,
+            failure: None,
+        }
+    }
+
     #[must_use]
     pub const fn new(source: &'a [u8], kind: mime_fields::Kind, attribute: Attribute) -> Self {
         Self {
@@ -526,7 +612,29 @@ pub struct Octets<'a> {
     selection: Option<Selection>,
     complete: bool,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct OctetsCheckpoint<'a> {
+    cursor: Checkpoint<'a>,
+    selection: Option<Selection>,
+    complete: bool,
+}
+
 impl<'a> Octets<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<OctetsCheckpoint<'a>, Error> {
+        Ok(OctetsCheckpoint {
+            cursor: self.cursor.checkpoint()?,
+            selection: self.selection,
+            complete: self.complete,
+        })
+    }
+    pub(crate) fn resume(checkpoint: OctetsCheckpoint<'a>) -> Self {
+        Self {
+            cursor: Cursor::resume(checkpoint.cursor),
+            selection: checkpoint.selection,
+            complete: checkpoint.complete,
+        }
+    }
+
     fn validated_selection(&self) -> Option<Selection> {
         if self.cursor.failure.is_some() {
             None

@@ -60,6 +60,20 @@ pub struct Cursor<'a, E: Copy> {
     delimited: Option<delimited::Cursor<'a, E>>,
     failure: Option<Error<E>>,
 }
+/// Pure lexical progress only; never an allowance or validity proof.
+#[derive(Clone, Copy)]
+pub struct Checkpoint<'a, E: Copy> {
+    source: &'a [u8],
+    mode: Mode,
+    quoted: bool,
+    phase: Phase,
+    position: usize,
+    end: usize,
+    role: Role,
+    language: language_tag::Tag,
+    delimited: Option<delimited::Checkpoint<'a, E>>,
+    marker: std::marker::PhantomData<E>,
+}
 
 fn attribute(b: u8) -> bool {
     mime_token_octet(b) && !matches!(b, b'\'' | b'%' | b'*')
@@ -73,6 +87,34 @@ fn hex(b: u8) -> Option<u8> {
     }
 }
 impl<'a, E: Copy> Cursor<'a, E> {
+    /// Capture healthy pure progress; refusal never produces a checkpoint.
+    pub fn checkpoint(&self) -> Result<Checkpoint<'a, E>, Error<E>> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            mode: self.mode,
+            quoted: self.quoted,
+            phase: self.phase,
+            position: self.position,
+            end: self.end,
+            role: self.role,
+            language: self.language,
+            delimited: self
+                .delimited
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()
+                .map_err(|e| match e {
+                    delimited::Error::Malformed => Error::Malformed,
+                    delimited::Error::Work(e) => Error::Work(e),
+                    delimited::Error::InvalidState => Error::InvalidState,
+                })?,
+            marker: std::marker::PhantomData,
+        })
+    }
+
     #[must_use]
     pub const fn new(source: &'a [u8], quoted: bool, mode: Mode) -> Self {
         Self {
@@ -252,6 +294,24 @@ impl<'a, E: Copy> Cursor<'a, E> {
                 })
             }
             Phase::Complete => Ok(Status::Complete),
+        }
+    }
+}
+
+impl<'a, E: Copy> Checkpoint<'a, E> {
+    /// Reconstruct lexical progress; each subsequent access must be admitted.
+    pub fn resume(self) -> Cursor<'a, E> {
+        Cursor {
+            source: self.source,
+            mode: self.mode,
+            quoted: self.quoted,
+            phase: self.phase,
+            position: self.position,
+            end: self.end,
+            role: self.role,
+            language: self.language,
+            delimited: self.delimited.map(delimited::Checkpoint::resume),
+            failure: None,
         }
     }
 }

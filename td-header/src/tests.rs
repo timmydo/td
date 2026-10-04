@@ -356,3 +356,106 @@ fn invalid_offsets_are_terminal_without_admission_or_overflow() {
         );
     }
 }
+
+#[test]
+fn pure_checkpoints_replay_exact_events_costs_and_refuse_failed_capture() {
+    macro_rules! replay {
+        ($new:expr, $complete:pat) => {{
+            let mut cursor = $new;
+            let mut complete = false;
+            for _ in 0..10000 {
+                let checkpoint = cursor.checkpoint().unwrap();
+                let mut original = work();
+                let result = cursor.poll(&mut original);
+                let mut restored = checkpoint.resume();
+                let mut repeated = work();
+                assert_eq!(restored.poll(&mut repeated), result);
+                assert_eq!(
+                    (repeated.visits, repeated.records),
+                    (original.visits, original.records)
+                );
+                for flavor in 0..2 {
+                    let used = if flavor == 0 {
+                        1_000_000 - original.visits
+                    } else {
+                        1_000_000 - original.records
+                    };
+                    for limit in 0..used {
+                        let mut refused = checkpoint.resume();
+                        let mut cut = work();
+                        if flavor == 0 {
+                            cut.visits = limit;
+                        } else {
+                            cut.records = limit;
+                        }
+                        let error = refused.poll(&mut cut).err().unwrap();
+                        assert_eq!(refused.checkpoint().err(), Some(error));
+                        let mut replacement = work();
+                        assert_eq!(refused.poll(&mut replacement), Err(error));
+                        assert_eq!(
+                            (replacement.visits, replacement.records),
+                            (1_000_000, 1_000_000)
+                        );
+                    }
+                }
+                match result {
+                    Ok($complete) => {
+                        complete = true;
+                        break;
+                    }
+                    Err(error) => {
+                        assert_eq!(cursor.checkpoint().err(), Some(error));
+                        assert_eq!(restored.checkpoint().err(), Some(error));
+                        complete = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(complete);
+        }};
+    }
+    replay!(
+        cfws::Cursor::new(b"(a\\(b\\) (x))\r\n \t", 0),
+        cfws::Status::Complete(_)
+    );
+    replay!(cfws::Cursor::new(b"(bad", 0), cfws::Status::Complete(_));
+    replay!(
+        delimited::Cursor::new(b"\"ab\\\"\r\n x\"", 0, delimited::Kind::QuotedString),
+        delimited::Status::Complete(_)
+    );
+    replay!(
+        delimited::Cursor::new(b"\"bad\\", 0, delimited::Kind::QuotedString),
+        delimited::Status::Complete(_)
+    );
+    replay!(
+        crate::mime_attribute::Cursor::new(b"filename*001*"),
+        crate::mime_attribute::Status::Complete(_)
+    );
+    replay!(
+        crate::mime_value::Cursor::new(
+            b"utf-8'en-US'e%CC%81",
+            false,
+            crate::mime_value::Mode::ExtendedInitial
+        ),
+        crate::mime_value::Status::Complete
+    );
+    replay!(
+        crate::mime_value::Cursor::new(b"\"x\\ y\r\n z\"", true, crate::mime_value::Mode::Ordinary),
+        crate::mime_value::Status::Complete
+    );
+    replay!(
+        crate::mime_attribute::Cursor::new(b"filename*0x"),
+        crate::mime_attribute::Status::Complete(_)
+    );
+    for source in [b"utf-8''%x".as_slice(), b"utf-8'bad", b"\"utf-8''x"] {
+        replay!(
+            crate::mime_value::Cursor::new(
+                source,
+                source.first() == Some(&b'"'),
+                crate::mime_value::Mode::ExtendedInitial
+            ),
+            crate::mime_value::Status::Complete
+        );
+    }
+}

@@ -32,7 +32,49 @@ pub(super) struct Cursor<'a> {
     word: Option<encoded_word::decode::Cursor<'a>>,
     problem: bool,
 }
+#[derive(Clone, Copy)]
+pub(super) struct Checkpoint<'a> {
+    raw: &'a [u8],
+    quoted: bool,
+    end: usize,
+    position: usize,
+    scan: usize,
+    token_start: usize,
+    gap_end: usize,
+    phase: Phase,
+    word: Option<encoded_word::decode::Cursor<'a>>,
+    problem: bool,
+}
 impl<'a> Cursor<'a> {
+    pub(super) fn checkpoint(&self) -> Checkpoint<'a> {
+        Checkpoint {
+            raw: self.raw,
+            quoted: self.quoted,
+            end: self.end,
+            position: self.position,
+            scan: self.scan,
+            token_start: self.token_start,
+            gap_end: self.gap_end,
+            phase: self.phase,
+            word: self.word,
+            problem: self.problem,
+        }
+    }
+    pub(super) fn resume(checkpoint: Checkpoint<'a>) -> Self {
+        Self {
+            raw: checkpoint.raw,
+            quoted: checkpoint.quoted,
+            end: checkpoint.end,
+            position: checkpoint.position,
+            scan: checkpoint.scan,
+            token_start: checkpoint.token_start,
+            gap_end: checkpoint.gap_end,
+            phase: checkpoint.phase,
+            word: checkpoint.word,
+            problem: checkpoint.problem,
+        }
+    }
+
     pub(super) fn new(source: &'a [u8], parameter: Parameter) -> Result<Self, Error> {
         let raw = source
             .get(parameter.value.start..parameter.value.end)

@@ -281,14 +281,28 @@ M06bz extracts this same engine into std-only td-nfc; the old mail engine is
 removed in the same landing. Mail retains all Unicode 17 tables, source
 validation/decoding/filtering, canonical decomposition and class lookups. Pure
 Copy source checkpoints retain exact decoder/pending-decomposition identity;
-separate generic admission borrows the original mail budgets/credit and real
-supplied Tick. Source callbacks and engine transitions preserve exact charges,
+separate generic admission borrows the original mail budgets/credit and uses
+the real Tick supplied for that poll. Source callbacks and engine
+transitions preserve exact charges,
 one/32-transition quanta and the existing source/cursor/scratch ceilings.
 Standalone engine correctness is conditional on caller-supplied deterministic
 canonical source/tables; its API owns no ambient Unicode version. The official
 vectors and all adversarial mail replay/budget/allocation fixtures remain the
 consumer oracle. Passive borrowed phase/checkpoint inspection is not a restore
 API or output validity proof. Parameter checkpoint composition remains open.
+
+M06ca composes original-source MIME parameter display with the same td-nfc
+engine and Unicode 17 tables. Private pure checkpoints retain nested lexical,
+family, octet, charset/word and filtered-scalar progress plus exact pending
+decomposition. Their larger separate source is qualified within existing
+parser/conversion reservations; the existing header source enum is unchanged.
+The live owner retains original aggregate/job allowances and credit across
+every replay and output/final check, using the real Tick supplied for each
+call. NFC applies after complete
+candidate validation and existing ordinary compatibility/extended filtering;
+completed normalized prefixes are never reconstructed to find a checkpoint.
+Typed refusals stay sticky and discard provisional property output. Filename
+precedence/retention and whole-worker/native/RSS qualification remain open.
 
 ## Acceptance evidence owned by M06
 

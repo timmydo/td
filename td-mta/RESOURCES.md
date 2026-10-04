@@ -1177,6 +1177,25 @@ the migrated consumer. Larger parameter sources must use their own qualified
 parser reservation rather than widening the fixed header Source enum.
 Output capacity, complete worker/native/RSS and MIME traversal remain open.
 
+M06ca qualifies a separate parameter normalization Source <=1088 bytes and
+Cursor plus HeaderBudget <=4608. Four pure checkpoints live in the engine;
+exact nested grammar/decoder/held-octet/decomposition state is copied without
+allowances, credit, clock or output backing. Cursor plus two temporary Source
+copies, reconstructed display cursor, live context and HeaderBudget fit the
+existing 16 KiB parser reservation. NFC scratch stays exclusively borrowed
+from the same 3072-byte conversion reservation. Existing header Source <=256
+and Cursor plus HeaderBudget <=1024 stay fixed; neither reservation grows.
+
+One admitted normalization transition invokes at most one bounded display
+source turn or pending decomposition lookup. Conservative composed ceilings
+are 225 original-byte visits, 457 aggregate steps and 30 job records, including
+engine/source/decomposition/class admission. Checkpoint restoration does not
+reparse normalized completed prefixes or copy/reset prepaid credit. Exact
+work/event replay, aggregate/job/output/deadline cuts, long combining replay
+and a dedicated Rust allocation interval qualify this source composition.
+State-size overlap sums are layout evidence, not native compiler stack or
+complete worker/RSS qualification. Retained output remains the later owner.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

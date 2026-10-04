@@ -123,7 +123,68 @@ pub struct Cursor<'a> {
     delimited: Option<header_delimited::Cursor<'a>>,
     failure: Option<Error>,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct Checkpoint<'a> {
+    source: &'a [u8],
+    kind: Kind,
+    position: usize,
+    start: usize,
+    phase: Phase,
+    first: Extent,
+    second: Option<Extent>,
+    name: Extent,
+    value: Extent,
+    quoted: bool,
+    cfws: Option<td_header::cfws::Checkpoint<'a, crate::decode_work::Error>>,
+    delimited: Option<td_header::delimited::Checkpoint<'a, crate::decode_work::Error>>,
+}
+
 impl<'a> Cursor<'a> {
+    pub(crate) fn checkpoint(&self) -> Result<Checkpoint<'a>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        Ok(Checkpoint {
+            source: self.source,
+            kind: self.kind,
+            position: self.position,
+            start: self.start,
+            phase: self.phase,
+            first: self.first,
+            second: self.second,
+            name: self.name,
+            value: self.value,
+            quoted: self.quoted,
+            cfws: self
+                .cfws
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+            delimited: self
+                .delimited
+                .as_ref()
+                .map(|cursor| cursor.checkpoint())
+                .transpose()?,
+        })
+    }
+    pub(crate) fn resume(checkpoint: Checkpoint<'a>) -> Self {
+        Self {
+            source: checkpoint.source,
+            kind: checkpoint.kind,
+            position: checkpoint.position,
+            start: checkpoint.start,
+            phase: checkpoint.phase,
+            first: checkpoint.first,
+            second: checkpoint.second,
+            name: checkpoint.name,
+            value: checkpoint.value,
+            quoted: checkpoint.quoted,
+            cfws: checkpoint.cfws.map(header_cfws::Cursor::resume),
+            delimited: checkpoint.delimited.map(header_delimited::Cursor::resume),
+            failure: None,
+        }
+    }
+
     /// Supply a complete authorized field value, excluding its final ending.
     pub const fn new(source: &'a [u8], kind: Kind) -> Self {
         Self {

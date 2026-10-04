@@ -129,9 +129,25 @@ retains the original Copy error. Cached completion performs no new work.
 Live final admission belongs to the caller. Generic cursor size depends on
 E; with td-mta's fixed errors CFWS and delimited cursors remain within 64
 bytes, and the parameter-name cursor within 128 bytes and the
-parameter-value cursor within 160 bytes. No Clone or Copy implementation
-permits duplicating live lexical state. Constructor allocation and
+parameter-value cursor within 160 bytes. Live cursors remain neither Clone
+nor Copy: healthy pure progress may be replayed through snapshots, while
+refused state cannot be copied this way. Constructor allocation and
 complete-field authorization are external.
+
+CFWS, delimited, parameter-name and parameter-value cursors expose opaque
+Copy Checkpoint snapshots of healthy pure lexical progress. Snapshots retain
+exact immutable source identity, positions, phases, escape/nesting/tag state
+and nested pure checkpoints; they retain no work, credit, clock, refusal or
+output owner. Refused cursors cannot produce snapshots. resume reconstructs
+provisional lexical progress, not field validity or publication authority.
+Every subsequent source/transition access is admitted again. The caller must
+keep the original allowances across replay; a historically healthy snapshot
+cannot revive a failed enclosing owner or replace its admission context.
+Restoring cached completion is inert and requires enclosing fresh admission.
+Mail keeps snapshots private inside its normalization source; its live owner
+structurally retains the original Meter/HeaderBudget/credit and sticky refusal.
+Shared event/cost and all per-turn callback-cut fixtures qualify snapshot
+fidelity. These snapshots change no lexical work or live-cursor size ceiling.
 
 Mail wrappers preserve their public errors and original budget/clock
 binding. The source grammars migrate atomically: no old parser remains

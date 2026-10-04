@@ -3797,6 +3797,57 @@ crypto admission. Preparation/staging uses the same compiled local-source
 list, with build scripts refused. Routing checks the primitive and mail reader
 without claiming distribution image or portable-artifact qualification.
 
+### 1.80 Original-source MIME parameter NFC
+
+M06ca composes display::normalized::Cursor with the shared td-nfc engine.
+Construction takes original field bytes, Kind/Attribute, existing exclusive
+Scratch and original Meter/HeaderBudget. It captures only healthy pure
+initial progress without inspecting source bytes. Each poll performs one
+admitted engine transition and at most one existing display/decomposition
+read. Scalar events remain provisional until the complete original candidate
+and normalization drain, output charging and fresh final admission. Complete
+carries the existing passive Decoded selection/diagnostics, not metadata or
+filename publication authority. Filename precedence/retention remains open.
+
+Opaque shared lexical checkpoints and private field/family/octet/scalar/
+display checkpoints preserve every phase, nested progress, word/charset
+state, held octet and decomposition. They contain no live allowance, credit,
+clock or output owner. Refused owners cannot capture checkpoints. Resume
+reconstructs exact pure progress and charges every subsequent access again;
+it cannot revive the enclosing failed normalization owner. All live public
+cursors remain non-Clone/non-Copy. Ordinary compatibility and extended-family
+selection/decoding retain their existing grammar and work contracts.
+
+The separate parameter Source is at most 1088 bytes; Cursor plus HeaderBudget
+is at most 4608. Cursor, two overlapping temporary Source copies, reconstructed
+display owner, live context and HeaderBudget fit the existing 16 KiB parser
+reservation. The exclusive 3072-byte NFC scratch remains in the conversion
+reservation. Existing header Source <=256 and Cursor plus HeaderBudget <=1024
+remain unchanged; no larger variant enters that enum. These layout/allocation
+intervals do not qualify complete worker/native stack or RSS.
+
+The source has one fixed transition per poll. Display reads retain their
+225-visit/453-step ceilings; engine/source/decomposition/class admission bounds
+the composed turn at 225 visits, 457 aggregate steps and 30 job records.
+These are conservative ceilings, not asserted simultaneous peaks. Copies
+restore exact successful display-turn identity plus pending decomposition,
+never normalized completed-prefix scans or a refreshed work credit. Unicode
+17 decomposition/class/composition rules and the 55-class replay bound stay
+unchanged. Selection and source diagnostics are retained only after successful
+complete source processing; any normalization, parsing, output or fresh
+admission refusal clears private result and latches the original typed error.
+Cached Complete is inert. finish(now) obtains fresh admission, consumes
+healthy Done and returns original work/header/scratch references; the owner
+must serialize/charge its final scalar before release and obtain enclosing
+publication admission. Exhaustion preserves Parameter or Normalization error
+provenance according to which admission layer refuses; either is fatal.
+
+Shared checkpoint event/cost/cut fixtures, mail nested checkpoint traces,
+ordinary/extended/continued/word NFC, long combining replay, original quota
+cuts, final output/deadline cuts and Rust allocation intervals qualify this
+composition. No external dependency, manifest/lock, feature, unsafe, crypto
+backend or staging-policy change is introduced.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
