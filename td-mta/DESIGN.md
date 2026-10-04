@@ -332,6 +332,14 @@ are provisional and the later explicit-frame traversal must discard them on
 any final refusal. The later traversal must exclude delimiter-leading endings from child headers;
 parent clipping, header admission and descriptor authority remain separate.
 
+M06ce separates private protocol and delimiter progress from public owners.
+A composing owner can retain both progress and original admission in its
+own fields, borrowing its immutable boundary and budgets only during polls.
+The public cursors use these same cores; no duplicate parsing mechanism or
+fresh allowance is introduced. Detached lexical progress is not authority:
+the enclosing owner pins source/boundary identity, prepaid header credit,
+sticky retirement, provisional retention and fresh final publication.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in

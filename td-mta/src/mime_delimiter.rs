@@ -4,7 +4,7 @@ use crate::{
     ports::Tick,
 };
 use td_header::{
-    mime_boundary::{Line, MAX_BOUNDARY_BYTES},
+    mime_boundary::{State, MAX_BOUNDARY_BYTES},
     mime_protocol::{Kind, Validator},
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,8 +50,42 @@ const BODY_BYTES_PER_TURN: usize = 128;
 /// fn cloned<T: Clone>() {} cloned::<td_mta::mime_delimiter::Cursor<'_, '_>>();
 /// ```
 pub struct Cursor<'a, 'w> {
+    core: Core<'a>,
+    boundary: &'a [u8],
+    work: &'w mut Meter,
+}
+impl<'a, 'w> Cursor<'a, 'w> {
+    pub fn new(
+        source: &'a [u8],
+        base: u64,
+        boundary: &'a [u8],
+        work: &'w mut Meter,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            core: Core::new(source, base, boundary.len())?,
+            boundary,
+            work,
+        })
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.core.check_deadline(now, self.work)
+    }
+    pub fn finish(mut self, now: Tick) -> Result<&'w mut Meter, Error> {
+        self.check_deadline(now)?;
+        if !self.core.complete {
+            return Err(Error::InvalidState);
+        }
+        Ok(self.work)
+    }
+    pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
+        self.core.poll(now, self.work, self.boundary)
+    }
+}
+/// Private progress; its owner pins the immutable pattern and original meter.
+/// No live admission reference is retained across calls.
+pub(crate) struct Core<'a> {
     source: &'a [u8],
-    line: Line<'a>,
+    line: State,
     base: u64,
     position: usize,
     line_start: usize,
@@ -62,21 +96,14 @@ pub struct Cursor<'a, 'w> {
     validated: bool,
     complete: bool,
     failure: Option<Error>,
-    work: &'w mut Meter,
 }
-impl<'a, 'w> Cursor<'a, 'w> {
-    pub fn new(
-        source: &'a [u8],
-        base: u64,
-        boundary: &'a [u8],
-        work: &'w mut Meter,
-    ) -> Result<Self, Error> {
+impl<'a> Core<'a> {
+    pub(crate) fn new(source: &'a [u8], base: u64, boundary_len: usize) -> Result<Self, Error> {
         base.checked_add(u64::try_from(source.len()).map_err(|_| Error::InvalidRange)?)
             .ok_or(Error::InvalidRange)?;
-        let line = Line::new(boundary).ok_or(Error::InvalidBoundary)?;
         Ok(Self {
             source,
-            line,
+            line: State::new(boundary_len).ok_or(Error::InvalidBoundary)?,
             base,
             position: 0,
             line_start: 0,
@@ -87,7 +114,6 @@ impl<'a, 'w> Cursor<'a, 'w> {
             validated: false,
             complete: false,
             failure: None,
-            work,
         })
     }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
@@ -97,31 +123,30 @@ impl<'a, 'w> Cursor<'a, 'w> {
         }
         result
     }
-    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+    pub(crate) fn check_deadline(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let result = self
-            .work
-            .charge(now, Charge::default())
-            .map_err(Error::Work);
+        let result = work.charge(now, Charge::default()).map_err(Error::Work);
         self.outcome(result)
     }
-    pub fn finish(mut self, now: Tick) -> Result<&'w mut Meter, Error> {
-        self.check_deadline(now)?;
-        if !self.complete {
-            return Err(Error::InvalidState);
-        }
-        Ok(self.work)
-    }
-    pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
+    pub(crate) fn poll(
+        &mut self,
+        now: Tick,
+        work: &mut Meter,
+        boundary: &[u8],
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
         if self.complete {
             return Ok(Status::Complete);
         }
-        let result = self.step(now);
+        let result = if boundary.len() != self.line.boundary_len() {
+            Err(Error::InvalidState)
+        } else {
+            self.step(now, work, boundary)
+        };
         self.outcome(result)
     }
     fn offset(&self, position: usize) -> Result<u64, Error> {
@@ -152,39 +177,33 @@ impl<'a, 'w> Cursor<'a, 'w> {
         self.line.reset();
         Ok(result)
     }
-    fn step(&mut self, now: Tick) -> Result<Status, Error> {
-        self.work
-            .charge(
-                now,
-                Charge {
-                    records: 1,
-                    ..Charge::default()
-                },
-            )
-            .map_err(Error::Work)?;
+    fn step(&mut self, now: Tick, work: &mut Meter, boundary: &[u8]) -> Result<Status, Error> {
+        work.charge(
+            now,
+            Charge {
+                records: 1,
+                ..Charge::default()
+            },
+        )
+        .map_err(Error::Work)?;
         if !self.validated {
             for _ in 0..MAX_BOUNDARY_BYTES {
-                if self.validation == self.line.boundary().len() {
+                if self.validation == self.line.boundary_len() {
                     break;
                 }
-                self.work
-                    .charge(
-                        now,
-                        Charge {
-                            io_bytes: 1,
-                            ..Charge::default()
-                        },
-                    )
-                    .map_err(Error::Work)?;
-                let byte = *self
-                    .line
-                    .boundary()
-                    .get(self.validation)
-                    .ok_or(Error::InvalidState)?;
+                work.charge(
+                    now,
+                    Charge {
+                        io_bytes: 1,
+                        ..Charge::default()
+                    },
+                )
+                .map_err(Error::Work)?;
+                let byte = *boundary.get(self.validation).ok_or(Error::InvalidState)?;
                 self.validator.feed(byte);
                 self.validation += 1;
             }
-            if self.validation != self.line.boundary().len() {
+            if self.validation != self.line.boundary_len() {
                 return Err(Error::InvalidState);
             }
             if !self.validator.is_valid() {
@@ -200,7 +219,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
                     return Ok(Status::Complete);
                 }
                 if self.pending_cr {
-                    self.line.feed(b'\r');
+                    self.line.feed(b'\r', boundary);
                     self.pending_cr = false;
                 }
                 if let Some(found) = self.end_line(0)? {
@@ -210,15 +229,14 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 return Ok(Status::Complete);
             }
             // One source read plus at most one trusted boundary comparison.
-            self.work
-                .charge(
-                    now,
-                    Charge {
-                        io_bytes: 2,
-                        ..Charge::default()
-                    },
-                )
-                .map_err(Error::Work)?;
+            work.charge(
+                now,
+                Charge {
+                    io_bytes: 2,
+                    ..Charge::default()
+                },
+            )
+            .map_err(Error::Work)?;
             let byte = *self.source.get(self.position).ok_or(Error::InvalidState)?;
             self.position += 1;
             if byte == b'\n' {
@@ -228,13 +246,13 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 }
             } else {
                 if self.pending_cr {
-                    self.line.feed(b'\r');
+                    self.line.feed(b'\r', boundary);
                     self.pending_cr = false;
                 }
                 if byte == b'\r' {
                     self.pending_cr = true;
                 } else {
-                    self.line.feed(byte);
+                    self.line.feed(byte, boundary);
                 }
             }
         }
@@ -267,6 +285,63 @@ mod tests {
             }
         }
         panic!("delimiter scan did not finish")
+    }
+    #[test]
+    fn moved_private_progress_matches_public_charges_and_events() {
+        let source = b"pre\r\n--a\r\nbody\n--a--tail";
+        let mut public_work = meter();
+        let mut private_work = meter();
+        let mut public = Cursor::new(source, 7, b"a", &mut public_work).unwrap();
+        let mut private = Core::new(source, 7, 1).unwrap();
+        for _ in 0..1000 {
+            let expected = public.poll(Tick(1)).unwrap();
+            private = std::hint::black_box(private);
+            assert_eq!(
+                private.poll(Tick(1), &mut private_work, b"a").unwrap(),
+                expected
+            );
+            assert_eq!(private_work.remaining(), public.work.remaining());
+            if expected == Status::Complete {
+                assert_eq!(
+                    private.check_deadline(Tick(100), &mut private_work),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                let before = private_work.remaining();
+                assert_eq!(
+                    private.poll(Tick(1), &mut private_work, b"a"),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                assert_eq!(private_work.remaining(), before);
+                return;
+            }
+        }
+        panic!("core did not finish");
+    }
+    #[test]
+    fn private_boundary_length_misuse_refuses_without_charging() {
+        let source = [b'x'; 300];
+        for active_turns in 0..=2 {
+            let mut work = meter();
+            let mut core = Core::new(&source, 0, 1).unwrap();
+            for _ in 0..active_turns {
+                assert_eq!(core.poll(Tick(1), &mut work, b"a"), Ok(Status::Yield));
+            }
+            let before = work.remaining();
+            assert_eq!(
+                core.poll(Tick(1), &mut work, b"ab"),
+                Err(Error::InvalidState)
+            );
+            assert_eq!(work.remaining(), before);
+            assert_eq!(
+                core.poll(Tick(1), &mut work, b"a"),
+                Err(Error::InvalidState)
+            );
+            assert_eq!(
+                core.check_deadline(Tick(1), &mut work),
+                Err(Error::InvalidState)
+            );
+            assert_eq!(work.remaining(), before);
+        }
     }
     // Independent whole-line oracle, intentionally allocating only in tests.
     fn reference(source: &[u8], base: u64, boundary: &[u8]) -> Vec<Delimiter> {
@@ -346,7 +421,7 @@ mod tests {
                 let mut cursor = Cursor::new(&source, 0, &boundary, &mut work).unwrap();
                 let before = cursor.work.remaining();
                 assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
-                assert!(cursor.validated);
+                assert!(cursor.core.validated);
                 assert_eq!(before.records - cursor.work.remaining().records, 1);
                 assert_eq!(before.io_bytes - cursor.work.remaining().io_bytes, 70);
                 assert_eq!(
@@ -401,7 +476,7 @@ mod tests {
                     break;
                 }
             }
-            assert!(cursor.complete);
+            assert!(cursor.core.complete);
         }
         for (total, stop) in [
             (initial.io_bytes - work.remaining().io_bytes, Stop::IoBytes),

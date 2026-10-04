@@ -5,11 +5,11 @@ pub struct Match {
     pub closing: bool,
     pub ignored_suffix: bool,
 }
-/// Fixed prefix/suffix state. Exclude the accepted line ending before feed.
-/// This matcher neither validates boundary grammar nor authorizes part extents.
+/// Pure progress for one immutable boundary, supplied by the enclosing owner.
+/// Every feed must supply the same bytes; this state grants no source authority.
 #[derive(Clone, Copy, Debug)]
-pub struct Line<'a> {
-    boundary: &'a [u8],
+pub struct State {
+    length: u8,
     prefix: u8,
     mismatch: bool,
     suffix_started: bool,
@@ -17,13 +17,13 @@ pub struct Line<'a> {
     closing: bool,
     ignored_suffix: bool,
 }
-impl<'a> Line<'a> {
-    pub fn new(boundary: &'a [u8]) -> Option<Self> {
-        if !(1..=MAX_BOUNDARY_BYTES).contains(&boundary.len()) {
+impl State {
+    pub fn new(length: usize) -> Option<Self> {
+        if !(1..=MAX_BOUNDARY_BYTES).contains(&length) {
             return None;
         }
         Some(Self {
-            boundary,
+            length: u8::try_from(length).ok()?,
             prefix: 0,
             mismatch: false,
             suffix_started: false,
@@ -32,8 +32,8 @@ impl<'a> Line<'a> {
             ignored_suffix: false,
         })
     }
-    pub const fn boundary(&self) -> &'a [u8] {
-        self.boundary
+    pub const fn boundary_len(&self) -> usize {
+        self.length as usize
     }
     pub fn reset(&mut self) {
         self.prefix = 0;
@@ -44,16 +44,18 @@ impl<'a> Line<'a> {
         self.ignored_suffix = false;
     }
     /// Fund one bounded transition and at most one boundary-byte comparison.
-    pub fn feed(&mut self, byte: u8) {
+    /// A mismatched length fails closed; immutable byte identity is external.
+    pub fn feed(&mut self, byte: u8, boundary: &[u8]) {
+        self.mismatch |= boundary.len() != usize::from(self.length);
         if self.mismatch {
             return;
         }
         let prefix = usize::from(self.prefix);
-        if prefix < self.boundary.len() + 2 {
+        if prefix < boundary.len() + 2 {
             let wanted = if prefix < 2 {
                 Some(b'-')
             } else {
-                self.boundary.get(prefix - 2).copied()
+                boundary.get(prefix - 2).copied()
             };
             self.mismatch = wanted != Some(byte);
             self.prefix = self.prefix.saturating_add(1);
@@ -77,13 +79,40 @@ impl<'a> Line<'a> {
     }
     /// A matching prefix is classified only at this complete logical line EOF.
     pub fn finish(&self) -> Option<Match> {
-        if self.mismatch || usize::from(self.prefix) != self.boundary.len() + 2 {
+        if self.mismatch || usize::from(self.prefix) != usize::from(self.length) + 2 {
             return None;
         }
         Some(Match {
             closing: self.closing,
             ignored_suffix: self.ignored_suffix || self.hyphen,
         })
+    }
+}
+/// Boundary-borrowing wrapper over the same pure transition state.
+/// Exclude the accepted line ending before feed. No boundary grammar validation.
+#[derive(Clone, Copy, Debug)]
+pub struct Line<'a> {
+    boundary: &'a [u8],
+    state: State,
+}
+impl<'a> Line<'a> {
+    pub fn new(boundary: &'a [u8]) -> Option<Self> {
+        Some(Self {
+            boundary,
+            state: State::new(boundary.len())?,
+        })
+    }
+    pub const fn boundary(&self) -> &'a [u8] {
+        self.boundary
+    }
+    pub fn reset(&mut self) {
+        self.state.reset();
+    }
+    pub fn feed(&mut self, byte: u8) {
+        self.state.feed(byte, self.boundary);
+    }
+    pub fn finish(&self) -> Option<Match> {
+        self.state.finish()
     }
 }
 #[cfg(test)]
@@ -145,6 +174,41 @@ mod tests {
                 ignored_suffix: false
             })
         );
+    }
+    #[test]
+    fn detached_progress_matches_borrowed_lines_and_rejects_wrong_lengths() {
+        const {
+            assert!(std::mem::size_of::<State>() <= 8);
+        }
+        for length in 1..=MAX_BOUNDARY_BYTES {
+            let boundary = vec![b'a'; length];
+            for suffix in [b"".as_slice(), b"-", b"--", b"---tail", b" \t", b"x"] {
+                let source = [b"--".as_slice(), &boundary, suffix].concat();
+                let mut line = Line::new(&boundary).unwrap();
+                let mut state = State::new(length).unwrap();
+                for byte in &source {
+                    line.feed(*byte);
+                    state.feed(*byte, &boundary);
+                    assert_eq!(state.finish(), line.finish());
+                }
+                state.feed(b' ', b"");
+                assert!(state.finish().is_none());
+                state.reset();
+                assert!(state.finish().is_none());
+                for byte in &source {
+                    state.feed(*byte, &boundary);
+                }
+                assert_eq!(state.finish(), line.finish());
+                state.reset();
+                state.feed(b'-', b"");
+                for byte in &source {
+                    state.feed(*byte, &boundary);
+                }
+                assert!(state.finish().is_none());
+            }
+        }
+        assert!(State::new(0).is_none());
+        assert!(State::new(MAX_BOUNDARY_BYTES + 1).is_none());
     }
     #[test]
     fn every_suffix_octet_has_deterministic_prefix_recovery() {

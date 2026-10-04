@@ -184,3 +184,11 @@ structure. reset clears only pure line progress and retains the same
 boundary view; boundary() returns that passive view, neither validating
 it nor admitting another scan. Enclosing owner refusal remains sticky
 across line resets.
+
+Detached mime_boundary::State holds at most eight bytes of the same pure
+transition state. Its enclosing owner supplies the same immutable boundary
+on every feed; differing lengths suppress Match until a pure reset. A live
+owner needing a refusal checks that contract before calling State.
+It has no borrowed source, clock or admission handle. Line wraps State and
+pins its borrowed boundary identity. Neither detached progress nor a reset
+can authorize a source extent or recover a retired live mail owner.

@@ -3973,6 +3973,31 @@ still requires the enclosing owner's admission after all other work succeeds.
 RESOURCES.md owns fixed work/layout ceilings. Parent-first extent clipping,
 header counting, explicit DFS, transfer sizes and locator issuance remain open.
 
+### 1.84 Private polling composition
+
+M06ce extracts protocol::Reader and mime_delimiter::Core as crate-private
+progress engines without live budget or retained-output references. Public
+protocol and delimiter cursors retain their original exclusive borrows,
+output handling, sticky refusal, inert completion and fresh handoff, driving
+the same engines. No new public mail parser or detached admission API exists.
+
+Protocol Reader emits provisional Data octets and the same completed End.
+Its owner supplies original Parsing admission and preserves prepaid credit;
+only the owner funds retained output and handles capacity overflow. A
+composing owner must discard provisional octets after late invalidity or
+refusal. The delimiter Core retains immutable source progress, accepts a
+boundary view per poll and requires its owner to pin the same immutable
+bytes throughout. The public cursor pins that view by borrowing it. Shared
+td-header::mime_boundary::State contains only pure prefix/suffix progress;
+Line wraps that state and its borrowed view. Detached state does not grant
+source, budget or publication authority.
+
+Metadata Cursor's crate-private poll_in_context uses the original shared
+HeaderBudget and prepaid credit supplied by its owner. Budgeted delegates
+to it, preserving fresh live admission and cached-completion semantics.
+These compositional hooks add no arena, wire output, descriptors or traversal
+claim. RESOURCES.md retains the previous public work/layout bounds.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

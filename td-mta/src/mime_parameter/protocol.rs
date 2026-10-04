@@ -78,11 +78,7 @@ impl<'w> Retained<'w> {
 /// fn cloned<T: Clone>() {} cloned::<td_mta::mime_parameter::protocol::Cursor<'_, '_>>();
 /// ```
 pub struct Cursor<'a, 'w> {
-    source: Octets<'a>,
-    validator: Validator,
-    purpose: Purpose,
-    qualifier: Label,
-    label: Label,
+    reader: Reader<'a>,
     output: &'w mut [u8],
     work: &'w mut Meter,
     budget: &'w mut HeaderBudget,
@@ -100,16 +96,8 @@ impl<'a, 'w> Cursor<'a, 'w> {
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
     ) -> Self {
-        let (attribute, grammar) = match purpose {
-            Purpose::Boundary => (Attribute::Boundary, Grammar::Boundary),
-            Purpose::Charset => (Attribute::Charset, Grammar::Token),
-        };
         Self {
-            source: Octets::new(source, Kind::ContentType, attribute),
-            validator: Validator::new(grammar),
-            purpose,
-            qualifier: Label::new(),
-            label: Label::new(),
+            reader: Reader::new(source, purpose),
             output,
             work,
             budget,
@@ -158,18 +146,16 @@ impl<'a, 'w> Cursor<'a, 'w> {
         }
         result
     }
-    fn admit(&mut self, now: Tick, steps: u64) -> Result<(), Error> {
-        self.budget
-            .charge(self.work, now, 0, steps, &mut self.credit)
-            .map_err(decode_work::Error::from)
-            .map_err(super::Error::from)
-            .map_err(Error::Parameter)
-    }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
-        let result = self.admit(now, 0);
+        let result = self
+            .budget
+            .charge(self.work, now, 0, 0, &mut self.credit)
+            .map_err(decode_work::Error::from)
+            .map_err(super::Error::from)
+            .map_err(Error::Parameter);
         self.outcome(result)
     }
     pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
@@ -183,40 +169,12 @@ impl<'a, 'w> Cursor<'a, 'w> {
         self.outcome(result)
     }
     fn step(&mut self, now: Tick) -> Result<Status, Error> {
-        let status = self
-            .source
-            .poll_with_work(
-                now,
-                &mut decode_work::Parsing::new(self.work, self.budget, &mut self.credit),
-            )
-            .map_err(Error::Parameter)?;
-        match status {
-            OctetStatus::Yield => Ok(Status::Yield),
-            OctetStatus::Octet { role, value } => {
-                if role == Role::Charset {
-                    self.admit(now, ALIAS_FEED_STEPS)?;
-                    self.qualifier.feed(value);
-                    return Ok(Status::Yield);
-                }
-                if role != Role::Data {
-                    return Ok(Status::Yield);
-                }
-                self.admit(
-                    now,
-                    1 + if self.purpose == Purpose::Charset {
-                        ALIAS_FEED_STEPS
-                    } else {
-                        0
-                    },
-                )?;
-                if self.purpose == Purpose::Charset {
-                    self.label.feed(value);
-                }
-                self.validator.feed(value);
-                if self.validator.is_invalid() {
-                    self.used = 0;
-                    return Ok(Status::Yield);
-                }
+        match self.reader.poll(
+            now,
+            &mut decode_work::Parsing::new(self.work, self.budget, &mut self.credit),
+        )? {
+            Read::Yield => Ok(Status::Yield),
+            Read::Octet(byte) => {
                 if self.overflow {
                     return Ok(Status::Yield);
                 }
@@ -235,12 +193,132 @@ impl<'a, 'w> Cursor<'a, 'w> {
                     )
                     .map_err(super::Error::Work)
                     .map_err(Error::Parameter)?;
-                target.copy_from_slice(&[value]);
+                target.copy_from_slice(&[byte]);
                 self.used = next;
                 Ok(Status::Yield)
             }
+            Read::Complete(end) => {
+                if end.value == Value::Present {
+                    if self.overflow {
+                        return Err(Error::OutputCapacity);
+                    }
+                    if self.used != end.bytes {
+                        return Err(Error::Parameter(super::Error::InvalidState));
+                    }
+                } else {
+                    self.used = 0;
+                }
+                self.end = Some(end);
+                Ok(Status::Complete(end))
+            }
+        }
+    }
+}
+/// Private pure source progress; enclosing live owners retain original admission.
+/// Octets remain provisional until complete selected protocol validation.
+pub(crate) enum Read {
+    Yield,
+    Octet(u8),
+    Complete(End),
+}
+pub(crate) struct Reader<'a> {
+    source: Octets<'a>,
+    validator: Validator,
+    purpose: Purpose,
+    qualifier: Label,
+    label: Label,
+    used: usize,
+    end: Option<End>,
+    failure: Option<Error>,
+}
+impl<'a> Reader<'a> {
+    pub(crate) fn new(source: &'a [u8], purpose: Purpose) -> Self {
+        let (attribute, grammar) = match purpose {
+            Purpose::Boundary => (Attribute::Boundary, Grammar::Boundary),
+            Purpose::Charset => (Attribute::Charset, Grammar::Token),
+        };
+        Self {
+            source: Octets::new(source, Kind::ContentType, attribute),
+            validator: Validator::new(grammar),
+            purpose,
+            qualifier: Label::new(),
+            label: Label::new(),
+            used: 0,
+            end: None,
+            failure: None,
+        }
+    }
+    pub(crate) fn poll(
+        &mut self,
+        now: Tick,
+        work: &mut decode_work::Parsing<'_>,
+    ) -> Result<Read, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if let Some(end) = self.end {
+            return Ok(Read::Complete(end));
+        }
+        let result = self.step(now, work);
+        if let Err(error) = result {
+            self.failure = Some(error);
+            self.end = None;
+            self.used = 0;
+        }
+        result
+    }
+    fn admit(now: Tick, steps: u64, work: &mut impl decode_work::Work) -> Result<(), Error> {
+        work.charge(
+            now,
+            Charge {
+                records: steps,
+                ..Charge::default()
+            },
+        )
+        .map_err(super::Error::from)
+        .map_err(Error::Parameter)
+    }
+    fn step(&mut self, now: Tick, work: &mut impl decode_work::Work) -> Result<Read, Error> {
+        match self
+            .source
+            .poll_with_work(now, work)
+            .map_err(Error::Parameter)?
+        {
+            OctetStatus::Yield => Ok(Read::Yield),
+            OctetStatus::Octet { role, value } => {
+                if role == Role::Charset {
+                    Self::admit(now, ALIAS_FEED_STEPS, work)?;
+                    self.qualifier.feed(value);
+                    return Ok(Read::Yield);
+                }
+                if role != Role::Data {
+                    return Ok(Read::Yield);
+                }
+                Self::admit(
+                    now,
+                    1 + if self.purpose == Purpose::Charset {
+                        ALIAS_FEED_STEPS
+                    } else {
+                        0
+                    },
+                    work,
+                )?;
+                if self.purpose == Purpose::Charset {
+                    self.label.feed(value);
+                }
+                self.validator.feed(value);
+                if self.validator.is_invalid() {
+                    self.used = 0;
+                    return Ok(Read::Yield);
+                }
+                self.used = self
+                    .used
+                    .checked_add(1)
+                    .ok_or(Error::Parameter(super::Error::InvalidState))?;
+                Ok(Read::Octet(value))
+            }
             OctetStatus::Complete(selection) => {
-                self.admit(now, 2 * ALIAS_FINISH_STEPS)?;
+                Self::admit(now, 2 * ALIAS_FINISH_STEPS, work)?;
                 let qualified = matches!(
                     selection.plan,
                     Some(
@@ -258,9 +336,6 @@ impl<'a, 'w> Cursor<'a, 'w> {
                     }
                     Value::Absent
                 } else if self.validator.is_valid() {
-                    if self.overflow {
-                        return Err(Error::OutputCapacity);
-                    }
                     Value::Present
                 } else {
                     self.used = 0;
@@ -278,7 +353,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
                     unsupported_qualifier,
                 };
                 self.end = Some(end);
-                Ok(Status::Complete(end))
+                Ok(Read::Complete(end))
             }
         }
     }

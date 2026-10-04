@@ -172,6 +172,41 @@ impl<'a> Cursor<'a> {
         }
         result
     }
+    pub(crate) fn poll_in_context(
+        &mut self,
+        now: Tick,
+        work: &mut Meter,
+        budget: &mut HeaderBudget,
+        credit: &mut u8,
+    ) -> Result<Status, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if matches!(self.phase, Phase::Complete) {
+            return Ok(Status::Complete);
+        }
+        self.check_in_context(now, work, budget, credit)?;
+        self.poll_with_work(now, &mut Aggregate::new(work, budget, credit))
+    }
+    pub(crate) fn check_in_context(
+        &mut self,
+        now: Tick,
+        work: &mut Meter,
+        budget: &mut HeaderBudget,
+        credit: &mut u8,
+    ) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = budget
+            .charge(work, now, 0, 0, credit)
+            .map_err(decode_work::Error::from)
+            .map_err(Error::from);
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
     /// Cached metadata is available only after the complete section validates.
     /// The caller checks fresh admission before later publication.
     pub fn selection(&self) -> Result<Option<Selection>, Error> {
@@ -389,31 +424,12 @@ impl<'a, 'w> Budgeted<'a, 'w> {
         self.cursor.selection()
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
-        if let Some(error) = self.cursor.failure {
-            return Err(error);
-        }
-        let result = self
-            .budget
-            .charge(self.work, now, 0, 0, &mut self.credit)
-            .map_err(decode_work::Error::from)
-            .map_err(Error::from);
-        if let Err(error) = result {
-            self.cursor.failure = Some(error);
-        }
-        result
+        self.cursor
+            .check_in_context(now, self.work, self.budget, &mut self.credit)
     }
     pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
-        if let Some(error) = self.cursor.failure {
-            return Err(error);
-        }
-        if matches!(self.cursor.phase, Phase::Complete) {
-            return Ok(Status::Complete);
-        }
-        self.check_deadline(now)?;
-        self.cursor.poll_with_work(
-            now,
-            &mut Aggregate::new(self.work, self.budget, &mut self.credit),
-        )
+        self.cursor
+            .poll_in_context(now, self.work, self.budget, &mut self.credit)
     }
 }
 

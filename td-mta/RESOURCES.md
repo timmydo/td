@@ -1251,6 +1251,14 @@ qualifies resident scanner state/work only, not DFS composition,
 complete worker/native stack or RSS. Child extent clipping and
 body/descriptor reservations remain those of the later traversal owner.
 
+M06ce's private protocol Reader, delimiter Core and metadata context poll
+replace their former inline mechanisms. Public cursor bounds and original
+per-turn charging are unchanged. Detached shared delimiter State fits eight
+bytes; Line still fits 24 bytes. No extra source/output backing, allowance,
+checkpoint replay, parser arena or descriptor reservation is introduced.
+Moving private progress preserves state and has no allocation or admission
+effect. A future traversal must qualify its simultaneous core/frame layout.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

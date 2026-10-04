@@ -1828,6 +1828,13 @@ Initial independently landable increments:
   Parent-first child clipping, explicit-frame traversal, transfer sizing and
   descriptor/publication authority remain open.
 
+- **M06ce — private polling composition:** separate protocol/delimiter
+  progress from exclusive public budget/output owners and share metadata
+  context polling. Preserve original admission, prepaid credit, retained
+  output and sticky retirement. Extract only pure detached delimiter state
+  to td-header. Qualify public equivalence and movable private progress;
+  explicit-frame traversal and simultaneous memory qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
