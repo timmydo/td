@@ -133,9 +133,10 @@ grouped decimal digits with a check digit per group so that entry does not
 depend on the keyboard layout ([td-protector](../td-protector/DESIGN.md)
 "Recovery key" owns the encoding). Its keyslot passphrase is the 48 digits
 without separators, so stock cryptsetup opens the volume with it from any
-medium. The installer displays it once on its completion screen, requires
-it to be typed back, and stores no copy. Completion waits for the
-type-back. If the installer is lost before it, the installation is
+medium when given the 48 digits alone; only td's own entry tolerates
+separators between groups. The installer displays it once on its completion
+screen, requires it to be typed back, and stores no copy. Completion waits
+for the type-back. If the installer is lost before it, the installation is
 withdrawn like any failure after layout (DESIGN.md "Device-bound
 formatting"), because recovery cannot be declined in this tier.
 

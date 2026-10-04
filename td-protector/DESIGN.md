@@ -110,13 +110,31 @@ standard order-10 quasigroup table, starting from zero. That makes eight
 groups of six digits, 48 digits and 128 bits. Damm detects every
 single-digit substitution and every adjacent transposition within a group.
 
-The keyslot passphrase is the 48 ASCII digits with no separator. The
-display form joins the groups with hyphens. Entry admits spaces and
-hyphens only between groups and around the whole, and refuses, naming
-the group where it can, a character other than a digit, space or hyphen,
-a separator inside a group, a digit count other than 48, a value above
-65535 and a wrong check digit. A key, its passphrase and its display form
-are zeroed on drop and are neither `Debug`, `Display` nor `Clone`.
+The keyslot passphrase is the 48 ASCII digits with no separator. Stock
+cryptsetup derives the keyslot key from exactly the bytes it is given,
+so whoever opens the volume without td types the 48 digits alone; only
+td's own entry tolerates the separators below. The display form joins
+the groups with hyphens. Entry admits spaces and hyphens only between
+groups and around the whole, and refuses, naming the group where it can,
+a byte other than a digit, space or hyphen (a tab or line terminator
+included, so a caller strips a line's terminator first), a separator
+ending a run of digits that is not whole groups, a digit count other
+than 48, a value above 65535 and a wrong check digit. A key, its
+passphrase and its display form are zeroed on drop and are neither
+`Debug`, `Display` nor `Clone`.
+
+`recovery::RecoveryKey` carries it, held as its 48 passphrase digits so
+that producing either text cannot fail. `generate` reads `/dev/random`
+through the same injectable reader as `Secret` and encodes the 16 bytes,
+zeroing them; `parse` scans at most 256 bytes and returns an `EntryError`
+naming the group, or the one-based byte offset of a refused byte, never
+the digits; a separator after a wrong number of digits names the group
+the run began in. `passphrase` and `display` return a `RecoveryText`,
+one allocation at exactly its 48- or 55-byte length, for the keyslot
+operation or the completion screen; UI code draws it from the borrow and
+never copies it into an ordinary `String` or other buffer that is not
+zeroed. `matches` compares two keys over every digit, for the
+installer's type-back. Whoever holds the entered bytes zeroes them.
 
 ## LUKS2 tokens
 
@@ -180,7 +198,14 @@ non-zero prior and no retry after a refused extension or a lost reply at
 any of the three exchanges; the installer check's command stream and its
 refusal of a private area the TPM will not load; refusal of unsealed
 payloads other than 32 bytes, including 31 and 33; and that secrets are
-one exact read from `/dev/random`, through an injectable source path. An
+one exact read from `/dev/random`, through an injectable source path.
+Recovery-key tests pin the Damm table and its published example (572
+checks to 4) and encodings computed by an independent implementation,
+check for every value from 0 to 65535 that each single-digit substitution
+and adjacent transposition in its group fails the check, and cover round
+trips through the passphrase and display form, the boundary values 0 and
+65535, a value above 65535 refused as such, separators between and inside
+groups, every refusal and its group, and the injected random source. An
 ignored oracle runs the same lifecycle against the pinned swtpm under
 td-secret's convention (`td-secret/DESIGN.md`, "TPM validation"):
 

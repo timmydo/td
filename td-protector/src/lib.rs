@@ -1,6 +1,6 @@
 //! td's device-bound disk protector policy over the shared td-tpm client:
 //! the first-boot and observed PCR policies, the protector secret, sealing
-//! and unsealing it, and the PCR 12 release cap (DESIGN.md,
+//! and unsealing it, the PCR 12 release cap and the recovery key (DESIGN.md,
 //! td-install/ENCRYPTION.md "Device-bound default").
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -19,6 +19,8 @@ use std::io::Read;
 use std::path::Path;
 use td_tpm::{Client, PcrPolicy, PcrSelection, SealedObject, Transport};
 
+pub mod recovery;
+
 /// The firmware's measurement of the selector EFI image.
 pub const SELECTOR_IMAGE_PCR: u8 = 4;
 /// The EFI stub's measurements of load options and the selector initramfs.
@@ -35,6 +37,14 @@ pub const CAP_DOMAIN: &[u8] = b"td/disk-protector/release-cap/v1";
 pub const SECRET_LEN: usize = 32;
 /// Blocks until the kernel CSPRNG is initialized, unlike `/dev/urandom`.
 const SECRET_SOURCE: &str = "/dev/random";
+
+/// Fill `out` from `source` in one exact read. Secrets and recovery keys
+/// share it, so tests substitute a file for `/dev/random`.
+fn read_random(source: &Path, out: &mut [u8], what: &str) -> Result<(), String> {
+    File::open(source)
+        .and_then(|mut file| file.read_exact(out))
+        .map_err(|e| format!("read {what} from {}: {e}", source.display()))
+}
 
 /// The SHA-256 event the release cap extends into PCR 12.
 pub fn cap_event() -> [u8; 32] {
@@ -97,9 +107,7 @@ impl Secret {
 
     fn read_from(source: &Path) -> Result<Self, String> {
         let mut secret = Self(Box::new([0; SECRET_LEN]));
-        File::open(source)
-            .and_then(|mut file| file.read_exact(secret.0.as_mut_slice()))
-            .map_err(|e| format!("read protector secret from {}: {e}", source.display()))?;
+        read_random(source, secret.0.as_mut_slice(), "protector secret")?;
         Ok(secret)
     }
 
