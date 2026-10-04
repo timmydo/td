@@ -1503,10 +1503,10 @@ fn glob_class(pat: &[u8], open: usize, g: u8, caret: bool) -> Class {
         first = false;
         // `[:alpha:]`, `[.a.]`, `[=a=]`. The delimiter repeats before the `]`.
         let construct = match (c, pat.get(i.saturating_add(1))) {
-            // A CLASS name is scanned byte by byte, and glibc abandons the
-            // CONSTRUCT -- not the pattern -- the moment a byte cannot belong
-            // to a name, re-reading the `[` as an ordinary item. See
-            // `glob_class_name` for where that boundary sits.
+            // A CLASS name is a run of name bytes; where the run stops short
+            // of `:]`, glibc abandons the CONSTRUCT -- not the pattern -- and
+            // re-reads the `[` as an ordinary item. See `glob_class_name` for
+            // where that boundary sits.
             (b'[', Some(b':')) => {
                 let body = i.saturating_add(2);
                 match glob_class_name(pat, body) {
@@ -1690,71 +1690,55 @@ fn glob_range(
     Ok(())
 }
 
-/// glibc's post-match walk over the rest of a bracket set. Once an item has
-/// matched, the remainder is walked rather than tested, and the walk re-parses
-/// what the scan already passed under *different* rules -- which is why `[a[=]`
-/// selects `[` and `=` but not `a`: the `a` matches, then the walk meets the
-/// malformed `[=` and voids the whole pattern. A `[:...:]` is only shape-checked
-/// here, its NAME never looked up. The unterminated-set literal fallback still
-/// applies, so `*[[` selects `[[`. Returns the index past the closing `]`.
-/// glibc also voids on a trailing `\` here, but that is not observable: the
-/// fallback re-reads the same trailing `\` in ordinary position, where it
-/// matches nothing either.
+/// The walk over the rest of a bracket set once an item has matched, as
+/// glibc's fnmatch does it: the remainder is walked, not tested, under its
+/// own rules -- which is why `[a[=]` selects `[` and `=` but not `a`: the `a`
+/// matches, then the walk meets the malformed `[=` and voids the pattern. A
+/// `[:...:]` is only shape-checked, its name never looked up. Running off the
+/// end is the unterminated-set literal fallback, so `*[[` selects `[[` (a
+/// trailing `\` would void it in glibc, but the fallback reads that `\`
+/// where it matches nothing either). Returns the index past the closing `]`.
 fn glob_skip(pat: &[u8], from: usize) -> Result<usize, Class> {
     let mut i = from;
     loop {
-        let Some(&c) = pat.get(i) else {
-            return Err(Class::Literal);
-        };
-        i = i.saturating_add(1);
-        if c == b']' {
-            return Ok(i);
-        }
-        match (c, pat.get(i)) {
-            (b'\\', Some(_)) => i = i.saturating_add(1),
-            (b'[', Some(b':')) => i = glob_skip_name(pat, i)?,
-            (b'[', Some(b'=')) => {
-                let body = i.saturating_add(1);
-                let shaped = pat.get(body).is_some()
-                    && pat.get(body.saturating_add(1)) == Some(&b'=')
-                    && pat.get(body.saturating_add(2)) == Some(&b']');
-                if !shaped {
-                    return Err(Class::Invalid);
-                }
-                i = body.saturating_add(3);
-            }
-            (b'[', Some(b'.')) => match glob_skip_dot(pat, i) {
-                Some(end) => i = end,
+        let rest = pat.get(i..).unwrap_or_default();
+        i = match rest {
+            [] => return Err(Class::Literal),
+            [b']', ..] => return Ok(i + 1),
+            [b'\\', _, ..] => i + 2,
+            [b'[', b':', ..] => glob_skip_name(pat, i + 1)?,
+            [b'[', b'=', _, b'=', b']', ..] => i + 5,
+            [b'[', b'=', ..] => return Err(Class::Invalid),
+            [b'[', b'.', after @ ..] => match after.windows(2).position(|w| w == b".]") {
+                Some(at) => i + 2 + at + 2,
                 None => return Err(Class::Invalid),
             },
-            _ => {}
-        }
+            _ => i + 1,
+        };
     }
 }
 
-/// `[:` inside the skip walk. The name is never looked up, only shaped: a byte
-/// outside `a`..`y` backs the construct off to its own `:`, which the walk then
-/// reads as an ordinary byte. So `[a[:]` ends at the `]` right after the colon,
-/// while `[a[:zz:]]` runs on to the FIRST `]` and leaves the second one in the
-/// pattern. Running off the end backs off too, and the walk then falls back.
+/// `[:` inside the skip walk, `colon` at its `:`. The name is shaped, never
+/// looked up: a run of `a`..`y` bytes, which `:]` must end. Anything else
+/// backs off to the `:`, which the walk then reads as an ordinary byte -- so
+/// `[a[:]` ends at the `]` after the colon, and `[a[:zz:]]` (`z` is outside
+/// the run) at the FIRST `]`, leaving the second in the pattern. Running off
+/// the end backs off too. A run as long as `CLASS_NAME_CAP` less one voids
+/// the pattern before its end is looked at, one byte sooner than the scan's
+/// bound in `glob_class_name`.
 fn glob_skip_name(pat: &[u8], colon: usize) -> Result<usize, Class> {
-    let mut i = colon;
-    let mut seen = 0usize;
-    loop {
-        i = i.saturating_add(1);
-        seen = seen.saturating_add(1);
-        // glibc gives up on an over-long name before it looks for the `:]`,
-        // so the bound bites one byte sooner here than in the scan.
-        if seen == CLASS_NAME_CAP {
-            return Err(Class::Invalid);
-        }
-        if pat.get(i) == Some(&b':') && pat.get(i.saturating_add(1)) == Some(&b']') {
-            return Ok(i.saturating_add(2));
-        }
-        match pat.get(i) {
-            Some(b'a'..=b'y') => {}
-            _ => return Ok(colon),
-        }
+    let name = pat.get(colon + 1..).unwrap_or_default();
+    let run = name
+        .iter()
+        .take(CLASS_NAME_CAP - 1)
+        .take_while(|b| matches!(b, b'a'..=b'y'))
+        .count();
+    if run == CLASS_NAME_CAP - 1 {
+        return Err(Class::Invalid);
+    }
+    match name.get(run..) {
+        Some([b':', b']', ..]) => Ok(colon + 1 + run + 2),
+        _ => Ok(colon),
     }
 }
 
@@ -1763,50 +1747,28 @@ fn glob_skip_name(pat: &[u8], colon: usize) -> Result<usize, Class> {
 /// varies.
 const CLASS_NAME_CAP: usize = 2048;
 
-/// `[.` inside the skip walk, which unlike the scan's one-byte collating
-/// element SEARCHES for the next `.]` -- so `[a[.xy.]]` selects `a`.
-fn glob_skip_dot(pat: &[u8], dot: usize) -> Option<usize> {
-    let mut i = dot;
-    loop {
-        i = i.saturating_add(1);
-        match pat.get(i) {
-            None => return None,
-            Some(&b'.') if pat.get(i.saturating_add(1)) == Some(&b']') => {
-                return Some(i.saturating_add(2))
-            }
-            Some(_) => {}
-        }
-    }
-}
-
-/// glibc's class-name scan (`fnmatch_loop.c`): bytes up to a `:` that is
-/// followed by `]`, whose index is returned. `None` means this is NOT a class
-/// after all and the `[` must be re-read as an ordinary item -- glibc decides
-/// that on the first byte outside `a`..`y`, END OF PATTERN included. `z` is
-/// outside on purpose (`c < 'a' || c >= 'z'` there), which is why `[[:az:]]`
-/// selects `a]` as the set `[ : a z :` and a literal `]`. A name that ENDS
-/// properly and is merely UNKNOWN is a different answer, made by the caller.
-///
-/// `Err(Literal)` is that re-read; `Err(Invalid)` is the length bound, which
-/// glibc tests BEFORE it reads the next byte and answers by giving the whole
-/// pattern up rather than by backing off. That is one byte later than the same
-/// bound in `glob_skip_name`, which tests after reading.
+/// A class name in the scan, from `from` just past `[:`: a run of `a`..`y`
+/// bytes that `:]` must end, as glibc's fnmatch reads it; the index of the
+/// `:` is returned. `z` is outside the run, as in glibc, which is why
+/// `[[:az:]]` selects `a]` as the set `[ : a z :` and a literal `]`.
+/// Anything else after the run, end of pattern included, means this is NOT
+/// a class and the `[` is re-read as an ordinary item: `Err(Literal)`. A run
+/// of `CLASS_NAME_CAP` bytes gives the whole pattern up, `Err(Invalid)` --
+/// one byte later than the same bound in `glob_skip_name`. A name that ends
+/// properly and is merely UNKNOWN is the caller's answer.
 fn glob_class_name(pat: &[u8], from: usize) -> Result<usize, Class> {
-    let mut i = from;
-    loop {
-        if i.saturating_sub(from) == CLASS_NAME_CAP {
-            return Err(Class::Invalid);
-        }
-        let Some(&c) = pat.get(i) else {
-            return Err(Class::Literal);
-        };
-        if c == b':' && pat.get(i.saturating_add(1)) == Some(&b']') {
-            return Ok(i);
-        }
-        if !matches!(c, b'a'..=b'y') {
-            return Err(Class::Literal);
-        }
-        i = i.saturating_add(1);
+    let name = pat.get(from..).unwrap_or_default();
+    let run = name
+        .iter()
+        .take(CLASS_NAME_CAP)
+        .take_while(|b| matches!(b, b'a'..=b'y'))
+        .count();
+    if run == CLASS_NAME_CAP {
+        return Err(Class::Invalid);
+    }
+    match name.get(run..) {
+        Some([b':', b']', ..]) => Ok(from + run),
+        _ => Err(Class::Literal),
     }
 }
 
