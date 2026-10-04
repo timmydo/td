@@ -3,7 +3,7 @@ name = "td-profiler"
 version = "0.1.0"
 edition = "2021"
 description = "td's continuous system profiler and offline report generator"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]

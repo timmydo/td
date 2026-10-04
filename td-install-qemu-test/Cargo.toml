@@ -2,7 +2,7 @@
 name = "td-install-qemu-test"
 version = "0.1.0"
 edition = "2021"
-license = "GPL-3.0-or-later"
+license = "MIT"
 description = "Native PID-1 fixture for disposable QEMU installation tests"
 
 [workspace]

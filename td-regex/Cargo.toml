@@ -3,7 +3,7 @@ name = "td-regex"
 version = "0.1.0"
 edition = "2021"
 description = "td's dependency-free POSIX regular expressions (BRE and ERE) over bytes in the C locale, with a step budget: the engine behind td's grep and sed and the mail client's rules"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
 # a worktree nested under it (see the root Cargo.toml). td-mail names this

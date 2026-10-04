@@ -3,7 +3,7 @@ name = "td-taskmgr"
 version = "0.1.0"
 edition = "2021"
 description = "A hierarchical Linux task manager for Wayland"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [workspace]
 

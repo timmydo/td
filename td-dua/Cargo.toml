@@ -3,7 +3,7 @@ name = "td-dua"
 version = "0.1.0"
 edition = "2021"
 description = "td's disk usage analyzer: a directory tree sorted by size over a treemap, with a delete list; dependency-free Rust over td's shared UI toolkit"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
 # a worktree nested under it (see the root Cargo.toml). Its dependencies are

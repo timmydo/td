@@ -3,7 +3,7 @@ name = "td-netd"
 version = "0.1.0"
 edition = "2021"
 description = "td's minimal static network bring-up daemon: link-up + DHCP + resolv.conf, a confined single-ioctl surface"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # Own workspace root. The engine root manifest carries no `exclude` list, and
 # never needed one: an `exclude` stops cargo only at that manifest, and this

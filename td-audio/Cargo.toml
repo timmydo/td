@@ -3,7 +3,7 @@ name = "td-audio"
 version = "0.1.0"
 edition = "2021"
 description = "td's audio daemon: the ALSA PCM back end and its mixer"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # This crate's confinement assertions live in test targets, so the lint pass
 # has to reach them.

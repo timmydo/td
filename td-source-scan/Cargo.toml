@@ -3,7 +3,7 @@ name = "td-source-scan"
 version = "0.1.0"
 edition = "2021"
 description = "td's dependency-free source-text scans for confinement tests: comment stripping, unsafe block and allow counts, module coverage"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
 # a worktree nested under it (see the root Cargo.toml). A consumer names this

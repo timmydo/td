@@ -3,7 +3,7 @@ name = "td-install"
 version = "0.1.0"
 edition = "2021"
 description = "td's disk installer: GPT, the EFI System Partition, and the td volume"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # Own workspace root, for td-boot's reason: the engine root manifest carries no
 # `exclude` list, and an `exclude` would stop cargo only at that manifest. From

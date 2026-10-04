@@ -3,7 +3,7 @@ name = "td-util"
 version = "0.1.0"
 edition = "2021"
 description = "Static dependency-free multicall for td's diagnostics userland (clear, which, free, ps, dmesg)"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [[bin]]
 name = "td-util"

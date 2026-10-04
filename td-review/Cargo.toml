@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 default-run = "td-review"
 description = "The integrator's window: review branches against main, land them, push to every remote"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 # The App-level tests drive a real git repo and are `#[ignore]`d so the

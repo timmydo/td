@@ -3,7 +3,7 @@ name = "td-editor"
 version = "0.1.0"
 edition = "2021"
 description = "A dependency-free text editor: the window, file session and headless replay over td-ui's editor core"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [workspace]
 

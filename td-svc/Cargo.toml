@@ -3,7 +3,7 @@ name = "td-svc"
 version = "0.1.0"
 edition = "2021"
 description = "Static dependency-free service supervisor for td (ordering, backoff, log capture, shutdown)"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]

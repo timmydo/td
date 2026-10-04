@@ -3,7 +3,7 @@ name = "td-firstboot"
 version = "0.1.0"
 edition = "2021"
 description = "Provisions td's per-machine identity into /var on first boot (machine-id, SSH host key, authorized_keys)"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 [package.metadata.td-gate]

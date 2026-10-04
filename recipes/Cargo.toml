@@ -3,7 +3,7 @@ name = "td-recipe"
 version = "0.1.0"
 edition = "2021"
 description = "td's package-recipe surface declared in Rust (replaces the boa/TypeScript surface; §5 move-off-Guile, rust-recipe-surface track)"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [lib]
 name = "td_recipe"

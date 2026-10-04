@@ -2,7 +2,7 @@
 name = "td-secret"
 version = "0.1.0"
 edition = "2021"
-license = "GPL-3.0-or-later"
+license = "MIT"
 description = "td's local credential store and console writer"
 
 [package.metadata.td-gate]

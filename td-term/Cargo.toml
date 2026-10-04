@@ -3,7 +3,7 @@ name = "td-term"
 version = "0.1.0"
 edition = "2021"
 description = "td's terminal: a Wayland window over a PTY, running td-ui's terminal model, renderer and keyboard encoder, with scrollback, a pointer selection and the clipboard; dependency-free Rust over td's shared UI toolkit"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
 # a worktree nested under it (see the root Cargo.toml). The toolkit is the one

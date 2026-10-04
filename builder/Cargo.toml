@@ -3,7 +3,7 @@ name = "td-builder"
 version = "0.1.0"
 edition = "2021"
 description = "td's own builder — executes a .drv in a user-namespace sandbox and registers the output (DESIGN §7.1)"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [[bin]]
 name = "td-builder"

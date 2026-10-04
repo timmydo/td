@@ -3,7 +3,7 @@ name = "td-login"
 version = "0.1.0"
 edition = "2021"
 description = "Static dependency-free multicall for td's credential switch (login, su)"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [[bin]]
 name = "td-login"

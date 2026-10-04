@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 default-run = "td-vm"
 description = "Host VM manager and Git enrollment services for td development"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # How builder/src/affected.rs gates this crate; absent keys take the defaults.
 # Lifecycle and integration tests need host QEMU, Git and trusted-root fixtures.

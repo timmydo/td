@@ -259,4 +259,5 @@ Set `TD_QEMU_ACCEL=tcg` to force software emulation when KVM is available.
 
 ## License
 
-GPL-3.0-or-later. See [COPYING](COPYING).
+MIT. See [LICENSE](LICENSE). Third-party material in the tree keeps
+its own license; [THIRD-PARTY.md](THIRD-PARTY.md) lists it.

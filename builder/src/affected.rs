@@ -1154,6 +1154,14 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return; // docs — no checks
     }
 
+    // td's license and the third-party texts THIRD-PARTY.md names: read by
+    // people, staged by no recipe and read by no check. COPYING is the GPL
+    // text the MIT relicense moved into LICENSES/; a diff spanning that move
+    // still names it.
+    if pattern_matches("LICENSE|LICENSES/*|COPYING", p) {
+        return;
+    }
+
     // td-boot's protocol.rs is the deployment contract, `#[path]`-included by
     // two OTHER trees: the td-recipe lib root, which is where every recipe and
     // the qemu oracle reach it, and — since the manifest header and size bound
@@ -5631,6 +5639,9 @@ mod tests {
         let root = repo_root();
         for path in [
             "README.md",
+            "LICENSE",
+            "LICENSES/Apache-2.0.txt",
+            "COPYING",
             "td-vm/DESIGN.md",
             ".gitignore",
             "engine/DESIGN.md",

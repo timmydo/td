@@ -3,7 +3,7 @@ name = "td-pass"
 version = "0.1.0"
 edition = "2021"
 description = "td's two-pane encrypted notebook for passwords and recovery notes"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # A nested worktree's cargo would otherwise be captured by the outer
 # checkout's manifest; an empty workspace pins this crate as its root.

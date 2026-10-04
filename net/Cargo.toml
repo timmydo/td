@@ -2,6 +2,7 @@
 name = "td-net"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 # The engine root carries no `exclude` list and never needed one: an `exclude`
 # stops cargo only at THAT manifest.

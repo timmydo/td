@@ -3,7 +3,7 @@ name = "td-sh"
 version = "0.1.0"
 edition = "2021"
 description = "td's target-built POSIX /bin/sh (busybox-sh replacement): interpreter + Oils-spec conformance harness"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # The SHIPPED shell is the `td-sh` bin (src/main.rs), compiled directly by rustc
 # from recipes/src/recipes/td-sh.rs (never `cargo build`) into a static ET_EXEC.

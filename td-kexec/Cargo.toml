@@ -3,7 +3,7 @@ name = "td-kexec"
 version = "0.1.0"
 edition = "2021"
 description = "td's guest-side kexec helper: kexec_file_load(2) + reboot(KEXEC), a confined two-syscall surface"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # Own workspace root. The engine root manifest carries no `exclude` list, and
 # never needed one: an `exclude` stops cargo only at that manifest, and this

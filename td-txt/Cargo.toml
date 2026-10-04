@@ -3,7 +3,7 @@ name = "td-txt"
 version = "0.1.0"
 edition = "2021"
 description = "td's target-built text userland (busybox grep/sed replacement): multicall + conformance harness"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 # The SHIPPED multicall is the `td-txt` bin (src/main.rs), compiled directly by
 # rustc from recipes/src/recipes/td-txt.rs (never `cargo build`) into a static
