@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cost::Tokens;
+use crate::workspace::Workspace;
 use td_json::Json;
 
 /// `O_NOFOLLOW` on x86-64, as td-ui's control socket spells it.
@@ -220,8 +221,48 @@ impl StateDir {
                 removed => removed,
             })
             .map_err(|e| format!("{}: {e}", gone.display()));
+        // Its jail directory, its scratch workspace with it, out of the
+        // way at once and removed on a thread of its own, since a large
+        // tree takes time; what is left the next start sweeps. A
+        // directory workspace is the human's and lies elsewhere.
+        let jail = crate::workspace::jail_dir(self, id);
+        let moved = match self.doom(&jail, id) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", jail.display())),
+            Ok(doomed) => {
+                let removing = doomed.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("td-agent-jail-removal".into())
+                    .spawn(move || {
+                        if let Err(e) = crate::workspace::remove_tree(&removing) {
+                            eprintln!("td-agent: {}: {e}", removing.display());
+                        }
+                    });
+                spawned
+                    .map(drop)
+                    .map_err(|e| format!("{}: {e}", doomed.display()))
+            }
+        };
         drop(lock);
-        Ok(removed.err())
+        let problems: Vec<String> = removed.err().into_iter().chain(moved.err()).collect();
+        Ok((!problems.is_empty()).then(|| problems.join("; ")))
+    }
+
+    /// Renames conversation `id`'s jail directory `jail` out of the way,
+    /// to be removed: `.deleting-<id>`, or, where an earlier removal left
+    /// that name, `.deleting-<id>.<random>`.
+    fn doom(&self, jail: &Path, id: &Id) -> std::io::Result<PathBuf> {
+        let jails = self.root().join(crate::workspace::JAIL);
+        let plain = jails.join(format!("{DELETING}{id}"));
+        // EEXIST and ENOTEMPTY: the name is taken.
+        match std::fs::rename(jail, &plain) {
+            Err(e) if matches!(e.raw_os_error(), Some(17 | 39)) => {
+                let suffix = random_hex(4).map_err(std::io::Error::other)?;
+                let to = jails.join(format!("{DELETING}{id}.{suffix}"));
+                std::fs::rename(jail, &to).map(|()| to)
+            }
+            moved => moved.map(|()| plain),
+        }
     }
 
     /// Finishes the deletions a crash or a failed removal left, by the
@@ -245,6 +286,54 @@ impl StateDir {
                     Err(e) => problems.push(format!("{gone}: {e}")),
                 }
                 drop(lock);
+            }
+        }
+        // A jail directory whose conversation is gone, one whose removal
+        // failed, and one being removed when the window last closed: the
+        // first renamed out of the way, and all removed on a thread of
+        // their own, since a large tree takes time. None is being made
+        // while the window, which alone sweeps, starts.
+        let jails = self.root().join(crate::workspace::JAIL);
+        let mut doomed = Vec::new();
+        for entry in std::fs::read_dir(&jails).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if let Some(own) = name.strip_prefix(DELETING) {
+                if own.split('.').next().and_then(Id::parse).is_some() {
+                    doomed.push(entry.path());
+                }
+                continue;
+            }
+            let Some(id) = Id::parse(name) else {
+                continue;
+            };
+            match std::fs::symlink_metadata(self.conversation(&id)) {
+                // Only a conversation surely gone: any other failure to
+                // look leaves its work alone, and says so.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    match self.doom(&entry.path(), &id) {
+                        Ok(to) => doomed.push(to),
+                        Err(e) => problems.push(format!("{}: {e}", entry.path().display())),
+                    }
+                }
+                Err(e) => problems.push(format!("{id}: {e}")),
+                Ok(_) => {}
+            }
+        }
+        if !doomed.is_empty() {
+            let spawned = std::thread::Builder::new()
+                .name("td-agent-jail-sweep".into())
+                .spawn(move || {
+                    for path in doomed {
+                        if let Err(e) = crate::workspace::remove_tree(&path) {
+                            eprintln!("td-agent: {}: {e}", path.display());
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                problems.push(format!("the jail directories' removal: {e}"));
             }
         }
         problems
@@ -404,8 +493,8 @@ pub(crate) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String
     })
 }
 
-/// A conversation's `meta` (DESIGN.md §6). The workspace, mode and
-/// parent are null until the increments that give them values.
+/// A conversation's `meta` (DESIGN.md §6). The mode and parent are null
+/// until the increments that give them values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Meta {
     pub id: Id,
@@ -421,6 +510,9 @@ pub struct Meta {
     /// in a meta written before.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// What it works in (DESIGN.md §7), fixed when it is created; null
+    /// for a conversation with none.
+    pub workspace: Option<Workspace>,
 }
 
 impl Meta {
@@ -430,7 +522,12 @@ impl Meta {
             ("id".into(), Json::Str(self.id.to_string())),
             ("role".into(), Json::Str(self.role.word().into())),
             ("title".into(), Json::Str(self.title.clone())),
-            ("workspace".into(), Json::Null),
+            (
+                "workspace".into(),
+                self.workspace
+                    .as_ref()
+                    .map_or(Json::Null, Workspace::to_json),
+            ),
             ("model".into(), or_null(&self.model)),
             ("mode".into(), Json::Null),
             ("parent".into(), Json::Null),
@@ -461,6 +558,12 @@ impl Meta {
             },
             model: optional_str(value, "model").ok_or("meta's model is not a string")?,
             effort: optional_str(value, "effort").ok_or("meta's effort is not a string")?,
+            workspace: match value.get("workspace") {
+                None | Some(Json::Null) => None,
+                Some(workspace) => {
+                    Some(Workspace::from_json(workspace).map_err(|e| format!("meta: {e}"))?)
+                }
+            },
         })
     }
 }
@@ -1223,6 +1326,27 @@ impl Conversation {
         create: Option<Role>,
         wait: Duration,
     ) -> Result<(Self, Load), String> {
+        Self::open_as(state, id, create.map(|role| (role, None)), wait)
+    }
+
+    /// Creates conversation `id` as `role`, working in `workspace`, and
+    /// opens it, as `open` does.
+    pub fn create(
+        state: &StateDir,
+        id: &Id,
+        role: Role,
+        workspace: Option<Workspace>,
+        wait: Duration,
+    ) -> Result<(Self, Load), String> {
+        Self::open_as(state, id, Some((role, workspace)), wait)
+    }
+
+    fn open_as(
+        state: &StateDir,
+        id: &Id,
+        create: Option<(Role, Option<Workspace>)>,
+        wait: Duration,
+    ) -> Result<(Self, Load), String> {
         let dir = state.conversation(id);
         if create.is_some() {
             DirBuilder::new()
@@ -1232,7 +1356,7 @@ impl Conversation {
         }
         let lock = lock_conversation(&dir, wait)?;
         let meta = match create {
-            Some(role) => {
+            Some((role, workspace)) => {
                 let meta = Meta {
                     id: id.clone(),
                     role,
@@ -1241,6 +1365,7 @@ impl Conversation {
                     paused: false,
                     model: None,
                     effort: None,
+                    workspace,
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
@@ -1739,6 +1864,64 @@ pub mod tests {
         drop(held);
         assert!(state.sweep_deleted().is_empty());
         assert!(!cut.exists());
+    }
+
+    /// A workspace is fixed in the meta at creation, and a conversation's
+    /// jail directory goes with it, or with the window's next sweep.
+    #[test]
+    fn a_workspace_is_recorded_and_its_jail_directory_deleted_with_it() {
+        let scratch = Scratch::new("workspace");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let workspace = Workspace::Directory("/home/u/notes".into());
+        let (conversation, _) = Conversation::create(
+            &state,
+            &id,
+            Role::Conversation,
+            Some(workspace.clone()),
+            LOCK_WAIT,
+        )
+        .unwrap();
+        assert_eq!(conversation.meta().workspace, Some(workspace.clone()));
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.meta().workspace, Some(workspace));
+        drop(conversation);
+        let (metas, _) = state.list();
+        assert_eq!(
+            metas
+                .first()
+                .and_then(|meta| meta.workspace.as_ref())
+                .map(Workspace::label)
+                .as_deref(),
+            Some("/home/u/notes")
+        );
+        let jail = crate::workspace::jail_dir(&state, &id);
+        std::fs::create_dir_all(jail.join("scratch/work")).unwrap();
+        assert_eq!(state.delete(&id).unwrap(), None);
+        assert!(!jail.exists());
+        // Removed on its thread; one the window closed on is swept.
+        let doomed = state.root().join("jail").join(format!("{DELETING}{id}"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while doomed.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!doomed.exists());
+        std::fs::create_dir_all(doomed.join("scratch")).unwrap();
+        // One left without its conversation is the sweep's; one with its
+        // conversation is kept.
+        let kept = Id::random().unwrap();
+        drop(Conversation::open(&state, &kept, Some(Role::Conversation), LOCK_WAIT).unwrap());
+        std::fs::create_dir_all(jail.join("home")).unwrap();
+        let held = crate::workspace::jail_dir(&state, &kept);
+        std::fs::create_dir_all(&held).unwrap();
+        assert!(state.sweep_deleted().is_empty());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (jail.exists() || doomed.exists()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!jail.exists() && !doomed.exists());
+        assert!(held.exists());
     }
 
     #[test]

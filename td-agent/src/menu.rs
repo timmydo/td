@@ -26,6 +26,10 @@ pub const OPEN: &str = "F10";
 pub enum Action {
     /// Start a conversation and open it, as `C-n` does.
     New,
+    /// Start a conversation in a scratch workspace.
+    NewScratch,
+    /// Choose a directory to start a conversation in.
+    NewInDirectory,
     /// Open the dialog that stores the OpenRouter key.
     SetKey,
     /// Write the diagnostics archive (DESIGN.md §4).
@@ -50,6 +54,12 @@ pub enum Action {
 /// works, or none), and the action.
 pub const FILE: &[(&str, &str, Action)] = &[
     ("New conversation", "C-n", Action::New),
+    ("New scratch conversation", "", Action::NewScratch),
+    (
+        "New conversation in a directory\u{2026}",
+        "",
+        Action::NewInDirectory,
+    ),
     ("Set OpenRouter key\u{2026}", "", Action::SetKey),
     ("Export diagnostics", "", Action::Export),
     ("Quit", "", Action::Quit),
@@ -342,10 +352,10 @@ mod tests {
         };
         assert_eq!(menu.event(Some(1), press).unwrap(), Outcome::Changed);
         assert!(menu.is_open());
-        // The pointer chooses: the second item's row.
+        // The pointer chooses: the fourth item's row.
         let row = menu
             .panel(0)
-            .map(|panel| (panel.x + 4, panel.y + 4 + td_ui::chrome::ROW as i64))
+            .map(|panel| (panel.x + 4, panel.y + 4 + 3 * td_ui::chrome::ROW as i64))
             .unwrap();
         let outcome = menu
             .event(Some(1), Event::Press { x: row.0, y: row.1 })

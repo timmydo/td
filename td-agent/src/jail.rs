@@ -64,6 +64,21 @@ impl Programs {
     /// entry and td-txt need distinct file names, since they share one
     /// directory inside.
     pub fn new(jail: PathBuf, agent: PathBuf, txt: PathBuf) -> Result<Self, String> {
+        // Named as they resolve, so what is checked, protected from the
+        // model's writes and run is one file, never a link to it.
+        let canonical = |what: &str, path: PathBuf| {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "the workspace jail's {what} {} is not an absolute path",
+                    path.display()
+                ));
+            }
+            fs::canonicalize(&path)
+                .map_err(|e| format!("the workspace jail's {what} {}: {e}", path.display()))
+        };
+        let jail = canonical("td-jail", jail)?;
+        let agent = canonical("td-agent", agent)?;
+        let txt = canonical("td-txt", txt)?;
         for (what, path) in [("td-jail", &jail), ("td-agent", &agent), ("td-txt", &txt)] {
             let executable = fs::metadata(path)
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
@@ -354,8 +369,21 @@ mod tests {
         // Named otherwise, td-jail would take its argv[0] as an application.
         let renamed = dir.join("td-jail2");
         fs::copy(&file, &renamed).unwrap();
-        let refused = Programs::new(renamed, file.clone(), txt.clone()).unwrap_err();
+        let refused = Programs::new(renamed.clone(), file.clone(), txt.clone()).unwrap_err();
         assert!(refused.contains("not named td-jail"), "{refused}");
+        // A link named td-jail is taken as what it names.
+        let link = dir.join("link/td-jail");
+        fs::create_dir_all(dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(&renamed, &link).unwrap();
+        assert!(Programs::new(link, file.clone(), txt.clone()).is_err());
+        let through = dir.join("through");
+        std::os::unix::fs::symlink(&dir, &through).unwrap();
+        assert_eq!(
+            Programs::new(through.join("td-jail"), file.clone(), txt.clone())
+                .unwrap()
+                .jail,
+            jail
+        );
         fs::set_permissions(&txt, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(Programs::new(jail, file, txt).is_err());
         fs::remove_dir_all(&dir).unwrap();

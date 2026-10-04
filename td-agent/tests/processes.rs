@@ -22,6 +22,7 @@ use td_agent::frame;
 use td_agent::protocol::{Down, Up};
 use td_agent::store::{Conversation, Id, Kind, Role, StateDir};
 use td_agent::supervisor::{Supervisor, Update, MAX_RESTARTS};
+use td_agent::workspace::Workspace;
 
 /// The settings with no key: each turn ends at once, saying so.
 fn keyless() -> Down {
@@ -158,6 +159,42 @@ fn a_message_sent_just_before_moving_away_is_delivered_on_reopening() {
         })
         .collect();
     assert_eq!(texts, ["kept"], "logged once, whichever process logged it");
+}
+
+/// A conversation created in a workspace is told it by the window and
+/// records it; each start clears the specs an earlier process left.
+#[test]
+fn a_workspace_reaches_the_conversation_and_stale_specs_are_cleared() {
+    let scratch = Scratch::new("workspace");
+    let state = scratch.state();
+    let id = Id::random().unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    supervisor
+        .create(id.clone(), Role::Conversation, Workspace::Scratch)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let recorded = loop {
+        let (metas, _) = state.list();
+        if let Some(meta) = metas.into_iter().find(|meta| meta.id == id) {
+            break meta.workspace;
+        }
+        assert!(Instant::now() < deadline, "no meta was written");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(recorded, Some(Workspace::Scratch));
+    drop(supervisor);
+    let specs = td_agent::workspace::jail_dir(&state, &id).join("specs");
+    std::fs::create_dir_all(&specs).unwrap();
+    std::fs::write(specs.join("spec-stale"), "format=1\n").unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    supervisor.open(id, None).unwrap();
+    while specs.exists() {
+        assert!(
+            Instant::now() < deadline + Duration::from_secs(10),
+            "the stale spec stayed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

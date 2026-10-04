@@ -604,8 +604,8 @@ pub enum Op {
 /// Whether a conversation (`caller`, of `caller_role`) may read or message
 /// `target` (of `target_role`) without a crossing (DESIGN.md §3, §11), or
 /// why it is refused. Crossings are decided from increment 13 and refused
-/// until then; there are no workspaces yet, so every conversation is a
-/// workspace of its own.
+/// until then. Every conversation counts as a workspace of its own until
+/// then, two in one directory included.
 pub fn crossing(
     caller: &Id,
     caller_role: Role,

@@ -394,7 +394,12 @@ fn descend(dir: &Path, name: &str, depth: usize, never: &Never, walk: &mut Walk)
             Ok(kind) if kind.is_dir() => {
                 let key_directory = std::fs::symlink_metadata(entry.path())
                     .is_ok_and(|m| Some(identity(&m)) == never.directory);
-                if key_directory {
+                if depth == 0 && file == crate::workspace::JAIL {
+                    walk.left_out.push((
+                        named,
+                        "the workspaces' jail directories hold the human's work".into(),
+                    ));
+                } else if key_directory {
                     walk.left_out.push((
                         named,
                         "it is the configuration directory, which holds the key".into(),
@@ -722,6 +727,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(state.join("models"), "{}").unwrap();
+        let scratch_work = state.join("jail").join(&id).join("scratch");
+        std::fs::create_dir_all(&scratch_work).unwrap();
+        std::fs::write(scratch_work.join("work"), "the human's").unwrap();
         std::fs::write(state.join("leaky"), format!("before {KEY} after")).unwrap();
         symlink("/etc/passwd", state.join("link")).unwrap();
         let configuration = scratch.0.join("td-agent");
@@ -792,7 +800,16 @@ mod tests {
             "{manifest}"
         );
         assert!(manifest.contains("  config 14\n"), "{manifest}");
-        assert_eq!((exported.files, exported.left_out), (5, 2));
+        // The jail directories hold the human's work: left out whole.
+        assert!(
+            manifest.contains("state/jail: the workspaces' jail directories"),
+            "{manifest}"
+        );
+        assert!(
+            members.iter().all(|(name, _)| !name.contains("/jail/")),
+            "{members:?}"
+        );
+        assert_eq!((exported.files, exported.left_out), (5, 3));
         // No part is left, and a second export in the same second takes
         // a name of its own.
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);

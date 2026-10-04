@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cost::{self, Limits};
+use crate::workspace::Shared;
 use td_json::Json;
 use td_toml::Toml;
 
@@ -37,6 +38,9 @@ pub struct Client {
     /// train on prompts may serve a request; `deny` by default.
     pub allow_data_collection: bool,
     pub limits: Limits,
+    /// The shared directories the window admitted (DESIGN.md §8),
+    /// resolved and absolute: what every workspace instance binds.
+    pub shared: Vec<Shared>,
 }
 
 impl Default for Client {
@@ -49,6 +53,7 @@ impl Default for Client {
             reasoning_effort: DEFAULT_EFFORT.into(),
             allow_data_collection: false,
             limits: Limits::default(),
+            shared: Vec::new(),
         }
     }
 }
@@ -86,6 +91,20 @@ impl Client {
                 limit(self.limits.conversation),
             ),
             ("max_cost_per_day".into(), limit(self.limits.day)),
+            (
+                "shared".into(),
+                Json::Arr(
+                    self.shared
+                        .iter()
+                        .map(|shared| {
+                            Json::Obj(vec![
+                                ("path".into(), Json::Str(shared.path.display().to_string())),
+                                ("write".into(), Json::Bool(shared.write)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
         ])
     }
 
@@ -113,6 +132,26 @@ impl Client {
                 turn: limit("max_cost_per_turn")?,
                 conversation: limit("max_cost_per_conversation")?,
                 day: limit("max_cost_per_day")?,
+            },
+            shared: match value.get("shared") {
+                None => Vec::new(),
+                Some(Json::Arr(items)) => items
+                    .iter()
+                    .map(|item| {
+                        let path = item
+                            .get("path")
+                            .and_then(Json::as_str)
+                            .map(PathBuf::from)
+                            .filter(|path| path.is_absolute())
+                            .ok_or("a shared directory with no absolute path")?;
+                        let write = item
+                            .get("write")
+                            .and_then(Json::as_bool)
+                            .ok_or("a shared directory with no write flag")?;
+                        Ok(Shared { path, write })
+                    })
+                    .collect::<Result<_, String>>()?,
+                Some(_) => return Err("shared is not a list".into()),
             },
         };
         Ok(client)
@@ -243,8 +282,8 @@ const KEYS: [(&str, Use); 28] = [
     ("max_cost_per_turn", Use::Read),
     ("max_cost_per_conversation", Use::Read),
     ("max_cost_per_day", Use::Read),
-    ("workspace_root", Use::Later(10)),
-    ("shared", Use::Later(10)),
+    ("workspace_root", Use::Read),
+    ("shared", Use::Read),
     ("remotes", Use::Later(11)),
     ("network", Use::Later(15)),
     ("network_allowlist", Use::Later(15)),
@@ -276,6 +315,66 @@ pub struct Config {
     /// One line per key present that a later increment reads, so a
     /// setting that does nothing yet is said, never silently ignored.
     pub notes: Vec<String>,
+    /// `workspace_root` as the file gives it, `~` unexpanded; none is
+    /// `DEFAULT_WORKSPACE_ROOT`.
+    pub workspace_root: Option<PathBuf>,
+    /// `[[shared]]` as the file gives them, `~` unexpanded; none is
+    /// `~/Downloads` read-only, and an empty list none at all.
+    pub shared: Option<Vec<Shared>>,
+}
+
+/// Where repository workspaces live (DESIGN.md §7).
+pub const DEFAULT_WORKSPACE_ROOT: &str = "~/td-agent";
+/// The shared directory every workspace gets unless configured otherwise.
+pub const DEFAULT_SHARED: &str = "~/Downloads";
+
+impl Config {
+    /// `workspace_root`, `~` expanded against `home`.
+    pub fn workspace_root(&self, home: &Path) -> PathBuf {
+        expand(
+            self.workspace_root
+                .as_deref()
+                .unwrap_or(Path::new(DEFAULT_WORKSPACE_ROOT)),
+            home,
+        )
+    }
+
+    /// The shared directories as configured, `~` expanded against `home`,
+    /// not yet admitted (`workspace::admit_shared`).
+    pub fn shared(&self, home: &Path) -> Vec<Shared> {
+        match &self.shared {
+            None => vec![Shared {
+                path: expand(Path::new(DEFAULT_SHARED), home),
+                write: false,
+            }],
+            Some(shared) => shared
+                .iter()
+                .map(|shared| Shared {
+                    path: expand(&shared.path, home),
+                    write: shared.write,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `~` and `~/...` against `home`; any other path as it is.
+pub fn expand(path: &Path, home: &Path) -> PathBuf {
+    match path.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// A configured path: absolute, or under `~`.
+fn configured_path(key: &str, text: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(text);
+    if text.len() > MAX_NAME || !(path.is_absolute() || path.starts_with("~")) {
+        return Err(format!(
+            "`{key}` is an absolute path or one under `~`, not {text:?}"
+        ));
+    }
+    Ok(path)
 }
 
 /// `$XDG_CONFIG_HOME/td-agent/config`, else `$HOME/.config/td-agent/config`.
@@ -370,6 +469,38 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if let Some(word) = text("data_collection")? {
         client.allow_data_collection = data_collection(word)?;
     }
+    if let Some(root) = text("workspace_root")? {
+        config.workspace_root = Some(configured_path("workspace_root", root)?);
+    }
+    if let Some(value) = table.get("shared") {
+        let items = value
+            .as_arr()
+            .ok_or("`shared` is a list of `[[shared]]` tables")?;
+        let mut shared = Vec::new();
+        for item in items {
+            if !item.is_table() {
+                return Err("`shared` is a list of `[[shared]]` tables".into());
+            }
+            item.check_known_keys(&["path", "write"])
+                .map_err(|e| format!("`shared`: {e}"))?;
+            let path = item
+                .optional_str("path")
+                .map_err(|e| format!("`shared`: {e}"))?
+                .ok_or("a `[[shared]]` table has no `path`")?;
+            let write = match item.get("write") {
+                None => false,
+                Some(write) => write
+                    .as_bool()
+                    .ok_or("`shared`'s `write` is true or false")?,
+            };
+            shared.push(Shared {
+                path: configured_path("shared", path)?,
+                write,
+            });
+        }
+        config.shared = Some(shared);
+    }
+    let client = &mut config.client;
     for (key, slot) in [
         ("max_cost_per_turn", &mut client.limits.turn),
         ("max_cost_per_conversation", &mut client.limits.conversation),
@@ -432,14 +563,72 @@ mod tests {
     /// The design's example parses, every key it sets accepted and each
     /// one a later increment reads said.
     #[test]
+    fn workspaces_and_shared_directories_are_configured() {
+        let home = Path::new("/home/u");
+        let config = parse("").unwrap();
+        assert_eq!(config.workspace_root(home), Path::new("/home/u/td-agent"));
+        assert_eq!(
+            config.shared(home),
+            [Shared {
+                path: "/home/u/Downloads".into(),
+                write: false
+            }]
+        );
+        let config =
+            parse("workspace_root = \"/srv/ws\"\n[[shared]]\npath = \"~\"\nwrite = true\n")
+                .unwrap();
+        assert_eq!(config.workspace_root(home), Path::new("/srv/ws"));
+        assert_eq!(
+            config.shared(home),
+            [Shared {
+                path: "/home/u".into(),
+                write: true
+            }]
+        );
+        assert!(parse("shared = []").unwrap().shared(home).is_empty());
+        for bad in [
+            "workspace_root = \"rel\"",
+            "workspace_root = 3",
+            "shared = 3",
+            "[shared]\npath = \"/a\"",
+            "[[shared]]\nwrite = true",
+            "[[shared]]\npath = \"rel\"",
+            "[[shared]]\npath = \"/a\"\nwrite = \"yes\"",
+            "[[shared]]\npath = \"/a\"\nmode = \"ro\"",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let client = Client {
+            shared: vec![Shared {
+                path: "/d".into(),
+                write: true,
+            }],
+            ..Client::default()
+        };
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+    }
+
+    #[test]
     fn every_listed_key_is_accepted_and_the_unread_ones_said() {
         let example = "model = \"anthropic/claude-sonnet-5.5\"\nmode = \"auto\"\n\
                        max_cost_per_day = 25\n\n[[shared]]\npath = \"~/Downloads\"\n\n\
                        [[shared]]\npath = \"~/src/reference\"\nwrite = false\n";
         let config = parse(example).unwrap();
         assert_eq!(config.mode, Mode::Auto);
-        assert_eq!(config.notes.len(), 1, "{:?}", config.notes);
-        assert!(config.notes.iter().any(|n| n.starts_with("`shared`")));
+        assert!(config.notes.is_empty(), "{:?}", config.notes);
+        assert_eq!(
+            config.shared(Path::new("/home/u")),
+            [
+                Shared {
+                    path: "/home/u/Downloads".into(),
+                    write: false
+                },
+                Shared {
+                    path: "/home/u/src/reference".into(),
+                    write: false
+                }
+            ]
+        );
         assert_eq!(config.client.model, "anthropic/claude-sonnet-5.5");
         assert_eq!(config.client.limits.day, Some(25 * cost::ONE));
         for (key, use_) in KEYS {

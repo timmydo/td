@@ -26,6 +26,7 @@ use crate::frame;
 use crate::key::Secret;
 use crate::protocol::{Down, Up};
 use crate::store::{random_hex, Effect, Id, Kind, Role};
+use crate::workspace::Workspace;
 
 /// Restarts in a row without a message acknowledged before the
 /// conversation is left failed; opening it again tries afresh.
@@ -298,6 +299,20 @@ impl Supervisor {
     /// its own or the one already running its turn; the conversation open
     /// before is closed, or left running while its turn does.
     pub fn open(&mut self, id: Id, create: Option<Role>) -> Result<Opened, String> {
+        self.open_as(id, create.map(|role| (role, None)))
+    }
+
+    /// Creates conversation `id` as `role`, working in `workspace`, and
+    /// opens it, as `open` does.
+    pub fn create(&mut self, id: Id, role: Role, workspace: Workspace) -> Result<Opened, String> {
+        self.open_as(id, Some((role, Some(workspace))))
+    }
+
+    fn open_as(
+        &mut self,
+        id: Id,
+        create: Option<(Role, Option<Workspace>)>,
+    ) -> Result<Opened, String> {
         self.leave();
         if let Some(at) = self.at(&id) {
             let failed = self.children.get(at).is_some_and(|r| r.failed);
@@ -312,7 +327,7 @@ impl Supervisor {
             Some(at) => self.parked.swap_remove(at).1,
             None => Vec::new(),
         };
-        let (child, mut writer, incoming) = match self.spawn(&id, create) {
+        let (child, mut writer, incoming) = match self.spawn(&id, create.as_ref()) {
             Ok(spawned) => spawned,
             Err(e) => {
                 if !pending.is_empty() {
@@ -374,7 +389,7 @@ impl Supervisor {
     fn spawn(
         &self,
         id: &Id,
-        create: Option<Role>,
+        create: Option<&(Role, Option<Workspace>)>,
     ) -> Result<(Child, UnixStream, Receiver<Incoming>), String> {
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
         let input = theirs.try_clone().map_err(|e| format!("socketpair: {e}"))?;
@@ -385,8 +400,11 @@ impl Supervisor {
             .arg(id.as_str())
             .arg("--state-dir")
             .arg(&self.state);
-        if let Some(role) = create {
+        if let Some((role, workspace)) = create {
             command.arg("--create").arg(role.word());
+            if let Some(workspace) = workspace {
+                command.arg("--workspace").arg(workspace.argument());
+            }
         }
         let mut child = command
             .stdin(Stdio::from(OwnedFd::from(input)))

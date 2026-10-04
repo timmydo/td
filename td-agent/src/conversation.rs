@@ -60,6 +60,7 @@ use crate::store::{
 };
 use crate::tools::{self, Args, Listed, Op, Target};
 use crate::wake;
+use crate::workspace::Workspace;
 
 /// What a turn ends with when there is no window settings to make a
 /// request with: the window sends them first, so only a harness that
@@ -93,14 +94,19 @@ const RESULT_ROOM: u64 = store::MAX_LINE as u64 + 1;
 
 /// Runs the conversation over the socketpair on standard input and
 /// output until it closes. An error is why it could not go on.
-pub fn run(state: &StateDir, id: &Id, create: Option<Role>) -> Result<(), String> {
+pub fn run(
+    state: &StateDir,
+    id: &Id,
+    create: Option<Role>,
+    workspace: Option<Workspace>,
+) -> Result<(), String> {
     // The socketpair is standard input and output: one socket, taken as
     // a stream by duplicating the descriptor, which needs no `unsafe`.
     let socket = io::stdin()
         .as_fd()
         .try_clone_to_owned()
         .map_err(|e| format!("standard input: {e}"))?;
-    serve(UnixStream::from(socket), state, id, create)
+    serve_in(UnixStream::from(socket), state, id, create, workspace)
 }
 
 /// What the reader thread, and a stream's thread, hand on.
@@ -189,7 +195,28 @@ pub fn serve(
     id: &Id,
     create: Option<Role>,
 ) -> Result<(), String> {
-    let (conversation, load) = Conversation::open(state, id, create, LOCK_WAIT)?;
+    serve_in(stream, state, id, create, None)
+}
+
+/// `serve`, creating the conversation in `workspace`; a workspace is
+/// given only with the role it is created as.
+pub fn serve_in(
+    stream: UnixStream,
+    state: &StateDir,
+    id: &Id,
+    create: Option<Role>,
+    workspace: Option<Workspace>,
+) -> Result<(), String> {
+    let (conversation, load) = match (create, workspace) {
+        (Some(role), workspace) => Conversation::create(state, id, role, workspace, LOCK_WAIT)?,
+        (None, None) => Conversation::open(state, id, None, LOCK_WAIT)?,
+        (None, Some(_)) => return Err("a workspace is given only to a new conversation".into()),
+    };
+    if conversation.meta().workspace.is_some() {
+        if let Err(e) = crate::workspace::clear_specs(state, id) {
+            eprintln!("td-agent: conversation {id}: {e}");
+        }
+    }
     if let Some(bytes) = load.torn {
         eprintln!("td-agent: conversation {id}: dropped a torn final log line of {bytes} bytes");
     }

@@ -511,7 +511,10 @@ fn the_file_menu_opens_a_masked_key_dialog() {
         "{}",
         agent.text()
     );
-    compositor.chord(&[], KEY_DOWN);
+    // Set OpenRouter key…, below the three New items.
+    for _ in 0..3 {
+        compositor.chord(&[], KEY_DOWN);
+    }
     compositor.chord(&[], KEY_ENTER);
     wait(&agent, "the item opens the key dialog", || {
         agent
@@ -685,7 +688,10 @@ mod fixture {
         .for_each(|outcome| assert!(outcome.starts_with("no API key"), "{outcome}"));
 
         compositor.chord(&[], KEY_F10);
-        compositor.chord(&[], KEY_DOWN);
+        // Set OpenRouter key…, below the three New items.
+        for _ in 0..3 {
+            compositor.chord(&[], KEY_DOWN);
+        }
         compositor.chord(&[], KEY_ENTER);
         wait(&agent, "the item opens the key dialog", || {
             agent.state().contains("dialog=entry").then_some(())

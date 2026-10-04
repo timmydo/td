@@ -5,8 +5,9 @@
 //! list, over the composer, td-ui's editor pane, and a status row.
 //!
 //! The list holds the orchestrator first and then every other
-//! conversation, most recently active first. There are no workspaces yet,
-//! so each conversation is a row of its own, a workspace of one.
+//! conversation, most recently active first. Each conversation is a row
+//! of its own; one with a workspace (DESIGN.md §7) names it in the status
+//! row.
 //!
 //! What the window must do outside itself (open a conversation, start a
 //! new one, send a message, ask a failed turn again, save the split) it
@@ -28,6 +29,7 @@
 //! Help → Keys opens the window's key list.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use td_ui::chrome::ROW;
 use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
@@ -44,6 +46,7 @@ use td_ui::tree_table::{self, Cell, Column, Model, Row as TreeRow};
 use td_ui::window::{Clipboard, Input, PointerPhase};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
+use crate::chooser::Chooser;
 use crate::config::Mode;
 use crate::confirm::Confirm;
 use crate::cost;
@@ -166,6 +169,8 @@ pub struct Row {
     pub state: RowState,
     /// The human paused it: messages from other conversations wait.
     pub paused: bool,
+    /// What it works in, as the status row names it.
+    pub workspace: Option<String>,
 }
 
 impl Row {
@@ -186,6 +191,10 @@ pub enum Request {
     Open(Id),
     /// Start a new conversation and open it.
     New,
+    /// Start a new conversation in a scratch workspace.
+    NewScratch,
+    /// Start a new conversation in this directory, once admitted.
+    NewIn(PathBuf),
     /// Send the human's message to the open conversation.
     Send(String),
     /// Ask the open conversation's failed turn again.
@@ -491,6 +500,13 @@ pub struct App {
     /// conversation's.
     picker: Option<Picker>,
     picking_default: bool,
+    /// The directory chooser while it is open, modal over the window, and
+    /// the folder it opens on.
+    chooser: Option<Chooser>,
+    chooser_start: PathBuf,
+    /// Why no workspace can be made, when none can: said at once, before
+    /// a directory is chosen.
+    no_workspaces: Option<String>,
     /// The question before a conversation is deleted, while it is open,
     /// modal over the window; its revision counts the questions asked.
     confirm: Option<Confirm>,
@@ -582,6 +598,12 @@ impl App {
             system_shown: false,
             picker: None,
             picking_default: false,
+            chooser: None,
+            chooser_start: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .unwrap_or_else(|| PathBuf::from("/")),
+            no_workspaces: None,
             confirm: None,
             confirm_revision: 0,
             menu_revision: 1,
@@ -691,6 +713,10 @@ impl App {
             .as_ref()
             .and_then(|id| self.rows.iter().find(|r| &r.id == id));
         let state = row.map_or("no conversation", Row::word);
+        let workspace = row
+            .and_then(|r| r.workspace.as_deref())
+            .map(|w| format!(" | in {w}"))
+            .unwrap_or_default();
         // A notice goes next to the state, where a narrow row still
         // shows it.
         let notice = self
@@ -740,7 +766,7 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{retry}{keyless}{notice} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
+            "{state}{workspace}{retry}{keyless}{notice} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
             of(self.meter.spent, self.limits.conversation),
             self.mode.word()
         )
@@ -788,6 +814,21 @@ impl App {
     /// The model picker, while it is open.
     pub fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
+    }
+
+    /// The directory chooser, while it is open.
+    pub fn chooser(&self) -> Option<&Chooser> {
+        self.chooser.as_ref()
+    }
+
+    /// The folder the directory chooser opens on.
+    pub fn set_chooser_start(&mut self, folder: PathBuf) {
+        self.chooser_start = folder;
+    }
+
+    /// Why no workspace can be made, or none when they can.
+    pub fn set_no_workspaces(&mut self, why: Option<String>) {
+        self.no_workspaces = why;
     }
 
     /// The orchestrator's id, when the list holds it.
@@ -1810,6 +1851,12 @@ impl App {
                 self.note("the window is now too small for the model picker, which is closed");
             }
         }
+        if let Some(chooser) = self.chooser.as_mut() {
+            if !chooser.resize(self.surface, body(self.surface)) {
+                self.close_chooser();
+                self.note("the window is now too small for the directory chooser, which is closed");
+            }
+        }
         if let Some(confirm) = self.confirm.as_mut() {
             if !confirm.resize(self.surface, body(self.surface)) {
                 self.close_confirm();
@@ -1889,6 +1936,7 @@ impl App {
             self.focused
                 && self.dialog.is_none()
                 && self.picker.is_none()
+                && self.chooser.is_none()
                 && self.confirm.is_none()
                 && self.focus == f
         };
@@ -2025,6 +2073,9 @@ impl App {
         if self.picker.is_some() {
             return self.picker_input(input);
         }
+        if self.chooser.is_some() {
+            return self.chooser_input(input);
+        }
         if self.confirm.is_some() {
             return self.confirm_input(input);
         }
@@ -2095,6 +2146,9 @@ impl App {
         }
         if self.picker.is_some() {
             return self.note("a paste that came while the model picker was open is dropped");
+        }
+        if self.chooser.is_some() {
+            return self.note("a paste that came while the directory chooser was open is dropped");
         }
         if self.confirm.is_some() {
             return self.note("a paste that came while the deletion question was open is dropped");
@@ -2206,6 +2260,8 @@ impl App {
     fn menu_action(&mut self, action: menu::Action) {
         match action {
             menu::Action::New => self.requests.push(Request::New),
+            menu::Action::NewScratch => self.new_scratch(),
+            menu::Action::NewInDirectory => self.open_chooser(),
             menu::Action::SetKey => self.open_key_dialog(),
             menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
@@ -2288,10 +2344,104 @@ impl App {
         self.show_picker(crate::picker::DEFAULT_TITLE, &current, true);
     }
 
-    /// Whether a modal is open: the picker, the key dialog or the
-    /// question.
+    /// Whether a modal is open: the picker, the chooser, the key dialog
+    /// or the question.
     fn modal(&self) -> bool {
-        self.picker.is_some() || self.dialog.is_some() || self.confirm.is_some()
+        self.picker.is_some()
+            || self.chooser.is_some()
+            || self.dialog.is_some()
+            || self.confirm.is_some()
+    }
+
+    /// Asks for a conversation in a scratch workspace, as File → New
+    /// scratch conversation does.
+    pub fn new_scratch(&mut self) {
+        if let Some(why) = self.no_workspaces.clone() {
+            return self.note(why);
+        }
+        self.requests.push(Request::NewScratch);
+        self.touch();
+    }
+
+    /// Opens the directory chooser, as File → New conversation in a
+    /// directory… does: modal over the window's body, on the folder it
+    /// last chose from, else the home directory.
+    pub fn open_chooser(&mut self) {
+        if self.modal() {
+            return;
+        }
+        if let Some(why) = self.no_workspaces.clone() {
+            return self.note(why);
+        }
+        self.cancel_pointer();
+        self.menu.dismiss();
+        // Where it last chose from, else the home directory, else the
+        // root: a folder gone since is not a dead end.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute());
+        let mut opened = Err("nowhere to start".to_string());
+        for start in [
+            Some(self.chooser_start.clone()),
+            home,
+            Some(PathBuf::from("/")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            opened = Chooser::open(self.surface, body(self.surface), &start);
+            if opened.is_ok() {
+                break;
+            }
+        }
+        match opened {
+            Ok(chooser) => {
+                self.chooser = Some(chooser);
+                self.apply_focus();
+                self.touch();
+            }
+            Err(e) => self.note(format!("the directory chooser: {e}")),
+        }
+    }
+
+    fn close_chooser(&mut self) {
+        self.chooser = None;
+        self.apply_focus();
+        self.touch();
+    }
+
+    /// An input while the chooser is open, which is the chooser's, as the
+    /// picker's are.
+    fn chooser_input(&mut self, input: Input<'_>) {
+        match input {
+            Input::Resize(surface) => return self.resize(surface),
+            Input::Focus(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.cancel_pointer();
+                }
+                return self.apply_focus();
+            }
+            _ => {}
+        }
+        let Some(chooser) = self.chooser.as_mut() else {
+            return;
+        };
+        match chooser.input(&input) {
+            crate::chooser::Reply::Stay(changed) => {
+                if changed {
+                    self.touch();
+                }
+            }
+            crate::chooser::Reply::Closed => self.close_chooser(),
+            crate::chooser::Reply::Chosen(folder) => {
+                if let Some(parent) = folder.parent() {
+                    self.chooser_start = parent.to_path_buf();
+                }
+                self.close_chooser();
+                self.requests.push(Request::NewIn(folder));
+            }
+        }
     }
 
     fn show_picker(&mut self, title: &str, current: &str, default: bool) {
@@ -2366,7 +2516,7 @@ impl App {
     /// Delete conversation… does: modal over the window's body, `Cancel`
     /// first. The orchestrator is never deleted.
     pub fn open_delete(&mut self) {
-        if self.picker.is_some() || self.dialog.is_some() || self.confirm.is_some() {
+        if self.modal() {
             return;
         }
         let Some(row) = self.active_row() else {
@@ -2377,7 +2527,7 @@ impl App {
                 "the orchestrator is not deleted: it is the one conversation that is always there",
             );
         }
-        let (id, title) = (row.id.clone(), row.title.clone());
+        let (id, title, workspace) = (row.id.clone(), row.title.clone(), row.workspace.clone());
         self.cancel_pointer();
         self.menu.dismiss();
         self.confirm_revision = self.confirm_revision.wrapping_add(1);
@@ -2386,6 +2536,7 @@ impl App {
             body(self.surface),
             id,
             &title,
+            workspace.as_deref(),
             self.confirm_revision,
         ) {
             Ok(confirm) => {
@@ -2466,9 +2617,10 @@ impl App {
         self.press = None;
         match KeyDialog::open(self.surface, &path) {
             Ok(dialog) => {
-                // One modal at a time: the dialog replaces the picker and
-                // the question.
+                // One modal at a time: the dialog replaces the picker, the
+                // chooser and the question.
                 self.picker = None;
+                self.chooser = None;
                 self.confirm = None;
                 self.dialog = Some(dialog);
                 self.apply_focus();
@@ -2621,6 +2773,9 @@ impl App {
         }
         if self.picker.is_some() {
             return self.picker_input(Input::Key { chord, repeat });
+        }
+        if self.chooser.is_some() {
+            return self.chooser_input(Input::Key { chord, repeat });
         }
         if self.confirm.is_some() {
             return self.confirm_input(Input::Key { chord, repeat });
@@ -3021,6 +3176,9 @@ impl Composition for App {
         if let Some(picker) = &self.picker {
             picker.emit(damage, sink);
         }
+        if let Some(chooser) = &self.chooser {
+            chooser.emit(damage, sink);
+        }
         if let Some(confirm) = &self.confirm {
             confirm.emit(damage, sink);
         }
@@ -3063,6 +3221,7 @@ pub mod tests {
             activity,
             state: RowState::Closed,
             paused: false,
+            workspace: None,
         }
     }
 
@@ -4275,7 +4434,10 @@ pub mod tests {
         app.set_key_path(Some(PATH.into()));
         app.set_keyed(false);
         key(&mut app, "F10");
-        key(&mut app, "Down");
+        // Set OpenRouter key…, below the three New items.
+        for _ in 0..3 {
+            key(&mut app, "Down");
+        }
         key(&mut app, "Return");
         assert!(app.dialog().is_some());
         app
@@ -4323,7 +4485,11 @@ pub mod tests {
         assert_eq!(app.take_requests(), [Request::New]);
         // A press on the header opens it; one on the third row exports,
         // and one on the fourth quits.
-        for (row, request) in [(2, Request::Export), (3, Request::Quit)] {
+        for (row, request) in [
+            (1, Request::NewScratch),
+            (4, Request::Export),
+            (5, Request::Quit),
+        ] {
             press(&mut app, CELL_WIDTH as i64 + 4, 4);
             assert!(app.menu_open());
             let panel = app.menu.panel(0).unwrap();
@@ -4590,7 +4756,10 @@ pub mod tests {
     fn with_nowhere_to_store_a_key_the_dialog_does_not_open() {
         let mut app = app();
         key(&mut app, "F10");
-        key(&mut app, "Down");
+        // Set OpenRouter key…, below the three New items.
+        for _ in 0..3 {
+            key(&mut app, "Down");
+        }
         key(&mut app, "Return");
         assert!(app.dialog().is_none());
         assert!(app.notice().unwrap().contains("nowhere to store a key"));
@@ -4608,6 +4777,61 @@ pub mod tests {
             offer("m/conv", true),
             offer("m/plain", false),
         ]
+    }
+
+    #[test]
+    fn workspaces_are_asked_for_from_the_file_menu_and_shown() {
+        let mut app = app();
+        // Without the jail the reason comes at once.
+        app.set_no_workspaces(Some("no workspace jail".into()));
+        app.menu_action(menu::Action::NewScratch);
+        app.menu_action(menu::Action::NewInDirectory);
+        assert!(app.take_requests().is_empty() && app.chooser().is_none());
+        assert_eq!(app.notice(), Some("no workspace jail"));
+        app.set_no_workspaces(None);
+        app.menu_action(menu::Action::NewScratch);
+        assert_eq!(app.take_requests(), [Request::NewScratch]);
+        let base = std::env::temp_dir().join(format!(
+            "td-agent-ui-chooser-{}-{}",
+            std::process::id(),
+            crate::store::random_hex(4).unwrap()
+        ));
+        std::fs::create_dir_all(base.join("notes")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        app.set_chooser_start(base.clone());
+        app.menu_action(menu::Action::NewInDirectory);
+        assert_eq!(app.chooser().unwrap().folder(), base);
+        // The chooser has every key: C-n starts nothing.
+        key(&mut app, "C-n");
+        assert!(app.take_requests().is_empty());
+        key(&mut app, "Return");
+        assert_eq!(app.chooser().unwrap().folder(), base.join("notes"));
+        key(&mut app, "C-Return");
+        assert!(app.chooser().is_none());
+        assert_eq!(app.take_requests(), [Request::NewIn(base.join("notes"))]);
+        // It opens next where it last chose from; Escape chooses nothing.
+        app.menu_action(menu::Action::NewInDirectory);
+        assert_eq!(app.chooser().unwrap().folder(), base);
+        key(&mut app, "Escape");
+        assert!(app.chooser().is_none() && app.take_requests().is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+        // Its folder gone, it opens elsewhere rather than not at all.
+        app.menu_action(menu::Action::NewInDirectory);
+        assert!(app
+            .chooser()
+            .is_some_and(|chooser| chooser.folder() != base));
+        key(&mut app, "Escape");
+        // The status row names the open conversation's workspace.
+        app.add_row(Row {
+            workspace: Some("scratch".into()),
+            ..row(9, Role::Conversation, 1)
+        });
+        app.set_active(id(9));
+        assert!(
+            app.status_line().contains(" | in scratch"),
+            "{}",
+            app.status_line()
+        );
     }
 
     #[test]

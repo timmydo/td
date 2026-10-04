@@ -27,6 +27,7 @@ use crate::accounts::Ledger;
 use crate::config::{Client, Config};
 use crate::control::Remote;
 use crate::diagnostics::{self, Exported};
+use crate::jail::Programs;
 use crate::key::{self, Secret, Unwritten};
 use crate::models::{Credit, Models, MAX_LIST};
 use crate::picker::Offer;
@@ -35,6 +36,7 @@ use crate::protocol::{Down, Up};
 use crate::store::{self, Event, Id, Kind, Role, StateDir};
 use crate::supervisor::{Opened, Supervisor, Update};
 use crate::ui::{App, Request, Row, RowState};
+use crate::workspace::{self, Places, Workspace};
 
 /// The longest a turn waits before polling the conversation again.
 const POLL_MS: u64 = 50;
@@ -185,6 +187,8 @@ pub struct Session {
     /// Help → Keys was chosen by the live pointer or keyboard: td-ui's
     /// window shows its key list.
     show_keys: bool,
+    /// Where no workspace may be, or why there are no workspaces.
+    places: Result<Places, String>,
 }
 
 impl Session {
@@ -193,7 +197,9 @@ impl Session {
         for request in self.app.take_requests() {
             match request {
                 Request::Open(id) => self.open(id, None),
-                Request::New => self.start(),
+                Request::New => self.start(None),
+                Request::NewScratch => self.start_in(None),
+                Request::NewIn(folder) => self.start_in(Some(folder)),
                 Request::Send(text) => {
                     if let Err(e) = self.supervisor.send(text.clone()) {
                         self.app.restore(&text, e);
@@ -279,7 +285,21 @@ impl Session {
     /// Opens conversation `id`: a process of its own replays its log; one
     /// already running its turn is adopted, and the log is read here.
     fn open(&mut self, id: Id, create: Option<Role>) {
-        match self.supervisor.open(id.clone(), create) {
+        let opened = self.supervisor.open(id.clone(), create);
+        self.opened(opened);
+    }
+
+    /// What opening a conversation came to: a process of its own replays
+    /// its log; one already running its turn is adopted, and the log is
+    /// read here.
+    fn opened(&mut self, opened: Result<Opened, String>) {
+        let Some(id) = self.supervisor.open_id().cloned() else {
+            if let Err(reason) = opened {
+                self.app.update(Update::Failed { reason }, store::now());
+            }
+            return;
+        };
+        match opened {
             Ok(Opened::Started) => {}
             Ok(Opened::Adopted) => match store::read_log(&self.state, &id) {
                 Ok(events) => {
@@ -293,8 +313,27 @@ impl Session {
         }
     }
 
+    /// A new conversation in a workspace: a scratch one, or `folder`,
+    /// admitted first (DESIGN.md §8), its refusal said by name.
+    fn start_in(&mut self, folder: Option<PathBuf>) {
+        let places = match &self.places {
+            Ok(places) => places,
+            Err(why) => return self.app.note(why.clone()),
+        };
+        let workspace = match folder {
+            None => Workspace::Scratch,
+            Some(folder) => {
+                match workspace::admit_directory(&folder, places, &self.client.shared) {
+                    Ok(admitted) => Workspace::Directory(admitted),
+                    Err(why) => return self.app.note(format!("no conversation there: {why}")),
+                }
+            }
+        };
+        self.start(Some(workspace));
+    }
+
     /// A new conversation, created by its own process and opened.
-    fn start(&mut self) {
+    fn start(&mut self, workspace: Option<Workspace>) {
         let id = match Id::random() {
             Ok(id) => id,
             Err(e) => {
@@ -309,9 +348,16 @@ impl Session {
             activity: store::now(),
             state: RowState::Starting,
             paused: false,
+            workspace: workspace.as_ref().map(Workspace::label),
         });
         self.app.set_active(id.clone());
-        self.open(id, Some(Role::Conversation));
+        match workspace {
+            None => self.open(id, Some(Role::Conversation)),
+            Some(workspace) => {
+                let created = self.supervisor.create(id, Role::Conversation, workspace);
+                self.opened(created);
+            }
+        }
     }
 
     /// What the conversation processes said: reservations answered from
@@ -476,7 +522,8 @@ impl Session {
     }
 
     /// Starts the diagnostics export (DESIGN.md §4) on a thread, into
-    /// `~/Downloads`, else the home directory.
+    /// `~/Downloads`, else the home directory: never where a workspace
+    /// reaches, since the archive holds every conversation's log.
     fn export(&mut self) {
         if self.export.is_some() {
             return self.app.note("a diagnostics export is already under way");
@@ -490,7 +537,29 @@ impl Session {
                 .note("no diagnostics: HOME is not an absolute path to write them under");
         };
         let downloads = home.join("Downloads");
-        let into = if downloads.is_dir() { downloads } else { home };
+        // Not where a workspace reaches: a shared directory, or a
+        // conversation's own directory.
+        let directories: Vec<PathBuf> = self
+            .state
+            .list()
+            .0
+            .into_iter()
+            .filter_map(|meta| match meta.workspace {
+                Some(Workspace::Directory(path)) => Some(path),
+                _ => None,
+            })
+            .chain(self.client.shared.iter().map(|shared| shared.path.clone()))
+            .collect();
+        let shared = std::fs::canonicalize(&downloads).is_ok_and(|real| {
+            directories
+                .iter()
+                .any(|reached| real.starts_with(reached) || reached.starts_with(&real))
+        });
+        let into = if downloads.is_dir() && !shared {
+            downloads
+        } else {
+            home
+        };
         let config = self.config_file();
         // Every key this window has held, and the stored one, only to
         // look for: no file holding one is taken.
@@ -703,6 +772,17 @@ fn default_model(
     }
 }
 
+/// Where no workspace may be (DESIGN.md §8), with the jail's programs:
+/// none without them.
+fn places(config: &Config, state: &StateDir) -> Result<Places, String> {
+    let programs = Programs::from_env()?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or("HOME is not an absolute path, so no workspace can be admitted")?;
+    Places::from_env(state.root(), &config.workspace_root(&home), &programs)
+}
+
 /// The conversations the store holds, as the list shows them, closed.
 fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
     let (metas, mut problems) = state.list();
@@ -723,6 +803,7 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
                 activity,
                 state: RowState::Closed,
                 paused: meta.paused,
+                workspace: meta.workspace.as_ref().map(Workspace::label),
             }
         })
         .collect();
@@ -788,6 +869,30 @@ pub fn run(
         .map(|r| r.id.clone());
     app.set_rows(rows);
     let mut client = config.client.clone();
+    // Workspaces, and the shared directories each gets, admitted once
+    // here; without ./agent's jail there are none, and asking says why.
+    let places = places(&config, &state);
+    match &places {
+        Ok(places) => {
+            let (shared, notes) = workspace::admit_shared(&config.shared(&places.home), places);
+            for note in &notes {
+                eprintln!("td-agent: {note}");
+            }
+            match notes.as_slice() {
+                [] => {}
+                [note] => app.note(note.clone()),
+                more => app.note(format!(
+                    "{} shared directories are not given to workspaces; see standard error",
+                    more.len()
+                )),
+            }
+            client.shared = shared;
+        }
+        Err(why) => {
+            eprintln!("td-agent: {why}");
+            app.set_no_workspaces(Some(why.clone()));
+        }
+    }
     let model_key = config.model_key.clone();
     let (model, set_aside) = default_model(
         model_key.as_deref(),
@@ -850,6 +955,7 @@ pub fn run(
         export: None,
         keys: key.iter().cloned().collect(),
         show_keys: false,
+        places,
     };
     // A cached list serves until the provider's comes.
     match Models::load(session.state.root()) {
@@ -875,6 +981,7 @@ pub fn run(
                 activity: store::now(),
                 state: RowState::Starting,
                 paused: false,
+                workspace: None,
             });
             session.app.set_active(id.clone());
             session.open(id, Some(Role::Orchestrator));

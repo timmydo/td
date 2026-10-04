@@ -1695,6 +1695,38 @@ workspace under the jail directory for a general-assistant conversation.
 Neither has git management. A directory whose top holds a `.git` is
 refused with a pointer to a repository workspace.
 
+**As built (increment 10, workspaces).** File → New scratch
+conversation, and File → New conversation in a directory…, which opens
+td-ui's finder over the human's folders (Return enters one, Backspace
+goes up, Control+Return chooses the one listed; a repository's top is
+marked `git`, a link `link`, hidden names left out). The window admits
+the directory when it is chosen, before the conversation exists, and
+says a refusal by name (§8, Admission). A repository's top, a work
+tree's or a bare one, and anything inside a git directory are refused
+too; a work tree's subdirectory is admitted, since its `.git` is out of
+the jail's reach. The shared directories, `[[shared]]` in configuration
+and `~/Downloads` read-only by default, are admitted once at the
+window's start, each refused one named and left out. Without
+`./agent`'s td-jail and td-txt no workspace is made, and asking for one
+says why at once. A conversation's `meta` records its workspace,
+`{"kind": "scratch"}` or `{"kind": "directory", "path": …}`, fixed at
+creation; its jail directory is `$XDG_STATE_HOME/td-agent/jail/<id>/`,
+holding the instances' `home/`, a scratch workspace's `scratch/`, and
+`specs/`, which its process clears whenever it starts. A directory
+workspace is the human's and is never removed. Deleting the
+conversation renames its jail directory out of the way and removes it
+on a thread of its own, with the walk Closing describes; the window's
+start does the same for one left without its conversation or cut short.
+The walk goes through directory descriptors opened without following a
+link, so a process still running in the tree cannot turn it out of the
+tree, and holds at most 256 open, moving a deeper directory up within
+the tree. The status row names the workspace; the deletion question
+says whether a scratch workspace goes with the conversation; and the
+diagnostics export leaves `jail/` out, since it holds the human's work,
+and writes its archive, which holds every conversation's log, to the
+home directory rather than a `~/Downloads` that a workspace reaches.
+The model is given no tool in a workspace until the next step.
+
 **Closing.** `close_workspace` stops the workspace's instances, then asks a
 maintenance instance whether each worktree is clean and each branch's tip
 has been pushed. That answer is jail-controlled, so a workspace that
@@ -1887,21 +1919,43 @@ td-agent then refuses, for every one of those sources, on top of §C:
 
 - one that is, contains, or lies inside td-agent's configuration
   directory, its state directory, its jail directory, the publish
-  repositories, or the caller's runtime directory, other than the parts of
-  the data directory the git chain binds;
+  repositories, or the caller's runtime directory (`/run/user/UID` when
+  `XDG_RUNTIME_DIR` is unset), other than the parts of the data
+  directory the git chain binds and a conversation's own instance home
+  and scratch workspace, which td-agent makes in its jail directory;
 - one that is, contains, or lies inside a credential location: `~/.ssh`,
   `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`,
   `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`,
   `~/.cargo/credentials` and `~/.cargo/credentials.toml`, `~/.npmrc`,
   `~/.pypirc`, `~/.docker`, `~/.kube`, `~/.password-store`,
   `~/.local/share/keyrings`, td's own credential and secret stores, or a
-  browser profile;
+  browser profile; a configuration home's (`~/.config` and
+  `$XDG_CONFIG_HOME`) `autostart`, `systemd`, `environment.d` and `git`,
+  which the session or git runs from; a data home's `applications`;
+  and sandboxed applications' `~/.var/app` and `~/snap`;
 - a shared or extra directory that contains a worktree or any part of the
   git chain, which would make a protected entry's ancestors renamable;
 - a shared or extra directory, or a directory workspace, that is,
   contains, or lies inside `workspace_root`, so that no workspace reaches
   another's tree; and td-agent creates no worktree under a path a live
-  grant covers.
+  grant covers;
+- any of the above reached through a bind mount: td-agent compares the
+  grant, and every mount at or below it, with each refused place by
+  device and the path within it, as `/proc/self/mountinfo` gives them,
+  and a place not made yet by where it will be, its deepest existing
+  ancestor resolved;
+- a directory workspace, or a shared or extra directory the model may
+  write, that is or contains a program td-agent runs or binds (td-jail,
+  td-txt, td-agent itself, each by the path it resolves to, which is
+  the path it is run by), or that is or contains a directory on
+  `PATH`, `~/bin`, `~/.local/bin` or `~/.cargo/bin` (one inside them
+  puts nothing there): the model could replace its own jail, or the
+  `cargo` that builds it. td-jail refuses the same by mount identity
+  for its own executable and the spec's programs. A checkout whose
+  build output holds them is therefore shared read-only or not at all;
+  one built elsewhere can be granted, and `./agent` then rebuilds
+  td-jail from sources the model wrote, a persistence channel like
+  those above.
 
 **Limits.** The first increments set none, and say so in the status row.
 td-jail's application launch sets the package's `RLIMIT_DATA` on every

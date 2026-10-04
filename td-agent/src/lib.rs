@@ -26,6 +26,7 @@
 
 pub mod accounts;
 pub mod assemble;
+pub mod chooser;
 pub mod client;
 pub mod config;
 pub mod confirm;
@@ -60,3 +61,4 @@ pub mod tools;
 pub mod ui;
 pub mod wake;
 pub mod window;
+pub mod workspace;

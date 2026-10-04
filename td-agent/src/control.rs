@@ -120,6 +120,18 @@ pub const BINDINGS: &[Binding] = &[
         help: "File > Set OpenRouter key...: open the dialog that stores the OpenRouter API key.",
     },
     Binding {
+        name: "new-scratch",
+        chord: None,
+        arguments: "",
+        help: "File > New scratch conversation: start a conversation in a scratch workspace of its own.",
+    },
+    Binding {
+        name: "new-in-directory",
+        chord: None,
+        arguments: "",
+        help: "File > New conversation in a directory...: open the directory chooser: Return enters a folder, Backspace goes up, C-Return starts the conversation in the folder listed, Escape cancels.",
+    },
+    Binding {
         name: "model",
         chord: None,
         arguments: "",
@@ -183,7 +195,13 @@ impl Controller for Remote<'_> {
         // Through the menu's own paths, as a choice of its item.
         if matches!(
             name,
-            "set-key" | "model" | "export-diagnostics" | "delete-conversation" | "default-model"
+            "set-key"
+                | "model"
+                | "export-diagnostics"
+                | "delete-conversation"
+                | "default-model"
+                | "new-scratch"
+                | "new-in-directory"
         ) {
             let before = self.app.generation();
             match name {
@@ -191,6 +209,8 @@ impl Controller for Remote<'_> {
                 "model" => self.app.open_picker(),
                 "delete-conversation" => self.app.open_delete(),
                 "default-model" => self.app.open_default_picker(),
+                "new-scratch" => self.app.new_scratch(),
+                "new-in-directory" => self.app.open_chooser(),
                 _ => self.app.export_diagnostics(),
             }
             return Ok(self.outcome(before));
@@ -263,8 +283,14 @@ impl Controller for Remote<'_> {
         let (picker, query) = app.picker().map_or(("none", ""), |picker| {
             (picker.selected().unwrap_or("nothing"), picker.query())
         });
+        // The chooser's folder: a path of the human's, as the status row
+        // would name it once chosen.
+        let chooser = app.chooser().map_or_else(
+            || "none".to_string(),
+            |chooser| chooser.folder().display().to_string(),
+        );
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tstatus={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
@@ -276,6 +302,7 @@ impl Controller for Remote<'_> {
             app.model(),
             app.effort(),
             app.default_model(),
+            chooser.replace(['\t', '\n'], " "),
             app.status_line().replace(['\t', '\n'], " "),
         ))
     }
@@ -342,14 +369,17 @@ mod tests {
             .contains("no key: File \u{2192} Set OpenRouter key\u{2026} (F10)"));
         assert!(driven::request(&mut remote, b"1\t1\taction\tmenu").ends_with("changed"));
         assert!(remote.state().unwrap().contains("menu=open"));
-        // Down to the second item, and chosen.
+        // Down to Set OpenRouter key…, below the three New items, and
+        // chosen.
+        for n in 2..5 {
+            driven::request(
+                &mut remote,
+                format!("1\t{n}\tkey\t{}", hex("Down")).as_bytes(),
+            );
+        }
         driven::request(
             &mut remote,
-            format!("1\t2\tkey\t{}", hex("Down")).as_bytes(),
-        );
-        driven::request(
-            &mut remote,
-            format!("1\t3\tkey\t{}", hex("Return")).as_bytes(),
+            format!("1\t5\tkey\t{}", hex("Return")).as_bytes(),
         );
         let state = remote.state().unwrap();
         assert!(

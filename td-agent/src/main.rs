@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use td_agent::store::{Id, Role, StateDir};
+use td_agent::workspace::Workspace;
 
 const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20      td-agent --help\n\
@@ -25,6 +26,8 @@ list, the transcript and the composer; F10 opens the menus: File's\n\
 Set OpenRouter key... stores the key and Export diagnostics writes an\n\
 archive of the state and configuration, never the key file, to\n\
 ~/Downloads (else the home directory);\n\
+File's New scratch conversation and New conversation in a directory...\n\
+start one with a workspace for the tools (td-agent/DESIGN.md §7);\n\
 Conversation's Model... and Effort choose the open conversation's model\n\
 and reasoning effort, Default model... the model new conversations use,\n\
 and Delete conversation... deletes the open one for good; F1, or\n\
@@ -37,17 +40,27 @@ API key: one line in $XDG_CONFIG_HOME/td-agent/openrouter.key, a file\n\
 of your own, mode 0600, in directories only you and root can write,\n\
 which File > Set OpenRouter key... writes.\n";
 
-/// `td-agent conversation ID --state-dir DIR [--create ROLE]`: the
-/// window starts these; a person does not.
+/// `td-agent conversation ID --state-dir DIR [--create ROLE [--workspace
+/// WORKSPACE]]`: the window starts these; a person does not.
 fn conversation(args: &[String]) -> Result<(), String> {
-    let usage = "usage: td-agent conversation ID --state-dir ABSOLUTE-DIR [--create ROLE]";
+    let usage = "usage: td-agent conversation ID --state-dir ABSOLUTE-DIR \
+                 [--create ROLE [--workspace scratch|ABSOLUTE-DIR]]";
     let (id, rest) = args.split_first().ok_or(usage)?;
     let id = Id::parse(id).ok_or_else(|| format!("{id:?} is not a conversation id"))?;
-    let (state, create) = match rest {
-        [flag, dir] if flag == "--state-dir" => (dir, None),
-        [flag, dir, create, role] if flag == "--state-dir" && create == "--create" => {
-            let role = Role::parse(role).ok_or_else(|| format!("{role:?} is not a role"))?;
-            (dir, Some(role))
+    let role = |role: &str| Role::parse(role).ok_or_else(|| format!("{role:?} is not a role"));
+    let (state, create, workspace) = match rest {
+        [flag, dir] if flag == "--state-dir" => (dir, None, None),
+        [flag, dir, create, named] if flag == "--state-dir" && create == "--create" => {
+            (dir, Some(role(named)?), None)
+        }
+        [flag, dir, create, named, inside, word]
+            if flag == "--state-dir" && create == "--create" && inside == "--workspace" =>
+        {
+            (
+                dir,
+                Some(role(named)?),
+                Some(Workspace::parse_argument(word)?),
+            )
         }
         _ => return Err(usage.into()),
     };
@@ -55,7 +68,7 @@ fn conversation(args: &[String]) -> Result<(), String> {
     if !state.is_absolute() {
         return Err(format!("{} is not an absolute path", state.display()));
     }
-    td_agent::conversation::run(&StateDir::at(state), &id, create)
+    td_agent::conversation::run(&StateDir::at(state), &id, create, workspace)
 }
 
 fn window(args: &[String]) -> Result<(), String> {

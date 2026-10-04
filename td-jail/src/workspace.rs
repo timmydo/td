@@ -369,6 +369,18 @@ fn admit(
         .parent()
         .map(|dir| authority::mount_identity_for_path(&mountinfo, dir))
         .transpose()?;
+    // A tree the instance can write holds no program the caller runs:
+    // td-jail itself, which runs outside every jail, nor the spec's, which
+    // the next instance runs and its launcher may run unconfined.
+    let mut held = vec![std::env::current_exe()?];
+    held.extend(programs.iter().map(|program| program.source.clone()));
+    let held = held
+        .into_iter()
+        .map(|path| {
+            let identity = authority::mount_identity_for_path(&mountinfo, &path)?;
+            Ok((path, identity))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let mut identities = Vec::new();
     for grant in &all {
         refuse_reserved(&grant.source, real_home, reserved)?;
@@ -394,6 +406,20 @@ fn admit(
                 "workspace spec {} lies in the directory {} it grants",
                 spec_path.display(),
                 grant.source.display()
+            )));
+        }
+        let writable_program = held.iter().find(|(path, identity)| {
+            !grant.read_only
+                && (path_is_same_or_child(path, &grant.source)
+                    || mounts
+                        .iter()
+                        .any(|mount| contains_by_identity(mount, identity)))
+        });
+        if let Some((program, _)) = writable_program {
+            return Err(invalid(format!(
+                "workspace directory {} is writable and holds the program {}",
+                grant.source.display(),
+                program.display()
             )));
         }
         if authority::mount_identity_sets_overlap(&mounts, &reserved_mounts) {
@@ -746,6 +772,33 @@ mod tests {
             &["/proc"],
         )
         .is_err());
+        // A program in a tree the instance could write, but not in one
+        // it can only read.
+        let built = tree.join("built");
+        fs::write(&built, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&built, fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = admit_spec(spec(&[&built], &home, &[&tree], &[])).unwrap_err();
+        assert!(
+            refused.to_string().contains("holds the program"),
+            "{refused}"
+        );
+        let given = shared.join("given");
+        fs::write(&given, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&given, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(admit_spec(spec(&[&given], &home, &[&tree], &[&shared])).is_ok());
+        let mut written = spec(&[&given], &home, &[&tree], &[]);
+        written.write.push(shared.clone());
+        assert!(admit_spec(written).is_err());
+        fs::remove_file(&built).unwrap();
+        fs::remove_file(&given).unwrap();
+        // td-jail's own executable, here the test's, in a writable tree.
+        let own = std::env::current_exe().unwrap();
+        let own_tree = fs::canonicalize(own.parent().unwrap()).unwrap();
+        let refused = admit_spec(spec(&[&entry], &home, &[&own_tree], &[])).unwrap_err();
+        assert!(
+            refused.to_string().contains("holds the program"),
+            "{refused}"
+        );
         // A link, rather than the directory it names.
         assert!(admit_spec(spec(&[&entry], &home, &[&base.join("link")], &[])).is_err());
         // Overlap, by path or as the same directory twice.

@@ -3555,7 +3555,10 @@ with the kind's own departures:
   through them the whole host; so is a system tree carrying one. The spec
   home must be the caller's, mode 0700. The spec itself must lie outside
   every directory it grants, since the caller's own jailed tools run as
-  the caller.
+  the caller, and no directory the instance can write (the home, a
+  worktree, a `write` directory) may hold td-jail's own executable or a
+  spec program, by path or by mount identity: td-jail runs outside every
+  jail, and a launcher may run its entry unconfined.
 - **Mount flags.** Every directory is `nosuid,nodev`. The home and the
   shared directories are `noexec`; worktrees are not, because the
   agent's shell runs what it builds there. `read` directories are

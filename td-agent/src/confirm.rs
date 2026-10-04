@@ -57,14 +57,27 @@ impl Confirm {
         body: Rect,
         id: Id,
         title: &str,
+        workspace: Option<&str>,
         revision: u64,
     ) -> Result<Self, String> {
         let named = format!("Delete \u{201c}{title}\u{201d} ({})?", id.as_str());
-        let details: &[&str] = &[
+        let worked = match workspace {
+            Some("scratch") => {
+                "Its scratch workspace and every file in it are removed with it.".to_string()
+            }
+            Some(directory) => {
+                format!("The directory it works in, {directory}, is yours and stays.")
+            }
+            None => String::new(),
+        };
+        let mut details: Vec<&str> = vec![
             &named,
             "Its log, its todo list, its cost record and the messages waiting for it are removed from this machine for good. Messages it sent to other conversations stay in theirs. This cannot be undone.",
         ];
-        let model = Model::new(TITLE, DELETE, details, Delete, revision)
+        if !worked.is_empty() {
+            details.push(&worked);
+        }
+        let model = Model::new(TITLE, DELETE, &details, Delete, revision)
             .map_err(|e| format!("the deletion question: {e}"))?;
         let dialog = Controller::new(model, surface, place(surface, body), None)
             .map_err(|e| format!("the deletion question: {e}"))?;
@@ -160,7 +173,7 @@ mod tests {
     fn open() -> Confirm {
         let surface = Surface::new(1024, 640, Scale::default()).unwrap();
         let id = Id::parse(&"c".repeat(32)).unwrap();
-        Confirm::open(surface, surface.bounds(), id, "a plan", 7).unwrap()
+        Confirm::open(surface, surface.bounds(), id, "a plan", Some("scratch"), 7).unwrap()
     }
 
     fn key(confirm: &mut Confirm, chord: &str) -> Reply {
