@@ -71,13 +71,29 @@ with both hexadecimal cases. Quoted extended wrappers are explicitly
 admitted but their logical content still follows extended spelling. Decoded
 NUL and invalid UTF-8 remain octets for the caller's charset/control policy.
 
-Projection owns no output buffer or collection and emits at most one octet
-per turn. Its visits/records fit the common shared maxima. All octet events
-remain provisional until Complete and retire after any later value or
-candidate refusal. check_work performs the same sticky zero-count fresh
-admission as the name classifier. Enclosing field validation, numbered
+mime_value projection owns no output buffer or collection and emits at most
+one octet per turn. Its visits/records fit the common shared maxima. All
+octet events remain provisional until Complete and retire after any later
+value or candidate refusal. check_work performs the same sticky zero-count
+fresh admission as the name classifier. Enclosing field validation, numbered
 assembly, charset conversion, filtering and display-word placement remain
 external; projected octets never authorize word recognition.
+
+projection::atom is a stateless logical reader shared by MIME values and
+mail phrase/comment display readers. The caller supplies a position, quoted
+flag and bounded read callback, retaining source bounds and exact EOF
+admission policy. One invocation makes at most six callback calls and
+returns at most one octet, next source position and escaped provenance.
+Unquote first, then unfold logical CRLF/LF followed by WSP; retain following
+whitespace and OR provenance across all fold contributors. Escaped nonfold
+line endings remain literal. The callback admits reads before access and
+propagates refusal immediately. Incomplete pairs and checked position
+overflow remain distinct failures. No source, work owner, clock, buffer or
+collection is retained. The caller supplies complete validated spelling,
+maps invariant errors and latches failure in its existing owner. No lexical
+proof or original-source encoded-word placement follows from projected
+octets. This helper has no poll/cached state and does not change the lexical
+cursor limits below.
 
 None of these helpers discovers raw-message field boundaries, selects
 fields, decodes encoded words or charsets, normalizes Unicode, assembles
@@ -85,19 +101,20 @@ addresses/parameters, creates protocol output or grants
 identity. Provisional comment events retire on any later failure; lexical
 Complete validates only the helper's scope, not its enclosing field.
 
-Work::charge runs before each access or transition. Charge reports visits
-and records separately, including lead-byte rereads and failed fold
-lookahead. Each poll performs at most 32 transitions, 160 source-byte visits
-and 32 record charges, emits no retained output bytes and owns no growing
-buffer or collection. The caller implements the bounded callback and binds
-current clock, cancellation and aggregate/job budgets to it. No replacement
-callback can revive a failed cursor; Error<E> retains the original Copy
-error. Cached completion performs no new work. Live final admission belongs
-to the caller. Generic cursor size depends on E; with td-mta's fixed errors
-CFWS and delimited cursors remain within 64 bytes, and the parameter-name
-cursor within 128 bytes and the parameter-value cursor within 160 bytes. No
-Clone or Copy implementation permits duplicating live lexical state.
-Constructor allocation and complete-field authorization are external.
+For resident lexical cursors, Work::charge runs before each access or
+transition. Charge reports visits and records separately, including
+lead-byte rereads and failed fold lookahead. Each poll performs at most 32
+transitions, 160 source-byte visits and 32 record charges, emits no retained
+output bytes and owns no growing buffer or collection. The caller implements
+the bounded callback and binds current clock, cancellation and aggregate/job
+budgets to it. No replacement callback can revive a failed cursor; Error<E>
+retains the original Copy error. Cached completion performs no new work.
+Live final admission belongs to the caller. Generic cursor size depends on
+E; with td-mta's fixed errors CFWS and delimited cursors remain within 64
+bytes, and the parameter-name cursor within 128 bytes and the
+parameter-value cursor within 160 bytes. No Clone or Copy implementation
+permits duplicating live lexical state. Constructor allocation and
+complete-field authorization are external.
 
 Mail wrappers preserve their public errors and original budget/clock
 binding. The source grammars migrate atomically: no old parser remains

@@ -109,48 +109,19 @@ impl<'a> Cursor<'a> {
         }
         Ok(Some(*self.source.get(at).ok_or(Error::InvalidState)?))
     }
-    fn unquoted(
-        &self,
-        at: usize,
-        now: Tick,
-        work: &mut impl Work,
-    ) -> Result<Option<(u8, usize, bool)>, Error> {
-        let Some(mut byte) = self.byte(at, now, work)? else {
-            return Ok(None);
-        };
-        let mut next = at.checked_add(1).ok_or(Error::InvalidState)?;
-        let escaped = byte == b'\\';
-        if escaped {
-            byte = self.byte(next, now, work)?.ok_or(Error::InvalidState)?;
-            next = next.checked_add(1).ok_or(Error::InvalidState)?;
-        }
-        Ok(Some((byte, next, escaped)))
-    }
     fn atom(
         &self,
         at: usize,
         now: Tick,
         work: &mut impl Work,
     ) -> Result<Option<(u8, usize, bool)>, Error> {
-        let Some((byte, next, escaped)) = self.unquoted(at, now, work)? else {
-            return Ok(None);
-        };
-        let after = match byte {
-            b'\r' => match self.unquoted(next, now, work)? {
-                Some((b'\n', after, quoted_lf)) => Some((after, escaped || quoted_lf)),
-                _ => None,
-            },
-            b'\n' => Some((next, escaped)),
-            _ => None,
-        };
-        if let Some((after, quoted_line)) = after {
-            if let Some((space @ (b' ' | b'\t'), next, quoted_space)) =
-                self.unquoted(after, now, work)?
-            {
-                return Ok(Some((space, next, quoted_line || quoted_space)));
-            }
-        }
-        Ok(Some((byte, next, escaped)))
+        td_header::projection::atom(at, true, |at| self.byte(at, now, work))
+            .map(|atom| atom.map(|atom| (atom.value, atom.next, atom.escaped)))
+            .map_err(|error| match error {
+                td_header::projection::Error::Read(error) => error,
+                td_header::projection::Error::IncompletePair
+                | td_header::projection::Error::InvalidState => Error::InvalidState,
+            })
     }
     fn begin_candidate(&mut self, position: usize) {
         self.token_start = position;
@@ -366,6 +337,41 @@ mod tests {
         collect(cursor(input.as_bytes()), &mut work())
     }
     #[test]
+    fn shared_projection_preserves_source_admission_and_eof_policy() {
+        #[derive(Default)]
+        struct Counts {
+            calls: u64,
+            visits: u64,
+        }
+        impl Work for Counts {
+            fn charge(
+                &mut self,
+                _now: Tick,
+                charge: Charge,
+            ) -> Result<(), crate::decode_work::Error> {
+                self.calls += 1;
+                self.visits += charge.io_bytes;
+                assert_eq!(charge.records, 0);
+                Ok(())
+            }
+        }
+        let source = b"(\\\r\\\n\\ x)";
+        let cursor = cursor(source);
+        let mut counts = Counts::default();
+        assert_eq!(
+            cursor.atom(1, Tick(1), &mut counts).unwrap(),
+            Some((b' ', 7, true))
+        );
+        assert_eq!((counts.calls, counts.visits), (6, 6));
+        let before = counts.calls;
+        assert_eq!(
+            cursor.atom(source.len() - 1, Tick(1), &mut counts).unwrap(),
+            None
+        );
+        assert_eq!(counts.calls - before, 1);
+        assert_eq!(counts.visits, 6);
+    }
+    #[test]
     fn comments_preserve_nested_and_escaped_text_with_explicit_whitespace_policy() {
         for (source, expected) in [
             ("()", ""),
@@ -402,6 +408,10 @@ mod tests {
             (format!("(({word}))"), "(x)".to_owned()),
             (format!("({word}\r\n {word})"), "xx".to_owned()),
             (format!("({word}\n {word})"), "xx".to_owned()),
+            (format!("(\\\r\\\n {word})"), " x".to_owned()),
+            (format!("(\\\r\n {word})"), " x".to_owned()),
+            (format!("(\\\n {word})"), " x".to_owned()),
+            (format!("({word}\\\r\\\n {word})"), "x x".to_owned()),
             (format!("({word} ({word}))"), "x (x)".to_owned()),
             (format!("({word}(nested))"), "x(nested)".to_owned()),
             (format!("((nested){word})"), "(nested)x".to_owned()),

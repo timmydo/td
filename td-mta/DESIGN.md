@@ -296,12 +296,12 @@ fresh admission is shared by the name/value wrappers without spending
 parsing steps or prepaid credit.
 The passive language-tag feed state is shared by parameter prefixes and
 encoded-word qualifiers; recognition retains its precharged 75-byte ceiling.
-The unquote/fold projection overlaps existing phrase/comment readers. A
-later shared extraction must preserve their original-source placement and
-escaped-byte provenance, their distinct invariant errors and EOF charge
-contracts; the value cursor alone grants no display-word placement. That
-migration remains open rather than widening this lexical increment into
-those display consumers without their dedicated qualification.
+Stateless shared projection now unquotes/folds MIME value, phrase and
+comment octets through one reader. Caller callbacks preserve source bounds,
+distinct errors and EOF charges; escaped-fold provenance remains available
+to mail display consumers. Original placement, scalar decoding/filtering,
+normalization and sticky admission/failure ownership remain in mail.
+Projected bytes create no lexical validity or display-word placement proof.
 New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed

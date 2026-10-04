@@ -1725,6 +1725,16 @@ Initial independently landable increments:
   ownership and allocation-free construction/drain. Numbered candidate
   replay, display conversion, boundaries and MIME traversal remain open.
 
+- **M06bt — shared unquote/fold reader:** atomically replace the MIME
+  value, phrase and comment projection grammars with stateless std-only
+  td-header::projection. Preserve escaped fold provenance, exact source
+  positions, distinct invariant errors and each callback's EOF admission.
+  Leave original placement, work/failure ownership and normalization in
+  mail. Pin maximal six reads, all octets and every refusal in shared
+  fixtures; pin mail EOF differences and retain placement, fixed-turn and
+  allocation qualification. Complete parameter-family selection, derived
+  metadata and MIME traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

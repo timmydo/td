@@ -137,43 +137,18 @@ impl<'a, E: Copy> Cursor<'a, E> {
             Ok(self.source.get(at).copied())
         }
     }
-    fn unquoted(
-        &self,
-        at: usize,
-        work: &mut impl Work<Error = E>,
-    ) -> Result<Option<(u8, usize)>, Error<E>> {
-        let Some(mut b) = self.byte(at, work)? else {
-            return Ok(None);
-        };
-        let mut next = at.checked_add(1).ok_or(Error::InvalidState)?;
-        if self.quoted && b == b'\\' {
-            b = self.byte(next, work)?.ok_or(Error::Malformed)?;
-            next = next.checked_add(1).ok_or(Error::InvalidState)?;
-        }
-        Ok(Some((b, next)))
-    }
     fn atom(
         &self,
         at: usize,
         work: &mut impl Work<Error = E>,
     ) -> Result<Option<(u8, usize)>, Error<E>> {
-        let Some((b, next)) = self.unquoted(at, work)? else {
-            return Ok(None);
-        };
-        let after = match b {
-            b'\r' => match self.unquoted(next, work)? {
-                Some((b'\n', after)) => Some(after),
-                _ => None,
-            },
-            b'\n' => Some(next),
-            _ => None,
-        };
-        if let Some(after) = after {
-            if let Some((space @ (b' ' | b'\t'), end)) = self.unquoted(after, work)? {
-                return Ok(Some((space, end)));
-            }
-        }
-        Ok(Some((b, next)))
+        crate::projection::atom(at, self.quoted, |at| self.byte(at, work))
+            .map(|atom| atom.map(|atom| (atom.value, atom.next)))
+            .map_err(|error| match error {
+                crate::projection::Error::Read(error) => error,
+                crate::projection::Error::IncompletePair => Error::Malformed,
+                crate::projection::Error::InvalidState => Error::InvalidState,
+            })
     }
     fn step(&mut self, work: &mut impl Work<Error = E>) -> Result<Status, Error<E>> {
         match self.phase {

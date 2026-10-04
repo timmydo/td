@@ -5,6 +5,7 @@ pub mod delimited;
 pub mod language_tag;
 pub mod mime_attribute;
 pub mod mime_value;
+pub mod projection;
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 /// Logical source visits and transitions, including zero-byte EOF attempts.
 pub struct Charge {

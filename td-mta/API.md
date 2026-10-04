@@ -3481,6 +3481,37 @@ revive any failure. No additional failure cache, collection or heap backing
 is introduced. Numbered candidate replay, duplicate/gap validation, display
 conversion, body-part traversal and full worker qualification remain open.
 
+### 1.73 Shared unquote/fold projection
+
+M06bt replaces the three value, phrase and comment logical readers with
+std-only td-header::projection::atom. It receives a position, quoted flag
+and caller read callback; the callback enforces admitted source bounds and
+EOF policy before access. At most six callback calls project one Octet with
+value, next source position and escaped provenance. The helper owns no
+source, cursor, work, clock, output backing or lexical validity proof.
+It operates only on complete spelling already validated by its caller.
+
+Unquote first, then unfold logical CRLF or bare LF followed by SP/HTAB.
+Keep the following whitespace and OR escaped provenance across all fold
+contributors. Escaped nonfold line endings remain literal for later control
+filtering. These bytes grant no original-source encoded-word placement.
+Comment callers retain that provenance; phrase and MIME value callers retain
+their existing separate placement or literal-octet rules.
+
+Read errors return immediately. IncompletePair and position overflow are
+separate typed failures: value maps incomplete pairs to Malformed, while
+validated phrase/comment consumers map invariant failure to InvalidState.
+Each enclosing owner retains its existing sticky refusal. Value/comment
+callbacks preserve charged zero-byte EOF attempts; phrase callbacks preserve
+the token-end check before charged access. Original Meter/HeaderBudget and
+private credit remain in the enclosing adapters. No turn/cursor/reservation
+bound changes and no new backing is introduced. Existing allocation probes
+cover all three migrated consumers. Shared fixtures pin exact read positions,
+maximal calls, escape provenance, every read/EOF refusal, all octets and
+incomplete/overflow behavior. Mail fixtures pin the differing EOF charge
+contracts and existing placement behavior. Full worker/native qualification
+and MIME traversal remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -159,52 +159,29 @@ impl<'a> Cursor<'a> {
         ))
     }
     // Unquote first, then unfold the logical bytes, including escaped CR/LF.
-    fn unquoted(
-        &self,
-        at: usize,
-        now: Tick,
-        work: &mut impl Work,
-    ) -> Result<Option<(u8, usize)>, Error> {
-        if at == self.token.end {
-            return Ok(None);
-        }
-        if at > self.token.end {
-            return Err(Error::InvalidState);
-        }
-        let mut byte = self.byte(at, now, work)?.ok_or(Error::InvalidState)?;
-        let mut next = at.checked_add(1).ok_or(Error::InvalidState)?;
-        if self.kind == Kind::Quoted && byte == b'\\' {
-            if next >= self.token.end {
-                return Err(Error::InvalidState);
-            }
-            byte = self.byte(next, now, work)?.ok_or(Error::InvalidState)?;
-            next = next.checked_add(1).ok_or(Error::InvalidState)?;
-        }
-        Ok(Some((byte, next)))
-    }
     fn atom(
         &self,
         at: usize,
         now: Tick,
         work: &mut impl Work,
     ) -> Result<Option<(u8, usize)>, Error> {
-        let Some((byte, next)) = self.unquoted(at, now, work)? else {
-            return Ok(None);
-        };
-        let after = match byte {
-            b'\r' => match self.unquoted(next, now, work)? {
-                Some((b'\n', after)) => Some(after),
-                _ => None,
-            },
-            b'\n' => Some(next),
-            _ => None,
-        };
-        if let Some(after) = after {
-            if let Some((space @ (b' ' | b'\t'), next)) = self.unquoted(after, now, work)? {
-                return Ok(Some((space, next)));
+        td_header::projection::atom(at, self.kind == Kind::Quoted, |at| {
+            if at == self.token.end {
+                return Ok(None);
             }
-        }
-        Ok(Some((byte, next)))
+            if at > self.token.end {
+                return Err(Error::InvalidState);
+            }
+            self.byte(at, now, work)?
+                .ok_or(Error::InvalidState)
+                .map(Some)
+        })
+        .map(|atom| atom.map(|atom| (atom.value, atom.next)))
+        .map_err(|error| match error {
+            td_header::projection::Error::Read(error) => error,
+            td_header::projection::Error::IncompletePair
+            | td_header::projection::Error::InvalidState => Error::InvalidState,
+        })
     }
     fn literal(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
         let Some((first, mut next)) = self.atom(self.scan, now, work)? else {
@@ -451,6 +428,52 @@ mod tests {
             ),
             &mut work(),
         )
+    }
+    #[test]
+    fn shared_projection_preserves_source_admission_and_eof_policy() {
+        #[derive(Default)]
+        struct Counts {
+            calls: u64,
+            visits: u64,
+        }
+        impl Work for Counts {
+            fn charge(
+                &mut self,
+                _now: Tick,
+                charge: Charge,
+            ) -> Result<(), crate::decode_work::Error> {
+                self.calls += 1;
+                self.visits += charge.io_bytes;
+                assert_eq!(charge.records, 0);
+                Ok(())
+            }
+        }
+        let source = b"\"\\\r\\\n\\ x\"";
+        let mut cursor = cursor(
+            source,
+            Extent {
+                start: 0,
+                end: source.len(),
+            },
+        );
+        cursor.token = Extent {
+            start: 1,
+            end: source.len() - 1,
+        };
+        cursor.kind = Kind::Quoted;
+        let mut counts = Counts::default();
+        assert_eq!(
+            cursor.atom(1, Tick(1), &mut counts).unwrap(),
+            Some((b' ', 7))
+        );
+        assert_eq!((counts.calls, counts.visits), (6, 6));
+        let before = counts.calls;
+        assert_eq!(
+            cursor.atom(source.len() - 1, Tick(1), &mut counts).unwrap(),
+            None
+        );
+        assert_eq!(counts.calls - before, 0);
+        assert_eq!(counts.visits, 6);
     }
     #[test]
     fn literal_names_unquote_unfold_and_trim_only_a_sole_quoted_word() {

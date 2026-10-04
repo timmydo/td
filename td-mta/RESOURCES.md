@@ -1070,6 +1070,16 @@ long drain, quoted/percent bytes and malformed/late refusal are Rust-allocation
 probe intervals. These are fixed state/counter-model claims, not complete
 worker, native/RSS or source-buffer qualification.
 
+M06bt's shared logical reader retains no source, cursor, work or backing.
+A single call invokes the caller's bounded admitted byte callback at most
+six times, including failed lookahead/EOF. The returned octet, source
+position and escaped flag are fixed parsing evidence. Each caller retains
+its original source bounds, EOF charges and sticky failure. All phrase,
+comment and MIME value cursor sizes and per-turn visit/step/record bounds
+remain unchanged; no new resident owner or reservation is added. Existing
+allocation intervals cover all three migrated consumers. This extraction
+does not qualify the complete worker, native allocator or RSS.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

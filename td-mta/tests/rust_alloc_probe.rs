@@ -899,6 +899,8 @@ fn mime_value() {
             Err(Error::Malformed),
         ),
         (b"\"a\r\n\tb\"", true, Mode::Ordinary, Ok(())),
+        (b"\"a\\\r\\\n\\ b\"", true, Mode::Ordinary, Ok(())),
+        (b"\"a\\\r\\\nb\"", true, Mode::Ordinary, Ok(())),
         (
             b"utf-8'en-'x",
             false,
