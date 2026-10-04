@@ -85,7 +85,11 @@ impl<'a> Cursor<'a> {
     pub fn poll(&mut self, now: Tick, work: &mut Meter) -> Result<Status, Error> {
         self.poll_with_work(now, work)
     }
-    fn poll_with_work(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
+    pub(super) fn poll_with_work(
+        &mut self,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -99,6 +103,18 @@ impl<'a> Cursor<'a> {
             self.held = None;
         }
         result
+    }
+    pub(super) fn ordinary_ready(&self) -> Option<Selection> {
+        if self.failure.is_some()
+            || !matches!(self.phase, Phase::Read)
+            || self.held.is_some()
+            || self.decoder.is_some()
+        {
+            return None;
+        }
+        self.octets
+            .validated_selection()
+            .filter(|selection| matches!(selection.plan, Some(Plan::Ordinary(_))))
     }
     fn decoded(&self) -> Result<Decoded, Error> {
         Ok(Decoded {

@@ -327,6 +327,14 @@ specifies. One held byte separates replay and decoding turns, and original
 budget/private credit persist through both. Charset diagnostics remain
 separate from rejected-family evidence. Scalar controls/noncharacters, raw
 word placement, filtering/NFC and display publication stay with later owners.
+Display conversion branches to a private original-raw Ordinary decoder only
+after complete family choice and before data conversion. Raw quote/LWS edges
+and contiguous unescaped words establish filename compatibility; neither
+projection nor decoded punctuation supplies placement. Extended/numbered data
+remain literal. Filtering precedes later NFC, and original allowances/credit
+span the inline handoff, word recognition and charset work. All scalar output
+and diagnostics remain provisional until fresh display completion; response
+retention and final metadata authority are still later-owner boundaries.
 New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed

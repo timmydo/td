@@ -867,6 +867,137 @@ fn store_read_pool() {
     }
 }
 
+fn mime_parameter_display() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_fields::Kind,
+        mime_parameter::{
+            display::{Budgeted, Status},
+            Attribute, Error,
+        },
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("attachment;filename=\"{}\"", "🐈".repeat(1024));
+    let maximal = format!("attachment;filename=\"=?utf-8?Q?{}?=\"", "a".repeat(63));
+    let label = format!("attachment;filename*={}''value", "a".repeat(4096));
+    let before = COUNTERS.snapshot();
+    for (source, kind, attribute, expected, problem, rejected) in [
+        (long.as_bytes(), 4096, false, false),
+        (maximal.as_bytes(), 63, false, false),
+        (label.as_bytes(), 5, true, false),
+        (
+            b"attachment;filename=\"=?utf-8?Q?a?=\r\n \t=?utf-8?Q?b?= \t\"".as_slice(),
+            4,
+            false,
+            false,
+        ),
+        (b"attachment;filename=\"\\=?utf-8?Q?x?=\"", 13, false, false),
+        (
+            b"attachment;filename*=utf-8''%3D%3Futf-8%3FQ%3Fx%3F%3D",
+            13,
+            false,
+            false,
+        ),
+        (
+            b"attachment;filename*0=\"=?utf-8?Q?\";filename*1=\"x?=\"",
+            13,
+            false,
+            false,
+        ),
+        (b"attachment;filename=\"=?unknown?Q?a?=\"", 15, false, false),
+        (b"attachment;filename=\"=?utf-8?Q?=E2?=\"", 3, true, false),
+        (
+            b"attachment;filename*=utf-8''%00%01%7F%C2%80%EF%B7%90",
+            7,
+            true,
+            false,
+        ),
+        (b"attachment;filename*=utf-8''%E1%00%80", 6, true, false),
+        (
+            b"attachment;filename=\"=?utf-8?Q?a?=\";filename*=utf-8''%xx",
+            1,
+            false,
+            true,
+        ),
+        (b"attachment;filename=\"\"", 0, false, false),
+        (b"attachment;filename*=utf-8''", 0, false, false),
+        (b"attachment;filename=\"=?utf-8?Q?=00?=\"", 0, false, false),
+        (b"attachment;filename=\"a\\\0b\"", 2, false, false),
+        (
+            b"attachment;filename=\"\\\xc3\xa9 =?utf-8?Q?a?=\"",
+            4,
+            false,
+            false,
+        ),
+        (b"attachment;x=missing", 0, false, false),
+    ]
+    .into_iter()
+    .map(|(source, expected, problem, rejected)| {
+        (
+            source,
+            Kind::ContentDisposition,
+            Attribute::Filename,
+            expected,
+            problem,
+            rejected,
+        )
+    })
+    .chain(std::iter::once((
+        b"text/plain;name=\"=?latin1?Q?caf=E9?=\"".as_slice(),
+        Kind::ContentType,
+        Attribute::Name,
+        5,
+        false,
+        false,
+    ))) {
+        let case_before = COUNTERS.snapshot();
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 100_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Budgeted::new(black_box(source), kind, attribute, &mut work, &mut budget);
+        assert!(std::mem::size_of_val(&cursor) <= 1536);
+        let mut bytes = 0;
+        loop {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Yield => {}
+                Status::Scalar(value) => {
+                    black_box(value);
+                    bytes += value.len_utf8();
+                }
+                Status::Complete(decoded) => {
+                    assert_eq!(bytes, expected);
+                    assert_eq!(decoded.is_encoding_problem, problem);
+                    assert_eq!(decoded.selection.invalid_extended, rejected);
+                    black_box(decoded);
+                    assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete(decoded)));
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100)),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+                    break;
+                }
+            }
+        }
+        let case_after = COUNTERS.snapshot();
+        assert!(!case_before.invalid && !case_after.invalid);
+        assert_eq!(
+            case_before, case_after,
+            "MIME display case allocated: {source:?}"
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME display projection allocated");
+}
+
 fn mime_parameter_scalars() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6491,6 +6622,7 @@ fn main() {
         mime_parameter();
         mime_parameter_octets();
         mime_parameter_scalars();
+        mime_parameter_display();
         body_value();
         mime_text();
         body_charset();
@@ -6637,6 +6769,7 @@ fn main() {
     mime_parameter();
     mime_parameter_octets();
     mime_parameter_scalars();
+    mime_parameter_display();
     body_value();
     mime_text();
     body_charset();

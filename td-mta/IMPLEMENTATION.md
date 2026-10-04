@@ -1766,6 +1766,17 @@ Initial independently landable increments:
   filename compatibility/display, boundaries, traversal and worker resource
   qualification remain open.
 
+- **M06bx — MIME parameter display scalars:** bind ordinary filename/name
+  compatibility to the original selected raw quoted value; recognize whole
+  contiguous words at actual unescaped LWS/quote boundaries. Preserve literal
+  extended/numbered spelling, apply display scalar filtering and retain
+  separate charset/family diagnostics. Keep one inline active decoder and
+  original allowance/credit through handoff and charged completion. Qualify
+  escaped placement, all budget cuts, maximal recognition, long conversion,
+  live ownership and allocation-free intervals. NFC, cross-field filename
+  precedence, output retention, boundaries, traversal and complete-worker
+  resource qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

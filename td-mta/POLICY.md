@@ -312,7 +312,18 @@ syntax selection is not a claim of agreement about multipart structure.
 For display names, prefer a valid extended filename,
 then ordinary filename, then valid extended Content-Type name*, then ordinary
 Content-Type name. Ordinary filename/name accept properly placed RFC 2047
-encoded words as a compatibility rule. For duplicate ordinary parameters use
+encoded words as a compatibility rule. For an ordinary quoted value, use
+original quote edges or actual unescaped LWS on both sides of a complete
+contiguous word, with the RFC 2047 Text payload alphabet. Raw quoted pairs
+inside a candidate reject it; an escaped marker or separator cannot create
+placement. Preserve leading/trailing quoted whitespace and suppress only
+pure original unescaped LWS between recognized words. Unknown, malformed,
+incorrectly placed and over-75-byte words remain literal. Extended/numbered
+values never gain word placement from their decoded or joined spelling.
+Literal parameter scalars drop NUL, retain other controls and replace
+noncharacters with a diagnostic before NFC; percent-introduced RFC 2231
+controls use that literal policy. Only RFC 2047 words drop their whole encoded
+control set. For duplicate ordinary parameters use
 the first complete value. Never use a supplied name as a filesystem path.
 Header names/values generated from JMAP must reject injection; only the serializer adds folding
 and delimiters.

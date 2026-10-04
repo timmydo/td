@@ -1134,6 +1134,23 @@ private credit span selection, replay and charset state; no output backing
 or capacity is introduced. Retained copying, display/NFC composition,
 complete worker stack, native/RSS and traversal qualification remain open.
 
+M06bx's original-source parameter display Cursor fits 1504 bytes and Budgeted
+1536 within the existing parser region. The active inline enum contains either
+the literal selection/conversion owner or the private 256-byte-bounded
+ordinary decoder; it introduces no box, scalar string or label buffer. A
+private handoff after complete selection drops the first active owner before
+ordinary display begins. Original job/header work and prepaid credit survive
+that handoff; source extents are not manufactured publication authority.
+Each poll does one child/fixed phase, emits at most one provisional scalar
+and spends at most 225 visits/228 plain records or 225 visits/453 aggregate
+steps/29 budgeted job records. The maximal 75-byte word fixture reaches 225
+visits and 453 aggregate steps; those are new display turn bounds, not the
+literal scalar producer's smaller ones. Rust-allocation intervals cover
+construction, long Unicode/labels, maximal words, escaped placement, ordinary
+and extended malformed/fallback/empty values, Name and late refusal. Retained
+output/capacity, NFC checkpoint composition, complete worker stack, native/RSS,
+selected boundary and MIME traversal qualification remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

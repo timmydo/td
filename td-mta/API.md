@@ -3668,6 +3668,61 @@ empty labels, invalid/fallback data and late refusal are Rust-allocation
 intervals. Complete display metadata, output/NFC retention, boundary admission,
 MIME traversal and full worker/native/RSS qualification remain open.
 
+### 1.77 Original-source MIME parameter display scalars
+
+M06bx adds mime_parameter::display::Cursor and Budgeted for trusted Name
+and Filename. Construction binds the original immutable field, kind and
+attribute; no public manufactured plan or decoded byte-vector entry exists.
+It composes section 1.76's complete family choice and literal conversion,
+then filters literal scalars. After complete selection, a private handoff
+may replace the inline literal owner with a decoder for the exact selected
+Ordinary raw extent, before any Data conversion. No second selector,
+allowance or candidate fallback is created. That internal handoff requires
+no failure, phase Read, no held octet and no chosen decoder.
+
+Only an Ordinary quoted value admits the filename/name RFC 2047 compatibility
+rule. Its original outer quote edges and actual unescaped SP/HTAB or accepted
+folds delimit complete contiguous candidates; Context::Text syntax applies.
+Scan original bytes, reject a raw backslash in a candidate, and retain unknown,
+malformed, incorrectly placed or over-75-byte words literally. Quoted-pair
+removal cannot manufacture a marker or either word boundary. Literal content
+uses shared unquote/unfold projection after placement. Source projection and
+local UTF-8 verification are separately charged input passes; complete source
+characters finish before another boundary is admitted. Preserve all leading
+and trailing interior whitespace; suppress pure original unescaped LWS only
+between recognized words, including words producing no surviving scalars.
+Decode each word separately with the existing charset/transfer fault and
+encoded-control/noncharacter policy. A recognized word's output never changes
+placement for the remaining original source.
+
+Extended and numbered families retain literal scalar conversion. A word
+spelling from percent decoding, unquoting or joined sections remains literal.
+Drop literal NUL after charset conversion, retain other literal controls and
+replace noncharacters with U+FFFD plus a diagnostic. RFC 2231 percent-introduced
+controls have this literal parameter policy; only RFC 2047 words discard the
+whole encoded control ranges. Keep Selection.invalid_extended separate from
+charset/filter is_encoding_problem. NFC, filename precedence across fields,
+retained output/capacity and metadata publication remain later-owner work.
+
+At most one provisional scalar escapes per poll. Original job/header work and
+private credit span selection, handoff, recognition and conversion. Charged
+Finish returns Complete(Decoded); every refusal drops active decoder state
+and clears the provisional result, with no fallback or later publication.
+Cached completion is inert; explicit zero-count check_deadline latches fresh
+refusal, including after completion or replacement plain meters. Output
+copying/capacity must be charged by the later retention owner.
+
+The private ordinary decoder fits 256 bytes, Cursor 1504 and Budgeted 1536 in
+the existing 16 KiB parser reservation. The active branch remains inline, with
+no boxes, buffers, copied labels or scalar string; live owners are neither
+Clone nor Copy. Each turn polls one child or does one fixed phase. Bounds are
+225 source visits/228 plain records or 225 visits/453 aggregate steps/29 job
+records; the 75-byte recognition fixture reaches 225 visits and 453 steps.
+Constructor, long Unicode/labels, maximal words, escaped placement, malformed
+and empty/fallback values, Name and late refusal are Rust-allocation intervals.
+Complete worker stack, native/RSS, NFC/output retention, selected boundary and
+MIME traversal qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
