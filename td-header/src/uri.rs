@@ -1,4 +1,5 @@
 //! Generic RFC 3986 URI and reference syntax; no resolution or scheme policy.
+pub mod unfold;
 use crate::{Charge, Work};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error<E> {

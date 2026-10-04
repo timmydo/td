@@ -4249,6 +4249,32 @@ whether empty references or particular schemes are valid in a field.
 Content-Location CFWS/folding/encoded-word decoding, first-valid part
 selection, retained JSON and worker/native/RSS remain separate.
 
+### 1.93 Shared URI wire unfolding
+
+M06cn adds td_header::uri::unfold::Cursor over a caller-selected immutable
+URI wire spelling. Exclude surrounding CFWS and the final header ending.
+Remove SP/HTAB and folded CRLF or bare LF followed by WSP, preserving all
+other octets and offsets within the supplied spelling slice; the caller
+rebases them to field/message positions. Nonfold CR/LF and unfinished folds
+fail. Percent spelling, comments, quotes, encoded words, NUL and 8-bit
+octets are literal here: unfolding supplies no URI/charset validation or
+encoded-word placement authority.
+
+One poll admits one source octet or EOF before access, with at most one
+visit and one record; whitespace runs yield without an unbounded scan.
+Octets are provisional until complete unfolding, and all retire on
+later syntax/work/enclosing refusal. Cached Complete is inert; check_work
+freshly admits zero-count work and retires completion on refusal, sticky
+across replacement callbacks. Live state is neither Copy nor Clone and
+owns no work, clock, output buffer or growing collection. The caller retains
+its original source/job/header allowances and funds retained output.
+
+This shared preprocessing step supports RFC 2557 section 4.4's unfolding
+before encoded-word decoding and RFC 2017 section 3.1's wire-whitespace
+removal. It does not implement Content-Location CFWS, complete URI labels,
+encoded-word decoding or first-valid metadata selection. Existing mail URL
+forms retain their grammar and work. Worker/native/RSS remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -398,6 +398,16 @@ fixed scheme-prefix disambiguation. Existing mail URL consumers retain the
 scheme-required constructor and original grammar/work; no base resolution,
 Content-Location field placement or retained metadata authority is added.
 
+M06cn adds a shared bounded URI wire-whitespace remover with literal octet
+provenance within the supplied spelling slice and sticky refusal.
+Content-Location composition must select the URI spelling outside CFWS and
+unfold before decoding encoded words; this primitive alone grants neither
+field validity nor label/publication authority. Encoded-word placement and
+trailing-CFWS selection remain open composer policy: whitespace removal
+erases spacing, and parentheses are URI characters. Gaps between octet
+offsets show removed whitespace but grant no placement proof; callers
+separately rebase those offsets to their field/message.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

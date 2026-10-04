@@ -1445,6 +1445,19 @@ empty, long, IPv6/IPvFuture, malformed, prepaid-work and fresh-final refusal
 paths with fixed caller work; they do not qualify mail field admission.
 Content-Location integration and worker/native/RSS remain open.
 
+M06cn's shared URI unfolding cursor fits 64 bytes with the public mail URL
+error type and owns no growing storage or output collection. Each poll
+admits one source octet or EOF before access: at most one visit and one
+record. Runs of whitespace remain bounded turns. Offsets within the supplied
+spelling slice and literal octets remain provisional; complete unfolding
+cannot replace enclosing admission. Cached completion is inert and fresh
+zero-count refusal retires it. Shared fixtures pin exact source/EOF costs
+and every callback cut. Warm/measured Rust allocation intervals cover empty,
+relative, long, folded encoded-word spelling, malformed folds,
+first-read/EOF refusal and late fresh refusal with a fixed generic callback;
+they do not qualify mail field/source admission, encoded-word composition or
+worker/native/RSS.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

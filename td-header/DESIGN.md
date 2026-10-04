@@ -4,10 +4,10 @@ This std-only crate owns resident lexical syntax and passive source-view
 helpers, not protocol or admission policy. It has no dependencies, clock,
 crypto, I/O or source ownership. Lexical cursors receive from their
 enclosing grammar a complete immutable field-value or parameter-name/value
-slice or one logical delimiter line, any required exact start offset, and
-permission for the lexical token at that location. The MIME line matcher
-owns no body traversal, transfer decoding, active-boundary precedence or
-source authorization.
+slice, one selected URI wire spelling slice or one logical delimiter line,
+any required exact start offset, and permission for the lexical token at
+that location. The MIME line matcher owns no body traversal, transfer
+decoding, active-boundary precedence or source authorization.
 
 cfws scans optional comments and folding whitespace, leaves the first
 non-CFWS byte untouched, and returns original top-level comment extents.
@@ -262,3 +262,29 @@ their original allowances and latch their own refused source reads.
 Normative grammar: https://www.rfc-editor.org/rfc/rfc3986.html#section-3,
 https://www.rfc-editor.org/rfc/rfc3986.html#section-4.1
 and https://www.rfc-editor.org/rfc/rfc3986.html#section-4.2.
+
+uri::unfold::Cursor removes wire SP/HTAB and CRLF or bare-LF folds followed
+by WSP from a caller-selected immutable URI spelling. Exclude surrounding
+CFWS and the final header ending. Nonfold CR/LF and unfinished folds fail.
+Emit all other octets literally, including percent spelling, encoded-word
+markers, comments, quotes, NUL and 8-bit octets. Report offsets within the
+supplied spelling slice; the caller rebases them to field/message positions.
+No quoted-pair removal, UTF-8/URI validation, encoded-word
+placement/decoding, scheme or empty-label policy follows. RFC 2557 section
+4.4.3 describes unfolding before header decoding; RFC 2017 section 3.1
+supplies wire-whitespace removal. These references do not make this helper a
+complete Content-Location reader or MIME parameter unquoter.
+
+One poll admits one source byte or EOF before access with at most one visit
+and one record. Whitespace yields instead of an unbounded scan. With mail's
+public URL error the cursor fits 64 bytes; generic size depends on E. It
+retains source, position, fold phase and sticky error, no work/clock/output
+owner or collection. Octets remain provisional until complete unfolding and
+retire after later refusal. Cached Complete is inert; check_work admits
+zero-count fresh work and retires success on refusal, sticky across
+callbacks. Live state is neither Copy nor Clone. Source/field selection,
+original allowances, retained output and final publication admission remain
+external. Normative folding:
+https://www.rfc-editor.org/rfc/rfc2557.html#section-4.4.2,
+https://www.rfc-editor.org/rfc/rfc2557.html#section-4.4.3 and
+https://www.rfc-editor.org/rfc/rfc2017.html#section-3.1.

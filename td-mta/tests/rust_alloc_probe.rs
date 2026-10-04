@@ -1229,6 +1229,82 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn uri_unfold_values() {
+    use td_header::uri::unfold::{Cursor, Error, Status};
+    struct UnfoldWork {
+        calls: usize,
+        cut: Option<usize>,
+    }
+    impl td_header::Work for UnfoldWork {
+        type Error = u8;
+        fn charge(&mut self, charge: td_header::Charge) -> Result<(), u8> {
+            assert!(charge.visits <= 1 && charge.records <= 1);
+            let call = self.calls;
+            self.calls += 1;
+            if self.cut == Some(call) {
+                Err(77)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    const _: () = assert!(std::mem::size_of::<Cursor<'_, td_mta::header_urls::Error>>() <= 64);
+    let long = "a%\r\n 2F\t".repeat(4096);
+    let before = COUNTERS.snapshot();
+    for (source, expected, cut) in [
+        (b"".as_slice(), None, None),
+        (b"../a%\r\n 2Fb", None, None),
+        (long.as_bytes(), None, None),
+        (b"=?utf-8?Q?a_\n b?=", None, None),
+        (b"a\r\nX", Some(Error::Malformed), None),
+        (b"a\r", Some(Error::Malformed), None),
+        (b"a\r\n", Some(Error::Malformed), None),
+        (b"a\n", Some(Error::Malformed), None),
+        (b"a", Some(Error::Work(77)), Some(0)),
+        (b"a", Some(Error::Work(77)), Some(1)),
+    ] {
+        let mut cursor = Cursor::new(source);
+        let mut work = UnfoldWork { calls: 0, cut };
+        let mut result = None;
+        for _ in 0..=source.len() {
+            match cursor.poll(&mut work) {
+                Ok(Status::Octet { byte, position }) => {
+                    assert_eq!(source.get(position), Some(&byte));
+                    black_box(byte);
+                }
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete) => break,
+                Err(error) => {
+                    result = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(result, expected);
+        if let Some(error) = expected {
+            assert!(!cursor.is_complete());
+            let calls = work.calls;
+            work.cut = None;
+            assert_eq!(cursor.poll(&mut work), Err(error));
+            assert_eq!(cursor.check_work(&mut work), Err(error));
+            assert_eq!(work.calls, calls);
+        } else {
+            assert!(cursor.is_complete());
+            let calls = work.calls;
+            assert_eq!(cursor.poll(&mut work), Ok(Status::Complete));
+            assert_eq!(work.calls, calls);
+            cursor.check_work(&mut work).unwrap();
+            work.cut = Some(work.calls);
+            assert_eq!(cursor.check_work(&mut work), Err(Error::Work(77)));
+            assert!(!cursor.is_complete());
+            assert_eq!(cursor.poll(&mut work), Err(Error::Work(77)));
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "URI wire unfolding allocated");
+}
+
 fn uri_reference_values() {
     use td_header::uri::{Error, Validator};
     struct RefWork {
@@ -8183,6 +8259,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        uri_unfold_values();
         uri_reference_values();
         content_id_values();
         content_language_values();
@@ -8341,6 +8418,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    uri_unfold_values();
     uri_reference_values();
     content_id_values();
     content_language_values();

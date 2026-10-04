@@ -1894,6 +1894,14 @@ Initial independently landable increments:
   Content-Location field decoding/selection, retained metadata and
   worker/native/RSS remain open.
 
+- **M06cn — shared URI unfolding:** remove wire SP/HTAB and accepted folds
+  with one admitted octet or EOF per turn. Preserve literal octets and source
+  offsets; reject nonfold endings and incomplete folds. Shared fixtures pin
+  exact costs, callback cuts and sticky/fresh refusal. Warm/measured Rust
+  allocation intervals cover empty, long, folded word, malformed and refused
+  preprocessing. Content-Location CFWS/encoded-word composition, retained
+  metadata and worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
