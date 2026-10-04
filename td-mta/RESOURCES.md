@@ -1738,6 +1738,22 @@ long whitespace/comments, optional-tail recovery, syntax/nesting/job refusal,
 healthy handoff and late retirement. No extra arena or selected-value copy
 is allocated. Whole-field projection and worker/native/RSS remain open.
 
+M06ct's literal field-value coordinator plus HeaderBudget fits 384 bytes
+within the existing parser region. Exclusive phase state contains a CFWS
+selector or literal URI reader; no second live child or source-sized scratch
+is retained. One poll invokes one bounded child plus fixed checked metadata,
+within 160 visits, 192 interpretation steps and 12 job records, and at most
+one separately charged output byte. These ceilings are inherited from the
+independently tested M06cs/M06cq child turns; the coordinator fixture pins
+combined costs rather than measuring each turn. Fresh consuming phase
+handoff keeps the
+original owners but leaves unused prepaid credit behind; the next phase
+charges conservatively without a new allowance. Complete field boundary
+selection and URI/fold validation precede projection. Allocation intervals
+cover combined healthy/refused fields, long values and fresh owner handoff.
+No extra arena is introduced. Encoded-word dispatch, retained metadata and
+worker/native/RSS qualification remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

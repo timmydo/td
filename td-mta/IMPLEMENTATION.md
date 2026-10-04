@@ -1947,6 +1947,15 @@ Initial independently landable increments:
   later phase's decision; word placement, complete Content-Location
   projection and retained metadata remain open.
 
+- **M06ct — literal URI field-value pipeline:** compose CFWS selection and
+  complete URI/fold validation before source replay, using exclusive child
+  state and fresh transfer of original allowances. Rebase emitted offsets
+  into the supplied complete field-value slice. Fixtures pin malformed
+  whole-field rejection before output, exact combined costs, owner identity,
+  every allowance/deadline cut and fresh final retirement. Literal mode is
+  explicitly caller-selected; encoded-word dispatch/placement, retained
+  metadata and whole Content-Location activation remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

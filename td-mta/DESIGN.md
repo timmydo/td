@@ -450,6 +450,16 @@ for the next phase. Empty or invalid URI spelling can complete selection
 without granting URI/presence validity. Complete Content-Location word/literal
 composition, retained metadata and publication remain separate work.
 
+M06ct composes whole field-value CFWS selection with the literal URI reader
+under exclusive child ownership. Fresh consuming phase handoff transfers
+the same original job/header owners without a selected-value copy. Complete
+selection and URI/fold validation precede literal octets; source provenance
+is rebased to the original supplied field-value slice. Caller explicitly
+chooses literal interpretation and owns encoded-word placement/path choice,
+field discovery/presence and retained metadata/publication. Empty references
+remain permitted. Complete Content-Location word/literal dispatch remains
+open; this path grants no resolution or source authority.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

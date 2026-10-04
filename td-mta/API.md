@@ -4393,6 +4393,37 @@ Clone. A future composer must keep the returned owners for subsequent
 placement, decoding and retention; this is not a complete Content-Location
 reader.
 
+### 1.99 Literal URI field-value pipeline
+
+M06ct adds mime_location_literal_field::Cursor for a complete immutable
+field-value slice excluding its final ending. Caller explicitly authorizes
+POLICY.md's surrounding CFWS and selects literal interpretation. The cursor
+selects boundaries, validates the complete unfolded URI reference, then
+replays literal ASCII with offsets rebased into that original field-value
+slice. No octet precedes full CFWS selection and URI/fold validation.
+Word-looking bytes, percent spelling, case and parentheses remain literal;
+no NFC, resolution or fetching occurs. Empty URI references remain permitted.
+Encoded-word placement/path choice and field presence remain external; this
+literal path does not activate a complete Content-Location parser. Interior
+comment-looking runs remain URI data under the selected boundary policy;
+wire whitespace is removed, so `a (b) c` projects as `a(b)c`.
+
+Exclusive phase state owns either the selection cursor or the literal
+reader, transferring the same original Meter/HeaderBudget through fresh
+consuming handoff. It retains only source and passive range metadata, without
+self references or a selected-value copy. Unused prepaid credit is not
+exported at handoff; the next phase charges conservatively through those
+same owners. One poll invokes one bounded child turn plus fixed metadata
+checks. Octets remain provisional until healthy Complete and fresh original
+admission. Cached Complete is inert; check_deadline retires completion on
+refusal. Consuming finish(now) freshly admits and returns both original
+owners plus Spelling after complete validation/projection. Fresh admission
+refusal precedes premature-finish InvalidState. Failure drops
+borrowed progress; root allocation ownership remains in the enclosing caller.
+No retry grant, retained metadata or source/publication authority follows.
+Live state is neither Copy nor Clone. Caller separately maps these offsets
+into its authorized resident/message extents.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

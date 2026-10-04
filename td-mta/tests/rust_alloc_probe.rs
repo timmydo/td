@@ -1229,6 +1229,113 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn uri_literal_field_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_location_literal_field::{Cursor, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("(lead) {} (tail)", "../a%2Fb?x/".repeat(4096));
+    let deep = format!("{}x{}a", "(".repeat(33), ")".repeat(33));
+    let unicode = format!("({})a(b)", "🐈".repeat(1024));
+    let before = COUNTERS.snapshot();
+    for (source, fault, records) in [
+        (b"".as_slice(), None, 100_000_000),
+        (b" (only)\t", None, 100_000_000),
+        (b"(lead) a\r\n b (tail)", None, 100_000_000),
+        (b"a (bad (tail)", None, 100_000_000),
+        (b"(x) http://[::1]/a%2Fb (tail)", None, 100_000_000),
+        (b"(x) =?ascii?Q?a_b?= (tail)", None, 100_000_000),
+        (long.as_bytes(), None, 100_000_000),
+        (unicode.as_bytes(), None, 100_000_000),
+        (b"(bad", Some(Error::MalformedCfws), 100_000_000),
+        (deep.as_bytes(), Some(Error::NestingLimit), 100_000_000),
+        (b"(x) a% (tail)", Some(Error::MalformedUri), 100_000_000),
+        (b"(x) a\rX (tail)", Some(Error::MalformedFold), 100_000_000),
+        (b"(x) a (tail)", Some(Error::Work(Stop::Records)), 0),
+    ] {
+        let trials = if fault.is_some() { 1 } else { 2 };
+        for trial in 0..trials {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records,
+                    output_bytes: 100_000_000,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let work_ptr = &work as *const Meter;
+            let budget_ptr = &budget as *const HeaderBudget;
+            let mut cursor = Cursor::new(black_box(source), &mut work, &mut budget);
+            let mut complete = false;
+            let mut result = None;
+            let mut output = 0;
+            for _ in 0..200_000 {
+                match cursor.poll(Tick(1)) {
+                    Ok(Status::Yield) => {}
+                    Ok(Status::Octet { byte, position }) => {
+                        assert_eq!(source.get(position), Some(&byte));
+                        output += 1;
+                        black_box(byte);
+                    }
+                    Ok(Status::Complete) => {
+                        complete = true;
+                        break;
+                    }
+                    Err(error) => {
+                        result = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(result, fault);
+            if let Some(error) = fault {
+                assert!(!cursor.is_complete());
+                assert_eq!(output, 0);
+                assert_eq!(cursor.poll(Tick(1)), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            assert!(complete);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            if trial == 1 {
+                assert_eq!(
+                    cursor.check_deadline(Tick(100)),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                assert!(!cursor.is_complete());
+                assert_eq!(
+                    cursor.finish(Tick(1)).err(),
+                    Some(Error::Work(Stop::Deadline))
+                );
+            } else {
+                let (work, budget, range) = cursor.finish(Tick(1)).unwrap();
+                black_box(source.get(range.start..range.end).unwrap());
+                assert!(std::ptr::eq(work, work_ptr));
+                assert!(std::ptr::eq(budget, budget_ptr));
+                let mut next = Cursor::new(b"(x) a(b) (y)", work, budget);
+                let mut complete = false;
+                for _ in 0..64 {
+                    if let Status::Complete = next.poll(Tick(1)).unwrap() {
+                        complete = true;
+                        break;
+                    }
+                }
+                assert!(complete);
+                let (work, budget, _) = next.finish(Tick(1)).unwrap();
+                assert!(std::ptr::eq(work, work_ptr));
+                assert!(std::ptr::eq(budget, budget_ptr));
+            }
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "literal URI field pipeline allocated");
+}
+
 fn uri_selection_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -8640,6 +8747,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        uri_literal_field_values();
         uri_selection_values();
         uri_spelling_values();
         uri_literal_values();
@@ -8803,6 +8911,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    uri_literal_field_values();
     uri_selection_values();
     uri_spelling_values();
     uri_literal_values();
