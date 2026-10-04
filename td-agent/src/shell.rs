@@ -676,6 +676,25 @@ mod tests {
         let mut mode = std::fs::metadata(&stand_in).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
         std::fs::set_permissions(&stand_in, mode).unwrap();
+        // A sibling test forking while the write above was open hands its
+        // child that descriptor until the child execs, and exec refuses a
+        // file open for writing (ETXTBSY). No later fork can copy it, so
+        // once one exec succeeds the stand-in stays runnable.
+        let since = Instant::now();
+        loop {
+            match std::process::Command::new(&stand_in).output() {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && since.elapsed() < Duration::from_secs(10) =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => {
+                    other.unwrap();
+                    break;
+                }
+            }
+        }
         let never = AtomicBool::new(false);
         let grep = Grep {
             pattern: "x".into(),
