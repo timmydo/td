@@ -30,12 +30,7 @@ impl Origin {
     }
 
     pub fn encode(&self) -> String {
-        let mut result = String::with_capacity(self.repository.len() * 2 + self.head.len() + 2);
-        use std::fmt::Write;
-        for byte in self.repository.bytes() {
-            // Writing into String cannot fail.
-            let _ = write!(result, "{byte:02x}");
-        }
+        let mut result = td_encoding::hex(self.repository.as_bytes());
         result.push(' ');
         result.push_str(&self.head);
         result.push('\n');
@@ -47,18 +42,10 @@ impl Origin {
             .strip_suffix('\n')
             .and_then(|s| s.split_once(' '))
             .ok_or("invalid origin reply")?;
-        if hex.len() > 400 || hex.len() % 2 != 0 {
+        if hex.len() > 400 {
             return Err("invalid origin path encoding".into());
         }
-        let mut bytes = Vec::with_capacity(hex.len() / 2);
-        for [a, b] in hex.as_bytes().as_chunks::<2>().0 {
-            let nibble = |b| match b {
-                b'0'..=b'9' => Ok(b - b'0'),
-                b'a'..=b'f' => Ok(b - b'a' + 10),
-                _ => Err("invalid origin path encoding"),
-            };
-            bytes.push(nibble(*a)? * 16 + nibble(*b)?);
-        }
+        let bytes = td_encoding::from_hex(hex).ok_or("invalid origin path encoding")?;
         Self::new(
             String::from_utf8(bytes).map_err(|_| "invalid origin path")?,
             head.into(),

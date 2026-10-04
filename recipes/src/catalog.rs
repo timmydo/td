@@ -489,6 +489,7 @@ mod tests {
                 "td-civil",
                 "td-compositor",
                 "td-editor",
+                "td-encoding",
                 "td-fetch-client",
                 "td-firstboot",
                 "td-html",

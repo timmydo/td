@@ -23,6 +23,12 @@ gate-test-args = "--bins"
 name = "td-vm"
 path = "src/bin/td-vm.rs"
 
+# td's byte encodings, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): the clipboard's base64 and the hex of
+# workspace ids, staging nonces and the origin reply.
+[dependencies]
+td-encoding = { path = "../td-encoding" }
+
 [lints.rust]
 unsafe_code = "deny"
 

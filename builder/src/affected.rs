@@ -1606,6 +1606,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // recipes beside the toolkit, so an edit reaches the same consumers.
     const SHARED_LIBRARIES: &[&str] = &[
         "td-civil/",
+        "td-encoding/",
         "td-fetch-client/",
         "td-html/",
         "td-json/",
@@ -2759,6 +2760,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_preflight!("td-mail/Cargo.lock", "local-source-roster");
     for path in [
         "td-civil/src/lib.rs",
+        "td-encoding/src/lib.rs",
         "td-fetch-client/src/lib.rs",
         "td-html/src/lib.rs",
         "td-json/src/lib.rs",

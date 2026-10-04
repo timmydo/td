@@ -672,11 +672,11 @@ fn enroll_reply(home: &Path, name: &str, key: &str, success: bool) -> Result<Out
         assert_eq!(fields.next(), Some("git-key"));
         assert_eq!(fields.next(), Some("0"));
         assert_eq!(fields.next(), Some("32"));
-        let encoded: String = id.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let encoded = td_encoding::hex(id.as_bytes());
         assert_eq!(fields.next(), Some(encoded.as_str()));
         assert!(fields.next().is_none());
         let data = format!("TDVM-GIT-KEY-1\n{id}\nssh-ed25519 {key}\n");
-        let encoded: String = data.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let encoded = td_encoding::hex(data.as_bytes());
         writeln!(stream, "TDVM1 {request} ok 0 {} {encoded}", data.len())
             .map_err(|e| e.to_string())?;
         Ok(())

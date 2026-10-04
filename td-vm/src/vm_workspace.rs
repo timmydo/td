@@ -58,7 +58,7 @@ impl Workspace {
             "read VM workspace identity",
         )?;
         Ok(Self {
-            id: random.iter().map(|byte| format!("{byte:02x}")).collect(),
+            id: td_encoding::hex(&random),
             branch: branch.into(),
             profile,
             enrollment: None,

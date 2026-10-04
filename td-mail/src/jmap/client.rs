@@ -136,7 +136,7 @@ impl std::fmt::Display for JmapError {
 impl JmapClient {
     fn auth_header(username: &str, password: &str) -> String {
         let credentials = format!("{}:{}", username, password);
-        let encoded = crate::b64::encode(credentials.as_bytes());
+        let encoded = td_encoding::base64(credentials.as_bytes());
         format!("Basic {}", encoded)
     }
 

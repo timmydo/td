@@ -1090,7 +1090,7 @@ impl Manager {
             io(File::open("/dev/urandom"), "open host randomness")?.read_exact(&mut random),
             "read staging nonce",
         )?;
-        let nonce: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let nonce = td_encoding::hex(&random);
         let _catalog = self.lock("catalog")?;
         let dir = self
             .root

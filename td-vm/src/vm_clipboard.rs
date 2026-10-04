@@ -108,34 +108,8 @@ pub fn copy(terminal: &mut term::Terminal, bytes: &[u8]) -> Result<(), String> {
     // Only this explicit action emits OSC 52. Guest bytes are base64 data,
     // never interpreted terminal escapes, and no OSC clipboard read is used.
     terminal
-        .draw(format!("\x1b]52;c;{}\x07", base64(bytes)?))
+        .draw(format!("\x1b]52;c;{}\x07", td_encoding::base64(bytes)))
         .map_err(|e| e.to_string())
-}
-
-fn base64(bytes: &[u8]) -> Result<String, String> {
-    const DIGITS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::new();
-    for chunk in bytes.chunks(3) {
-        let a = *chunk.first().ok_or("base64 input")?;
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        for (index, value) in [
-            a >> 2,
-            ((a & 3) << 4) | (b >> 4),
-            ((b & 15) << 2) | (c >> 6),
-            c & 63,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            encoded.push(if index > chunk.len() {
-                '='
-            } else {
-                char::from(*DIGITS.get(usize::from(value)).ok_or("base64 digit")?)
-            });
-        }
-    }
-    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -191,16 +165,14 @@ mod tests {
         assert!(control.push(b'~').unwrap_err().contains("control"));
     }
 
+    /// The OSC 52 payload is base64 alone: no guest byte, control or
+    /// terminator among them, survives into the escape.
     #[test]
     fn clipboard_encoding_cannot_inject_terminal_controls() {
-        for (bytes, expected) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foobar", "Zm9vYmFy"),
-        ] {
-            assert_eq!(base64(bytes.as_bytes()).unwrap(), expected);
-        }
+        let every: Vec<u8> = (0..=255).collect();
+        let encoded = td_encoding::base64(&every);
+        assert!(encoded
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)));
     }
 }

@@ -13,6 +13,7 @@ pub fn recipe() -> Recipe {
         .local_source("td-mail")
         .local_source_trees(&[
             "td-civil",
+            "td-encoding",
             "td-fetch-client",
             "td-html",
             "td-json",
@@ -49,6 +50,7 @@ mod tests {
             recipe.local_source_trees,
             Some(vec![
                 "td-civil".into(),
+                "td-encoding".into(),
                 "td-fetch-client".into(),
                 "td-html".into(),
                 "td-json".into(),
@@ -83,6 +85,7 @@ mod tests {
             names,
             [
                 "td-civil",
+                "td-encoding",
                 "td-fetch-client",
                 "td-html",
                 "td-json",
@@ -97,6 +100,7 @@ mod tests {
         let manifest = include_str!("../../../td-mail/Cargo.toml");
         for sibling in [
             "td-civil",
+            "td-encoding",
             "td-fetch-client",
             "td-html",
             "td-json",

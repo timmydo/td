@@ -7,7 +7,6 @@
 mod log;
 
 mod attach;
-mod b64;
 mod backend;
 mod cache;
 mod cli;
