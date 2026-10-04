@@ -665,9 +665,9 @@ nothing (§2).
 **As built (increment 4).** Each conversation counts as a workspace of
 its own: the list is every conversation, most recently active first,
 with the state of the open one (`starting`, `idle`, `restarting` or
-`failed`; a closed one shows none), and `C-n` starts a conversation
-with no workspace until the templates step makes it open the chooser of
-§7. `F6` and `S-F6` move the focus between the list, the transcript
+`failed`; a closed one shows none), and `C-n` started a conversation
+with no workspace; it now opens the chooser of §7 (As built
+(templates)). `F6` and `S-F6` move the focus between the list, the transcript
 and the composer, and `Return` on a list row opens it. The transcript
 holds what td-ui's message list bounds it to (16 MiB of text); past that
 it drops its oldest messages an eighth at a time and says so, and the
@@ -750,7 +750,8 @@ every other chord is consumed, as is a hover, a press outside closes it
 and goes no further, and a focus loss or a resize closes it. It is
 painted after the window's frame. File's items are:
 
-- `New conversation`, shown with `C-n`, which does what `C-n` does;
+- `New conversation…`, shown with `C-n`, which does what `C-n` does:
+  the template chooser of §7;
 - `Set OpenRouter key…`, which opens the key dialog below; it has no
   chord;
 - `Export diagnostics`, the diagnostics export (below, "As built (the
@@ -924,8 +925,9 @@ window too (below).
   the picker through the item's own path; the state gains `picker` (the
   selected model, `nothing`, or `none` when closed), `query` (the
   filter), `model` and `effort`; and `default-model`, which opens the
-  default's picker, `picking` (`default`, `conversation` or `none`) and
-  `default`, the default model.
+  default's picker, `picking` (`default`, `conversation`, `template`
+  for the template chooser of §7, or `none`) and `default`, the default
+  model.
 
 **As built (the system context).** The transcript shows what every
 request begins with. Its first message, headed `system`, is the
@@ -1684,6 +1686,36 @@ template's `repos` asks for: the store, the git worker, workspace
 repositories and their worktrees, everything from Layout to Keeping
 current below, and the workspace card.
 
+**As built (templates).** `C-n` and File → `New conversation…`, now
+File's one New item, open the model picker's finder over Empty (its
+meta `scratch`), Directory… (`folder`) and each configured template in
+the order written (`scratch`, or `repositories` for one naming any),
+Empty selected: typing filters, `Return` or a second press chooses, and
+`Escape` makes nothing. Empty starts a conversation in a scratch
+workspace, and Directory… opens the folder chooser. A template naming
+no repository makes a `{"kind": "template", "name": …}` workspace, a
+scratch directory as Empty's is, which binds the template's own
+`shared` list when it names one. Each such list is admitted at the
+window's start as the top-level one is, a refusal named with its
+template, and handed to every conversation process beside the
+top-level list; a conversation finds its template's list by name, so
+an edited list applies from the next start. A template that names no
+list binds the top-level one, as Empty does; one no longer configured,
+removed or renamed, binds none, so that no edit widens what its old
+conversations reach without the human choosing it. When the lists
+would take more than half of a setup frame they are not handed on,
+said in a note, and template workspaces bind none. The status row and
+the `conversations` tool name the workspace `template NAME`, and the
+question before a deletion says, by the workspace's kind and not its
+name, that a template's scratch directory goes with the conversation.
+A template naming repositories is listed, the finder's note saying it
+is refused until increment 11, and choosing it makes nothing and says
+why. Choosing Directory… goes straight to the folder chooser: a card
+that waited behind the template chooser waits behind it too.
+Without `./agent`'s jail no workspace can be made and there is nothing
+to choose: `C-n` starts a conversation with none at once, the reason on
+standard error, which is how the native compositor tests run.
+
 **The workspace card.** A repository workspace has a card of its own,
 shown in its conversation once its bases are fetched and kept behind its
 status row: it lists each repository's `.td-agent/rules`, shows the
@@ -1774,10 +1806,10 @@ that is not a git repository. Neither has git management. A directory
 whose top holds a `.git` is refused with a pointer to a repository
 template.
 
-**As built (increment 10, workspaces).** File has two workspace items,
-which the templates step folds into the chooser as its built-ins: New
-scratch conversation, which becomes Empty, and New conversation in a
-directory…, which becomes Directory… and opens td-ui's finder over the
+**As built (increment 10, workspaces).** File had two workspace items,
+which the templates step folded into the chooser as its built-ins: New
+scratch conversation became Empty, and New conversation in a
+directory… became Directory…, which opens td-ui's finder over the
 human's folders (Return enters one, Backspace
 goes up, Control+Return chooses the one listed; a repository's top is
 marked `git`, a link `link`, hidden names left out). The window admits
@@ -1788,8 +1820,8 @@ too; a work tree's subdirectory is admitted, since its `.git` is out of
 the jail's reach. The shared directories, `[[shared]]` in configuration
 and `~/Downloads` read-only by default, are admitted once at the
 window's start, each refused one named and left out. Without
-`./agent`'s td-jail and td-txt no workspace is made, and asking for one
-says why at once. A conversation's `meta` records its workspace,
+`./agent`'s td-jail and td-txt no workspace is made (As built
+(templates)). A conversation's `meta` records its workspace,
 `{"kind": "scratch"}` or `{"kind": "directory", "path": …}`, fixed at
 creation; its jail directory is `$XDG_STATE_HOME/td-agent/jail/<id>/`,
 holding the instances' `home/`, a scratch workspace's `scratch/`, and
@@ -3244,6 +3276,19 @@ Conversation menu chooses another for one conversation, and a default
 model the window saves replaces `model` until the key is edited (§4);
 this file records neither. The key file is not a key of this file (§6).
 
+**As built (templates).** `template` is read. A `name` is visible text
+of at most 64 bytes with no space at either end and nothing a card
+would show as `<U+XXXX>` (§11), unique among the templates and neither
+`Empty` nor `Directory…` (nor `Directory...`), each ASCII case aside;
+there are at most 64 templates. Each of `repos` has a `remote`, a
+`base` and a `branch`, text of at most 2,048 bytes with no control
+character, and an optional `sparse` list of paths, each relative, with
+no `..` and no control character; increment 11 prepares them.
+`shared` is checked as the top-level key is, its errors naming
+`template.shared`. `network` is accepted
+with a note that increment 15 reads it, and any other key is refused
+by name.
+
 ## 16. Prior art: opencode
 
 opencode is the open agent closest to td-agent's shape, with
@@ -3640,6 +3685,29 @@ it with no models list fetched; and finds the key in no other file
 under the test's directory and not on standard error. The fixture
 build costs every td-agent native run a second build of the crate, in a
 target directory of its own, its library tests and its strict Clippy.
+
+**As built (templates).** `src/config.rs` covers templates read in
+order, their own shared lists, an empty one included, `network`'s note,
+and each refusal (no name, an empty, padded, control-bearing or
+invisible one, a built-in's, a duplicate in any case, an unknown key,
+`repos` that is no list or lacks a field, a `sparse` that is no list,
+absolute, climbing or control-bearing, a shared list that is no list
+or has a relative path, too many), and which list a workspace binds:
+a template's own, the top-level one for a template naming none, none
+for one gone, through the setup's round trip; `tests/model_client.rs`
+holds that a conversation process made from a template sends its own
+list, and none once its template is gone, never the top-level one;
+`tests/processes.rs` that a template workspace reaches the meta;
+`src/ui.rs` covers the chooser's rows in order with Empty selected,
+the note, what each choice asks, Directory… opening the folder chooser
+even with a card waiting, `Escape`, and `C-n` with no workspaces
+starting one with none; `src/window.rs` covers a repository template's
+refusal; `src/control.rs` drives `new` both ways; `src/confirm.rs`
+covers what the deletion question says of each kind of workspace; and
+`src/workspace.rs` round-trips a template workspace, refuses a bad
+`template:` argument, and labels one `template NAME`. The native
+compositor tests run without the jail, so their `C-n` starts a
+conversation with no workspace as before.
 
 The live check is by hand. Run `./agent` from a checkout, with the key
 written as one line to `$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode

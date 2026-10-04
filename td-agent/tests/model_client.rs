@@ -1447,6 +1447,54 @@ fn a_workspace_command_waits_for_the_person_and_a_refusal_is_its_answer() {
     }
 }
 
+/// A conversation made from a template binds the template's own shared
+/// directories, not the top-level ones, and none once the template is
+/// no longer configured: removing or renaming one never widens it.
+#[test]
+fn a_template_workspace_binds_its_own_shared_directories() {
+    use td_agent::config::TemplateShared;
+    use td_agent::workspace::Shared;
+    for (name, said) in [
+        ("notes", "- Shared directories: /own (read-write)."),
+        ("gone", "- Shared directories: none."),
+    ] {
+        let mut h = Harness::new_in(
+            &format!("template-{name}"),
+            Role::Conversation,
+            Some(&format!("template:{name}")),
+            false,
+            vec![Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")],
+        );
+        h.setup(Client {
+            shared: vec![Shared {
+                path: "/top".into(),
+                write: false,
+            }],
+            template_shared: vec![TemplateShared {
+                name: "notes".into(),
+                shared: Some(vec![Shared {
+                    path: "/own".into(),
+                    write: true,
+                }]),
+            }],
+            ..Client::default()
+        });
+        h.say("hello");
+        let (_, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied");
+        let requests = h.mock.requests();
+        let first = flat(&requests[0].text());
+        let system = &first["messages.0.content"];
+        assert!(system.contains(said), "{name}: {system}");
+        assert!(!system.contains("/top"), "{name}: {system}");
+        assert!(
+            system.contains("a scratch directory td-agent made"),
+            "{system}"
+        );
+        h.close();
+    }
+}
+
 /// An allowed command runs, here to say the jail is missing; one asked
 /// while the turn is interrupted is withdrawn and not run.
 #[test]

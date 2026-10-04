@@ -1197,14 +1197,14 @@ impl Session {
         let state = StateDir::at(self.state.clone());
         let policy = self
             .bench
-            .prepare(workspace, &state, &meta.id, &client.shared)
+            .prepare(workspace, &state, &meta.id, client.shared_for(workspace))
             .map_err(|e| format!("the workspace could not be prepared: {e}"))?;
         let directory = policy
             .worktrees
             .first()
             .ok_or("the workspace has no directory")?;
         let place = crate::prompt::Place {
-            scratch: matches!(workspace, Workspace::Scratch),
+            scratch: workspace.scratch(),
             directory,
             read: &policy.read,
             write: &policy.write,

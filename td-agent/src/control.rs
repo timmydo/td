@@ -45,7 +45,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "new",
         chord: Some("C-n"),
         arguments: "",
-        help: "Start a new conversation and open it.",
+        help: "File > New conversation...: open the template chooser (Return chooses, Escape cancels), or, when no workspace can be made, start a conversation with none.",
     },
     Binding {
         name: "previous",
@@ -120,18 +120,6 @@ pub const BINDINGS: &[Binding] = &[
         help: "File > Set OpenRouter key...: open the dialog that stores the OpenRouter API key.",
     },
     Binding {
-        name: "new-scratch",
-        chord: None,
-        arguments: "",
-        help: "File > New scratch conversation: start a conversation in a scratch workspace of its own.",
-    },
-    Binding {
-        name: "new-in-directory",
-        chord: None,
-        arguments: "",
-        help: "File > New conversation in a directory...: open the directory chooser: Return enters a folder, Backspace goes up, C-Return starts the conversation in the folder listed, Escape cancels.",
-    },
-    Binding {
         name: "model",
         chord: None,
         arguments: "",
@@ -195,13 +183,7 @@ impl Controller for Remote<'_> {
         // Through the menu's own paths, as a choice of its item.
         if matches!(
             name,
-            "set-key"
-                | "model"
-                | "export-diagnostics"
-                | "delete-conversation"
-                | "default-model"
-                | "new-scratch"
-                | "new-in-directory"
+            "set-key" | "model" | "export-diagnostics" | "delete-conversation" | "default-model"
         ) {
             let before = self.app.generation();
             match name {
@@ -209,8 +191,6 @@ impl Controller for Remote<'_> {
                 "model" => self.app.open_picker(),
                 "delete-conversation" => self.app.open_delete(),
                 "default-model" => self.app.open_default_picker(),
-                "new-scratch" => self.app.new_scratch(),
-                "new-in-directory" => self.app.open_chooser(),
                 _ => self.app.export_diagnostics(),
             }
             return Ok(self.outcome(before));
@@ -327,9 +307,25 @@ mod tests {
             "1\t1\tok\tchanged"
         );
         assert!(remote.state().unwrap().contains("focus=list"));
+        // `new` opens the template chooser, or, with no workspaces,
+        // starts a conversation with none.
         assert_eq!(
             driven::request(&mut remote, b"1\t2\taction\tnew"),
             "1\t2\tok\tchanged"
+        );
+        assert!(remote.state().unwrap().contains("picking=template"));
+        assert!(remote.app.take_requests().is_empty());
+        driven::request(
+            &mut remote,
+            format!("1\t5\tkey\t{}", hex("Escape")).as_bytes(),
+        );
+        assert!(remote.state().unwrap().contains("picking=none"));
+        remote
+            .app
+            .set_no_workspaces(Some("no workspace jail".into()));
+        assert_eq!(
+            driven::request(&mut remote, b"1\t6\taction\tnew"),
+            "1\t6\tok\tchanged"
         );
         assert_eq!(remote.app.take_requests(), [Request::New]);
         // Typed through the seam's key verb, then sent.
@@ -369,14 +365,12 @@ mod tests {
             .contains("no key: File \u{2192} Set OpenRouter key\u{2026} (F10)"));
         assert!(driven::request(&mut remote, b"1\t1\taction\tmenu").ends_with("changed"));
         assert!(remote.state().unwrap().contains("menu=open"));
-        // Down to Set OpenRouter key…, below the three New items, and
+        // Down to Set OpenRouter key…, below New conversation…, and
         // chosen.
-        for n in 2..5 {
-            driven::request(
-                &mut remote,
-                format!("1\t{n}\tkey\t{}", hex("Down")).as_bytes(),
-            );
-        }
+        driven::request(
+            &mut remote,
+            format!("1\t4\tkey\t{}", hex("Down")).as_bytes(),
+        );
         driven::request(
             &mut remote,
             format!("1\t5\tkey\t{}", hex("Return")).as_bytes(),

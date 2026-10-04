@@ -7,6 +7,10 @@
 //! and cannot be chosen. The conversation's model is marked and selected
 //! when it opens. Each row's meta is the model's price in dollars per
 //! million prompt and completion tokens.
+//!
+//! The same finder, opened by `Picker::templates`, is the template
+//! chooser of a new conversation (DESIGN.md §7): Empty, Directory… and
+//! the configured templates in the order given, Empty selected.
 
 use std::time::{Duration, Instant};
 
@@ -24,6 +28,9 @@ pub const TITLE: &str =
 /// Its title row, choosing the default.
 pub const DEFAULT_TITLE: &str =
     "Default model for new conversations: type to filter, Return chooses, Escape cancels";
+/// Its title row, choosing a new conversation's workspace template.
+pub const TEMPLATE_TITLE: &str =
+    "New conversation: choose its workspace; type to filter, Return chooses, Escape cancels";
 /// How soon a second press on a row chooses it, as td-mail's finder does.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
@@ -85,6 +92,28 @@ fn price(pricing: Pricing) -> String {
     }
 }
 
+/// The finder's entries for `rows`, each a name, its meta and whether it
+/// can be chosen, `current` marked, and how many were left out: past the
+/// finder's bound in number or bytes, or a row it refused.
+fn entries<'a>(
+    rows: impl ExactSizeIterator<Item = (&'a str, &'a str, bool)>,
+    current: &str,
+) -> (Vec<Entry>, usize) {
+    let total = rows.len();
+    let mut entries = Vec::new();
+    let mut bytes = 0usize;
+    for (name, meta, enabled) in rows.take(finder::ENTRIES) {
+        bytes = bytes.saturating_add(name.len() + meta.len());
+        if let Ok(entry) = Entry::new(name, meta, Kind::File, enabled) {
+            if bytes <= finder::LISTING_BYTES {
+                entries.push(entry.with_marked(!current.is_empty() && name == current));
+            }
+        }
+    }
+    let left_out = total.saturating_sub(entries.len());
+    (entries, left_out)
+}
+
 /// What the picker made of an input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reply {
@@ -116,32 +145,62 @@ impl Picker {
     ) -> Result<Self, String> {
         let mut sorted: Vec<&Offer> = offers.iter().collect();
         sorted.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut entries = Vec::new();
-        let mut bytes = 0usize;
-        for offer in sorted.into_iter().take(finder::ENTRIES) {
-            bytes = bytes.saturating_add(offer.id.len() + offer.price.len());
-            if let Ok(entry) = Entry::new(&offer.id, &offer.price, Kind::File, offer.usable) {
-                if bytes <= finder::LISTING_BYTES {
-                    entries.push(entry.with_marked(offer.id == current));
-                }
-            }
-        }
+        let rows = sorted
+            .into_iter()
+            .map(|offer| (offer.id.as_str(), offer.price.as_str(), offer.usable));
+        let (entries, left_out) = entries(rows, current);
         if entries.is_empty() {
             return Err("no models are known yet: the models list has not been fetched".into());
         }
-        // Past the finder's bound in number or bytes, or a row it refused.
-        let left_out = offers.len().saturating_sub(entries.len());
-        let listing = Listing::new(title, entries, left_out > 0)
-            .map_err(|e| format!("the model picker: {e}"))?;
-        let mut finder = Controller::new(listing, Choose::File, surface, rect, Some(current))
-            .map_err(|e| format!("the model picker: {e}"))?;
         let note = if left_out > 0 {
             let models = if left_out == 1 { "model" } else { "models" };
             format!("{left_out} {models} left out; greyed models take no tools or max_tokens")
         } else {
             "greyed models take no tools or max_tokens, which td-agent sends".to_string()
         };
-        let _ = finder.set_note(&note);
+        Self::over(surface, rect, title, entries, left_out, current, &note)
+            .map_err(|e| format!("the model picker: {e}"))
+    }
+
+    /// The picker over a new conversation's workspace templates, `rows`
+    /// each a name and its meta in the order given, the first selected.
+    pub fn templates(
+        surface: Surface,
+        rect: Rect,
+        rows: &[(String, String)],
+        note: &str,
+    ) -> Result<Self, String> {
+        let first = rows.first().map(|(name, _)| name.as_str()).unwrap_or("");
+        let (entries, left_out) = entries(
+            rows.iter()
+                .map(|(name, meta)| (name.as_str(), meta.as_str(), true)),
+            "",
+        );
+        Self::over(
+            surface,
+            rect,
+            TEMPLATE_TITLE,
+            entries,
+            left_out,
+            first,
+            note,
+        )
+        .map_err(|e| format!("the template chooser: {e}"))
+    }
+
+    fn over(
+        surface: Surface,
+        rect: Rect,
+        title: &str,
+        entries: Vec<Entry>,
+        left_out: usize,
+        selected: &str,
+        note: &str,
+    ) -> Result<Self, String> {
+        let listing = Listing::new(title, entries, left_out > 0).map_err(|e| e.to_string())?;
+        let mut finder = Controller::new(listing, Choose::File, surface, rect, Some(selected))
+            .map_err(|e| e.to_string())?;
+        let _ = finder.set_note(note);
         Ok(Self {
             finder,
             surface,

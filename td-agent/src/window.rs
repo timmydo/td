@@ -24,7 +24,7 @@ use td_ui::raster::{Composition, Raster, Scale, Surface};
 use td_ui::window::{Clipboard, Flow, Handler, Input};
 
 use crate::accounts::Ledger;
-use crate::config::{Client, Config};
+use crate::config::{Client, Config, Template, TemplateShared};
 use crate::control::Remote;
 use crate::diagnostics::{self, Exported};
 use crate::jail::Programs;
@@ -189,6 +189,8 @@ pub struct Session {
     show_keys: bool,
     /// Where no workspace may be, or why there are no workspaces.
     places: Result<Places, String>,
+    /// The configured workspace templates (DESIGN.md §7).
+    templates: Vec<Template>,
 }
 
 impl Session {
@@ -200,6 +202,7 @@ impl Session {
                 Request::New => self.start(None),
                 Request::NewScratch => self.start_in(None),
                 Request::NewIn(folder) => self.start_in(Some(folder)),
+                Request::NewFrom(name) => self.start_from(&name),
                 Request::Send(text) => {
                     if let Err(e) = self.supervisor.send(text.clone()) {
                         self.app.restore(&text, e);
@@ -341,6 +344,19 @@ impl Session {
         self.start(Some(workspace));
     }
 
+    /// A new conversation from the configured template `name`
+    /// (DESIGN.md §7): one naming repositories is refused until increment
+    /// 11 prepares them, and nothing is made.
+    fn start_from(&mut self, name: &str) {
+        if let Err(why) = &self.places {
+            return self.app.note(why.clone());
+        }
+        match from_template(&self.templates, name) {
+            Ok(workspace) => self.start(Some(workspace)),
+            Err(why) => self.app.note(why),
+        }
+    }
+
     /// A new conversation, created by its own process and opened.
     fn start(&mut self, workspace: Option<Workspace>) {
         let id = match Id::random() {
@@ -356,7 +372,7 @@ impl Session {
             activity: store::now_ms(),
             state: RowState::Starting,
             paused: false,
-            workspace: workspace.as_ref().map(Workspace::label),
+            workspace: workspace.clone(),
         });
         self.app.set_active(id.clone());
         match workspace {
@@ -579,6 +595,13 @@ impl Session {
                 _ => None,
             })
             .chain(self.client.shared.iter().map(|shared| shared.path.clone()))
+            .chain(
+                self.client
+                    .template_shared
+                    .iter()
+                    .flat_map(|template| template.shared.iter().flatten())
+                    .map(|shared| shared.path.clone()),
+            )
             .collect();
         let shared = std::fs::canonicalize(&downloads).is_ok_and(|real| {
             directories
@@ -809,6 +832,24 @@ fn places(config: &Config, state: &StateDir) -> Result<Places, String> {
     Places::from_env(state.root(), &config.workspace_root(&home), &programs)
 }
 
+/// The most a setup frame's client may take of `frame::MAX_FRAME`, the
+/// key and the framing having the rest.
+const SETUP_CLIENT_BYTES: usize = crate::frame::MAX_FRAME / 2;
+
+/// The workspace template `name` makes, or why it makes none.
+fn from_template(templates: &[Template], name: &str) -> Result<Workspace, String> {
+    let template = templates
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| format!("no template is named {name:?}"))?;
+    if !template.repos.is_empty() {
+        return Err(format!(
+            "no conversation from template {name:?}: it names repositories, and repository workspaces come with increment 11"
+        ));
+    }
+    Ok(Workspace::Template(name.to_string()))
+}
+
 /// The conversations the store holds, as the list shows them, closed.
 fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
     let (metas, mut problems) = state.list();
@@ -823,7 +864,7 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
                 activity,
                 state: RowState::Closed,
                 paused: meta.paused,
-                workspace: meta.workspace.as_ref().map(Workspace::label),
+                workspace: meta.workspace,
             }
         })
         .collect();
@@ -890,7 +931,23 @@ pub fn run(
     let places = places(&config, &state);
     match &places {
         Ok(places) => {
-            let (shared, notes) = workspace::admit_shared(&config.shared(&places.home), places);
+            let (shared, mut notes) = workspace::admit_shared(&config.shared(&places.home), places);
+            // A template's own list, admitted as the top-level one is.
+            for template in &config.templates {
+                let shared = template.shared(&places.home).map(|own| {
+                    let (admitted, refused) = workspace::admit_shared(&own, places);
+                    notes.extend(
+                        refused
+                            .into_iter()
+                            .map(|note| format!("template {:?}: {note}", template.name)),
+                    );
+                    admitted
+                });
+                client.template_shared.push(TemplateShared {
+                    name: template.name.clone(),
+                    shared,
+                });
+            }
             for note in &notes {
                 eprintln!("td-agent: {note}");
             }
@@ -903,12 +960,28 @@ pub fn run(
                 )),
             }
             client.shared = shared;
+            // Every conversation process is handed the lists in its setup
+            // frame: past this the templates' own go, and their
+            // workspaces bind none, rather than no process starting.
+            if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
+                client.template_shared.clear();
+                let note = "the templates' shared directories are too many to hand to conversations; their workspaces bind none";
+                eprintln!("td-agent: {note}");
+                app.note(note);
+            }
         }
         Err(why) => {
             eprintln!("td-agent: {why}");
             app.set_no_workspaces(Some(why.clone()));
         }
     }
+    app.set_templates(
+        config
+            .templates
+            .iter()
+            .map(|template| (template.name.clone(), !template.repos.is_empty()))
+            .collect(),
+    );
     let model_key = config.model_key.clone();
     let (model, set_aside) = default_model(
         model_key.as_deref(),
@@ -972,6 +1045,7 @@ pub fn run(
         keys: key.iter().cloned().collect(),
         show_keys: false,
         places,
+        templates: config.templates.clone(),
     };
     // A cached list serves until the provider's comes.
     match Models::load(session.state.root()) {
@@ -997,7 +1071,33 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::default_model;
+    #![allow(clippy::unwrap_used)]
+    use super::{default_model, from_template};
+    use crate::config::{Repo, Template};
+    use crate::workspace::Workspace;
+
+    #[test]
+    fn a_template_naming_repositories_is_refused_until_increment_11() {
+        let template = |name: &str, repos: Vec<Repo>| Template {
+            name: name.into(),
+            repos,
+            shared: None,
+        };
+        let repo = Repo {
+            remote: "r".into(),
+            base: "main".into(),
+            branch: "b".into(),
+            sparse: None,
+        };
+        let templates = [template("notes", Vec::new()), template("td", vec![repo])];
+        assert_eq!(
+            from_template(&templates, "notes"),
+            Ok(Workspace::Template("notes".into()))
+        );
+        let refused = from_template(&templates, "td").unwrap_err();
+        assert!(refused.contains("come with increment 11"), "{refused}");
+        assert!(from_template(&templates, "gone").is_err());
+    }
 
     #[test]
     fn the_saved_default_holds_until_the_configuration_changes_model() {

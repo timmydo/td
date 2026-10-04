@@ -59,6 +59,7 @@ use crate::protocol::{Up, MAX_TEXT};
 use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TodoItem};
 use crate::supervisor::Update;
 use crate::tools;
+use crate::workspace::Workspace;
 
 /// Why a hello came without the prefix (DESIGN.md §4).
 const LONG_PREFIX: &str = "the conversation's prefix file is longer than the window is sent";
@@ -173,6 +174,17 @@ struct Streaming {
     reasoning: bool,
 }
 
+/// What the open picker chooses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Picking {
+    /// The open conversation's model.
+    Model,
+    /// The default model.
+    Default,
+    /// A new conversation's workspace template.
+    Template,
+}
+
 /// One conversation in the list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Row {
@@ -184,8 +196,8 @@ pub struct Row {
     pub state: RowState,
     /// The human paused it: messages from other conversations wait.
     pub paused: bool,
-    /// What it works in, as the status row names it.
-    pub workspace: Option<String>,
+    /// What it works in; the status row names it.
+    pub workspace: Option<Workspace>,
 }
 
 impl Row {
@@ -204,12 +216,15 @@ pub enum Request {
     /// Open this conversation in its own process; the one open before is
     /// closed.
     Open(Id),
-    /// Start a new conversation and open it.
+    /// Start a new conversation with no workspace, when none can be made.
     New,
-    /// Start a new conversation in a scratch workspace.
+    /// Start a new conversation in a scratch workspace: the Empty
+    /// template.
     NewScratch,
     /// Start a new conversation in this directory, once admitted.
     NewIn(PathBuf),
+    /// Start a new conversation from the configured template named.
+    NewFrom(String),
     /// Send the human's message to the open conversation.
     Send(String),
     /// Ask the open conversation's failed turn again.
@@ -518,11 +533,13 @@ pub struct App {
     /// A prefix is in force, shown or said not to be, since the
     /// transcript was last cleared, so a later one replaces it.
     system_shown: bool,
-    /// The model picker while it is open, modal over the window, and
-    /// whether it chooses the default rather than the open
-    /// conversation's.
+    /// The picker while it is open, modal over the window, and what it
+    /// chooses.
     picker: Option<Picker>,
-    picking_default: bool,
+    picking: Picking,
+    /// The configured templates the template chooser lists after the
+    /// built-ins, each a name and whether it names repositories.
+    templates: Vec<(String, bool)>,
     /// The directory chooser while it is open, modal over the window, and
     /// the folder it opens on.
     chooser: Option<Chooser>,
@@ -630,7 +647,8 @@ impl App {
             asked: VecDeque::new(),
             system_shown: false,
             picker: None,
-            picking_default: false,
+            picking: Picking::Model,
+            templates: Vec::new(),
             chooser: None,
             chooser_start: std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -750,8 +768,8 @@ impl App {
             .and_then(|id| self.rows.iter().find(|r| &r.id == id));
         let state = row.map_or("no conversation", Row::word);
         let workspace = row
-            .and_then(|r| r.workspace.as_deref())
-            .map(|w| format!(" | in {w}"))
+            .and_then(|r| r.workspace.as_ref())
+            .map(|w| format!(" | in {}", w.label()))
             .unwrap_or_default();
         // A notice goes next to the state, where a narrow row still
         // shows it.
@@ -840,7 +858,7 @@ impl App {
         self.touch();
     }
 
-    /// The model picker, while it is open.
+    /// The picker, the model's or the template's, while it is open.
     pub fn picker(&self) -> Option<&Picker> {
         self.picker.as_ref()
     }
@@ -858,6 +876,12 @@ impl App {
     /// Why no workspace can be made, or none when they can.
     pub fn set_no_workspaces(&mut self, why: Option<String>) {
         self.no_workspaces = why;
+    }
+
+    /// The configured templates, each a name and whether it names
+    /// repositories.
+    pub fn set_templates(&mut self, templates: Vec<(String, bool)>) {
+        self.templates = templates;
     }
 
     /// The most recently active conversation's id, when the list holds
@@ -878,13 +902,14 @@ impl App {
         &self.default_model
     }
 
-    /// What the open picker chooses: `default`, `conversation`, or
-    /// `none` when it is closed.
+    /// What the open picker chooses: `default`, `conversation`,
+    /// `template`, or `none` when it is closed.
     pub fn picking(&self) -> &'static str {
-        match (&self.picker, self.picking_default) {
+        match (&self.picker, self.picking) {
             (None, _) => "none",
-            (Some(_), true) => "default",
-            (Some(_), false) => "conversation",
+            (Some(_), Picking::Default) => "default",
+            (Some(_), Picking::Model) => "conversation",
+            (Some(_), Picking::Template) => "template",
         }
     }
 
@@ -1971,7 +1996,7 @@ impl App {
         if let Some(picker) = self.picker.as_mut() {
             if !picker.resize(self.surface, body(self.surface)) {
                 self.close_picker();
-                self.note("the window is now too small for the model picker, which is closed");
+                self.note("the window is now too small for the picker, which is closed");
             }
         }
         if let Some(chooser) = self.chooser.as_mut() {
@@ -2274,7 +2299,7 @@ impl App {
             return self.note("a paste that came while the key dialog was open is dropped");
         }
         if self.picker.is_some() {
-            return self.note("a paste that came while the model picker was open is dropped");
+            return self.note("a paste that came while the picker was open is dropped");
         }
         if self.chooser.is_some() {
             return self.note("a paste that came while the directory chooser was open is dropped");
@@ -2388,9 +2413,7 @@ impl App {
     /// offers.
     fn menu_action(&mut self, action: menu::Action) {
         match action {
-            menu::Action::New => self.requests.push(Request::New),
-            menu::Action::NewScratch => self.new_scratch(),
-            menu::Action::NewInDirectory => self.open_chooser(),
+            menu::Action::New => self.new_conversation(),
             menu::Action::SetKey => self.open_key_dialog(),
             menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
@@ -2456,14 +2479,58 @@ impl App {
         }
         let wanted = self.wanted().0;
         let current = wanted.unwrap_or_else(|| self.model().to_string());
-        self.show_picker(crate::picker::TITLE, &current, false);
+        let opened = Picker::open(
+            self.surface,
+            body(self.surface),
+            crate::picker::TITLE,
+            &self.offers,
+            &current,
+        );
+        self.show_picker(opened, Picking::Model);
     }
 
     /// Opens the model picker for the default model, which a conversation
     /// with no model of its own uses (DESIGN.md §4).
     pub fn open_default_picker(&mut self) {
-        let current = self.default_model.clone();
-        self.show_picker(crate::picker::DEFAULT_TITLE, &current, true);
+        if self.modal() {
+            return;
+        }
+        let opened = Picker::open(
+            self.surface,
+            body(self.surface),
+            crate::picker::DEFAULT_TITLE,
+            &self.offers,
+            &self.default_model,
+        );
+        self.show_picker(opened, Picking::Default);
+    }
+
+    /// Starts a new conversation, as `C-n` and File → New conversation…
+    /// do: through the template chooser (DESIGN.md §7), Empty selected,
+    /// or, when no workspace can be made, at once with none.
+    pub fn new_conversation(&mut self) {
+        if self.modal() {
+            return;
+        }
+        if self.no_workspaces.is_some() {
+            self.requests.push(Request::New);
+            return self.touch();
+        }
+        let mut rows = vec![
+            (crate::config::EMPTY.to_string(), "scratch".to_string()),
+            (crate::config::DIRECTORY.to_string(), "folder".to_string()),
+        ];
+        rows.extend(self.templates.iter().map(|(name, repos)| {
+            let meta = if *repos { "repositories" } else { "scratch" };
+            (name.clone(), meta.to_string())
+        }));
+        let note = if self.templates.iter().any(|(_, repos)| *repos) {
+            "a template naming repositories is refused until increment 11 prepares them"
+        } else {
+            "Empty is a private scratch directory; Directory\u{2026} is a folder of yours"
+        };
+        let opened = Picker::templates(self.surface, body(self.surface), &rows, note);
+        self.show_picker(opened, Picking::Template);
     }
 
     /// Whether a modal is open: the picker, the chooser, the key dialog
@@ -2475,20 +2542,10 @@ impl App {
             || self.confirm.is_some()
     }
 
-    /// Asks for a conversation in a scratch workspace, as File → New
-    /// scratch conversation does.
-    pub fn new_scratch(&mut self) {
-        if let Some(why) = self.no_workspaces.clone() {
-            return self.note(why);
-        }
-        self.requests.push(Request::NewScratch);
-        self.touch();
-    }
-
-    /// Opens the directory chooser, as File → New conversation in a
-    /// directory… does: modal over the window's body, on the folder it
-    /// last chose from, else the home directory.
-    pub fn open_chooser(&mut self) {
+    /// Opens the directory chooser, as the template chooser's Directory…
+    /// does: modal over the window's body, on the folder it last chose
+    /// from, else the home directory.
+    fn open_chooser(&mut self) {
         if self.modal() {
             return;
         }
@@ -2567,22 +2624,16 @@ impl App {
         }
     }
 
-    fn show_picker(&mut self, title: &str, current: &str, default: bool) {
+    fn show_picker(&mut self, opened: Result<Picker, String>, picking: Picking) {
         if self.modal() {
             return;
         }
         self.cancel_pointer();
         self.menu.dismiss();
-        match Picker::open(
-            self.surface,
-            body(self.surface),
-            title,
-            &self.offers,
-            current,
-        ) {
+        match opened {
             Ok(picker) => {
                 self.picker = Some(picker);
-                self.picking_default = default;
+                self.picking = picking;
                 self.apply_focus();
                 self.touch();
             }
@@ -2592,7 +2643,7 @@ impl App {
 
     fn close_picker(&mut self) {
         self.picker = None;
-        self.picking_default = false;
+        self.picking = Picking::Model;
         self.apply_focus();
         self.touch();
         self.offer();
@@ -2623,14 +2674,40 @@ impl App {
                 }
             }
             crate::picker::Reply::Closed => self.close_picker(),
-            crate::picker::Reply::Chosen(model) => {
-                let default = self.picking_default;
-                self.close_picker();
-                if default {
-                    self.requests.push(Request::SetDefault(model));
+            crate::picker::Reply::Chosen(name) => {
+                let picking = self.picking;
+                if picking == Picking::Template && name == crate::config::DIRECTORY {
+                    self.picker = None;
+                    self.picking = Picking::Model;
+                    // Focus back where it was, should the chooser not open.
+                    self.apply_focus();
                     self.touch();
                 } else {
-                    self.choose(Some(model), self.wanted().1);
+                    self.close_picker();
+                }
+                match picking {
+                    Picking::Default => {
+                        self.requests.push(Request::SetDefault(name));
+                        self.touch();
+                    }
+                    Picking::Model => self.choose(Some(name), self.wanted().1),
+                    Picking::Template if name == crate::config::EMPTY => {
+                        self.requests.push(Request::NewScratch);
+                        self.touch();
+                    }
+                    // Straight on to the folder chooser: a card that waited
+                    // behind the picker waits behind the chooser too, rather
+                    // than open first and leave Directory… undone.
+                    Picking::Template if name == crate::config::DIRECTORY => {
+                        self.open_chooser();
+                        if self.chooser.is_none() {
+                            self.offer();
+                        }
+                    }
+                    Picking::Template => {
+                        self.requests.push(Request::NewFrom(name));
+                        self.touch();
+                    }
                 }
             }
         }
@@ -2655,7 +2732,7 @@ impl App {
             body(self.surface),
             id,
             &title,
-            workspace.as_deref(),
+            workspace.as_ref(),
             self.confirm_revision,
         ) {
             Ok(confirm) => {
@@ -2943,10 +3020,7 @@ impl App {
         match chord {
             menu::OPEN if !repeat => return self.open_menu(),
 
-            "C-n" if !repeat => {
-                self.requests.push(Request::New);
-                return;
-            }
+            "C-n" if !repeat => return self.new_conversation(),
             "C-t" if !repeat => {
                 if self.todo.is_empty() {
                     self.note("the conversation has no todo list");
@@ -3696,6 +3770,7 @@ pub mod tests {
     #[test]
     fn c_n_asks_for_a_conversation_and_c_page_keys_switch() {
         let mut app = app();
+        app.set_no_workspaces(Some("no workspace jail".into()));
         key(&mut app, "C-n");
         assert_eq!(app.take_requests(), [Request::New]);
         key(&mut app, "C-PageDown");
@@ -4613,10 +4688,8 @@ pub mod tests {
         app.set_key_path(Some(PATH.into()));
         app.set_keyed(false);
         key(&mut app, "F10");
-        // Set OpenRouter key…, below the three New items.
-        for _ in 0..3 {
-            key(&mut app, "Down");
-        }
+        // Set OpenRouter key…, below New conversation….
+        key(&mut app, "Down");
         key(&mut app, "Return");
         assert!(app.dialog().is_some());
         app
@@ -4658,17 +4731,16 @@ pub mod tests {
         assert!(app.take_requests().is_empty());
         key(&mut app, "Return");
         assert!(!app.menu_open());
-        assert_eq!(app.take_requests(), [Request::New]);
+        assert_eq!(app.picking(), "template");
+        key(&mut app, "Escape");
+        assert!(app.take_requests().is_empty());
         // The chord the item shows, with the menu closed, does the same.
         key(&mut app, "C-n");
-        assert_eq!(app.take_requests(), [Request::New]);
+        assert_eq!(app.picking(), "template");
+        key(&mut app, "Escape");
         // A press on the header opens it; one on the third row exports,
         // and one on the fourth quits.
-        for (row, request) in [
-            (1, Request::NewScratch),
-            (4, Request::Export),
-            (5, Request::Quit),
-        ] {
+        for (row, request) in [(2, Request::Export), (3, Request::Quit)] {
             press(&mut app, CELL_WIDTH as i64 + 4, 4);
             assert!(app.menu_open());
             let panel = app.menu.panel(0).unwrap();
@@ -4935,10 +5007,8 @@ pub mod tests {
     fn with_nowhere_to_store_a_key_the_dialog_does_not_open() {
         let mut app = app();
         key(&mut app, "F10");
-        // Set OpenRouter key…, below the three New items.
-        for _ in 0..3 {
-            key(&mut app, "Down");
-        }
+        // Set OpenRouter key…, below New conversation….
+        key(&mut app, "Down");
         key(&mut app, "Return");
         assert!(app.dialog().is_none());
         assert!(app.notice().unwrap().contains("nowhere to store a key"));
@@ -4959,17 +5029,54 @@ pub mod tests {
     }
 
     #[test]
-    fn workspaces_are_asked_for_from_the_file_menu_and_shown() {
+    fn a_new_conversation_chooses_its_workspace_template() {
         let mut app = app();
-        // Without the jail the reason comes at once.
+        // Without the jail there is nothing to choose: C-n starts a
+        // conversation with no workspace, as File's item does.
         app.set_no_workspaces(Some("no workspace jail".into()));
-        app.menu_action(menu::Action::NewScratch);
-        app.menu_action(menu::Action::NewInDirectory);
-        assert!(app.take_requests().is_empty() && app.chooser().is_none());
-        assert_eq!(app.notice(), Some("no workspace jail"));
+        key(&mut app, "C-n");
+        app.menu_action(menu::Action::New);
+        assert_eq!(app.take_requests(), [Request::New, Request::New]);
+        assert!(app.picker().is_none());
         app.set_no_workspaces(None);
-        app.menu_action(menu::Action::NewScratch);
+        app.set_templates(vec![("notes".into(), false), ("td".into(), true)]);
+        // The built-ins, then the templates in the order written, Empty
+        // selected; the note says a repository template waits.
+        key(&mut app, "C-n");
+        assert_eq!(app.picking(), "template");
+        let picker = app.picker().unwrap();
+        let listed: Vec<&str> = picker
+            .listing()
+            .entries()
+            .iter()
+            .map(|entry| entry.name())
+            .collect();
+        assert_eq!(listed, ["Empty", "Directory\u{2026}", "notes", "td"]);
+        assert_eq!(picker.selected(), Some("Empty"));
+        assert!(
+            text(&app).contains("refused until increment 11"),
+            "{}",
+            text(&app)
+        );
+        assert!(text(&app).contains("repositories"), "{}", text(&app));
+        // The picker has every key: C-n starts nothing more.
+        key(&mut app, "C-n");
+        assert!(app.take_requests().is_empty());
+        key(&mut app, "Return");
+        assert!(app.picker().is_none());
         assert_eq!(app.take_requests(), [Request::NewScratch]);
+        for (downs, name) in [(2, "notes"), (3, "td")] {
+            app.menu_action(menu::Action::New);
+            for _ in 0..downs {
+                key(&mut app, "Down");
+            }
+            key(&mut app, "Return");
+            assert_eq!(app.take_requests(), [Request::NewFrom(name.into())]);
+        }
+        // Escape chooses nothing.
+        key(&mut app, "C-n");
+        key(&mut app, "Escape");
+        assert!(app.picker().is_none() && app.take_requests().is_empty());
         let base = std::env::temp_dir().join(format!(
             "td-agent-ui-chooser-{}-{}",
             std::process::id(),
@@ -4978,7 +5085,14 @@ pub mod tests {
         std::fs::create_dir_all(base.join("notes")).unwrap();
         let base = std::fs::canonicalize(&base).unwrap();
         app.set_chooser_start(base.clone());
-        app.menu_action(menu::Action::NewInDirectory);
+        // Directory… opens the folder chooser.
+        let directory = |app: &mut App| {
+            key(app, "C-n");
+            key(app, "Down");
+            key(app, "Return");
+        };
+        directory(&mut app);
+        assert!(app.picker().is_none());
         assert_eq!(app.chooser().unwrap().folder(), base);
         // The chooser has every key: C-n starts nothing.
         key(&mut app, "C-n");
@@ -4989,20 +5103,36 @@ pub mod tests {
         assert!(app.chooser().is_none());
         assert_eq!(app.take_requests(), [Request::NewIn(base.join("notes"))]);
         // It opens next where it last chose from; Escape chooses nothing.
-        app.menu_action(menu::Action::NewInDirectory);
+        directory(&mut app);
         assert_eq!(app.chooser().unwrap().folder(), base);
         key(&mut app, "Escape");
         assert!(app.chooser().is_none() && app.take_requests().is_empty());
         std::fs::remove_dir_all(&base).unwrap();
         // Its folder gone, it opens elsewhere rather than not at all.
-        app.menu_action(menu::Action::NewInDirectory);
+        directory(&mut app);
         assert!(app
             .chooser()
             .is_some_and(|chooser| chooser.folder() != base));
         key(&mut app, "Escape");
+        // A card that waited behind the picker waits behind the folder
+        // chooser too: Directory… is not lost to it.
+        key(&mut app, "C-n");
+        app.ask(Card {
+            conversation: id(1),
+            call: 4,
+            title: "Run a command".into(),
+            details: vec!["make".into()],
+        });
+        assert!(app.confirm().is_none());
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert!(app.chooser().is_some() && app.confirm().is_none());
+        key(&mut app, "Escape");
+        assert!(app.chooser().is_none() && app.confirm().is_some());
+        app.withdraw(&id(1), None);
         // The status row names the open conversation's workspace.
         app.add_row(Row {
-            workspace: Some("scratch".into()),
+            workspace: Some(Workspace::Scratch),
             ..row(9, 1)
         });
         app.set_active(id(9));

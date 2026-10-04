@@ -11,6 +11,7 @@ use td_ui::window::{Input, PointerPhase};
 use td_ui::CELL_WIDTH;
 
 use crate::store::Id;
+use crate::workspace::Workspace;
 
 /// The dialog's one action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +55,24 @@ pub struct Confirm {
     revision: u64,
 }
 
+/// What becomes of a deleted conversation's workspace: td-agent's
+/// directory goes with it, the human's stays.
+fn worked(workspace: Option<&Workspace>) -> String {
+    match workspace {
+        Some(Workspace::Scratch) => {
+            "Its scratch workspace and every file in it are removed with it.".to_string()
+        }
+        Some(Workspace::Template(name)) => format!(
+            "Its workspace, a scratch directory made from template {name}, and every file in it are removed with it."
+        ),
+        Some(Workspace::Directory(directory)) => format!(
+            "The directory it works in, {}, is yours and stays.",
+            directory.display()
+        ),
+        None => String::new(),
+    }
+}
+
 /// The dialog's place: at most 64 cells by 10 rows, centred in `body`.
 /// A card's is larger, at most 100 cells by 24 rows, so more of the
 /// action shows at once.
@@ -81,19 +100,11 @@ impl Confirm {
         body: Rect,
         id: Id,
         title: &str,
-        workspace: Option<&str>,
+        workspace: Option<&Workspace>,
         revision: u64,
     ) -> Result<Self, String> {
         let named = format!("Delete \u{201c}{title}\u{201d} ({})?", id.as_str());
-        let worked = match workspace {
-            Some("scratch") => {
-                "Its scratch workspace and every file in it are removed with it.".to_string()
-            }
-            Some(directory) => {
-                format!("The directory it works in, {directory}, is yours and stays.")
-            }
-            None => String::new(),
-        };
+        let worked = worked(workspace);
         let mut details: Vec<&str> = vec![
             &named,
             "Its log, its todo list, its cost record and the messages waiting for it are removed from this machine for good. Messages it sent to other conversations stay in theirs. This cannot be undone.",
@@ -228,7 +239,22 @@ mod tests {
     fn open() -> Confirm {
         let surface = Surface::new(1024, 640, Scale::default()).unwrap();
         let id = Id::parse(&"c".repeat(32)).unwrap();
-        Confirm::open(surface, surface.bounds(), id, "a plan", Some("scratch"), 7).unwrap()
+        let workspace = Workspace::Scratch;
+        Confirm::open(surface, surface.bounds(), id, "a plan", Some(&workspace), 7).unwrap()
+    }
+
+    #[test]
+    fn the_question_says_whether_the_workspace_goes_by_its_kind() {
+        assert!(worked(Some(&Workspace::Scratch)).contains("removed with it"));
+        // A template's is td-agent's scratch directory, whatever its name.
+        let template = worked(Some(&Workspace::Template("notes".into())));
+        assert!(template.contains("template notes") && template.contains("removed with it"));
+        let directory = worked(Some(&Workspace::Directory("/home/u/notes".into())));
+        assert_eq!(
+            directory,
+            "The directory it works in, /home/u/notes, is yours and stays."
+        );
+        assert_eq!(worked(None), "");
     }
 
     fn key(confirm: &mut Confirm, chord: &str) -> Reply {

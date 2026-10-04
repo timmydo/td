@@ -23,11 +23,17 @@ use crate::store::{Id, StateDir};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Workspace {
     /// A directory td-agent makes for it, under its jail directory,
-    /// removed with the conversation.
+    /// removed with the conversation: the Empty template.
     Scratch,
     /// A directory of the human's, admitted when chosen, never removed.
     Directory(PathBuf),
+    /// A scratch directory made from the configured template named, which
+    /// names no repository: it binds the template's shared directories.
+    Template(String),
 }
+
+/// How a template's workspace is passed a new conversation's process.
+const TEMPLATE_ARGUMENT: &str = "template:";
 
 impl Workspace {
     pub fn to_json(&self) -> Json {
@@ -36,6 +42,10 @@ impl Workspace {
             Self::Directory(path) => Json::Obj(vec![
                 ("kind".into(), Json::Str("directory".into())),
                 ("path".into(), Json::Str(path.display().to_string())),
+            ]),
+            Self::Template(name) => Json::Obj(vec![
+                ("kind".into(), Json::Str("template".into())),
+                ("name".into(), Json::Str(name.clone())),
             ]),
         }
     }
@@ -50,7 +60,13 @@ impl Workspace {
                 .filter(|path| path.is_absolute())
                 .map(Self::Directory)
                 .ok_or_else(|| "a directory workspace has no absolute path".into()),
-            _ => Err("a workspace is a scratch or a directory one".into()),
+            Some("template") => value
+                .get("name")
+                .and_then(Json::as_str)
+                .ok_or_else(|| "a template workspace has no name".to_string())
+                .and_then(crate::config::template_name)
+                .map(Self::Template),
+            _ => Err("a workspace is a scratch, a directory or a template one".into()),
         }
     }
 
@@ -59,12 +75,16 @@ impl Workspace {
         match self {
             Self::Scratch => "scratch".into(),
             Self::Directory(path) => path.as_os_str().to_os_string(),
+            Self::Template(name) => format!("{TEMPLATE_ARGUMENT}{name}").into(),
         }
     }
 
     pub fn parse_argument(word: &str) -> Result<Self, String> {
         if word == "scratch" {
             return Ok(Self::Scratch);
+        }
+        if let Some(name) = word.strip_prefix(TEMPLATE_ARGUMENT) {
+            return crate::config::template_name(name).map(Self::Template);
         }
         let path = PathBuf::from(word);
         if !path.is_absolute() {
@@ -80,7 +100,13 @@ impl Workspace {
         match self {
             Self::Scratch => "scratch".into(),
             Self::Directory(path) => path.display().to_string(),
+            Self::Template(name) => format!("template {name}"),
         }
+    }
+
+    /// Whether td-agent made its directory, a scratch one.
+    pub fn scratch(&self) -> bool {
+        matches!(self, Self::Scratch | Self::Template(_))
     }
 }
 
@@ -707,7 +733,7 @@ pub fn policy(
         fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))
     };
     let tree = match workspace {
-        Workspace::Scratch => made("scratch")?,
+        Workspace::Scratch | Workspace::Template(_) => made("scratch")?,
         Workspace::Directory(path) => path.clone(),
     };
     let policy = Policy {
@@ -748,7 +774,11 @@ mod tests {
 
     #[test]
     fn a_workspace_round_trips() {
-        for workspace in [Workspace::Scratch, Workspace::Directory("/w/a b".into())] {
+        for workspace in [
+            Workspace::Scratch,
+            Workspace::Directory("/w/a b".into()),
+            Workspace::Template("td notes".into()),
+        ] {
             assert_eq!(
                 Workspace::from_json(&workspace.to_json()).unwrap(),
                 workspace
@@ -757,6 +787,18 @@ mod tests {
             assert_eq!(Workspace::parse_argument(&word).unwrap(), workspace);
         }
         assert!(Workspace::parse_argument("relative").is_err());
+        for word in [
+            "template:",
+            "template:Empty",
+            "template: x",
+            "template:a\tb",
+        ] {
+            assert!(Workspace::parse_argument(word).is_err(), "{word}");
+        }
+        assert_eq!(
+            Workspace::Template("/home/u/p".into()).label(),
+            "template /home/u/p"
+        );
         assert!(Workspace::from_json(&Json::Obj(vec![(
             "kind".into(),
             Json::Str("directory".into())

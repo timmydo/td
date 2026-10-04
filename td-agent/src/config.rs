@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cost::{self, Limits};
-use crate::workspace::Shared;
+use crate::workspace::{Shared, Workspace};
 use td_json::Json;
 use td_toml::Toml;
 
@@ -41,6 +41,17 @@ pub struct Client {
     /// The shared directories the window admitted (DESIGN.md §8),
     /// resolved and absolute: what every workspace instance binds.
     pub shared: Vec<Shared>,
+    /// Every configured template, with the shared directories of its
+    /// own its workspaces bind in place of `shared`, admitted as it is.
+    pub template_shared: Vec<TemplateShared>,
+}
+
+/// A configured template and its own shared directories, admitted; none
+/// when it names none and its workspaces bind `shared`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemplateShared {
+    pub name: String,
+    pub shared: Option<Vec<Shared>>,
 }
 
 impl Default for Client {
@@ -53,11 +64,69 @@ impl Default for Client {
             allow_data_collection: false,
             limits: Limits::default(),
             shared: Vec::new(),
+            template_shared: Vec::new(),
         }
     }
 }
 
+/// Shared directories as `to_json` writes them.
+fn shared_json(shared: &[Shared]) -> Json {
+    Json::Arr(
+        shared
+            .iter()
+            .map(|shared| {
+                Json::Obj(vec![
+                    ("path".into(), Json::Str(shared.path.display().to_string())),
+                    ("write".into(), Json::Bool(shared.write)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// `shared_json`'s value back.
+fn shared_from_json(value: &Json) -> Result<Vec<Shared>, String> {
+    let Json::Arr(items) = value else {
+        return Err("shared is not a list".into());
+    };
+    items
+        .iter()
+        .map(|item| {
+            let path = item
+                .get("path")
+                .and_then(Json::as_str)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or("a shared directory with no absolute path")?;
+            let write = item
+                .get("write")
+                .and_then(Json::as_bool)
+                .ok_or("a shared directory with no write flag")?;
+            Ok(Shared { path, write })
+        })
+        .collect()
+}
+
 impl Client {
+    /// What a workspace binds: a template's own shared directories when
+    /// it was made from one that names them, `shared` when it names none,
+    /// and none when its template is no longer configured, so removing or
+    /// renaming one never widens what its conversations reach.
+    pub fn shared_for(&self, workspace: &Workspace) -> &[Shared] {
+        match workspace {
+            Workspace::Template(name) => {
+                match self.template_shared.iter().find(|t| &t.name == name) {
+                    Some(TemplateShared {
+                        shared: Some(own), ..
+                    }) => own,
+                    Some(TemplateShared { shared: None, .. }) => &self.shared,
+                    None => &[],
+                }
+            }
+            Workspace::Scratch | Workspace::Directory(_) => &self.shared,
+        }
+    }
+
     /// The settings as the socketpair carries them.
     pub fn to_json(&self) -> Json {
         let limit = |l: Option<u64>| l.map_or(Json::Null, Json::from);
@@ -86,15 +155,19 @@ impl Client {
                 limit(self.limits.conversation),
             ),
             ("max_cost_per_day".into(), limit(self.limits.day)),
+            ("shared".into(), shared_json(&self.shared)),
             (
-                "shared".into(),
+                "template_shared".into(),
                 Json::Arr(
-                    self.shared
+                    self.template_shared
                         .iter()
-                        .map(|shared| {
+                        .map(|template| {
                             Json::Obj(vec![
-                                ("path".into(), Json::Str(shared.path.display().to_string())),
-                                ("write".into(), Json::Bool(shared.write)),
+                                ("name".into(), Json::Str(template.name.clone())),
+                                (
+                                    "shared".into(),
+                                    template.shared.as_deref().map_or(Json::Null, shared_json),
+                                ),
                             ])
                         })
                         .collect(),
@@ -129,23 +202,32 @@ impl Client {
             },
             shared: match value.get("shared") {
                 None => Vec::new(),
+                Some(shared) => shared_from_json(shared)?,
+            },
+            template_shared: match value.get("template_shared") {
+                None => Vec::new(),
                 Some(Json::Arr(items)) => items
                     .iter()
                     .map(|item| {
-                        let path = item
-                            .get("path")
+                        let name = item
+                            .get("name")
                             .and_then(Json::as_str)
-                            .map(PathBuf::from)
-                            .filter(|path| path.is_absolute())
-                            .ok_or("a shared directory with no absolute path")?;
-                        let write = item
-                            .get("write")
-                            .and_then(Json::as_bool)
-                            .ok_or("a shared directory with no write flag")?;
-                        Ok(Shared { path, write })
+                            .ok_or("a template's shared directories with no name")?;
+                        let shared = match item.get("shared") {
+                            Some(Json::Null) => None,
+                            Some(shared) => Some(
+                                shared_from_json(shared)
+                                    .map_err(|e| format!("template {name:?}: {e}"))?,
+                            ),
+                            None => return Err(format!("template {name:?} with no shared")),
+                        };
+                        Ok(TemplateShared {
+                            name: template_name(name)?,
+                            shared,
+                        })
                     })
                     .collect::<Result<_, String>>()?,
-                Some(_) => return Err("shared is not a list".into()),
+                Some(_) => return Err("template_shared is not a list".into()),
             },
         };
         Ok(client)
@@ -250,8 +332,6 @@ enum Use {
     Read,
     /// Accepted by name; the DESIGN.md §18 increment given reads it.
     Later(u8),
-    /// Accepted by name; the DESIGN.md §18 step named reads it.
-    Step(&'static str),
 }
 
 /// Every key DESIGN.md §15 lists, in its order.
@@ -271,7 +351,7 @@ const KEYS: &[(&str, Use)] = &[
     ("max_cost_per_day", Use::Read),
     ("workspace_root", Use::Read),
     ("shared", Use::Read),
-    ("template", Use::Step("the templates step")),
+    ("template", Use::Read),
     ("remotes", Use::Later(11)),
     ("network", Use::Later(15)),
     ("network_allowlist", Use::Later(15)),
@@ -316,6 +396,201 @@ pub struct Config {
     /// `[[shared]]` as the file gives them, `~` unexpanded; none is
     /// `~/Downloads` read-only, and an empty list none at all.
     pub shared: Option<Vec<Shared>>,
+    /// `[[template]]` in the order written (DESIGN.md §7).
+    pub templates: Vec<Template>,
+}
+
+/// A workspace template (DESIGN.md §7, §15).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Template {
+    pub name: String,
+    /// The repositories to check out, which increment 11 prepares; until
+    /// then a template naming any is refused at creation.
+    pub repos: Vec<Repo>,
+    /// Its own `[[shared]]`, `~` unexpanded, in place of the top-level
+    /// list; none is the top-level list.
+    pub shared: Option<Vec<Shared>>,
+}
+
+/// One of a template's repositories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Repo {
+    pub remote: String,
+    pub base: String,
+    pub branch: String,
+    /// The cone-mode paths to check out; none is the whole tree.
+    pub sparse: Option<Vec<String>>,
+}
+
+/// The longest template name.
+pub const MAX_TEMPLATE_NAME: usize = 64;
+/// The most templates a configuration lists.
+const MAX_TEMPLATES: usize = 64;
+/// The chooser's built-ins, which no template may be named.
+pub const EMPTY: &str = "Empty";
+pub const DIRECTORY: &str = "Directory\u{2026}";
+
+/// A template's name: visible, at most `MAX_TEMPLATE_NAME` bytes, and
+/// neither built-in's, ASCII case aside.
+pub fn template_name(name: &str) -> Result<String, String> {
+    // As a card would show it: nothing invisible, no bidirectional
+    // control, so no name can look like another's.
+    let visible = crate::tools::visible(name) == name;
+    if name.is_empty() || name.len() > MAX_TEMPLATE_NAME || name.trim() != name || !visible {
+        return Err(format!(
+            "a template's `name` is visible text of at most {MAX_TEMPLATE_NAME} bytes with no space at either end, not {name:?}"
+        ));
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower == "empty" || lower == "directory\u{2026}" || lower == "directory..." {
+        return Err(format!(
+            "no template may be named {name:?}: the chooser lists {EMPTY} and {DIRECTORY} itself"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// A `[[shared]]` list under `key`.
+fn shared_list(key: &str, value: &Toml) -> Result<Vec<Shared>, String> {
+    let wrong = || format!("`{key}` is a list of `[[{key}]]` tables");
+    let items = value.as_arr().ok_or_else(wrong)?;
+    let mut shared = Vec::new();
+    for item in items {
+        if !item.is_table() {
+            return Err(wrong());
+        }
+        item.check_known_keys(&["path", "write"])
+            .map_err(|e| format!("`{key}`: {e}"))?;
+        let path = item
+            .optional_str("path")
+            .map_err(|e| format!("`{key}`: {e}"))?
+            .ok_or_else(|| format!("a `[[{key}]]` table has no `path`"))?;
+        let write = match item.get("write") {
+            None => false,
+            Some(write) => write
+                .as_bool()
+                .ok_or_else(|| format!("`{key}`'s `write` is true or false"))?,
+        };
+        shared.push(Shared {
+            path: configured_path(key, path)?,
+            write,
+        });
+    }
+    Ok(shared)
+}
+
+/// A repository field: visible text of at most `MAX_NAME` bytes.
+fn repo_text<'a>(item: &'a Toml, key: &str) -> Result<&'a str, String> {
+    let text = item
+        .optional_str(key)
+        .map_err(|e| format!("`template.repos`: {e}"))?
+        .ok_or_else(|| format!("a `[[template.repos]]` table has no `{key}`"))?;
+    if text.is_empty() || text.len() > MAX_NAME || text.chars().any(char::is_control) {
+        return Err(format!(
+            "`template.repos`'s `{key}` is text of at most {MAX_NAME} bytes, not {text:?}"
+        ));
+    }
+    Ok(text)
+}
+
+const SPARSE: &str =
+    "`template.repos`'s `sparse` is a list of relative paths with no `..` or control character";
+
+/// A sparse path as given: relative, inside the tree, at most `MAX_NAME`
+/// bytes, nothing that would break git's line-based sparse file.
+fn sparse_path(path: &str) -> Option<String> {
+    let inside = !path.starts_with('/') && !path.split('/').any(|part| part == "..");
+    (!path.is_empty() && path.len() <= MAX_NAME && inside && !path.contains(char::is_control))
+        .then(|| path.to_string())
+}
+
+/// `[[template]]`, and a note for each key it has that is not read yet.
+fn templates(value: &Toml, notes: &mut Vec<String>) -> Result<Vec<Template>, String> {
+    let wrong = "`template` is a list of `[[template]]` tables";
+    let items = value.as_arr().ok_or(wrong)?;
+    if items.len() > MAX_TEMPLATES {
+        return Err(format!("at most {MAX_TEMPLATES} templates are listed"));
+    }
+    let mut templates: Vec<Template> = Vec::new();
+    for item in items {
+        if !item.is_table() {
+            return Err(wrong.into());
+        }
+        item.check_known_keys(&["name", "repos", "shared", "network"])
+            .map_err(|e| format!("`template`: {e}"))?;
+        let name = item
+            .optional_str("name")
+            .map_err(|e| format!("`template`: {e}"))?
+            .ok_or("a `[[template]]` table has no `name`")?;
+        let name = template_name(name)?;
+        if templates.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
+            return Err(format!("two templates are named {name:?}"));
+        }
+        if item.get("network").is_some() {
+            notes.push(format!(
+                "template {name:?}'s `network` is accepted and not read yet: increment 15 reads it"
+            ));
+        }
+        let mut repos = Vec::new();
+        if let Some(value) = item.get("repos") {
+            let wrong = "`template.repos` is a list of `[[template.repos]]` tables";
+            for repo in value.as_arr().ok_or(wrong)? {
+                if !repo.is_table() {
+                    return Err(wrong.into());
+                }
+                repo.check_known_keys(&["remote", "base", "branch", "sparse"])
+                    .map_err(|e| format!("`template.repos`: {e}"))?;
+                let sparse = match repo.get("sparse") {
+                    None => None,
+                    Some(paths) => Some(
+                        paths
+                            .as_arr()
+                            .ok_or(SPARSE)?
+                            .iter()
+                            .map(|path| path.as_str().and_then(sparse_path).ok_or(SPARSE))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                };
+                repos.push(Repo {
+                    remote: repo_text(repo, "remote")?.into(),
+                    base: repo_text(repo, "base")?.into(),
+                    branch: repo_text(repo, "branch")?.into(),
+                    sparse,
+                });
+            }
+        }
+        let shared = match item.get("shared") {
+            None => None,
+            Some(value) => Some(shared_list("template.shared", value)?),
+        };
+        templates.push(Template {
+            name,
+            repos,
+            shared,
+        });
+    }
+    Ok(templates)
+}
+
+impl Template {
+    /// Its shared directories as configured, `~` expanded against `home`;
+    /// none when it names none of its own.
+    pub fn shared(&self, home: &Path) -> Option<Vec<Shared>> {
+        self.shared
+            .as_ref()
+            .map(|shared| expand_shared(shared, home))
+    }
+}
+
+/// `shared` with `~` expanded against `home`.
+fn expand_shared(shared: &[Shared], home: &Path) -> Vec<Shared> {
+    shared
+        .iter()
+        .map(|shared| Shared {
+            path: expand(&shared.path, home),
+            write: shared.write,
+        })
+        .collect()
 }
 
 /// Where repository workspaces live (DESIGN.md §7).
@@ -342,13 +617,7 @@ impl Config {
                 path: expand(Path::new(DEFAULT_SHARED), home),
                 write: false,
             }],
-            Some(shared) => shared
-                .iter()
-                .map(|shared| Shared {
-                    path: expand(&shared.path, home),
-                    write: shared.write,
-                })
-                .collect(),
+            Some(shared) => expand_shared(shared, home),
         }
     }
 }
@@ -441,9 +710,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
             Some((_, Use::Later(increment))) => config.notes.push(format!(
                 "`{key}` is accepted and not read yet: increment {increment} reads it"
             )),
-            Some((_, Use::Step(step))) => config.notes.push(format!(
-                "`{key}` is accepted and not read yet: {step} reads it"
-            )),
             Some((_, Use::Read)) => {}
         }
     }
@@ -476,32 +742,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
         config.workspace_root = Some(configured_path("workspace_root", root)?);
     }
     if let Some(value) = table.get("shared") {
-        let items = value
-            .as_arr()
-            .ok_or("`shared` is a list of `[[shared]]` tables")?;
-        let mut shared = Vec::new();
-        for item in items {
-            if !item.is_table() {
-                return Err("`shared` is a list of `[[shared]]` tables".into());
-            }
-            item.check_known_keys(&["path", "write"])
-                .map_err(|e| format!("`shared`: {e}"))?;
-            let path = item
-                .optional_str("path")
-                .map_err(|e| format!("`shared`: {e}"))?
-                .ok_or("a `[[shared]]` table has no `path`")?;
-            let write = match item.get("write") {
-                None => false,
-                Some(write) => write
-                    .as_bool()
-                    .ok_or("`shared`'s `write` is true or false")?,
-            };
-            shared.push(Shared {
-                path: configured_path("shared", path)?,
-                write,
-            });
-        }
-        config.shared = Some(shared);
+        config.shared = Some(shared_list("shared", value)?);
+    }
+    if let Some(value) = table.get("template") {
+        config.templates = templates(value, &mut config.notes)?;
     }
     let client = &mut config.client;
     for (key, slot) in [
@@ -637,9 +881,19 @@ mod tests {
                        branch = \"agent\"\nsparse = [\"td-agent\", \"td-ui\"]\n";
         let config = parse(example).unwrap();
         assert_eq!(config.mode, Mode::Auto);
+        assert!(config.notes.is_empty(), "{:?}", config.notes);
         assert_eq!(
-            config.notes,
-            ["`template` is accepted and not read yet: the templates step reads it"]
+            config.templates,
+            [Template {
+                name: "td".into(),
+                repos: vec![Repo {
+                    remote: "https://github.com/timmydo/td".into(),
+                    base: "main".into(),
+                    branch: "agent".into(),
+                    sparse: Some(vec!["td-agent".into(), "td-ui".into()]),
+                }],
+                shared: None,
+            }]
         );
         assert_eq!(
             config.shared(Path::new("/home/u")),
@@ -665,12 +919,6 @@ mod tests {
                     config.unwrap(),
                     [format!(
                         "`{key}` is accepted and not read yet: increment {n} reads it"
-                    )]
-                ),
-                Use::Step(step) => assert_eq!(
-                    config.unwrap(),
-                    [format!(
-                        "`{key}` is accepted and not read yet: {step} reads it"
                     )]
                 ),
             }
@@ -750,5 +998,142 @@ mod tests {
             Some(PathBuf::from("/h/.config/td-agent/config"))
         );
         assert_eq!(path(None, None), None);
+    }
+
+    #[test]
+    fn templates_are_read_in_order_and_checked() {
+        let config = parse(
+            "[[template]]\nname = \"notes\"\n[[template.shared]]\npath = \"~/notes\"\n\
+             write = true\n\n[[template]]\nname = \"bare\"\nshared = []\nnetwork = \"off\"\n\n\
+             [[template]]\nname = \"repo\"\n[[template.repos]]\nremote = \"r\"\n\
+             base = \"main\"\nbranch = \"b\"\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = config.templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["notes", "bare", "repo"]);
+        let home = Path::new("/home/u");
+        let shared = |n: usize| config.templates.get(n).unwrap().shared(home);
+        assert_eq!(
+            shared(0),
+            Some(vec![Shared {
+                path: "/home/u/notes".into(),
+                write: true
+            }])
+        );
+        assert_eq!(shared(1), Some(Vec::new()));
+        assert_eq!(shared(2), None);
+        assert_eq!(config.templates.get(2).unwrap().repos.len(), 1);
+        let repo = config.templates.get(2).unwrap().repos.first().unwrap();
+        assert_eq!(repo.sparse, None);
+        assert_eq!(
+            config.notes,
+            ["template \"bare\"'s `network` is accepted and not read yet: increment 15 reads it"]
+        );
+        for (text, said) in [
+            ("template = 3", "a list of `[[template]]` tables"),
+            ("[[template]]\nshared = []", "has no `name`"),
+            ("[[template]]\nname = \"\"", "visible text"),
+            ("[[template]]\nname = \" x\"", "visible text"),
+            ("[[template]]\nname = \"a\\tb\"", "visible text"),
+            ("[[template]]\nname = \"empty\"", "the chooser lists"),
+            ("[[template]]\nname = \"a\\u202Eb\"", "visible text"),
+            ("[[template]]\nname = \"a\\u200Bb\"", "visible text"),
+            (
+                "[[template]]\nname = \"Notes\"\n[[template]]\nname = \"notes\"",
+                "two templates are named \"notes\"",
+            ),
+            ("[[template]]\nname = \"Directory...\"", "the chooser lists"),
+            (
+                "[[template]]\nname = \"a\"\n[[template]]\nname = \"a\"",
+                "two templates are named \"a\"",
+            ),
+            (
+                "[[template]]\nname = \"a\"\nmode = 1",
+                "unknown field `mode`",
+            ),
+            (
+                "[[template]]\nname = \"a\"\nrepos = 1",
+                "`template.repos` is a list",
+            ),
+            (
+                "[[template]]\nname = \"a\"\n[[template.repos]]\nremote = \"r\"\nbase = \"m\"",
+                "has no `branch`",
+            ),
+            (
+                "[[template]]\nname = \"a\"\n[[template.repos]]\nremote = \"r\"\nbase = \"m\"\n\
+                 branch = \"b\"\nsparse = \"x\"",
+                "`sparse` is a list of relative paths",
+            ),
+            (
+                "[[template]]\nname = \"a\"\n[[template.repos]]\nremote = \"r\"\nbase = \"m\"\n\
+                 branch = \"b\"\nsparse = [\"a/../../b\"]",
+                "no `..`",
+            ),
+            (
+                "[[template]]\nname = \"a\"\n[[template.repos]]\nremote = \"r\"\nbase = \"m\"\n\
+                 branch = \"b\"\nsparse = [\"/etc\"]",
+                "relative paths",
+            ),
+            (
+                "[[template]]\nname = \"a\"\n[[template.repos]]\nremote = \"r\"\nbase = \"m\"\n\
+                 branch = \"b\"\nsparse = [\"a\\nb\"]",
+                "control character",
+            ),
+            (
+                "[[template]]\nname = \"a\"\n[[template.shared]]\npath = \"rel\"",
+                "`template.shared` is an absolute path",
+            ),
+            (
+                "[[template]]\nname = \"a\"\nshared = 1",
+                "`template.shared` is a list of `[[template.shared]]` tables",
+            ),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.contains(said), "{text}: {e}");
+        }
+        let many = "[[template]]\nname = \"t\"\n".repeat(MAX_TEMPLATES + 1);
+        assert!(parse(&many).unwrap_err().contains("at most"));
+        assert!(template_name(&"x".repeat(MAX_TEMPLATE_NAME)).is_ok());
+        assert!(template_name(&"x".repeat(MAX_TEMPLATE_NAME + 1)).is_err());
+    }
+
+    #[test]
+    fn a_template_workspace_binds_its_own_shared_directories() {
+        let own = vec![Shared {
+            path: "/n".into(),
+            write: true,
+        }];
+        let client = Client {
+            shared: vec![Shared {
+                path: "/d".into(),
+                write: false,
+            }],
+            template_shared: vec![
+                TemplateShared {
+                    name: "notes".into(),
+                    shared: Some(own.clone()),
+                },
+                TemplateShared {
+                    name: "plain".into(),
+                    shared: None,
+                },
+            ],
+            ..Client::default()
+        };
+        assert_eq!(client.shared_for(&Workspace::Template("notes".into())), own);
+        // A template that names none, and the built-ins, bind the
+        // top-level list.
+        for workspace in [
+            Workspace::Template("plain".into()),
+            Workspace::Scratch,
+            Workspace::Directory("/w".into()),
+        ] {
+            assert_eq!(client.shared_for(&workspace), client.shared);
+        }
+        // One removed or renamed since binds none: never wider.
+        assert!(client
+            .shared_for(&Workspace::Template("gone".into()))
+            .is_empty());
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
     }
 }

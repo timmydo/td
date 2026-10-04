@@ -22,14 +22,14 @@ serves that.\n\
 \n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\
 C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
-C-n starts a conversation; C-PageUp and C-PageDown\n\
+C-n starts a conversation from a workspace template\n\
+(Empty, Directory... or one configured; td-agent/DESIGN.md §7), or\n\
+with no workspace when ./agent's jail is absent; C-PageUp and C-PageDown\n\
 open the one above or below; F6 and S-F6 move the focus between the\n\
 list, the transcript and the composer; F10 opens the menus: File's\n\
 Set OpenRouter key... stores the key and Export diagnostics writes an\n\
 archive of the state and configuration, never the key file, to\n\
 ~/Downloads (else the home directory);\n\
-File's New scratch conversation and New conversation in a directory...\n\
-start one with a workspace for the tools (td-agent/DESIGN.md §7);\n\
 Conversation's Model... and Effort choose the open conversation's model\n\
 and reasoning effort, Default model... the model new conversations use,\n\
 and Delete conversation... deletes the open one for good; F1, or\n\
@@ -46,7 +46,7 @@ which File > Set OpenRouter key... writes.\n";
 /// WORKSPACE]]`: the window starts these; a person does not.
 fn conversation(args: &[String]) -> Result<(), String> {
     let usage = "usage: td-agent conversation ID --state-dir ABSOLUTE-DIR \
-                 [--create ROLE [--workspace scratch|ABSOLUTE-DIR]]";
+                 [--create ROLE [--workspace scratch|template:NAME|ABSOLUTE-DIR]]";
     let (id, rest) = args.split_first().ok_or(usage)?;
     let id = Id::parse(id).ok_or_else(|| format!("{id:?} is not a conversation id"))?;
     let role = |role: &str| Role::parse(role).ok_or_else(|| format!("{role:?} is not a role"));

@@ -169,30 +169,42 @@ fn a_workspace_reaches_the_conversation_and_stale_specs_are_cleared() {
     let state = scratch.state();
     let id = Id::random().unwrap();
     let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    let template = Id::random().unwrap();
     supervisor
         .create(id.clone(), Role::Conversation, Workspace::Scratch)
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let recorded = loop {
-        let (metas, _) = state.list();
-        if let Some(meta) = metas.into_iter().find(|meta| meta.id == id) {
-            break meta.workspace;
+    supervisor
+        .create(
+            template.clone(),
+            Role::Conversation,
+            Workspace::Template("my notes".into()),
+        )
+        .unwrap();
+    let recorded = |id: &Id| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (metas, _) = state.list();
+            if let Some(meta) = metas.into_iter().find(|meta| &meta.id == id) {
+                break meta.workspace;
+            }
+            assert!(Instant::now() < deadline, "no meta was written");
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(Instant::now() < deadline, "no meta was written");
-        std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(recorded, Some(Workspace::Scratch));
+    assert_eq!(
+        recorded(&template),
+        Some(Workspace::Template("my notes".into()))
+    );
+    assert_eq!(recorded(&id), Some(Workspace::Scratch));
     drop(supervisor);
     let specs = td_agent::workspace::jail_dir(&state, &id).join("specs");
     std::fs::create_dir_all(&specs).unwrap();
     std::fs::write(specs.join("spec-stale"), "format=1\n").unwrap();
     let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
     supervisor.open(id, None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
     while specs.exists() {
-        assert!(
-            Instant::now() < deadline + Duration::from_secs(10),
-            "the stale spec stayed"
-        );
+        assert!(Instant::now() < deadline, "the stale spec stayed");
         std::thread::sleep(Duration::from_millis(20));
     }
 }
