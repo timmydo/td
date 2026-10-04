@@ -4347,6 +4347,28 @@ Admission precedes premature-finish InvalidState; expiration retains work
 refusal precedence. Cursor is neither Copy nor Clone and adds no source/publication authority,
 whole Content-Location parser or retained metadata policy.
 
+### 1.97 Shared URI spelling selection
+
+M06cr adds td_header::uri::spelling::Cursor for one complete immutable
+field-value slice under the caller's explicit surrounding-CFWS permission.
+POLICY.md owns the ambiguous parentheses rule: greedy leading CFWS and a
+complete terminal CFWS suffix beginning with WSP or a fold are preferred;
+after leading CFWS, adjoining parentheses and failed optional suffix grammar
+remain literal. Leading malformed/over-nested comments reject selection;
+Work/InvalidState never enter grammar fallback. Source-relative start/end
+offsets can be empty and grant no whole-field presence, URI/fold validity or
+word placement.
+
+Each poll invokes one funded bounded CFWS turn or one funded source/probe
+step. The cursor borrows source, retains fixed exclusive child state and owns
+no work/deadline/output owner. It is neither Copy nor Clone. Cached Complete
+is inert; check_work uses fresh zero-count admission and retires success on
+refusal across replacement callbacks. Consuming finish requires healthy
+completion but no new admission. Mail's eventual composer must keep original
+job/header owners, freshly admit before retaining the range and rebase offsets
+to its authorized field/message. This does not activate a complete
+Content-Location reader or metadata/publication authority.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

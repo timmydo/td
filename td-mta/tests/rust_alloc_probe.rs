@@ -1229,6 +1229,90 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn uri_spelling_values() {
+    use td_header::{
+        uri::spelling::{Cursor, Error, Status},
+        Charge, Work,
+    };
+    struct Budget {
+        calls: usize,
+        cut: Option<usize>,
+    }
+    impl Work for Budget {
+        type Error = u8;
+        fn charge(&mut self, charge: Charge) -> Result<(), u8> {
+            black_box(charge);
+            let call = self.calls;
+            self.calls += 1;
+            if self.cut == Some(call) {
+                return Err(77);
+            }
+            Ok(())
+        }
+    }
+    assert!(std::mem::size_of::<Cursor<'_, td_mta::mime_location_literal::Error>>() <= 160);
+    let long = format!("(lead) a{}(bad{}", " ".repeat(8192), "x".repeat(8192));
+    let deep = format!("{}x{}a", "(".repeat(33), ")".repeat(33));
+    let before = COUNTERS.snapshot();
+    for (source, fault, cut) in [
+        (b"".as_slice(), None, None),
+        (b" (only)\t", None, None),
+        (b"(lead) ../a(b) (tail)", None, None),
+        (b"a (b) c (tail)", None, None),
+        (b"a (bad", None, None),
+        (b"a (bad (tail)", None, None),
+        (b"a\r\n", None, None),
+        (long.as_bytes(), None, None),
+        (b"(bad", Some(Error::Malformed), None),
+        (deep.as_bytes(), Some(Error::NestingLimit), None),
+        (b"a (tail)", Some(Error::Work(77)), Some(0)),
+    ] {
+        for late in [false, true] {
+            let mut work = Budget { calls: 0, cut };
+            let mut cursor = Cursor::new(black_box(source));
+            let mut result = None;
+            let mut spelling = None;
+            for _ in 0..200_000 {
+                match cursor.poll(&mut work) {
+                    Ok(Status::Yield) => {}
+                    Ok(Status::Complete(range)) => {
+                        spelling = Some(range);
+                        break;
+                    }
+                    Err(error) => {
+                        result = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(result, fault);
+            if let Some(error) = fault {
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.poll(&mut work), Err(error));
+                assert_eq!(cursor.finish(), Err(error));
+                break;
+            }
+            let range = spelling.unwrap();
+            black_box(source.get(range.start..range.end).unwrap());
+            let calls = work.calls;
+            assert_eq!(cursor.poll(&mut work), Ok(Status::Complete(range)));
+            assert_eq!(work.calls, calls);
+            if late {
+                work.cut = Some(work.calls);
+                assert_eq!(cursor.check_work(&mut work), Err(Error::Work(77)));
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.finish(), Err(Error::Work(77)));
+            } else {
+                cursor.check_work(&mut work).unwrap();
+                assert_eq!(cursor.finish(), Ok(range));
+            }
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "URI spelling selector allocated");
+}
+
 fn uri_literal_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -8434,6 +8518,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        uri_spelling_values();
         uri_literal_values();
         uri_word_values();
         uri_unfold_values();
@@ -8595,6 +8680,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    uri_spelling_values();
     uri_literal_values();
     uri_word_values();
     uri_unfold_values();

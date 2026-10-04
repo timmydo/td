@@ -1928,6 +1928,17 @@ Initial independently landable increments:
   malformed-tail rejection, every allowance/deadline cut, provenance and
   exact successful costs. Whole Content-Location composition remains open.
 
+- **M06cr — shared URI spelling selection:** select original slice offsets
+  under explicit leading/terminal CFWS permission. Fixed exclusive child
+  state funds every probe/replay and EOF; optional grammar recovery never
+  hides work/internal failure. POLICY.md freezes ambiguous parentheses
+  handling without claiming complete Content-Location validity. Fixtures
+  cover partial/failed suffixes, leading errors, every callback cut, fresh
+  retirement and long whitespace/comment replay; allocation intervals cover
+  both completion and refusal. Original mail-owner composition, whole-field
+  presence/word placement, retained metadata and worker/native/RSS remain
+  open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

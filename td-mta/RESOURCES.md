@@ -1715,6 +1715,17 @@ Rust allocation intervals include empty, long, folded, IPv6/IPvFuture,
 word-marker literal, malformed/refused and fresh final handoff paths.
 Whole-field and worker/native/RSS qualification remain open.
 
+M06cr's shared URI spelling selector fits 160 bytes with u8 or mail's public
+literal-reader error, retaining only source offsets and exclusive CFWS or
+unfolder child state. Generic layout depends on E; this is not a future
+composer-size claim. One poll stays within 160 visits and 32 lexical records.
+All whitespace probes, optional suffix retries and CFWS replay are funded;
+no total linear-work guarantee follows. Warm/measured Rust allocation
+intervals cover long whitespace, comments, partial/malformed suffixes,
+leading syntax/nesting errors, callback refusal and fresh final retirement.
+No new arena or source-sized scratch is reserved. Original owner integration
+and worker/native/RSS qualification remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

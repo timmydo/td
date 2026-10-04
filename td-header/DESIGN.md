@@ -288,3 +288,37 @@ external. Normative folding:
 https://www.rfc-editor.org/rfc/rfc2557.html#section-4.4.2,
 https://www.rfc-editor.org/rfc/rfc2557.html#section-4.4.3 and
 https://www.rfc-editor.org/rfc/rfc2017.html#section-3.1.
+
+uri::spelling::Cursor selects a source-relative range under explicit caller
+permission for greedy leading CFWS and terminal CFWS beginning with WSP or an
+admitted fold. The complete supplied field-value slice excludes its final
+header ending. After leading CFWS, parentheses adjoining URI bytes stay
+literal. Partial optional CFWS, malformed optional comments and optional
+comment nesting beyond 32 stay in the URI spelling; leading CFWS errors reject
+selection. After a malformed or over-nested optional comment or malformed
+whitespace probe, retain its entire remaining suffix literally, including
+inner balanced parentheses and trailing whitespace, and fund a plain scan to
+EOF. Optional syntax recovery never masks Work or InvalidState. A whitespace
+probe learns the first non-WSP position before attempting a comment suffix, so
+failure does not retry a long leading whitespace run one byte at a time. All
+probes and CFWS replay are separately funded. No total linear-work claim
+follows.
+
+Selection alone proves no URI/fold/word-placement validity or nonempty field.
+An empty range remains a caller presence decision. The resulting offsets refer
+to the original supplied slice, not a copied/unfolded buffer. Caller policy
+decides ambiguous comment versus URI parentheses; percent spelling can
+preserve intended leading parentheses. This helper grants no raw-file field
+discovery, source authorization or retained output authority.
+
+One poll performs one bounded CFWS turn or one source/whitespace-probe step,
+including admitted EOF attempts, within 160 visits and 32 records. For E=u8
+and mail's public literal-reader error, state fits 160 bytes; generic size
+depends on E. Exclusive child state holds CFWS or unfolding, never both. No
+source-sized scratch, growing collection, clock or work owner is retained.
+Live cursors are neither Copy nor Clone. Cached Complete is inert; check_work
+freshly admits zero-count work and retires completion on refusal, sticky
+across replacement callbacks. Consuming finish requires healthy completion but
+performs no fresh admission; callers separately check original work before
+consuming/retaining offsets. Normative surrounding grammar:
+https://www.rfc-editor.org/rfc/rfc2557.html#section-4.1.

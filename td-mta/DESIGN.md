@@ -435,6 +435,14 @@ owners. No source-sized scratch, normalization, percent decoding or encoded
 word interpretation is introduced. Whole-field CFWS/placement, presence,
 label retention and publication remain separate composer obligations.
 
+M06cr shares a fixed URI spelling selector with caller-authorized surrounding
+CFWS policy. POLICY.md freezes the ambiguous parentheses rule. Exclusive CFWS
+or whitespace-probe child state returns original slice offsets without
+copying the selected value. Leading grammar failure rejects; optional suffix
+grammar can remain literal, but work/internal refusal never falls back. The
+helper owns no original allowance or field/word/URI authority. Complete mail
+composition, presence, retained metadata and publication remain open.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

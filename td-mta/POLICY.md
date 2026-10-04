@@ -313,6 +313,25 @@ preference, quality weight or charset inference follows. Raw headers remain
 available. Field discovery, duplicate-field selection and retained JSON
 composition must separately establish their complete-source/output authority.
 
+Content-Location surrounding-CFWS selection prefers greedy leading CFWS and a
+complete terminal CFWS suffix beginning with SP/HTAB or an admitted fold.
+After leading CFWS, parentheses adjoining URI bytes stay literal. Partial
+optional CFWS or an optional comment with malformed syntax or nesting beyond
+32 stays in the URI spelling; it was not selected as grammatical comment
+content. After a malformed/over-nested optional comment or malformed fold
+probe, keep the whole remaining suffix literal, including inner comments and
+trailing whitespace. A funded plain scan reaches EOF without reselecting its
+interior. Leading CFWS syntax or nesting failure rejects the field. Work or
+internal failure never becomes literal fallback. Each probe and replay uses
+the same original interpretation allowance. This explicit ambiguity policy can
+remove intended leading URI parentheses or a whitespace-separated terminal
+parenthesis run; percent-spell such URI characters to preserve them. Raw
+headers retain every original byte. Empty selection remains subject to
+complete-field presence policy; selection alone validates no URI, folds or
+encoded-word placement. The shared selector implements this boundary rule;
+complete Content-Location word/literal composition and retained metadata
+remain separate work.
+
 RFC 2231 MIME parameters support percent decoding, charset/language prefixes,
 and numbered continuations beginning at zero without gaps or leading zeros.
 A malformed extended name (including leading zeros, numeric overflow or extra
