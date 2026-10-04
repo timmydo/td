@@ -149,7 +149,7 @@ fn schema(properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
     ])
 }
 
-const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`, or `orchestrator`. This conversation's own log when left out.";
+const CONVERSATION_PROPERTY: &str = "Another conversation's id, from `conversations`, or `orchestrator`. This conversation's own log when left out or empty.";
 
 /// One tool's definition as the request carries it.
 fn definition(tool: Tool, role: Role) -> Json {
@@ -287,12 +287,16 @@ pub enum Target {
 }
 
 impl Target {
-    fn parse(text: &str, member: &str) -> Result<Self, String> {
+    /// The conversation `text` names; a refusal quotes it, cut to 64
+    /// characters, and adds `hint`.
+    fn parse(text: &str, member: &str, hint: &str) -> Result<Self, String> {
         if text == "orchestrator" {
             return Ok(Self::Orchestrator);
         }
         Id::parse(text).map(Self::Id).ok_or_else(|| {
-            format!("`{member}` is not a conversation id (32 lowercase hexadecimal digits from `conversations`) or `orchestrator`")
+            let quoted: String = text.chars().take(64).collect();
+            let cut = if quoted.len() < text.len() { "\u{2026}" } else { "" };
+            format!("`{member}` is {quoted:?}{cut}, not a conversation id (32 lowercase hexadecimal digits from `conversations`) or `orchestrator`{hint}")
         })
     }
 }
@@ -350,9 +354,19 @@ fn members<'a>(
     Ok(members)
 }
 
+/// A member's value, when present and not null: a model that fills
+/// every member of a schema sends null for one it means to leave out.
+fn member<'a>(members: &'a [(String, Json)], name: &str) -> Option<&'a Json> {
+    members
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v)
+        .filter(|v| !v.is_null())
+}
+
 /// A string member, when present.
 fn text<'a>(members: &'a [(String, Json)], name: &str) -> Result<Option<&'a str>, String> {
-    match members.iter().find(|(n, _)| n == name).map(|(_, v)| v) {
+    match member(members, name) {
         None => Ok(None),
         Some(Json::Str(text)) => Ok(Some(text)),
         Some(_) => Err(format!("`{name}` is not a string")),
@@ -370,7 +384,7 @@ fn number(
     least: u64,
     most: u64,
 ) -> Result<Option<u64>, String> {
-    let Some(value) = members.iter().find(|(n, _)| n == name).map(|(_, v)| v) else {
+    let Some(value) = member(members, name) else {
         return Ok(None);
     };
     let number = value
@@ -382,10 +396,13 @@ fn number(
     Ok(Some(number))
 }
 
-/// A conversation a member names, when present.
-fn target(members: &[(String, Json)], name: &str) -> Result<Option<Target>, String> {
+/// The log a history tool reads: another conversation's, or, when the
+/// member is left out, null, empty or blank, the caller's own.
+fn log_target(members: &[(String, Json)], name: &str) -> Result<Option<Target>, String> {
     text(members, name)?
-        .map(|t| Target::parse(t, name))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| Target::parse(t, name, " (left out, it is this conversation's own log)"))
         .transpose()
 }
 
@@ -406,7 +423,7 @@ fn message_text(members: &[(String, Json)], name: &str) -> Result<String, String
 
 /// The todo list a `todo_write` call gives, checked against §12's bounds.
 fn todo(given: &[(String, Json)]) -> Result<Vec<TodoItem>, String> {
-    let items = match given.iter().find(|(n, _)| n == "items").map(|(_, v)| v) {
+    let items = match member(given, "items") {
         None => return Err("`items` is missing".into()),
         Some(Json::Arr(items)) => items,
         Some(_) => return Err("`items` is not a list".into()),
@@ -503,7 +520,7 @@ pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
                     query.len()
                 ));
             }
-            let kinds = match m.iter().find(|(n, _)| n == "kinds").map(|(_, v)| v) {
+            let kinds = match member(m, "kinds") {
                 None => Vec::new(),
                 Some(Json::Arr(kinds)) => kinds
                     .iter()
@@ -523,7 +540,7 @@ pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
             };
             Args::Search(Search {
                 query: query.to_string(),
-                conversation: target(m, "conversation")?,
+                conversation: log_target(m, "conversation")?,
                 kinds,
                 limit: number(m, "limit", 1, MAX_SEARCH_LIMIT as u64)?
                     .map_or(SEARCH_LIMIT, |n| n as usize),
@@ -536,7 +553,7 @@ pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
                 &["conversation", "from", "offset", "count", "max_bytes"],
             )?;
             Args::Read(Read {
-                conversation: target(m, "conversation")?,
+                conversation: log_target(m, "conversation")?,
                 from: number(m, "from", 1, u64::MAX)?.ok_or("`from` is missing")?,
                 offset: number(m, "offset", 0, u64::MAX)?.unwrap_or(0),
                 count: number(m, "count", 1, MAX_READ_COUNT as u64)?
@@ -552,7 +569,11 @@ pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
         Tool::SendMessage => {
             let m = members(tool_name, &value, &["to", "text"])?;
             Args::Send {
-                to: target(m, "to")?.ok_or("`to` is missing")?,
+                to: text(m, "to")?
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| "`to` is missing or empty".to_string())
+                    .and_then(|t| Target::parse(t, "to", ""))?,
                 text: message_text(m, "text")?,
             }
         }
@@ -832,7 +853,7 @@ mod tests {
             (r#"{"query":"a","kinds":["mail"]}"#, "not a kind"),
             (
                 r#"{"query":"a","conversation":"bob"}"#,
-                "not a conversation id",
+                "`conversation` is \"bob\", not a conversation id",
             ),
         ] {
             let e = parse(Role::Conversation, "history_search", arguments).unwrap_err();
@@ -851,6 +872,14 @@ mod tests {
             (r#"{"to":"orchestrator"}"#, "`text` is missing"),
             (r#"{"to":"orchestrator","text":" "}"#, "empty"),
             (r#"{"text":"hi"}"#, "`to` is missing"),
+            // A blank or null receiver is never a default one.
+            (r#"{"to":"","text":"hi"}"#, "`to` is missing or empty"),
+            (r#"{"to":"  ","text":"hi"}"#, "`to` is missing or empty"),
+            (r#"{"to":null,"text":"hi"}"#, "`to` is missing or empty"),
+            (
+                r#"{"to":"bob","text":"hi"}"#,
+                "`to` is \"bob\", not a conversation id",
+            ),
         ] {
             let e = parse(Role::Conversation, "send_message", arguments).unwrap_err();
             assert!(e.contains(said), "{arguments}: {e}");
@@ -887,6 +916,49 @@ mod tests {
                 limit: SEARCH_LIMIT,
             })
         );
+        // The diagnostics of a live session: a model filling every member
+        // sends an empty or null one for its own log.
+        for arguments in [
+            r#"{"query":"build failed","conversation":"","kinds":null,"limit":null}"#,
+            r#"{"query":"build failed","conversation":null}"#,
+        ] {
+            assert_eq!(
+                parse(Role::Conversation, "history_search", arguments).unwrap(),
+                Args::Search(Search {
+                    query: "build failed".into(),
+                    conversation: None,
+                    kinds: Vec::new(),
+                    limit: SEARCH_LIMIT,
+                }),
+                "{arguments}"
+            );
+        }
+        for (arguments, conversation) in [
+            (r#"{"from":1,"conversation":"   "}"#, None),
+            (r#"{"from":1,"conversation":null}"#, None),
+            (
+                r#"{"from":1,"conversation":" orchestrator "}"#,
+                Some(Target::Orchestrator),
+            ),
+        ] {
+            let Args::Read(read) = parse(Role::Conversation, "history_read", arguments).unwrap()
+            else {
+                panic!("{arguments}")
+            };
+            assert_eq!(read.conversation, conversation, "{arguments}");
+        }
+        // A refusal says what leaving it out means, and quotes a long
+        // value cut.
+        let long = format!(r#"{{"query":"a","conversation":"{}"}}"#, "x".repeat(300));
+        let e = parse(Role::Conversation, "history_search", &long).unwrap_err();
+        assert!(e.contains(&format!("{:?}\u{2026}", "x".repeat(64))), "{e}");
+        assert!(
+            e.contains("left out, it is this conversation's own log"),
+            "{e}"
+        );
+        // A null required member is missing.
+        let e = parse(Role::Conversation, "history_search", r#"{"query":null}"#).unwrap_err();
+        assert!(e.contains("`query` is missing"), "{e}");
         let other = format!("{}", id(7));
         assert_eq!(
             parse(

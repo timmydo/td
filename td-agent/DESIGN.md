@@ -2484,6 +2484,13 @@ takes at least one character, so it moves. A page is held to `max_bytes`
 of text, and to 512 KiB as the tool result is logged, escaped. The todo
 item in progress is shown by `conversations` for the caller's own
 conversation, and to the orchestrator for every one, as the title is.
+A member that is null is as if left out, since a model that fills
+every member of a schema sends null for one it means to omit: an
+optional one takes its default and a required one is missing. The
+history tools' `conversation` is trimmed, and when empty or blank is the
+caller's own log, as when left out; `send_message`'s `to` is trimmed
+and refused when empty, never a default receiver. A conversation id
+that does not parse is refused quoting the value, cut to 64 characters.
 
 ## 13. Prompting
 
