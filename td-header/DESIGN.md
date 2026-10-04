@@ -155,3 +155,15 @@ alongside the shared implementation. Shared fixtures exercise
 lexical/refusal contracts; mail tests and allocation probes retain consumer
 composition qualification. These bounds do not establish total worker/native
 memory or scheduler latency.
+
+The mime_protocol Validator classifies already admitted logical parameter
+bytes with four bytes of pure fixed state. Boundary implements RFC 2046
+section 5.1.1's one-through-70 ASCII bchars rule with a non-space final byte;
+Token implements RFC 2045 section 5.1's nonempty ASCII MIME token grammar.
+No trimming, decoding, charset default or Unicode normalization occurs.
+Alphabet/length failure is sticky; a trailing space is evaluated only at
+complete-value EOF. Prefix validity is passive, never field completeness,
+source admission or multipart authority. Callers fund each bounded feed,
+consume the entire selected value, and retain their original budgets.
+Normative grammar: https://datatracker.ietf.org/doc/html/rfc2046#section-5.1.1
+and https://datatracker.ietf.org/doc/html/rfc2045#section-5.1.

@@ -1229,6 +1229,230 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn mime_protocol_parameters() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_parameter::protocol::{Cursor, Error, Purpose, Status, Value},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let token = format!("text/plain;charset={}", "x".repeat(4096));
+    let too_long = format!("multipart/mixed;boundary={}", "x".repeat(71));
+    let nested = format!(
+        "{}{}text/plain;charset=utf-8",
+        "(".repeat(33),
+        ")".repeat(33)
+    );
+    let before = COUNTERS.snapshot();
+    for (source, purpose, expected, value) in [
+        (
+            b"multipart/mixed;boundary=ordinary;boundary*=utf-8''a%20b".as_slice(),
+            Purpose::Boundary,
+            Some(b"a b".as_slice()),
+            Value::Present,
+        ),
+        (
+            b"multipart/mixed;boundary=ordinary;boundary*=utf-8''a%20",
+            Purpose::Boundary,
+            None,
+            Value::Invalid,
+        ),
+        (
+            b"multipart/mixed;boundary*1*=b;boundary*0*=utf-8'en'a",
+            Purpose::Boundary,
+            Some(b"ab"),
+            Value::Present,
+        ),
+        (
+            b"multipart/mixed;boundary=ordinary;boundary*=utf-8''%xx",
+            Purpose::Boundary,
+            Some(b"ordinary"),
+            Value::Present,
+        ),
+        (
+            b"multipart/mixed;boundary=\"=?utf-8?Q?x?=\"",
+            Purpose::Boundary,
+            Some(b"=?utf-8?Q?x?="),
+            Value::Present,
+        ),
+        (
+            b"multipart/mixed;boundary*=unknown''ABC",
+            Purpose::Boundary,
+            Some(b"ABC"),
+            Value::Present,
+        ),
+        (
+            b"text/plain;charset=UtF-8",
+            Purpose::Charset,
+            Some(b"UtF-8"),
+            Value::Present,
+        ),
+        (
+            b"text/plain;charset=unknown",
+            Purpose::Charset,
+            Some(b"unknown"),
+            Value::Present,
+        ),
+        (
+            b"text/plain;charset=ascii;charset*=utf-8''%FF",
+            Purpose::Charset,
+            None,
+            Value::Invalid,
+        ),
+        (
+            b"text/plain;charset=\"\"",
+            Purpose::Charset,
+            None,
+            Value::Invalid,
+        ),
+        (b"text/plain", Purpose::Charset, None, Value::Absent),
+        (too_long.as_bytes(), Purpose::Boundary, None, Value::Invalid),
+        (
+            token.as_bytes(),
+            Purpose::Charset,
+            Some(token.as_bytes().get(19..).unwrap()),
+            Value::Present,
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 100_000_000,
+                output_bytes: 100_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut output = [0; 4096];
+        let pointers = (&work as *const _, &budget as *const _);
+        let mut cursor = Cursor::new(
+            black_box(source),
+            purpose,
+            &mut output,
+            &mut work,
+            &mut budget,
+        );
+        assert!(cursor.value().is_none());
+        let mut end = None;
+        for _ in 0..100_000 {
+            if let Status::Complete(result) = cursor.poll(Tick(1)).unwrap() {
+                end = Some(result);
+                break;
+            }
+        }
+        let end = end.unwrap();
+        assert_eq!(end.value, value);
+        assert_eq!(cursor.value(), expected);
+        assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete(end)));
+        let (retained, work, budget) = cursor.finish(Tick(1)).unwrap();
+        assert_eq!(retained.value(), expected);
+        assert_eq!(pointers, (work as *const _, budget as *const _));
+    }
+    for (source, limit, expired, capacity, wanted) in [
+        (
+            b"text/plain;charset=utf8".as_slice(),
+            100_000,
+            false,
+            3,
+            Error::OutputCapacity,
+        ),
+        (
+            b"text/plain;charset=utf8",
+            0,
+            false,
+            70,
+            Error::Parameter(td_mta::mime_parameter::Error::Work(Stop::OutputBytes)),
+        ),
+        (
+            b"text/plain;charset=utf8",
+            100_000,
+            true,
+            70,
+            Error::Parameter(td_mta::mime_parameter::Error::Work(Stop::Deadline)),
+        ),
+        (
+            b"text/plain;charset=utf8;broken",
+            100_000,
+            false,
+            70,
+            Error::Parameter(td_mta::mime_parameter::Error::Malformed),
+        ),
+        (
+            nested.as_bytes(),
+            100_000,
+            false,
+            70,
+            Error::Parameter(td_mta::mime_parameter::Error::NestingLimit),
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                output_bytes: limit,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut output = [0; 70];
+        let mut cursor = Cursor::new(
+            black_box(source),
+            Purpose::Charset,
+            output.get_mut(..capacity).unwrap(),
+            &mut work,
+            &mut budget,
+        );
+        let mut error = None;
+        for _ in 0..100_000 {
+            match cursor.poll(if expired { Tick(100) } else { Tick(1) }) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete(_)) => panic!("refused protocol value completed"),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(error, Some(wanted));
+        assert!(cursor.value().is_none());
+        assert_eq!(cursor.check_deadline(Tick(1)), Err(wanted));
+        assert_eq!(cursor.poll(Tick(1)), Err(wanted));
+        assert!(cursor.finish(Tick(1)).is_err());
+    }
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000,
+            records: 100_000,
+            output_bytes: 100_000,
+            ..Charge::default()
+        },
+    );
+    let mut budget = HeaderBudget::new();
+    let mut output = [0; 70];
+    let mut cursor = Cursor::new(
+        black_box(b"text/plain;charset=utf8"),
+        Purpose::Charset,
+        &mut output,
+        &mut work,
+        &mut budget,
+    );
+    let mut done = false;
+    for _ in 0..100_000 {
+        if matches!(cursor.poll(Tick(1)).unwrap(), Status::Complete(_)) {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert!(cursor.finish(Tick(100)).is_err());
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "protocol parameter admission allocated");
+}
+
 fn mime_parameter_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -7226,6 +7450,7 @@ fn main() {
         mime_parameter_display();
         mime_parameter_nfc();
         mime_filename_retention();
+        mime_protocol_parameters();
         body_value();
         mime_text();
         body_charset();
@@ -7376,6 +7601,7 @@ fn main() {
     mime_parameter_display();
     mime_parameter_nfc();
     mime_filename_retention();
+    mime_protocol_parameters();
     body_value();
     mime_text();
     body_charset();

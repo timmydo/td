@@ -3895,6 +3895,48 @@ invalid_extended flag aggregates rejected families in any attempted field;
 Origin names only the selected field. POLICY.md owns display-name use.
 Complete worker/native/RSS qualification and MIME part traversal remain open.
 
+### 1.82 Selected boundary and charset metadata
+
+M06cc adds mime_parameter::protocol::Cursor over one exact first-valid
+Content-Type field value selected by the enclosing metadata owner. Purpose
+selects Boundary or Charset and the existing RFC 2231 family owner supplies
+the complete extended family, otherwise first ordinary candidate. Admission
+validates the selected logical Data octets; a grammatically invalid selected
+value never reconsiders an ordinary sibling. Selection.invalid_extended
+still describes rejected families before candidate choice.
+
+Complete distinguishes Absent (no plan), Invalid (selected value fails
+protocol grammar) and Present. Only Present exposes exact ASCII bytes in
+caller-reserved backing. No whitespace trim, charset conversion, encoded-word
+recognition, scalar filtering or NFC changes structural metadata. Boundary
+uses td-header's complete ASCII length/alphabet/final-byte validator. Charset
+uses its nonempty token validator; the original spelling remains visible.
+known_charset classifies the explicit mail aliases when Present and Purpose
+is Charset, with no default. Unknown valid tokens remain Present with None;
+Invalid and Absent do not silently become body charset defaults.
+
+RFC 2231 Charset/Language roles never enter Data. A qualified family with an
+empty or unknown charset qualifier sets unsupported_qualifier; admitted
+ASCII Data remains exact (all supported charsets agree on these octets).
+Non-ASCII Data fails protocol grammar rather than acquiring repaired syntax.
+Body recovery/defaulting and multipart authority belong to future enclosing
+owners under POLICY.md; these diagnostic results authorize neither.
+
+The cursor keeps original Meter, HeaderBudget and prepaid credit through
+complete-field validation, family replay, ASCII classification and fixed
+alias matching. Charge classification before feeding and output before
+copying. A full output window stops retention while complete grammar validation
+continues. Invalid grammar wins over capacity; only a valid oversized value
+returns fatal OutputCapacity. No truncation or lower-priority fallback.
+Malformed whole fields, nesting or resource refusal are sticky fatal errors
+and hide output. Complete/value are inert caches; check_deadline performs
+fresh original admission, including after completion, and hides results on
+refusal. finish(now) requires healthy completion and fresh admission and
+returns passive Retained plus the exact original budgets. Failed/premature
+handoff yields no bytes. Publication still needs the enclosing owner's fresh
+final admission after all metadata/structure succeeds. Backing is not erased.
+RESOURCES.md owns layout, work ceilings and bounded output reservations.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

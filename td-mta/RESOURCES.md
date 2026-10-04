@@ -1214,6 +1214,25 @@ their existing bounded work window and may refuse an oversized valid name.
 Capacity failure retires the entire value. Layout evidence does not qualify
 native compiler stack, complete worker composition or RSS.
 
+M06cc's protocol parameter cursor plus HeaderBudget fits 1280 bytes in the
+existing 16 KiB parser reservation; the shared ASCII validator fits four
+bytes. No conversion/NFC scratch is borrowed. Original octet source turns
+remain <=160 visits and <=256 aggregate steps. Each returned Data octet
+adds one classification step and charset purposes add ten alias-feed steps;
+qualifier octets add ten alias-feed steps. Final completion charges twenty
+alias-finish steps. Conservative composed per-poll ceilings are 160 source
+visits, 276 aggregate steps, eighteen job records and one output byte.
+Caller backing belongs to the existing response/work reservation. A 70-byte
+boundary window accepts every grammar-valid boundary; invalid length/alphabet
+is drained without further retention once sticky, but full source work is
+still charged. Charset tokens have no additional grammar length cap, so
+callers choose a bounded window. Overflow stops retention but drains complete
+original validation: invalid grammar stays Invalid regardless of its bad byte's
+position; valid oversized values refuse OutputCapacity. One raw
+field byte bounds one retained token byte. No intermediate vector or new
+arena is allocated. Layout/counting evidence does not qualify whole worker,
+native compiler stack, portable backend or RSS.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

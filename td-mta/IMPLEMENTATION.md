@@ -1813,6 +1813,14 @@ Initial independently landable increments:
   fresh final admission. Selected boundary/charset metadata, traversal and
   complete worker/native/RSS qualification remain open.
 
+- **M06cc — selected protocol parameters:** retain selected boundary/charset
+  ASCII bytes with exact spelling and fixed shared grammar classification.
+  Preserve complete extended-family choice without ordinary retry after
+  protocol invalidity; distinguish absent, invalid, known and unknown labels.
+  Fund source replay, qualifier/alias work and output through original owners.
+  Qualify bounded turns, sticky refusal and fresh passive handoff. Multipart
+  traversal, body defaults/recovery and complete worker/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

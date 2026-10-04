@@ -312,6 +312,19 @@ than choosing a lower-priority candidate. Completed display bytes are passive
 metadata, never paths or locator authority; enclosing publication needs fresh
 admission. This adds no per-part heap strings or resource arena.
 
+M06cc admits selected boundary/charset logical bytes as ASCII protocol
+metadata, preserving spelling and complete extended-family precedence.
+Invalid selected values are passive diagnostics, never an ordinary retry or
+multipart/charset-default authority. The shared td-header validator owns
+pure bounded grammar; mail owns selected source replay, original work/header
+admission, fixed charset-alias classification, output and sticky refusal.
+No display decoding/NFC can introduce structural syntax. Healthy handoff
+returns original budgets while retained bytes remain provisional. Strict
+70-byte/alphabet admission and extended-family precedence may differ from
+permissive or RFC 2231-unaware clients; POLICY.md owns that parser differential
+and the explicit unreadable-content/raw-download recovery, not a fallback to
+an alternative boundary interpretation.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in

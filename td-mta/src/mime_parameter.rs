@@ -1,5 +1,6 @@
 //! Complete candidate validation through fixed-state charged field replay.
 pub mod display;
+pub mod protocol;
 pub mod scalars;
 use crate::{
     admission::work::{Charge, Meter, Stop},
