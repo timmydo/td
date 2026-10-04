@@ -8,8 +8,9 @@ use crate::types::Recipe;
 /// td-authd's request, descriptor and consent modules, td-busd's D-Bus codec
 /// and td-firstboot's principal loader by relative `#[path]`, and those reach
 /// td-authd's account file and engine's principal source, and td-secret's
-/// crypto mounts engine's SHA-256, so those trees are staged beside it. Its
-/// lock lists only td-pass, td-secret and td-ui, so the closure is std and
+/// crypto mounts engine's SHA-256, so those trees are staged beside it, with
+/// td-tpm, the TPM client crate td-secret depends on by path. Its lock lists
+/// only td-pass, td-secret, td-tpm and td-ui, so the closure is std and
 /// the vendor set is empty; the binary is linked fully static. The image
 /// copies the complete output, debug companion included, and links
 /// `/bin/td-pass` to it, so the same executable can be carried to a foreign
@@ -26,6 +27,7 @@ pub fn recipe() -> Recipe {
             "td-busd",
             "td-firstboot",
             "engine",
+            "td-tpm",
         ])
         .native_inputs(&[
             "rust-toolchain",
@@ -59,7 +61,8 @@ mod tests {
                     "td-authd",
                     "td-busd",
                     "td-firstboot",
-                    "engine"
+                    "engine",
+                    "td-tpm"
                 ]
                 .map(String::from)
                 .to_vec()
@@ -113,7 +116,7 @@ mod tests {
     }
 
     /// The trees td-pass's build reads are exactly the ones staged: every
-    /// file the three compiled crates name by a literal `#[path]` or
+    /// file the four compiled crates name by a literal `#[path]` or
     /// `include` macro, test code included, and every file those name in
     /// turn, resolved against the naming file's directory, lies in
     /// td-pass or a staged tree, and every staged tree is reached.
@@ -124,7 +127,7 @@ mod tests {
             .unwrap()
             .to_path_buf();
         let mut pending: Vec<std::path::PathBuf> = Vec::new();
-        for krate in ["td-pass", "td-secret", "td-ui"] {
+        for krate in ["td-pass", "td-secret", "td-tpm", "td-ui"] {
             let mut dirs = vec![root.join(krate).join("src")];
             while let Some(dir) = dirs.pop() {
                 for entry in std::fs::read_dir(&dir).unwrap() {
@@ -163,6 +166,7 @@ mod tests {
         assert!(mounts > 100, "{mounts}");
         trees.remove("td-pass");
         trees.insert("td-secret".to_owned());
+        trees.insert("td-tpm".to_owned());
         trees.insert("td-ui".to_owned());
         let staged: std::collections::BTreeSet<String> = recipe()
             .local_source_trees

@@ -508,6 +508,7 @@ mod tests {
                 "td-taskmgr",
                 "td-term",
                 "td-toml",
+                "td-tpm",
                 "td-ui"
             ]
         );

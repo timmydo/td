@@ -148,8 +148,8 @@ then a changed selector reaches recovery and its confirmed reseal.
 
 TPM bus interposition is an invasive hardware attack, outside Scope; this
 tier's unseal sessions need not be salted or encrypted. The protector
-formats and policies are disk-specific; they share td-secret's TPM client
-but not its application-secret formats.
+formats and policies are disk-specific; they share the td-tpm client
+crate with td-secret but not its application-secret formats.
 
 Without a usable TPM 2.0, the installer offers no device-bound volume and no
 passphrase substitute. A usable TPM has a SHA-256 PCR bank, and the live

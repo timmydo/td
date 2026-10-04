@@ -25,7 +25,9 @@ use crate::types::{Recipe, Step};
 //
 // The crate root declares each sibling module with `mod NAME;`, so a single
 // `rustc src/main.rs` pulls them all in — but only if every module file sits beside
-// it in {src}. Keep MODULES in sync with `main.rs`'s `mod` lines.
+// it in {src}. Keep MODULES in sync with `main.rs`'s `mod` lines. td-secret's
+// shared `tpm.rs` runs over the sibling crate td-tpm, compiled first as an
+// rlib with the binary's profile and passed by `--extern`.
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command
@@ -35,6 +37,7 @@ use crate::types::{Recipe, Step};
 // That guard's roster exempts named reviewed bodies from even that, and none
 // of td-firstboot's is on it.
 pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs");
+const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
@@ -138,6 +141,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-secret/src",
         "{src}/td-authd/src",
         "{src}/engine/src",
+        "{src}/td-tpm/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
@@ -185,6 +189,11 @@ pub fn recipe() -> Recipe {
         content: include_str!("../../../engine/src/sha256.rs").into(),
         exec: false,
     });
+    steps.push(Step::WriteFile {
+        path: "{src}/td-tpm/src/lib.rs".into(),
+        content: TPM_RS.into(),
+        exec: false,
+    });
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
@@ -192,6 +201,35 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    steps.push(
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                "td_tpm",
+                "-C",
+                "opt-level=s",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                "-C",
+                "panic=abort",
+                "-o",
+                "{root}/libtd_tpm.rlib",
+                "{src}/td-tpm/src/lib.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
     steps.push(
         target_rustc(
             "{src}",
@@ -212,6 +250,8 @@ pub fn recipe() -> Recipe {
                 // shared target policy deliberately preserves symbols.
                 "-C",
                 "panic=abort",
+                "--extern",
+                "td_tpm={root}/libtd_tpm.rlib",
                 &linker,
                 "-L",
                 glib,
@@ -392,7 +432,9 @@ mod tests {
             let recipe = crate::catalog::lookup(stem).unwrap_or_else(|| unreachable!("{stem}"));
             for step in recipe.steps.unwrap_or_default() {
                 if let Step::Run { argv, .. } = step {
-                    if argv.iter().any(|arg| arg.ends_with("/bin/rustc")) {
+                    if argv.iter().any(|arg| arg.ends_with("/bin/rustc"))
+                        && argv.iter().any(|arg| arg.starts_with("{out}/bin/"))
+                    {
                         return argv;
                     }
                 }
@@ -405,8 +447,19 @@ mod tests {
             !mine.is_empty() && !proven.is_empty(),
             "no rustc step found"
         );
-        // The ONLY differences may be the output path and the crate root; every
-        // other argument is toolchain/link configuration and must match.
+        // The ONLY differences may be the output path, the crate root and
+        // td-tpm's one `--extern`; every other argument is toolchain/link
+        // configuration and must match.
+        let extern_at = mine
+            .iter()
+            .position(|arg| arg == "td_tpm={root}/libtd_tpm.rlib")
+            .unwrap_or_else(|| unreachable!("the td-firstboot link names no td-tpm rlib"));
+        let flag_at = extern_at.checked_sub(1).unwrap_or_else(|| {
+            panic!("td-tpm's rlib is the first rustc argument, not an --extern")
+        });
+        assert_eq!(mine.get(flag_at).map(String::as_str), Some("--extern"));
+        let mut mine = mine;
+        mine.drain(flag_at..=extern_at);
         let normalize = |argv: Vec<String>| -> Vec<String> {
             argv.into_iter()
                 .map(|arg| {

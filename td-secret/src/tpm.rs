@@ -1,81 +1,16 @@
-//! TPM 2.0 sealing and public-only ES256 verification.
+//! td-secret's sealed-store formats and PCR policy over td-tpm's client,
+//! and public-only ES256 verification.
 
-use crate::crypto;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use td_tpm::{check_name, put16, put32, put_blob, PcrPolicy, PcrSelection, Reader};
+pub use td_tpm::{Device, Transport, MAX_PACKET};
+use td_tpm::{ALG_NULL, NULL, SHA256};
 
-const NO_SESSIONS: u16 = 0x8001;
-const SESSIONS: u16 = 0x8002;
-const OWNER: u32 = 0x4000_0001;
-const NULL: u32 = 0x4000_0007;
-const PASSWORD: u32 = 0x4000_0009;
-const SHA256: u16 = 0x000b;
-const O_NOFOLLOW: i32 = 0o400000;
-const TRIAL_SESSION: u8 = 0x03;
-const ALG_NULL: u16 = 0x0010;
-const CREATE_PRIMARY: u32 = 0x131;
-const CREATE: u32 = 0x153;
-const LOAD: u32 = 0x157;
-const UNSEAL: u32 = 0x15e;
-const POLICY_COMMAND_CODE: u32 = 0x16c;
-const POLICY_PCR: u32 = 0x17f;
-const PCR_READ: u32 = 0x17e;
-const START_AUTH_SESSION: u32 = 0x176;
-const FLUSH_CONTEXT: u32 = 0x165;
-const POLICY_GET_DIGEST: u32 = 0x189;
 const LOAD_EXTERNAL: u32 = 0x167;
 const VERIFY_SIGNATURE: u32 = 0x177;
-const SEALED_ATTRIBUTES: u32 = 0x492;
-pub const MAX_PACKET: usize = 4096;
 const MAX_BOUND_KEY: usize = 4096;
 
-pub trait Transport {
-    fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String>;
-}
-
-pub struct Device(File);
-impl Device {
-    pub fn open() -> Result<Self, String> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(O_NOFOLLOW)
-            .open("/dev/tpmrm0")
-            .map_err(|e| format!("open TPM resource manager: {e}"))?;
-        if !file
-            .metadata()
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_char_device()
-        {
-            return Err("TPM resource manager is not a character device".into());
-        }
-        Ok(Self(file))
-    }
-}
-impl Transport for Device {
-    fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
-        // TPM device writes are complete commands, not a byte stream.
-        let written = self
-            .0
-            .write(command)
-            .map_err(|e| format!("write TPM: {e}"))?;
-        if written != command.len() {
-            return Err("short TPM command write".into());
-        }
-        let mut reply = vec![0; MAX_PACKET];
-        let size = self
-            .0
-            .read(&mut reply)
-            .map_err(|e| format!("read TPM: {e}"))?;
-        reply.truncate(size);
-        Ok(reply)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pcrs(u16);
+pub struct Pcrs(PcrSelection);
 impl Pcrs {
     pub fn parse(value: &str) -> Result<Self, String> {
         let mut mask = 0u16;
@@ -95,22 +30,7 @@ impl Pcrs {
         Self::from_mask(mask)
     }
     fn from_mask(mask: u16) -> Result<Self, String> {
-        if mask == 0 {
-            return Err("empty PCR policy".into());
-        }
-        if mask.count_ones() > 8 {
-            return Err("select at most eight PCRs per store".into());
-        }
-        Ok(Self(mask))
-    }
-    fn selection(self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        put32(&mut bytes, 1);
-        put16(&mut bytes, SHA256);
-        bytes.push(3);
-        bytes.extend_from_slice(&self.0.to_le_bytes());
-        bytes.push(0);
-        bytes
+        Ok(Self(PcrSelection::new(mask)?))
     }
 }
 
@@ -126,7 +46,7 @@ impl SealedKey {
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         let mut bytes = b"TDTPM001".to_vec();
         put32(&mut bytes, self.uid);
-        put16(&mut bytes, self.pcrs.0);
+        put16(&mut bytes, self.pcrs.0.mask());
         bytes.extend_from_slice(&self.pcr_digest);
         put_blob(&mut bytes, &self.public)?;
         put_blob(&mut bytes, &self.private)?;
@@ -162,28 +82,17 @@ impl SealedKey {
         result.validate_public()?;
         Ok(result)
     }
+    fn policy(&self) -> PcrPolicy {
+        PcrPolicy {
+            selection: self.pcrs.0,
+            pcr_digest: self.pcr_digest,
+        }
+    }
     fn policy_digest(&self) -> [u8; 32] {
-        let mut bytes = vec![0; 32];
-        put32(&mut bytes, POLICY_PCR);
-        bytes.extend_from_slice(&self.pcrs.selection());
-        bytes.extend_from_slice(&self.pcr_digest);
-        let mut bytes = crypto::digest(&bytes).to_vec();
-        put32(&mut bytes, POLICY_COMMAND_CODE);
-        put32(&mut bytes, UNSEAL);
-        crypto::digest(&bytes)
+        self.policy().digest()
     }
     fn validate_public(&self) -> Result<(), String> {
-        let mut public = Reader(&self.public);
-        if public.u16()? != 8
-            || public.u16()? != SHA256
-            || public.u32()? != SEALED_ATTRIBUTES
-            || public.blob()? != self.policy_digest()
-            || public.u16()? != ALG_NULL
-            || public.blob()?.len() != 32
-        {
-            return Err("sealed TPM object does not have the fixed PCR-only policy".into());
-        }
-        public.end()
+        td_tpm::validate_sealed_public(&self.public, &self.policy_digest())
     }
 }
 
@@ -235,23 +144,11 @@ impl BoundKey {
     }
 }
 
-pub struct Client<T: Transport> {
-    transport: T,
-    handles: Vec<u32>,
-}
-impl<T: Transport> Drop for Client<T> {
-    fn drop(&mut self) {
-        while let Some(handle) = self.handles.pop() {
-            let _ = self.call(FLUSH_CONTEXT, &[handle], None, &[], false);
-        }
-    }
-}
+/// td-secret's operations on td-tpm's client; it owns no TPM state itself.
+pub struct Client<T: Transport>(td_tpm::Client<T>);
 impl<T: Transport> Client<T> {
     pub fn new(transport: T) -> Self {
-        Self {
-            transport,
-            handles: Vec::new(),
-        }
+        Self(td_tpm::Client::new(transport))
     }
 
     /// Verify a digest with a public-only P-256 key. This grants no store access.
@@ -277,7 +174,7 @@ impl<T: Transport> Client<T> {
         put_blob(&mut parameters, &[])?; // public only
         put_blob(&mut parameters, &public)?;
         put32(&mut parameters, NULL);
-        let (handle, out) = self.call(LOAD_EXTERNAL, &[], None, &parameters, true)?;
+        let (handle, out) = self.0.call(LOAD_EXTERNAL, &[], None, &parameters, true)?;
         let handle = handle.ok_or("missing TPM verification handle")?;
         let verified = (|| {
             let mut reader = Reader(&out);
@@ -289,7 +186,9 @@ impl<T: Transport> Client<T> {
             put16(&mut signature, SHA256);
             put_blob(&mut signature, r)?;
             put_blob(&mut signature, s)?;
-            let (_, out) = self.call(VERIFY_SIGNATURE, &[handle], None, &signature, false)?;
+            let (_, out) = self
+                .0
+                .call(VERIFY_SIGNATURE, &[handle], None, &signature, false)?;
             let mut ticket = Reader(&out);
             if ticket.u16()? != 0x8022 || ticket.u32()? != NULL || !ticket.blob()?.is_empty() {
                 return Err("invalid public-only TPM verification ticket".into());
@@ -297,12 +196,7 @@ impl<T: Transport> Client<T> {
             ticket.end()
         })();
         // Repeated assertions must not exhaust the TPM's transient object slots.
-        let flushed = self
-            .call(FLUSH_CONTEXT, &[handle], None, &[], false)
-            .and_then(|(_, out)| Reader(&out).end());
-        if flushed.is_ok() {
-            self.handles.retain(|value| *value != handle);
-        }
+        let flushed = self.0.flush(handle);
         match (verified, flushed) {
             (Err(primary), Err(cleanup)) => Err(format!(
                 "{primary}; verification object cleanup failed: {cleanup}"
@@ -312,236 +206,16 @@ impl<T: Transport> Client<T> {
         }
     }
 
-    fn call(
-        &mut self,
-        code: u32,
-        handles: &[u32],
-        auth: Option<u32>,
-        parameters: &[u8],
-        returns_handle: bool,
-    ) -> Result<(Option<u32>, Vec<u8>), String> {
-        let mut command = Vec::new();
-        put16(
-            &mut command,
-            if auth.is_some() {
-                SESSIONS
-            } else {
-                NO_SESSIONS
-            },
-        );
-        put32(&mut command, 0);
-        put32(&mut command, code);
-        for handle in handles {
-            put32(&mut command, *handle);
-        }
-        if let Some(auth) = auth {
-            let mut area = Vec::new();
-            put32(&mut area, auth);
-            if auth == PASSWORD {
-                put_blob(&mut area, &[])?;
-            } else {
-                put_blob(&mut area, &random()?)?;
-            }
-            area.push(0);
-            put_blob(&mut area, &[])?;
-            put32(
-                &mut command,
-                u32::try_from(area.len()).map_err(|_| "oversized TPM authorization")?,
-            );
-            command.extend_from_slice(&area);
-        }
-        command.extend_from_slice(parameters);
-        if command.len() > MAX_PACKET {
-            return Err("oversized TPM command".into());
-        }
-        let size = u32::try_from(command.len()).map_err(|_| "oversized TPM command")?;
-        command
-            .get_mut(2..6)
-            .ok_or("missing TPM command size")?
-            .copy_from_slice(&size.to_be_bytes());
-        let response = self.transport.exchange(&command);
-        command.fill(0);
-        let mut response = response?;
-        let result = (|| {
-            let mut reader = Reader(&response);
-            let tag = reader.u16()?;
-            if reader.u32()? as usize != response.len() || response.len() > MAX_PACKET {
-                return Err("invalid TPM response size".into());
-            }
-            let rc = reader.u32()?;
-            if rc != 0 {
-                if tag != NO_SESSIONS || !reader.0.is_empty() {
-                    return Err("malformed TPM error response".into());
-                }
-                return Err(format!("TPM command {code:#x} refused: {rc:#x}"));
-            }
-            if tag
-                != if auth.is_some() {
-                    SESSIONS
-                } else {
-                    NO_SESSIONS
-                }
-            {
-                return Err("invalid TPM response tag".into());
-            }
-            let handle = if returns_handle {
-                let handle = reader.u32()?;
-                let kind = if code == START_AUTH_SESSION { 3 } else { 0x80 };
-                if handle >> 24 != kind {
-                    return Err("unexpected TPM handle class".into());
-                }
-                self.handles.push(handle);
-                Some(handle)
-            } else {
-                None
-            };
-            let parameters = if let Some(auth) = auth {
-                let size = reader.u32()? as usize;
-                let parameters = reader.take(size)?;
-                let nonce = reader.blob()?;
-                if (auth == PASSWORD && !nonce.is_empty())
-                    || (auth != PASSWORD && nonce.len() != 32)
-                {
-                    return Err("invalid TPM response nonce".into());
-                }
-                let flags = reader.u8()?;
-                if flags != u8::from(auth == PASSWORD) || !reader.blob()?.is_empty() {
-                    return Err("unexpected TPM authorization response".into());
-                }
-                reader.end()?;
-                parameters.to_vec()
-            } else {
-                reader.0.to_vec()
-            };
-            Ok((handle, parameters))
-        })();
-        response.fill(0);
-        result
-    }
-
-    fn parent(&mut self, binding: Option<&[u8; 32]>) -> Result<(u32, Vec<u8>), String> {
-        let mut public = Vec::new();
-        put16(&mut public, 0x23); // ECC
-        put16(&mut public, SHA256);
-        put32(&mut public, 0x30472); // fixed, generated, restricted decrypt parent
-        put_blob(&mut public, &[])?;
-        for value in [6, 128, 0x43, ALG_NULL, 3, ALG_NULL] {
-            put16(&mut public, value);
-        }
-        let prefix_len = public.len();
-        put_blob(
-            &mut public,
-            binding.map_or(&[][..], |value| value.as_slice()),
-        )?;
-        put_blob(&mut public, &[])?;
-        let mut parameters = Vec::new();
-        put_blob(&mut parameters, &[0, 0, 0, 0])?;
-        put_blob(&mut parameters, &public)?;
-        put_blob(&mut parameters, &[])?;
-        put32(&mut parameters, 0);
-        let (handle, out) =
-            self.call(CREATE_PRIMARY, &[OWNER], Some(PASSWORD), &parameters, true)?;
-        let mut reader = Reader(&out);
-        let returned_public = reader.blob()?;
-        if returned_public.get(..prefix_len) != public.get(..prefix_len) {
-            return Err("TPM changed the storage parent template".into());
-        }
-        let mut unique = Reader(
-            returned_public
-                .get(prefix_len..)
-                .ok_or("short TPM parent")?,
-        );
-        if !(1..=32).contains(&unique.blob()?.len()) || !(1..=32).contains(&unique.blob()?.len()) {
-            return Err("invalid TPM parent public point".into());
-        }
-        unique.end()?;
-        creation(&mut reader)?;
-        let name = reader.blob()?;
-        check_name(returned_public, name)?;
-        reader.end()?;
-        Ok((handle.ok_or("missing TPM parent handle")?, name.to_vec()))
-    }
-
-    fn bound_parent(&mut self, binding: &[u8; 32]) -> Result<u32, String> {
-        let (unbound, unbound_name) = self.parent(None)?;
-        let (_, out) = self.call(FLUSH_CONTEXT, &[unbound], None, &[], false)?;
-        Reader(&out).end()?;
-        self.handles.retain(|handle| *handle != unbound);
-        let (bound, bound_name) = self.parent(Some(binding))?;
-        if bound_name == unbound_name {
-            return Err("TPM ignored storage primary personalization".into());
-        }
-        Ok(bound)
-    }
-
+    /// The composite PCR digest a store seals to; an unmeasured PCR is refused.
     fn snapshot(&mut self, pcrs: Pcrs) -> Result<[u8; 32], String> {
-        let selection = pcrs.selection();
-        let (_, out) = self.call(PCR_READ, &[], None, &selection, false)?;
-        let mut reader = Reader(&out);
-        reader.u32()?; // update counter; PolicyPCR closes the read/use race
-        if reader.u32()? != 1 || reader.u16()? != SHA256 {
-            return Err("TPM returned another PCR bank".into());
-        }
-        let width = reader.u8()?;
-        if !(3..=4).contains(&width) {
-            return Err("unsupported TPM PCR selection width".into());
-        }
-        let mask = reader.take(usize::from(width))?;
-        if mask.get(..2) != Some(pcrs.0.to_le_bytes().as_slice())
-            || mask
-                .get(2..)
-                .is_none_or(|tail| tail.iter().any(|byte| *byte != 0))
-            || reader.u32()? != pcrs.0.count_ones()
+        let values = self.0.read_pcrs(pcrs.0)?;
+        if values
+            .iter()
+            .any(|value| value.iter().all(|byte| *byte == 0))
         {
-            return Err("TPM did not return the complete SHA-256 PCR selection".into());
+            return Err("selected PCR is missing or unmeasured".into());
         }
-        let mut values = Vec::new();
-        for _ in 0..pcrs.0.count_ones() {
-            let digest = reader.blob()?;
-            if digest.len() != 32 || digest.iter().all(|byte| *byte == 0) {
-                return Err("selected PCR is missing or unmeasured".into());
-            }
-            values.extend_from_slice(digest);
-        }
-        reader.end()?;
-        Ok(crypto::digest(&values))
-    }
-
-    fn policy(&mut self, key: &SealedKey, trial: bool) -> Result<u32, String> {
-        let mut parameters = Vec::new();
-        put_blob(&mut parameters, &random()?)?;
-        put_blob(&mut parameters, &[])?;
-        parameters.push(if trial { TRIAL_SESSION } else { 1 });
-        put16(&mut parameters, ALG_NULL);
-        put16(&mut parameters, SHA256);
-        let (handle, out) =
-            self.call(START_AUTH_SESSION, &[NULL, NULL], None, &parameters, true)?;
-        let handle = handle.ok_or("missing TPM session handle")?;
-        let mut reader = Reader(&out);
-        if reader.blob()?.len() != 32 {
-            return Err("invalid TPM session nonce".into());
-        }
-        reader.end()?;
-        let mut parameters = Vec::new();
-        put_blob(&mut parameters, &key.pcr_digest)?;
-        parameters.extend_from_slice(&key.pcrs.selection());
-        let (_, out) = self.call(POLICY_PCR, &[handle], None, &parameters, false)?;
-        Reader(&out).end()?;
-        let (_, out) = self.call(
-            POLICY_COMMAND_CODE,
-            &[handle],
-            None,
-            &UNSEAL.to_be_bytes(),
-            false,
-        )?;
-        Reader(&out).end()?;
-        let (_, out) = self.call(POLICY_GET_DIGEST, &[handle], None, &[], false)?;
-        let mut reader = Reader(&out);
-        if reader.blob()? != key.policy_digest() {
-            return Err("TPM policy digest mismatch".into());
-        }
-        reader.end()?;
-        Ok(handle)
+        Ok(td_tpm::pcr_digest(&values))
     }
 
     pub fn seal(self, uid: u32, pcrs: Pcrs, master: &[u8; 32]) -> Result<SealedKey, String> {
@@ -572,46 +246,23 @@ impl<T: Transport> Client<T> {
         binding: Option<&[u8; 32]>,
     ) -> Result<SealedKey, String> {
         let pcr_digest = self.snapshot(pcrs)?;
-        let mut key = SealedKey {
+        let policy = PcrPolicy {
+            selection: pcrs.0,
+            pcr_digest,
+        };
+        // The sealed payload binds the owner UID to the master.
+        let mut payload = uid.to_be_bytes().to_vec();
+        payload.extend_from_slice(master);
+        let sealed = self.0.seal_object(&policy, binding, &mut payload);
+        payload.fill(0);
+        let sealed = sealed?;
+        Ok(SealedKey {
             uid,
             pcrs,
             pcr_digest,
-            public: Vec::new(),
-            private: Vec::new(),
-        };
-        self.policy(&key, true)?;
-        let parent = match binding {
-            Some(binding) => self.bound_parent(binding)?,
-            None => self.parent(None)?.0,
-        };
-        let mut public = Vec::new();
-        put16(&mut public, 8);
-        put16(&mut public, SHA256);
-        put32(&mut public, SEALED_ATTRIBUTES);
-        put_blob(&mut public, &key.policy_digest())?;
-        put16(&mut public, ALG_NULL);
-        put_blob(&mut public, &[])?;
-        let mut sensitive = vec![0, 0];
-        let mut payload = uid.to_be_bytes().to_vec();
-        payload.extend_from_slice(master);
-        put_blob(&mut sensitive, &payload)?;
-        payload.fill(0);
-        let mut parameters = Vec::new();
-        put_blob(&mut parameters, &sensitive)?;
-        sensitive.fill(0);
-        put_blob(&mut parameters, &public)?;
-        put_blob(&mut parameters, &[])?;
-        put32(&mut parameters, 0);
-        let result = self.call(CREATE, &[parent], Some(PASSWORD), &parameters, false);
-        parameters.fill(0);
-        let (_, out) = result?;
-        let mut reader = Reader(&out);
-        key.private = reader.blob()?.to_vec();
-        key.public = reader.blob()?.to_vec();
-        creation(&mut reader)?;
-        reader.end()?;
-        key.validate_public()?;
-        Ok(key)
+            public: sealed.public,
+            private: sealed.private,
+        })
     }
 
     pub fn unseal(self, key: &SealedKey) -> Result<[u8; 32], String> {
@@ -626,27 +277,12 @@ impl<T: Transport> Client<T> {
         self.unseal_inner(&key.key, Some(binding))
     }
 
-    fn unseal_inner(
-        mut self,
-        key: &SealedKey,
-        binding: Option<&[u8; 32]>,
-    ) -> Result<[u8; 32], String> {
-        key.validate_public()?;
-        let (parent, _) = self.parent(binding)?;
-        let mut parameters = Vec::new();
-        put_blob(&mut parameters, &key.private)?;
-        put_blob(&mut parameters, &key.public)?;
-        let (handle, out) = self.call(LOAD, &[parent], Some(PASSWORD), &parameters, true)?;
-        let handle = handle.ok_or("missing sealed object handle")?;
-        let mut reader = Reader(&out);
-        check_name(&key.public, reader.blob()?)?;
-        reader.end()?;
-        let session = self.policy(key, false)?;
-        let (_, mut out) = self.call(UNSEAL, &[handle], Some(session), &[], false)?;
-        self.handles.retain(|handle| *handle != session);
+    fn unseal_inner(self, key: &SealedKey, binding: Option<&[u8; 32]>) -> Result<[u8; 32], String> {
+        let mut payload =
+            self.0
+                .unseal_object(&key.policy(), binding, &key.public, &key.private)?;
         let result = (|| {
-            let mut reader = Reader(&out);
-            let mut payload = Reader(reader.blob()?);
+            let mut payload = Reader(&payload);
             if payload.u32()? != key.uid {
                 return Err("sealed TPM key belongs to another user".into());
             }
@@ -655,108 +291,51 @@ impl<T: Transport> Client<T> {
                 .try_into()
                 .map_err(|_| "invalid unsealed key length")?;
             payload.end()?;
-            reader.end()?;
             Ok(master)
         })();
-        out.fill(0);
+        payload.fill(0);
         result
-    }
-}
-
-fn creation(reader: &mut Reader<'_>) -> Result<(), String> {
-    reader.blob()?; // creation data
-    if reader.blob()?.len() != 32 || reader.u16()? != 0x8021 || reader.u32()? != OWNER {
-        return Err("invalid TPM creation ticket".into());
-    }
-    // The hierarchy proof uses the TPM implementation's hash, not nameAlg.
-    if !matches!(reader.blob()?.len(), 20 | 32 | 48 | 64) {
-        return Err("invalid TPM creation digest".into());
-    }
-    Ok(())
-}
-fn check_name(public: &[u8], name: &[u8]) -> Result<(), String> {
-    let mut expected = SHA256.to_be_bytes().to_vec();
-    expected.extend_from_slice(&crypto::digest(public));
-    if name != expected {
-        return Err("TPM object name mismatch".into());
-    }
-    Ok(())
-}
-fn random() -> Result<[u8; 32], String> {
-    let mut bytes = [0; 32];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|e| e.to_string())?;
-    Ok(bytes)
-}
-fn put16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-fn put32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-fn put_blob(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
-    put16(
-        out,
-        u16::try_from(value.len()).map_err(|_| "oversized TPM field")?,
-    );
-    out.extend_from_slice(value);
-    Ok(())
-}
-struct Reader<'a>(&'a [u8]);
-impl<'a> Reader<'a> {
-    fn take(&mut self, count: usize) -> Result<&'a [u8], String> {
-        let head = self.0.get(..count).ok_or("truncated TPM field")?;
-        self.0 = self.0.get(count..).ok_or("truncated TPM field")?;
-        Ok(head)
-    }
-    fn u8(&mut self) -> Result<u8, String> {
-        self.take(1)?
-            .first()
-            .copied()
-            .ok_or_else(|| "missing TPM byte".into())
-    }
-    fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_be_bytes(
-            self.take(2)?.try_into().map_err(|_| "short TPM u16")?,
-        ))
-    }
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_be_bytes(
-            self.take(4)?.try_into().map_err(|_| "short TPM u32")?,
-        ))
-    }
-    fn blob(&mut self) -> Result<&'a [u8], String> {
-        let size = self.u16()?;
-        self.take(size as usize)
-    }
-    fn end(&self) -> Result<(), String> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err("trailing TPM data".into())
-        }
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::crypto;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
+    use td_tpm::{
+        CREATE, CREATE_PRIMARY, FLUSH_CONTEXT, LOAD, NO_SESSIONS, OWNER, PASSWORD, PCR_READ,
+        POLICY_COMMAND_CODE, POLICY_GET_DIGEST, POLICY_PCR, SEALED_ATTRIBUTES, SESSIONS,
+        START_AUTH_SESSION, UNSEAL,
+    };
+
+    const O_NOFOLLOW: i32 = 0o400000;
+
+    fn random() -> [u8; 32] {
+        let mut bytes = [0; 32];
+        File::open("/dev/urandom")
+            .unwrap()
+            .read_exact(&mut bytes)
+            .unwrap();
+        bytes
+    }
 
     // Disposable virtual-token signer, compiled only into the test harness.
     pub(crate) struct SigningKey {
-        client: Client<Device>,
+        client: td_tpm::Client<Device>,
         handle: u32,
         pub(crate) cose: Vec<u8>,
     }
 
     impl SigningKey {
         pub(crate) fn new() -> Self {
-            Self::in_hierarchy(NULL, &random().unwrap())
+            Self::in_hierarchy(NULL, &random())
         }
 
         pub(crate) fn persistent(unique: &[u8; 32]) -> Self {
@@ -764,7 +343,7 @@ pub(crate) mod tests {
         }
 
         fn in_hierarchy(hierarchy: u32, unique: &[u8; 32]) -> Self {
-            let mut client = Client::new(Device::open().unwrap());
+            let mut client = td_tpm::Client::new(Device::open().unwrap());
             let mut public = Vec::new();
             put16(&mut public, 0x23);
             put16(&mut public, SHA256);
@@ -922,12 +501,7 @@ pub(crate) mod tests {
             Client::new(Socket(socket))
         }
         pub(crate) fn extend(&self, digest: &[u8; 32]) {
-            let mut parameters = 1u32.to_be_bytes().to_vec();
-            put16(&mut parameters, SHA256);
-            parameters.extend_from_slice(digest);
-            self.client()
-                .call(0x182, &[7], Some(PASSWORD), &parameters, false)
-                .unwrap();
+            self.client().0.extend_pcr(7, digest).unwrap();
         }
     }
     impl Drop for Emulator {
@@ -1324,7 +898,7 @@ pub(crate) mod tests {
         for value in ["", "16", "32", "0,0", "-1", "7,", "7 8", " 7"] {
             assert!(Pcrs::parse(value).is_err(), "{value}");
         }
-        assert_eq!(Pcrs::parse("0,7,15").unwrap().0, 0x8081);
+        assert_eq!(Pcrs::parse("0,7,15").unwrap().0.mask(), 0x8081);
         for size in 0..100 {
             assert!(SealedKey::decode(&vec![0; size]).is_err());
         }
@@ -1338,69 +912,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pcr_read_matches_the_mask_independent_of_selection_width() {
+    fn snapshot_refuses_an_unmeasured_pcr_and_digests_the_values() {
         struct Reply(Vec<u8>);
         impl Transport for Reply {
             fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
                 Ok(self.0.clone())
             }
         }
-        for width in [3, 4] {
+        for value in [[4; 32], [0; 32]] {
             let mut parameters = Vec::new();
             put32(&mut parameters, 0);
+            parameters.extend_from_slice(&PcrSelection::new(1 << 7).unwrap().marshal());
             put32(&mut parameters, 1);
-            put16(&mut parameters, SHA256);
-            parameters.push(width);
-            parameters.push(0x80);
-            parameters.extend(std::iter::repeat_n(0, usize::from(width) - 1));
-            put32(&mut parameters, 1);
-            put_blob(&mut parameters, &[4; 32]).unwrap();
+            put_blob(&mut parameters, &value).unwrap();
             let mut response = NO_SESSIONS.to_be_bytes().to_vec();
             put32(&mut response, 10 + parameters.len() as u32);
             put32(&mut response, 0);
             response.extend_from_slice(&parameters);
-            assert_eq!(
-                Client::new(Reply(response.clone()))
-                    .snapshot(Pcrs::parse("7").unwrap())
-                    .unwrap(),
-                crypto::digest(&[4; 32])
-            );
-            response[21] |= 1; // extra PCR selected without an extra digest
-            assert!(Client::new(Reply(response))
-                .snapshot(Pcrs::parse("7").unwrap())
-                .is_err());
+            let snapshot = Client::new(Reply(response)).snapshot(Pcrs::parse("7").unwrap());
+            if value == [0; 32] {
+                assert_eq!(
+                    snapshot.unwrap_err(),
+                    "selected PCR is missing or unmeasured"
+                );
+            } else {
+                assert_eq!(snapshot.unwrap(), crypto::digest(&value));
+            }
         }
     }
 
     #[test]
-    fn malformed_transport_replies_and_policy_downgrades_are_refused() {
-        struct Reply(Vec<u8>);
-        impl Transport for Reply {
-            fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
-                Ok(self.0.clone())
-            }
-        }
-        let mut good = NO_SESSIONS.to_be_bytes().to_vec();
-        put32(&mut good, 10);
-        put32(&mut good, 0);
-        for size in 0..good.len() {
-            assert!(Client::new(Reply(good[..size].to_vec()))
-                .call(PCR_READ, &[], None, &[], false)
-                .is_err());
-        }
-        let mut oversized = good.clone();
-        oversized.push(0);
-        assert!(Client::new(Reply(oversized))
-            .call(PCR_READ, &[], None, &[], false)
-            .is_err());
-        assert!(Client::new(Reply(good.clone()))
-            .call(UNSEAL, &[], Some(PASSWORD), &[], false)
-            .is_err());
-        let mut wrong_tag = good;
-        wrong_tag[0] = 0;
-        assert!(Client::new(Reply(wrong_tag))
-            .call(PCR_READ, &[], None, &[], false)
-            .is_err());
+    fn policy_downgrades_are_refused() {
         let key = SealedKey::decode(&fixture(1000)).unwrap();
         let mut downgraded = key.clone();
         downgraded.public[7] |= 0x40; // userWithAuth would permit password authorization
@@ -1501,106 +1043,15 @@ pub(crate) mod tests {
                 loaded,
                 "only admitted transient objects are retired"
             );
-            assert_eq!(client.handles.len(), usize::from(matches!(fault, 7 | 10)));
+            assert_eq!(
+                client.0.owned_handles(),
+                usize::from(matches!(fault, 7 | 10))
+            );
             drop(client);
             assert_eq!(
                 flushes.get(),
                 if matches!(fault, 7 | 10) { 2 } else { loaded }
             );
-        }
-    }
-
-    #[test]
-    fn primary_binding_is_marshaled_and_ignored_personalization_is_refused() {
-        use std::cell::Cell;
-        use std::rc::Rc;
-        struct Reply {
-            binding: [u8; 32],
-            ignore: bool,
-            creates: Rc<Cell<usize>>,
-            flushes: Rc<Cell<usize>>,
-        }
-        impl Transport for Reply {
-            fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
-                let code = u32::from_be_bytes(command[6..10].try_into().unwrap());
-                if code == FLUSH_CONTEXT {
-                    self.flushes.set(self.flushes.get() + 1);
-                    let mut response = NO_SESSIONS.to_be_bytes().to_vec();
-                    put32(&mut response, 10);
-                    put32(&mut response, 0);
-                    return Ok(response);
-                }
-                assert_eq!(code, CREATE_PRIMARY);
-                let mut input = Reader(&command[10..]);
-                assert_eq!(input.u32().unwrap(), OWNER);
-                let auth_size = input.u32().unwrap() as usize;
-                input.take(auth_size).unwrap();
-                assert_eq!(input.blob().unwrap(), [0, 0, 0, 0]);
-                let public = input.blob().unwrap();
-                let prefix = [
-                    0, 0x23, 0, 0x0b, 0, 3, 4, 0x72, 0, 0, 0, 6, 0, 128, 0, 0x43, 0, 0x10, 0, 3, 0,
-                    0x10,
-                ];
-                assert_eq!(&public[..22], prefix);
-                let bound = self.creates.get() == 1;
-                let mut unique = Reader(&public[22..]);
-                assert_eq!(
-                    unique.blob().unwrap(),
-                    if bound { &self.binding[..] } else { &[] }
-                );
-                assert!(unique.blob().unwrap().is_empty());
-                unique.end().unwrap();
-                assert!(input.blob().unwrap().is_empty());
-                assert_eq!(input.u32().unwrap(), 0);
-                input.end().unwrap();
-                self.creates.set(self.creates.get() + 1);
-                let mut returned = prefix.to_vec();
-                put_blob(
-                    &mut returned,
-                    &[if bound && !self.ignore { 2 } else { 1 }; 32],
-                )
-                .unwrap();
-                put_blob(&mut returned, &[3; 32]).unwrap();
-                let mut parameters = Vec::new();
-                put_blob(&mut parameters, &returned).unwrap();
-                put_blob(&mut parameters, &[]).unwrap();
-                put_blob(&mut parameters, &[4; 32]).unwrap();
-                put16(&mut parameters, 0x8021);
-                put32(&mut parameters, OWNER);
-                put_blob(&mut parameters, &[5; 32]).unwrap();
-                let mut name = SHA256.to_be_bytes().to_vec();
-                name.extend_from_slice(&crypto::digest(&returned));
-                put_blob(&mut parameters, &name).unwrap();
-                let mut response = SESSIONS.to_be_bytes().to_vec();
-                put32(&mut response, (23 + parameters.len()) as u32);
-                put32(&mut response, 0);
-                put32(&mut response, 0x80000000 + u32::from(bound));
-                put32(&mut response, parameters.len() as u32);
-                response.extend_from_slice(&parameters);
-                response.extend_from_slice(&[0, 0, 1, 0, 0]);
-                Ok(response)
-            }
-        }
-        for binding in [[0; 32], [9; 32]] {
-            for ignore in [false, true] {
-                let creates = Rc::new(Cell::new(0));
-                let flushes = Rc::new(Cell::new(0));
-                let mut client = Client::new(Reply {
-                    binding,
-                    ignore,
-                    creates: creates.clone(),
-                    flushes: flushes.clone(),
-                });
-                let result = client.bound_parent(&binding);
-                assert_eq!(result.is_err(), ignore);
-                if ignore {
-                    assert!(result.unwrap_err().contains("ignored"));
-                }
-                assert_eq!(creates.get(), 2);
-                assert_eq!(flushes.get(), 1);
-                drop(client);
-                assert_eq!(flushes.get(), 2);
-            }
         }
     }
 
@@ -1722,7 +1173,7 @@ pub(crate) mod tests {
         let [x, y, digest, r, s] = es256_fixture();
         for _ in 0..16 {
             client.verify_es256(&x, &y, &digest, &r, &s).unwrap();
-            assert!(client.handles.is_empty());
+            assert_eq!(client.0.owned_handles(), 0);
         }
         for field in 0..5 {
             let mut values = [x, y, digest, r, s];
@@ -1732,7 +1183,7 @@ pub(crate) mod tests {
                 client.verify_es256(&x, &y, &digest, &r, &s).is_err(),
                 "field {field}"
             );
-            assert!(client.handles.is_empty());
+            assert_eq!(client.0.owned_handles(), 0);
         }
         drop(client);
         drop(emulator);
@@ -1771,6 +1222,7 @@ pub(crate) mod tests {
         // TPM2_Shutdown(CLEAR) makes the persisted owner seed reusable at boot.
         emulator
             .client()
+            .0
             .call(0x145, &[], None, &0u16.to_be_bytes(), false)
             .unwrap();
         drop(emulator);
@@ -1813,12 +1265,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn qemu_extend(digest: &[u8; 32]) {
-        let mut parameters = 1u32.to_be_bytes().to_vec();
-        put16(&mut parameters, SHA256);
-        parameters.extend_from_slice(digest);
-        qemu_client()
-            .call(0x182, &[7], Some(PASSWORD), &parameters, false)
-            .unwrap();
+        qemu_client().0.extend_pcr(7, digest).unwrap();
     }
 
     fn qemu_disk(write: bool) -> File {

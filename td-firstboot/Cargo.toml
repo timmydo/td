@@ -20,6 +20,10 @@ path = "src/main.rs"
 # the walk. Same reason td-util/td-sh carry one.
 [workspace]
 
+# The TPM 2.0 client under td-secret's shared sealed-store module.
+[dependencies]
+td-tpm = { path = "../td-tpm" }
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

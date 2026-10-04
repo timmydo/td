@@ -164,20 +164,24 @@ Legacy TPM-only bundles are accepted only as locked migration inputs to
 presented FIDO enrollment; they cannot release application credentials.
 
 The implementation speaks bounded TPM 2.0 packets through safe file I/O to
-`/dev/tpmrm0`. ACPI discovery and the TIS/FIFO and CRB drivers are built into
-the target kernel. The device stays root-owned; neither the portal nor the
-application receives TPM access. A deterministic ECC P-256 restricted storage
-primary under the owner hierarchy wraps a fixedTPM/fixedParent keyed-hash
-object. Its encrypted sensitive payload binds the owner UID to the master;
-unseal rejects a transplanted or edited UID before returning any key. The
-sealed object's userWithAuth bit is clear. Its sole release policy is
-PolicyPCR followed by PolicyCommandCode(Unseal), with SHA-256 throughout. An
-empty password cannot bypass that policy. Owner authorization is assumed
-empty; a TPM whose owner hierarchy is administered otherwise is refused,
-never reset or cleared. The client flushes transient objects and sessions on
-success and failure. The kernel resource manager also owns the connection
-lifetime. Replies, names, policy digests, templates and lengths are checked;
-TPM failures are returned without retry or fallback.
+`/dev/tpmrm0`. That client is the sibling crate td-tpm
+([td-tpm/DESIGN.md](../td-tpm/DESIGN.md)), shared with the disk protector;
+td-secret keeps its formats and policy: PCR list parsing, the `TDTPM001` and
+`TDBOUND1` envelopes, the owner-UID payload prefix, the refusal of an
+unmeasured PCR, and ES256 verification. ACPI discovery and the TIS/FIFO and
+CRB drivers are built into the target kernel. The device stays root-owned;
+neither the portal nor the application receives TPM access. A deterministic
+ECC P-256 restricted storage primary under the owner hierarchy wraps a
+fixedTPM/fixedParent keyed-hash object. Its encrypted sensitive payload binds
+the owner UID to the master; unseal rejects a transplanted or edited UID
+before returning any key. The sealed object's userWithAuth bit is clear. Its
+sole release policy is PolicyPCR followed by PolicyCommandCode(Unseal), with
+SHA-256 throughout. An empty password cannot bypass that policy. Owner
+authorization is assumed empty; a TPM whose owner hierarchy is administered
+otherwise is refused, never reset or cleared. The client flushes transient
+objects and sessions on success and failure. The kernel resource manager also
+owns the connection lifetime. Replies, names, policy digests, templates and
+lengths are checked; TPM failures are returned without retry or fallback.
 
 Enrollment generates a new master, seals it and verifies an actual unseal
 before publication. It decrypts all existing entries and re-encrypts them
@@ -835,17 +839,21 @@ TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-sec
 ```
 
 The ignored tests require that explicit executable path, create fresh
-emulator state and Unix sockets, and never open a hardware TPM. They cover
-restart, changed PCRs, a different TPM, private-blob tampering,
-unmeasured-PCR refusal, and migration plus volatile release of a real
-encrypted store without persisting the new master in its store directory.
-Filesystem fixtures cover volatile release, fingerprint mismatch, missing
-keys, metadata, stale temporary cleanup, failed unseal, root identity, core
-limits, and compiled-out swap. The fixture paths and ownership enter private
-helpers; production callers retain the fixed `/run` path and root checks.
-Ordinary tests also exercise malformed envelopes and replies, backend
-selection, failed enrollment, master rotation and interrupted cleanup. A
-normal cargo pass with those tests ignored is not TPM integration evidence.
+emulator state and Unix sockets, and never open a hardware TPM. The
+emulator helper lives in td-secret's test module over td-tpm's public
+client, which td-firstboot and td-portal also compile; td-tpm has no
+emulator oracle of its own. The ignored emulator tests cover restart,
+changed PCRs, a different TPM, private-blob tampering, unmeasured-PCR
+refusal, and migration plus volatile release of a real encrypted store
+without persisting the new master in its store directory. Filesystem
+fixtures cover volatile release, fingerprint mismatch, missing keys,
+metadata, stale temporary cleanup, failed unseal, root identity, core
+limits, and compiled-out swap. The fixture paths and ownership enter
+private helpers; production callers retain the fixed `/run` path and root
+checks. Ordinary tests also exercise malformed envelopes and replies,
+backend selection, failed enrollment, master rotation and interrupted
+cleanup. A normal cargo pass with those tests ignored is not TPM
+integration evidence.
 
 ### TPM through the QEMU guest device
 

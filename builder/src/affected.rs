@@ -308,7 +308,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/sha256.rs",
-        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
+        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it and td-firstboot link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
     ),
     (
         "engine/src/crc32.rs",
@@ -377,6 +377,8 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
+    ("td-tpm/src", "recipes/src/recipes/td-secret.rs"),
+    ("td-tpm/src", "recipes/src/recipes/td-firstboot.rs"),
     (
         "recipes/src/fixtures",
         "recipes/src/recipes/td-secret-vm-test.rs",
@@ -2488,9 +2490,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // the loop the landing which added this was splitting itself in two to
     // avoid, so the correspondence is asserted rather than remembered.
     //
-    // One entry per crate that has such a recipe. td-install joined td-boot with
-    // the recipe that builds it, and a crate MISSING from this roster is the
-    // failure it exists for — so the roster is checked against the tree below.
+    // One row per source tree and recipe that stages it: a tree compiled into
+    // several recipes (td-tpm's into td-secret and td-firstboot) has a row for
+    // each. td-install joined td-boot with the recipe that builds it, and a
+    // crate MISSING from this roster is the failure it exists for — so the
+    // roster is checked against the tree below.
     for (src_dir, recipe_path) in TARGET_STATIC_RECIPES {
         let mut sources = Vec::new();
         collect_rs_recursive(&root.join(src_dir), &mut sources);
@@ -10850,10 +10854,14 @@ mod tests {
             checked = checked.saturating_add(1);
         }
         // POSITIVE CONTROL: a scan that matched no recipe would pass whatever
-        // the roster said.
+        // the roster said. A recipe that stages a second crate's tree, as
+        // td-secret's and td-firstboot's stage td-tpm, has one row per tree.
+        let mut distinct: Vec<&str> = TARGET_STATIC_RECIPES.iter().map(|(_, r)| *r).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
         assert_eq!(
             checked,
-            TARGET_STATIC_RECIPES.len(),
+            distinct.len(),
             "the roster and the recipes that stage Rust sources are different sizes"
         );
     }

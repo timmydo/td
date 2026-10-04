@@ -2,6 +2,8 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 const LIB_RS: &str = include_str!("../../../td-secret/src/lib.rs");
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
+/// The TPM 2.0 client crate td-secret depends on (td-tpm/DESIGN.md).
+const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
 const MODULES: &[(&str, &str)] = &[
     (
         "set_client",
@@ -115,6 +117,8 @@ pub fn recipe() -> Recipe {
         "{src}/td-authd/src",
         "{src}/td-authd/tests",
         "{src}/engine/src",
+        "{src}/td-tpm/src",
+        "{root}/test-deps",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
@@ -126,6 +130,7 @@ pub fn recipe() -> Recipe {
     for (path, content) in [
         ("{src}/td-secret/src/lib.rs", LIB_RS),
         ("{src}/td-secret/src/main.rs", MAIN_RS),
+        ("{src}/td-tpm/src/lib.rs", TPM_RS),
     ] {
         steps.push(Step::WriteFile {
             path: path.into(),
@@ -238,6 +243,35 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
+    // td-tpm, the TPM client td-secret's sealed-store formats run over, with
+    // the shipped profile; the unwinding test harness links its own copy.
+    for (dir, profile) in [
+        ("{root}", &["-C", "opt-level=s", "-C", "panic=abort"][..]),
+        ("{root}/test-deps", &[][..]),
+    ] {
+        let output = format!("{dir}/libtd_tpm.rlib");
+        let mut args = vec![
+            "--edition",
+            "2021",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            "td_tpm",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "-C",
+            "target-feature=+crt-static",
+            "-C",
+            "relocation-model=static",
+        ];
+        args.extend_from_slice(profile);
+        args.extend_from_slice(&["-o", &output, "{src}/td-tpm/src/lib.rs"]);
+        steps.push(
+            target_rustc("{src}", rustc, &args)
+                .env("PATH", &path)
+                .env("SOURCE_DATE_EPOCH", "1"),
+        );
+    }
     // The library holds every module; the binary only calls its `run`.
     steps.push(
         target_rustc(
@@ -260,6 +294,8 @@ pub fn recipe() -> Recipe {
                 "relocation-model=static",
                 "-C",
                 "panic=abort",
+                "--extern",
+                "td_tpm={root}/libtd_tpm.rlib",
                 "-o",
                 "{root}/libtd_secret.rlib",
                 "{src}/td-secret/src/lib.rs",
@@ -289,6 +325,8 @@ pub fn recipe() -> Recipe {
                 "panic=abort",
                 "--extern",
                 "td_secret={root}/libtd_secret.rlib",
+                "-L",
+                "dependency={root}",
                 &linker,
                 "-L",
                 glib,
@@ -319,6 +357,8 @@ pub fn recipe() -> Recipe {
                 "--test",
                 "--crate-name",
                 "td_secret_tests",
+                "--extern",
+                "td_tpm={root}/test-deps/libtd_tpm.rlib",
                 "--target",
                 "x86_64-unknown-linux-gnu",
                 "-C",
@@ -342,6 +382,38 @@ pub fn recipe() -> Recipe {
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::run("{root}", &["{root}/secret-tests"]));
+    steps.push(
+        target_rustc(
+            "{src}",
+            rustc,
+            &[
+                "--edition",
+                "2021",
+                "--test",
+                "--crate-name",
+                "td_tpm_tests",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+                &linker,
+                "-L",
+                glib,
+                &lib_b,
+                &bin_b,
+                "-Clink-arg=-L{root}/eh",
+                "-Clink-arg=-static-libgcc",
+                "-o",
+                "{root}/tpm-tests",
+                "{src}/td-tpm/src/lib.rs",
+            ],
+        )
+        .env("PATH", &path)
+        .env("SOURCE_DATE_EPOCH", "1"),
+    );
+    steps.push(Step::run("{root}", &["{root}/tpm-tests"]));
     steps.push(split_target_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/td-secret"]));
 

@@ -1,18 +1,17 @@
 [package]
-name = "td-secret"
+name = "td-tpm"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "td's local credential store and console writer"
+license = "GPL-3.0-or-later"
+description = "td's dependency-free TPM 2.0 client: transport, PCR policy, sealing and PCR extension"
 
 [package.metadata.td-gate]
 clippy-all-targets = true
 
 [workspace]
 
-# The TPM 2.0 client this crate's sealed-store formats run over.
-[dependencies]
-td-tpm = { path = "../td-tpm" }
+[lints.rust]
+unsafe_code = "forbid"
 
 [lints.clippy]
 unwrap_used = "deny"
