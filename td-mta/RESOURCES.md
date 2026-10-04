@@ -1080,6 +1080,26 @@ remain unchanged; no new resident owner or reservation is added. Existing
 allocation intervals cover all three migrated consumers. This extraction
 does not qualify the complete worker, native allocator or RSS.
 
+M06bu's complete parameter-family Cursor fits 1024 bytes and its Budgeted
+owner 1056 in the existing 16 KiB parser region. It retains inline lexical
+children, counters and source extents without a section vector, copied source
+or output backing. One turn polls one child or performs a fixed transition;
+plain limits are 160 visits and 33 records. Budgeted limits are 160 visits,
+256 aggregate steps and 16 job records, including original private credit.
+Per-index whole-field replay is explicitly quadratic and every visit is
+charged to the original job/header allowance. Aggregate refusal is fatal,
+never ordinary fallback, and exhausted HeaderBudget also blocks unrelated
+later projections of that email. The pinned fresh-budget fixture with
+`attachment;filename=saved` and 400 `filename*N=x` sections is 5915 bytes
+and uses 15,759,691 of 16,000,000 steps (98.5%); 600 sections in 8915 bytes
+exhaust the allowance and refuse even a later zero-count charge. This is a
+fixture cost, not a universal accepted section count: spelling, unrelated
+parameters, prior email work and future drain replay change the threshold.
+Constructor, long replay, malformed/fallback and
+late sticky refusal are allocation-probe intervals. Ancestor frames do not
+multiply this owner. Derived output retention, full-worker composition and
+native/RSS qualification remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

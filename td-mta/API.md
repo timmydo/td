@@ -3512,6 +3512,62 @@ incomplete/overflow behavior. Mail fixtures pin the differing EOF charge
 contracts and existing placement behavior. Full worker/native qualification
 and MIME traversal remain open.
 
+### 1.74 Complete bounded MIME parameter-family selection
+
+M06bu adds mime_parameter::Cursor over one immutable complete MIME field
+value and its ContentType or ContentDisposition kind. Attribute selects
+Boundary, Charset, Name or Filename through trusted fixed ASCII names;
+matching is case insensitive and charges its source reads. TransferEncoding
+is refused as InvalidState. The caller retains the original field-selection
+context and the meaning of kind/attribute pairs; any of the four names may
+be selected from either parameterized kind. Complete is parsing evidence,
+not a boundary, charset, display
+string, blob, path or publication capability.
+
+The first pass validates the whole field and classifies every name. Retain
+the first ordinary value as one Parameter extent of source offsets. A single extended
+value and numbered sections are alternative families: duplicate singles,
+mixed forms, malformed matching names, duplicate indices or gaps reject the
+whole extended family. Section numbers begin at zero. All-unencoded numbered
+sections also form a continuation family and precede ordinary fallback.
+The necessary max+1=count check rejects enormous or plainly incomplete
+indices without index-sized work; it does not prove uniqueness.
+
+Replay the complete field for each increasing index and require exactly one
+matching section. Ordinary values are already validated by the whole-field
+grammar. Fully validate extended/section values through mime_value;
+encoded zero requires charset'language' prefix delimiters, later encoded
+sections require complete percent triplets, and unencoded sections remain
+logical ordinary octets. Triplets cannot cross sections. All values must
+complete before Plan is published; no partial decoded bytes are retained.
+Malformed extended values reject the family; complete ordinary fallback
+remains available. Whole-field syntax/nesting and every work or aggregate
+refusal instead retire the entire selection. None of those failures can
+become a fallback success.
+
+Status::Complete(Selection) supplies plan and invalid_extended. A plan is an
+Ordinary/Extended Parameter or Sections { count, initial_encoded }; the
+passive flag distinguishes absence from rejected extended spelling without
+allocating diagnostics. It grants no word-placement or metadata authority.
+A later drain must replay those exact sections under the original budgets
+and keep conversion output provisional. Unquoting or percent decoding never
+creates original-source word placement. Charset/scalar state crosses mixed
+sections only in that later owner.
+
+One poll executes one child turn or fixed transition. Plain turns cap visits
+at 160 and records at 33; Budgeted turns cap visits at 160, aggregate steps at
+256 and job records at 16. All replay and comparisons are charged; quadratic
+replay is explicit and bounded by aggregate allowance, not an arbitrary
+linear-time claim. Cursor fits 1024 bytes and Budgeted 1056 inside the existing
+16 KiB parser reservation, with no section vector, copied source or output
+backing. Live owners are neither Clone nor Copy. Final completion is charged;
+cached results are inert. Explicit fresh check_deadline uses zero-count live
+admission and latches refusal, including after cached completion and across
+replacement plain meters. The budgeted owner preserves the original Meter,
+HeaderBudget and private credit. Constructor, long replay, invalid/fallback
+and late refusal are allocation-probe intervals. Display/boundary/charset
+projection, MIME traversal and worker/native qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

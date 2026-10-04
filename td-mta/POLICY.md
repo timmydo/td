@@ -292,7 +292,24 @@ and numbered continuations beginning at zero without gaps or leading zeros.
 A malformed extended name (including leading zeros, numeric overflow or extra
 suffix bytes), duplicate segment numbers or malformed percent escapes
 invalidate that base name's entire extended candidate; do not concatenate an
-attacker-selected subset. Prefer a valid extended filename,
+attacker-selected subset. Duplicate single extended values and mixtures of
+single and numbered forms also invalidate that family. A complete series of
+unencoded numbered values has the same priority as an encoded continuation
+family. Validate the complete field and every selected section before choosing
+a family. Charged replay must establish exactly one section at each index;
+maximum index and count alone do not prove uniqueness. A rejected extended
+family may fall back to the first ordinary value; whole-field syntax, nesting
+or work/aggregate refusal retires the entire selection. Exhausting the
+shared email interpretation allowance blocks all later projections using it.
+A job-meter refusal retires the selector without exhausting that allowance. Do not replace work refusal with a section-count cap and ordinary
+fallback; the configured shared allowance bounds interpretation work.
+
+For each of boundary, charset, name and filename, prefer a complete extended
+family over the first ordinary value. Later boundary/charset admission applies
+to that selected value and does not reconsider its ordinary sibling. Thus an
+extended boundary can differ from the one a parser ignoring RFC 2231 chooses;
+syntax selection is not a claim of agreement about multipart structure.
+For display names, prefer a valid extended filename,
 then ordinary filename, then valid extended Content-Type name*, then ordinary
 Content-Type name. Ordinary filename/name accept properly placed RFC 2047
 encoded words as a compatibility rule. For duplicate ordinary parameters use
@@ -309,7 +326,10 @@ explicit UTF-8 replacement recovery for an unknown or empty label, with a
 diagnostic; this recovery does not assign an RFC charset default.
 Language is passive metadata with
 the same lexical tag rule as section 2, without registry lookup. Unencoded
-sections remain literal and mixed sections share one later charset state;
+sections remain literal. Encoded later sections may follow an unencoded zero
+without declaring charset/language information; requiring an encoded zero
+is conditional on that information being supplied (RFC 2231 section 4.1).
+Mixed sections share one later charset state;
 percent triplets cannot span sections. Quoted spaces and other forbidden
 extended logical bytes require percent encoding. Neither unquoting nor
 percent decoding creates encoded-word placement authority. Scalar control

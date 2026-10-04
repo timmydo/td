@@ -302,6 +302,13 @@ distinct errors and EOF charges; escaped-fold provenance remains available
 to mail display consumers. Original placement, scalar decoding/filtering,
 normalization and sticky admission/failure ownership remain in mail.
 Projected bytes create no lexical validity or display-word placement proof.
+Complete parameter-family selection remains mail policy. The fixed-state
+owner validates the whole field, classifies names, then replays every numbered
+index under the original work and header allowance. It retains only source
+extents and passive rejection evidence; no section table or decoded output.
+POLICY.md owns precedence and fallback. All derived output remains provisional
+until a later charged drain and conversion completes. This selector fits the
+existing parser reservation; ancestor frames must not each retain one.
 New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed

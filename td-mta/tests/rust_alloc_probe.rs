@@ -867,6 +867,93 @@ fn store_read_pool() {
     }
 }
 
+fn mime_parameter() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_fields::Kind,
+        mime_parameter::{Attribute, Budgeted, Error, Plan, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let mut long = format!("attachment;filename=saved;{}=ignored", "x".repeat(4096));
+    for index in (0..24).rev() {
+        long.push_str(&format!(";filename*{index}=value"));
+    }
+    let before = COUNTERS.snapshot();
+    for (source, expected, rejected) in [
+        (long.as_bytes(), 2, false),
+        (b"attachment;filename=one".as_slice(), 0, false),
+        (b"attachment;filename*=utf-8'en'%E2%82%AC%00", 1, false),
+        (
+            b"attachment;filename*0=a;filename*0=b;filename*2=c;filename=saved",
+            0,
+            true,
+        ),
+        (b"attachment;filename*=utf-8''%x0;filename=saved", 0, true),
+        (b"attachment;filename*01=bad", 3, true),
+        (b"attachment;x=one", 3, false),
+        (b"attachment;filename=saved;", 4, false),
+    ] {
+        let case_before = COUNTERS.snapshot();
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records: 10_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Budgeted::new(
+            black_box(source),
+            Kind::ContentDisposition,
+            Attribute::Filename,
+            &mut work,
+            &mut budget,
+        );
+        assert!(std::mem::size_of_val(&cursor) <= 1056);
+        loop {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete(selection)) => {
+                    let kind = match selection.plan {
+                        Some(Plan::Ordinary(_)) => 0,
+                        Some(Plan::Extended(_)) => 1,
+                        Some(Plan::Sections { .. }) => 2,
+                        None => 3,
+                    };
+                    assert_eq!(kind, expected);
+                    assert_eq!(selection.invalid_extended, rejected);
+                    black_box(selection);
+                    assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete(selection)));
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100)),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+                    break;
+                }
+                Err(error) => {
+                    assert_eq!(expected, 4);
+                    assert_eq!(error, Error::Malformed);
+                    assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    break;
+                }
+            }
+        }
+        let case_after = COUNTERS.snapshot();
+        assert!(!case_before.invalid && !case_after.invalid);
+        assert_eq!(
+            case_before, case_after,
+            "MIME parameter candidate case allocated: {source:?}"
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME parameter candidate replay allocated");
+}
+
 fn mime_value() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6207,6 +6294,7 @@ fn main() {
         mime_metadata();
         mime_attribute();
         mime_value();
+        mime_parameter();
         body_value();
         mime_text();
         body_charset();
@@ -6350,6 +6438,7 @@ fn main() {
     mime_metadata();
     mime_attribute();
     mime_value();
+    mime_parameter();
     body_value();
     mime_text();
     body_charset();

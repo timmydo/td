@@ -1735,6 +1735,16 @@ Initial independently landable increments:
   allocation qualification. Complete parameter-family selection, derived
   metadata and MIME traversal remain open.
 
+- **M06bu — complete MIME parameter families:** select the first ordinary
+  value or a complete preferred extended family with fixed-state charged
+  field replay. Reject duplicate/mixed singles, gaps, duplicate indices,
+  malformed names and incomplete percent escapes without selecting subsets.
+  Validate every value before publishing passive source plans; distinguish
+  extended rejection from absence and preserve fatal work/nesting/field
+  refusals. Qualify fixed turns, original budgets, final admission, live
+  ownership and allocation-free construction/replay. Derived octet drain,
+  charset/display/boundary projection and MIME traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
