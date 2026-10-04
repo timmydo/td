@@ -3,7 +3,7 @@ name = "td-protector"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "td's device-bound disk protector: PCR policies, sealing, unsealing and the PCR 12 release cap over td-tpm"
+description = "td's device-bound disk protector: PCR policies, sealing, unsealing, the PCR 12 release cap, recovery keys and LUKS2 tokens over td-tpm"
 
 [package.metadata.td-gate]
 clippy-all-targets = true
@@ -11,6 +11,7 @@ clippy-all-targets = true
 [workspace]
 
 [dependencies]
+td-json = { path = "../td-json" }
 td-tpm = { path = "../td-tpm" }
 
 [lints.rust]

@@ -74,7 +74,14 @@ releases in this order, and no step may move earlier:
 
 1. td's bounded reader loads the sealed blobs from the header copy that
    cryptsetup will use, chosen by the same checksum and sequence rule, and
-   refuses copies that disagree; no C parser has run.
+   refuses copies that disagree; no C parser has run. Where that copy
+   fails td's own checks, td refuses rather than fall back. cryptsetup
+   also falls back from a copy whose JSON fails its wider validation, so
+   td reads the copy cryptsetup will use or refuses, with one gap
+   ([td-protector](../td-protector/DESIGN.md) "LUKS2 tokens"): from a copy
+   failing only cryptsetup's validation, the released secret opens the
+   volume only if its keyslot is in cryptsetup's copy, and otherwise the
+   boot reaches recovery.
 2. The selector tries every td token, up to a fixed bound, device-bound
    tokens first.
 3. Only when the first-boot protector alone releases, it seals the
@@ -103,7 +110,9 @@ measurements of any firmware load options and of the prepared selector
 initramfs (`EFI/BOOT/INITRD`). The selector refuses to seal while either
 PCR is unmeasured and enters recovery instead. An interrupted first boot
 keeps the first-boot keyslot and repeats the transition, discarding any
-orphaned td keyslot or token. Until the installed selector's first boot,
+orphaned td keyslot or token; cryptsetup leaves a token whose keyslot was
+destroyed naming no keyslot, and td's reader reports it without releasing
+it. Until the installed selector's first boot,
 release is not bound to the boot chain: any OS that leaves PCR 12 at zero,
 other than td's live medium, can unseal the first-boot protector. The first
 boot also adopts that boot's load options, so a one-time firmware boot-menu

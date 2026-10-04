@@ -1,6 +1,7 @@
 //! td's device-bound disk protector policy over the shared td-tpm client:
 //! the first-boot and observed PCR policies, the protector secret, sealing
-//! and unsealing it, the PCR 12 release cap and the recovery key (DESIGN.md,
+//! and unsealing it, the PCR 12 release cap, the recovery key and the td
+//! LUKS2 tokens with their bounded header reader (DESIGN.md,
 //! td-install/ENCRYPTION.md "Device-bound default").
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -19,7 +20,9 @@ use std::io::Read;
 use std::path::Path;
 use td_tpm::{Client, PcrPolicy, PcrSelection, SealedObject, Transport};
 
+pub mod luks2;
 pub mod recovery;
+pub mod token;
 
 /// The firmware's measurement of the selector EFI image.
 pub const SELECTOR_IMAGE_PCR: u8 = 4;

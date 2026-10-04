@@ -8,7 +8,8 @@ the device-bound protector and caps PCR 12 (increment 6). It runs over the
 shared TPM 2.0 client [td-tpm](../td-tpm/DESIGN.md) and owns only what
 ENCRYPTION.md makes disk-specific: which PCRs a protector names, the
 release cap, and the protector secret. It is pure `std`, depends only on
-td-tpm, forbids `unsafe` and adds no syscall surface to `UNSAFE.md`.
+td-tpm and the std-only td-json, forbids `unsafe` and adds no syscall
+surface to `UNSAFE.md`.
 
 Increment 5 adds the two persisted formats the installer writes and the
 selector reads: the recovery key's encoding and the td LUKS2 token, with
@@ -153,6 +154,16 @@ to 256 and 512 bytes. A missing, extra or duplicated key, another type in
 any field, or a value outside these bounds refuses the token. Other token
 types are ignored.
 
+A td token whose `keyslots` array is empty is an orphan. cryptsetup
+strips a destroyed keyslot from every token that names it and keeps the
+token, so a transition interrupted between destroying a keyslot and its
+token leaves one. An orphan must otherwise be the format; it is never
+released, it counts toward the four-token bound, and the reader reports
+its token number and role so that the transition removes it
+(ENCRYPTION.md). cryptsetup's own token validation also admits a token
+naming several keyslots; td writes none, and a td token naming more than
+one refuses the header.
+
 The reader reads the header copy cryptsetup will use, by cryptsetup's own
 rule, before any C parser runs. A copy is valid when its binary header has
 its position's magic, version 2, its own offset in `hdr_offset`, a
@@ -169,22 +180,51 @@ agreeing, the primary is used. A checksum algorithm other than `sha256`
 refuses the header rather than the copy, so that td never picks a
 different copy than cryptsetup would.
 
-The used copy's `hdr_size` must be one of the nine powers of two
-cryptsetup formats, and its JSON area must hold one JSON object followed
-only by NUL bytes, parsing without a duplicate key. Its `tokens` and
-`keyslots` objects are keyed by numbers 0 to 31, each token names
-keyslots that exist, and at most four td tokens are present: a first-boot
-and a device-bound protector, one superseded and one an interrupted
-transition left. td's checks of the used copy refuse rather than fall
-back to the other: cryptsetup's own JSON validation is wider than td's,
-so a copy that fails only cryptsetup's makes the two choose differently,
-and the keyslot td's token names then fails to open and reaches recovery.
+td parses only a used copy of the 16 KiB it formats (ENCRYPTION.md
+"Device-bound formatting"): any other `hdr_size` refuses the header
+before its JSON reaches td-json, which therefore never sees more than the
+12 KiB JSON area. That area must hold one JSON object followed only by NUL
+bytes, parsing without a duplicate key. Its `tokens` and `keyslots`
+objects are keyed by numbers 0 to 31, each token names keyslots that
+exist (cryptsetup's own token rule), and at most four td tokens, orphans
+included, are present: a first-boot and a device-bound protector, one
+superseded and one an interrupted transition left.
+
+td's checks of the used copy refuse rather than fall back to the other
+copy. cryptsetup also discards a checksum-valid copy whose JSON fails its
+own validation (`LUKS2_hdr_validate`) and falls back to the other copy,
+and that validation is wider than td's. So td reads the copy cryptsetup
+will use or refuses, with one gap: a copy that passes td's checks and
+fails only cryptsetup's is one td reads and cryptsetup does not use. The
+secret td releases from it opens the volume only if its keyslot is also in
+cryptsetup's copy; otherwise the boot reaches recovery.
+
+`token::Token` carries one td token: `encode` writes the compact JSON
+`cryptsetup token import` takes, keys in the order above, `decode` and
+`from_json` admit it, and `orphan_from_json` admits an orphan.
+`luks2::read` takes any `Read + Seek` whose offset zero is the volume's
+first byte, such as a window onto the installer's claim or the selector's
+opened partition, and returns the used copy's sequence number, size,
+UUID, label, keyslot numbers, td tokens and orphans with their token
+numbers. It runs no cryptsetup and needs no privilege.
 
 ## Bounds
 
 Every TPM exchange is td-tpm's: bounded commands and replies, no retry or
 fallback, and errors rather than panics. This crate adds fixed selections
-and a 32-byte payload length.
+and a 32-byte payload length. The header reader reads and hashes a 4 KiB
+binary header per candidate and, where that is valid, its whole area: at
+most 4 MiB for the primary, then at most 4 MiB for the secondary or,
+when the primary is invalid, the nine scan offsets' areas, under 8 MiB
+together: under 12 MiB in all, hashed twice at most (the checksum, then
+the JSON area's own digest). It holds at most one area, up to 4 MiB, at
+a time, and keeps of
+each verified copy only its binary header, its JSON area's SHA-256 and,
+at 16 KiB, its 12 KiB JSON area. td-json parses at most 12 KiB and bounds
+nesting. `decode` admits a token text of at most 4096 bytes; a token from
+either path has only bounded fields and encodes in under 1700 bytes. Its
+sealed areas are at most 256 and 512 bytes, and a header carries at most
+four td tokens, orphans included, among 32.
 
 ## Evidence
 
@@ -205,9 +245,31 @@ check for every value from 0 to 65535 that each single-digit substitution
 and adjacent transposition in its group fails the check, and cover round
 trips through the passphrase and display form, the boundary values 0 and
 65535, a value above 65535 refused as such, separators between and inside
-groups, every refusal and its group, and the injected random source. An
-ignored oracle runs the same lifecycle against the pinned swtpm under
-td-secret's convention (`td-secret/DESIGN.md`, "TPM validation"):
+groups, every refusal and its group, and the injected random source. Token
+tests pin the exact encoding and round trip it at both bounds, and refuse
+unknown, missing and repeated keys, other types, keyslot texts that are
+not canonical numbers up to 31, unknown roles, uppercase, odd and
+oversized hexadecimal, and oversized text; an orphan is admitted only
+with an empty `keyslots` array and an otherwise valid format. Header
+tests build both copies in the test, checksummed with td-tpm's SHA-256,
+and cover agreeing copies, either sequence number winning, copies that
+disagree at one sequence number in their JSON or label, a primary invalid
+by magic, version, either size bound, own offset, JSON bytes or stored
+checksum falling back to the secondary, the scan finding a secondary at
+64 KiB and refusing its size, a secondary not at its own size, a
+truncated medium, another checksum algorithm, sizes td does not format
+(20 and 32 KiB), a checksum-valid 4 MiB primary filled by one JSON string
+refused by its size without parsing, malformed and padded JSON areas, a
+duplicate key, non-canonical slot numbers, tokens naming absent
+keyslots, a malformed td token, a td token naming two keyslots, other
+token types ignored, orphans reported beside a valid token and counted
+toward the four-token bound, a malformed orphan, and a read error. No
+test reads a header cryptsetup wrote: that needs the source-built
+cryptsetup and its kernel crypto interfaces, which the host
+gate does not provide, so increment 5's encrypted-installation oracle
+reads one in the guest. An ignored oracle runs the protector lifecycle against
+the pinned swtpm under td-secret's convention (`td-secret/DESIGN.md`, "TPM
+validation"):
 
 ```
 TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-protector/Cargo.toml emulator_ -- --ignored
