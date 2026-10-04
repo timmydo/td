@@ -120,6 +120,7 @@ pub mod window;
 #[allow(clippy::new_without_default)]
 #[path = "../../td-compositor/src/wire.rs"]
 pub mod wire;
+pub mod xdg;
 pub mod xkb;
 mod xkb_compat;
 mod xkb_keys;

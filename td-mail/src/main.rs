@@ -28,16 +28,16 @@ use jmap::client::{JmapClient, JmapError};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// `td-mail/config.toml` under the configuration home. With no usable
+/// home there is no default to read or name, so the command stops and
+/// says so rather than reading `config.toml` wherever it was started.
 fn default_config_path() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("td-mail").join("config.toml")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".config")
-            .join("td-mail")
-            .join("config.toml")
-    } else {
-        PathBuf::from("config.toml")
+    match td_ui::xdg::from_env(td_ui::xdg::Base::Config) {
+        Some(dir) => dir.join("td-mail").join("config.toml"),
+        None => {
+            eprintln!("td-mail: {}", td_ui::xdg::Base::Config.missing());
+            std::process::exit(1)
+        }
     }
 }
 
@@ -227,7 +227,10 @@ pub fn connect_account(account: &AccountConfig) -> Result<JmapClient, String> {
 }
 
 fn show_log() {
-    let path = log::log_path();
+    let Some(path) = log::log_path() else {
+        eprintln!("td-mail: {}", td_ui::xdg::Base::State.missing());
+        std::process::exit(1)
+    };
     if !path.exists() {
         eprintln!("No log file found at {}", path.display());
         std::process::exit(1);
@@ -532,7 +535,10 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--clear-cache") {
-        cache::Cache::clear_all_accounts();
+        if let Err(e) = cache::Cache::clear_all_accounts() {
+            eprintln!("td-mail: {e}");
+            std::process::exit(1);
+        }
         eprintln!("Cache cleared.");
     }
 

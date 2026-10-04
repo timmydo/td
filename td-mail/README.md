@@ -297,6 +297,12 @@ Default config path:
 - `$XDG_CONFIG_HOME/td-mail/config.toml`
 - Fallback: `~/.config/td-mail/config.toml`
 
+As the XDG base directory specification says, a relative or empty
+`XDG_*` value is ignored, and `HOME` counts only when absolute; with
+neither, td-mail names no default configuration, keeps no cache, log or
+spam model, and never falls back to the working directory or a shared
+`/tmp` directory.
+
 Example config:
 
 ```toml

@@ -78,6 +78,14 @@ impl FeedConfig {
     }
 }
 
+/// `td-news/config.toml` under the configuration home, or why there is
+/// none: never one relative to wherever td-news was started.
+pub fn default_path() -> Result<PathBuf, String> {
+    td_ui::xdg::from_env(td_ui::xdg::Base::Config)
+        .map(|dir| dir.join("td-news").join("config.toml"))
+        .ok_or_else(|| td_ui::xdg::Base::Config.missing())
+}
+
 impl Config {
     /// Map a configuration document. Tables and the `feed` array are all
     /// optional here; `load` is what refuses a document with no feed.
@@ -100,13 +108,7 @@ impl Config {
     pub fn load(path: Option<&str>) -> Result<Config, String> {
         let config_path = match path {
             Some(p) => PathBuf::from(p),
-            None => {
-                let xdg = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    format!("{}/.config", home)
-                });
-                PathBuf::from(xdg).join("td-news").join("config.toml")
-            }
+            None => default_path()?,
         };
 
         let contents = std::fs::read_to_string(&config_path)

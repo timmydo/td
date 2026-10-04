@@ -762,7 +762,9 @@ pub fn spawn(
                 None
             }
         };
-        let spam_model = SpamModel::load(&spam::model_path());
+        let spam_model = spam::model_path()
+            .map(|path| SpamModel::load(&path))
+            .unwrap_or_default();
         log_info!(
             "[Spam] loaded model ({} spam / {} ham trained, enabled={})",
             spam_model.spam_messages(),
@@ -2777,13 +2779,14 @@ fn train_message(
     id: &str,
     label: spam::Label,
 ) -> Result<(), String> {
+    let path = spam::model_path()?;
     let raw = client
         .get_email_raw(id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no raw message source available".to_string())?;
     let msg = spam::RawMessage::from_bytes(raw.as_bytes());
     model.train(&msg, label);
-    model.save(&spam::model_path())
+    model.save(&path)
 }
 
 /// Bulk-train every message in a mailbox (up to `limit`, 0 = all) with one
@@ -2795,6 +2798,7 @@ fn train_mailbox(
     label: spam::Label,
     limit: u32,
 ) -> Result<(usize, usize), String> {
+    let path = spam::model_path()?;
     let mut ids = fetch_all_mailbox_email_ids(client, mailbox_id)?;
     if limit > 0 {
         ids.truncate(limit as usize);
@@ -2818,7 +2822,7 @@ fn train_mailbox(
             }
         }
     }
-    model.save(&spam::model_path())?;
+    model.save(&path)?;
     Ok((trained, failed))
 }
 

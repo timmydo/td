@@ -414,6 +414,15 @@ of its own files may name each module.
   `FILE`, `MAX_FILE_BYTES`, `parse` and `text`, the file's name and
   contents; `MAX_APP_ID` and `path`, where a program's file is given the
   configuration and home directories. Under "Themes" below.
+- `xdg`: `Base`, the per-user base directories; `dir`, the one rule
+  (the variable when its value is absolute, else the fallback under an
+  absolute `HOME`, else none: never a relative or shared directory),
+  pure; and `from_env`, that rule over the process's environment.
+  `theme::path` and td-mail's draft directory are built on `dir`;
+  td-mail finds its configuration, cache, state and data, and td-news
+  its configuration and cache, through `from_env`. `face_file::places`
+  keeps its own copy of the rule: td-compositor and td-recipe-eval
+  compile that file by `#[path]` without this module.
 - `theme_file`: `host_path`, `theme::path` from the process's
   environment; `read`, the bounded read of the theme a file names, none
   when there is no file; `write`, its whole replacement; and `Kept`, a
@@ -1221,11 +1230,12 @@ not frames, and stays its own).
   `MAX_FILE_BYTES`, and replaces it by making its directory (0700),
   try-locking it and renaming a private (0600) sibling over the file;
   and `pty`, which opens `/dev/ptmx`, spawns the caller's command and
-  owns the threads around it. Apart from `open`'s `BROWSER`,
-  `face_file`'s three directory values and `theme_file`'s two they read
-  no environment variable, taking the display values, the socket path,
-  the face setting and a child's whole environment as explicit
-  arguments. The terminal's pure modules are `vt`, `vt_render`,
+  owns the threads around it. `xdg`'s `from_env` reads one base
+  directory's variable and `HOME`. Apart from `open`'s `BROWSER`,
+  `face_file`'s three directory values, `theme_file`'s two and `xdg`'s
+  two they read no environment variable, taking the display values,
+  the socket path, the face setting and a child's whole environment as
+  explicit arguments. The terminal's pure modules are `vt`, `vt_render`,
   `vt_terminfo` and `vt_keys`: bytes, sizes, chords and snapshots in;
   cells, replies, pixels and byte sequences out.
 - `control` and `driven` are pure: the frame, envelope and codecs touch
@@ -2254,12 +2264,12 @@ selected row (3.1:1, 3:1), and line numbers on the selected row
 
 A program's theme is kept in `FILE`, `theme`, in its own directory under
 the configuration home: `$XDG_CONFIG_HOME/<app_id>/theme`, else
-`$HOME/.config/<app_id>/theme`, a relative or empty value ignored, which
-for td-news and td-mail is beside their `config.toml` whenever
-`XDG_CONFIG_HOME` is unset or absolute (they take an empty or relative
-value as given). Under the application jail that home is the
-application's own private configuration directory (APPLICATIONS.md
-§B.4), so a jailed program's choice stays in its state. An `app_id` that
+`$HOME/.config/<app_id>/theme`, a relative or empty value ignored
+(`xdg::dir`), which for td-news and td-mail is beside their
+`config.toml`, found by the same rule. Under the application jail that
+home is the application's own private configuration directory
+(APPLICATIONS.md §B.4), so a jailed program's choice stays in its
+state. An `app_id` that
 is not one plain name of ASCII letters, digits, `-`, `_` and `.` up to
 `MAX_APP_ID`, not beginning with `.`, has no file. The file holds the
 theme's name and a newline; a reader takes at most `MAX_FILE_BYTES` of a

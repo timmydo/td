@@ -72,7 +72,10 @@ fn main() {
     }
 
     if opts.log {
-        let path = log::debug_log_path();
+        let Some(path) = log::debug_log_path() else {
+            eprintln!("No log: {}", td_ui::xdg::Base::Cache.missing());
+            return;
+        };
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 print!("{}", contents);
@@ -85,7 +88,10 @@ fn main() {
     }
 
     if opts.news_log {
-        let path = log::news_log_path();
+        let Some(path) = log::news_log_path() else {
+            eprintln!("No log: {}", td_ui::xdg::Base::Cache.missing());
+            return;
+        };
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 print!("{}", contents);
@@ -107,8 +113,9 @@ fn main() {
     if opts.clear_cache {
         if let Some(path) = opts.cache_path.clone() {
             cache::Cache::clear_at(path);
-        } else {
-            cache::Cache::clear();
+        } else if let Err(e) = cache::Cache::clear() {
+            eprintln!("td-news: {e}");
+            std::process::exit(1);
         }
         log::info("cache cleared");
         eprintln!("Cache cleared.");
@@ -286,11 +293,10 @@ impl CliOptions {
 }
 
 fn print_help_config() {
-    let xdg = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/.config", home)
-    });
-    eprintln!("Configuration file: {}/td-news/config.toml", xdg);
+    match config::default_path() {
+        Ok(path) => eprintln!("Configuration file: {}", path.display()),
+        Err(why) => eprintln!("Configuration file: none ({why})"),
+    }
     eprintln!();
     eprintln!("[ui]");
     eprintln!("  mouse = true                 # enable mouse support (default: true)");

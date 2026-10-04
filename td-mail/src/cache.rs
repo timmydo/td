@@ -46,27 +46,25 @@ pub struct Cache {
     store: Store,
 }
 
-fn cache_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("td-mail")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cache").join("td-mail")
-    } else {
-        PathBuf::from("/tmp").join("td-mail-cache")
-    }
+/// `td-mail` under the cache home; none without one, never a directory
+/// other users share.
+fn cache_dir() -> Result<PathBuf, String> {
+    td_ui::xdg::from_env(td_ui::xdg::Base::Cache)
+        .map(|dir| dir.join("td-mail"))
+        .ok_or_else(|| td_ui::xdg::Base::Cache.missing())
 }
 
 fn safe_account_name(account_name: &str) -> String {
     account_name.replace(['/', '\\', '\0'], "_")
 }
 
-fn db_path(account_name: &str) -> PathBuf {
-    cache_dir().join(format!("{}.tdkv", safe_account_name(account_name)))
+fn db_path(account_name: &str) -> Result<PathBuf, String> {
+    Ok(cache_dir()?.join(format!("{}.tdkv", safe_account_name(account_name))))
 }
 
 impl Cache {
     pub fn open(account_name: &str) -> Result<Cache, String> {
-        let path = db_path(account_name);
+        let path = db_path(account_name)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create cache dir: {}", e))?;
@@ -469,10 +467,10 @@ impl Cache {
         }
     }
 
-    pub fn clear_all_accounts() {
-        let dir = cache_dir();
+    pub fn clear_all_accounts() -> Result<(), String> {
+        let dir = cache_dir()?;
         if !dir.exists() {
-            return;
+            return Ok(());
         }
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -490,6 +488,7 @@ impl Cache {
                 }
             }
         }
+        Ok(())
     }
 }
 

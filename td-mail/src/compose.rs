@@ -1000,20 +1000,12 @@ fn draft_dir_from_env(
     xdg_state_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> io::Result<PathBuf> {
-    let state_dir = xdg_state_home
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| {
-            home.map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|p| p.join(".local/state"))
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "draft retention requires an absolute XDG_STATE_HOME or HOME",
-            )
-        })?;
+    let state_dir = td_ui::xdg::dir(
+        td_ui::xdg::Base::State,
+        xdg_state_home.as_deref(),
+        home.as_deref(),
+    )
+    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, td_ui::xdg::Base::State.missing()))?;
     Ok(state_dir.join("td-mail/drafts"))
 }
 

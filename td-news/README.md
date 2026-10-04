@@ -53,6 +53,12 @@ Default config path:
 - `$XDG_CONFIG_HOME/td-news/config.toml`
 - or `~/.config/td-news/config.toml`
 
+As the XDG base directory specification says, a relative or empty
+`XDG_*` value is ignored, and `HOME` counts only when absolute; with
+neither, td-news names no default configuration, keeps no log, and
+stops, saying why, rather than open its cache in a directory relative
+to where it was started.
+
 Example:
 
 ```toml

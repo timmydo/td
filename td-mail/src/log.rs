@@ -6,21 +6,17 @@ use std::time::SystemTime;
 
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 
-/// Return the log file path: $XDG_STATE_HOME/td-mail/td-mail.log
-pub fn log_path() -> PathBuf {
-    let state_dir = if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(xdg)
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".local").join("state")
-    } else {
-        PathBuf::from(".")
-    };
-    state_dir.join("td-mail").join("td-mail.log")
+/// `td-mail/td-mail.log` under the state home; none without one, and
+/// then nothing is logged.
+pub fn log_path() -> Option<PathBuf> {
+    td_ui::xdg::from_env(td_ui::xdg::Base::State).map(|dir| dir.join("td-mail").join("td-mail.log"))
 }
 
 /// Initialize the log file. Call once at startup.
 pub fn init() {
-    let path = log_path();
+    let Some(path) = log_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -33,7 +29,7 @@ pub fn init() {
 
 /// Truncate the log file to empty. Safe to call before startup.
 pub fn clear() -> Result<(), String> {
-    let path = log_path();
+    let path = log_path().ok_or_else(|| td_ui::xdg::Base::State.missing())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create log dir: {}", e))?;
     }

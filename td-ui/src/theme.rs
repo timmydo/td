@@ -8,7 +8,7 @@
 //! the file; nothing here touches the environment or the filesystem.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::chrome::{DISABLED, SELECTED_ROW};
 use crate::raster::{
@@ -200,13 +200,7 @@ pub fn path(config_home: Option<&OsStr>, home: Option<&OsStr>, app_id: &str) -> 
     if !plain {
         return None;
     }
-    fn absolute(value: Option<&OsStr>) -> Option<&Path> {
-        value.map(Path::new).filter(|path| path.is_absolute())
-    }
-    let base = match absolute(config_home) {
-        Some(config) => config.to_path_buf(),
-        None => absolute(home)?.join(".config"),
-    };
+    let base = crate::xdg::dir(crate::xdg::Base::Config, config_home, home)?;
     Some(base.join(app_id).join(FILE))
 }
 

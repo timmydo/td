@@ -10,15 +10,12 @@ static DEBUG_LOGGER: OnceLock<Result<Mutex<File>, String>> = OnceLock::new();
 /// writes nowhere near a person's own logs; otherwise the cache home.
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-fn log_dir() -> PathBuf {
+/// None without a cache home: then nothing is logged.
+fn log_dir() -> Option<PathBuf> {
     if let Some(dir) = LOG_DIR.get() {
-        return dir.clone();
+        return Some(dir.clone());
     }
-    let xdg = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/.cache", home)
-    });
-    PathBuf::from(xdg).join("td-news")
+    td_ui::xdg::from_env(td_ui::xdg::Base::Cache).map(|dir| dir.join("td-news"))
 }
 
 /// Sends every log of this process to `dir`, once; a later call keeps the
@@ -28,12 +25,12 @@ pub fn use_log_dir(dir: PathBuf) -> PathBuf {
     LOG_DIR.get_or_init(|| dir).clone()
 }
 
-pub fn news_log_path() -> PathBuf {
-    log_dir().join("news.log")
+pub fn news_log_path() -> Option<PathBuf> {
+    Some(log_dir()?.join("news.log"))
 }
 
-pub fn debug_log_path() -> PathBuf {
-    log_dir().join("debug.log")
+pub fn debug_log_path() -> Option<PathBuf> {
+    Some(log_dir()?.join("debug.log"))
 }
 
 pub fn init() -> Result<(), String> {
@@ -69,7 +66,8 @@ pub fn news(msg: impl AsRef<str>) {
     write_line(&NEWS_LOGGER, news_log_path, "INFO", msg.as_ref());
 }
 
-fn open_logger(path: PathBuf) -> Result<Mutex<File>, String> {
+fn open_logger(path: Option<PathBuf>) -> Result<Mutex<File>, String> {
+    let path = path.ok_or_else(|| td_ui::xdg::Base::Cache.missing())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create log dir: {}", e))?;
     }
@@ -83,7 +81,7 @@ fn open_logger(path: PathBuf) -> Result<Mutex<File>, String> {
 
 fn write_line(
     logger_ref: &OnceLock<Result<Mutex<File>, String>>,
-    path_fn: fn() -> PathBuf,
+    path_fn: fn() -> Option<PathBuf>,
     level: &str,
     msg: &str,
 ) {

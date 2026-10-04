@@ -295,15 +295,12 @@ impl SpamModel {
 ///
 /// Lives under the *data* dir, not the cache: the trained store is curated by
 /// the user (via the J / un-junk training keys) and must survive cache clears.
-pub fn model_path() -> PathBuf {
-    let data_dir = if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(xdg)
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".local").join("share")
-    } else {
-        PathBuf::from(".")
-    };
-    data_dir.join("td-mail").join("spam-model.json")
+/// Without a data home there is no model file: training is refused and
+/// classification starts from an empty model.
+pub fn model_path() -> Result<PathBuf, String> {
+    td_ui::xdg::from_env(td_ui::xdg::Base::Data)
+        .map(|dir| dir.join("td-mail").join("spam-model.json"))
+        .ok_or_else(|| td_ui::xdg::Base::Data.missing())
 }
 
 // --- Tokenization ---

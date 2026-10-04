@@ -1437,8 +1437,10 @@ impl App {
                 if self.pane_text != key {
                     let text = self.log_text(total, start, rows, columns.max(1));
                     self.log_shown_total = text.as_ref().and(total);
-                    let text = text
-                        .unwrap_or_else(|| format!("Could not read {}", self.log_path().display()));
+                    let text = text.unwrap_or_else(|| match self.log_path() {
+                        Some(path) => format!("Could not read {}", path.display()),
+                        None => td_ui::xdg::Base::Cache.missing(),
+                    });
                     self.set_pane_text(key, &text);
                 }
             }
@@ -1456,7 +1458,7 @@ impl App {
         rows: usize,
         width: usize,
     ) -> Option<String> {
-        let path = self.log_path();
+        let path = self.log_path()?;
         // Resume from the last frame's first line when it is not past this
         // one's; the count drops the hint of a log that shrank.
         let hint = self.log_window_hint.get(log_tab_index(self.log_tab));
@@ -1511,7 +1513,7 @@ impl App {
                 "{} lines | {}",
                 self.log_shown_total
                     .map_or_else(|| "?".to_string(), |total| total.to_string()),
-                self.log_path().display()
+                self.log_name()
             ),
             // M3: the scope the list is in, which the old header named.
             View::ArticleList => {
@@ -2176,11 +2178,19 @@ impl App {
         self.feeds.iter().map(|f| f.unread).sum()
     }
 
-    fn log_path(&self) -> PathBuf {
+    fn log_path(&self) -> Option<PathBuf> {
         match self.log_tab {
             LogTab::News => crate::log::news_log_path(),
             LogTab::Debug => crate::log::debug_log_path(),
         }
+    }
+
+    /// The shown log's path for the header and errors, or why there is none.
+    fn log_name(&self) -> String {
+        self.log_path().map_or_else(
+            || td_ui::xdg::Base::Cache.missing(),
+            |path| path.display().to_string(),
+        )
     }
 
     /// How many lines the shown log has, or nothing for one that cannot be
@@ -2188,7 +2198,7 @@ impl App {
     fn current_log_entry_count(&self) -> Option<usize> {
         let tab = log_tab_index(self.log_tab);
         count_log(
-            &self.log_path(),
+            &self.log_path()?,
             self.log_count.get(tab)?,
             self.log_window_hint.get(tab)?,
         )

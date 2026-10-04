@@ -115,6 +115,7 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "theme_file.rs",
                 "wayland.rs",
                 "window.rs",
+                "xdg.rs",
             ]
             .iter(),
         )
@@ -488,9 +489,10 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 );
             }
         }
-        // Outside tests the environment is read in three places: the
+        // Outside tests the environment is read in four places: the
         // opener's `BROWSER`, the face search's three directory values
-        // and their list's split, and the theme file's two, pinned above.
+        // and their list's split, the theme file's two, pinned above, and
+        // the base-directory lookup's variable and `HOME`.
         let production = text.split("#[cfg(test)]").next().unwrap_or_default();
         assert_eq!(
             production.matches("std::env").count(),
@@ -498,10 +500,20 @@ fn source_inventory_and_shared_mounts_are_closed() {
                 "open.rs" => 1,
                 "face_file.rs" => 4,
                 "theme_file.rs" => 2,
+                "xdg.rs" => 2,
                 _ => 0,
             },
             "environment access in {name}"
         );
+        if name == "xdg.rs" {
+            // Read only, never set, and only the two values the rule takes.
+            let flat = crate::compact(production);
+            assert!(flat.contains("std::env::var_os(base.variable())"));
+            assert!(flat.contains("std::env::var_os(\"HOME\")"));
+            for absent in ["std::fs", "std::process", "set_var", "remove_var"] {
+                assert!(!flat.contains(absent), "{absent} in xdg.rs");
+            }
+        }
         if name == "open.rs" {
             assert!(production.contains("std::env::var(\"BROWSER\")"));
             assert!(production.contains(".env_remove(\"WAYLAND_SOCKET\")"));

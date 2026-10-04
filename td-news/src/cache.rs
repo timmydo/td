@@ -53,8 +53,7 @@ pub struct FeedRefreshSummary {
 
 impl Cache {
     pub fn open() -> Result<Cache, String> {
-        let path = Self::default_db_path();
-        Self::open_at(path)
+        Self::open_at(Self::default_db_path()?)
     }
 
     pub fn open_at(path: PathBuf) -> Result<Cache, String> {
@@ -71,13 +70,13 @@ impl Cache {
         })
     }
 
-    pub fn default_db_path() -> PathBuf {
-        cache_dir().join(CACHE_FILE)
+    pub fn default_db_path() -> Result<PathBuf, String> {
+        Ok(cache_dir()?.join(CACHE_FILE))
     }
 
-    pub fn clear() {
-        let path = Self::default_db_path();
-        Self::clear_at(path);
+    pub fn clear() -> Result<(), String> {
+        Self::clear_at(Self::default_db_path()?);
+        Ok(())
     }
 
     pub fn clear_at(path: PathBuf) {
@@ -301,12 +300,11 @@ fn open_store(path: &Path) -> Result<(Store, Option<String>), String> {
     }
 }
 
-fn cache_dir() -> PathBuf {
-    let xdg = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/.cache", home)
-    });
-    PathBuf::from(xdg).join("td-news")
+/// `td-news` under the cache home, or why there is none.
+fn cache_dir() -> Result<PathBuf, String> {
+    td_ui::xdg::from_env(td_ui::xdg::Base::Cache)
+        .map(|dir| dir.join("td-news"))
+        .ok_or_else(|| td_ui::xdg::Base::Cache.missing())
 }
 
 fn insert_json(txn: &mut WriteTxn<'_>, table: &str, key: &str, value: &Json) {
