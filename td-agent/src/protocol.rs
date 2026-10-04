@@ -57,6 +57,9 @@ pub enum Down {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// The human's decision on the card the conversation asked for call
+    /// `call` (its `ToolCall`'s sequence number).
+    Decision { call: u64, allow: bool },
 }
 
 /// From a conversation to the window.
@@ -120,6 +123,19 @@ pub enum Up {
     /// answers with `States`.
     Query {
         id: u64,
+    },
+    /// A card for the human (DESIGN.md §11): may call `call` (its
+    /// `ToolCall`'s sequence number) run, as `title` and `details` say?
+    /// The window answers with `Decision`.
+    Ask {
+        call: u64,
+        title: String,
+        details: Vec<String>,
+    },
+    /// The card for `call` is no longer asked: the turn was interrupted,
+    /// or the window closed, before the human decided it.
+    Withdraw {
+        call: u64,
     },
 }
 
@@ -246,6 +262,13 @@ impl Down {
                     ("effort".into(), optional(effort)),
                 ],
             ),
+            Self::Decision { call, allow } => typed(
+                "decision",
+                vec![
+                    ("call".into(), Json::from(*call)),
+                    ("allow".into(), Json::Bool(*allow)),
+                ],
+            ),
         }
     }
 
@@ -337,6 +360,13 @@ impl Down {
                     text: string(&value, "text")?,
                 })
             }
+            Some("decision") => Ok(Self::Decision {
+                call: number(&value, "call")?,
+                allow: value
+                    .get("allow")
+                    .and_then(Json::as_bool)
+                    .ok_or("no allow")?,
+            }),
             other => Err(format!("unknown message {other:?}")),
         }
     }
@@ -425,6 +455,22 @@ impl Up {
                 ],
             ),
             Self::Query { id } => typed("query", vec![("id".into(), Json::from(*id))]),
+            Self::Ask {
+                call,
+                title,
+                details,
+            } => typed(
+                "ask",
+                vec![
+                    ("call".into(), Json::from(*call)),
+                    ("title".into(), Json::Str(title.clone())),
+                    (
+                        "details".into(),
+                        Json::Arr(details.iter().cloned().map(Json::Str).collect()),
+                    ),
+                ],
+            ),
+            Self::Withdraw { call } => typed("withdraw", vec![("call".into(), Json::from(*call))]),
         }
     }
 
@@ -491,6 +537,24 @@ impl Up {
             Some("query") => Self::Query {
                 id: number(&value, "id")?,
             },
+            Some("ask") => Self::Ask {
+                call: number(&value, "call")?,
+                title: string(&value, "title")?,
+                details: value
+                    .get("details")
+                    .and_then(Json::as_arr)
+                    .ok_or("no details")?
+                    .iter()
+                    .map(|line| {
+                        line.as_str()
+                            .map(str::to_string)
+                            .ok_or("a detail not a string")
+                    })
+                    .collect::<Result<_, _>>()?,
+            },
+            Some("withdraw") => Self::Withdraw {
+                call: number(&value, "call")?,
+            },
             other => return Err(format!("unknown message {other:?}")),
         })
     }
@@ -546,6 +610,12 @@ mod tests {
                 status: None,
             },
             Up::Query { id: 6 },
+            Up::Ask {
+                call: 9,
+                title: "Run a command?".into(),
+                details: vec!["In /w:".into(), "cargo test".into()],
+            },
+            Up::Withdraw { call: 9 },
             Up::Event(Event {
                 seq: 1,
                 time: 2,
@@ -620,6 +690,14 @@ mod tests {
             },
             Down::Pause { paused: true },
             Down::ClearTodo,
+            Down::Decision {
+                call: 7,
+                allow: true,
+            },
+            Down::Decision {
+                call: 8,
+                allow: false,
+            },
             Down::Choose {
                 model: Some("openai/gpt-6".into()),
                 effort: Some("high".into()),

@@ -1386,6 +1386,9 @@ mod tests {
                     call: 4,
                     content: "#1 report".into(),
                     error: false,
+                    // What the log keeps beside a result is never sent.
+                    kept: Some("the whole output".into()),
+                    digest: Some("0123".into()),
                 },
             ),
         ];

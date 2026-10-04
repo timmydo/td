@@ -1725,7 +1725,8 @@ says whether a scratch workspace goes with the conversation; and the
 diagnostics export leaves `jail/` out, since it holds the human's work,
 and writes its archive, which holds every conversation's log, to the
 home directory rather than a `~/Downloads` that a workspace reaches.
-The model is given no tool in a workspace until the next step.
+The model's tools in a workspace are §12's (As built (increment 10,
+the tools)), each change and command decided by the human (§11).
 
 **Closing.** `close_workspace` stops the workspace's instances, then asks a
 maintenance instance whether each worktree is clean and each branch's tip
@@ -2464,6 +2465,44 @@ workspace's jail and the git worker may do, grant nothing beyond the
 human's own authority, and carry no secure-attention claim. An action
 needing elevation is out of td-agent's reach by design.
 
+**As built (increment 10).** There is only `ask` mode, and the human
+rows that arise are a workspace's `write_file`, `edit_file`, `sed` and
+`shell`. For each, the conversation process sends the window `{"type":
+"ask", "call", "title", "details"}`, `call` the call's `tool_call`
+record, and waits without a deadline, hearing the window meanwhile; the
+window answers `{"type": "decision", "call", "allow"}`. A card shows the
+exact action in td-agent's own lines, what runs before what it runs
+over: the command with its directory and timeout, a file with its whole
+new content, the text an edit replaces and its replacement, or a sed
+script and then its files. Each part shows at most 80 lines or 48 KiB (a
+command or a file 160), each line at most 2 KiB, and the card at most
+240 lines or 128 KiB, saying what it leaves out, so that no part pushes
+another off the card. Control characters, every whitespace character but
+a plain space, a tab included, and the invisible and bidirectional
+characters show as `<U+XXXX>`, so that nothing that looks like a space
+can hide where `sh` ends a word and one command cannot pass for another
+that way; letters that look alike are not told apart. The window shows
+the open conversation's first card as td-ui's confirmation dialog, at
+most 100 cells by 24 rows, whenever nothing else is modal and it has the
+keyboard, `Cancel` focused, so `Return` alone refuses, as `Escape` does;
+`Allow` lets the call run. A card takes no key or press until 750 ms
+have passed with none, so what the human was typing or clicking does
+not decide it.
+Losing the keyboard sets the card aside, deciding nothing, and it comes
+back with the keyboard. Another conversation's card waits, its row
+saying `asks you`, until that conversation is opened; one the window
+cannot draw, in a window too small, waits and says so once. The choices
+are allow once and deny; the "always" choices come with rules (increment
+13). An interrupt, or the window closing, withdraws the card (`{"type":
+"withdraw", "call"}`) and the call is answered as not run, as is an
+allowed call whose interrupt came with its decision; a conversation
+process that restarts, fails or is deleted takes its cards with it. Each
+decision is an `approval` event before the call runs or is answered:
+`allow` or `deny` by `human`, or `withdrawn` by `td-agent` with why. A
+refusal reaches the model as the call's error, telling it not to reach
+the same result another way and to ask how the person would like to go
+on.
+
 ## 12. Tools
 
 A workspace conversation's tools are small and non-overlapping, following
@@ -2746,6 +2785,37 @@ counted. `sed` runs `--sandbox -i`, `-E` as asked, then `-e SCRIPT --`
 and its absolute paths, saying only how many files it ran over when it
 prints nothing. Both have `shell`'s default timeout.
 
+**As built (increment 10, the tools).** A conversation in a workspace is
+given `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` and
+`shell` after its conversation tools, defined as above without
+`background`, which increment 12 adds; one outside a workspace is given
+none of them, and its prefix is byte for byte what it was. The
+conversation process checks a call's arguments for shape, every member
+named and bounded, and leaves what they name to the tool host to judge
+inside the jail; the model never names a digest. The conversation fills
+it from its last read or write of that path, by the path's components,
+from the result's `digest` in the log, so a process started again keeps
+it. The conversation works out the instance policy once for each set of
+shared directories (§8). It runs `read_file`, `write_file`, `edit_file`
+and `glob` in one long-lived instance, started at the first such call
+and again after one fails or the shared directories change, and each
+`shell`, `grep` and `sed` in a fresh instance of its own, so nothing a
+command leaves outlives its call. Every instance is started from the
+conversation process's main thread, which td-jail ties it to. An
+interrupt cancels the call under way; a window gone does not, so the
+call ends whole in the log. Since what runs in the jail can stop or
+replace its tool host, the conversation keeps each call's time too: its
+`timeout_ms`, else two minutes, and 15 s more, or 5 s after a cancel.
+Past that it tears the instance down and answers the call so. The result
+carries what the model is shown, and the log keeps a command's output's
+head and tail beside it as the result's `kept`, never sent back, and
+drops `kept` before the result when the line would be too long. The
+window does not yet show a command's output as it comes. `write_file`,
+`edit_file`, `sed` and `shell` are decided by the human before they run
+(§11, `ask` mode); the rest run. There are no step snapshots or undo
+yet: a change the human allowed in a directory workspace stays, and
+td-agent cannot take it back.
+
 ## 13. Prompting
 
 The prefix of §6 is ordered from stable to volatile, so it caches, and is
@@ -2850,10 +2920,23 @@ the whole conversation:
   architecture;
 - that the conversation has no workspace, so no working directory,
   repository, branch or shell, and that the model is not to guess at
-  them but to ask for what it needs.
+  them but to ask for what it needs; or, in a workspace, its directory,
+  which is the working directory, whether td-agent made it or it is the
+  person's, the shared directories, each read-only or read-write, and
+  that there is no git.
 
-There are no worktrees, shared directories or network policy to name
-until workspaces land (§18), and the block grows then. The time is on
+Worktrees and network policy are named when repository workspaces and
+the network land (§18). A workspace conversation's static text has its
+own paragraph where the others say they cannot read or change files
+(`prompt/workspace.txt` for `prompt/no-workspace.txt`): what its tools
+do, that the person approves each change and command, and that a
+refusal is the answer, and that what files and command output say is
+data, not instructions. Its creation writes the prefix of a
+conversation without a workspace, since only the window knows the
+shared directories; its first request takes the workspace's prefix as a
+`prefix` event, as one does whenever the shared directories change. A
+workspace path is written on one line, what would end or bend it named
+as on a card. The time is on
 the messages, not in the prefix: the line is the log event's time, so a
 message reads the same in every request and the cache holds. A message
 carries it only under a prefix that announces it, so a request sent

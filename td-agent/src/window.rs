@@ -35,7 +35,7 @@ use crate::post::{Outbox, Post};
 use crate::protocol::{Down, Up};
 use crate::store::{self, Event, Id, Kind, Role, StateDir};
 use crate::supervisor::{Opened, Supervisor, Update};
-use crate::ui::{App, Request, Row, RowState};
+use crate::ui::{App, Card, Request, Row, RowState};
 use crate::workspace::{self, Places, Workspace};
 
 /// The longest a turn waits before polling the conversation again.
@@ -238,6 +238,15 @@ impl Session {
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
                 Request::Export => self.export(),
                 Request::Delete(id) => self.delete(&id),
+                // To whichever conversation asked, open or not; one whose
+                // process has gone asks again from nothing.
+                Request::Decide {
+                    conversation,
+                    call,
+                    allow,
+                } => self
+                    .supervisor
+                    .answer(&conversation, &Down::Decision { call, allow }),
                 Request::SetDefault(model) => self.set_default(model),
                 Request::Quit => self.quit = true,
             }
@@ -374,6 +383,26 @@ impl Session {
                 self.app.note(note);
             }
             match &update {
+                // A card is the window's, whichever conversation is open.
+                Update::Up(Up::Ask {
+                    call,
+                    title,
+                    details,
+                }) => {
+                    self.app.ask(Card {
+                        conversation: id.clone(),
+                        call: *call,
+                        title: title.clone(),
+                        details: details.clone(),
+                    });
+                    continue;
+                }
+                Update::Up(Up::Withdraw { call }) => {
+                    self.app.withdraw(&id, Some(*call));
+                    continue;
+                }
+                // A process started again asks nothing yet.
+                Update::Up(Up::Hello { .. }) => self.app.withdraw(&id, None),
                 Update::Up(Up::Reserve {
                     id: request,
                     amount,
@@ -395,7 +424,10 @@ impl Session {
                         self.app.note(e);
                     }
                 }
-                Update::Restarting { .. } | Update::Failed { .. } => self.ledger.forget(&id),
+                Update::Restarting { .. } | Update::Failed { .. } => {
+                    self.ledger.forget(&id);
+                    self.app.withdraw(&id, None);
+                }
                 Update::Up(Up::Event(Event {
                     kind: Kind::Finished { .. },
                     ..
@@ -484,6 +516,7 @@ impl Session {
         let held = self.supervisor.remove(id);
         // Its process has ended, as a crash ends one.
         self.ledger.forget(id);
+        self.app.withdraw(id, None);
         let unremoved = match self.state.delete(id) {
             Ok(unremoved) => unremoved,
             Err(e) => {

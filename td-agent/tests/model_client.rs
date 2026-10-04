@@ -76,13 +76,34 @@ struct Harness {
 
 impl Harness {
     fn new(tag: &str, role: Role, script: Vec<Reply>) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        Self::new_in(tag, role, None, false, script)
+    }
+
+    /// A conversation created in `workspace`, `scratch` or a directory,
+    /// given td-jail and td-txt from this process's environment when
+    /// `jailed`.
+    fn new_in(
+        tag: &str,
+        role: Role,
+        workspace: Option<&str>,
+        jailed: bool,
+        script: Vec<Reply>,
+    ) -> Self {
+        let name = format!(
             "td-agent-model-{tag}-{}-{}",
             std::process::id(),
             td_agent::store::random_hex(4).unwrap()
-        ));
+        );
+        let root = std::env::temp_dir().join(&name);
         std::fs::create_dir(&root).unwrap();
-        let state = StateDir::at(root.join("state"));
+        // A jailed one's state lies outside `/tmp`, which td-jail
+        // reserves; its sockets stay in `root`, within a socket path's
+        // bound.
+        let state = StateDir::at(if jailed {
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
+        } else {
+            root.join("state")
+        });
         state.ensure().unwrap();
         let runtime = root.join("run");
         std::fs::create_dir(&runtime).unwrap();
@@ -94,7 +115,15 @@ impl Harness {
             .unwrap();
         let id = Id::random().unwrap();
         let stderr = root.join("stderr");
-        let (child, window) = spawn(&state, &id, Some(role), mock.runtime(), &stderr);
+        let (child, window) = spawn(
+            &state,
+            &id,
+            Some(role),
+            workspace,
+            jailed,
+            mock.runtime(),
+            &stderr,
+        );
         let mut harness = Self {
             root,
             state,
@@ -213,6 +242,42 @@ impl Harness {
         }
     }
 
+    /// What the process said until it asked the person a card,
+    /// reservations answered on the way: the card's call, title and
+    /// details, the events kept for `turn`.
+    fn until_ask(&mut self) -> (u64, String, Vec<String>) {
+        loop {
+            let up = self.next();
+            if self.hear(&up) {
+                continue;
+            }
+            match up {
+                Up::Ask {
+                    call,
+                    title,
+                    details,
+                } => return (call, title, details),
+                Up::Event(event) => self.heard.push(event),
+                _ => {}
+            }
+        }
+    }
+
+    /// What the process said until it withdrew a card: its call.
+    fn until_withdrawn(&mut self) -> u64 {
+        loop {
+            let up = self.next();
+            if self.hear(&up) {
+                continue;
+            }
+            match up {
+                Up::Withdraw { call } => return call,
+                Up::Event(event) => self.heard.push(event),
+                _ => {}
+            }
+        }
+    }
+
     /// The text every delta of request `request` brought.
     fn streamed(&self, request: u64) -> (String, String) {
         let mut out = (String::new(), String::new());
@@ -278,6 +343,7 @@ impl Drop for Harness {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(self.state.root());
     }
 }
 
@@ -285,6 +351,8 @@ fn spawn(
     state: &StateDir,
     id: &Id,
     create: Option<Role>,
+    workspace: Option<&str>,
+    jailed: bool,
     runtime: &std::path::Path,
     stderr: &std::path::Path,
 ) -> (Child, UnixStream) {
@@ -297,6 +365,17 @@ fn spawn(
         .env("XDG_RUNTIME_DIR", runtime);
     if let Some(role) = create {
         command.args(["--create", role.word()]);
+    }
+    if let Some(workspace) = workspace {
+        command.args(["--workspace", workspace]);
+    }
+    if jailed {
+        for var in [td_agent::jail::JAIL_VAR, td_agent::jail::TXT_VAR] {
+            command.env(
+                var,
+                std::env::var_os(var).unwrap_or_else(|| panic!("{var}")),
+            );
+        }
     }
     let child = command
         .stdin(Stdio::from(OwnedFd::from(theirs.try_clone().unwrap())))
@@ -606,7 +685,15 @@ fn the_next_request_replays_the_log_and_the_reasoning_byte_for_byte() {
     assert_eq!(outcome, "replied");
     let (_, mut h) = h.close();
     // A restart: a new process over the same log.
-    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    let (child, window) = spawn(
+        &h.state,
+        &h.id,
+        None,
+        None,
+        false,
+        h.mock.runtime(),
+        &h.stderr,
+    );
     h.child = child;
     h.window = window;
     assert!(matches!(h.next(), Up::Hello { .. }));
@@ -666,7 +753,15 @@ fn a_prefix_with_the_members_once_sent_is_replaced_before_the_next_request() {
     );
     assert_ne!(old, current);
     std::fs::write(&file, &old).unwrap();
-    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    let (child, window) = spawn(
+        &h.state,
+        &h.id,
+        None,
+        None,
+        false,
+        h.mock.runtime(),
+        &h.stderr,
+    );
     h.child = child;
     h.window = window;
     assert!(matches!(h.next(), Up::Hello { .. }));
@@ -724,7 +819,15 @@ fn a_chosen_model_and_effort_are_what_the_next_request_sends() {
     );
     drop(conversation);
     // A model the list does not have, chosen: refused, naming the choice.
-    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    let (child, window) = spawn(
+        &h.state,
+        &h.id,
+        None,
+        None,
+        false,
+        h.mock.runtime(),
+        &h.stderr,
+    );
     h.child = child;
     h.window = window;
     assert!(matches!(h.next(), Up::Hello { .. }));
@@ -1146,7 +1249,15 @@ fn a_request_in_flight_when_its_process_dies_is_never_resent() {
     h.mock.wait_for(1);
     h.child.kill().unwrap();
     h.child.wait().unwrap();
-    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    let (child, window) = spawn(
+        &h.state,
+        &h.id,
+        None,
+        None,
+        false,
+        h.mock.runtime(),
+        &h.stderr,
+    );
     h.child = child;
     h.window = window;
     let Up::Hello { interrupted, .. } = h.next() else {
@@ -1201,6 +1312,326 @@ fn without_a_key_a_turn_says_why_and_sends_nothing() {
     let (_, outcome, _) = h.turn();
     assert!(outcome.starts_with("no API key"), "{outcome}");
     assert!(h.mock.requests().is_empty());
+}
+
+// --- the workspace tools (DESIGN.md §7, §11, §12) ------------------------
+
+/// The approvals of `events`: the call each decided, its outcome, by whom
+/// and why.
+fn approvals(events: &[Event]) -> Vec<(u64, String, String, Option<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Approval {
+                call,
+                outcome,
+                by,
+                reason,
+                ..
+            } => Some((*call, outcome.clone(), by.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `ToolCall` record of call `id` in `events`.
+fn call_record(events: &[Event], id: &str) -> u64 {
+    events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::ToolCall { id: of, .. } if of == id => Some(e.seq),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A workspace conversation's request names its workspace and carries
+/// its tools; a read runs without asking, and a command waits for the
+/// person, whose refusal is the call's answer. Without `./agent`'s
+/// td-jail neither can run, which each says, so the gate needs no jail:
+/// the jail's own tests run the calls (tests/jail.rs).
+#[test]
+fn a_workspace_command_waits_for_the_person_and_a_refusal_is_its_answer() {
+    let mut h = Harness::new_in(
+        "ask",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Tidy the notes.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Run a command");
+    assert_eq!(
+        details,
+        [
+            "In the workspace, for at most 120 s, in a jail of its own:",
+            "rm -f notes.txt"
+        ]
+    );
+    // The read went first and asked nothing.
+    let read = results(&h.heard);
+    assert_eq!(read.len(), 1, "{read:?}");
+    assert_eq!(read[0].0, "toolu_read_01");
+    assert!(
+        read[0].2 && read[0].1.starts_with("error: the jail: "),
+        "{read:?}"
+    );
+    assert_eq!(call, call_record(&h.heard, "toolu_shell_01"));
+    // A decision for another call is not this one's.
+    h.down(&Down::Decision {
+        call: call + 1000,
+        allow: true,
+    });
+    h.down(&Down::Decision { call, allow: false });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let results = results(&events);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[1].0, "toolu_shell_01");
+    assert!(results[1].2);
+    assert!(
+        results[1]
+            .1
+            .starts_with("error: not run: the person refused this call. That is their answer"),
+        "{results:?}"
+    );
+    assert_eq!(
+        approvals(&events),
+        [(call, "deny".to_string(), "human".to_string(), None)]
+    );
+    // The turn's two requests, then the title's.
+    let mut requests = h.mock.requests();
+    assert_eq!(requests.len(), 3);
+    requests.truncate(2);
+    let first = flat(&requests[0].text());
+    let tools: Vec<&str> = first
+        .iter()
+        .filter(|(k, _)| k.starts_with("tools.") && k.ends_with(".function.name"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    for tool in [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "sed",
+        "shell",
+    ] {
+        assert!(tools.contains(&tool), "{tools:?}");
+    }
+    let system = &first["messages.0.content"];
+    let scratch = h
+        .state
+        .root()
+        .join("jail")
+        .join(h.id.as_str())
+        .join("scratch");
+    let scratch = std::fs::canonicalize(scratch).unwrap();
+    assert!(
+        system.contains(&format!(
+            "- Workspace: {}, a scratch directory td-agent made",
+            scratch.display()
+        )),
+        "{system}"
+    );
+    assert!(system.contains("- Shared directories: none."), "{system}");
+    assert!(!system.contains("no working directory"), "{system}");
+    let second = flat(&requests[1].text());
+    assert!(second["messages.4.content"].starts_with("error: not run: the person refused"));
+    let (conversation, _) = h.close();
+    for (n, request) in requests.iter().enumerate() {
+        rebuilt(&conversation, n, &request.text());
+    }
+}
+
+/// An allowed command runs, here to say the jail is missing; one asked
+/// while the turn is interrupted is withdrawn and not run.
+#[test]
+fn an_allowed_command_runs_and_an_interrupt_withdraws_the_card() {
+    let mut h = Harness::new_in(
+        "allow",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Tidy the notes.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Decision { call, allow: true });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let first = results(&events);
+    assert!(first[1].1.starts_with("error: the jail: "), "{first:?}");
+    assert_eq!(
+        approvals(&events),
+        [(call, "allow".to_string(), "human".to_string(), None)]
+    );
+
+    h.mock.then(vec![Reply::sse("stream-tool-workspace.sse")]);
+    h.say("Again.");
+    let (call, _, _) = h.until_ask();
+    h.down(&Down::Interrupt);
+    assert_eq!(h.until_withdrawn(), call);
+    let (events, outcome, retry) = h.turn();
+    assert!(
+        outcome.starts_with("interrupted between tool calls"),
+        "{outcome}"
+    );
+    assert!(retry);
+    let results = results(&events);
+    assert!(
+        results[1]
+            .1
+            .starts_with("error: not run: the turn was interrupted, or the window closed"),
+        "{results:?}"
+    );
+    assert_eq!(
+        approvals(&events),
+        [(
+            call,
+            "withdrawn".to_string(),
+            "td-agent".to_string(),
+            Some("the turn was interrupted".to_string())
+        )]
+    );
+    assert_eq!(h.mock.requests().len(), 4);
+}
+
+/// A card asked when the window closes is withdrawn, and its call
+/// answered as not run.
+#[test]
+fn a_card_asked_when_the_window_closes_is_withdrawn() {
+    let mut h = Harness::new_in(
+        "gone",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![Reply::sse("stream-tool-workspace.sse")],
+    );
+    h.setup(Client::default());
+    h.say("Tidy the notes.");
+    let (call, _, _) = h.until_ask();
+    let (conversation, _) = h.close();
+    let events = conversation.events();
+    assert_eq!(
+        approvals(events),
+        [(
+            call,
+            "withdrawn".to_string(),
+            "td-agent".to_string(),
+            Some("the window closed".to_string())
+        )]
+    );
+    let results = results(events);
+    assert!(
+        results[1]
+            .1
+            .starts_with("error: not run: the turn was interrupted, or the window closed"),
+        "{results:?}"
+    );
+}
+
+/// A command the person allows runs in the conversation's jail, in its
+/// scratch workspace, and a search runs there without asking.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn an_allowed_command_runs_in_the_workspace_jail() {
+    let mut h = Harness::new_in(
+        "live",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-workspace-live.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Make the notes.");
+    let (call, _, details) = h.until_ask();
+    assert_eq!(details[1], "printf made > notes.txt && cat notes.txt");
+    h.down(&Down::Decision { call, allow: true });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    let scratch = std::fs::canonicalize(
+        h.state
+            .root()
+            .join("jail")
+            .join(h.id.as_str())
+            .join("scratch"),
+    )
+    .unwrap();
+    assert_eq!(results[0].0, "toolu_shell_02");
+    assert!(
+        !results[0].2 && results[0].1.contains("made"),
+        "{results:?}"
+    );
+    assert_eq!(results[1].0, "toolu_glob_01");
+    assert!(
+        results[1]
+            .1
+            .contains(&scratch.join("notes.txt").display().to_string()),
+        "{results:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("notes.txt")).unwrap(),
+        "made"
+    );
+    // The command's output is kept in the log beside its result.
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        Kind::ToolResult { kept: Some(kept), .. } if kept.contains("made")
+    )));
+}
+
+/// A command that stops its own tool host cannot hold the conversation:
+/// past the call's time and the grace for it, the jail is torn down and
+/// the call answered.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_tool_host_that_does_not_answer_is_torn_down_at_the_deadline() {
+    let mut h = Harness::new_in(
+        "stop",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            Reply::sse("stream-tool-workspace-stop.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Stop.");
+    let (call, _, _) = h.until_ask();
+    let asked = Instant::now();
+    h.down(&Down::Decision { call, allow: true });
+    // The harness waits at most TIMEOUT for each message, longer than the
+    // call's 0.1 s and the 15 s grace together.
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let results = results(&events);
+    assert!(
+        results[0]
+            .1
+            .starts_with("error: the tool host did not end this call by its deadline"),
+        "{results:?}"
+    );
+    assert!(asked.elapsed() < Duration::from_secs(25));
 }
 
 // --- the conversation tools (DESIGN.md §3, §5, §12) ---------------------
@@ -1649,7 +2080,15 @@ fn a_call_started_and_not_finished_is_answered_as_interrupted_after_a_restart() 
         c.sync().unwrap();
         assert_eq!(started, 5);
     }
-    let (child, window) = spawn(&h.state, &h.id, None, h.mock.runtime(), &h.stderr);
+    let (child, window) = spawn(
+        &h.state,
+        &h.id,
+        None,
+        None,
+        false,
+        h.mock.runtime(),
+        &h.stderr,
+    );
     h.child = child;
     h.window = window;
     let Up::Hello { interrupted, .. } = h.next() else {

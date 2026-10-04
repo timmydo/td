@@ -45,11 +45,13 @@ use std::time::{Duration, Instant};
 
 use crate::accounts;
 use crate::assemble::Assembly;
+use crate::bench::Bench;
 use crate::client::{self, Completion, Failure, Params};
 use crate::config::Client;
 use crate::cost;
 use crate::frame;
 use crate::history;
+use crate::host;
 use crate::key::Secret;
 use crate::models::{Model, Models};
 use crate::protocol::{Down, Up, MAX_TEXT};
@@ -81,6 +83,27 @@ pub const MAX_STEPS: usize = 40;
 const MAX_LISTED: usize = 200;
 /// What a call the human interrupted before it ran is answered with.
 const CALL_SKIPPED: &str = "not run: the person interrupted the turn before this call ran";
+/// What a call the human refused is answered with (DESIGN.md §11).
+const CALL_REFUSED: &str = "not run: the person refused this call. That is their answer: do not try to reach the same result another way. Say what you needed it for and ask how they would like to go on";
+/// What a call is answered with when the turn ended before the human
+/// decided it.
+const CALL_UNDECIDED: &str =
+    "not run: the turn was interrupted, or the window closed, before the person decided this call";
+/// How often a call in the jail looks for an interrupt.
+const HOST_POLL: Duration = Duration::from_millis(100);
+/// How long a cancelled call's tool host has to say it ended.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+/// What a call is answered with when its tool host says nothing by the
+/// call's deadline: the jail is torn down instead.
+const CALL_UNANSWERED: &str = "the tool host did not end this call by its deadline, so its jail was torn down; whatever the call did before then stays";
+
+/// What the log keeps of a call beside the result the model is shown
+/// (`Kind::ToolResult`).
+#[derive(Default)]
+struct Beside {
+    kept: Option<String>,
+    digest: Option<String>,
+}
 /// What a call the log has no room to run is answered with.
 const CALL_NO_ROOM: &str =
     "not run: the conversation's log is full; tell the person to start another conversation";
@@ -208,6 +231,10 @@ pub fn serve_in(
     workspace: Option<Workspace>,
 ) -> Result<(), String> {
     let (conversation, load) = match (create, workspace) {
+        // Its tools and text are a conversation's (DESIGN.md §7).
+        (Some(Role::Orchestrator), Some(_)) => {
+            return Err("the orchestrator works in no workspace".into())
+        }
         (Some(role), workspace) => Conversation::create(state, id, role, workspace, LOCK_WAIT)?,
         (None, None) => Conversation::open(state, id, None, LOCK_WAIT)?,
         (None, Some(_)) => return Err("a workspace is given only to a new conversation".into()),
@@ -240,7 +267,12 @@ pub fn serve_in(
         next_reservation: u64::from_str_radix(&crate::store::random_hex(6)?, 16)
             .map_err(|e| format!("a reservation id: {e}"))?,
         gone: false,
+        bench: Bench::default(),
     };
+    // What this conversation read or wrote before, so a replacement of an
+    // unchanged file needs no read again.
+    let role = session.conversation.meta().role;
+    session.bench.restore(role, session.conversation.events());
     session.send(&Up::Hello {
         role: session.conversation.meta().role,
         title: session.conversation.meta().title.clone(),
@@ -403,6 +435,8 @@ struct Session {
     /// The window has closed its end: the turn under way finishes in the
     /// log, and then the process exits.
     gone: bool,
+    /// The workspace's jail instances, for a conversation in one.
+    bench: Bench,
 }
 
 impl Session {
@@ -492,10 +526,13 @@ impl Session {
                 // Between turns there is nothing to interrupt, and an
                 // answer that comes after its call gave up is not waited
                 // for.
+                // A decision that comes after its call gave up is not
+                // waited for either.
                 Down::Reservation { .. }
                 | Down::Interrupt
                 | Down::Sent { .. }
-                | Down::States { .. } => {}
+                | Down::States { .. }
+                | Down::Decision { .. } => {}
             }
             if !self.gone {
                 let _ = self.writer.flush();
@@ -839,9 +876,14 @@ impl Session {
         }
         let pricing = model.as_ref().and_then(|m| m.pricing);
         // The prefix this program writes; a conversation begun by another
-        // (one from before the conversation tools, say) takes it as an
-        // event, at the cost of one cache miss.
-        let expected = crate::prompt::prefix(role, self.conversation.meta().created);
+        // (one from before the conversation tools, say), or whose shared
+        // directories changed, takes it as an event, at the cost of one
+        // cache miss. A workspace conversation's first request takes one,
+        // since its creation does not know the shared directories.
+        let expected = match self.expected_prefix(&client) {
+            Ok(expected) => expected,
+            Err(why) => return Ok(Outcome::stop(why)),
+        };
         if client::current_prefix(self.conversation.events(), self.conversation.prefix_file()).1
             != expected
         {
@@ -1070,10 +1112,11 @@ impl Session {
             })
             .unwrap_or_default();
         let role = self.conversation.meta().role;
+        let workspace = self.conversation.meta().workspace.is_some();
         for (at, call) in calls.iter().enumerate() {
             self.hear();
             if self.interrupt {
-                self.result(reply, call, 0, CALL_SKIPPED.into(), true)?;
+                self.result(reply, call, 0, CALL_SKIPPED.into(), true, Beside::default())?;
                 continue;
             }
             // Run only while its result and every later call's answer fit,
@@ -1084,7 +1127,7 @@ impl Session {
                 .conversation
                 .has_room_for(RESULT_ROOM.saturating_add(later.saturating_mul(CALL_RECORDS)))
             {
-                self.result(reply, call, 0, CALL_NO_ROOM.into(), true)?;
+                self.result(reply, call, 0, CALL_NO_ROOM.into(), true, Beside::default())?;
                 continue;
             }
             let started = self
@@ -1096,15 +1139,17 @@ impl Session {
                 .seq;
             // Durable before it runs: a restart never runs it again.
             self.sync()?;
-            let answer = match tools::parse(role, &call.name, &call.arguments) {
-                Ok(args) => self.run(args)?,
-                Err(why) => Err(why),
-            };
+            let (answer, beside) =
+                match tools::parse_in(role, workspace, &call.name, &call.arguments) {
+                    Ok(Args::Host { call, acts }) => self.host(started, call, acts)?,
+                    Ok(args) => (self.run(args)?, Beside::default()),
+                    Err(why) => (Err(why), Beside::default()),
+                };
             let (content, error) = match answer {
                 Ok(content) => (content, false),
                 Err(why) => (format!("error: {why}"), true),
             };
-            self.result(reply, call, started, content, error)?;
+            self.result(reply, call, started, content, error, beside)?;
         }
         self.sync()?;
         Ok(!self.interrupt)
@@ -1119,22 +1164,198 @@ impl Session {
         started: u64,
         content: String,
         error: bool,
+        beside: Beside,
     ) -> Result<(), String> {
-        let result = |content: String, error: bool| Kind::ToolResult {
-            reply,
-            id: call.id.clone(),
-            name: call.name.clone(),
-            call: started,
-            content,
-            error,
-        };
-        if let Err(e) = self.log(result(content, error)) {
+        let result =
+            |content: String, error: bool, kept: Option<String>, digest: Option<String>| {
+                Kind::ToolResult {
+                    reply,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    call: started,
+                    content,
+                    error,
+                    kept,
+                    digest,
+                }
+            };
+        let digest = beside.digest.clone();
+        if self
+            .log(result(content.clone(), error, beside.kept, beside.digest))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // The kept output is what may not fit: the result without it.
+        if let Err(e) = self.log(result(content, error, None, digest)) {
             self.log(result(
                 format!("error: the result could not be logged: {e}"),
                 true,
+                None,
+                None,
             ))?;
         }
         Ok(())
+    }
+
+    /// The prefix this conversation's requests begin with: for one in a
+    /// workspace, the workspace prepared for `client`'s shared directories
+    /// and named, with its tools.
+    fn expected_prefix(&mut self, client: &Client) -> Result<String, String> {
+        let meta = self.conversation.meta().clone();
+        let Some(workspace) = &meta.workspace else {
+            return Ok(crate::prompt::prefix(meta.role, meta.created));
+        };
+        let state = StateDir::at(self.state.clone());
+        let policy = self
+            .bench
+            .prepare(workspace, &state, &meta.id, &client.shared)
+            .map_err(|e| format!("the workspace could not be prepared: {e}"))?;
+        let directory = policy
+            .worktrees
+            .first()
+            .ok_or("the workspace has no directory")?;
+        let place = crate::prompt::Place {
+            scratch: matches!(workspace, Workspace::Scratch),
+            directory,
+            read: &policy.read,
+            write: &policy.write,
+        };
+        Ok(crate::prompt::prefix_in(
+            meta.role,
+            meta.created,
+            Some(&place),
+        ))
+    }
+
+    /// Runs a workspace tool's call, the `ToolCall` record `started`, in
+    /// the jail (DESIGN.md §8, §12), the human deciding first when it
+    /// `acts` (§11): the tool's answer or why not, and what the log keeps
+    /// beyond it. An interrupt cancels it; a window gone does not, so the
+    /// call ends whole in the log.
+    fn host(
+        &mut self,
+        started: u64,
+        call: host::Call,
+        acts: bool,
+    ) -> Result<(Result<String, String>, Beside), String> {
+        let failed = |why: String| Ok((Err(why), Beside::default()));
+        if acts {
+            match self.decide(started, &call)? {
+                Some(true) => {}
+                Some(false) => return failed(CALL_REFUSED.into()),
+                None => return failed(CALL_UNDECIDED.into()),
+            }
+        }
+        // An interrupt that came with the decision, or before it: nothing
+        // starts.
+        self.hear();
+        if self.interrupt {
+            return failed(CALL_SKIPPED.into());
+        }
+        let call = self.bench.with_digest(call);
+        let mut client = match self.bench.take(&call) {
+            Ok(client) => client,
+            Err(why) => return failed(format!("the jail: {why}")),
+        };
+        let id = match client.call(call.clone()) {
+            Ok(id) => id,
+            Err(why) => return failed(why),
+        };
+        // What runs in the jail may stop or replace the tool host, so the
+        // call's time is kept here too, past which its jail is torn down.
+        let mut deadline = Instant::now() + crate::bench::limit(&call);
+        let mut cancelled = false;
+        loop {
+            self.hear();
+            if self.interrupt && !cancelled {
+                cancelled = true;
+                deadline = deadline.min(Instant::now() + CANCEL_GRACE);
+                if let Err(why) = client.cancel(id) {
+                    return failed(why);
+                }
+            }
+            if Instant::now() >= deadline {
+                drop(client);
+                return failed(CALL_UNANSWERED.into());
+            }
+            match client.next_reply(HOST_POLL) {
+                None | Some(Ok(host::Up::Output { .. })) => {}
+                // The instance is gone, and with it the call.
+                Some(Err(why)) => return failed(why),
+                Some(Ok(host::Up::Done { outcome, .. })) => {
+                    let answer = match outcome {
+                        Ok(done) => {
+                            self.bench.record(&call, done.digest.as_deref());
+                            let beside = Beside {
+                                kept: done.kept,
+                                digest: done.digest,
+                            };
+                            (Ok(done.text), beside)
+                        }
+                        Err(why) => (Err(why), Beside::default()),
+                    };
+                    self.bench.keep(&call, client);
+                    return Ok(answer);
+                }
+            }
+        }
+    }
+
+    /// Asks the human whether the call `started` may run, on a card the
+    /// window draws (DESIGN.md §11), and waits for the answer however
+    /// long it takes, hearing the window meanwhile: whether it may, or
+    /// none when the turn was interrupted or the window closed first, the
+    /// card then withdrawn. The decision is logged.
+    fn decide(&mut self, started: u64, call: &host::Call) -> Result<Option<bool>, String> {
+        let (title, details) = tools::card(call);
+        self.send(&Up::Ask {
+            call: started,
+            title,
+            details,
+        });
+        let allow = loop {
+            if self.gone || self.interrupt {
+                break None;
+            }
+            match self.inbox.recv() {
+                Ok(Inbound::Down(Down::Decision { call, allow })) if call == started => {
+                    break Some(allow)
+                }
+                // A card already answered or withdrawn.
+                Ok(Inbound::Down(Down::Decision { .. })) => {}
+                Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
+                Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
+                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Broken(why)) => {
+                    eprintln!("td-agent: the window: {why}");
+                    self.gone = true;
+                }
+                Ok(Inbound::Closed) | Err(_) => self.gone = true,
+            }
+        };
+        let (outcome, by, reason) = match allow {
+            Some(true) => ("allow", "human", None),
+            Some(false) => ("deny", "human", None),
+            None => {
+                self.send(&Up::Withdraw { call: started });
+                let why = if self.gone {
+                    "the window closed"
+                } else {
+                    "the turn was interrupted"
+                };
+                ("withdrawn", "td-agent", Some(why.to_string()))
+            }
+        };
+        self.log(Kind::Approval {
+            call: started,
+            outcome: outcome.into(),
+            by: by.into(),
+            probabilities: None,
+            reason,
+        })?;
+        Ok(allow)
     }
 
     /// Runs one call: the tool's answer, or why it failed, which the model
@@ -1165,6 +1386,8 @@ impl Session {
             Args::Report { status, summary } => {
                 self.post(Target::Orchestrator, summary, Some(status))
             }
+            // `answer` runs these through `host`, with their record.
+            Args::Host { .. } => Err("a workspace tool runs only in the jail".into()),
         })
     }
 

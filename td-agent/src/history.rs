@@ -490,6 +490,8 @@ mod tests {
                 call: 2,
                 content: content.into(),
                 error: false,
+                kept: None,
+                digest: None,
             },
         )
     }

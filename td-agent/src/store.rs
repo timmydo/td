@@ -868,8 +868,12 @@ pub enum Kind {
         name: String,
     },
     /// A tool call's result as returned to the model, whole: the
-    /// `ToolCall` record it finishes (0 for a call that never ran), and
-    /// whether it is a refusal or a failure rather than the tool's answer.
+    /// `ToolCall` record it finishes (0 for a call that never ran),
+    /// whether it is a refusal or a failure rather than the tool's answer,
+    /// what the log keeps beyond it, a command's output's head and tail
+    /// (DESIGN.md §12), and the digest of the file a read or write left,
+    /// which the next replacement of it expects; neither is sent to the
+    /// model.
     ToolResult {
         reply: u64,
         id: String,
@@ -877,6 +881,8 @@ pub enum Kind {
         call: u64,
         content: String,
         error: bool,
+        kept: Option<String>,
+        digest: Option<String>,
     },
     /// The todo list as written, whole (DESIGN.md §12); `cleared` when the
     /// human cleared it from the window.
@@ -892,8 +898,9 @@ pub enum Kind {
     /// An approval decision (DESIGN.md §6, §11): the `ToolCall` it
     /// decided, its outcome, who decided it (a rule, a classifier stage or
     /// the human), Jev's probabilities where it gave them, and the reason.
-    /// Nothing writes one until approvals land (increment 13); the history
-    /// tools already show a model only its outcome and who decided.
+    /// The human's decisions on cards write one (increment 10), rules and
+    /// the classifier later (increment 13); the history tools show a model
+    /// only its outcome and who decided.
     Approval {
         call: u64,
         outcome: String,
@@ -1049,6 +1056,8 @@ impl Event {
                 call,
                 content,
                 error,
+                kept,
+                digest,
             } => {
                 put("kind", Json::Str("tool_result".into()));
                 put("reply", Json::from(*reply));
@@ -1058,6 +1067,12 @@ impl Event {
                 put("content", Json::Str(content.clone()));
                 if *error {
                     put("error", Json::Bool(true));
+                }
+                if let Some(kept) = kept {
+                    put("kept", Json::Str(kept.clone()));
+                }
+                if let Some(digest) = digest {
+                    put("digest", Json::Str(digest.clone()));
                 }
             }
             Kind::Todo { items, cleared } => {
@@ -1238,6 +1253,8 @@ impl Event {
                 call: number("call")?,
                 content: string("content")?,
                 error: flag("error")?,
+                kept: optional("kept")?,
+                digest: optional("digest")?,
             },
             Some("todo") => Kind::Todo {
                 items: value
@@ -1456,6 +1473,8 @@ impl Conversation {
                 call,
                 content: content.into(),
                 error: true,
+                kept: None,
+                digest: None,
             })?;
             if call != 0 {
                 load.interrupted.push(call);
@@ -2158,6 +2177,8 @@ pub mod tests {
                 call: 4,
                 content: "The todo list is empty.".into(),
                 error: false,
+                kept: None,
+                digest: None,
             },
             Kind::ToolResult {
                 reply: 3,
@@ -2166,6 +2187,8 @@ pub mod tests {
                 call: 0,
                 content: CALL_NOT_RUN.into(),
                 error: true,
+                kept: None,
+                digest: None,
             },
             Kind::Todo {
                 items: vec![TodoItem {
@@ -2318,6 +2341,8 @@ pub mod tests {
                     call: 3,
                     content: "No event matches.".into(),
                     error: false,
+                    kept: None,
+                    digest: None,
                 })
                 .unwrap();
             conversation

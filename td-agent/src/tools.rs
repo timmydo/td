@@ -1,15 +1,19 @@
-//! The conversation tools (DESIGN.md §3, §12): the first tools a model is
-//! given, none of which touches a file. Their definitions are fixed text
+//! The tools (DESIGN.md §3, §12): the conversation tools every
+//! conversation has, and the workspace tools one in a workspace has too,
+//! which the tool host runs in its jail. Their definitions are fixed text
 //! in the request prefix (§13); a call's arguments are parsed here under
 //! a bound, each refused by name rather than guessed at, and the rules of
 //! which conversation may read or message which are here too, since the
-//! window checks a message again with them.
+//! window checks a message again with them. So is the card that asks the
+//! human about a workspace tool's call (§11).
 //!
 //! - `todo_write` replaces the conversation's todo list whole.
 //! - `history_search` and `history_read` reach a conversation's whole log
 //!   (`history`).
 //! - `conversations` lists the conversations; `send_message` and `report`
 //!   send one a message, which the window routes.
+//! - `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `sed` and
+//!   `shell` read and change the workspace (`host::Call`).
 //!
 //! The orchestrator has all of them but `report`, which is a message to
 //! the orchestrator itself. Every read or message §11 makes a crossing is
@@ -19,7 +23,9 @@
 //! conversation messages the orchestrator, and nothing else crosses.
 
 use crate::history::Searchable;
+use crate::host::Call;
 use crate::store::{Id, Role, Status, TodoItem};
+use crate::{files, shell};
 use td_json::Json;
 
 /// The most a call's arguments may run to, as the model wrote them.
@@ -54,7 +60,26 @@ pub enum Tool {
     Conversations,
     SendMessage,
     Report,
+    ReadFile,
+    WriteFile,
+    EditFile,
+    Glob,
+    Grep,
+    Sed,
+    Shell,
 }
+
+/// The tools a workspace adds (DESIGN.md §12), run by the tool host in
+/// the workspace's jail, in the order the prefix defines them.
+const WORKSPACE: &[Tool] = &[
+    Tool::ReadFile,
+    Tool::WriteFile,
+    Tool::EditFile,
+    Tool::Glob,
+    Tool::Grep,
+    Tool::Sed,
+    Tool::Shell,
+];
 
 impl Tool {
     pub fn name(self) -> &'static str {
@@ -65,7 +90,33 @@ impl Tool {
             Self::Conversations => "conversations",
             Self::SendMessage => "send_message",
             Self::Report => "report",
+            Self::ReadFile => "read_file",
+            Self::WriteFile => "write_file",
+            Self::EditFile => "edit_file",
+            Self::Glob => "glob",
+            Self::Grep => "grep",
+            Self::Sed => "sed",
+            Self::Shell => "shell",
         }
+    }
+
+    /// The tools a conversation of `role` has, with a workspace's when it
+    /// works in one.
+    pub fn all(role: Role, workspace: bool) -> Vec<Self> {
+        let mut tools = Self::of(role).to_vec();
+        if workspace {
+            tools.extend_from_slice(WORKSPACE);
+        }
+        tools
+    }
+
+    /// Whether a call to it changes the workspace or runs a command, which
+    /// in `ask` mode the human decides first (DESIGN.md §11).
+    pub fn acts(self) -> bool {
+        matches!(
+            self,
+            Self::WriteFile | Self::EditFile | Self::Sed | Self::Shell
+        )
     }
 
     /// The tools a conversation of `role` has, in the order the prefix
@@ -90,8 +141,10 @@ impl Tool {
         }
     }
 
-    fn find(role: Role, name: &str) -> Option<Self> {
-        Self::of(role).iter().copied().find(|t| t.name() == name)
+    fn find(role: Role, workspace: bool, name: &str) -> Option<Self> {
+        Self::all(role, workspace)
+            .into_iter()
+            .find(|t| t.name() == name)
     }
 }
 
@@ -234,6 +287,94 @@ fn definition(tool: Tool, role: Role) -> Json {
                 &["to", "text"],
             ),
         ),
+        Tool::ReadFile => (
+            format!("Read a text file in the workspace or a shared directory, by its absolute path, as numbered lines: at most {} lines or {} KiB from `offset` (the first line is 1). A view that stops short says so and names the offset to go on from. Every read returns the file's digest, which a later write_file or edit_file of it needs: read a file before changing it. Reading a directory is an error; list one with glob.", files::MAX_LINES, files::MAX_READ_BYTES / 1024),
+            schema(
+                vec![
+                    ("path", property("string", "The file's absolute path.")),
+                    ("offset", integer("The first line to show, from 1; 1 when left out.", 1, None)),
+                    ("limit", integer("The most lines to show.", 1, Some(files::MAX_LINES))),
+                ],
+                &["path"],
+            ),
+        ),
+        Tool::WriteFile => (
+            "Create a file, or replace one whole, with `content`. Replacing a file needs this conversation to have read it, and the file to be unchanged since. The person approves each write before it is made, and may refuse it.".to_string(),
+            schema(
+                vec![
+                    ("path", property("string", "The file's absolute path.")),
+                    ("content", property("string", "The file's whole new text.")),
+                ],
+                &["path", "content"],
+            ),
+        ),
+        Tool::EditFile => (
+            "Replace `old_string` in a file with `new_string`: an exact match, which must be unique unless `replace_all` is true. Give enough surrounding text to make it unique; no match, or several, is an error that says which. The file must have been read by this conversation and be unchanged since. The person approves each edit before it is made, and may refuse it.".to_string(),
+            schema(
+                vec![
+                    ("path", property("string", "The file's absolute path.")),
+                    ("old_string", property("string", "The exact text to replace.")),
+                    ("new_string", property("string", "What replaces it.")),
+                    ("replace_all", property("boolean", "Replace every match rather than one unique match; false when left out.")),
+                ],
+                &["path", "old_string", "new_string"],
+            ),
+        ),
+        Tool::Glob => (
+            format!("List the files whose paths match a glob pattern (`*`, `?`, `[...]`, `**` for any depth, `{{a,b}}`), sorted, at most {}, under `path` or the working directory.", files::MAX_GLOB),
+            schema(
+                vec![
+                    ("pattern", property("string", "The pattern, relative to `path`.")),
+                    ("path", property("string", "The absolute directory to search; the working directory when left out.")),
+                ],
+                &["pattern"],
+            ),
+        ),
+        Tool::Grep => (
+            format!("Search files for a POSIX regular expression, as `grep -rn`: each match as path:line:text, at most {} lines. Basic expressions unless `extended`.", shell::MAX_GREP_LINES),
+            schema(
+                vec![
+                    ("pattern", property("string", "The regular expression.")),
+                    ("path", property("string", "The absolute file or directory to search; the working directory when left out.")),
+                    ("include", property("string", "Only files whose names match this glob.")),
+                    ("exclude", property("string", "No files whose names match this glob.")),
+                    ("extended", property("boolean", "Extended rather than basic expressions; false when left out.")),
+                    ("ignore_case", property("boolean", "Match regardless of case; false when left out.")),
+                    ("context", integer("Lines of context around each match.", 0, Some(u64::from(shell::MAX_CONTEXT)))),
+                ],
+                &["pattern"],
+            ),
+        ),
+        Tool::Sed => (
+            "Run a sed script over the named files in place, for a change across many files that edit_file would take many calls to make. The script reads and writes only those files: commands that run a program or touch another file are refused. The person approves it before it runs, and may refuse it.".to_string(),
+            schema(
+                vec![
+                    ("script", property("string", "The sed script, such as s/old/new/g.")),
+                    (
+                        "paths",
+                        Json::Obj(vec![
+                            ("type".into(), Json::Str("array".into())),
+                            ("items".into(), property("string", "A file's absolute path.")),
+                            ("minItems".into(), Json::from(1u64)),
+                            ("description".into(), Json::Str("The files to edit.".into())),
+                        ]),
+                    ),
+                    ("extended", property("boolean", "Extended rather than basic expressions; false when left out.")),
+                ],
+                &["script", "paths"],
+            ),
+        ),
+        Tool::Shell => (
+            format!("Run a command with sh -c in the workspace, in a fresh jail of its own: the working directory and shared directories are there, the network and the rest of this machine are not, and nothing it starts outlives the call. The working directory is the workspace's unless `workdir` names another directory in it, and does not persist between calls. Returns the exit status and the output, its middle cut when long. Default timeout {} s, at most {} s. The person approves each command before it runs, and may refuse it.", shell::DEFAULT_TIMEOUT.as_secs(), shell::MAX_TIMEOUT.as_secs()),
+            schema(
+                vec![
+                    ("command", property("string", "The command, as sh -c takes it.")),
+                    ("timeout_ms", integer("How long it may run, in milliseconds.", 1, Some(shell::MAX_TIMEOUT.as_millis() as u64))),
+                    ("workdir", property("string", "The absolute directory to run in.")),
+                ],
+                &["command"],
+            ),
+        ),
         Tool::Report => (
             "Report to the orchestrator: a status and a summary of what was done, what is left, and anything the person must decide. Use it when the work is done, when it is blocked, and at points the orchestrator should know of. It is delivered as a message to the orchestrator.".to_string(),
             schema(
@@ -259,12 +400,13 @@ fn definition(tool: Tool, role: Role) -> Json {
 }
 
 /// The request prefix of a conversation of `role` (DESIGN.md §13): its
-/// tools and their settings, then the messages every request begins
-/// with, `messages` last so a request appends to it.
-pub fn prefix(role: Role, system: &str) -> String {
-    let tools = Tool::of(role)
-        .iter()
-        .map(|tool| definition(*tool, role))
+/// tools, a workspace's with them when it works in one, and their
+/// settings, then the messages every request begins with, `messages`
+/// last so a request appends to it.
+pub fn prefix(role: Role, workspace: bool, system: &str) -> String {
+    let tools = Tool::all(role, workspace)
+        .into_iter()
+        .map(|tool| definition(tool, role))
         .collect();
     Json::Obj(vec![
         ("tools".into(), Json::Arr(tools)),
@@ -327,8 +469,136 @@ pub enum Args {
     Search(Search),
     Read(Read),
     Conversations,
-    Send { to: Target, text: String },
-    Report { status: String, summary: String },
+    Send {
+        to: Target,
+        text: String,
+    },
+    Report {
+        status: String,
+        summary: String,
+    },
+    /// A workspace tool's, for the tool host; `acts` when the human
+    /// decides it first. A write's or an edit's expected digest is the
+    /// conversation's to fill.
+    Host {
+        call: Call,
+        acts: bool,
+    },
+}
+
+/// A boolean member, when present.
+fn flag(members: &[(String, Json)], name: &str) -> Result<bool, String> {
+    match member(members, name) {
+        None => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("`{name}` is not true or false")),
+    }
+}
+
+/// A workspace tool's call, its arguments checked as far as their shape;
+/// what they name is the tool host's to judge, inside the jail.
+fn host_call(tool: Tool, value: &Json) -> Result<Call, String> {
+    let name = tool.name();
+    let owned = |m: &[(String, Json)], key: &str| text(m, key).map(|t| t.map(str::to_string));
+    Ok(match tool {
+        Tool::ReadFile => {
+            let m = members(name, value, &["path", "offset", "limit"])?;
+            Call::Read {
+                path: required(m, "path")?.to_string(),
+                offset: number(m, "offset", 1, u64::MAX)?,
+                limit: number(m, "limit", 1, files::MAX_LINES)?,
+            }
+        }
+        Tool::WriteFile => {
+            let m = members(name, value, &["path", "content"])?;
+            Call::Write {
+                path: required(m, "path")?.to_string(),
+                content: required(m, "content")?.to_string(),
+                expected: None,
+            }
+        }
+        Tool::EditFile => {
+            let m = members(
+                name,
+                value,
+                &["path", "old_string", "new_string", "replace_all"],
+            )?;
+            Call::Edit {
+                path: required(m, "path")?.to_string(),
+                old: required(m, "old_string")?.to_string(),
+                new: required(m, "new_string")?.to_string(),
+                all: flag(m, "replace_all")?,
+                expected: None,
+            }
+        }
+        Tool::Glob => {
+            let m = members(name, value, &["pattern", "path"])?;
+            Call::Glob {
+                pattern: required(m, "pattern")?.to_string(),
+                path: owned(m, "path")?,
+            }
+        }
+        Tool::Grep => {
+            let m = members(
+                name,
+                value,
+                &[
+                    "pattern",
+                    "path",
+                    "include",
+                    "exclude",
+                    "extended",
+                    "ignore_case",
+                    "context",
+                ],
+            )?;
+            Call::Grep {
+                pattern: required(m, "pattern")?.to_string(),
+                path: owned(m, "path")?,
+                include: owned(m, "include")?,
+                exclude: owned(m, "exclude")?,
+                extended: flag(m, "extended")?,
+                ignore_case: flag(m, "ignore_case")?,
+                context: number(m, "context", 0, u64::from(shell::MAX_CONTEXT))?
+                    .and_then(|n| u32::try_from(n).ok()),
+            }
+        }
+        Tool::Sed => {
+            let m = members(name, value, &["script", "paths", "extended"])?;
+            let paths = match member(m, "paths") {
+                Some(Json::Arr(paths)) if !paths.is_empty() => paths
+                    .iter()
+                    .map(|path| {
+                        path.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| "`paths` holds something not a string".to_string())
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(Json::Arr(_)) => return Err("`paths` is empty".into()),
+                Some(_) => return Err("`paths` is not a list".into()),
+                None => return Err("`paths` is missing".into()),
+            };
+            Call::Sed {
+                script: required(m, "script")?.to_string(),
+                paths,
+                extended: flag(m, "extended")?,
+            }
+        }
+        Tool::Shell => {
+            let m = members(name, value, &["command", "timeout_ms", "workdir"])?;
+            let command = required(m, "command")?;
+            if command.trim().is_empty() {
+                return Err("`command` is empty".into());
+            }
+            Call::Shell {
+                command: command.to_string(),
+                timeout_ms: number(m, "timeout_ms", 1, shell::MAX_TIMEOUT.as_millis() as u64)?,
+                workdir: owned(m, "workdir")?,
+            }
+        }
+        _ => return Err(format!("{name} is not run by the tool host")),
+    })
 }
 
 /// The members of a call's arguments, every one of them named in
@@ -480,8 +750,16 @@ fn todo(given: &[(String, Json)]) -> Result<Vec<TodoItem>, String> {
 /// arguments parsed, or why they cannot be, which the call is answered
 /// with and nothing is done.
 pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
-    let tool = Tool::find(role, name).ok_or_else(|| {
-        let names: Vec<&str> = Tool::of(role).iter().map(|t| t.name()).collect();
+    parse_in(role, false, name, arguments)
+}
+
+/// `parse`, for a conversation that works in a workspace when `workspace`.
+pub fn parse_in(role: Role, workspace: bool, name: &str, arguments: &str) -> Result<Args, String> {
+    let tool = Tool::find(role, workspace, name).ok_or_else(|| {
+        let names: Vec<&str> = Tool::all(role, workspace)
+            .iter()
+            .map(|t| t.name())
+            .collect();
         format!(
             "there is no tool named {name:?}; the tools are {}",
             names.join(", ")
@@ -577,6 +855,16 @@ pub fn parse(role: Role, name: &str, arguments: &str) -> Result<Args, String> {
                 text: message_text(m, "text")?,
             }
         }
+        Tool::ReadFile
+        | Tool::WriteFile
+        | Tool::EditFile
+        | Tool::Glob
+        | Tool::Grep
+        | Tool::Sed
+        | Tool::Shell => Args::Host {
+            call: host_call(tool, &value)?,
+            acts: tool.acts(),
+        },
         Tool::Report => {
             let m = members(tool_name, &value, &["status", "summary"])?;
             let status = required(m, "status")?;
@@ -715,6 +1003,214 @@ pub fn listing(caller: &Id, caller_role: Role, entries: &[Listed], omitted: usiz
     out
 }
 
+/// The most lines a card shows, and the most bytes of them all, and of
+/// one, within what td-ui's dialog takes; and the most lines and bytes
+/// one part of it shows, so that no part can push another off the card.
+const CARD_LINES: usize = 240;
+const CARD_BYTES: usize = 128 * 1024;
+const CARD_LINE_BYTES: usize = 2048;
+const PART_LINES: usize = 80;
+const PART_BYTES: usize = 48 * 1024;
+
+/// A card's lines, as td-ui's dialog takes them: the action's text made
+/// visible, cut where the bounds say and the cut said, so the human knows
+/// when the card does not show all of it.
+#[derive(Default)]
+struct Lines {
+    lines: Vec<String>,
+    bytes: usize,
+    /// Lines not shown for want of room on the card.
+    unshown: usize,
+}
+
+/// `text`'s lines, as a card shows them: split at each newline, a final
+/// newline ending the last line rather than beginning another.
+fn pieces(text: &str) -> Vec<&str> {
+    let mut pieces: Vec<&str> = text.split('\n').collect();
+    if text.ends_with('\n') {
+        pieces.pop();
+    }
+    pieces
+}
+
+impl Lines {
+    /// One line of td-agent's own.
+    fn line(&mut self, line: String) {
+        self.push(line);
+    }
+
+    /// `text` as one part of the card, at most `most` lines, each after
+    /// `mark`, saying how many more it has.
+    fn text(&mut self, mark: &str, text: &str, most: usize) {
+        let pieces = pieces(text);
+        let mut bytes = 0usize;
+        for (shown, piece) in pieces.iter().enumerate() {
+            if shown >= most.min(PART_LINES * 2) || bytes >= PART_BYTES {
+                self.push(format!(
+                    "{mark}\u{2026} and {} more lines of it, not shown",
+                    pieces.len() - shown
+                ));
+                return;
+            }
+            let line = format!("{mark}{}", visible(piece));
+            bytes += line.len();
+            self.push(line);
+        }
+    }
+
+    fn push(&mut self, mut line: String) {
+        if self.lines.len() >= CARD_LINES || self.bytes >= CARD_BYTES {
+            self.unshown += 1;
+            return;
+        }
+        if line.len() > CARD_LINE_BYTES {
+            let mut at = CARD_LINE_BYTES;
+            while !line.is_char_boundary(at) {
+                at -= 1;
+            }
+            let more = line.len() - at;
+            line.truncate(at);
+            line.push_str(&format!(
+                " \u{2026} ({more} more bytes on this line, not shown)"
+            ));
+        }
+        self.bytes += line.len();
+        self.lines.push(line);
+    }
+
+    fn done(mut self) -> Vec<String> {
+        if self.unshown > 0 {
+            self.lines.push(format!(
+                "\u{2026} and {} more lines, not shown.",
+                self.unshown
+            ));
+        }
+        self.lines
+    }
+}
+
+/// `line` with what would not show, or would show as something else,
+/// named as `<U+XXXX>`: control characters; every whitespace character
+/// but a plain space, a tab included, so that nothing that looks like a
+/// space can hide where `sh` ends a word; and the invisible and
+/// bidirectional characters that could make one command look like
+/// another.
+pub fn visible(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        let hidden = c.is_control()
+            || (c.is_whitespace() && c != ' ')
+            || matches!(
+                c,
+                '\u{ad}'
+                    | '\u{34f}'
+                    | '\u{61c}'
+                    | '\u{115f}'
+                    | '\u{1160}'
+                    | '\u{17b4}'
+                    | '\u{17b5}'
+                    | '\u{180b}'..='\u{180f}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{2800}'
+                    | '\u{3164}'
+                    | '\u{fe00}'..='\u{fe0f}'
+                    | '\u{feff}'
+                    | '\u{ffa0}'
+                    | '\u{fff0}'..='\u{fffb}'
+                    | '\u{e0000}'..='\u{e0fff}'
+            );
+        if hidden {
+            out.push_str(&format!("<U+{:04X}>", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The card that asks the human whether `call` may run (DESIGN.md §11):
+/// its title and the exact action, line by line, what it runs before the
+/// lists it runs over.
+pub fn card(call: &Call) -> (String, Vec<String>) {
+    let mut card = Lines::default();
+    let title = match call {
+        Call::Shell {
+            command,
+            timeout_ms,
+            workdir,
+        } => {
+            let timeout =
+                timeout_ms.map_or(shell::DEFAULT_TIMEOUT.as_secs(), |ms| ms.div_ceil(1000));
+            card.line(format!(
+                "In {}, for at most {timeout} s, in a jail of its own:",
+                workdir
+                    .as_deref()
+                    .map_or("the workspace".to_string(), visible)
+            ));
+            card.text("", command, PART_LINES * 2);
+            "Run a command"
+        }
+        Call::Write { path, content, .. } => {
+            card.line(format!(
+                "{}, made or replaced whole with {} bytes in {} lines:",
+                visible(path),
+                content.len(),
+                pieces(content).len()
+            ));
+            card.text("", content, PART_LINES * 2);
+            "Write a file"
+        }
+        Call::Edit {
+            path,
+            old,
+            new,
+            all,
+            ..
+        } => {
+            card.line(format!(
+                "In {}, {} of this text:",
+                visible(path),
+                if *all { "every match" } else { "the one match" }
+            ));
+            card.text("- ", old, PART_LINES);
+            card.line("replaced with:".into());
+            card.text("+ ", new, PART_LINES);
+            "Edit a file"
+        }
+        Call::Sed {
+            script,
+            paths,
+            extended,
+        } => {
+            card.line(format!(
+                "This script, with {} expressions:",
+                if *extended { "extended" } else { "basic" }
+            ));
+            card.text("", script, PART_LINES);
+            card.line(format!("over {} files, in place:", paths.len()));
+            // Each made visible first, so a newline in one is named
+            // rather than listing a file sed does not run over.
+            let listed: Vec<String> = paths
+                .iter()
+                .map(|path| format!("  {}", visible(path)))
+                .collect();
+            card.text("", &listed.join("\n"), PART_LINES);
+            "Run sed over files"
+        }
+        Call::Read { path, .. } => {
+            card.line(visible(path));
+            "Read a file"
+        }
+        Call::Glob { pattern, .. } | Call::Grep { pattern, .. } => {
+            card.line(visible(pattern));
+            "Search the workspace"
+        }
+    };
+    (title.to_string(), card.done())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -727,7 +1223,7 @@ mod tests {
     #[test]
     fn the_prefix_defines_each_roles_tools_before_its_messages() {
         for role in [Role::Orchestrator, Role::Conversation] {
-            let text = prefix(role, "system text");
+            let text = prefix(role, false, "system text");
             assert!(text.ends_with("]}"), "{text}");
             let value = td_json::parse(&text).unwrap();
             let names: Vec<&str> = value
@@ -750,9 +1246,243 @@ mod tests {
             };
             assert_eq!(members.last().unwrap().0, "messages");
             // The same text every time: the prefix is fixed.
-            assert_eq!(text, prefix(role, "system text"));
+            assert_eq!(text, prefix(role, false, "system text"));
         }
         assert!(!Tool::of(Role::Orchestrator).contains(&Tool::Report));
+    }
+
+    #[test]
+    fn a_workspace_adds_its_tools_and_their_calls_go_to_the_host() {
+        let names: Vec<&str> = Tool::all(Role::Conversation, true)
+            .iter()
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(
+            names[names.len() - 7..],
+            [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob",
+                "grep",
+                "sed",
+                "shell"
+            ]
+        );
+        // The tool host's tools are offered only in a workspace.
+        let outside = parse(Role::Conversation, "shell", r#"{"command":"ls"}"#).unwrap_err();
+        assert!(
+            outside.starts_with("there is no tool named \"shell\""),
+            "{outside}"
+        );
+        let call = |name: &str, args: &str| parse_in(Role::Conversation, true, name, args);
+        assert_eq!(
+            call("shell", r#"{"command":"ls -l","timeout_ms":null}"#).unwrap(),
+            Args::Host {
+                call: Call::Shell {
+                    command: "ls -l".into(),
+                    timeout_ms: None,
+                    workdir: None
+                },
+                acts: true
+            }
+        );
+        assert_eq!(
+            call("read_file", r#"{"path":"/w/a","offset":3}"#).unwrap(),
+            Args::Host {
+                call: Call::Read {
+                    path: "/w/a".into(),
+                    offset: Some(3),
+                    limit: None
+                },
+                acts: false
+            }
+        );
+        assert_eq!(
+            call(
+                "edit_file",
+                r#"{"path":"/w/a","old_string":"x","new_string":"y","replace_all":true}"#
+            )
+            .unwrap(),
+            Args::Host {
+                call: Call::Edit {
+                    path: "/w/a".into(),
+                    old: "x".into(),
+                    new: "y".into(),
+                    all: true,
+                    expected: None
+                },
+                acts: true
+            }
+        );
+        assert_eq!(
+            call("sed", r#"{"script":"s/a/b/","paths":["/w/a","/w/b"]}"#).unwrap(),
+            Args::Host {
+                call: Call::Sed {
+                    script: "s/a/b/".into(),
+                    paths: vec!["/w/a".into(), "/w/b".into()],
+                    extended: false
+                },
+                acts: true
+            }
+        );
+        // The model never names the digest a write expects.
+        assert!(call(
+            "write_file",
+            r#"{"path":"/w/a","content":"","expected":"d"}"#
+        )
+        .is_err());
+        for (name, args, why) in [
+            ("shell", r#"{"command":"  "}"#, "`command` is empty"),
+            (
+                "shell",
+                r#"{"command":"x","timeout_ms":600001}"#,
+                "timeout_ms",
+            ),
+            ("sed", r#"{"script":"p","paths":[]}"#, "`paths` is empty"),
+            ("sed", r#"{"script":"p","paths":[1]}"#, "not a string"),
+            ("grep", r#"{"pattern":"x","context":21}"#, "context"),
+            ("read_file", r#"{"path":"/w/a","limit":2001}"#, "limit"),
+            (
+                "edit_file",
+                r#"{"path":"/a","old_string":"x","new_string":"y","replace_all":"yes"}"#,
+                "true or false",
+            ),
+        ] {
+            let e = call(name, args).unwrap_err();
+            assert!(e.contains(why), "{name} {args}: {e}");
+        }
+        assert!(
+            Tool::Shell.acts()
+                && Tool::Sed.acts()
+                && Tool::WriteFile.acts()
+                && Tool::EditFile.acts()
+        );
+        assert!(!Tool::ReadFile.acts() && !Tool::Glob.acts() && !Tool::Grep.acts());
+    }
+
+    #[test]
+    fn a_card_shows_the_action_whole_or_says_what_it_leaves_out() {
+        let (title, lines) = card(&Call::Shell {
+            command: "rm -rf build\n\tmake\u{202e}x\u{200b}\u{7}".into(),
+            timeout_ms: Some(1500),
+            workdir: None,
+        });
+        assert_eq!(title, "Run a command");
+        assert_eq!(
+            lines,
+            [
+                "In the workspace, for at most 2 s, in a jail of its own:",
+                "rm -rf build",
+                "<U+0009>make<U+202E>x<U+200B><U+0007>",
+            ]
+        );
+        let (_, lines) = card(&Call::Edit {
+            path: "/w/a".into(),
+            old: "one\ntwo".into(),
+            new: "three".into(),
+            all: false,
+            expected: None,
+        });
+        assert_eq!(
+            lines,
+            [
+                "In /w/a, the one match of this text:",
+                "- one",
+                "- two",
+                "replaced with:",
+                "+ three"
+            ]
+        );
+        // Past its bounds a card says how much it leaves out, and every
+        // line fits td-ui's dialog.
+        let long = format!("{}\n", "x".repeat(5000)).repeat(300);
+        let (title, lines) = card(&Call::Write {
+            path: "/w/big".into(),
+            content: long.clone(),
+            expected: None,
+        });
+        assert_eq!(title, "Write a file");
+        assert!(lines.len() <= CARD_LINES + 1);
+        assert!(lines.len() <= td_ui::confirmations::DETAILS);
+        assert!(lines
+            .iter()
+            .all(|l| l.len() <= td_ui::confirmations::DETAIL_BYTES));
+        assert!(lines.iter().map(String::len).sum::<usize>() <= CARD_BYTES + 8192);
+        assert!(lines[0].contains("in 300 lines:"), "{}", lines[0]);
+        assert!(
+            lines[1].ends_with("more bytes on this line, not shown)"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .contains("more lines of it, not shown"),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|l| !l.chars().any(char::is_control)));
+        // A sed script is shown before its files, however many, and an
+        // edit's replacement however long the text it replaces.
+        let paths: Vec<String> = (0..500).map(|n| format!("/w/{n}")).collect();
+        let (_, lines) = card(&Call::Sed {
+            script: "s/a/b/".into(),
+            paths,
+            extended: false,
+        });
+        assert_eq!(lines[1], "s/a/b/");
+        let (_, odd) = card(&Call::Sed {
+            script: "p".into(),
+            paths: vec!["/w/a\n  /w/b".into()],
+            extended: false,
+        });
+        assert_eq!(odd[3], "  /w/a<U+000A>  /w/b");
+        assert_eq!(odd.len(), 4);
+        assert!(
+            lines.iter().any(|l| l.contains("420 more lines of it")),
+            "{lines:?}"
+        );
+        let (_, lines) = card(&Call::Edit {
+            path: "/w/a".into(),
+            old: "x\n".repeat(1000),
+            new: "the new text".into(),
+            all: true,
+            expected: None,
+        });
+        assert!(lines.contains(&"+ the new text".to_string()), "{lines:?}");
+    }
+
+    /// Nothing that looks like a space, or like nothing, passes for one:
+    /// `make test<NBSP># ; rm -rf x` is one word, a separator and `rm`.
+    #[test]
+    fn a_card_names_what_could_hide_a_word_or_a_command() {
+        for c in [
+            '\u{a0}', '\u{1680}', '\u{2000}', '\u{200a}', '\u{202f}', '\u{205f}', '\u{3000}',
+            '\u{2800}', '\u{85}', '\u{2028}', '\u{2029}', '\t', '\u{b}', '\u{c}', '\r',
+        ] {
+            let shown = visible(&format!("a{c}b"));
+            assert_eq!(shown, format!("a<U+{:04X}>b", u32::from(c)));
+        }
+        assert_eq!(
+            visible("make test\u{a0}# ; rm -rf x"),
+            "make test<U+00A0># ; rm -rf x"
+        );
+        assert_eq!(visible("plain text, é and 日本"), "plain text, é and 日本");
+        // A file ending in a newline has as many lines as its card shows.
+        let (_, lines) = card(&Call::Write {
+            path: "/w/a".into(),
+            content: "one\ntwo\n".into(),
+            expected: None,
+        });
+        assert_eq!(
+            lines,
+            [
+                "/w/a, made or replaced whole with 8 bytes in 2 lines:",
+                "one",
+                "two"
+            ]
+        );
     }
 
     #[test]

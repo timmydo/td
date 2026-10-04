@@ -1,6 +1,8 @@
-//! The question before a conversation is deleted (DESIGN.md §4): td-ui's
-//! confirmation dialog (td-ui/DESIGN.md), centred over the window's body,
-//! `Cancel` focused first, so `Return` alone deletes nothing.
+//! The window's questions, td-ui's confirmation dialog (td-ui/DESIGN.md)
+//! centred over its body, `Cancel` focused first, so `Return` alone does
+//! nothing: before a conversation is deleted (DESIGN.md §4), and the card
+//! that asks whether a workspace tool may act (§11), where `Cancel`
+//! refuses it and `Allow` lets it run.
 
 use td_ui::chrome::ROW;
 use td_ui::confirmations::{self, Choice, Controller, Event, Key, Model, Outcome};
@@ -12,36 +14,58 @@ use crate::store::Id;
 
 /// The dialog's one action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Delete;
+pub struct Act;
+
+/// What a question is for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Purpose {
+    /// Deleting this conversation.
+    Delete(Id),
+    /// Letting call `call` (its `ToolCall`'s sequence number) of this
+    /// conversation run.
+    Approve { conversation: Id, call: u64 },
+}
 
 /// What an input came to.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Reply {
     /// Still open; whether it changed.
     Stay(bool),
-    /// Closed with nothing deleted.
+    /// The human chose `Cancel`, or `Escape`: nothing deleted, the call
+    /// refused.
     Closed,
-    /// The human chose `Delete` for this conversation.
-    Confirmed(Id),
+    /// Closed without the human's choice, the window having lost the
+    /// keyboard: a card is asked again when it comes back.
+    SetAside,
+    /// The human chose the action.
+    Confirmed(Purpose),
 }
 
-/// The dialog's title and its action's label.
+/// The deletion question's title and its action's label.
 pub const TITLE: &str = "Delete conversation";
 pub const DELETE: &str = "Delete";
+/// A card's action's label.
+pub const ALLOW: &str = "Allow";
 
-/// The open question: the conversation it is about and the dialog.
+/// The open question: what it is for and the dialog.
 pub struct Confirm {
-    id: Id,
-    dialog: Controller<Delete, u64, ()>,
+    purpose: Purpose,
+    dialog: Controller<Act, u64, ()>,
     revision: u64,
 }
 
 /// The dialog's place: at most 64 cells by 10 rows, centred in `body`.
-fn place(surface: Surface, body: Rect) -> Rect {
+/// A card's is larger, at most 100 cells by 24 rows, so more of the
+/// action shows at once.
+fn place(surface: Surface, body: Rect, purpose: &Purpose) -> Rect {
+    let (columns, rows) = match purpose {
+        Purpose::Delete(_) => (64, 10),
+        Purpose::Approve { .. } => (100, 24),
+    };
     let scale = surface.scale.value();
     let pixels = |logical: usize| u32::try_from(logical.saturating_mul(scale)).unwrap_or(u32::MAX);
-    let width = pixels(CELL_WIDTH * 64).min(body.width);
-    let height = pixels(ROW * 10).min(body.height);
+    let width = pixels(CELL_WIDTH * columns).min(body.width);
+    let height = pixels(ROW * rows).min(body.height);
     Rect {
         x: body.x + i64::from((body.width - width) / 2),
         y: body.y + i64::from((body.height - height) / 2),
@@ -77,28 +101,57 @@ impl Confirm {
         if !worked.is_empty() {
             details.push(&worked);
         }
-        let model = Model::new(TITLE, DELETE, &details, Delete, revision)
+        let model = Model::new(TITLE, DELETE, &details, Act, revision)
             .map_err(|e| format!("the deletion question: {e}"))?;
-        let dialog = Controller::new(model, surface, place(surface, body), None)
+        let purpose = Purpose::Delete(id);
+        let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
             .map_err(|e| format!("the deletion question: {e}"))?;
         Ok(Self {
-            id,
+            purpose,
             dialog,
             revision,
         })
     }
 
-    /// The conversation it asks about.
-    pub fn id(&self) -> &Id {
-        &self.id
+    /// The card for call `call` of `conversation`: may it run, as `title`
+    /// and `details` say?
+    pub fn approve(
+        surface: Surface,
+        body: Rect,
+        conversation: Id,
+        call: u64,
+        title: &str,
+        details: &[String],
+        revision: u64,
+    ) -> Result<Self, String> {
+        let details: Vec<&str> = details.iter().map(String::as_str).collect();
+        let model = Model::new(title, ALLOW, &details, Act, revision)
+            .map_err(|e| format!("the card: {e}"))?;
+        let purpose = Purpose::Approve { conversation, call };
+        let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
+            .map_err(|e| format!("the card: {e}"))?;
+        Ok(Self {
+            purpose,
+            dialog,
+            revision,
+        })
     }
 
-    /// Where its keyboard is: `details`, `cancel` or `delete`.
+    /// What it asks about.
+    pub fn purpose(&self) -> &Purpose {
+        &self.purpose
+    }
+
+    /// Where its keyboard is: `details`, `cancel`, or its action, `delete`
+    /// or `allow`.
     pub fn focus(&self) -> &'static str {
         match self.dialog.focus() {
             confirmations::Focus::Details => "details",
             confirmations::Focus::Cancel => "cancel",
-            confirmations::Focus::Alternate | confirmations::Focus::Confirm => "delete",
+            confirmations::Focus::Alternate | confirmations::Focus::Confirm => match self.purpose {
+                Purpose::Delete(_) => "delete",
+                Purpose::Approve { .. } => "allow",
+            },
         }
     }
 
@@ -107,7 +160,7 @@ impl Confirm {
     pub fn resize(&mut self, surface: Surface, body: Rect) -> bool {
         let event = Event::Resize {
             surface,
-            rect: place(surface, body),
+            rect: place(surface, body, &self.purpose),
         };
         !matches!(
             self.dialog.event(Some(self.revision), false, event),
@@ -148,13 +201,15 @@ impl Confirm {
             | Input::Hover(_)
             | Input::Close => return Reply::Stay(false),
         };
+        let lost = matches!(event, Event::FocusLost);
         match self.dialog.event(Some(self.revision), false, event) {
             Outcome::Ignored | Outcome::Consumed => Reply::Stay(false),
             Outcome::Changed => Reply::Stay(true),
             Outcome::Closed {
-                choice: Choice::Confirmed(Delete),
+                choice: Choice::Confirmed(Act),
                 ..
-            } => Reply::Confirmed(self.id.clone()),
+            } => Reply::Confirmed(self.purpose.clone()),
+            Outcome::Closed { .. } if lost => Reply::SetAside,
             Outcome::Closed { .. } => Reply::Closed,
         }
     }
@@ -213,20 +268,20 @@ mod tests {
             follow: false,
         };
         confirm.input(&pointer(PointerPhase::Press));
-        assert_eq!(confirm.input(&Input::Focus(false)), Reply::Closed);
+        assert_eq!(confirm.input(&Input::Focus(false)), Reply::SetAside);
         let mut confirm = open();
         confirm.input(&pointer(PointerPhase::Press));
         confirm.input(&Input::CancelPointer);
         assert_ne!(
             confirm.input(&pointer(PointerPhase::Release)),
-            Reply::Confirmed(Id::parse(&"c".repeat(32)).unwrap())
+            Reply::Confirmed(Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()))
         );
         // Pressed and released over it, it confirms.
         let mut confirm = open();
         confirm.input(&pointer(PointerPhase::Press));
         assert_eq!(
             confirm.input(&pointer(PointerPhase::Release)),
-            Reply::Confirmed(Id::parse(&"c".repeat(32)).unwrap())
+            Reply::Confirmed(Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()))
         );
     }
 
@@ -237,7 +292,7 @@ mod tests {
         assert_eq!(confirm.focus(), "delete");
         assert_eq!(
             key(&mut confirm, "Return"),
-            Reply::Confirmed(Id::parse(&"c".repeat(32)).unwrap())
+            Reply::Confirmed(Purpose::Delete(Id::parse(&"c".repeat(32)).unwrap()))
         );
     }
 }

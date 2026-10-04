@@ -30,6 +30,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use td_ui::chrome::ROW;
 use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as PaneOutcome};
@@ -48,7 +49,7 @@ use td_ui::{CELL_HEIGHT, CELL_WIDTH};
 
 use crate::chooser::Chooser;
 use crate::config::Mode;
-use crate::confirm::Confirm;
+use crate::confirm::{self, Confirm};
 use crate::cost;
 use crate::key::Secret;
 use crate::keydialog::{KeyDialog, Reply};
@@ -111,6 +112,22 @@ impl RowState {
         }
     }
 }
+
+/// A card a conversation asks the human, until decided or withdrawn: may
+/// its call `call` run?
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Card {
+    pub conversation: Id,
+    pub call: u64,
+    pub title: String,
+    pub details: Vec<String>,
+}
+
+/// What the list says of a conversation that asks the human.
+pub const ASKS: &str = "asks you";
+/// How long a card that came unbidden ignores keys and presses, so that
+/// what the human was typing or clicking does not decide it.
+const CARD_SETTLE: Duration = Duration::from_millis(750);
 
 /// What the status row says of the open conversation, from its log.
 #[derive(Clone, Debug, Default)]
@@ -217,6 +234,13 @@ pub enum Request {
     Delete(Id),
     /// Make this the default model, from Conversation → Default model….
     SetDefault(String),
+    /// The human decided a card: whether call `call` of `conversation`
+    /// may run (DESIGN.md §11).
+    Decide {
+        conversation: Id,
+        call: u64,
+        allow: bool,
+    },
     /// Close the window, from File → Quit.
     Quit,
     /// The open conversation's model and effort as the human chose them,
@@ -507,10 +531,20 @@ pub struct App {
     /// Why no workspace can be made, when none can: said at once, before
     /// a directory is chosen.
     no_workspaces: Option<String>,
-    /// The question before a conversation is deleted, while it is open,
-    /// modal over the window; its revision counts the questions asked.
+    /// The question before a conversation is deleted, or a card, while
+    /// it is open, modal over the window; its revision counts the
+    /// questions asked.
     confirm: Option<Confirm>,
     confirm_revision: u64,
+    /// The cards the conversations ask, in the order they came; the open
+    /// conversation's first is shown whenever nothing else is modal.
+    cards: Vec<Card>,
+    /// When the card shown appeared, and how long it ignores keys and
+    /// presses from then.
+    card_shown: Option<Instant>,
+    settle: Duration,
+    /// The card that could not be drawn, said once until one is.
+    card_trouble: Option<(Id, u64)>,
     /// The menu's revision: it is built again, from the state of the
     /// moment, each time it opens.
     menu_revision: u64,
@@ -606,6 +640,10 @@ impl App {
             no_workspaces: None,
             confirm: None,
             confirm_revision: 0,
+            cards: Vec::new(),
+            card_shown: None,
+            settle: CARD_SETTLE,
+            card_trouble: None,
             menu_revision: 1,
             credit: None,
             today: None,
@@ -988,6 +1026,108 @@ impl App {
         self.active = Some(id);
         self.clear_transcript();
         self.refresh_list();
+        self.offer();
+    }
+
+    /// The cards still asked.
+    pub fn cards(&self) -> &[Card] {
+        &self.cards
+    }
+
+    /// Conversation `card.conversation` asks the human `card`: shown at
+    /// once if it is the open conversation's and nothing else is modal,
+    /// else when it is.
+    pub fn ask(&mut self, card: Card) {
+        self.cards
+            .retain(|c| (&c.conversation, c.call) != (&card.conversation, card.call));
+        self.cards.push(card);
+        self.refresh_list();
+        self.offer();
+    }
+
+    /// Conversation `conversation` withdrew its card for `call`, or every
+    /// card it asked when `call` is none, as its process ended: its card
+    /// is closed if shown.
+    pub fn withdraw(&mut self, conversation: &Id, call: Option<u64>) {
+        let gone = |c: &Card| &c.conversation == conversation && call.is_none_or(|n| n == c.call);
+        if !self.cards.iter().any(gone) {
+            return;
+        }
+        self.cards.retain(|c| !gone(c));
+        let shown = self
+            .confirm
+            .as_ref()
+            .is_some_and(|confirm| match confirm.purpose() {
+                confirm::Purpose::Approve {
+                    conversation: of,
+                    call: n,
+                } => of == conversation && call.is_none_or(|call| call == *n),
+                confirm::Purpose::Delete(_) => false,
+            });
+        if shown {
+            self.close_confirm();
+        }
+        self.refresh_list();
+        self.offer();
+    }
+
+    /// Shows the open conversation's first card when nothing else is
+    /// modal and the window has the keyboard. A card that cannot be drawn,
+    /// in a window too small, say, waits, and that is said once; the
+    /// human can still interrupt the turn, which withdraws it.
+    fn offer(&mut self) {
+        if self.modal() || !self.focused || self.menu.is_open() {
+            return;
+        }
+        let Some(card) = self
+            .active
+            .as_ref()
+            .and_then(|id| self.cards.iter().find(|c| &c.conversation == id))
+            .cloned()
+        else {
+            return;
+        };
+        self.cancel_pointer();
+        self.press = None;
+        self.confirm_revision = self.confirm_revision.wrapping_add(1);
+        match Confirm::approve(
+            self.surface,
+            body(self.surface),
+            card.conversation.clone(),
+            card.call,
+            &card.title,
+            &card.details,
+            self.confirm_revision,
+        ) {
+            Ok(confirm) => {
+                self.confirm = Some(confirm);
+                self.card_shown = Some(Instant::now());
+                self.card_trouble = None;
+                self.apply_focus();
+                self.touch();
+            }
+            Err(e) => {
+                let trouble = Some((card.conversation, card.call));
+                if self.card_trouble != trouble {
+                    self.card_trouble = trouble;
+                    self.note(format!(
+                        "a card cannot be shown ({e}); make the window larger to decide it, or interrupt the turn"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The human's decision on a card, sent and the card forgotten.
+    fn decide(&mut self, conversation: Id, call: u64, allow: bool) {
+        self.cards
+            .retain(|c| (&c.conversation, c.call) != (&conversation, call));
+        self.requests.push(Request::Decide {
+            conversation,
+            call,
+            allow,
+        });
+        self.refresh_list();
     }
 
     fn clear_transcript(&mut self) {
@@ -1132,6 +1272,8 @@ impl App {
                 self.refresh_list();
             }
             Update::Up(Up::Event(event)) => self.event(event),
+            // The window hands cards to `ask` and `withdraw`.
+            Update::Up(Up::Ask { .. } | Up::Withdraw { .. }) => {}
             Update::Up(Up::Delivered { .. }) => {
                 if let Some(row) = self.active_row() {
                     row.activity = now;
@@ -2054,8 +2196,14 @@ impl App {
     }
 
     /// One input, with its clipboard: td-ui's window's through
-    /// `input_live`, or the control seam's.
+    /// `input_live`, or the control seam's. A card waiting is shown once
+    /// it has made way for it.
     pub fn input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        self.handle(input, clipboard);
+        self.offer();
+    }
+
+    fn handle(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
         if let Input::Paste(text) = input {
             return self.pasted(text);
         }
@@ -2408,6 +2556,7 @@ impl App {
         self.chooser = None;
         self.apply_focus();
         self.touch();
+        self.offer();
     }
 
     /// An input while the chooser is open, which is the chooser's, as the
@@ -2472,6 +2621,7 @@ impl App {
         self.picking_default = false;
         self.apply_focus();
         self.touch();
+        self.offer();
     }
 
     /// An input while the picker is open, which is the picker's: every
@@ -2548,10 +2698,12 @@ impl App {
         }
     }
 
+    /// Closes the question or card; a card waiting is shown next.
     fn close_confirm(&mut self) {
         self.confirm = None;
         self.apply_focus();
         self.touch();
+        self.offer();
     }
 
     /// An input while the question is open, which is the question's: every
@@ -2564,13 +2716,16 @@ impl App {
                 self.focused = focused;
                 if !focused {
                     self.cancel_pointer();
-                    // td-ui's question is cancelled when the window loses
-                    // the keyboard: nothing is deleted.
-                    let cancelled = self
-                        .confirm
-                        .as_mut()
-                        .is_some_and(|c| c.input(&input) == crate::confirm::Reply::Closed);
-                    if cancelled {
+                    // td-ui's question is closed when the window loses
+                    // the keyboard: nothing is deleted, and a card is
+                    // set aside, to be shown again when it comes back.
+                    let closed = self.confirm.as_mut().is_some_and(|c| {
+                        matches!(
+                            c.input(&input),
+                            confirm::Reply::Closed | confirm::Reply::SetAside
+                        )
+                    });
+                    if closed {
                         self.confirm = None;
                         self.touch();
                     }
@@ -2582,16 +2737,48 @@ impl App {
         let Some(confirm) = self.confirm.as_mut() else {
             return;
         };
+        let purpose = confirm.purpose().clone();
+        // A card just shown takes no key or press yet: one meant for
+        // what was there before is not a decision.
+        let settling = matches!(purpose, confirm::Purpose::Approve { .. })
+            && self
+                .card_shown
+                .is_some_and(|shown| shown.elapsed() < self.settle);
+        if settling
+            && matches!(
+                input,
+                Input::Key { .. }
+                    | Input::Pointer {
+                        phase: PointerPhase::Press,
+                        ..
+                    }
+            )
+        {
+            // Settled only once nothing has come for that long.
+            self.card_shown = Some(Instant::now());
+            return;
+        }
         match confirm.input(&input) {
-            crate::confirm::Reply::Stay(changed) => {
+            confirm::Reply::Stay(changed) => {
                 if changed {
                     self.touch();
                 }
             }
-            crate::confirm::Reply::Closed => self.close_confirm(),
-            crate::confirm::Reply::Confirmed(id) => {
+            confirm::Reply::SetAside => self.close_confirm(),
+            // Cancel, or Escape, refuses a card's call.
+            confirm::Reply::Closed => {
+                if let confirm::Purpose::Approve { conversation, call } = purpose {
+                    self.decide(conversation, call, false);
+                }
+                self.close_confirm();
+            }
+            confirm::Reply::Confirmed(confirm::Purpose::Delete(id)) => {
                 self.close_confirm();
                 self.requests.push(Request::Delete(id));
+            }
+            confirm::Reply::Confirmed(confirm::Purpose::Approve { conversation, call }) => {
+                self.decide(conversation, call, true);
+                self.close_confirm();
             }
         }
     }
@@ -2635,6 +2822,7 @@ impl App {
             dialog.close();
         }
         self.apply_focus();
+        self.offer();
     }
 
     fn reply(&mut self, reply: Reply) {
@@ -3038,6 +3226,7 @@ impl App {
     fn cell(&self, index: usize, column: usize) -> Cell<'_> {
         let text = self.rows.get(index).map_or("", |row| match column {
             0 => row.title.as_str(),
+            _ if self.cards.iter().any(|c| c.conversation == row.id) => ASKS,
             _ => row.word(),
         });
         Cell::new(text).unwrap_or_else(|_| Cell::empty())
@@ -4338,6 +4527,8 @@ pub mod tests {
                     call: 0,
                     content: "No event matches.".into(),
                     error: true,
+                    kept: None,
+                    digest: None,
                 },
             ),
             0,
@@ -5022,6 +5213,129 @@ pub mod tests {
         app.set_key_path(Some(PATH.into()));
         app.open_key_dialog();
         assert!(app.picker().is_none() && app.dialog().is_some());
+    }
+
+    /// A card is shown for the open conversation whenever nothing else is
+    /// modal, Cancel focused: Return or Escape refuses its call, Allow
+    /// lets it run, and the decision goes to the conversation that asked.
+    /// Losing the keyboard sets it aside; another conversation's waits,
+    /// its row saying it asks; a withdrawn one closes.
+    #[test]
+    fn a_card_asks_the_person_and_their_answer_goes_to_its_conversation() {
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        app.set_active(id(2));
+        let card = |conversation: u8, call: u64| Card {
+            conversation: id(conversation),
+            call,
+            title: "Run a command".into(),
+            details: vec!["In the workspace:".into(), "make".into()],
+        };
+        let decided = |conversation: u8, call: u64, allow: bool| Request::Decide {
+            conversation: id(conversation),
+            call,
+            allow,
+        };
+        let shown = |app: &App| match app.confirm().map(Confirm::purpose) {
+            Some(confirm::Purpose::Approve { conversation, call }) => {
+                Some((conversation.clone(), *call))
+            }
+            _ => None,
+        };
+        let says = |app: &App, of: u8| {
+            let at = app.rows().iter().position(|r| r.id == id(of)).unwrap();
+            app.cell(at, 1).text().to_string()
+        };
+        app.ask(card(3, 7));
+        assert!(app.confirm().is_none(), "another conversation's waits");
+        assert_eq!(says(&app, 3), ASKS);
+        app.ask(card(2, 5));
+        assert_eq!(shown(&app), Some((id(2), 5)));
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        assert!(text(&app).contains("Run a command"));
+        key(&mut app, "C-n");
+        assert!(app.take_requests().is_empty(), "keys are the card's");
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [decided(2, 5, false)]);
+        assert!(app.confirm().is_none());
+        app.ask(card(2, 6));
+        key(&mut app, "Escape");
+        assert_eq!(app.take_requests(), [decided(2, 6, false)]);
+        app.ask(card(2, 8));
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        key(&mut app, "Tab");
+        assert_eq!(app.confirm().unwrap().focus(), "allow");
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [decided(2, 8, true)]);
+        // Two cards come one after the other.
+        app.ask(card(2, 10));
+        app.ask(card(2, 11));
+        key(&mut app, "Escape");
+        assert_eq!(shown(&app), Some((id(2), 11)));
+        key(&mut app, "Escape");
+        assert_eq!(
+            app.take_requests(),
+            [decided(2, 10, false), decided(2, 11, false)]
+        );
+        // Set aside with the keyboard, armed or not, and decided nothing.
+        app.ask(card(2, 9));
+        key(&mut app, "Tab");
+        app.input(Input::Focus(false), &mut NoClipboard);
+        assert!(app.confirm().is_none());
+        assert!(app.take_requests().is_empty());
+        app.input(Input::Focus(true), &mut NoClipboard);
+        assert_eq!(shown(&app), Some((id(2), 9)));
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        // Withdrawn, it closes, and nothing is decided.
+        app.withdraw(&id(2), Some(9));
+        assert!(app.confirm().is_none());
+        assert!(app.take_requests().is_empty());
+        // Opening the conversation that asked shows its card; its process
+        // ending withdraws them all.
+        app.set_active(id(3));
+        assert_eq!(shown(&app), Some((id(3), 7)));
+        app.withdraw(&id(3), None);
+        assert!(app.confirm().is_none() && app.cards().is_empty());
+        assert_ne!(says(&app, 3), ASKS);
+        // A modal open first goes first.
+        app.open_delete();
+        app.ask(card(3, 12));
+        assert!(matches!(
+            app.confirm().map(Confirm::purpose),
+            Some(confirm::Purpose::Delete(_))
+        ));
+        key(&mut app, "Escape");
+        assert_eq!(shown(&app), Some((id(3), 12)));
+    }
+
+    /// A card that comes while the human types takes no key at first: what
+    /// was meant for the composer neither refuses nor allows it.
+    #[test]
+    fn a_card_just_shown_takes_no_key() {
+        let mut app = app();
+        app.settle = Duration::from_secs(3600);
+        app.set_active(id(2));
+        app.ask(Card {
+            conversation: id(2),
+            call: 4,
+            title: "Run a command".into(),
+            details: vec!["make".into()],
+        });
+        for chord in ["Tab", "Space", "Return", "Escape"] {
+            key(&mut app, chord);
+        }
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        app.settle = Duration::ZERO;
+        key(&mut app, "Escape");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Decide {
+                conversation: id(2),
+                call: 4,
+                allow: false
+            }]
+        );
     }
 
     /// Deletion asks first, Cancel focused, and never takes the

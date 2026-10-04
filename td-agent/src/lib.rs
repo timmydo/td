@@ -26,6 +26,7 @@
 
 pub mod accounts;
 pub mod assemble;
+pub mod bench;
 pub mod chooser;
 pub mod client;
 pub mod config;
