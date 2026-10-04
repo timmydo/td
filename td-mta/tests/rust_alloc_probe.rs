@@ -1229,6 +1229,89 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn uri_literal_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_location_literal::{Cursor, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = "../a%2Fb?x/".repeat(4096);
+    let before = COUNTERS.snapshot();
+    for (source, fault, records) in [
+        (b"".as_slice(), None, 100_000_000),
+        (b"../a%\r\n 2Fb?x#Y", None, 100_000_000),
+        (b"http://[::1]/a(b)", None, 100_000_000),
+        (b"//[vF.a:!]/x", None, 100_000_000),
+        (b"=?ascii?Q?file_name?=", None, 100_000_000),
+        (long.as_bytes(), None, 100_000_000),
+        (b"a%", Some(Error::MalformedUri), 100_000_000),
+        (b"1g:h", Some(Error::MalformedUri), 100_000_000),
+        (b"http://[:::]/", Some(Error::MalformedUri), 100_000_000),
+        (b"a\r\n", Some(Error::MalformedFold), 100_000_000),
+        (b"../a", Some(Error::Work(Stop::Records)), 0),
+    ] {
+        let trials = if fault.is_some() { 1 } else { 2 };
+        for trial in 0..trials {
+            let late = trial == 1;
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records,
+                    output_bytes: 100_000_000,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let mut cursor = Cursor::new(source, &mut work, &mut budget);
+            let mut result = None;
+            let mut complete = false;
+            for _ in 0..100_000 {
+                match cursor.poll(Tick(1)) {
+                    Ok(Status::Octet { byte, position }) => {
+                        assert_eq!(source.get(position), Some(&byte));
+                        black_box(byte);
+                    }
+                    Ok(Status::Yield) => {}
+                    Ok(Status::Complete) => {
+                        complete = true;
+                        break;
+                    }
+                    Err(error) => {
+                        result = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(result, fault);
+            if let Some(error) = fault {
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.poll(Tick(1)), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+            } else {
+                assert!(complete);
+                assert!(cursor.is_complete());
+                assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+                if late {
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100)),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert!(!cursor.is_complete());
+                    assert!(cursor.finish(Tick(1)).is_err());
+                } else {
+                    let (work, budget) = cursor.finish(Tick(1)).unwrap();
+                    black_box((work, budget));
+                }
+            }
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "literal URI reader allocated");
+}
+
 fn uri_word_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -8351,6 +8434,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        uri_literal_values();
         uri_word_values();
         uri_unfold_values();
         uri_reference_values();
@@ -8511,6 +8595,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    uri_literal_values();
     uri_word_values();
     uri_unfold_values();
     uri_reference_values();

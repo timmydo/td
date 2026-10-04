@@ -1703,6 +1703,18 @@ The selected-reader allocation intervals cover folded Q/Base64 success,
 repair, unknown/oversized fallback and late malformed/fresh deadline refusal.
 Whole-field placement, pipeline/worker/native/RSS qualification remain open.
 
+M06cq's selected literal URI reader plus HeaderBudget fits 320 bytes in the
+existing parser region. It retains shared fixed validator/unfolder state
+and source borrows, with no source-sized scratch or second header arena.
+One poll visits at most one source byte, spends at most 66 interpretation
+steps and five job records, and emits at most one charged ASCII output byte.
+The bounded IPv6 parse prepays 64 lexical records through those owners,
+mapped to 64 interpretation steps and four job records. Complete validation precedes projection; funded replay
+preserves slice-relative offsets and exact literal spelling. Warm/measured
+Rust allocation intervals include empty, long, folded, IPv6/IPvFuture,
+word-marker literal, malformed/refused and fresh final handoff paths.
+Whole-field and worker/native/RSS qualification remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

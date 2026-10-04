@@ -428,6 +428,13 @@ scratch transitions, recognition, decoding and output. Whole-field
 CFWS/placement and URI label validity remain
 open; the helper grants no Content-Location or publication authority.
 
+M06cq composes shared URI unfolding and reference validation into a selected
+literal spelling reader. It validates the complete spelling before replaying
+literal ASCII octets and slice-relative provenance under original job/header
+owners. No source-sized scratch, normalization, percent decoding or encoded
+word interpretation is introduced. Whole-field CFWS/placement, presence,
+label retention and publication remain separate composer obligations.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

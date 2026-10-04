@@ -4325,6 +4325,28 @@ Consuming finish(now) checks fresh admission and returns the original owners
 and End only after healthy completion. No NFC, CFWS selection, word placement,
 whole Content-Location parsing, label resolution or publication is provided.
 
+### 1.96 Selected literal URI-reference reader
+
+M06cq adds mime_location_literal::Cursor over one caller-authorized selected
+URI spelling outside surrounding CFWS and the final header line ending.
+It unfolds wire whitespace and validates the entire RFC 3986 URI reference
+before replaying any literal ASCII octet. Empty relative references remain
+valid at this layer; whole-field presence and grammar are external. Syntax
+or fold errors emit no octets. The caller separately establishes encoded-word
+placement; this literal path leaves word markers, percent spelling, case,
+path segments and parentheses unchanged. No NFC or resolution occurs.
+
+Octet events retain offsets within the supplied spelling slice, which the
+caller rebases into the authorized field/message. Replay uses the same
+immutable source and original job/header owners. Each visit, bounded IPv6
+parse and projected output byte is funded. Events remain provisional until
+healthy Complete and fresh original admission. Cached Complete is inert;
+check_deadline retires completion on refusal. Consuming finish(now) performs
+fresh admission and returns the original owners only after completion.
+Admission precedes premature-finish InvalidState; expiration retains work
+refusal precedence. Cursor is neither Copy nor Clone and adds no source/publication authority,
+whole Content-Location parser or retained metadata policy.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -1920,6 +1920,14 @@ Initial independently landable increments:
   scalars. Whole Content-Location CFWS/placement, URI validation, retained
   metadata and worker/native/RSS remain open.
 
+- **M06cq — selected literal URI references:** validate complete unfolded
+  spelling before projecting literal ASCII octets and source-slice offsets.
+  Replay retains original job/header owners and fresh consuming handoff.
+  Empty references stay valid at this layer; word placement, CFWS, complete
+  field grammar and retained metadata remain external. Fixtures pin complete
+  malformed-tail rejection, every allowance/deadline cut, provenance and
+  exact successful costs. Whole Content-Location composition remains open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
