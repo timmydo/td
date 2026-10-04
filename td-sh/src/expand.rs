@@ -688,14 +688,12 @@ fn is_always_set(name: &str) -> bool {
 /// RANDOM carries into a child. That write is why the lookup path takes `&mut`.
 fn random_value(sh: &mut Shell) -> String {
     let mut gen = sh.random.unwrap_or_else(|| {
-        // ash's uninitialised state is `INIT_RANDOM_T(rnd, getpid(),
-        // monotonic_us())` -- two DISTINCT inputs landing in different state
-        // words, not one value used twice. The clock stands in for the monotonic
-        // source; an unseeded sequence only has to differ per shell.
+        // An unseeded sequence only has to differ per shell: the pid and the
+        // clock's nanoseconds.
         let clock = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        crate::random::Rand::init(std::process::id().max(1), clock)
+        crate::random::Rand::unseeded(std::process::id(), clock)
     });
     let value = gen.next().to_string();
     sh.random = Some(gen);

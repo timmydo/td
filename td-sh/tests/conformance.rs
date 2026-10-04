@@ -2643,8 +2643,9 @@ fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// `$RANDOM` is ash's one DYNAMIC variable. Every expected value here was
-/// measured on busybox 1.37.0 ash: a script that seeds asks for one SPECIFIC
+/// `$RANDOM` is ash's one DYNAMIC variable: when it draws, seeds, writes
+/// back and retires is ash's. The numbers are td's own generator's
+/// (random.rs), pinned because a script that seeds asks for one SPECIFIC
 /// sequence, so "produces numbers in range" is not the same answer.
 #[test]
 fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
@@ -2661,20 +2662,20 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     };
     let six = "echo $RANDOM $RANDOM $RANDOM $RANDOM $RANDOM $RANDOM";
     for (seed, want) in [
-        ("0", "3240 22231 2355 11491 7008 14858"),
-        ("1", "9882 31274 32415 17757 4881 16130"),
-        ("42", "20351 9206 20506 13396 18747 8898"),
-        ("4294967295", "29350 13153 5018 5161 8973 25390"),
+        ("0", "28944 14140 866 31813 3484 10725"),
+        ("1", "18565 24437 31817 14560 14557 24998"),
+        ("42", "24299 5239 9129 11278 1246 28450"),
+        ("4294967295", "14808 12432 30501 2426 23432 32168"),
         // `strtoul`, so a numeric prefix counts and a non-number is 0...
-        ("5x", "3710 1948 21657 10135 29411 21828"),
-        ("5", "3710 1948 21657 10135 29411 21828"),
-        ("abc", "3240 22231 2355 11491 7008 14858"),
-        ("0x10", "3240 22231 2355 11491 7008 14858"),
+        ("5x", "12673 24651 7625 3255 6159 12471"),
+        ("5", "12673 24651 7625 3255 6159 12471"),
+        ("abc", "28944 14140 866 31813 3484 10725"),
+        ("0x10", "28944 14140 866 31813 3484 10725"),
         // ...a negative seed is negated as UNSIGNED, so -1 is 4294967295...
-        ("-1", "29350 13153 5018 5161 8973 25390"),
+        ("-1", "14808 12432 30501 2426 23432 32168"),
         // ...and an absurd one saturates at ULONG_MAX, whose low 32 bits are the
         // same all-ones, which is why it matches -1 rather than 0.
-        ("18446744073709551616", "29350 13153 5018 5161 8973 25390"),
+        ("18446744073709551616", "14808 12432 30501 2426 23432 32168"),
     ] {
         assert_eq!(
             run(&format!("RANDOM={seed}; {six}"))?,
@@ -2685,42 +2686,42 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // Re-seeding restarts the sequence rather than continuing it.
     assert_eq!(
         run("RANDOM=1; echo $RANDOM; RANDOM=1; echo $RANDOM")?,
-        "9882\n9882\n"
+        "18565\n18565\n"
     );
     // ARITHMETIC draws too, and draws once per mention: reading the stored text
     // instead would add the seed to itself.
-    assert_eq!(run("RANDOM=1; echo $((RANDOM+RANDOM))")?, "41156\n");
+    assert_eq!(run("RANDOM=1; echo $((RANDOM+RANDOM))")?, "43002\n");
     // A read REWRITES the stored text (ash's `VNOFUNC` write-back), so the value
     // last drawn is what an exported RANDOM carries. Asserted through `export -p`
     // because `echo $RANDOM` twice would pass with NO write-back at all -- the
     // second read simply draws again.
     let listing = run("RANDOM=1; export RANDOM; echo $RANDOM >/dev/null; export -p")?;
-    assert!(listing.contains("export RANDOM='9882'"), "{listing}");
+    assert!(listing.contains("export RANDOM='18565'"), "{listing}");
     // `set -a` reaches that write-back too: ash's `setvareq` ORs VEXPORT in, so a
     // read under `-a` exports a name that was assigned before the option was set.
     let listing = run("RANDOM=1; set -a; echo $RANDOM >/dev/null; export -p")?;
-    assert!(listing.contains("export RANDOM='9882'"), "{listing}");
+    assert!(listing.contains("export RANDOM='18565'"), "{listing}");
     // `unset` switches the generator off for good; the name is then ORDINARY,
     // so an assignment reads back literally instead of seeding.
     assert_eq!(run("unset RANDOM; echo \"[$RANDOM]\"")?, "[]\n");
     assert_eq!(run("unset RANDOM; RANDOM=1; echo \"[$RANDOM]\"")?, "[1]\n");
     // A DYNAMIC variable is exempt from the readonly refusal, which ash spells
     // `(flags & (VREADONLY|VDYNAMIC)) == VREADONLY`.
-    assert_eq!(run("readonly RANDOM; RANDOM=1; echo $RANDOM")?, "9882\n");
+    assert_eq!(run("readonly RANDOM; RANDOM=1; echo $RANDOM")?, "18565\n");
     // A subshell must NOT replay the parent's sequence -- ash clears the
     // generator in the child on purpose -- and must not disturb it either.
     let out = run("RANDOM=1; (echo $RANDOM >/dev/null); echo $RANDOM")?;
     assert_eq!(
-        out, "9882\n",
+        out, "18565\n",
         "the subshell must not consume the parent's draw"
     );
     // ...and must not INHERIT it either: an inheriting child would draw the
-    // parent's un-consumed 9882, and five of them would draw it five times.
+    // parent's un-consumed 18565, and five of them would draw it five times.
     let kids = run("RANDOM=1; for i in 1 2 3 4 5; do (echo $RANDOM); done")?;
     let kids: Vec<&str> = kids.split_whitespace().collect();
     assert_eq!(kids.len(), 5, "{kids:?}");
     assert!(
-        kids.iter().any(|v| *v != "9882"),
+        kids.iter().any(|v| *v != "18565"),
         "children inherited the parent generator: {kids:?}"
     );
     for v in &kids {
@@ -2734,9 +2735,9 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // `setvareq`, which fires the name's func. A shell that merely stored the
     // string would draw an unrelated sequence here.
     for (seed, want) in [
-        ("1", "9882 31274"),
-        ("42", "20351 9206"),
-        ("5x", "3710 1948"),
+        ("1", "18565 24437"),
+        ("42", "24299 5239"),
+        ("5x", "12673 24651"),
     ] {
         let out = std::process::Command::new(&shell)
             .arg("-c")
@@ -2755,8 +2756,8 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // the name: ash puts the valueless varinit text back, which reseeds with
     // `strtoul("")` = 0. Treating the restore as an unset would retire the
     // generator instead, and every later `$RANDOM` would be empty.
-    assert_eq!(run("RANDOM=1 true; echo $RANDOM $RANDOM")?, "3240 22231\n");
-    assert_eq!(run("RANDOM=5; RANDOM=1 true; echo $RANDOM")?, "3710\n");
+    assert_eq!(run("RANDOM=1 true; echo $RANDOM $RANDOM")?, "28944 14140\n");
+    assert_eq!(run("RANDOM=5; RANDOM=1 true; echo $RANDOM")?, "12673\n");
 
     // `local RANDOM` unsets the name for the call -- ash's `mklocal` reaches
     // `unsetvar` -- so it reads empty and the generator is suspended, NOT
@@ -2764,13 +2765,13 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // sequence resumes where the seed left it.
     assert_eq!(
         run("f(){ local RANDOM; echo \"[$RANDOM]\"; }; RANDOM=1; f; echo $RANDOM $RANDOM")?,
-        "[]\n9882 31274\n"
+        "[]\n18565 24437\n"
     );
     // With a VALUE the local assignment seeds like any other, and the outer
     // binding comes back on return.
     assert_eq!(
         run("f(){ local RANDOM=7; echo $RANDOM; }; RANDOM=1; f; echo $RANDOM")?,
-        "17008\n9882\n"
+        "12773\n18565\n"
     );
 
     // `set -u` must not COST a draw. The nounset check and the expansion are two
@@ -2778,15 +2779,15 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // shell that checks by looking up skips every other number under `-u` alone.
     assert_eq!(
         run("set -u; RANDOM=1; echo $RANDOM $RANDOM")?,
-        "9882 31274\n"
+        "18565 24437\n"
     );
     assert_eq!(
         run("set -u; RANDOM=1; echo ${#RANDOM}; echo $RANDOM")?,
-        "4\n31274\n"
+        "5\n24437\n"
     );
     assert_eq!(
         run("set -u; RANDOM=1; echo ${RANDOM#x}; echo $RANDOM")?,
-        "9882\n31274\n"
+        "18565\n24437\n"
     );
 
     // `strtoul`'s range error is ULONG_MAX and is NOT negated afterwards, so an
@@ -2794,9 +2795,12 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // magnitude that still fits is negated as usual.
     assert_eq!(
         run("RANDOM=-18446744073709551616; echo $RANDOM")?,
-        "29350\n"
+        "14808\n"
     );
-    assert_eq!(run("RANDOM=-18446744073709551615; echo $RANDOM")?, "9882\n");
+    assert_eq!(
+        run("RANDOM=-18446744073709551615; echo $RANDOM")?,
+        "18565\n"
+    );
 
     // `readonly` does not block the UNSET, because ash applies the same
     // `(VREADONLY|VDYNAMIC)` exemption there -- but the attribute SURVIVES it, so
@@ -2818,23 +2822,23 @@ fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
     // One `live` flag cannot say both.
     assert_eq!(
         run("RANDOM=1; echo $((1?0:RANDOM)); echo $RANDOM")?,
-        "0\n9882\n"
+        "0\n18565\n"
     );
     assert_eq!(
         run("RANDOM=1; echo $((0?RANDOM:0)); echo $RANDOM")?,
-        "0\n9882\n"
+        "0\n18565\n"
     );
     assert_eq!(
         run("RANDOM=1; echo $((0?RANDOM:RANDOM)); echo $RANDOM")?,
-        "9882\n31274\n"
+        "18565\n24437\n"
     );
     assert_eq!(
         run("RANDOM=1; echo $((0&&RANDOM)); echo $RANDOM")?,
-        "0\n31274\n"
+        "0\n24437\n"
     );
     assert_eq!(
         run("RANDOM=1; echo $((1||RANDOM)); echo $RANDOM")?,
-        "1\n31274\n"
+        "1\n24437\n"
     );
 
     // `unset` is the one thing that DOES retire it: the name is then genuinely

@@ -1,68 +1,39 @@
-//! busybox ash's `$RANDOM` generator (`shell/random.c`): an LCG, a Galois LFSR
-//! and a 64-bit xorshift combined, then masked to bash's 0..32767. Reproduced
-//! exactly rather than approximated because `RANDOM=n` SEEDS it, so a script
-//! that seeds is asking for one specific sequence.
+//! `$RANDOM`'s generator: SplitMix64 (Steele, Lea and Flood, "Fast
+//! Splittable Pseudorandom Number Generators", 2014), whose top 15 bits are
+//! bash's 0..32767. `RANDOM=n` SEEDS it, so a seeding script gets the same
+//! sequence on every run; the sequence is td's own, not another shell's.
 
-/// The three generators' state. `galois` must be SIGNED: the LFSR tap fires on
-/// the bit shifted out of the msb, which the C reads as `< 0`.
+/// The generator's state: a counter that every draw advances by the golden
+/// ratio constant, and that the output function then mixes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rand {
-    galois: i32,
-    lcg: u32,
-    xs_x: u32,
-    xs_y: u32,
+    state: u64,
 }
 
 impl Rand {
-    /// `INIT_RANDOM_T(rnd, nonzero, v)`: two SEPARATE inputs, one reaching the
-    /// LFSR and an xorshift word, the other the LCG and the second xorshift word.
-    pub fn init(nonzero: u32, v: u32) -> Self {
+    /// An unseeded shell's generator, from the process id and a clock reading,
+    /// so two shells started together still draw differently.
+    pub fn unseeded(pid: u32, clock: u32) -> Self {
         Self {
-            galois: nonzero as i32,
-            lcg: v,
-            xs_x: nonzero,
-            xs_y: v,
+            state: u64::from(pid) << 32 | u64::from(clock),
         }
     }
 
-    /// An assignment has only ONE value, which ash passes as both -- coercing
-    /// zero up, since zero is the LFSR's fixed point AND ash's "uninitialised"
-    /// marker, and it leaves the xorshift all-zero where `next`'s skip loop
-    /// never reaches its exit condition.
+    /// The generator an assignment `RANDOM=v` starts. Every seed is usable,
+    /// zero included: the counter only has to differ, not be nonzero.
     pub fn seeded(v: u32) -> Self {
-        Self::init(if v == 0 { 1 } else { v }, v)
+        Self {
+            state: u64::from(v),
+        }
     }
 
     pub fn next(&mut self) -> u32 {
-        const MASK: u32 = 0x8000_000b;
-        const A: u32 = 2;
-        const B: u32 = 7;
-        const C: u32 = 3;
-
-        self.lcg = self.lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-
-        let mut t = (self.galois as u32) << 1;
-        if self.galois < 0 {
-            t ^= MASK;
-        }
-        self.galois = t as i32;
-
-        loop {
-            let t = self.xs_x ^ (self.xs_x << A);
-            self.xs_x = self.xs_y;
-            self.xs_y = self.xs_y ^ (self.xs_y >> C) ^ t ^ (t >> B);
-            // Skipping two states drops the xorshift's period from 2^64-1 to
-            // 2^64-3, which shares no divisor with the LFSR's 2^32-1; the
-            // unskipped period does, shortening the combination's.
-            if !(self.xs_y == 0 && self.xs_x <= 2) {
-                break;
-            }
-        }
-
-        let combined = (self.galois as u32)
-            .wrapping_sub(self.lcg)
-            .wrapping_add(self.xs_y);
-        combined & 0x7fff
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        u32::try_from(z >> 49).unwrap_or(0)
     }
 }
 
@@ -112,23 +83,47 @@ pub fn seed_of(text: &str) -> u32 {
 mod tests {
     use super::*;
 
-    /// Sequences measured on busybox 1.37.0 ash. An approximation of the
-    /// generator passes every "is it a number in range" check and still hands a
-    /// seeding script different numbers, which is why these are exact.
+    /// td's sequences, pinned so a change to the generator is a decision and
+    /// not an accident: a seeding script asks for exactly these numbers.
     #[test]
-    fn a_seeded_sequence_is_ashs() {
+    fn a_seeded_sequence_is_pinned() {
         for (seed, want) in [
-            (0u32, [3240u32, 22231, 2355, 11491, 7008, 14858]),
-            (1, [9882, 31274, 32415, 17757, 4881, 16130]),
-            (2, [16531, 7559, 29736, 24043, 2854, 17563]),
-            (42, [20351, 9206, 20506, 13396, 18747, 8898]),
-            (12345, [2864, 29935, 14187, 3798, 9436, 5897]),
-            (4_294_967_295, [29350, 13153, 5018, 5161, 8973, 25390]),
+            (0u32, [28944u32, 14140, 866, 31813, 3484, 10725]),
+            (1, [18565, 24437, 31817, 14560, 14557, 24998]),
+            (2, [19372, 24548, 19517, 25081, 10210, 11358]),
+            (42, [24299, 5239, 9129, 11278, 1246, 28450]),
+            (12345, [4360, 6711, 3917, 5771, 16609, 11043]),
+            (4_294_967_295, [14808, 12432, 30501, 2426, 23432, 32168]),
         ] {
             let mut r = Rand::seeded(seed);
             let got: Vec<u32> = want.iter().map(|_| r.next()).collect();
             assert_eq!(got, want.to_vec(), "seed {seed}");
         }
+    }
+
+    /// Reseeding restarts, and distinct seeds and distinct unseeded inputs
+    /// give distinct sequences.
+    #[test]
+    fn a_seed_names_one_sequence() {
+        let draw = |mut r: Rand| -> Vec<u32> { (0..8).map(|_| r.next()).collect() };
+        assert_eq!(draw(Rand::seeded(9)), draw(Rand::seeded(9)));
+        assert_ne!(draw(Rand::seeded(9)), draw(Rand::seeded(10)));
+        assert_ne!(draw(Rand::unseeded(100, 5)), draw(Rand::unseeded(101, 5)));
+        assert_ne!(draw(Rand::unseeded(100, 5)), draw(Rand::unseeded(100, 6)));
+    }
+
+    /// Every one of the 32768 values is reachable, so no bit of the range is
+    /// stuck.
+    #[test]
+    fn the_whole_range_is_drawn() {
+        let mut r = Rand::seeded(7);
+        let mut seen = vec![false; 32768];
+        for _ in 0..400_000 {
+            if let Some(slot) = seen.get_mut(r.next() as usize) {
+                *slot = true;
+            }
+        }
+        assert!(seen.iter().all(|s| *s));
     }
 
     #[test]
