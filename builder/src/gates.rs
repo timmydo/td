@@ -1568,8 +1568,63 @@ fn journal_read(root: &Path, key: &str) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Serializes this process's journal writes: gates finish on parallel
+/// threads, and a forget is a read, filter and rename that a concurrent
+/// one would otherwise undo, putting back a pass it had removed.
+static JOURNAL: Mutex<()> = Mutex::new(());
+
+/// Remove `gate` from every journal before it runs, under any key: a pass
+/// whose rerun was asked for (TD_CHECK_FULL, a doubted host, a changed
+/// scope) is no longer a proof, whether the rerun fails, is stopped, or
+/// never finishes. Losing another tree's line costs a rerun, never a
+/// wrong skip. Best-effort like the append, but a journal it cannot
+/// rewrite is removed, so a stale pass cannot outlive a failed forget.
+fn journal_forget(root: &Path, gate: &str) {
+    let _held = JOURNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(entries) = std::fs::read_dir(root.join(".td-build-cache/gate-verdicts")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !text.lines().any(|l| l == gate) {
+            continue;
+        }
+        let kept: String = text
+            .lines()
+            .filter(|l| *l != gate)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, kept).is_err() || std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Whether a gate's log says it passed with checks it could not run (the
+/// recipe-checks gate's unprovisioned sentinel): green, but not the whole
+/// proof, so it is not journaled and a resumed run asks again.
+fn passed_partially(log: &Path) -> bool {
+    use std::io::BufRead;
+    std::fs::File::open(log).is_ok_and(|f| {
+        std::io::BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .any(|l| l.contains(crate::check_loop::GATES_SKIPPED_SENTINEL))
+    })
+}
+
 /// Append one PASS (best-effort — journaling must never affect a verdict).
 fn journal_pass(root: &Path, key: &str, gate: &str) {
+    let _held = JOURNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let p = journal_path(root, key);
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1617,11 +1672,13 @@ struct RunCfg {
     log_dir: PathBuf,
     remove_logs: bool,
     /// The working-tree content key (TD_CHECK_TREE, computed host-side by
-    /// `td-builder check` from git HEAD + dirty diff + untracked contents).
+    /// `td-builder check` from HEAD's tree + dirty diff + untracked contents
+    /// + the gate runner's bytes).
     /// When present, every PASS is journaled under it; None disables journaling.
     tree_key: Option<String>,
     /// --resume: skip gates journaled green for THIS tree key (issue #320).
-    /// Opt-in, interactive iteration only — an automated run never passes it.
+    /// `affected-checks --run` (so `ready`) passes it: the key binds the
+    /// content and the gate runner, so a journaled PASS is the same proof.
     resume: bool,
     /// TD_CHECK_GATE_TIMEOUT: the wall-clock FLOOR of a gate's budget, in
     /// seconds (0 = unbudgeted). The effective budget is this or a multiple of
@@ -1835,6 +1892,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     }
                 }
                 let log_path = cfg.log_dir.join(format!("{}.log", g.name));
+                journal_forget(&cfg.root, &g.name);
                 let started = std::time::Instant::now();
                 let job_budget_bytes = slot_hold
                     .as_ref()
@@ -1865,6 +1923,8 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     g.non_blocking,
                     started.elapsed().as_secs_f64(),
                 );
+                // Read before the log is discarded below.
+                let partial = outcome == Outcome::Passed && passed_partially(&log_path);
                 // The whole check's /tmp is a private disk bind, not tmpfs,
                 // and each finished log is discarded immediately after its
                 // target-synchronized stream. This bounds both RAM and normal-
@@ -1872,9 +1932,10 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 if cfg.remove_logs {
                     let _ = std::fs::remove_file(&log_path);
                 }
-                // Only a real PASS is journaled: an Unprovisioned skip must re-run
-                // on a provisioned host, so it is never recorded green for --resume.
-                if outcome == Outcome::Passed {
+                // Only a real, whole PASS is journaled: an Unprovisioned skip,
+                // or a pass with unprovisioned checks inside it, must re-run on
+                // a provisioned host, so neither is recorded green for --resume.
+                if outcome == Outcome::Passed && !partial {
                     if let Some(key) = &cfg.tree_key {
                         journal_pass(&cfg.root, key, &g.name);
                     }
@@ -3208,6 +3269,61 @@ mod tests {
         // A plain (non-resume) run ignores the journal entirely.
         assert!(!run_selected(&set, &sel, &with(Some("k1"), false)).unwrap());
         assert_eq!(runs("a.runs"), 3, "non-resume runs must ignore the journal");
+    }
+
+    /// A pass is a proof only until it is asked again: a gate that runs
+    /// leaves no pass behind under any key until it passes anew, so a forced
+    /// rerun that reds (the host changed under an unchanged tree) is not
+    /// answered from the old pass by the next resumed run, scoped or not.
+    /// And a pass with unprovisioned checks inside it is never journaled.
+    #[test]
+    fn a_rerun_forgets_the_old_pass_and_a_partial_pass_is_never_journaled() {
+        let d = tmpdir("forget");
+        let runs = |f: &str| -> usize {
+            std::fs::read_to_string(d.join(f))
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let set = synth(
+            &d,
+            &[
+                (
+                    "a",
+                    Pool::Heavy,
+                    "echo run >> {D}/a.runs; test ! -e {D}/host-changed",
+                    &[],
+                ),
+                (
+                    "p",
+                    Pool::Heavy,
+                    &format!(
+                        "echo run >> {{D}}/p.runs; echo '{}'",
+                        crate::check_loop::GATES_SKIPPED_SENTINEL
+                    ),
+                    &[],
+                ),
+            ],
+        );
+        let sel = expand_goals(&set, &["check".to_string()]).unwrap();
+        let with = |key: &str, resume: bool| {
+            let mut c = cfg(&d, 2, None);
+            c.root = d.clone();
+            c.tree_key = Some(key.to_string());
+            c.resume = resume;
+            c
+        };
+        assert!(run_selected(&set, &sel, &with("tree", false)).unwrap());
+        assert!(run_selected(&set, &sel, &with("tree", true)).unwrap());
+        assert_eq!(runs("a.runs"), 1, "a resumed from its pass");
+        assert_eq!(runs("p.runs"), 2, "a partial pass is never skipped");
+        // A scoped pass; then the forced rerun under the unscoped key reds,
+        // and neither key has a pass left to resume.
+        assert!(run_selected(&set, &sel, &with("tree+scope", false)).unwrap());
+        std::fs::write(d.join("host-changed"), "").unwrap();
+        assert!(!run_selected(&set, &sel, &with("tree", false)).unwrap());
+        assert!(!run_selected(&set, &sel, &with("tree+scope", true)).unwrap());
+        assert!(!run_selected(&set, &sel, &with("tree", true)).unwrap());
+        assert_eq!(runs("a.runs"), 5, "a red rerun leaves no pass to resume");
     }
 
     #[test]

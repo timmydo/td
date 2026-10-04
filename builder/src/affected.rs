@@ -2114,7 +2114,9 @@ fn path_output(root: &Path, path: &str) -> String {
     format_output(root, &header, &changed, &sel, false)
 }
 
-/// The command that runs `targets`, printed VERBATIM as `--run` executes it.
+/// The command that runs `targets`, printed VERBATIM as `--run` executes it
+/// but for the `--resume` `run_self_check` adds, which skips only gates
+/// journaled green for this exact content and changes no verdict.
 /// `check <gate>` is not redundant even though the tier already selects the gate:
 /// naming it makes it an EXPLICIT goal, and a `non_blocking` gate's failure reds
 /// the run only when it is explicit (`gates::explicit_goal_indices`). Collapsing
@@ -3450,7 +3452,14 @@ fn run_self_check(root: &Path, targets: &[String], changed: &[String]) -> i32 {
         return 1;
     };
     let mut cmd = Command::new(&me);
-    cmd.arg("check").args(targets).current_dir(root);
+    // --resume: a gate that passed on this exact content, under this exact
+    // gate runner, is not run again — a run stopped and restarted after an
+    // amend that changed only a message keeps what it finished.
+    // TD_CHECK_FULL still runs everything.
+    cmd.arg("check")
+        .arg("--resume")
+        .args(targets)
+        .current_dir(root);
     // The child's scope is this run's or none: one exported by the caller's
     // shell must not outlive a change that has left the roster.
     cmd.env_remove(crate::check_loop::CHECK_SCOPE_ENV);

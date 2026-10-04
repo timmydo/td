@@ -727,11 +727,15 @@ fn s(v: &str) -> String {
 }
 
 /// The working-tree content key for the verdict journal (issue #320): sha256
-/// over git HEAD + the full dirty diff + every untracked file's bytes — ANY
-/// tree change yields a new key, so a --resume skip can never survive an edit
-/// (whole-tree invalidation, deliberately no per-gate cleverness). None when
-/// git is unavailable (resume then refuses to run).
-fn tree_key(root: &Path) -> Option<String> {
+/// over HEAD's tree + the full dirty diff + every untracked file's bytes —
+/// ANY content change yields a new key, so a --resume skip can never survive
+/// an edit (whole-tree invalidation, deliberately no per-gate cleverness) —
+/// and over the bytes of `gate_runner`, the td-builder whose compiled-in
+/// gate bodies run them. HEAD's tree, not HEAD: no gate reads history or a
+/// commit message, so an amend that changes only the message keeps the key
+/// and `ready` reuses what already passed. None when git is unavailable
+/// (resume then refuses to run).
+fn tree_key(root: &Path, gate_runner: &Path) -> Option<String> {
     let git = |args: &[&str]| -> Option<Vec<u8>> {
         let mut cmd = Command::new("git");
         cmd.args(args).current_dir(root);
@@ -742,8 +746,24 @@ fn tree_key(root: &Path) -> Option<String> {
         }
         Some(out.stdout)
     };
+    // The runner enters as its own fixed-length digest, streamed rather
+    // than read whole, and resolved as the loop runs it, from `root`.
+    let runner = {
+        let mut file = std::fs::File::open(root.join(gate_runner)).ok()?;
+        let mut h = crate::sha256::Sha256::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            h.update(buf.get(..n)?);
+        }
+        h.finalize()
+    };
     let mut h = crate::sha256::Sha256::new();
-    h.update(&git(&["rev-parse", "HEAD"])?);
+    h.update(&runner);
+    h.update(&git(&["rev-parse", "HEAD^{tree}"])?);
     h.update(&git(&["diff", "HEAD"])?);
     let status = git(&["status", "--porcelain=v1", "-uall", "-z"])?;
     h.update(&status);
@@ -1545,11 +1565,11 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         std::env::var_os("TD_CHECK_FULL").is_some(),
         std::env::var(CHECK_SCOPE_ENV).ok().as_deref(),
     );
-    match tree_key(&root) {
+    match tree_key(&root, Path::new(&tb)) {
         Some(key) => child_envs.push((s("TD_CHECK_TREE"), scoped_tree_key(&key, scope.as_deref()))),
         None if resume => {
             return Err(fatal(
-                "--resume needs a git working tree to key the verdict journal, and `git` failed here — cannot prove the tree is unchanged, refusing to skip",
+                "--resume needs a git working tree and a readable gate runner to key the verdict journal, and `git` or reading the runner failed here — cannot prove the tree is unchanged, refusing to skip",
             )
             .into())
         }
@@ -2029,6 +2049,75 @@ mod tests {
 #[cfg(test)]
 mod scope_key_tests {
     use super::*;
+
+    /// The journal key is the content and the gate runner, not the commit:
+    /// an amend that changes only the message keeps it, so a restarted
+    /// `ready` reuses what passed, while an edit, an untracked file or
+    /// another runner each change it.
+    #[test]
+    fn the_tree_key_survives_a_message_amend_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!(
+            "td-tree-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let repo = root.join("repo");
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("SKIP: no git");
+            return;
+        }
+        let git = |args: &[&str]| -> bool {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        assert!(git(&["init", "-q"]));
+        let runner = root.join("td-builder");
+        std::fs::write(&runner, b"runner one").unwrap();
+        std::fs::write(repo.join("code.rs"), "fn main() {}\n").unwrap();
+        assert!(git(&["add", "code.rs"]));
+        assert!(git(&["commit", "-qm", "first message"]));
+        let key = tree_key(&repo, &runner).unwrap();
+        assert!(git(&["commit", "--amend", "-qm", "second message"]));
+        assert_eq!(tree_key(&repo, &runner).unwrap(), key, "message-only amend");
+
+        std::fs::write(&runner, b"runner two").unwrap();
+        assert_ne!(tree_key(&repo, &runner).unwrap(), key, "another runner");
+        std::fs::write(&runner, b"runner one").unwrap();
+
+        std::fs::write(repo.join("code.rs"), "fn main() { () }\n").unwrap();
+        let edited = tree_key(&repo, &runner).unwrap();
+        assert_ne!(edited, key, "a dirty edit");
+        assert!(git(&["commit", "-qam", "edit"]));
+        let committed = tree_key(&repo, &runner).unwrap();
+        assert_ne!(committed, key, "a committed edit");
+
+        std::fs::write(repo.join("new.rs"), "x").unwrap();
+        assert_ne!(tree_key(&repo, &runner).unwrap(), committed, "untracked");
+        assert!(tree_key(&repo, &root.join("missing")).is_none());
+    }
 
     /// A scoped run journals under a key of its own: the tree key is
     /// untouched without a scope, and two scopes, or a scope and none, never

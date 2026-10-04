@@ -78,6 +78,18 @@ prove their bootstrap.
 that an intermediate commit is green, so keep every commit independently
 passing as it is made.
 
+A gate that already passed on the same content is not run again: `ready`
+gives its `td-builder check` `--resume`, whose journal
+(`.td-build-cache/gate-verdicts/`) keys each pass on HEAD's tree, the
+dirty diff and untracked files, the recipe-checks scope, and the bytes of
+the td-builder whose gate bodies ran it. HEAD's tree, not HEAD: no gate
+reads history or a message, so a run stopped to amend a commit message
+and started again runs only the gates it had not passed. A gate that
+runs first drops its pass under every key, so a rerun that fails or is
+stopped leaves nothing to resume, and a pass with unprovisioned checks
+inside it is not journaled. The journal does not see the host either;
+`TD_CHECK_FULL` runs every gate, forgetting each pass as it goes.
+
 The recipe-checks gate answers a check from its verdict memo when that check
 passed on this host before and nothing it reads has changed since: the
 closure's recipe definitions with the sources they embed — the closure of
