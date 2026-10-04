@@ -525,7 +525,10 @@ impl App {
             Input::Hover(at) => self.hover = at,
             // Nothing here is editable: a paste has nowhere to go, and
             // the reader asks for none.
-            Input::Pointer { .. } | Input::Wheel { .. } | Input::Paste(_) => {}
+            Input::Pointer { .. }
+            | Input::Wheel { .. }
+            | Input::Paste(_)
+            | Input::Context { .. } => {}
         }
         self.underline_link();
         self.quitting

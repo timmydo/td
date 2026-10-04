@@ -276,6 +276,7 @@ impl Picker {
             | Input::Paste(_)
             | Input::CancelPointer
             | Input::Hover(_)
+            | Input::Context { .. }
             | Input::Close => return Reply::Stay(false),
         };
         // The entry a press lands on, by the listing's index; any other

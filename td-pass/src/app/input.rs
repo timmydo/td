@@ -230,7 +230,7 @@ impl App {
                 let _ = self.pane.dispatch(Event::CancelPointer);
             }
             Input::Wheel { rows, .. } => self.wheel(rows),
-            Input::Hover(_) => {}
+            Input::Hover(_) | Input::Context { .. } => {}
             Input::Paste(text) => self.pasted(text),
         }
         self.reveal_fields();

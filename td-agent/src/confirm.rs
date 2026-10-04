@@ -210,6 +210,7 @@ impl Confirm {
             | Input::Focus(true)
             | Input::Paste(_)
             | Input::Hover(_)
+            | Input::Context { .. }
             | Input::Close => return Reply::Stay(false),
         };
         let lost = matches!(event, Event::FocusLost);

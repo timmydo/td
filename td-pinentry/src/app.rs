@@ -383,7 +383,7 @@ impl Dialog {
                 }
                 Flow::Continue
             }
-            Input::Wheel { .. } | Input::Hover(_) => Flow::Continue,
+            Input::Wheel { .. } | Input::Hover(_) | Input::Context { .. } => Flow::Continue,
         }
     }
 

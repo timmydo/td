@@ -598,9 +598,11 @@ impl Session {
                 }
                 return false;
             }
-            Input::Focus(_) | Input::Paste(_) | Input::CancelPointer | Input::Hover(_) => {
-                return false
-            }
+            Input::Focus(_)
+            | Input::Paste(_)
+            | Input::CancelPointer
+            | Input::Hover(_)
+            | Input::Context { .. } => return false,
         };
         let pointed = matches!(input, Input::Pointer { .. } | Input::Wheel { .. });
         if pointed && !self.mouse {
@@ -1194,8 +1196,9 @@ impl Session {
     /// An input while a dropdown is open, which is the dropdown's: the
     /// toolkit's keys as the chord names them and every other chord
     /// consumed, the pointer's press, move and release (a press outside
-    /// it dismisses it), the wheel scrolling its panel, and a focus
-    /// loss or a resize dismissing it. The key it activates is the
+    /// it, or a right press anywhere, dismisses it), the wheel scrolling
+    /// its panel, and a focus loss or a resize dismissing it. The key it
+    /// activates is the
     /// view's, as the label would have been. True when the input went
     /// no further; a resize and a focus loss are the frame's and the
     /// pane's as well, and a close, a paste, a pointer cancel and a
@@ -1249,6 +1252,11 @@ impl Session {
             },
             Input::Focus(false) => menus::Event::FocusLost,
             Input::Resize(surface) => menus::Event::Resize(surface),
+            // A right press dismisses it, as a press outside it does.
+            Input::Context { .. } => menus::Event::Key {
+                key: menus::Key::Dismiss,
+                repeated: false,
+            },
             Input::Focus(true)
             | Input::Close
             | Input::Paste(_)
@@ -1259,7 +1267,7 @@ impl Session {
         };
         if matches!(
             input,
-            Input::Key { .. } | Input::Pointer { .. } | Input::Wheel { .. }
+            Input::Key { .. } | Input::Pointer { .. } | Input::Wheel { .. } | Input::Context { .. }
         ) {
             self.last_user_activity = Instant::now();
         }
@@ -1595,6 +1603,9 @@ impl Handler for Session {
                     }
                 }
                 Input::CancelPointer => self.pane.cancel_pointer(),
+                // Nothing here opens at a right press; the Folder menu
+                // opens from the action bar.
+                Input::Context { .. } => {}
                 Input::Hover(at) => self.hover = at,
                 Input::Wheel { rows, .. } => {
                     if self.mouse {
@@ -3693,6 +3704,11 @@ mod frame_tests {
         key(&mut session, "Escape");
         assert!(session.menu.is_none());
         assert!(!session.shown().contains("Delete folder"));
+        // So does a right press, wherever it is.
+        open(&mut session);
+        session.input(Input::Context { x: 2, y: 2 }, &mut NoClipboard);
+        assert!(session.menu.is_none());
+        assert_eq!(session.stack.depth(), 1);
         // The first row, New folder, is selected as it opens, so Return
         // is its key, which opens the name entry.
         open(&mut session);

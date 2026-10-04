@@ -704,7 +704,10 @@ impl<T> Handler for Window<T> {
                 self.chooser.clicks.cancel();
                 return Flow::Continue;
             }
-            Input::Pointer { .. } | Input::Wheel { .. } | Input::Hover(_) => return Flow::Continue,
+            Input::Pointer { .. }
+            | Input::Wheel { .. }
+            | Input::Hover(_)
+            | Input::Context { .. } => return Flow::Continue,
         };
         self.step(step)
     }

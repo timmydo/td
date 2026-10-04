@@ -2298,7 +2298,7 @@ impl App {
                 ..
             } => self.pointer(phase, x, y, extend, clipboard),
             Input::CancelPointer => self.cancel_pointer(),
-            Input::Hover(_) => {}
+            Input::Hover(_) | Input::Context { .. } => {}
             Input::Wheel { rows, columns } => {
                 let changed = match self.focus {
                     Focus::List => {
@@ -2410,8 +2410,9 @@ impl App {
 
     /// An input while the menu is open, which is the menu's: its keys,
     /// every other chord consumed, the pointer, the wheel over its panel,
-    /// and a focus loss or resize closing it. True when the input went no
-    /// further; a resize and a focus change are the window's as well.
+    /// and a right press, a focus loss or a resize closing it. True when
+    /// the input went no further; a resize and a focus change are the
+    /// window's as well.
     fn menu_input(&mut self, input: &Input<'_>) -> bool {
         use td_ui::menus::Event;
         let event = match *input {
@@ -2441,6 +2442,11 @@ impl App {
                 None => Event::Other,
             },
             Input::Focus(false) => Event::FocusLost,
+            // A right press dismisses it, as a press outside it does.
+            Input::Context { .. } => Event::Key {
+                key: td_ui::menus::Key::Dismiss,
+                repeated: false,
+            },
             // Under the open menu, nothing shows hover.
             Input::Hover(_) => return true,
             Input::Resize(_)
@@ -3050,7 +3056,9 @@ impl App {
                 return;
             }
             // A close never comes here: the window quits on it first.
-            Input::Wheel { .. } | Input::Hover(_) | Input::Close => Reply::Stay(false),
+            Input::Wheel { .. } | Input::Hover(_) | Input::Context { .. } | Input::Close => {
+                Reply::Stay(false)
+            }
         };
         self.reply(reply);
     }
@@ -4889,6 +4897,11 @@ pub mod tests {
             press(&mut app, panel.x + 8, panel.y + (row * ROW) as i64 + 4);
             assert_eq!(app.take_requests(), [request]);
         }
+        // A right press closes it and goes no further.
+        key(&mut app, "F10");
+        app.input(Input::Context { x: 600, y: 300 }, &mut NoClipboard);
+        assert!(!app.menu_open());
+        assert!(app.take_requests().is_empty());
         // Escape and F10 close it, and a press outside closes it and
         // goes no further.
         for chord in ["Escape", "F10"] {

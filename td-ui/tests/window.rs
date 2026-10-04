@@ -44,6 +44,7 @@ enum Record {
     Key(String, bool),
     /// Phase, position, `extend`, `follow`.
     Pointer(PointerPhase, i64, i64, bool, bool),
+    Context(i64, i64),
     CancelPointer,
     Hover(Option<(i64, i64)>),
     Wheel(isize, isize),
@@ -64,6 +65,7 @@ impl Record {
                 extend,
                 follow,
             } => Self::Pointer(phase, x, y, extend, follow),
+            Input::Context { x, y } => Self::Context(x, y),
             Input::CancelPointer => Self::CancelPointer,
             Input::Hover(at) => Self::Hover(at),
             Input::Wheel { rows, columns } => Self::Wheel(rows, columns),
@@ -716,7 +718,8 @@ fn the_theme_chord_repaints_in_the_next_theme_keeps_it_and_is_not_delivered() {
 /// F1 shows the key list over the handler's frame; while it is open the
 /// list takes every press but F12, repeats included, and the wheel
 /// scrolls it; the left button's press closes it, reaching nobody, nor
-/// do the release after it and a held key's repeat; Escape closes it,
+/// do the release after it and a held key's repeat, and the right
+/// button's is nothing; Escape closes it,
 /// and the handler's own help key opens it through `take_show_keys`.
 #[test]
 fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
@@ -805,6 +808,12 @@ fn f1_shows_the_key_list_over_the_frame_and_keeps_its_keys_until_closed() {
     press(&mut w, keyboard, 140, F1);
     release(&mut w, keyboard, 141, F1);
     assert!(w.help().is_open());
+    // A right press neither closes it, which only the left button does
+    // as in every window, nor asks for a context menu under it.
+    w.event(message(pointer, 3, &[144, 0, 0x111, 1])).unwrap();
+    assert!(w.help().is_open());
+    assert_eq!(w.handler().inputs.len(), seen);
+    w.event(message(pointer, 3, &[145, 0, 0x111, 0])).unwrap();
     // Escape closes it, and x is the handler's again; there it asks for
     // the list, which opens from its top.
     press(&mut w, keyboard, 42, ESCAPE);
@@ -945,15 +954,24 @@ fn the_left_button_presses_drags_and_releases_in_surface_pixels_with_shift() {
             false
         ))
     );
-    // Motion without the button, a release without a press and the right
-    // button are nothing.
+    // Motion without the button and a release without a press are
+    // nothing; the right button's press asks for a context menu where
+    // the pointer is, and its release is nothing.
     let seen = w.handler().inputs.len();
     w.event(message(pointer, 2, &[0, fixed(30), fixed(30)]))
         .unwrap();
     w.event(message(pointer, 3, &[6, 0, 0x110, 0])).unwrap();
-    w.event(message(pointer, 3, &[7, 0, 0x111, 1])).unwrap();
-    w.event(message(pointer, 3, &[8, 0, 0x111, 0])).unwrap();
     assert_eq!(w.handler().inputs.len(), seen);
+    w.event(message(pointer, 3, &[7, 0, 0x111, 1])).unwrap();
+    assert_eq!(last(&w), Some(&Record::Context(30, 30)));
+    w.event(message(pointer, 3, &[8, 0, 0x111, 0])).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen + 1);
+    // While the left button is held, a right press is nothing.
+    w.event(message(pointer, 3, &[61, 0, 0x110, 1])).unwrap();
+    let seen = w.handler().inputs.len();
+    w.event(message(pointer, 3, &[62, 0, 0x111, 1])).unwrap();
+    assert_eq!(w.handler().inputs.len(), seen);
+    w.event(message(pointer, 3, &[63, 0, 0x110, 0])).unwrap();
     // Leaving while held cancels the drag without a release.
     w.event(message(pointer, 3, &[9, 0, 0x110, 1])).unwrap();
     assert_eq!(

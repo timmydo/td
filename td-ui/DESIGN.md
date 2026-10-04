@@ -1860,8 +1860,10 @@ clock made them and not after the window closed, a bare modifier
 nothing, focus following the keyboard and a handler quitting on a chord;
 the left button's press at the pointer in surface pixels rounded down,
 motion while held a drag signed past the edge, a second press while held
-nothing, the release where the pointer is, motion without the button, a
-stray release and the right button nothing, leaving or losing the
+nothing, the release where the pointer is, motion without the button and
+a stray release nothing, the right button's press a `Context` at the
+pointer and its release nothing, its press while the left is held or
+the key list is open nothing, leaving or losing the
 pointer while held a cancel with no release after it, a handler quitting
 on that cancel hearing nothing of the resize that made it nor of
 anything after, and Shift under a focused synchronized keyboard
@@ -1918,9 +1920,13 @@ repeat clock made; `Pointer` with the driven seam's `PointerPhase` (`Press`,
 travel past an edge is representable, `extend`, Shift held at the
 press, and `follow`, Control held at the press, as the keyboard's
 synchronized modifier state reports them while the window has focus;
-`CancelPointer` when the pointer leaves or the
-device goes while the button is held, so the handler ends a drag
-without a release; `Hover` with the pointer's position while Control is
+`Context` with the pointer's position at a right-button press while
+the left is not held and the key list is closed, so the handler opens
+the context menu of what lies there (through "Shared menu controller",
+whose `open_context` places it); holding the right button is no drag,
+so such a menu is chosen from by a click, not by a release over it;
+`CancelPointer` when the pointer leaves or the device goes while the
+button is held, so the handler ends a drag without a release; `Hover` with the pointer's position while Control is
 held, by that same state, and the pointer has entered the surface (a
 held button's grab keeps it entered through travel past an edge), and
 `None` once either ends, delivered on a change only, button held or
@@ -1930,7 +1936,8 @@ frame; `Resize` with the `Surface` the handler lays out for; `Focus`
 and `Close`. Motion is delivered as `Pointer` only while the button is
 held and as `Hover` only while Control is, so a handler without drags
 sees no motion stream until Control is held; a second press while held,
-a release without a press and every other button are nothing.
+a release without a press, the right button's release, its press while
+the left is held, and every other button are nothing.
 
 The loop, turn by turn: on `Bound` the window sets the title and app id,
 commits, and hands the handler the default `Resize`; on `Configure` it
@@ -2070,7 +2077,8 @@ the list is open the window keeps every press but `theme::CHORD` from
 the handler, the list taking its reading and closing keys and a held key
 repeating there while it moves the list; a drag under way when it opens
 is cancelled, so its motion and release are the list's and reach nobody;
-a left-button press closes the list and reaches nobody else, and with
+a left-button press closes the list and reaches nobody else, a right
+one is nothing, and with
 nothing held the release after it reaches nobody either, and a key held
 through it stops repeating; the wheel scrolls it. A handler's own help
 key, or a press on its `keys::BUTTON`, opens the same list through
@@ -2198,7 +2206,8 @@ the program, and every window routes alike, as the widget window does
 - opening it ends a drag under way; a left-button press while it is
   open goes to `press`, which closes it, and reaches nobody else, and
   the release after it reaches nobody either; a click that closes it
-  cancels a held key's repeat;
+  cancels a held key's repeat; a right-button press while it is open
+  reaches nobody and leaves it open;
 - a program may open it from the pointer too: a bar's or strip's
   button labelled `BUTTON` (`Help`), an item `ITEM` (`Keys`) in a
   menu named `BUTTON`, whose shortcut shows `CHORD`, or a press on a

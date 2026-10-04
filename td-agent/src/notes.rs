@@ -248,6 +248,7 @@ impl Panel {
             | Input::Focus(_)
             | Input::Paste(_)
             | Input::Hover(_)
+            | Input::Context { .. }
             | Input::Close => return Reply::Stay(false),
         };
         match self.list.event(event, clipboard) {

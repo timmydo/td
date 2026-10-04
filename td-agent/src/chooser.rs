@@ -219,6 +219,7 @@ impl Chooser {
             | Input::Paste(_)
             | Input::CancelPointer
             | Input::Hover(_)
+            | Input::Context { .. }
             | Input::Close => return Reply::Stay(false),
         };
         let hit = match event {

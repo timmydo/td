@@ -2,7 +2,8 @@
 //! a raster over the surface and drives the program's [`Handler`] with
 //! what the window receives — keypresses as the keymap's chords, the left
 //! button's press, drag and release in surface pixels with Shift and
-//! Control, the pointer while Control is held, wheel travel in rows and
+//! Control, the right button's press asking for a context menu, the
+//! pointer while Control is held, wheel travel in rows and
 //! columns, the surface laid out again on configure,
 //! focus, the close request and the text of a paste it asked for — and
 //! polls it each turn under the wait it asks for, so a program whose work
@@ -40,6 +41,8 @@ pub const DEFAULT_HEIGHT: usize = 600;
 
 /// The left button, as `wl_pointer.button` names it.
 const LEFT: u32 = 0x110;
+/// The right button, which asks for a context menu.
+const RIGHT: u32 = 0x111;
 
 /// The longest a turn waits while a clipboard transfer is pending: its
 /// endpoint is not in the loop's wait, so the transfer is stepped at
@@ -75,6 +78,14 @@ pub enum Input<'a> {
         y: i64,
         extend: bool,
         follow: bool,
+    },
+    /// The right button's press, at the pointer, while the left is not
+    /// held and the key list is closed: the handler opens the context
+    /// menu of what lies there. Its release is nothing, and holding it
+    /// is no drag: a menu it opens is chosen from by a click.
+    Context {
+        x: i64,
+        y: i64,
     },
     /// The pointer left, or the device went, while the button was held:
     /// the handler ends its drag without a release.
@@ -728,6 +739,19 @@ impl<'h, H: Handler> Window<'h, H> {
                 } else if !pressed && self.held {
                     self.held = false;
                     self.button(serial, PointerPhase::Release)?;
+                }
+            }
+            // A right press asks for a context menu, unless a drag is
+            // under way or the key list is open, which only the left
+            // button closes, as in every window. Its release is nothing.
+            P::Button {
+                serial,
+                button: RIGHT,
+                pressed: true,
+            } if self.client.entered().is_some() => {
+                if !self.held && !self.keys.is_open() {
+                    let (x, y) = self.pointer;
+                    self.deliver_at(serial, Input::Context { x, y })?;
                 }
             }
             P::Axis(..) | P::Source(_) | P::Stop(_) | P::Discrete(..)
