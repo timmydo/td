@@ -125,11 +125,11 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
     let chars: Vec<char> = text.chars().collect();
     let mut toks = Vec::new();
     let mut i = 0usize;
-    // Whether the numstack TOP is a variable, which is what busybox asks before
-    // splitting a pair (math.c:791) -- not "the last token was a name":
-    // `var_name` survives a PENDING operator and dies when one is APPLIED
-    // (math.c:498). Knowing which pending ones an operator applies is the whole
-    // reason `prec` is mirrored here.
+    // Whether the operand a `++`/`--` would bind back to is a name. Not "the
+    // last token was a name": a name stays reachable across operators still
+    // waiting for their right side (`a-` leaves `a` reachable), and stops being
+    // reachable once an operator takes it as an operand. Knowing which waiting
+    // operators the next one completes is why precedence is tracked here.
     let mut operand_is_name = false;
     // Whether the last token COMPLETED an operand, which is what makes the next
     // `+`/`-` binary. A postfix pair completes one; a prefix pair does not.
@@ -162,39 +162,23 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
             ends_operand = true;
             continue;
         }
-        // An adjacent `++`/`--` is ONE token only where it binds -- backward to a
-        // name already lexed, or forward to one after it. Otherwise a single
-        // character is emitted and the scan resumes at the SECOND, which may
-        // itself begin a binding pair (math.c:780-801). It has to happen here:
-        // by parse time the pair is one token and the re-scan is gone.
-        if (c == '+' || c == '-') && chars.get(i + 1) == Some(&c) {
-            let mut k = i + 2;
-            while chars.get(k).is_some_and(|n| is_blank(*n)) {
-                k += 1;
-            }
-            let fwd = chars
-                .get(k)
-                .is_some_and(|n| n.is_ascii_alphabetic() || *n == '_');
-            if operand_is_name || fwd {
-                // It binds, so it is an operator over a name and is displaced
-                // like a unary sign -- PENDING, not applied, so the name stays
-                // reachable until something displaces it. Whether it COMPLETES
-                // an operand is decided by what came BEFORE it and not by the
-                // name it binds: a pair after a value is a postfix and is one,
-                // a pair that followed an operator became a prefix and is not
-                // (math.c:847-865). So `ends_operand` carries through
-                // untouched either way.
-                toks.push(Tk::Op(if c == '+' { "++" } else { "--" }));
-                pending.push(PREC_UNARY);
-                i += 2;
-                continue;
-            }
-            // Otherwise busybox emits ONE sign and rescans from the second
-            // (math.c:795-798, `expr++; goto tok_found1`). That IS the ordinary
-            // single-character match below -- `++` is not in `OPS` at all -- so
-            // this falls through to it and the half meets the same unary
-            // handling as any other sign, including being discarded when it is
-            // one.
+        // A doubled sign is one `++`/`--` token only where it binds (see
+        // `doubled_sign_binds`). One that binds waits like a unary sign, so the
+        // name stays reachable; whether it completes an operand depends on what
+        // came before it -- after a value it is a postfix, after an operator a
+        // prefix -- so `ends_operand` is left as it was. One that does not bind
+        // is NOT a token: `++` is not in `OPS`, so the single-character match
+        // below takes its first sign like any other and the scan resumes at the
+        // second, which may itself begin a pair that binds. This has to happen
+        // here, since by parse time a pair would be one token.
+        if (c == '+' || c == '-')
+            && chars.get(i + 1) == Some(&c)
+            && doubled_sign_binds(&chars, i + 2, operand_is_name)
+        {
+            toks.push(Tk::Op(if c == '+' { "++" } else { "--" }));
+            pending.push(PREC_UNARY);
+            i += 2;
+            continue;
         }
         // Longest-match over OPS by comparing each candidate directly against the
         // char slice at `i` — no per-character tail allocation (keeps the lexer
@@ -219,11 +203,10 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
                 pending.push(BARRIER);
                 ends_operand = false;
             }
-            // `:` closes the conditional's implicit parenthesis, which busybox
-            // synthesizes as a real RPAREN (math.c:840-842). Two things then
-            // differ from `)`: the conditional itself stays PENDING, so only a
-            // `,` is low enough to reduce it, and it still WANTS an operand,
-            // which is what keeps a sign after it unary.
+            // `:` ends the middle of a conditional as `)` ends a group: `?`
+            // opened it like `(`. Two things differ from `)`: the conditional
+            // itself is still waiting for its last operand, so only a `,` is low
+            // enough to complete it, and a sign after `:` is unary.
             ")" | ":" => {
                 while pending.last().is_some_and(|p| *p != BARRIER) {
                     pending.pop();
@@ -253,11 +236,11 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
                 if op == "?" {
                     pending.push(BARRIER);
                 } else if unary && op == "+" {
-                    // busybox DISCARDS a unary plus rather than stacking it, so
-                    // nothing later can apply it: `+a+--1` still holds `a` and is
-                    // refused, where `-a+--1`, whose sign IS applied, splits.
-                    // It emits no TOKEN either, which is what leaves the name
-                    // behind one reachable: `+n=5` assigns.
+                    // A unary plus is dropped, not kept waiting, so nothing later
+                    // completes it: `+a+--1` still reaches `a` and is refused,
+                    // where `-a+--1`, whose sign is completed, splits. It is no
+                    // token either, which leaves the name behind it reachable:
+                    // `+n=5` assigns.
                     discard = true;
                 } else {
                     pending.push(if unary { PREC_UNARY } else { p });
@@ -271,6 +254,20 @@ fn lex(text: &str) -> Result<Vec<Tk>, String> {
         i += op.chars().count();
     }
     Ok(toks)
+}
+
+/// Whether a doubled sign binds as `++`/`--`: back to the operand before it,
+/// when that is a name still reachable, or forward to a name, when the first
+/// non-blank character from `after` starts one. `1 ++ 2` binds neither way,
+/// so it reads as `1 + +2`.
+fn doubled_sign_binds(chars: &[char], after: usize, name_before: bool) -> bool {
+    name_before
+        || chars
+            .get(after..)
+            .unwrap_or_default()
+            .iter()
+            .find(|c| !is_blank(**c))
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
 }
 
 /// True when `op`'s characters match `chars` starting at `i`, comparing against
@@ -297,89 +294,69 @@ const SYNTAX: &str = "arithmetic syntax error";
 /// `$(((1?2)))` -- and `stopped_at` does not serve it; see there.
 const MALFORMED_TERNARY: &str = "malformed ?: operator";
 
-/// A digit's value in an explicit base, or None where busybox's loop BREAKS
-/// (math.c:551-595). The mapping is `| 0x20` arithmetic on the byte rather than
-/// a table, because which characters are digits is a consequence of it: above
-/// base 36 the letters split into `a-z` at 10-35 and `A-Z` at 36-61, so `64#z`
-/// is 35 and `64#Z` is 61, and only `@` and `_` are named outright.
+/// A digit's value in an explicit base, or None where the digits end. Up to
+/// base 36 a letter is 10-35 in either case; above it the two cases part,
+/// `a-z` staying 10-35 and `A-Z` becoming 36-61, and `@` and `_` are 62 and
+/// 63 -- so `64#z` is 35 and `64#Z` is 61, as in bash and ash. Anything else,
+/// and any value the base does not reach, ends the digits.
 fn base_digit(c: char, base: u32) -> Option<u32> {
-    let ch = u32::from(c);
-    // Below `'0'` C's unsigned subtraction wraps past every base, which is how a
-    // `+` or a blank ends the run rather than being read as a digit.
-    let mut digit = ch.checked_sub(u32::from('0'))?;
-    if digit >= 10 {
-        if digit > u32::from('z') - u32::from('0') {
-            return None;
-        }
-        digit = (ch | 0x20).checked_sub(u32::from('a') - 10)?;
-        if base > 36 && ch <= u32::from('_') {
-            digit = match c {
-                '_' => 63,
-                '@' => 62,
-                _ if digit < 36 => digit + (36 - 10),
-                // `[\]^`, which land between `Z` and `_` and name nothing.
-                _ => return None,
-            };
-        }
-        // What arrives here below 10 is `` ` ``, and `@` in the bases that did
-        // not just name it 62. `:;<=>?` never reach it at all: the fold above
-        // lands under `'a' - 10` for them and returns.
-        if digit < 10 {
-            return None;
-        }
-    }
-    if digit >= base {
-        None
-    } else {
-        Some(digit)
-    }
+    let wide = base > 36;
+    let value = match c {
+        '0'..='9' => u32::from(c) - u32::from('0'),
+        'a'..='z' => u32::from(c) - u32::from('a') + 10,
+        'A'..='Z' if wide => u32::from(c) - u32::from('A') + 36,
+        'A'..='Z' => u32::from(c) - u32::from('A') + 10,
+        '@' if wide => 62,
+        '_' if wide => 63,
+        _ => return None,
+    };
+    (value < base).then_some(value)
 }
 
-/// `BASE#DIGITS` once the base is known. Out of range WRAPS, as everywhere else
-/// here: busybox does not check, so `16#ffffffffffffffff` is -1.
+/// `BASE#DIGITS` once the base is known: the longest run of the base's
+/// digits, its value wrapping like every other here, so `16#ffffffffffffffff`
+/// is -1. No digit at all -- `64#`, or `2#7`, whose `7` is not binary -- is
+/// the syntax error bash 5.2 made of it.
 fn lex_with_base(chars: &[char], start: usize, base: u32) -> Result<(i64, usize), String> {
-    let mut i = start;
-    let mut value: u64 = 0;
-    while let Some(&c) = chars.get(i) {
-        let Some(d) = base_digit(c, base) else { break };
-        value = value
-            .wrapping_mul(u64::from(base))
-            .wrapping_add(u64::from(d));
-        i += 1;
-    }
-    // A base with no digits after it is the error bash 5.2 made of `64#`, and
-    // it is also how a digit the base lacks surfaces: the run stops before the
-    // first one, so `2#7` reaches here having consumed nothing.
-    if i == start {
+    let (value, count) = chars
+        .get(start..)
+        .unwrap_or_default()
+        .iter()
+        .map_while(|&c| base_digit(c, base))
+        .fold((0u64, 0usize), |(value, count), d| {
+            let value = value
+                .wrapping_mul(u64::from(base))
+                .wrapping_add(u64::from(d));
+            (value, count + 1)
+        });
+    if count == 0 {
         return Err(SYNTAX.into());
     }
-    Ok((value as i64, i))
+    Ok((value as i64, start + count))
 }
 
-/// The explicit base of a `BASE#` prefix, and where its digits start. One or two
-/// digits only, and NOT a leading `0`, which stays the octal prefix -- ash reads
-/// the base off `nptr[0]`, so `0#1` never reaches this at all (math.c:597-635).
-/// A base outside 2..=64 is None rather than an error: ash falls back to reading
-/// the digits as decimal (math.c:634), which leaves the `#` as trailing input,
-/// so `1#1` and `65#1` are refused a step later instead.
+/// The base of a `BASE#` prefix and where its digits start: one or two
+/// decimal digits, the first not `0` (a leading `0` is the octal prefix, so
+/// `0#1` is not a base at all), then `#`, naming a base from 2 to 64. Any
+/// other prefix is None, not an error: the caller then reads a plain number
+/// and the `#` is left over as trailing input, so `1#1` and `65#1` fail a
+/// step later.
 fn explicit_base(chars: &[char], start: usize) -> Option<(u32, usize)> {
-    let d0 = chars.get(start)?.to_digit(10)?;
-    if d0 == 0 {
+    let rest = chars.get(start..)?;
+    let len = rest
+        .iter()
+        .take(2)
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    let (digits, after) = rest.split_at_checked(len)?;
+    if digits.first() == Some(&'0') || after.first() != Some(&'#') {
         return None;
     }
-    if chars.get(start + 1) == Some(&'#') {
-        return if d0 > 1 { Some((d0, start + 2)) } else { None };
-    }
-    let d1 = chars.get(start + 1)?.to_digit(10)?;
-    if chars.get(start + 2) != Some(&'#') {
-        return None;
-    }
-    let base = d0 * 10 + d1;
-    if base <= 64 {
-        Some((base, start + 3))
-    } else {
-        None
-    }
+    let base = digits
+        .iter()
+        .filter_map(|c| c.to_digit(10))
+        .fold(0, |base, d| base * 10 + d);
+    (2..=64).contains(&base).then_some((base, start + len + 1))
 }
 
 /// `BASE#DIGITS`, `0x` hex, leading-`0` octal, else decimal — the C conventions
