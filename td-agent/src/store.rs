@@ -8,9 +8,10 @@
 //!
 //! Locks are `File::try_lock`, std's `flock(LOCK_EX | LOCK_NB)`: the
 //! kernel drops one when its holder exits however it exits, so there is
-//! no stale lock to judge, and std opens every file close-on-exec, so a
-//! child never inherits one. Files are opened without following a final
-//! symbolic link.
+//! no stale lock to judge, and std opens every file close-on-exec, so no
+//! program a child execs keeps one; a child forked while one is held
+//! holds it too until that exec. Files are opened without following a
+//! final symbolic link.
 
 use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{Read, Write};
@@ -1879,9 +1880,15 @@ pub mod tests {
         let held = lock_conversation(&cut, Duration::ZERO).unwrap();
         assert!(state.sweep_deleted().is_empty());
         assert!(cut.exists());
-        // One a crash cut short is finished.
+        // One a crash cut short is finished, by a later sweep should a
+        // child another test forked while it was held not yet have
+        // execed.
         drop(held);
-        assert!(state.sweep_deleted().is_empty());
+        let deadline = Instant::now() + LOCK_WAIT;
+        while cut.exists() && Instant::now() < deadline {
+            assert!(state.sweep_deleted().is_empty());
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(!cut.exists());
     }
 
@@ -2387,7 +2394,9 @@ pub mod tests {
         // Creating it again is refused before the lock: it exists.
         assert!(Conversation::open(&state, &id, Some(Role::Conversation), Duration::ZERO).is_err());
         drop(first);
-        assert!(Conversation::open(&state, &id, None, Duration::ZERO).is_ok());
+        // Waiting, as a writer does: a child another test forked while
+        // the lock was held holds it too until it execs.
+        Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
     }
 
     #[test]
@@ -2398,7 +2407,15 @@ pub mod tests {
         let refused = state.lock_window().unwrap_err();
         assert!(refused.contains("another td-agent window"), "{refused}");
         drop(held);
-        assert!(state.lock_window().is_ok());
+        // Tried again for a while, as above: a child forked while it was
+        // held holds it too until it execs.
+        let deadline = Instant::now() + LOCK_WAIT;
+        let mut again = state.lock_window();
+        while again.is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            again = state.lock_window();
+        }
+        again.unwrap();
     }
 
     #[test]

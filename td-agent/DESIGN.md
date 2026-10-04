@@ -237,7 +237,8 @@ would hold its conversation's lock against the next.
   `window.lock` at the top of the state directory and `lock` in each
   conversation's directory. The kernel drops one when its holder exits,
   however it exits, so there is no stale lock and no pid to judge, and
-  std opens every file close-on-exec, so no child inherits one. It needs
+  std opens every file close-on-exec, so no program a child execs keeps
+  one (a child forked while one is held holds it too until then). It needs
   no `unsafe`. A conversation process waits up to 3 s for its directory's
   lock, for an earlier process of the same conversation still exiting,
   and is then refused; a second window process is refused at once,
