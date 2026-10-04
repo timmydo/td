@@ -582,62 +582,32 @@ impl ScriptParser<'_> {
         }
     }
 
-    /// GNU's `snarf_char_class` (sed/compile.c:456-530): where the delimiter scan
-    /// resumes past a bracket expression. A sub-expression's closing `:`/`.`/`=`
-    /// only ARMS the `]` and any other byte disarms it again -- except `[`, which
-    /// disarms nothing, so `[[..[]]` closes where `[[...]]` runs off the end. It
-    /// decides only where the half ENDS; what it hands back is the regex
-    /// compiler's to reject, which is why `s/[[..[]]/X/` is `Unmatched [` rather
-    /// than `unterminated`. Returns having consumed the `]`, which the caller
+    /// Where a bracket expression in a delimited half ends, so the delimiter
+    /// scan resumes past it. After the opening `[`, a leading `^` and then a
+    /// leading `]` are members, so `[]a]` and `[^]a]` are not empty. Then a
+    /// `[` followed by `.`, `:` or `=` opens a sub-expression, which only its
+    /// own character followed by `]` closes; a `]` outside a sub-expression
+    /// ends the bracket. A `[` inside a sub-expression keeps a pending close
+    /// pending, so `[[..[]]` ends where `[[...]]` runs off the end, as in GNU
+    /// sed. Only the extent is decided here: what the bracket holds is the
+    /// regex compiler's to accept, so `s/[[..[]]/X/` is `Unmatched [`, not
+    /// `unterminated`. Returns having consumed the `]`, which the caller
     /// appends.
     fn snarf_char_class(&mut self, out: &mut Vec<u8>, unterminated: &str) -> Result<(), String> {
-        let mut state = 0u8;
-        let mut delim = 0u8;
         let mut ch = self.class_byte(unterminated)?;
-        // Stepped over before the machine runs, so `[]a]` and `[^]a]` are sets
-        // whose first member is a `]` rather than empty ones.
-        if ch == b'^' {
-            out.push(ch);
-            ch = self.class_byte(unterminated)?;
-        }
-        if ch == b']' {
-            out.push(ch);
-            ch = self.class_byte(unterminated)?;
-        }
-        loop {
-            let mut demote = true;
-            match ch {
-                b'.' | b':' | b'=' => {
-                    if state == 1 {
-                        (delim, state, demote) = (ch, 2, false);
-                    } else if state == 2 && ch == delim {
-                        (state, demote) = (3, false);
-                    }
-                }
-                b'[' => {
-                    state = if state == 0 { 1 } else { state };
-                    demote = false;
-                }
-                b']' => {
-                    if state == 0 || state == 1 {
-                        return Ok(());
-                    }
-                    state = if state == 3 { 0 } else { state };
-                }
-                _ => {}
+        for leading in *b"^]" {
+            if ch == leading {
+                out.push(ch);
+                ch = self.class_byte(unterminated)?;
             }
-            if demote {
-                // GNU's `state &= ~1`: a byte that is not the one the state was
-                // waiting for drops 1 to 0 and 3 to 2, and leaves the even ones.
-                state = match state {
-                    1 => 0,
-                    3 => 2,
-                    s => s,
-                };
-            }
+        }
+        let mut at = BracketScan::Plain;
+        while let Some(next) = at.after(ch) {
+            at = next;
             out.push(ch);
             ch = self.class_byte(unterminated)?;
         }
+        Ok(())
     }
 
     /// One byte of a bracket expression. A bare newline ends the half here as it
@@ -1384,43 +1354,73 @@ fn normalize_regex(raw: &[u8], at_posix_level: bool) -> Result<Vec<u8>, String> 
     Ok(out)
 }
 
-/// GNU's `bracket_state` (sed/compile.c:1390), the decoder's own account of where
-/// a bracket expression is -- a SECOND and different machine from the delimiter
-/// reader's `snarf_char_class`, over the same syntax. Decoding is suppressed
-/// anywhere but `Out`.
+/// Where `snarf_char_class` stands inside a bracket expression.
+#[derive(Clone, Copy)]
+enum BracketScan {
+    /// Among ordinary members.
+    Plain,
+    /// Just past a `[`, which a `.`, `:` or `=` would make a sub-expression.
+    Open,
+    /// Inside a sub-expression, which this byte followed by `]` closes.
+    Sub(u8),
+    /// Just past the sub-expression's own character, so a `]` closes it.
+    Closing(u8),
+}
+
+impl BracketScan {
+    /// The state after `ch`, or None when `ch` is the `]` ending the bracket.
+    fn after(self, ch: u8) -> Option<BracketScan> {
+        Some(match (self, ch) {
+            (BracketScan::Plain | BracketScan::Open, b']') => return None,
+            (BracketScan::Open, b'.' | b':' | b'=') => BracketScan::Sub(ch),
+            (BracketScan::Plain | BracketScan::Open, b'[') => BracketScan::Open,
+            (BracketScan::Plain | BracketScan::Open, _) => BracketScan::Plain,
+            (BracketScan::Sub(end), _) if ch == end => BracketScan::Closing(end),
+            (BracketScan::Sub(end), _) => BracketScan::Sub(end),
+            (BracketScan::Closing(_), b']') => BracketScan::Plain,
+            (BracketScan::Closing(end), b'[') => BracketScan::Closing(end),
+            (BracketScan::Closing(end), _) => BracketScan::Sub(end),
+        })
+    }
+}
+
+/// Where the escape decoder stands relative to a bracket expression, which
+/// it tracks separately from `snarf_char_class`. Escapes are decoded only
+/// `Out` of one.
 #[derive(Clone, Copy, PartialEq)]
 enum Bracket {
     Out,
     /// Inside a bracket, but not in a `[:`/`[.`/`[=` sub-expression.
     In,
-    /// Inside one opened by this byte, which is what its closer must match.
+    /// Inside a sub-expression opened with this byte.
     Sub(u8),
 }
 
 impl Bracket {
-    /// One byte of the walk (compile.c:1473-1495). The two LOOKBEHINDS on the
-    /// closing arm (compile.c:1493) are GNU's own and are why this cannot be a
-    /// state machine alone: they make `[::]` differ from `[:a:]`, since a closer
-    /// that is also the opener leaves the state armed and suppression never ends.
+    /// The state after byte `b` of the pattern text, at index `at`. A `[`
+    /// opens a bracket; inside one, `.`, `:` or `=` right after a `[` opens a
+    /// sub-expression, and a `]` closes the bracket. A sub-expression closes
+    /// at a `]` whose previous byte is its own character and whose byte
+    /// before that is not -- so `[:a:]` closes at its `]`, but `[::]` does
+    /// not, and stays open until a later `x:]` closes it, as in GNU sed.
     ///
-    /// They read the buffer GNU is COMPACTING IN PLACE, not the original text --
-    /// `p` reads and `q` writes into one array (compile.c:1379-1380), so a byte
-    /// below `q` is one already emitted. That is invisible until a decoded escape
-    /// makes the two cursors differ, and at a gap of exactly one it aliases
-    /// `p[-2]` onto `p[-1]`'s value, which reads as `x != k && x == k` and stops
-    /// any sub-expression closing at all. `out` is `q`'s side of that.
+    /// "Previous" is as GNU sees it, which is not always the text: GNU looks
+    /// back in the buffer it is decoding into, where an index already written
+    /// holds decoded output (`out`) and a later one still holds the text
+    /// (`raw`). That only shows once an escape has shortened the output, and
+    /// it is observable -- with one byte of difference both looks land on
+    /// the same byte, and no sub-expression can close.
     fn step(self, raw: &[u8], out: &[u8], at: usize, b: u8) -> Self {
-        let back = |n: usize| {
-            at.checked_sub(n)
-                .and_then(|j| out.get(j).or_else(|| raw.get(j)))
-                .copied()
+        let seen = |back: usize| {
+            let j = at.checked_sub(back)?;
+            out.get(j).or_else(|| raw.get(j)).copied()
         };
-        match (b, self) {
-            (b'[', Self::Out) => Self::In,
-            (b':' | b'.' | b'=', Self::In) if back(1) == Some(b'[') => Self::Sub(b),
-            (b']', Self::In) => Self::Out,
-            (b']', Self::Sub(k)) if back(2) != Some(k) && back(1) == Some(k) => Self::In,
-            _ => self,
+        match self {
+            Self::Out if b == b'[' => Self::In,
+            Self::In if b == b']' => Self::Out,
+            Self::In if matches!(b, b':' | b'.' | b'=') && seen(1) == Some(b'[') => Self::Sub(b),
+            Self::Sub(own) if b == b']' && seen(1) == Some(own) && seen(2) != Some(own) => Self::In,
+            state => state,
         }
     }
 }
@@ -2746,12 +2746,11 @@ fn kind_matches(
 impl Sed {
     /// Does the command at `idx` select this line? Advances the range state.
     ///
-    /// Ranges follow GNU's `match_address_p` (sed/execute.c) exactly, including
-    /// its two asymmetries: a LINE-NUMBER start is absolute — it fires on the
-    /// first line at or past it, so a start line consumed by `N`/`n`/`D` is not
-    /// missed — and only such a range is subject to the line-number end test on
-    /// its own first line. A range started by a regex always selects at least
-    /// that line.
+    /// Ranges behave as GNU sed's do, including their two asymmetries: a
+    /// LINE-NUMBER start is absolute — it fires on the first line at or past
+    /// it, so a start line consumed by `N`/`n`/`D` is not missed — and only
+    /// such a range is subject to the line-number end test on its own first
+    /// line. A range started by a regex always selects at least that line.
     fn addr_matches(&mut self, idx: usize, stream: &mut Stream) -> Result<bool, Vec<u8>> {
         // The script is only read through raw pieces here so each borrow ends
         // before the range state (or `last_regex`) is written.
@@ -3354,7 +3353,7 @@ fn compile_script(
 /// `getopt_long` accepts one (`sed --quie`, `sed --expr=2d`). An exact name
 /// always wins over being a prefix of a longer one.
 ///
-/// A transcription of GNU's `longopts[]` (sed.c:197), in ITS order rather than
+/// The long options in the order GNU's getopt reports them, rather than
 /// alphabetically: an ambiguous abbreviation lists its possibilities in the
 /// order `getopt_long` walks the table, so `--s` is `'--silent' '--sandbox'
 /// '--separate'` and sorting the names would report the same set in the wrong
