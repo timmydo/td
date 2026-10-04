@@ -3612,6 +3612,62 @@ fallback, empty/rejected families and sticky late refusal. These are resident
 parser/Rust-allocation claims; full-worker, native/RSS and traversal
 qualification remain open.
 
+### 1.76 Bounded literal MIME parameter scalar conversion
+
+M06bw adds mime_parameter::scalars::Cursor and Budgeted for trusted Name
+or Filename attributes in a complete immutable parameterized field. Other
+attributes are refused as InvalidState after the first charged admission.
+Work/aggregate refusal takes precedence over inspecting that contract;
+protocol field/attribute meaning
+remains caller owned. The owner composes complete selection and octet replay
+from section 1.75 with one fixed-state charset Decoder. It accepts original
+source/kind/attribute, never a manufactured plan or caller-decoded byte slice.
+
+Charset::parse and incremental mime_charset::Label use one exact ten-alias
+table for UTF-8, ASCII, Latin1 and Windows1252. Matching is ASCII case
+insensitive, never trims whitespace and assigns no default. Label retains
+ten candidate flags and a saturating bounded position, no label buffer or
+registry lookup. One feed performs at most ten trusted alias comparisons;
+the enclosing conversion owner charges its record work before feeding an
+already charged octet. Existing body/word alias choices remain unchanged.
+
+Declared initial charset labels select that decoder. Unknown or empty labels
+use explicit UTF-8 replacement recovery with a diagnostic. Unlabelled display
+values use native UTF-8 conversion, including an unencoded zero followed by
+encoded later sections; that is display recovery rather than an RFC charset
+default. Keep one decoder across every ordered Data octet, including literal
+UTF-8 source bytes in unencoded sections under a declared single-byte charset.
+Never choose a different charset for each section or reset at a section edge.
+Incomplete EOF and malformed sequences replace under the existing decoder
+policy; invalid continuation lookahead is charged and revisited.
+
+One fixed held octet connects the replay owner and decoder. Each turn polls
+one child or executes one fixed phase; at most one Scalar(char) is emitted.
+Charset/language bytes never enter data conversion. Language remains passive
+validated metadata. Scalar controls, noncharacters and word-looking bytes
+remain literal here: filtering, noncharacter recovery, NFC and ordinary
+RFC 2047 compatibility belong to later original-source display owners.
+Converted or joined bytes create no word-placement authority.
+
+All scalars are provisional until charged Complete(Decoded) returns the
+original Selection and is_encoding_problem. That flag records only charset
+label recovery or malformed charset data; invalid_extended remains separate
+in Selection for the later diagnostic owner. Absence returns no scalars and
+no charset diagnostic. Final fresh admission, original job/header allowance
+and private credit persist across selection, replay and conversion. Every
+refusal retires the whole scalar derivation; cached completion is inert and
+explicit zero-count check_deadline latches late refusal, including replacement
+plain meters. Output capacity and retained copying are charged by the later
+owner; this producer allocates and retains no scalar string.
+
+Label fits 16 bytes, Cursor 1280 and Budgeted 1312 in the existing 16 KiB
+parser reservation. Live owners are neither Clone nor Copy. Turns remain
+bounded at 160 source visits/33 plain records or 160 visits/256 aggregate
+steps/16 budgeted job records. Constructor, long conversion, known/unknown/
+empty labels, invalid/fallback data and late refusal are Rust-allocation
+intervals. Complete display metadata, output/NFC retention, boundary admission,
+MIME traversal and full worker/native/RSS qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

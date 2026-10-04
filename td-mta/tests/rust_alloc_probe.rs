@@ -867,6 +867,115 @@ fn store_read_pool() {
     }
 }
 
+fn mime_parameter_scalars() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_fields::Kind,
+        mime_parameter::{
+            scalars::{Budgeted, Status},
+            Attribute, Error,
+        },
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        "attachment;filename*0=\"{}\";filename*1=tail",
+        "🐈".repeat(1024)
+    );
+    let label = format!("attachment;filename*= {}''value", "a".repeat(4096));
+    let before = COUNTERS.snapshot();
+    for (source, kind, attribute, expected, problem, rejected) in [
+        (long.as_bytes(), 4100, false, false),
+        (label.as_bytes(), 5, true, false),
+        (
+            b"attachment;filename*=unknown''%E2%82%AC%00".as_slice(),
+            4,
+            true,
+            false,
+        ),
+        (
+            b"attachment;filename*1*=%82%AC;filename*0*=utf-8''%E2",
+            3,
+            false,
+            false,
+        ),
+        (b"attachment;filename*=cp1252''%80%81", 6, true, false),
+        (b"attachment;filename*=''", 0, true, false),
+        (b"attachment;filename*=utf-8''%E2", 3, true, false),
+        (
+            b"attachment;filename=saved;filename*=utf-8''%xx",
+            5,
+            false,
+            true,
+        ),
+        (b"attachment;x=missing", 0, false, false),
+    ]
+    .into_iter()
+    .map(|(source, expected, problem, rejected)| {
+        (
+            source,
+            Kind::ContentDisposition,
+            Attribute::Filename,
+            expected,
+            problem,
+            rejected,
+        )
+    })
+    .chain(std::iter::once((
+        b"text/plain;name*=iso_8859-1''%E9".as_slice(),
+        Kind::ContentType,
+        Attribute::Name,
+        2,
+        false,
+        false,
+    ))) {
+        let case_before = COUNTERS.snapshot();
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records: 10_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Budgeted::new(black_box(source), kind, attribute, &mut work, &mut budget);
+        assert!(std::mem::size_of_val(&cursor) <= 1312);
+        let mut bytes = 0;
+        loop {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Yield => {}
+                Status::Scalar(value) => {
+                    black_box(value);
+                    bytes += value.len_utf8();
+                }
+                Status::Complete(decoded) => {
+                    assert_eq!(bytes, expected);
+                    assert_eq!(decoded.is_encoding_problem, problem);
+                    assert_eq!(decoded.selection.invalid_extended, rejected);
+                    black_box(decoded);
+                    assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete(decoded)));
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100)),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+                    break;
+                }
+            }
+        }
+        let case_after = COUNTERS.snapshot();
+        assert!(!case_before.invalid && !case_after.invalid);
+        assert_eq!(
+            case_before, case_after,
+            "MIME scalar case allocated: {source:?}"
+        );
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME scalar conversion allocated");
+}
+
 fn mime_parameter_octets() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6381,6 +6490,7 @@ fn main() {
         mime_value();
         mime_parameter();
         mime_parameter_octets();
+        mime_parameter_scalars();
         body_value();
         mime_text();
         body_charset();
@@ -6526,6 +6636,7 @@ fn main() {
     mime_value();
     mime_parameter();
     mime_parameter_octets();
+    mime_parameter_scalars();
     body_value();
     mime_text();
     body_charset();

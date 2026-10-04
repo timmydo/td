@@ -319,6 +319,14 @@ that complete spelling before octets. Replay failure retires all provisional
 output and cannot choose a second fallback. Charset/language/data roles are
 lexical evidence only; original-source placement and metadata publication
 remain with later owners.
+Literal Name/Filename scalar conversion composes validated octet replay with
+one decoder across all data sections. A fixed incremental matcher and slice
+lookup share the exact existing mail charset alias table; no label buffer or
+registry is introduced. Unknown/empty declared labels recover as POLICY.md
+specifies. One held byte separates replay and decoding turns, and original
+budget/private credit persist through both. Charset diagnostics remain
+separate from rejected-family evidence. Scalar controls/noncharacters, raw
+word placement, filtering/NFC and display publication stay with later owners.
 New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed

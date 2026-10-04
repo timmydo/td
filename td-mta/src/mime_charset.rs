@@ -12,31 +12,64 @@ pub enum Charset {
     Latin1,
     Windows1252,
 }
+const LABELS: &[(&[u8], Charset)] = &[
+    (b"utf-8", Charset::Utf8),
+    (b"utf8", Charset::Utf8),
+    (b"us-ascii", Charset::Ascii),
+    (b"ascii", Charset::Ascii),
+    (b"ansi_x3.4-1968", Charset::Ascii),
+    (b"iso-8859-1", Charset::Latin1),
+    (b"latin1", Charset::Latin1),
+    (b"iso_8859-1", Charset::Latin1),
+    (b"windows-1252", Charset::Windows1252),
+    (b"cp1252", Charset::Windows1252),
+];
+/// Passive bounded matching of already admitted label octets; no charset default.
+#[derive(Clone, Copy)]
+pub struct Label {
+    possible: [bool; LABELS.len()],
+    position: u8,
+}
+impl Default for Label {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Label {
+    pub(crate) const FEED_RECORDS: u64 = LABELS.len() as u64;
+    pub const fn new() -> Self {
+        Self {
+            possible: [true; LABELS.len()],
+            position: 0,
+        }
+    }
+    /// At most ten trusted alias comparisons. The caller owns admission.
+    pub fn feed(&mut self, byte: u8) {
+        for ((name, _), possible) in LABELS.iter().zip(self.possible.iter_mut()) {
+            *possible &= name
+                .get(usize::from(self.position))
+                .is_some_and(|wanted| wanted.eq_ignore_ascii_case(&byte));
+        }
+        self.position = self.position.saturating_add(1);
+    }
+    pub fn finish(&self) -> Option<Charset> {
+        LABELS
+            .iter()
+            .zip(self.possible.iter())
+            .find_map(|((name, charset), possible)| {
+                (*possible && name.len() == usize::from(self.position)).then_some(*charset)
+            })
+    }
+}
 impl Charset {
     /// Labels are already unquoted by the caller; whitespace is not trimmed.
     pub fn parse(label: &[u8]) -> Option<Self> {
-        for (names, charset) in [
-            ([b"utf-8".as_slice(), b"utf8"].as_slice(), Self::Utf8),
-            (
-                [b"us-ascii".as_slice(), b"ascii", b"ansi_x3.4-1968"].as_slice(),
-                Self::Ascii,
-            ),
-            (
-                [b"iso-8859-1".as_slice(), b"latin1", b"iso_8859-1"].as_slice(),
-                Self::Latin1,
-            ),
-            (
-                [b"windows-1252".as_slice(), b"cp1252"].as_slice(),
-                Self::Windows1252,
-            ),
-        ] {
-            if names.iter().any(|name| label.eq_ignore_ascii_case(name)) {
-                return Some(charset);
-            }
-        }
-        None
+        LABELS
+            .iter()
+            .find_map(|(name, charset)| label.eq_ignore_ascii_case(name).then_some(*charset))
     }
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Scalar(char),
@@ -541,5 +574,49 @@ mod tests {
             }
         );
         assert_eq!(work.remaining(), before);
+    }
+    #[test]
+    fn incremental_aliases_equal_exact_slice_matching_at_every_cut() {
+        assert_eq!(LABELS.len(), 10);
+        assert_eq!(LABELS.len(), Label::new().possible.len());
+        assert!(std::mem::size_of::<Label>() <= 16);
+        for (name, charset) in LABELS {
+            for split in 0..=name.len() {
+                let mut matcher = Label::new();
+                for byte in name.iter().take(split) {
+                    matcher.feed(byte.to_ascii_uppercase());
+                }
+                assert_eq!(matcher.finish(), Charset::parse(name.get(..split).unwrap()));
+                for byte in name.iter().skip(split) {
+                    matcher.feed(byte.to_ascii_uppercase());
+                }
+                assert_eq!(matcher.finish(), Some(*charset));
+                matcher.feed(b'x');
+                assert_eq!(matcher.finish(), None);
+            }
+        }
+        for input in [
+            b"".as_slice(),
+            b" utf-8",
+            b"utf-8 ",
+            b"utf",
+            b"unknown",
+            b"UTF-8*en",
+            b"utf-8\0",
+            b"\xff",
+        ] {
+            let mut matcher = Label::new();
+            for byte in input {
+                matcher.feed(*byte);
+            }
+            assert_eq!(matcher.finish(), Charset::parse(input));
+            assert_eq!(matcher.finish(), None);
+        }
+        let mut matcher = Label::new();
+        for _ in 0..100_000 {
+            matcher.feed(b'a');
+        }
+        assert_eq!(matcher.finish(), None);
+        assert_eq!(matcher.position, u8::MAX);
     }
 }

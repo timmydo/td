@@ -1120,6 +1120,20 @@ empty families, and late refusal are Rust-allocation intervals. Complete
 worker stack composition, output retention, native/RSS and traversal remain
 open.
 
+M06bw's literal parameter scalar Cursor fits 1280 bytes and its Budgeted
+owner 1312 within the existing parser region. Its inline Octets owner, one
+charset Decoder, 16-byte-bounded passive Label and one held octet replace
+buffers or a retained label/string. Ten exact trusted aliases are shared
+with existing slice lookup; feeding charges at most ten record units and
+retains no source. Each turn polls one child or performs a fixed phase, at
+most one provisional scalar. Original 160 visits/33 plain records and
+160 visits/256 aggregate steps/16 budgeted job-record bounds still hold.
+Constructor, long conversion, known/unknown/empty labels, malformed/fallback
+and late refusal are Rust-allocation intervals. Original allowances and
+private credit span selection, replay and charset state; no output backing
+or capacity is introduced. Retained copying, display/NFC composition,
+complete worker stack, native/RSS and traversal qualification remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

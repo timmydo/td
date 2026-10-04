@@ -329,7 +329,22 @@ the same lexical tag rule as section 2, without registry lookup. Unencoded
 sections remain literal. Encoded later sections may follow an unencoded zero
 without declaring charset/language information; requiring an encoded zero
 is conditional on that information being supplied (RFC 2231 section 4.1).
-Mixed sections share one later charset state;
+Mixed sections share one charset state, including literal UTF-8 source bytes
+in unencoded sections when an initial label declares a single-byte charset.
+Complete field UTF-8 admission proves raw syntax, not a replacement charset
+for the derived byte value. The declared charset remains authoritative for
+that whole value; valid single-byte mappings set no encoding fault solely
+because another interpretation would display different text. The separate
+body prescan/default policy does not apply to display parameters.
+Unlabelled display values use native UTF-8 conversion with replacement for
+malformed data, including encoded sections following an unencoded zero; this
+is display recovery, not an RFC charset default. An explicitly empty label
+is admitted RFC 2231 syntax but unsupported charset evidence and sets the
+recovery diagnostic even without data; absence of a label in native display
+syntax does not. Charset conversion diagnostics
+and rejected-family diagnostics remain separate until the metadata owner
+combines them. Scalar filtering and ordinary encoded-word compatibility do
+not apply during literal charset conversion;
 percent triplets cannot span sections. Quoted spaces and other forbidden
 extended logical bytes require percent encoding. Neither unquoting nor
 percent decoding creates encoded-word placement authority. Scalar control

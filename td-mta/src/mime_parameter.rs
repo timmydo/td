@@ -1,4 +1,5 @@
 //! Complete candidate validation through fixed-state charged field replay.
+pub mod scalars;
 use crate::{
     admission::work::{Charge, Meter, Stop},
     decode_work::{self, Work},
@@ -525,6 +526,14 @@ pub struct Octets<'a> {
     complete: bool,
 }
 impl<'a> Octets<'a> {
+    fn validated_selection(&self) -> Option<Selection> {
+        if self.cursor.failure.is_some() {
+            None
+        } else {
+            self.selection
+        }
+    }
+
     #[must_use]
     pub const fn new(source: &'a [u8], kind: mime_fields::Kind, attribute: Attribute) -> Self {
         Self {

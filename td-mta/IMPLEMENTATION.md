@@ -1755,6 +1755,17 @@ Initial independently landable increments:
   allocation-free construction/drain. Charset/display/boundary projection,
   MIME traversal and full-worker qualification remain open.
 
+- **M06bw — literal MIME parameter scalars:** share the existing charset
+  alias table with a bounded incremental label matcher; compose validated
+  Name/Filename replay with one decoder across mixed sections. Recover
+  unknown/empty declared labels explicitly, retain native unlabelled UTF-8
+  display conversion and distinguish charset/family diagnostics. Preserve
+  scalar controls/noncharacters and original-source word placement for later
+  display filtering/NFC. Qualify aliases, split and malformed data, all work
+  cuts, fixed turns, live ownership and allocation-free conversion. Complete
+  filename compatibility/display, boundaries, traversal and worker resource
+  qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
