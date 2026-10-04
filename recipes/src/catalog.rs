@@ -773,7 +773,8 @@ mod named_dirs_tests {
     ///
     /// The one exception is a line that is exactly `#[path = "..."]`
     /// naming a file in `build.rs`'s own-source list, read with comments
-    /// stripped, so the verdict key holds its bytes: the face and Unifont
+    /// stripped, so the oracles' verdict key holds its bytes (as
+    /// `host-evaluator`, `HOST_CHECK_SOURCES`): the face and Unifont
     /// modules the screen oracles draw the compositor's chrome text with.
     /// Only `qemu_boot/update.rs` and `live.rs` may name them, which serve
     /// `qemu-boot-live`, a command rather than a recipe check, so no check

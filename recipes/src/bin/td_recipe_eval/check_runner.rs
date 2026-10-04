@@ -4785,8 +4785,10 @@ impl RecipeCheckRunner {
 
     /// A host oracle's key components: what its recipes are built from, its
     /// name, the accelerator it would boot on, since a KVM pass is not
-    /// evidence for a TCG boot, and the boot timeout override, which reaches
-    /// the guest's command line as well as the host's deadline.
+    /// evidence for a TCG boot, the boot timeout override, which reaches
+    /// the guest's command line as well as the host's deadline, and the boot
+    /// harnesses' own sources, which the recipe checks' `evaluator`
+    /// component leaves out (`HOST_CHECK_SOURCES` in build.rs).
     fn oracle_verdict_components(
         &self,
         name: &str,
@@ -4818,6 +4820,10 @@ impl RecipeCheckRunner {
                     hash_field(h, set.as_deref().unwrap_or_default().as_encoded_bytes());
                     Ok(())
                 })?,
+            ),
+            (
+                "host-evaluator".to_string(),
+                env!("TD_EVALUATOR_HOST_SOURCE_FINGERPRINT").to_string(),
             ),
         ];
         out.extend(self.closure_verdict_components(targets)?);
@@ -11473,6 +11479,252 @@ chmod 755 '{}'
         }
     }
 
+    /// The boot harnesses (`HOST_CHECK_SOURCES` in build.rs) are left out of
+    /// every recipe check's `evaluator` component, which is sound only while
+    /// no recipe check runs them. Held by name, both ways: no runner module
+    /// and no other evaluator file names a harness module; in this file
+    /// exactly the host commands and the oracle key do; and whatever here
+    /// calls one of those is itself a host command. A new caller reds here
+    /// and has to say which side it is on.
+    #[test]
+    fn no_recipe_check_runs_a_boot_harness() {
+        const HARNESSES: &[&str] = &[
+            "accel",
+            "bundle",
+            "qemu_boot",
+            "release_source",
+            "run",
+            "vm_profile",
+        ];
+        const FONT_MOUNTS: &[&str] = &[
+            "atlas",
+            "coverage",
+            "face",
+            "face_file",
+            "font",
+            "font_data",
+            "sfnt",
+        ];
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        // Each whole-identifier `word` in `line`, with what precedes and
+        // follows it.
+        let occurrences = |line: &str, word: &str| -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            let mut from = 0;
+            while let Some(at) = line.get(from..).and_then(|r| r.find(word)) {
+                let start = from + at;
+                let end = start + word.len();
+                let before = line.get(..start).unwrap_or("");
+                let after = line.get(end..).unwrap_or("");
+                if !before.chars().last().is_some_and(ident)
+                    && !after.chars().next().is_some_and(ident)
+                {
+                    out.push((before.to_string(), after.to_string()));
+                }
+                from = end;
+            }
+            out
+        };
+        // A harness module is named by a path through it (`m::`), by an
+        // alias (`m as`, or `checks::m` / `super::m` as anything but a
+        // call), or by any mention inside a `use` item, which rustfmt may
+        // wrap over lines up to its `;`. `checks::run(` is mod.rs's dispatch
+        // function and `codex::run(` a runner's, not the module. The font
+        // mounts at the crate root are the screen oracles' alone. Each
+        // non-comment line comes back with what it names.
+        let named_lines = |text: &str| -> Vec<(String, BTreeSet<&'static str>)> {
+            let mut out = Vec::new();
+            let mut in_use = false;
+            for line in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                let mut item = line.trim_start();
+                if item.starts_with("#[") {
+                    item = item.split_once(']').map_or("", |(_, r)| r).trim_start();
+                }
+                in_use |= ["use ", "pub use ", "pub(crate) use ", "pub(super) use "]
+                    .iter()
+                    .any(|p| item.starts_with(p));
+                let mut found = BTreeSet::new();
+                for m in HARNESSES.iter().chain(FONT_MOUNTS) {
+                    for (before, after) in occurrences(line, m) {
+                        let via = before.ends_with("checks::") || before.ends_with("super::");
+                        let after = after.as_str();
+                        if in_use
+                            || after.starts_with("::")
+                            || after.trim_start().starts_with("as ")
+                            || (via && !after.trim_start().starts_with('('))
+                        {
+                            found.insert(*m);
+                        }
+                    }
+                }
+                if in_use && line.contains(';') {
+                    in_use = false;
+                }
+                out.push((line.to_string(), found));
+            }
+            out
+        };
+        // The function an item line declares, if it declares one.
+        let item_fn = |line: &str| -> Option<String> {
+            let mut rest = line.trim_start();
+            for prefix in [
+                "pub(crate) ",
+                "pub(super) ",
+                "pub ",
+                "const ",
+                "async ",
+                "unsafe ",
+            ] {
+                rest = rest.strip_prefix(prefix).unwrap_or(rest);
+            }
+            let name: String = rest
+                .strip_prefix("fn ")?
+                .chars()
+                .take_while(|c| ident(*c))
+                .collect();
+            (!name.is_empty()).then_some(name)
+        };
+        let expected: BTreeSet<String> = [
+            // The host commands, each a `td-recipe-eval` subcommand.
+            "build_iso_cli",
+            "bundle_cli",
+            "bundle_usage",
+            "parse_bundle_args",
+            "qemu_boot_cli",
+            "qemu_boot_erofs_cli",
+            "qemu_boot_kexec_cli",
+            "qemu_boot_live_cli",
+            "qemu_boot_media_cli",
+            "qemu_boot_net_cli",
+            "qemu_boot_session_cli",
+            "qemu_boot_system_cli",
+            "qemu_boot_uefi_cli",
+            "qemu_install_cli",
+            "qemu_install_system_cli",
+            "qemu_secret_cli",
+            "qemu_secret_system_cli",
+            "run_cli",
+            // Called from those commands alone.
+            "oracle_host",
+            // The oracle key, which holds the harnesses' fingerprint.
+            "oracle_verdict_components",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        // Whether `line` calls one of those, or names it through
+        // check_runner as a value.
+        let reaches_host = |line: &str| -> Option<String> {
+            expected
+                .iter()
+                .find(|host| {
+                    occurrences(line, host).iter().any(|(before, after)| {
+                        after.trim_start().starts_with('(') || before.ends_with("check_runner::")
+                    })
+                })
+                .cloned()
+        };
+
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin");
+        let eval = bin.join("td_recipe_eval");
+        let harness_file = |rel: &str| {
+            let rel = rel.strip_prefix("td_recipe_eval/checks/").unwrap_or("");
+            HARNESSES
+                .iter()
+                .any(|m| rel == format!("{m}.rs") || rel.starts_with(&format!("{m}/")))
+        };
+        let mut pending = vec![bin.clone()];
+        let mut seen = 0usize;
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&bin)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                if !rel.ends_with(".rs")
+                    || harness_file(&rel)
+                    || rel == "td-recipe-eval.rs"
+                    || rel == "td_recipe_eval/check_runner.rs"
+                {
+                    continue;
+                }
+                // mod.rs among them: its `mod m;` declarations name no path.
+                for (line, found) in named_lines(&fs::read_to_string(&path).unwrap()) {
+                    assert!(found.is_empty(), "{rel} names {found:?}: {line}");
+                    let host = reaches_host(&line);
+                    assert!(host.is_none(), "{rel} reaches {host:?}: {line}");
+                }
+                seen += 1;
+            }
+        }
+        assert!(seen >= 5, "the runner modules were not found ({seen})");
+
+        // The evaluator's own dispatch reaches the harnesses only for the
+        // two host commands it routes to them directly.
+        let main = fs::read_to_string(bin.join("td-recipe-eval.rs")).unwrap();
+        let routed: Vec<String> = named_lines(&main)
+            .into_iter()
+            .filter(|(_, found)| !found.is_empty())
+            .map(|(l, _)| l.trim().to_string())
+            .collect();
+        assert_eq!(routed.len(), 2, "{routed:?}");
+        assert!(routed
+            .iter()
+            .all(|l| l.contains("checks::qemu_boot::test_iso::cli")
+                || l.contains("checks::qemu_boot::update::run_cli")));
+
+        let src = fs::read_to_string(eval.join("check_runner.rs")).unwrap();
+        let (production, _) = src
+            .split_once("\nmod tests {")
+            .expect("check_runner.rs's test module");
+        let mut current = String::new();
+        let lines: Vec<(String, String, BTreeSet<&str>)> = named_lines(production)
+            .into_iter()
+            .map(|(l, found)| {
+                if let Some(name) = item_fn(&l) {
+                    current = name;
+                }
+                (current.clone(), l, found)
+            })
+            .collect();
+        let callers: BTreeSet<String> = lines
+            .iter()
+            .filter(|(_, _, found)| !found.is_empty())
+            .map(|(f, _, _)| f.clone())
+            .collect();
+        assert_eq!(callers, expected);
+        // And nothing else here reaches them: each caller of one is one, or
+        // the `oracle-memo` command that reads the oracle key.
+        let mut hosts = expected.clone();
+        hosts.insert("oracle_memo_cli".to_string());
+        for (caller, line, _) in &lines {
+            if item_fn(line).is_some() {
+                continue;
+            }
+            for host in &expected {
+                let called = occurrences(line, host)
+                    .iter()
+                    .any(|(_, after)| after.trim_start().starts_with('('));
+                assert!(
+                    !called || hosts.contains(caller),
+                    "{caller} calls {host}, which runs a boot harness"
+                );
+            }
+        }
+        assert_eq!(env!("TD_EVALUATOR_HOST_SOURCE_FINGERPRINT").len(), 64);
+        assert_ne!(
+            env!("TD_EVALUATOR_HOST_SOURCE_FINGERPRINT"),
+            env!("TD_EVALUATOR_SOURCE_FINGERPRINT")
+        );
+    }
+
     /// The check's key takes its components in order, the declared builds'
     /// recipes and sources among them.
     #[test]
@@ -11493,6 +11745,10 @@ chmod 755 '{}'
         let names: Vec<&str> = parts.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names.first(), Some(&"check"));
         assert_eq!(names.last(), Some(&"evaluator"));
+        assert!(
+            !names.contains(&"host-evaluator"),
+            "a recipe check runs no boot harness: {names:?}"
+        );
         for name in [
             "recipe uutils",
             "sources uutils",
@@ -11529,8 +11785,8 @@ chmod 755 '{}'
         let system = parts("qemu-boot-system");
         let names: Vec<&str> = system.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
-            names.get(..3),
-            Some(&["oracle", "accelerator", "boot-timeout"][..])
+            names.get(..4),
+            Some(&["oracle", "accelerator", "boot-timeout", "host-evaluator"][..])
         );
         assert_eq!(names.last(), Some(&"evaluator"));
         for name in [

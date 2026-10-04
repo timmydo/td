@@ -14,7 +14,9 @@
 //! Also fingerprints the evaluator's OWN sources into
 //! `TD_EVALUATOR_SOURCE_FINGERPRINT` for the check verdict key, so the key
 //! names the logic that runs rather than whatever the tree holds when a check
-//! starts (see `evaluator_source_fingerprint`).
+//! starts (see `evaluator_source_fingerprint`), less the host-only boot
+//! harnesses, which `TD_EVALUATOR_HOST_SOURCE_FINGERPRINT` holds for the
+//! integration oracles' key (`HOST_CHECK_SOURCES`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -347,7 +349,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     writeln!(out, "    ]")?;
     writeln!(out, "}}")?;
 
-    let (fingerprint, fingerprinted) =
+    let (fingerprint, host_fingerprint, fingerprinted) =
         evaluator_source_fingerprint(Path::new(&manifest_dir), &shared_files, &per_recipe)?;
     writeln!(
         out,
@@ -366,7 +368,41 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(&out_path, out)?;
 
     println!("cargo:rustc-env=TD_EVALUATOR_SOURCE_FINGERPRINT={fingerprint}");
+    println!("cargo:rustc-env=TD_EVALUATOR_HOST_SOURCE_FINGERPRINT={host_fingerprint}");
     Ok(())
+}
+
+/// Evaluator sources only the host-side commands and the integration
+/// oracles run: the boot harnesses and what they alone mount. No recipe
+/// check's runner reaches them (`checks/mod.rs` dispatches to the others,
+/// and a test holds that boundary), so they key an oracle's verdict through
+/// `TD_EVALUATOR_HOST_SOURCE_FINGERPRINT` and not every recipe check's. A
+/// trailing `/` names a directory.
+const HOST_CHECK_SOURCES: &[&str] = &[
+    "recipes/src/bin/td_recipe_eval/checks/accel.rs",
+    "recipes/src/bin/td_recipe_eval/checks/bundle.rs",
+    "recipes/src/bin/td_recipe_eval/checks/qemu_boot.rs",
+    "recipes/src/bin/td_recipe_eval/checks/qemu_boot/",
+    "recipes/src/bin/td_recipe_eval/checks/release_source.rs",
+    "recipes/src/bin/td_recipe_eval/checks/run.rs",
+    "recipes/src/bin/td_recipe_eval/checks/vm_profile.rs",
+    "td-ui/src/atlas.rs",
+    "td-ui/src/coverage.rs",
+    "td-ui/src/face.rs",
+    "td-ui/src/face_file.rs",
+    "td-ui/src/sfnt.rs",
+    "td-compositor/src/font.rs",
+    "td-compositor/src/font_data.rs",
+];
+
+fn is_host_check_source(rel: &str) -> bool {
+    HOST_CHECK_SOURCES.iter().any(|entry| {
+        if entry.ends_with('/') {
+            rel.starts_with(entry)
+        } else {
+            rel == *entry
+        }
+    })
 }
 
 /// Who reads each file a recipe's evaluation reads under `recipes/`, and
@@ -692,7 +728,7 @@ fn evaluator_source_fingerprint(
     manifest_dir: &Path,
     shared_embeds: &[String],
     per_recipe: &BTreeSet<String>,
-) -> Result<(String, Vec<String>), Box<dyn Error>> {
+) -> Result<(String, String, Vec<String>), Box<dyn Error>> {
     let root = manifest_dir
         .parent()
         .ok_or("recipes crate has no parent directory")?;
@@ -723,15 +759,30 @@ fn evaluator_source_fingerprint(
     // An entry is a file path, or a bare crate directory whose sources an
     // embedded file reads further (`shared_file_entry`).
     for entry in shared_embeds {
+        let mut embedded = Vec::new();
         if entry.contains('/') {
-            files.push(root.join(entry));
+            embedded.push(root.join(entry));
         } else {
-            walk_sources(&root.join(entry).join("src"), &mut files)?;
+            walk_sources(&root.join(entry).join("src"), &mut embedded)?;
         }
+        // What a shared module compiles in runs in every check, so it may
+        // not be one of the harness files only the oracles' key holds.
+        for file in &embedded {
+            let rel = file.strip_prefix(root)?.to_str().unwrap_or("");
+            if is_host_check_source(rel) {
+                return Err(format!(
+                    "{rel} is a boot-harness source (HOST_CHECK_SOURCES) but the shared \
+                     embed `{entry}` compiles it into every check"
+                )
+                .into());
+            }
+        }
+        files.extend(embedded);
     }
     files.sort();
     files.dedup();
     let mut h = sha256::Sha256::new();
+    let mut host = sha256::Sha256::new();
     let mut listed = Vec::with_capacity(files.len());
     for file in &files {
         let rel = file
@@ -744,13 +795,22 @@ fn evaluator_source_fingerprint(
         }
         let digest = sha256::sha256_file(file)
             .map_err(|e| format!("fingerprint {}: {e}", file.display()))?;
-        h.update(rel.as_bytes());
-        h.update(b"\0");
-        h.update(digest.as_bytes());
-        h.update(b"\n");
-        listed.push(rel.to_string());
+        let into = if is_host_check_source(rel) {
+            &mut host
+        } else {
+            listed.push(rel.to_string());
+            &mut h
+        };
+        into.update(rel.as_bytes());
+        into.update(b"\0");
+        into.update(digest.as_bytes());
+        into.update(b"\n");
     }
-    Ok((sha256::to_base16(&h.finalize()), listed))
+    Ok((
+        sha256::to_base16(&h.finalize()),
+        sha256::to_base16(&host.finalize()),
+        listed,
+    ))
 }
 
 fn walk_sources(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {

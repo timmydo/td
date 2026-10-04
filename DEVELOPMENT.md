@@ -97,8 +97,14 @@ a recipe that reads it, by that recipe's source digest (its own file,
 what it embeds, and the files of the recipes whose modules it names,
 transitively), so a uutils bump re-keys only the check that builds
 uutils. A recipe file the evaluator's own code reads stays in the
-fingerprint and re-keys every check, as fixtures and probes do. The
-repo's cargo config is in that key; the host toolchain that compiles
+fingerprint and re-keys every check, as fixtures and probes do. The boot
+harnesses — `checks/qemu_boot` and the host-command modules beside it,
+and the td-ui and td-compositor font files only the screen oracles mount
+(`HOST_CHECK_SOURCES` in `recipes/build.rs`) — are not in it: no recipe
+check runs them, which a test holds by name, so an edit there re-keys the
+integration oracles, whose key holds them as `host-evaluator`, and no
+recipe check; a shared embed that would compile one in fails the build.
+The repo's cargo config is in that key; the host toolchain that compiles
 either binary is not. The gate says how many checks it answered that way
 and counts them apart from the ones it ran.
 
