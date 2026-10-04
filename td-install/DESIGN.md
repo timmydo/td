@@ -191,7 +191,13 @@ true — `td-boot` reaches only `td-init` applets, and `losetup` moved into
 between a machine and its root filesystem. This workstream does not
 reintroduce one. The deliberate exception is D7's `mkfs.btrfs`: at INSTALL
 time, and on a LIVE boot, whose deployment initramfs formats its volatile
-volume with it (MEDIA.md "Live boot").
+volume with it (MEDIA.md "Live boot"). The second is the source-built static
+`cryptsetup` that [ENCRYPTION.md](ENCRYPTION.md) approves for LUKS2: the
+installer formats with it, and the selector and deployment initramfs open
+the volume with it. Its key material reaches it only through a descriptor,
+never argv or the environment. Nothing execs it yet; the landing that first
+does carries the same build-time binding D7 requires of `mkfs.btrfs`, and
+ships its debug companion with it.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create

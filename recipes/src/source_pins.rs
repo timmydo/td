@@ -173,6 +173,15 @@ const PINS: &[PinDef] = &[
         file: "coreutils-5.0.tar.bz2",
     },
     PinDef {
+        key: "cryptsetup-x86-64-source",
+        aliases: &[],
+        // LUKS2 userspace for td-install/ENCRYPTION.md, under the owner's
+        // principle-2 sign-off; hash matches upstream's sha256sums.asc.
+        url: "https://www.kernel.org/pub/linux/utils/cryptsetup/v2.8/cryptsetup-2.8.8.tar.xz",
+        sha256: "3acfa685f2dd7fcc832e0b77bc7093aa7da554a51ce8dafbb4138eaa854eee35",
+        file: "cryptsetup-2.8.8.tar.xz",
+    },
+    PinDef {
         key: "curl-x86-64-source",
         aliases: &[],
         // curl 8.21.0 supplies Git's source-built HTTP/HTTPS transport. The
@@ -458,6 +467,16 @@ const PINS: &[PinDef] = &[
         file: "nerd-fonts-3.5.1-weather-icons-OFL.txt",
     },
     PinDef {
+        key: "json-c-x86-64-source",
+        aliases: &[],
+        // cryptsetup's LUKS2 metadata library; only libjson-c.a is built. The
+        // project's static release object; its contents are identical to the
+        // json-c-0.18-20240915 tag archive whose SHA-512 Fedora records.
+        url: "https://s3.amazonaws.com/json-c_releases/releases/json-c-0.18.tar.gz",
+        sha256: "876ab046479166b869afc6896d288183bbc0e5843f141200c677b3e8dfb11724",
+        file: "json-c-0.18.tar.gz",
+    },
+    PinDef {
         key: "libcap-x86-64-source",
         aliases: &[],
         // libcap 2.78 is the small static capability-name library required by
@@ -466,6 +485,15 @@ const PINS: &[PinDef] = &[
         url: "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.78.tar.xz",
         sha256: "0d621e562fd932ccf67b9660fb018e468a683d7b827541df27813228c996bb11",
         file: "libcap-2.78.tar.xz",
+    },
+    PinDef {
+        key: "libdevmapper-x86-64-source",
+        aliases: &[],
+        // LVM2, of which only libdevmapper.a is built for cryptsetup; the
+        // file matches upstream's sha512.sum.
+        url: "https://sourceware.org/pub/lvm2/LVM2.2.03.43.tgz",
+        sha256: "d87ec0dac9061f1fa58ebced5c6b1360c87d4c5cd7b455dc0ebe1d3f036920d7",
+        file: "LVM2.2.03.43.tgz",
     },
     PinDef {
         key: "libressl-x86-64-source",
@@ -608,6 +636,15 @@ const PINS: &[PinDef] = &[
         url: "https://www.python.org/ftp/python/3.11.1/Python-3.11.1.tar.xz",
         sha256: "85879192f2cffd56cb16c092905949ebf3e5e394b7f764723529637901dfb58f",
         file: "Python-3.11.1.tar.xz",
+    },
+    PinDef {
+        key: "popt-x86-64-source",
+        aliases: &[],
+        // cryptsetup's command-line parser; only libpopt.a is built. The file
+        // matches Fedora's recorded SHA-512; the host serves no valid https.
+        url: "http://ftp.rpm.org/popt/releases/popt-1.x/popt-1.19.tar.gz",
+        sha256: "c25a4838fc8e4c1c8aacb8bd620edb3084a3d63bf8987fdad3ca2758c63240f9",
+        file: "popt-1.19.tar.gz",
     },
     PinDef {
         key: "protobuf-x86-64-source",
@@ -857,8 +894,9 @@ mod tests {
         // trees (APPLICATIONS.md §W.8) and pin nothing here.
         // IANA timezone data 2026d adds one source-data pin, and the Nerd
         // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
-        // the archive and nine licence notices.
-        assert_eq!(all().len(), 83);
+        // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
+        // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
+        assert_eq!(all().len(), 87);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

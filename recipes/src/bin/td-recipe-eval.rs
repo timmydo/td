@@ -693,8 +693,9 @@ mod tests {
         // 20250127.0 source dependency, OpenSSH Portable 10.5p1, the
         // Claude Code 2.1.260 native Linux x86-64 binary, IANA timezone
         // data 2026d, and the Nerd Fonts v3.5.1 JetBrains Mono release with
-        // nine licence notices.
-        assert_eq!(pins.len(), 83);
+        // nine licence notices + cryptsetup 2.8.8 with json-c 0.18, popt 1.19
+        // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries).
+        assert_eq!(pins.len(), 87);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "tzdata-source"));
@@ -732,6 +733,17 @@ mod tests {
         assert!(pins
             .iter()
             .any(|pin| pin.key == "util-linux-libs-x86-64-source"));
+        for key in [
+            "cryptsetup-x86-64-source",
+            "json-c-x86-64-source",
+            "libdevmapper-x86-64-source",
+            "popt-x86-64-source",
+        ] {
+            assert!(
+                pins.iter().any(|pin| pin.key == key && !pin.foreign()),
+                "missing {key}"
+            );
+        }
     }
 
     #[test]

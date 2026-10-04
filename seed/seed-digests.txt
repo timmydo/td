@@ -26,6 +26,7 @@ codex-cargo-tokio-tungstenite-source 7wxk1mcdbbigmmlrl17v1a2kj18d3slm-codex-carg
 codex-cargo-tungstenite-source mxhgq411phj88hcvazjvimzli4gsf0jz-codex-cargo-tungstenite-source
 codex-source 468dyzi341i0b80fp9rl64q634inclbn-codex-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
+cryptsetup-x86-64-source v3g69yip0g4zybh9yw2hlp3zzcfy98fc-cryptsetup-x86-64-source
 curl-x86-64-source 985mgjp6q4y958wwzqs984nkh399jnac-curl-x86-64-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
 elfutils-x86-64-source n4g2hjlg72jm5wn0lx9fxplvh2y82d0b-elfutils-x86-64-source
@@ -50,7 +51,9 @@ gmp63 a1sfm9d525pjz2if348xssl3wprnr21f-gmp63
 grep-mesboot0-source 664n3hm5dz2hyn5py2frds5cc3r4nid4-grep-mesboot0-source
 hello-source r2gr5vy54san8vw8ry4mmjm93ivybbpv-hello-source
 jetbrains-mono-nerd-font-source 632myin1d84lnr23d9ma4f4iwgs13bk2-jetbrains-mono-nerd-font-source
+json-c-x86-64-source csb78c2cixywmxii4vxp4ab11q5273p5-json-c-x86-64-source
 libcap-x86-64-source 14mkpjichrq0gzqyz5nrg4l0yq9hd3dw-libcap-x86-64-source
+libdevmapper-x86-64-source 14i35fjwswmcjr5jp6p00vhh8b2m99d4-libdevmapper-x86-64-source
 libressl-x86-64-source vmx5274krlcs393la52x3iggv4kparn4-libressl-x86-64-source
 linux-headers hg590f1sggdwv8z3yvs4yz90cr0vnvfd-linux-headers
 linux-headers-x86-64 r4mg86l36d6x7c08wqj8v2fdkx23sxjv-linux-headers-x86-64
@@ -84,6 +87,7 @@ patch-glibc-boot-2.2.5 qcs888irnnqm8bybmlbgapyvbbc844ka-patch-glibc-boot-2.2.5
 patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc-bootstrap-system-2.16.0
 patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
 patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
+popt-x86-64-source i2hswa2a3s6kzvqrzl9hz4gvgavsx4yh-popt-x86-64-source
 protobuf-x86-64-source khzifk156vrqqnbdk3a009m6syccq6vm-protobuf-x86-64-source
 python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
 ripgrep-seed-source vg4gdaxl18mqlbhybnn2pq7lpwm3wm2q-ripgrep-seed-source

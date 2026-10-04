@@ -436,7 +436,14 @@ pub fn recipe() -> Recipe {
     //    of BLK_DEV_DM; DM_CRYPT selects CRYPTO but not AES-XTS. Keep generic
     //    AES/XTS for CPUs without AES-NI and the accelerated implementation
     //    for ordinary laptops. Unlock must work before the volume is mounted.
-    //    This enables no mapping, enrollment or encrypted installation.
+    //    cryptsetup's kernel crypto backend reaches PBKDF2 and keyslot
+    //    encryption through AF_ALG, so the hash and skcipher user APIs and
+    //    SHA-256 (which registers hmac(sha256) itself) are built in, with the
+    //    generic HMAC template for other hashes. td formats only AES-XTS with
+    //    SHA-256 and imports no foreign volume, so no other cipher or hash is
+    //    built in for it. td-jail's socket-family filter keeps confined
+    //    applications from AF_ALG. This enables no mapping, enrollment or
+    //    encrypted installation.
     //
     //    SOFTWARE UI: the first graphical profile writes XRGB8888 through the
     //    virtio-gpu driver's fbdev client and reads QEMU's PS/2 devices through
@@ -596,6 +603,10 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_CRYPTO_AES[ =]/d; \
                   /^#? *CONFIG_CRYPTO_XTS[ =]/d; \
                   /^#? *CONFIG_CRYPTO_AES_NI_INTEL[ =]/d; \
+                  /^#? *CONFIG_CRYPTO_HMAC[ =]/d; \
+                  /^#? *CONFIG_CRYPTO_SHA256[ =]/d; \
+                  /^#? *CONFIG_CRYPTO_USER_API_HASH[ =]/d; \
+                  /^#? *CONFIG_CRYPTO_USER_API_SKCIPHER[ =]/d; \
                   /^#? *CONFIG_NET[ =]/d; \
                   /^#? *CONFIG_PACKET[ =]/d; \
                   /^#? *CONFIG_UNIX[ =]/d; \
@@ -741,6 +752,10 @@ pub fn recipe() -> Recipe {
                    'CONFIG_CRYPTO_AES=y' \
                    'CONFIG_CRYPTO_XTS=y' \
                    'CONFIG_CRYPTO_AES_NI_INTEL=y' \
+                   'CONFIG_CRYPTO_HMAC=y' \
+                   'CONFIG_CRYPTO_SHA256=y' \
+                   'CONFIG_CRYPTO_USER_API_HASH=y' \
+                   'CONFIG_CRYPTO_USER_API_SKCIPHER=y' \
                    'CONFIG_NET=y' \
                    'CONFIG_PACKET=y' \
                    'CONFIG_UNIX=y' \
@@ -878,6 +893,10 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_CRYPTO_AES=y' .config || { echo 'CRYPTO_AES off — disk encryption needs a generic AES fallback' >&2; exit 1; }; \
                  grep -q '^CONFIG_CRYPTO_XTS=y' .config || { echo 'CRYPTO_XTS off — disk encryption needs the generic XTS mode' >&2; exit 1; }; \
                  grep -q '^CONFIG_CRYPTO_AES_NI_INTEL=y' .config || { echo 'CRYPTO_AES_NI_INTEL off — disk encryption needs the x86 accelerated AES-XTS implementation' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CRYPTO_HMAC=y' .config || { echo 'CRYPTO_HMAC off — cryptsetup needs the generic HMAC template for hashes other than SHA-256 through AF_ALG' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CRYPTO_SHA256=y' .config || { echo 'CRYPTO_SHA256 off — cryptsetup hashes and derives keyslot keys with SHA-256 and hmac(sha256) through AF_ALG' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CRYPTO_USER_API_HASH=y' .config || { echo 'CRYPTO_USER_API_HASH off — cryptsetup kernel crypto backend needs the AF_ALG hash interface' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CRYPTO_USER_API_SKCIPHER=y' .config || { echo 'CRYPTO_USER_API_SKCIPHER off — cryptsetup kernel crypto backend needs the AF_ALG skcipher interface' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_LOOP=y' .config || { echo 'BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_RAM=y' .config || { echo 'BLK_DEV_RAM off - a live boot keeps its volatile volume on /dev/ram0' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_RAM_COUNT=1$' .config || { echo 'BLK_DEV_RAM_COUNT is not 1 - the live profile uses exactly /dev/ram0' >&2; exit 1; }; \
