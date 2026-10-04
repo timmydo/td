@@ -16,9 +16,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::frame;
+use crate::jail::Tail;
 use td_json::Json;
 
 /// The most calls one tool host runs at once; one more is refused.
@@ -394,7 +396,19 @@ pub struct Client {
     next: u64,
     open: BTreeSet<u64>,
     child: Option<Child>,
+    /// A jailed host's spec, removed with it, and the tail of td-jail's
+    /// own diagnostics (crate::jail).
+    spec: Option<PathBuf>,
+    diagnostic: Option<Arc<Tail>>,
+    /// A failure has waited for td-jail's account once; later ones do not.
+    waited: bool,
 }
+
+/// How long a failure waits for td-jail to finish saying why.
+const FAILURE_WAIT: Duration = Duration::from_secs(2);
+/// How long dropping a jailed host waits for its instance to let go of
+/// the channel.
+const DROP_WAIT: Duration = Duration::from_secs(5);
 
 impl Client {
     /// Speaks to a tool host over `reader` and `writer`.
@@ -424,7 +438,53 @@ impl Client {
             next: 1,
             open: BTreeSet::new(),
             child: None,
+            spec: None,
+            diagnostic: None,
+            waited: false,
         }
+    }
+
+    /// This client with the jail instance it speaks to, killed when the
+    /// client is dropped, and that instance's spec and diagnostics.
+    pub(crate) fn owning(mut self, child: Child, spec: PathBuf, diagnostic: Arc<Tail>) -> Self {
+        self.child = Some(child);
+        self.spec = Some(spec);
+        self.diagnostic = Some(diagnostic);
+        self
+    }
+
+    /// What td-jail has said so far, when this host is jailed and it said
+    /// anything.
+    pub fn diagnostic(&self) -> Option<String> {
+        self.diagnostic.as_ref()?.text(Duration::ZERO)
+    }
+
+    /// `what` went wrong with the host; for a jailed one, with what td-jail
+    /// said and how it ended, the first failure giving it a moment to
+    /// finish both.
+    fn failed(&mut self, what: String) -> String {
+        let Some(tail) = &self.diagnostic else {
+            return what;
+        };
+        let wait = if self.waited {
+            Duration::ZERO
+        } else {
+            FAILURE_WAIT
+        };
+        self.waited = true;
+        let mut why = what;
+        if let Some(said) = tail.text(wait) {
+            why.push_str(": ");
+            why.push_str(&said);
+        }
+        let ended = self
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten());
+        if let Some(status) = ended {
+            why.push_str(&format!(" (td-jail {status})"));
+        }
+        why
     }
 
     /// Starts `program tool-host` over its standard input and output, for
@@ -455,16 +515,16 @@ impl Client {
     pub fn call(&mut self, call: Call) -> Result<u64, String> {
         let id = self.next;
         self.next = self.next.saturating_add(1);
-        frame::write(&mut self.writer, &Down::Call { id, call }.encode())
-            .map_err(|e| format!("the tool host: {e}"))?;
+        let sent = frame::write(&mut self.writer, &Down::Call { id, call }.encode());
+        sent.map_err(|e| self.failed(format!("the tool host: {e}")))?;
         self.open.insert(id);
         Ok(id)
     }
 
     /// Asks for call `id` to end early.
     pub fn cancel(&mut self, id: u64) -> Result<(), String> {
-        frame::write(&mut self.writer, &Down::Cancel { id }.encode())
-            .map_err(|e| format!("the tool host: {e}"))
+        let sent = frame::write(&mut self.writer, &Down::Cancel { id }.encode());
+        sent.map_err(|e| self.failed(format!("the tool host: {e}")))
     }
 
     /// The next reply to a call in flight, waiting at most `wait`; none when
@@ -480,12 +540,14 @@ impl Client {
                 Err(RecvTimeoutError::Timeout) => return None,
                 Err(RecvTimeoutError::Disconnected) if self.open.is_empty() => return None,
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Some(Err("the tool host ended with calls in flight".into()))
+                    let why = "the tool host ended with calls in flight".into();
+                    return Some(Err(self.failed(why)));
                 }
             };
             match reply {
                 Ok(Up::Output { id, .. }) if !self.open.contains(&id) => continue,
                 Ok(Up::Done { id, .. }) if !self.open.remove(&id) => continue,
+                Err(e) => return Some(Err(self.failed(e))),
                 other => return Some(other),
             }
         }
@@ -502,6 +564,19 @@ impl Drop for Client {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if let Some(spec) = &self.spec {
+            let _ = std::fs::remove_file(spec);
+            // Killing td-jail's outer process takes the instance down
+            // through each stage's parent-death signal. Its stage 2 and
+            // tool host hold the channel's other end until they are gone,
+            // so the reader's end of it is the instance's.
+            let deadline = Instant::now().checked_add(DROP_WAIT);
+            while let Some(left) = deadline.map(|at| at.saturating_duration_since(Instant::now())) {
+                if left.is_zero() || self.replies.recv_timeout(left).is_err() {
+                    break;
+                }
+            }
         }
     }
 }

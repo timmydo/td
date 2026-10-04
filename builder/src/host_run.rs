@@ -32,6 +32,17 @@ fn crate_of(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The programs an application runs beside it, each a checkout crate built
+/// as its binary and named to the application in an environment variable:
+/// td-agent's workspace jail and the td-txt its tools run
+/// (td-agent/DESIGN.md §8, td-agent/src/jail.rs).
+fn companions(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "agent" => &[("td-jail", "TD_AGENT_JAIL"), ("td-txt", "TD_AGENT_TXT")],
+        _ => &[],
+    }
+}
+
 /// The checkout, which is the working directory: the entry scripts change
 /// to it, and a verb run from anywhere else is told so before anything is
 /// built.
@@ -210,14 +221,14 @@ fn launch(root: &Path, name: &str, args: &[String]) -> Result<Infallible, String
     let tools = tools(root)?;
     let td_net = build(root, &tools, "net", "td-net")?;
     let app = build(root, &tools, crate_dir, crate_dir)?;
+    let mut command = Command::new(&td_net);
+    for (crate_dir, var) in companions(name) {
+        command.env(var, build(root, &tools, crate_dir, crate_dir)?);
+    }
     eprintln!("host-run: running {} under td-net launch", app.display());
     // td-net's launch serves the fetch socket and becomes the application,
     // as this process becomes it: the application's exit is this verb's.
-    let e = Command::new(&td_net)
-        .arg("launch")
-        .arg(&app)
-        .args(args)
-        .exec();
+    let e = command.arg("launch").arg(&app).args(args).exec();
     Err(format!("cannot run {} launch: {e}", td_net.display()))
 }
 
@@ -274,6 +285,16 @@ mod tests {
         assert_eq!(crate_of("td-news"), None);
         assert_eq!(crate_of("td-agent"), None);
         assert_eq!(crate_of(""), None);
+    }
+
+    #[test]
+    fn the_agent_is_given_its_jail_and_td_txt() {
+        assert_eq!(
+            companions("agent"),
+            [("td-jail", "TD_AGENT_JAIL"), ("td-txt", "TD_AGENT_TXT")]
+        );
+        assert!(companions("news").is_empty());
+        assert!(companions("mail").is_empty());
     }
 
     #[test]

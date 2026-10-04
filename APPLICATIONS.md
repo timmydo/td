@@ -10710,8 +10710,11 @@ the seed provisioning resolves it), and execs `td-builder host-run
 NAME`, whose whole logic is dependency-free Rust in the builder. The
 verb resolves the host's own cargo and C compiler the same way, with no
 static or musl requirement, since nothing it builds enters a build;
-builds the checkout's td-net and the application, taking each binary
-from cargo's own report of where it put it; and becomes `td-net launch
+builds the checkout's td-net and the application, and for td-agent the
+checkout's td-jail and td-txt, named to it in `TD_AGENT_JAIL` and
+`TD_AGENT_TXT` so that its tools run in §X.8's `workspace` kind, the one
+confined part of the launch, taking each binary from cargo's own report
+of where it put it; and becomes `td-net launch
 APP`, the multicall's `launch` applet, which serves the application's
 fetch service itself, in a runtime directory of the launch's own under
 the session's (`$XDG_RUNTIME_DIR/td-launch/PID`, mode 0700), and then
@@ -10785,8 +10788,9 @@ two-configuration rule requires:
 User namespaces and the workspace seccomp program are fatal
 prerequisites, as for §X.1; the unenforced aggregate caps are one named
 diagnostic. A launch from §X.7's unjailed `./agent` is how td-agent
-reaches this kind on a host; that wiring is td-agent's (its DESIGN.md
-§8 and §18).
+reaches this kind on a host: `./agent` builds td-jail and td-txt and
+names them to td-agent, which writes each instance's spec and launches
+td-jail itself (its DESIGN.md §8).
 
 ## Z. No server infrastructure
 

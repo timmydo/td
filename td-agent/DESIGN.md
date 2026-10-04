@@ -2013,6 +2013,36 @@ tests named above run with td-agent's launch in the next commit; the
 kind's own live test launches it on a socket, reads its plan back from
 inside, and is ignored where unprivileged user namespaces are absent.
 
+**As built (increment 10, the launch).** `./agent` builds td-jail and
+td-txt from the checkout beside td-agent and names them in
+`TD_AGENT_JAIL` and `TD_AGENT_TXT`; without them every tool is refused
+with that reason. `jail::launch` writes an instance's spec, mode 0600,
+under a 0700 directory of the caller's, creates the instance's 0700
+home, and starts `td-jail --workspace PID SPEC tool-host --txt
+/opt/workspace/bin/td-txt --root DIR...` with one end of a stream
+socketpair as its standard input and output and an empty environment;
+the tool host's roots are the worktrees and the shared directories,
+never the home. td-jail must be named `td-jail`, since its argv[0]
+selects its kind. td-jail's own standard error is read into a bounded
+tail of bytes, decoded whole, that any failure of the host's channel
+reports with how td-jail ended. Dropping the client kills td-jail's
+outer process, which takes stage 1 and the whole instance with it
+through their parent-death signals, removes the spec, and waits, at
+most five seconds, for the instance to let go of the channel. The
+instance's stage 2 holds it, so the wait ends as the namespace's init
+exits; the kernel kills that namespace's last processes as it does,
+and a system call already under way in one of them may still complete.
+The drop blocks its thread for that wait, and the first channel failure
+for up to two seconds while td-jail finishes its account.
+The caller names the spec directory; a conversation's are under
+`$XDG_STATE_HOME/td-agent/jail/`, outside `/tmp`, which td-jail
+reserves, and a specs directory and a home are named as they resolve.
+Ignored live tests, which name
+td-jail and td-txt as `./agent` does, run file, grep and shell calls in
+an instance and read its confinement back from inside, and kill a
+launching process with `SIGKILL` and find no process of its instance
+left, the command it was running included.
+
 **Unconfined workspaces.** The one way to run tools without a jail is a
 choice the human makes when creating a directory or scratch workspace;
 repository workspaces are always jailed. It is shown in the status row and

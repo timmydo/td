@@ -37,6 +37,7 @@ pub mod files;
 pub mod frame;
 pub mod history;
 pub mod host;
+pub mod jail;
 pub mod key;
 pub mod keydialog;
 pub mod menu;
