@@ -19,7 +19,8 @@ conversations, the orchestrator first, beside the open one. Each message\n\
 is a turn with the configured model through OpenRouter, by way of td's\n\
 fetch service: run it as ./agent from a td checkout, which serves that.\n\
 \n\
-Keys: C-Return sends the composer (Return is a newline); C-r asks a\n\
+Keys: Return in the composer sends it (S-Return is a newline, and\n\
+C-Return sends from outside a dialog); C-r asks a\n\
 failed turn again; C-n starts a conversation; C-PageUp and C-PageDown\n\
 open the one above or below; F6 and S-F6 move the focus between the\n\
 list, the transcript and the composer; F10 opens the menus: File's\n\

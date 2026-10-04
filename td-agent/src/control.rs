@@ -63,7 +63,7 @@ pub const BINDINGS: &[Binding] = &[
         name: "send",
         chord: Some("C-Return"),
         arguments: "",
-        help: "Send the composer's text; Return is a newline.",
+        help: "Send the composer's text, as Return in the composer does; S-Return is a newline.",
     },
     Binding {
         name: "retry",

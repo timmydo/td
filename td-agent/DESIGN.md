@@ -599,7 +599,8 @@ visible from the list.
 - approval and question cards (§11), composed from the toolkit's existing
   action buttons and wrapped text block, never transcript text.
 - the todo list (§12), collapsed to its item in progress until opened.
-- the composer, an editable pane. `C-Return` sends; `Return` is a newline.
+- the composer, an editable pane. `Return` sends, as `C-Return` does from
+  outside a dialog; `S-Return` is a newline.
 - a status row: the model, the mode (`ask` or `auto`), the network policy,
   whether the workspace is unconfined, context used against the model's
   length, the resource limits (`no limits` until §8's land), the count
@@ -3277,8 +3278,9 @@ follows:
 **As built (increment 4).** The window increment declared
 `native-compositor-tests`, with one case in `tests/control_process.rs`:
 keys typed through the headless compositor's seat send a message to the
-orchestrator, start a conversation and send there (`Return` a newline,
-`C-Return` the send), and switch back, each result read from the store.
+orchestrator, start a conversation and send there (`S-Return` a
+newline, `Return` and `C-Return` the send), and switch back, each result
+read from the store.
 `tests/processes.rs` drives the built program's conversation personality
 over real socketpairs: a killed child restarted from its log and going
 on from it, a child failing every start left failed after three

@@ -292,8 +292,9 @@ struct Regions {
     status: Rect,
 }
 
-/// The composer: one editable document in td-ui's editor pane. `C-Return`
-/// sends it; `Return` is the pane's own newline.
+/// The composer: one editable document in td-ui's editor pane. `Return`
+/// sends it, as `C-Return` does from outside a dialog; `S-Return` is the
+/// pane's own newline.
 struct Composer {
     pane: Pane,
     tab: Option<TabId>,
@@ -458,11 +459,11 @@ const TRANSCRIPT_KEYS: &[(&str, &str)] = &[
     ("C-S-c", "Copy the focused message whole."),
 ];
 const COMPOSER_KEYS: &[(&str, &str)] = &[
-    ("Return", "Start a new line."),
     (
-        "C-Return",
+        "Return/C-Return",
         "Send the text to the open conversation and empty the composer; blank text is not sent.",
     ),
+    ("S-Return", "Start a new line."),
     ("C-c/C-Insert", "Copy the selection."),
     ("C-x", "Cut the selection."),
     ("C-v/S-Insert", "Paste."),
@@ -3083,6 +3084,18 @@ impl App {
                 }
             }
             Focus::Composer => match chord {
+                // Return sends, as a chat's composer does; a held one
+                // sends once and types nothing.
+                "Return" => {
+                    if !repeat {
+                        self.send();
+                    }
+                }
+                "S-Return" => {
+                    if self.composer.chord("Return") {
+                        self.touch();
+                    }
+                }
                 "C-c" | "C-Insert" | "C-x" if !repeat => {
                     let Some(snapshot) = self.composer.selection() else {
                         return;
@@ -3566,20 +3579,33 @@ pub mod tests {
     }
 
     #[test]
-    fn return_is_a_newline_and_c_return_sends_and_empties_the_composer() {
+    fn return_sends_and_empties_the_composer_and_s_return_is_a_newline() {
         let mut app = app();
-        for chord in ["h", "i", "Return", "t", "h", "e", "r", "e"] {
+        for chord in ["h", "i", "S-Return", "t", "h", "e", "r", "e"] {
             key(&mut app, chord);
         }
         assert_eq!(app.composed(), "hi\nthere");
-        assert!(app.take_requests().is_empty(), "Return sends nothing");
-        key(&mut app, "C-Return");
+        assert!(app.take_requests().is_empty(), "S-Return sends nothing");
+        key(&mut app, "Return");
         assert_eq!(app.take_requests(), [Request::Send("hi\nthere".into())]);
         assert_eq!(app.composed(), "");
+        // C-Return sends too; a held Return sends once and types nothing.
+        key(&mut app, "x");
+        key(&mut app, "C-Return");
+        assert_eq!(app.take_requests(), [Request::Send("x".into())]);
+        key(&mut app, "y");
+        app.key("Return", true, &mut NoClipboard);
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.composed(), "y");
+        // A held S-Return types a line break each time.
+        app.key("S-Return", true, &mut NoClipboard);
+        assert_eq!(app.composed(), "y\n");
         // An empty or blank composer sends nothing.
-        key(&mut app, "C-Return");
-        key(&mut app, "space");
-        key(&mut app, "C-Return");
+        app.composer.fresh();
+        key(&mut app, "Return");
+        key(&mut app, "Space");
+        assert_eq!(app.composed(), " ");
+        key(&mut app, "Return");
         assert!(app.take_requests().is_empty());
     }
 

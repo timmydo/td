@@ -30,6 +30,7 @@ const KEY_I: u32 = 23;
 const KEY_O: u32 = 24;
 const KEY_ENTER: u32 = 28;
 const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTSHIFT: u32 = 42;
 const KEY_A: u32 = 30;
 const KEY_S: u32 = 31;
 const KEY_K: u32 = 37;
@@ -418,9 +419,10 @@ fn wait<T>(agent: &AgentProcess, what: &str, mut ready: impl FnMut() -> Option<T
     }
 }
 
-/// The window opens the orchestrator, creating it; `hi` and Control-Return
-/// sends it to the orchestrator's log; Control-N starts a conversation
-/// whose process logs `yo` and titles it so; Control-PageUp opens the
+/// The window opens the orchestrator, creating it; `hi` and Return sends
+/// it to the orchestrator's log; Control-N starts a conversation, where
+/// `yo`, Shift-Return and `o` sent with Control-Return log `yo` and `o`
+/// on two lines and title it `yo`; Control-PageUp opens the
 /// orchestrator again in a fresh process, which goes on from its log.
 /// Every step is a chord through the compositor's seat, and every result
 /// is read from the store.
@@ -447,7 +449,7 @@ fn messages_typed_into_the_window_land_in_each_conversations_log() {
 
     compositor.chord(&[], KEY_H);
     compositor.chord(&[], KEY_I);
-    compositor.chord(&[KEY_LEFTCTRL], KEY_ENTER);
+    compositor.chord(&[], KEY_ENTER);
     wait(&agent, "hi lands in the orchestrator's log", || {
         (agent.conversations() == [orchestrator(&["hi"])]).then_some(())
     });
@@ -455,8 +457,9 @@ fn messages_typed_into_the_window_land_in_each_conversations_log() {
     compositor.chord(&[KEY_LEFTCTRL], KEY_N);
     compositor.chord(&[], KEY_Y);
     compositor.chord(&[], KEY_O);
-    // Return is a newline in the composer, not a send.
-    compositor.chord(&[], KEY_ENTER);
+    // Shift-Return is a newline in the composer, not a send; Control-
+    // Return sends as Return does.
+    compositor.chord(&[KEY_LEFTSHIFT], KEY_ENTER);
     compositor.chord(&[], KEY_O);
     compositor.chord(&[KEY_LEFTCTRL], KEY_ENTER);
     let conversation = (
