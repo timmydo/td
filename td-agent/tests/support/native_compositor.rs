@@ -592,7 +592,7 @@ fn the_conversation_menu_chooses_a_model_the_conversation_logs() {
     wait(&agent, "typing filters to the model", || {
         agent
             .state()
-            .contains("picker=anthropic/claude-haiku-4.5\tquery=haiku")
+            .contains("picker=anthropic/claude-haiku-4.5\tpicking=conversation\tquery=haiku")
             .then_some(())
     });
     compositor.chord(&[], KEY_ENTER);

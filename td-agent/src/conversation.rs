@@ -68,6 +68,8 @@ pub const NO_SETTINGS: &str = "no settings from the window";
 
 /// Where a refusal says the human chose the conversation's model.
 const CHOSEN: &str = "the conversation's model (Conversation \u{2192} Model\u{2026})";
+/// Where a conversation with no model of its own gets one (DESIGN.md §4).
+const DEFAULT: &str = "`model` or the default model (Conversation \u{2192} Default model\u{2026})";
 /// How long a request waits for the window to answer: a reservation, a
 /// message queued, the conversations' states.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
@@ -782,14 +784,14 @@ impl Session {
             Err(why) => return Ok(Outcome::stop(why)),
         };
         let role = self.conversation.meta().role;
-        // The human's choice for this conversation, else the
-        // configuration's (§4, §5).
+        // The human's choice for this conversation, else the default:
+        // the configuration's, or the window's for a conversation (§4).
         let meta = self.conversation.meta();
         let (chosen, chosen_effort) = (meta.model.clone(), meta.effort.clone());
         let setting = match (&chosen, role) {
             (Some(_), _) => CHOSEN,
             (None, Role::Orchestrator) => "`orchestrator_model`",
-            (None, Role::Conversation) => "`model`",
+            (None, Role::Conversation) => DEFAULT,
         };
         let name = chosen.unwrap_or_else(|| client.model_for(role).to_string());
         let reasoning_effort = chosen_effort.unwrap_or_else(|| client.reasoning_effort.clone());

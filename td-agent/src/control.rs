@@ -38,8 +38,8 @@ impl ErrorCode for Refusal {
 }
 
 /// The window's actions, each its default chord; `set-key`, `model`,
-/// `export-diagnostics` and `delete-conversation` have none, and are menu
-/// items.
+/// `default-model`, `export-diagnostics` and `delete-conversation` have
+/// none, and are menu items.
 pub const BINDINGS: &[Binding] = &[
     Binding {
         name: "new",
@@ -126,6 +126,12 @@ pub const BINDINGS: &[Binding] = &[
         help: "Conversation > Model...: open the picker of the open conversation's model: type to filter, Return chooses, Escape cancels.",
     },
     Binding {
+        name: "default-model",
+        chord: None,
+        arguments: "",
+        help: "Conversation > Default model...: open the picker for the model new conversations, and those with no model of their own, use.",
+    },
+    Binding {
         name: "delete-conversation",
         chord: None,
         arguments: "",
@@ -177,13 +183,14 @@ impl Controller for Remote<'_> {
         // Through the menu's own paths, as a choice of its item.
         if matches!(
             name,
-            "set-key" | "model" | "export-diagnostics" | "delete-conversation"
+            "set-key" | "model" | "export-diagnostics" | "delete-conversation" | "default-model"
         ) {
             let before = self.app.generation();
             match name {
                 "set-key" => self.app.open_key_dialog(),
                 "model" => self.app.open_picker(),
                 "delete-conversation" => self.app.open_delete(),
+                "default-model" => self.app.open_default_picker(),
                 _ => self.app.export_diagnostics(),
             }
             return Ok(self.outcome(before));
@@ -257,16 +264,18 @@ impl Controller for Remote<'_> {
             (picker.selected().unwrap_or("nothing"), picker.query())
         });
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tstatus={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
             app.transcript().len(),
             app.composed().len(),
             if app.menu_open() { "open" } else { "closed" },
+            app.picking(),
             app.confirm().map_or("none", |confirm| confirm.focus()),
             app.model(),
             app.effort(),
+            app.default_model(),
             app.status_line().replace(['\t', '\n'], " "),
         ))
     }
@@ -397,6 +406,38 @@ mod tests {
         assert_eq!(remote.app.take_requests(), [Request::Export]);
     }
 
+    /// `default-model` opens the default's picker, which the state names.
+    #[test]
+    fn the_default_model_is_driven_through_its_picker() {
+        let mut app = crate::ui::tests::app();
+        let offer = |id: &str| crate::picker::Offer {
+            id: id.into(),
+            price: String::new(),
+            usable: true,
+            reasoning: true,
+        };
+        app.set_offers(vec![offer("m/conv"), offer("m/new")], "medium");
+        let mut remote = Remote { app: &mut app };
+        assert!(driven::request(&mut remote, b"1\t1\taction\tdefault-model").ends_with("changed"));
+        assert!(remote
+            .state()
+            .unwrap()
+            .contains("picker=m/conv\tpicking=default\t"));
+        driven::request(
+            &mut remote,
+            format!("1\t2\tkey\t{}", hex("Down")).as_bytes(),
+        );
+        driven::request(
+            &mut remote,
+            format!("1\t3\tkey\t{}", hex("Return")).as_bytes(),
+        );
+        assert!(remote.state().unwrap().contains("picking=none"));
+        assert_eq!(
+            remote.app.take_requests(),
+            [Request::SetDefault("m/new".into())]
+        );
+    }
+
     /// `delete-conversation` asks, and the state says where the
     /// question's keyboard is.
     #[test]
@@ -436,17 +477,25 @@ mod tests {
         let mut remote = Remote { app: &mut app };
         let state = remote.state().unwrap();
         assert!(
-            state.contains("picker=none\tquery=\tconfirm=none\tmodel=m/orch\teffort=medium"),
+            state.contains(
+                "picker=none\tpicking=none\tquery=\tconfirm=none\tmodel=m/orch\teffort=medium\tdefault=m/conv\t"
+            ),
             "{state}"
         );
         assert!(driven::request(&mut remote, b"1\t1\taction\tmodel").ends_with("changed"));
-        assert!(remote.state().unwrap().contains("picker=m/orch\tquery="));
+        assert!(remote
+            .state()
+            .unwrap()
+            .contains("picker=m/orch\tpicking=conversation\tquery="));
         for (n, c) in ["c", "o", "n", "v"].iter().enumerate() {
             let line = format!("1\t{}\tkey\t{}", 10 + n, hex(c));
             assert!(driven::request(&mut remote, line.as_bytes()).ends_with("changed"));
         }
         let state = remote.state().unwrap();
-        assert!(state.contains("picker=m/conv\tquery=conv"), "{state}");
+        assert!(
+            state.contains("picker=m/conv\tpicking=conversation\tquery=conv"),
+            "{state}"
+        );
         driven::request(
             &mut remote,
             format!("1\t20\tkey\t{}", hex("Return")).as_bytes(),

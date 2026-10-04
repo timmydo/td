@@ -168,6 +168,10 @@ pub struct Session {
     ledger: Ledger,
     fetcher: Option<Fetcher>,
     client: Client,
+    /// The configuration's `model` key as the window started with it,
+    /// which a default chosen here is set over when the file cannot be
+    /// read again (DESIGN.md §4).
+    model_key: Option<String>,
     post: Post,
     /// Where the key dialog stores the key; none without a configuration
     /// directory.
@@ -228,6 +232,7 @@ impl Session {
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
                 Request::Export => self.export(),
                 Request::Delete(id) => self.delete(&id),
+                Request::SetDefault(model) => self.set_default(model),
                 Request::Quit => self.quit = true,
             }
         }
@@ -387,6 +392,40 @@ impl Session {
         self.exported();
     }
 
+    /// The configuration file, beside the key file.
+    fn config_file(&self) -> Option<PathBuf> {
+        self.key_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("config"))
+    }
+
+    /// Makes `model` the default (DESIGN.md §4): saved over the
+    /// configuration's `model` key as the file says it now, then every
+    /// conversation with no model of its own uses it from its next turn.
+    fn set_default(&mut self, model: String) {
+        let over = match crate::config::load(self.config_file().as_deref()) {
+            Ok(config) => config.model_key,
+            Err(e) => {
+                eprintln!("td-agent: the configuration: {e}");
+                self.model_key.clone()
+            }
+        };
+        if let Err(e) = self.state.save_default_model(&model, over.as_deref()) {
+            eprintln!("td-agent: the default model: {e}");
+            return self
+                .app
+                .note(format!("the default model was not saved: {e}"));
+        }
+        self.client.model = model;
+        self.supervisor.reconfigure(self.client.clone());
+        self.app.set_default_model(&self.client.model);
+        self.app.note(format!(
+            "the default model is {}: new conversations, and those with no model of their own, use it from their next turn",
+            self.client.model
+        ));
+    }
+
     /// Deletes conversation `id` for good (DESIGN.md §4): its process
     /// ends, what was queued for it goes, then its directory; the window
     /// opens the orchestrator in its place when it was the one open.
@@ -452,11 +491,7 @@ impl Session {
         };
         let downloads = home.join("Downloads");
         let into = if downloads.is_dir() { downloads } else { home };
-        let config = self
-            .key_path
-            .as_deref()
-            .and_then(Path::parent)
-            .map(|dir| dir.join("config"));
+        let config = self.config_file();
         // Every key this window has held, and the stored one, only to
         // look for: no file holding one is taken.
         let mut keys = self.keys.clone();
@@ -651,6 +686,23 @@ impl Handler for Session {
     }
 }
 
+/// The model a conversation with no model of its own uses (DESIGN.md
+/// §4): the window's saved default while the configuration's `model` key
+/// (`key`, none when left out) is what it was set over, else
+/// `configured`, the configuration's, edited since and so the newer; and
+/// a saved default so set aside, to be said and forgotten.
+fn default_model(
+    key: Option<&str>,
+    configured: &str,
+    saved: Option<(String, Option<String>)>,
+) -> (String, Option<String>) {
+    match saved {
+        Some((model, over)) if over.as_deref() == key => (model, None),
+        Some((model, _)) => (configured.to_string(), Some(model)),
+        None => (configured.to_string(), None),
+    }
+}
+
 /// The conversations the store holds, as the list shows them, closed.
 fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
     let (metas, mut problems) = state.list();
@@ -735,7 +787,27 @@ pub fn run(
         .find(|r| r.role == Role::Orchestrator)
         .map(|r| r.id.clone());
     app.set_rows(rows);
-    let client = config.client.clone();
+    let mut client = config.client.clone();
+    let model_key = config.model_key.clone();
+    let (model, set_aside) = default_model(
+        model_key.as_deref(),
+        &client.model,
+        state.load_default_model(),
+    );
+    client.model = model;
+    // Once the configuration has won it stays won, even if `model` goes
+    // back to what the default was set over.
+    if let Some(set_aside) = set_aside {
+        let said = format!(
+            "the default model {set_aside}, chosen in the window, is set aside: the configuration's `model` changed since, and new conversations use {}",
+            client.model
+        );
+        eprintln!("td-agent: {said}");
+        app.note(said);
+        if let Err(e) = state.forget_default_model() {
+            eprintln!("td-agent: the default model: {e}");
+        }
+    }
     app.set_models(&client.model, &client.orchestrator_model, Vec::new());
     app.set_offers(Vec::new(), &client.reasoning_effort);
     app.set_limits(client.limits);
@@ -771,6 +843,7 @@ pub fn run(
         ledger,
         fetcher,
         client,
+        model_key,
         post: Post::new(outbox),
         key_path,
         quit: false,
@@ -812,4 +885,41 @@ pub fn run(
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
     );
     td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_model;
+
+    #[test]
+    fn the_saved_default_holds_until_the_configuration_changes_model() {
+        let saved = |over: Option<&str>| Some(("a/new".to_string(), over.map(String::from)));
+        let chosen = ("a/new".to_string(), None);
+        assert_eq!(
+            default_model(Some("c/old"), "c/old", saved(Some("c/old"))),
+            chosen
+        );
+        // Set over no `model` key: td-agent's built-in default changing
+        // is no edit.
+        assert_eq!(default_model(None, "built/in2", saved(None)), chosen);
+        // Edited since: the configuration's wins, and the default is set
+        // aside.
+        let set_aside = Some("a/new".to_string());
+        assert_eq!(
+            default_model(Some("c/edited"), "c/edited", saved(Some("c/old"))),
+            ("c/edited".to_string(), set_aside.clone())
+        );
+        assert_eq!(
+            default_model(Some("c/added"), "c/added", saved(None)),
+            ("c/added".to_string(), set_aside.clone())
+        );
+        assert_eq!(
+            default_model(None, "built/in", saved(Some("c/old"))),
+            ("built/in".to_string(), set_aside)
+        );
+        assert_eq!(
+            default_model(Some("c/old"), "c/old", None),
+            ("c/old".to_string(), None)
+        );
+    }
 }

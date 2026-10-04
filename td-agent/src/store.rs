@@ -28,6 +28,8 @@ const O_NOFOLLOW: i32 = 0o400000;
 const MAX_META: u64 = 64 * 1024;
 /// The longest `prefix` read back.
 pub const MAX_PREFIX: u64 = 1024 * 1024;
+/// The file holding the window's default model.
+const DEFAULT_MODEL: &str = "default-model";
 /// The name a conversation's directory takes while it is deleted.
 const DELETING: &str = ".deleting-";
 /// The longest log loaded; a longer one is refused rather than read.
@@ -285,6 +287,51 @@ impl StateDir {
         let rest = text.strip_prefix("share ")?.strip_suffix('\n')?;
         let (first, total) = rest.split_once(' ')?;
         Some((first.parse().ok()?, total.parse().ok()?))
+    }
+
+    /// The default model the window last set (DESIGN.md §4) and the
+    /// configuration's `model` key it was set over, none when the key was
+    /// left out: `model <id>` then `over <id>` or a bare `over`. Anything
+    /// else is no default.
+    pub fn load_default_model(&self) -> Option<(String, Option<String>)> {
+        // Two model ids and their keys, at the longest.
+        let bound = 2 * crate::config::MAX_NAME as u64 + 16;
+        let text = read_bounded(&self.root.join(DEFAULT_MODEL), bound).ok()?;
+        let text = std::str::from_utf8(&text).ok()?;
+        let (model, over) = text.strip_suffix('\n')?.split_once('\n')?;
+        let model = crate::config::model_id("model", model.strip_prefix("model ")?).ok()?;
+        let over = match over.strip_prefix("over")? {
+            "" => None,
+            id => Some(crate::config::model_id("model", id.strip_prefix(' ')?).ok()?),
+        };
+        Some((model, over))
+    }
+
+    /// Saves the default model, set over the configuration's `model` key
+    /// `over`, replacing the file whole.
+    pub fn save_default_model(&self, model: &str, over: Option<&str>) -> Result<(), String> {
+        crate::config::model_id("the default model", model)?;
+        let over = match over {
+            Some(id) => format!("over {}", crate::config::model_id("`model`", id)?),
+            None => "over".to_string(),
+        };
+        replace(
+            &self.root,
+            DEFAULT_MODEL,
+            format!("model {model}\n{over}\n").as_bytes(),
+        )
+    }
+
+    /// Forgets the default model: the configuration's `model` key changed
+    /// since it was chosen, and is the newer.
+    pub fn forget_default_model(&self) -> Result<(), String> {
+        let path = self.root.join(DEFAULT_MODEL);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("{}: {e}", path.display()))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Saves the split's share, replacing the file whole.
@@ -2159,6 +2206,44 @@ pub mod tests {
             .unwrap();
         assert!(conversation.delivered("d1"));
         assert!(!conversation.delivered("d2"));
+    }
+
+    #[test]
+    fn the_default_model_is_saved_whole_and_read_back() {
+        let scratch = Scratch::new("default");
+        let state = scratch.state();
+        assert_eq!(state.load_default_model(), None);
+        state.save_default_model("a/b", None).unwrap();
+        assert_eq!(state.load_default_model(), Some(("a/b".into(), None)));
+        // The longest ids round-trip.
+        let longest = "m".repeat(crate::config::MAX_NAME);
+        state.save_default_model(&longest, Some(&longest)).unwrap();
+        assert_eq!(
+            state.load_default_model(),
+            Some((longest.clone(), Some(longest)))
+        );
+        state.save_default_model("a/b", Some("c/d")).unwrap();
+        assert_eq!(
+            state.load_default_model(),
+            Some(("a/b".into(), Some("c/d".into())))
+        );
+        // Not a model id: refused, and the file kept.
+        assert!(state.save_default_model("a b", None).is_err());
+        assert!(state.save_default_model("a/b", Some("")).is_err());
+        assert_eq!(state.load_default_model().unwrap().0, "a/b");
+        for text in [
+            "model a/b\n",
+            "model a b\nover c/d\n",
+            "over c/d\nmodel a/b\n",
+            "model a/b\noverc/d\n",
+            "model a/b\nover \n",
+        ] {
+            std::fs::write(state.root().join(DEFAULT_MODEL), text).unwrap();
+            assert_eq!(state.load_default_model(), None, "{text:?}");
+        }
+        state.forget_default_model().unwrap();
+        assert!(!state.root().join(DEFAULT_MODEL).exists());
+        state.forget_default_model().unwrap();
     }
 
     #[test]

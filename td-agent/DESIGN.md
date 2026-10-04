@@ -825,7 +825,9 @@ model and reasoning effort. The configuration's `model` (or
 `orchestrator_model`) and `reasoning_effort` (§15) are what a
 conversation starts with and keeps until the human chooses otherwise,
 and a choice is the open conversation's alone: it moves to no other,
-and the configuration file is never written.
+and the configuration file is never written. The default model, which
+a conversation with no model of its own uses, can be chosen from the
+window too (below).
 
 - **The menu.** The bar's second header, `Conversation`, lies between
   `File` and `Help`. Its items are `Model…`, which opens the picker below, and
@@ -873,9 +875,25 @@ and the configuration file is never written.
   transcript naming the model and effort (or `no reasoning`) `from the
   next request`; the
   history tools show the event to a model as the person's choice.
+- **The default model.** `Default model…`, an item of the same menu,
+  on with or without a conversation open, opens the same picker titled
+  for the default, the default marked and selected. A model chosen
+  there is saved as `default-model` in the state directory (§6), with
+  the configuration's `model` it was set over, and replaces that
+  `model`: the window sends every conversation's process a fresh
+  `Setup`, which it takes between turns as it takes a key, so new
+  conversations and those with no model of their own use it from their
+  next turn. The orchestrator keeps `orchestrator_model`. What it is
+  set over is the configuration's `model` key as the file says it at
+  that moment, read again, or that the key is left out, so a change to
+  td-agent's built-in default is no edit. At start the saved default
+  holds while that key is unchanged; a `model` edited since is the
+  newer and wins, and the window forgets the saved default and says so
+  in a notice. The configuration file is not written.
 - **Refusals** that name where a model was set (§5) say `the
-  conversation's model (Conversation → Model…)` for a chosen one, and
-  the configuration key otherwise.
+  conversation's model (Conversation → Model…)` for a chosen one,
+  `orchestrator_model` for the orchestrator's otherwise, and `` `model`
+  or the default model (Conversation → Default model…) `` for another's.
 - **The status row** names the open conversation's model and then its
   effort (`anthropic/claude-sonnet-5.5 medium`), or `no reasoning` for
   a model that does not take one, and its context length is looked up
@@ -883,7 +901,9 @@ and the configuration file is never written.
 - **Driven.** The actions gain `model`, which has no chord and opens
   the picker through the item's own path; the state gains `picker` (the
   selected model, `nothing`, or `none` when closed), `query` (the
-  filter), `model` and `effort`.
+  filter), `model` and `effort`; and `default-model`, which opens the
+  default's picker, `picking` (`default`, `conversation` or `none`) and
+  `default`, the default model.
 
 **As built (the system context).** The transcript shows what every
 request begins with. Its first message, headed `system`, is the
@@ -2765,8 +2785,9 @@ fragment or space, so the key is never sent in the clear; a trailing
 of `none`, `minimal`, `low`, `medium`, `high` and `xhigh`. A limit is a
 non-negative number of credits, or `none`. `model`, `orchestrator_model`
 and `reasoning_effort` are what a conversation starts with; the
-Conversation menu chooses another for one conversation (§4), which this
-file never records. The key file is not a key of
+Conversation menu chooses another for one conversation, and a default
+model the window saves replaces `model` until the key is edited (§4);
+this file records neither. The key file is not a key of
 this file (§6).
 
 ## 16. Prior art: opencode

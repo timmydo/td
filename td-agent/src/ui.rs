@@ -206,10 +206,12 @@ pub enum Request {
     Export,
     /// Delete this conversation for good, as the human confirmed.
     Delete(Id),
+    /// Make this the default model, from Conversation → Default model….
+    SetDefault(String),
     /// Close the window, from File → Quit.
     Quit,
     /// The open conversation's model and effort as the human chose them,
-    /// whole; none is the configuration's.
+    /// whole; none is the default.
     Choose {
         model: Option<String>,
         effort: Option<String>,
@@ -484,8 +486,11 @@ pub struct App {
     /// A prefix is in force, shown or said not to be, since the
     /// transcript was last cleared, so a later one replaces it.
     system_shown: bool,
-    /// The model picker while it is open, modal over the window.
+    /// The model picker while it is open, modal over the window, and
+    /// whether it chooses the default rather than the open
+    /// conversation's.
     picker: Option<Picker>,
+    picking_default: bool,
     /// The question before a conversation is deleted, while it is open,
     /// modal over the window; its revision counts the questions asked.
     confirm: Option<Confirm>,
@@ -576,6 +581,7 @@ impl App {
             asked: VecDeque::new(),
             system_shown: false,
             picker: None,
+            picking_default: false,
             confirm: None,
             confirm_revision: 0,
             menu_revision: 1,
@@ -741,7 +747,7 @@ impl App {
     }
 
     /// The open conversation's model: the human's choice, else the
-    /// configuration's for its role.
+    /// default for its role.
     pub fn model(&self) -> &str {
         if let Some(model) = &self.choice.0 {
             return model;
@@ -790,6 +796,28 @@ impl App {
             .iter()
             .find(|r| r.role == Role::Orchestrator)
             .map(|r| r.id.clone())
+    }
+
+    /// The default model is now `model`.
+    pub fn set_default_model(&mut self, model: &str) {
+        self.models.0 = model.to_string();
+        self.touch();
+    }
+
+    /// The default model: the one a conversation with no model of its
+    /// own uses.
+    pub fn default_model(&self) -> &str {
+        &self.models.0
+    }
+
+    /// What the open picker chooses: `default`, `conversation`, or
+    /// `none` when it is closed.
+    pub fn picking(&self) -> &'static str {
+        match (&self.picker, self.picking_default) {
+            (None, _) => "none",
+            (Some(_), true) => "default",
+            (Some(_), false) => "conversation",
+        }
     }
 
     /// The question before a deletion, while it is open.
@@ -889,8 +917,7 @@ impl App {
     /// Shows conversation `id`, its transcript empty until its process
     /// replays its log, and every other conversation closed.
     pub fn set_active(&mut self, id: Id) {
-        // A model is chosen, and a deletion asked, for the conversation
-        // the picker or the question opened over.
+        // A modal opened over one conversation is not left over another.
         if self.picker.take().is_some() | self.confirm.take().is_some() {
             self.apply_focus();
         }
@@ -2184,6 +2211,7 @@ impl App {
             menu::Action::Quit => self.requests.push(Request::Quit),
             menu::Action::Model => self.open_picker(),
             menu::Action::Delete => self.open_delete(),
+            menu::Action::DefaultModel => self.open_default_picker(),
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
             // The list is the window's: `input_live` reports the choice.
             menu::Action::Keys => self.keys_chosen = true,
@@ -2241,19 +2269,47 @@ impl App {
     /// Opens the model picker for the open conversation, modal over the
     /// window's body.
     pub fn open_picker(&mut self) {
-        if self.picker.is_some() || self.dialog.is_some() || self.confirm.is_some() {
+        if self.modal() {
             return;
         }
         if self.active.is_none() {
             return self.note("no conversation is open to choose a model for");
         }
+        let wanted = self.wanted().0;
+        let current = wanted.unwrap_or_else(|| self.model().to_string());
+        self.show_picker(crate::picker::TITLE, &current, false);
+    }
+
+    /// Opens the model picker for the default model, which a conversation
+    /// with no model of its own uses (DESIGN.md §4), the orchestrator
+    /// aside.
+    pub fn open_default_picker(&mut self) {
+        let current = self.models.0.clone();
+        self.show_picker(crate::picker::DEFAULT_TITLE, &current, true);
+    }
+
+    /// Whether a modal is open: the picker, the key dialog or the
+    /// question.
+    fn modal(&self) -> bool {
+        self.picker.is_some() || self.dialog.is_some() || self.confirm.is_some()
+    }
+
+    fn show_picker(&mut self, title: &str, current: &str, default: bool) {
+        if self.modal() {
+            return;
+        }
         self.cancel_pointer();
         self.menu.dismiss();
-        let wanted = self.wanted().0;
-        let current = wanted.as_deref().unwrap_or_else(|| self.model());
-        match Picker::open(self.surface, body(self.surface), &self.offers, current) {
+        match Picker::open(
+            self.surface,
+            body(self.surface),
+            title,
+            &self.offers,
+            current,
+        ) {
             Ok(picker) => {
                 self.picker = Some(picker);
+                self.picking_default = default;
                 self.apply_focus();
                 self.touch();
             }
@@ -2263,6 +2319,7 @@ impl App {
 
     fn close_picker(&mut self) {
         self.picker = None;
+        self.picking_default = false;
         self.apply_focus();
         self.touch();
     }
@@ -2293,8 +2350,14 @@ impl App {
             }
             crate::picker::Reply::Closed => self.close_picker(),
             crate::picker::Reply::Chosen(model) => {
+                let default = self.picking_default;
                 self.close_picker();
-                self.choose(Some(model), self.wanted().1);
+                if default {
+                    self.requests.push(Request::SetDefault(model));
+                    self.touch();
+                } else {
+                    self.choose(Some(model), self.wanted().1);
+                }
             }
         }
     }
@@ -4796,6 +4859,58 @@ pub mod tests {
         assert!(app.active().is_none());
         assert!(app.rows().iter().all(|r| r.id != id(2)));
         assert_eq!(app.orchestrator(), Some(id(1)));
+    }
+
+    /// Conversation → Default model… opens the picker on the default,
+    /// with or without a conversation open, and its choice asks the
+    /// session to make it the default, not the open conversation's.
+    #[test]
+    fn the_default_model_is_chosen_through_its_own_picker() {
+        let mut app = app();
+        let offer = |id: &str| crate::picker::Offer {
+            id: id.into(),
+            price: String::new(),
+            usable: true,
+            reasoning: true,
+        };
+        app.set_offers(vec![offer("m/conv"), offer("m/new")], "medium");
+        app.set_active(id(2));
+        app.menu_action(menu::Action::DefaultModel);
+        assert_eq!(app.picking(), "default");
+        let picker = app.picker().unwrap();
+        assert_eq!(picker.selected(), Some("m/conv"));
+        assert!(text(&app).contains("Default model for new conversations"));
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert!(app.picker().is_none());
+        assert_eq!(app.take_requests(), [Request::SetDefault("m/new".into())]);
+        // The open conversation's own picker still chooses for it.
+        app.open_picker();
+        key(&mut app, "Return");
+        assert!(matches!(
+            app.take_requests().as_slice(),
+            [Request::Choose { .. }]
+        ));
+        // Opening another conversation closes it, nothing chosen.
+        app.open_default_picker();
+        app.set_active(id(3));
+        assert_eq!(app.picking(), "none");
+        assert!(app
+            .take_requests()
+            .iter()
+            .all(|r| !matches!(r, Request::SetDefault(_))));
+        // Escape leaves nothing of the default's picker behind.
+        app.open_default_picker();
+        key(&mut app, "Escape");
+        assert!(app.take_requests().is_empty());
+        app.open_picker();
+        key(&mut app, "Return");
+        assert!(matches!(
+            app.take_requests().as_slice(),
+            [Request::Choose { .. }]
+        ));
+        app.set_default_model("m/new");
+        assert_eq!(app.default_model(), "m/new");
     }
 
     #[test]

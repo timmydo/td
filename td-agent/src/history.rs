@@ -229,8 +229,8 @@ pub fn render(event: &Event) -> String {
         Kind::Pause { paused: false } => "the person resumed this conversation".into(),
         Kind::Choice { model, effort } => format!(
             "the person chose the model {} and the reasoning effort {}",
-            model.as_deref().unwrap_or("of the configuration"),
-            effort.as_deref().unwrap_or("of the configuration")
+            model.as_deref().unwrap_or("by default"),
+            effort.as_deref().unwrap_or("by default")
         ),
         Kind::Approval { outcome, by, .. } => approval(outcome, by),
     };

@@ -42,6 +42,8 @@ pub enum Action {
     Keys,
     /// Ask whether to delete the open conversation.
     Delete,
+    /// Choose the model new conversations start with.
+    DefaultModel,
 }
 
 /// The File menu's items: label, the chord shown beside it (one that
@@ -61,6 +63,8 @@ pub const HELP: &[(&str, &str, Action)] = &[(keys::ITEM, keys::CHORD, Action::Ke
 pub const MODEL: &str = "Model\u{2026}";
 /// The Conversation menu's submenu of efforts.
 pub const EFFORT: &str = "Effort";
+/// The Conversation menu's item that chooses the default model.
+pub const DEFAULT_MODEL: &str = "Default model\u{2026}";
 /// The Conversation menu's item that asks to delete the open one.
 pub const DELETE: &str = "Delete conversation\u{2026}";
 
@@ -123,6 +127,11 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         row: row(level, "", true, level == state.effort),
         item: Item::Action(Action::Effort(level)),
     }));
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(DEFAULT_MODEL, "", true, false),
+        item: Item::Action(Action::DefaultModel),
+    });
     nodes.push(Node {
         parent: Some(conversation),
         row: row(DELETE, "", state.open && state.deletable, false),
@@ -255,6 +264,8 @@ mod tests {
             ..OPENED
         };
         assert!(!enabled(orchestrator, DELETE));
+        // The default is chosen with or without one open.
+        assert!(enabled(closed, DEFAULT_MODEL) && enabled(OPENED, DEFAULT_MODEL));
     }
 
     #[test]

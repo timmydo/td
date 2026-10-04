@@ -25,9 +25,10 @@ Set OpenRouter key... stores the key and Export diagnostics writes an\n\
 archive of the state and configuration, never the key file, to\n\
 ~/Downloads (else the home directory);\n\
 Conversation's Model... and Effort choose the open conversation's model\n\
-and reasoning effort, and Delete conversation... deletes it for good;\n\
-F1, or Help > Keys, lists every key. The control socket speaks td-ui's\n\
-driven protocol.\n\
+and reasoning effort, Default model... the model new conversations use,\n\
+and Delete conversation... deletes the open one for good; F1, or\n\
+Help > Keys, lists every key. The control socket speaks td-ui's driven\n\
+protocol.\n\
 \n\
 State: $XDG_STATE_HOME/td-agent. Configuration:\n\
 $XDG_CONFIG_HOME/td-agent/config (TOML; unknown keys are refused). The\n\

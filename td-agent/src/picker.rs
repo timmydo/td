@@ -18,9 +18,12 @@ use td_ui::window::{Input, PointerPhase};
 use crate::cost::{Pricing, ONE};
 use crate::models::Model;
 
-/// The finder's title row.
+/// The finder's title row, choosing for the open conversation.
 pub const TITLE: &str =
     "Model for this conversation: type to filter, Return chooses, Escape cancels";
+/// Its title row, choosing the default.
+pub const DEFAULT_TITLE: &str =
+    "Default model for new conversations: type to filter, Return chooses, Escape cancels";
 /// How soon a second press on a row chooses it, as td-mail's finder does.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
@@ -107,6 +110,7 @@ impl Picker {
     pub fn open(
         surface: Surface,
         rect: Rect,
+        title: &str,
         offers: &[Offer],
         current: &str,
     ) -> Result<Self, String> {
@@ -127,7 +131,7 @@ impl Picker {
         }
         // Past the finder's bound in number or bytes, or a row it refused.
         let left_out = offers.len().saturating_sub(entries.len());
-        let listing = Listing::new(TITLE, entries, left_out > 0)
+        let listing = Listing::new(title, entries, left_out > 0)
             .map_err(|e| format!("the model picker: {e}"))?;
         let mut finder = Controller::new(listing, Choose::File, surface, rect, Some(current))
             .map_err(|e| format!("the model picker: {e}"))?;
@@ -295,7 +299,7 @@ mod tests {
     }
 
     fn open(current: &str) -> Picker {
-        Picker::open(surface(), surface().bounds(), &offers(), current).unwrap()
+        Picker::open(surface(), surface().bounds(), TITLE, &offers(), current).unwrap()
     }
 
     fn key(picker: &mut Picker, chord: &str) -> Reply {
@@ -382,12 +386,12 @@ mod tests {
         assert_eq!(price(pricing(1_500, 2)), "$0.002/$0.001");
         assert_eq!(price(pricing(0, 0)), "free");
         assert_eq!(price(pricing(123_456_789_000, 987_654_321_000)), "");
-        assert!(Picker::open(surface(), surface().bounds(), &[], "x").is_err());
+        assert!(Picker::open(surface(), surface().bounds(), TITLE, &[], "x").is_err());
         // Every model past the finder's bound is counted as left out.
         let many: Vec<Offer> = (0..finder::ENTRIES + 3)
             .map(|n| offer(&format!("m/{n:05}"), true))
             .collect();
-        let picker = Picker::open(surface(), surface().bounds(), &many, "m/00000").unwrap();
+        let picker = Picker::open(surface(), surface().bounds(), TITLE, &many, "m/00000").unwrap();
         assert_eq!(picker.listing().entries().len(), finder::ENTRIES);
         assert!(picker.listing().truncated());
         assert!(picker.finder.note().starts_with("3 models left out"));

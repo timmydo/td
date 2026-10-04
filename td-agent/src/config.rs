@@ -20,7 +20,7 @@ pub const DEFAULT_TITLE_MODEL: &str = "anthropic/claude-haiku-4.5";
 pub const EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const DEFAULT_EFFORT: &str = "medium";
 /// The longest base URL or model id taken.
-const MAX_NAME: usize = 2048;
+pub(crate) const MAX_NAME: usize = 2048;
 
 /// What the model client reads of the configuration: the window process
 /// parses it and hands it to every conversation process (DESIGN.md §2).
@@ -270,6 +270,9 @@ const REFUSED: [(&str, &str); 1] = [(
 pub struct Config {
     pub mode: Mode,
     pub client: Client,
+    /// The `model` key as the file gives it, none when it is left out:
+    /// what a default chosen in the window is set over (DESIGN.md §4).
+    pub model_key: Option<String>,
     /// One line per key present that a later increment reads, so a
     /// setting that does nothing yet is said, never silently ignored.
     pub notes: Vec<String>,
@@ -363,6 +366,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if let Some(word) = text("reasoning_effort")? {
         client.reasoning_effort = effort(word)?;
     }
+    config.model_key = text("model")?.map(str::to_string);
     if let Some(word) = text("data_collection")? {
         client.allow_data_collection = data_collection(word)?;
     }
@@ -463,6 +467,10 @@ mod tests {
              max_cost_per_day = 0\n",
         )
         .unwrap();
+        // The key as written, which a window default is set over; none
+        // when left out, whatever the built-in default.
+        assert_eq!(config.model_key.as_deref(), Some("a/b"));
+        assert_eq!(parse("mode = \"ask\"\n").unwrap().model_key, None);
         let client = &config.client;
         assert_eq!(client.base_url, "https://example.test/api/v1");
         assert_eq!(

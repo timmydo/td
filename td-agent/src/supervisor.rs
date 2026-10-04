@@ -241,6 +241,19 @@ impl Supervisor {
         if let Down::Setup { key: held, .. } = &mut self.setup {
             *held = Ok(key);
         }
+        self.resend_setup();
+    }
+
+    /// Settings the window changed, the default model among them: as a
+    /// stored key, every child gets them, now or when it starts.
+    pub fn reconfigure(&mut self, client: crate::config::Client) {
+        if let Down::Setup { client: held, .. } = &mut self.setup {
+            *held = client;
+        }
+        self.resend_setup();
+    }
+
+    fn resend_setup(&mut self) {
         let bytes = self.setup.encode();
         for running in self.children.iter_mut().filter(|r| !r.failed) {
             if frame::write(&mut running.writer, &bytes).is_err() {
