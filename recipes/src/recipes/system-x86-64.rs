@@ -23,13 +23,12 @@ use crate::ladder::{
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
     TD_APPLICATIONS_PLACED_MARKER, TD_BUSD_RUNTIME_MARKER, TD_CLAUDE_TERMINAL_MARKER,
-    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
-    TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER, TD_FIREFOX_CONTENT_MARKER,
-    TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER, TD_FIREFOX_SUPPORT_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER, TD_JAIL_SECCOMP_PROBE_MARKER,
-    TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY,
-    TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY, TD_NEWS_NAME,
-    TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
+    TD_FETCH_BOOT_MARKER, TD_FIREFOX_BOOT_MARKER, TD_FIREFOX_CONTENT_MARKER,
+    TD_FIREFOX_INPUT_FAILED_MARKER, TD_FIREFOX_SECCOMP_AUDIT_MARKER, TD_FIREFOX_SOAK_MARKER,
+    TD_FIREFOX_SUPPORT_MARKER, TD_INIT_RUNTIME_MARKER, TD_JAIL_KILL_REAPS_MARKER,
+    TD_JAIL_SECCOMP_PROBE_MARKER, TD_JAIL_TRANSITION_MARKER, TD_LOGIN_RUNTIME_MARKER,
+    TD_MAIL_BOOT_MARKER, TD_MAIL_ENTRY, TD_MAIL_NAME, TD_NEWS_BOOT_MARKER, TD_NEWS_ENTRY,
+    TD_NEWS_NAME, TD_PORTAL_REQUEST_RUNTIME_MARKER, TD_PORTAL_RUNTIME_MARKER,
     TD_PORTAL_UNAVAILABLE_RUNTIME_MARKER, TD_SANDBOX_KERNEL_MARKER, TD_SETUP_LIVE_MARKER,
     TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
@@ -312,6 +311,9 @@ const FIREFOX_SECCOMP_AUDIT_WAIT_ITERATIONS: u16 = 30;
 const FIREFOX_INPUT_TIMEOUT_SECS: u16 = 60;
 const FIREFOX_FOCUS_TIMEOUT_SECS: u16 = 20;
 const FIREFOX_INPUT_ATTEMPTS: u16 = 3;
+// Five stages the unit retries, and clipboard, which retries its location-bar
+// focus inside one td-jail session (two minutes at most) within the same
+// allowance.
 const FIREFOX_RETRIED_INPUT_STAGES: u16 = 6;
 const FIREFOX_DOWNLOAD_TIMEOUT_SECS: u16 = 40;
 const FIREFOX_FILE_CHOOSER_TIMEOUT_SECS: u16 = 60;
@@ -1413,6 +1415,12 @@ mod svc_timeouts {
     pub const BOOTFAIL: u32 = 300;
 }
 
+/// What the firefox-input unit runs when a stage gives up: a marker the host
+/// fails the boot on at once, then the unit's failure.
+fn firefox_input_give_up() -> String {
+    format!("{{ /bin/td-util printf \"%s\\n\" {TD_FIREFOX_INPUT_FAILED_MARKER}; exit 1; }}")
+}
+
 /// `/etc/td-svc.conf` — the boot's ordering contract, as a graph rather than as line
 /// order in the inittab.
 ///
@@ -1978,7 +1986,7 @@ fn build_td_svc_conf() -> String {
          \n\
          [firefox-input]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; primary_home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || exit 1; /bin/td-login exec-primary -- /bin/rm -f \"$primary_home/Downloads/{firefox_download_name}\" \"$primary_home/Downloads/{firefox_download_name}.part\" || exit 1; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input focus || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard && break; n=$((n+1)); case \"$n\" in 1) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_one};; 2) /bin/td-util printf \"%s\\n\" {firefox_clipboard_focus_retry_two};; *) :;; esac; /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input download || exit 1; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-primary -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || exit 1; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-focus || exit 1; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || exit 1; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-result || exit 1; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) :;; *) exit 0;; esac; primary_home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || {firefox_input_give_up}; /bin/td-login exec-primary -- /bin/rm -f \"$primary_home/Downloads/{firefox_download_name}\" \"$primary_home/Downloads/{firefox_download_name}.part\" || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_input_evidence_wait} ]; do evidence=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); [ \"$evidence\" = {firefox_completion} ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_evidence_wait} ] || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || {firefox_input_give_up}; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input focus || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input menu && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input final && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus-arm && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_input_wait} ]; do /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard-refocus && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_input_wait} ] || {firefox_input_give_up}; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input clipboard || {firefox_input_give_up}; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input download || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_download_observe_wait} ]; do if download=$(/bin/td-login exec-primary -- /bin/td-jail --probe-firefox-download); then /bin/td-util printf \"%s\\n\" \"$download\" && break; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_download_observe_wait} ] || {firefox_input_give_up}; portal_done=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_done\" ] || portal_done=0; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser || {firefox_input_give_up}; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-focus || {firefox_input_give_up}; n=0; while [ \"$n\" -lt {firefox_file_chooser_wait} ]; do portal_now=$(/bin/rg -c \"^{portal_file_chooser_completed} .* response=0$\" {portal_service_log} 2>/dev/null || :); [ -n \"$portal_now\" ] || portal_now=0; [ \"$portal_now\" -gt \"$portal_done\" ] && break; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {firefox_file_chooser_wait} ] || {firefox_input_give_up}; /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-input file-chooser-result || {firefox_input_give_up}; /bin/rm -f {firefox_input_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_input_completion} > {firefox_input_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_input_completion_tmp_path} && /bin/mv {firefox_input_completion_tmp_path} {firefox_input_completion_path} && exit 0; {firefox_input_give_up}'\n\
          after=terminal-authority-evidence\n\
          requires=terminal-authority-evidence\n\
          restart=never\n\
@@ -2150,8 +2158,7 @@ fn build_td_svc_conf() -> String {
         firefox_input_evidence_wait = FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS,
         firefox_support_attempts = FIREFOX_SUPPORT_ATTEMPTS,
         firefox_input_cmdline_token = FIREFOX_INPUT_CMDLINE_TOKEN,
-        firefox_clipboard_focus_retry_one = TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
-        firefox_clipboard_focus_retry_two = TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
+        firefox_input_give_up = firefox_input_give_up(),
         firefox_audit_cmdline_token = FIREFOX_AUDIT_CMDLINE_TOKEN,
         firefox_input_wait = FIREFOX_INPUT_ATTEMPTS,
         firefox_download_name = FIREFOX_DOWNLOAD_NAME,
@@ -6352,6 +6359,13 @@ mod tests {
             "const FOCUS_PROBE_DEADLINE: Duration = Duration::from_secs({});",
             FIREFOX_FOCUS_TIMEOUT_SECS
         )));
+        // The clipboard probe retries its focus inside one session; that
+        // session must end within the allowance the unit gives the stage.
+        let clipboard_deadline = 120;
+        assert!(firefox_probe.contains(&format!(
+            "const CLIPBOARD_PROBE_DEADLINE: Duration = Duration::from_secs({clipboard_deadline});"
+        )));
+        assert!(clipboard_deadline <= FIREFOX_INPUT_TIMEOUT_SECS * FIREFOX_INPUT_ATTEMPTS);
         assert!(firefox_probe.contains("event.isTrusted && event.target === input &&"));
         assert!(firefox_probe.contains("event.clientX >= 360 && event.clientX <= 380)"));
         assert!(FIREFOX_HTTPS_DOCUMENT.contains("left:58%;top:0;width:28%;height:100vh;"));
@@ -6636,19 +6650,20 @@ mod tests {
         assert!(unit_key("firefox-evidence", "requires").is_none());
 
         let input = unit_key("firefox-input", "exec").unwrap_or_default();
+        let give_up = firefox_input_give_up();
         assert!(input.starts_with(&format!(
             "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" \
              {FIREFOX_INPUT_CMDLINE_TOKEN} \"*) :;; *) exit 0;; esac; \
-             primary_home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || exit 1; \
+             primary_home=$(/bin/td-login exec-primary -- /bin/printenv HOME) || {give_up}; \
              /bin/td-login exec-primary -- /bin/rm -f \
              \"$primary_home/Downloads/{FIREFOX_DOWNLOAD_NAME}\" \
-             \"$primary_home/Downloads/{FIREFOX_DOWNLOAD_NAME}.part\" || exit 1; n=0; while \
+             \"$primary_home/Downloads/{FIREFOX_DOWNLOAD_NAME}.part\" || {give_up}; n=0; while \
              [ \"$n\" -lt {FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS} ]; do \
              evidence=$(/bin/td-util cat {FIREFOX_COMPLETION_PATH} 2>/dev/null); \
              [ \"$evidence\" = {FIREFOX_COMPLETION} ] && break"
         )));
         assert!(input.contains(&format!(
-            "[ \"$n\" -lt {FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS} ] || exit 1; \
+            "[ \"$n\" -lt {FIREFOX_INPUT_EVIDENCE_WAIT_ITERATIONS} ] || {give_up}; \
              n=0; while [ \"$n\" -lt {FIREFOX_INPUT_ATTEMPTS} ]; do \
              /bin/td-login exec-service-as tda65536 -- /bin/td-jail \
              --probe-firefox-input arm && break"
@@ -6661,7 +6676,7 @@ mod tests {
             "final &&",
             "clipboard-refocus-arm &&",
             "clipboard-refocus &&",
-            "clipboard &&",
+            "clipboard ||",
             "download ||",
             "file-chooser ||",
             "file-chooser-focus ||",
@@ -6689,36 +6704,33 @@ mod tests {
         let clipboard_refocus = input
             .find("--probe-firefox-input clipboard-refocus &&")
             .unwrap();
-        let clipboard = input.find("--probe-firefox-input clipboard &&").unwrap();
-        let clipboard_focus_retry_one = input
-            .find(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER)
-            .unwrap();
-        let clipboard_focus_retry_two = input
-            .find(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER)
-            .unwrap();
-        assert_eq!(
-            input
-                .matches(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER)
-                .count(),
-            1
-        );
-        assert_eq!(
-            input
-                .matches(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER)
-                .count(),
-            1
-        );
+        let clipboard = input.find("--probe-firefox-input clipboard ||").unwrap();
         assert_eq!(FIREFOX_INPUT_ATTEMPTS, 3);
-        let clipboard_retry_protocol = format!(
-            "--probe-firefox-input clipboard && break; n=$((n+1)); \
-             case \"$n\" in 1) /bin/td-util printf \"%s\\n\" \
-             {TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER};; \
-             2) /bin/td-util printf \"%s\\n\" \
-             {TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER};; \
-             *) :;; esac; /bin/td-util sleep 1; done; \
-             [ \"$n\" -lt 3 ] || exit 1"
+        // Clipboard runs once: its focus retries are td-jail's, inside one
+        // Marionette session, and the unit gives up loudly if it fails.
+        assert_eq!(
+            give_up,
+            format!(
+                "{{ /bin/td-util printf \"%s\\n\" {TD_FIREFOX_INPUT_FAILED_MARKER}; exit 1; }}"
+            )
         );
-        assert_eq!(input.matches(&clipboard_retry_protocol).count(), 1);
+        assert_eq!(
+            input
+                .matches(&format!("--probe-firefox-input clipboard || {give_up}; "))
+                .count(),
+            1
+        );
+        // Every failure says so before the unit exits: each stage's, the
+        // download and file-chooser waits', the home lookup, the download
+        // cleanup, the evidence wait and the completion's publication. Only
+        // a boot without the token leaves quietly.
+        assert_eq!(input.matches(&give_up).count(), stages.len() + 6);
+        assert_eq!(
+            input.matches("exit 1").count(),
+            input.matches(&give_up).count()
+        );
+        assert!(input.ends_with(&format!("&& exit 0; {give_up}'")));
+        assert!(!input.contains("FOCUS-RETRY"));
         let download = input.find("--probe-firefox-input download ||").unwrap();
         let file_probe = input.find("--probe-firefox-download").unwrap();
         let file_chooser = input.find("--probe-firefox-input file-chooser ||").unwrap();
@@ -6741,9 +6753,7 @@ mod tests {
                 && final_stage < clipboard_refocus_arm
                 && clipboard_refocus_arm < clipboard_refocus
                 && clipboard_refocus < clipboard
-                && clipboard < clipboard_focus_retry_one
-                && clipboard_focus_retry_one < clipboard_focus_retry_two
-                && clipboard_focus_retry_two < download
+                && clipboard < download
                 && download < file_probe
                 && file_probe < portal_completions[0]
                 && portal_completions[0] < file_chooser

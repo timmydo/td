@@ -205,6 +205,9 @@ const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER;
 const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER;
+const TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER: &str =
+    td_recipe::ladder::TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER;
+const TD_FIREFOX_INPUT_FAILED_MARKER: &str = td_recipe::ladder::TD_FIREFOX_INPUT_FAILED_MARKER;
 const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER: &str =
     td_recipe::ladder::TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER;
 const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER: &str =
@@ -531,6 +534,8 @@ struct ConsoleEvidence {
     td_term_clipboard_sent: bool,
     td_firefox_clipboard_refocus_armed: bool,
     td_firefox_clipboard_window_armed: bool,
+    td_firefox_clipboard_session_ready: bool,
+    td_firefox_input_failed: bool,
     td_firefox_clipboard_focus_retry_one: bool,
     td_firefox_clipboard_focus_retry_two: bool,
     td_firefox_clipboard_armed: bool,
@@ -6267,6 +6272,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         exact_line_window(TD_TERM_CLIPBOARD_SENT_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER),
+        exact_line_window(TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER),
+        exact_line_window(TD_FIREFOX_INPUT_FAILED_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER),
         exact_line_window(TD_FIREFOX_CLIPBOARD_ARMED_MARKER),
@@ -6689,6 +6696,18 @@ fn latch_console_evidence_from(
         &mut evidence.td_firefox_clipboard_window_armed,
         buf,
         TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_clipboard_session_ready,
+        buf,
+        TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER.as_bytes(),
+        starts_at_stream_boundary,
+    );
+    latch_line_marker(
+        &mut evidence.td_firefox_input_failed,
+        buf,
+        TD_FIREFOX_INPUT_FAILED_MARKER.as_bytes(),
         starts_at_stream_boundary,
     );
     latch_line_marker(
@@ -7619,6 +7638,12 @@ impl PhysicalInputController {
     }
 
     fn progress(&mut self, evidence: &mut ConsoleEvidence) -> Result<(), String> {
+        if evidence.td_firefox_input_failed {
+            return Err(format!(
+                "the guest's firefox-input unit gave up ({TD_FIREFOX_INPUT_FAILED_MARKER}); \
+                 the console tail says which stage"
+            ));
+        }
         if self.phase == PhysicalInputPhase::AuthorityArm && evidence.td_terminal_authority_armed {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let mut qmp = Qmp::connect_until(&self.path, deadline)?;
@@ -7745,8 +7770,11 @@ impl PhysicalInputController {
             qmp.button_until("left", deadline)?;
             self.phase = PhysicalInputPhase::FirefoxFocus;
         }
+        // Keyed on the clipboard probe's own session, not the window arm
+        // before it: opening a Marionette session moves Firefox's focus into
+        // the page, and a Control+L sent earlier is undone.
         if self.phase == PhysicalInputPhase::FirefoxFocus
-            && evidence.td_firefox_clipboard_window_armed
+            && evidence.td_firefox_clipboard_session_ready
         {
             let deadline = qmp_deadline(QMP_IO_TIMEOUT)?;
             let qmp = self
@@ -9432,6 +9460,21 @@ mod tests {
             commands
         });
 
+        // A guest input unit that gave up ends the boot at once, in any
+        // phase, before any key is sent.
+        let mut gave_up = PhysicalInputController::new(path.clone());
+        gave_up.phase = PhysicalInputPhase::FirefoxPasteArm;
+        // A retry this phase would key on is pending too: a check placed
+        // after the keying would reach for the absent QMP socket instead.
+        let mut failed = ConsoleEvidence {
+            td_firefox_input_failed: true,
+            td_firefox_clipboard_focus_retry_one: true,
+            ..ConsoleEvidence::default()
+        };
+        let error = gave_up.progress(&mut failed).unwrap_err();
+        assert!(error.contains(TD_FIREFOX_INPUT_FAILED_MARKER), "{error}");
+        assert!(gave_up.qmp.is_none());
+
         let mut controller = PhysicalInputController::new(path);
         controller.phase = PhysicalInputPhase::Arm;
         let mut evidence = ConsoleEvidence::default();
@@ -9472,6 +9515,9 @@ mod tests {
         controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxFocus);
         evidence.td_firefox_clipboard_window_armed = true;
+        controller.progress(&mut evidence).unwrap();
+        assert_eq!(controller.phase, PhysicalInputPhase::FirefoxFocus);
+        evidence.td_firefox_clipboard_session_ready = true;
         controller.progress(&mut evidence).unwrap();
         assert_eq!(controller.phase, PhysicalInputPhase::FirefoxPasteArm);
         evidence.td_firefox_clipboard_focus_retry_one = true;
@@ -9818,6 +9864,18 @@ mod tests {
         assert!(firefox.contains(&format!(
             "const INPUT_CLIPBOARD_PUBLIC_ARMED: &str = \"{TD_FIREFOX_CLIPBOARD_ARMED_MARKER}\";"
         )));
+        assert!(firefox.contains(&format!(
+            "const INPUT_CLIPBOARD_SESSION_READY: &str = \"{TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER}\";"
+        )));
+        for retry in [
+            TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
+            TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
+        ] {
+            assert!(
+                firefox.contains(&format!("(\"{retry}\", ")),
+                "td-jail omitted {retry}"
+            );
+        }
         assert!(firefox.contains(&format!(
             "const INPUT_CLIPBOARD_PUBLIC_RETRY: &str = \"{TD_FIREFOX_CLIPBOARD_RETRY_MARKER}\";"
         )));
@@ -10622,8 +10680,8 @@ mod tests {
         assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
     }
 
-    fn all_console_markers() -> [&'static str; 86] {
-        [
+    fn all_console_markers() -> &'static [&'static str] {
+        &[
             TD_COMPOSITOR_DEVICES_PRIVATE_MARKER,
             MARKER,
             EROFS_MARKER,
@@ -10687,6 +10745,8 @@ mod tests {
             TD_TERM_CLIPBOARD_SENT_MARKER,
             TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER,
             TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER,
+            TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER,
+            TD_FIREFOX_INPUT_FAILED_MARKER,
             TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER,
             TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_TWO_MARKER,
             TD_FIREFOX_CLIPBOARD_ARMED_MARKER,
@@ -10831,7 +10891,7 @@ mod tests {
     #[test]
     fn system_boot_markers_are_distinct() {
         let markers = all_console_markers();
-        let unique = std::collections::BTreeSet::from(markers);
+        let unique: std::collections::BTreeSet<&str> = markers.iter().copied().collect();
         assert_eq!(
             unique.len(),
             markers.len(),
@@ -11869,6 +11929,30 @@ mod tests {
             b"target",
         );
         assert!(evidence.td_firefox_clipboard_window_armed);
+
+        for (marker, seen) in [
+            (
+                TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER,
+                (|e: &ConsoleEvidence| e.td_firefox_clipboard_session_ready)
+                    as fn(&ConsoleEvidence) -> bool,
+            ),
+            (TD_FIREFOX_INPUT_FAILED_MARKER, |e: &ConsoleEvidence| {
+                e.td_firefox_input_failed
+            }),
+        ] {
+            latch_console_evidence(
+                &mut evidence,
+                format!("\ntd-jail: {marker} failed\n").as_bytes(),
+                b"target",
+            );
+            assert!(!seen(&evidence), "{marker}");
+            latch_console_evidence(
+                &mut evidence,
+                format!("\n{marker}\r\n").as_bytes(),
+                b"target",
+            );
+            assert!(seen(&evidence), "{marker}");
+        }
 
         latch_console_evidence(
             &mut evidence,

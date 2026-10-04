@@ -1207,8 +1207,15 @@ pub const TD_TERM_CLIPBOARD_MARKER: &str = "TD-TERM-CLIPBOARD-READY bytes=7";
 pub const TD_TERM_CLIPBOARD_SENT_MARKER: &str = "TD-TERM-CLIPBOARD-SENT bytes=7";
 pub const TD_FIREFOX_CLIPBOARD_REFOCUS_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-REFOCUS-ARMED";
 pub const TD_FIREFOX_CLIPBOARD_WINDOW_ARMED_MARKER: &str = "TD-FIREFOX-CLIPBOARD-WINDOW-ARMED";
-/// Requests the first bounded physical Control+L retry after Firefox reports
-/// that the initial location-bar focus command did not settle.
+/// Printed by td-jail once the clipboard probe's own Marionette session is
+/// open: the host keys the physical Control+L on it, since opening the
+/// session moves Firefox's focus into the page.
+pub const TD_FIREFOX_CLIPBOARD_SESSION_READY_MARKER: &str = "TD-FIREFOX-CLIPBOARD-SESSION-READY";
+/// Printed by the firefox-input unit when a stage gave up, so the host fails
+/// the boot now rather than at its wall-clock ceiling.
+pub const TD_FIREFOX_INPUT_FAILED_MARKER: &str = "TD-FIREFOX-INPUT-FAILED";
+/// Requests the first bounded physical Control+L retry after Firefox reports,
+/// from inside the same session, that the location bar did not take focus.
 pub const TD_FIREFOX_CLIPBOARD_FOCUS_RETRY_ONE_MARKER: &str = "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-1";
 /// Requests the final bounded physical Control+L retry before the input unit
 /// fails closed.

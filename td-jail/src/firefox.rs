@@ -15,6 +15,8 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 const FOCUS_PROBE_DEADLINE: Duration = Duration::from_secs(20);
 const NETWORK_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 const DOWNLOAD_PROBE_DEADLINE: Duration = Duration::from_secs(40);
+/// Three 20-second location-bar arms in one session, and the paste.
+const CLIPBOARD_PROBE_DEADLINE: Duration = Duration::from_secs(120);
 const SOAK_PROBE_DEADLINE: Duration = Duration::from_secs(360);
 const SOAK_DURATION: Duration = Duration::from_secs(300);
 const SOAK_INTERVAL: Duration = Duration::from_secs(10);
@@ -41,6 +43,18 @@ const INPUT_CLIPBOARD_RETRY: &str = "TD-FIREFOX-CLIPBOARD-RETRY";
 const INPUT_CLIPBOARD_PUBLIC_ARMED: &str = "TD-FIREFOX-CLIPBOARD-ARMED";
 const INPUT_CLIPBOARD_PUBLIC_RETRY: &str = "TD-FIREFOX-CLIPBOARD-RETRY-ARMED";
 const INPUT_CLIPBOARD_OK: &str = "TD-FIREFOX-CLIPBOARD-OK";
+/// Printed once the clipboard probe's own Marionette session is open. The
+/// host's physical Control+L is keyed on it: opening a session moves
+/// Firefox's focus into the page, undoing a keystroke sent before it.
+const INPUT_CLIPBOARD_SESSION_READY: &str = "TD-FIREFOX-CLIPBOARD-SESSION-READY";
+/// The arm script's answer when the location bar never took focus.
+const INPUT_CLIPBOARD_ARM_ERROR: &str = "TD-FIREFOX-INPUT-ERROR:clipboard-arm:";
+/// Each asks the host for one more physical Control+L from inside the same
+/// session, beside the Marionette id of the re-arm that follows it.
+const INPUT_CLIPBOARD_FOCUS_RETRIES: &[(&str, u8)] = &[
+    ("TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-1", 7),
+    ("TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-2", 8),
+];
 const INPUT_DOWNLOAD_ARMED: &str = "TD-FIREFOX-DOWNLOAD-CONTENT-ARMED";
 const INPUT_DOWNLOAD_PUBLIC_ARMED: &str = "TD-FIREFOX-DOWNLOAD-ARMED";
 const INPUT_DOWNLOAD_CLICKED: &str = "TD-FIREFOX-DOWNLOAD-CLICKED";
@@ -861,6 +875,7 @@ pub(crate) fn probe_input<W: Write>(
     let timeout = match stage {
         InputStage::Focus => FOCUS_PROBE_DEADLINE,
         InputStage::Download => DOWNLOAD_PROBE_DEADLINE,
+        InputStage::Clipboard => CLIPBOARD_PROBE_DEADLINE,
         _ => PROBE_DEADLINE,
     };
     let deadline = Instant::now()
@@ -1183,12 +1198,22 @@ fn run_input_stage<S: Read + Write, W: Write>(
         }
         InputStage::Clipboard => {
             set_context(stream, 2, "chrome")?;
-            require_script_value(
-                stream,
-                3,
-                CHROME_CLIPBOARD_ARM_SCRIPT,
-                INPUT_CLIPBOARD_ARMED,
-            )?;
+            writeln!(progress, "{INPUT_CLIPBOARD_SESSION_READY}")?;
+            progress.flush()?;
+            let mut armed = script_value(stream, 3, CHROME_CLIPBOARD_ARM_SCRIPT)?;
+            for (retry, id) in INPUT_CLIPBOARD_FOCUS_RETRIES {
+                let Some(detail) = armed.strip_prefix(INPUT_CLIPBOARD_ARM_ERROR) else {
+                    break;
+                };
+                writeln!(
+                    progress,
+                    "td-jail: the location bar did not take focus ({detail}); asking again"
+                )?;
+                writeln!(progress, "{retry}")?;
+                progress.flush()?;
+                armed = script_value(stream, *id, CHROME_CLIPBOARD_ARM_SCRIPT)?;
+            }
+            require_exact("input script value", &armed, INPUT_CLIPBOARD_ARMED)?;
             writeln!(progress, "{INPUT_CLIPBOARD_PUBLIC_ARMED}")?;
             progress.flush()?;
             let value = script_value(stream, 4, CHROME_CLIPBOARD_SCRIPT)?;
@@ -1888,6 +1913,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use std::cell::Cell;
     use std::io::Cursor;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2283,6 +2309,179 @@ mod tests {
         assert_eq!(clock.elapsed, Duration::from_secs(40));
     }
 
+    /// A location bar that has not taken focus is asked again inside the
+    /// same session, each time after a retry marker the host keys another
+    /// Control+L on, and never after its session-ready marker comes too
+    /// late: the session that would steal focus is already open.
+    #[test]
+    fn the_clipboard_arm_retries_its_focus_inside_one_session() {
+        let error =
+            format!("{INPUT_CLIPBOARD_ARM_ERROR}true,true,false,false,true,true,true,false");
+        let mut io = input_transcript(
+            InputStage::Clipboard,
+            &[&error, INPUT_CLIPBOARD_ARMED, INPUT_CLIPBOARD_OK],
+        );
+        let mut progress = Vec::new();
+        probe_input_stream_with_progress(&mut io, InputStage::Clipboard, &mut progress).unwrap();
+        let progress = String::from_utf8(progress).unwrap();
+        let lines: Vec<&str> = progress.lines().collect();
+        assert_eq!(lines.first(), Some(&INPUT_CLIPBOARD_SESSION_READY));
+        assert!(lines
+            .get(1)
+            .is_some_and(|l| l.starts_with("td-jail: the location bar did not take focus (")));
+        assert_eq!(
+            lines.get(2..),
+            Some(
+                &[
+                    "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-1",
+                    INPUT_CLIPBOARD_PUBLIC_ARMED
+                ][..]
+            )
+        );
+        let mut commands = Cursor::new(io.output);
+        assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,2,"Marionette:SetContext",{"value":"chrome"}]"#
+        );
+        for id in [3, 7] {
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                execute_command_with_id(id, CHROME_CLIPBOARD_ARM_SCRIPT).unwrap()
+            );
+        }
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(4, CHROME_CLIPBOARD_SCRIPT).unwrap()
+        );
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            r#"[0,6,"WebDriver:DeleteSession",{}]"#
+        );
+        assert!(read_frame(&mut commands).is_err());
+
+        // Settling on the last re-arm (id 8) goes straight to the paste.
+        let mut io = input_transcript(
+            InputStage::Clipboard,
+            &[&error, &error, INPUT_CLIPBOARD_ARMED, INPUT_CLIPBOARD_OK],
+        );
+        let mut progress = Vec::new();
+        probe_input_stream_with_progress(&mut io, InputStage::Clipboard, &mut progress).unwrap();
+        let progress = String::from_utf8(progress).unwrap();
+        assert!(progress.ends_with(&format!(
+            "TD-FIREFOX-CLIPBOARD-FOCUS-RETRY-2\n{INPUT_CLIPBOARD_PUBLIC_ARMED}\n"
+        )));
+        let mut commands = Cursor::new(io.output);
+        for _ in 0..2 {
+            read_frame(&mut commands).unwrap();
+        }
+        for id in [3, 7, 8] {
+            assert_eq!(
+                read_frame(&mut commands).unwrap(),
+                execute_command_with_id(id, CHROME_CLIPBOARD_ARM_SCRIPT).unwrap()
+            );
+        }
+        assert_eq!(
+            read_frame(&mut commands).unwrap(),
+            execute_command_with_id(4, CHROME_CLIPBOARD_SCRIPT).unwrap()
+        );
+
+        // Three arms that never settle: both retries asked for, then a
+        // failure naming the last answer, and the session still deleted.
+        let mut io = input_transcript(InputStage::Clipboard, &[&error, &error, &error]);
+        let mut progress = Vec::new();
+        let failed =
+            probe_input_stream_with_progress(&mut io, InputStage::Clipboard, &mut progress)
+                .unwrap_err();
+        assert!(
+            failed.to_string().contains(INPUT_CLIPBOARD_ARM_ERROR),
+            "{failed}"
+        );
+        let progress = String::from_utf8(progress).unwrap();
+        for (retry, _) in INPUT_CLIPBOARD_FOCUS_RETRIES {
+            assert_eq!(
+                progress.lines().filter(|l| l == retry).count(),
+                1,
+                "{progress}"
+            );
+        }
+        assert!(!progress.contains(INPUT_CLIPBOARD_PUBLIC_ARMED));
+        let mut commands = Cursor::new(io.output);
+        let mut last = String::new();
+        while let Ok(command) = read_frame(&mut commands) {
+            last = command;
+        }
+        assert_eq!(last, r#"[0,6,"WebDriver:DeleteSession",{}]"#);
+        assert_eq!(CLIPBOARD_PROBE_DEADLINE, Duration::from_secs(120));
+    }
+
+    /// The host keys Control+L on the session-ready marker, so it must come
+    /// after the session that moves focus is open and its context set: the
+    /// marker is written only once the greeting, the new-session reply and
+    /// the set-context reply have all been read.
+    #[test]
+    fn the_clipboard_session_announces_itself_only_once_open() {
+        struct Tracked<'a> {
+            io: ScriptedIo,
+            read_to: &'a Cell<u64>,
+        }
+        impl Read for Tracked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.io.read(buf)?;
+                self.read_to.set(self.io.input.position());
+                Ok(n)
+            }
+        }
+        impl Write for Tracked<'_> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.io.write(buf)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.io.flush()
+            }
+        }
+        struct Progress<'a> {
+            read_to: &'a Cell<u64>,
+            writes: Vec<(u64, String)>,
+        }
+        impl Write for Progress<'_> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let text = String::from_utf8_lossy(buf).into_owned();
+                self.writes.push((self.read_to.get(), text));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let io = input_transcript(
+            InputStage::Clipboard,
+            &[INPUT_CLIPBOARD_ARMED, INPUT_CLIPBOARD_OK],
+        );
+        let mut replies = Cursor::new(io.input.get_ref().clone());
+        for _ in 0..3 {
+            read_frame(&mut replies).unwrap();
+        }
+        let opened = replies.position();
+        let read_to = Cell::new(0);
+        let mut tracked = Tracked {
+            io,
+            read_to: &read_to,
+        };
+        let mut progress = Progress {
+            read_to: &read_to,
+            writes: Vec::new(),
+        };
+        probe_input_stream_with_progress(&mut tracked, InputStage::Clipboard, &mut progress)
+            .unwrap();
+        let ready = progress
+            .writes
+            .iter()
+            .find(|(_, text)| text.starts_with(INPUT_CLIPBOARD_SESSION_READY))
+            .map(|(at, _)| *at);
+        assert_eq!(ready, Some(opened));
+    }
+
     fn input_transcript(stage: InputStage, values: &[&str]) -> ScriptedIo {
         let mut responses = vec![
             HELLO.to_string(),
@@ -2313,8 +2512,14 @@ mod tests {
             }
             InputStage::Clipboard => {
                 responses.push(r#"[1,2,null,{"value":null}]"#.to_string());
-                for (index, value) in values.iter().enumerate() {
-                    let id = if index == 0 { 3 } else { index + 3 };
+                // The arm is id 3 and its re-arms 7 and 8; the paste scripts
+                // that follow a settled arm are 4 and 5.
+                let mut arms = [3, 7, 8].into_iter();
+                let mut pastes = [4, 5].into_iter();
+                let mut arming = true;
+                for value in values {
+                    let id = if arming { arms.next() } else { pastes.next() }.unwrap();
+                    arming = value.starts_with(INPUT_CLIPBOARD_ARM_ERROR);
                     responses.push(format!("[1,{id},null,{{\"value\":\"{value}\"}}]"));
                 }
             }
@@ -2551,7 +2756,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(retry_progress).unwrap(),
-            format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n{INPUT_CLIPBOARD_PUBLIC_RETRY}\n")
+            format!(
+                "{INPUT_CLIPBOARD_SESSION_READY}\n{INPUT_CLIPBOARD_PUBLIC_ARMED}\n\
+                 {INPUT_CLIPBOARD_PUBLIC_RETRY}\n"
+            )
         );
         let mut retry_commands = Cursor::new(retry_io.output);
         assert_eq!(read_frame(&mut retry_commands).unwrap(), NEW_SESSION);
@@ -2593,7 +2801,10 @@ mod tests {
         assert!(error.to_string().contains(INPUT_CLIPBOARD_RETRY));
         assert_eq!(
             String::from_utf8(exhausted_progress).unwrap(),
-            format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n{INPUT_CLIPBOARD_PUBLIC_RETRY}\n")
+            format!(
+                "{INPUT_CLIPBOARD_SESSION_READY}\n{INPUT_CLIPBOARD_PUBLIC_ARMED}\n\
+                 {INPUT_CLIPBOARD_PUBLIC_RETRY}\n"
+            )
         );
 
         let mut clipboard_refocus_arm_io = input_transcript(
@@ -2649,7 +2860,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(progress).unwrap(),
-            format!("{INPUT_CLIPBOARD_PUBLIC_ARMED}\n")
+            format!("{INPUT_CLIPBOARD_SESSION_READY}\n{INPUT_CLIPBOARD_PUBLIC_ARMED}\n")
         );
         let mut commands = Cursor::new(clipboard_io.output);
         assert_eq!(read_frame(&mut commands).unwrap(), NEW_SESSION);
