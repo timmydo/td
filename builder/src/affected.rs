@@ -1593,6 +1593,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // td-pinentry is a host program `./install-apps` builds with the host's
+    // cargo. No recipe builds it, so neither the bootstrap ladder nor the
+    // image can read it; the cargo-test preflight is every tier that does:
+    // its suite, lints and lock, and its native compositor cases.
+    if p.starts_with("td-pinentry/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // Toolkit edits affect its standalone consumers and their target recipes;
     // locally derived source identities and realized-output checks apply.
     if p.starts_with("td-ui/") && !p.contains("..") {
@@ -3100,6 +3109,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "td-vm/tests/vm_git.rs",
         "td-vm/Cargo.toml",
         "td-vm/Cargo.lock",
+    ] {
+        assert_preflight!(path, "cargo-test");
+        assert_no_target!(path, "recipe-checks");
+        assert_no_target!(path, "check");
+    }
+    // td-pinentry is a host program no recipe builds, routed as td-vm is.
+    for path in [
+        "td-pinentry/src/main.rs",
+        "td-pinentry/src/assuan.rs",
+        "td-pinentry/tests/control_process.rs",
+        "td-pinentry/Cargo.toml",
+        "td-pinentry/Cargo.lock",
     ] {
         assert_preflight!(path, "cargo-test");
         assert_no_target!(path, "recipe-checks");
@@ -5936,6 +5957,7 @@ mod tests {
                 "td-mail",
                 "td-pass",
                 "td-photo",
+                "td-pinentry",
                 "td-portal",
                 "td-seatd",
                 "td-secret",
@@ -8556,6 +8578,7 @@ mod tests {
                 "td-open",
                 "td-pass",
                 "td-photo",
+                "td-pinentry",
                 "td-portal",
                 "td-review",
                 "td-seatd",
@@ -8568,15 +8591,16 @@ mod tests {
                 "td-vm-guest"
             ]
         );
-        // td-agent's, td-photo's, td-mail's and td-pass's native cases make
-        // their commands three, as td-setup's are; td-dua, td-news, td-review
-        // and td-term, toolkit consumers with no native case, add two each.
+        // td-agent's, td-photo's, td-mail's, td-pass's and td-pinentry's
+        // native cases make their commands three, as td-setup's are; td-dua,
+        // td-news, td-review and td-term, toolkit consumers with no native
+        // case, add two each.
         // The test-only P-256 oracle connects td-secret to td-crypto and then
         // td-mta, adding two commands each, and td-open, which mounts
         // td-secret's descriptor module, adds two; the installation fixture,
         // reading td-install's codecs, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 65, "{comp:?}");
+        assert_eq!(comp.len(), 68, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -8601,6 +8625,7 @@ mod tests {
                 "td-open",
                 "td-pass",
                 "td-photo",
+                "td-pinentry",
                 "td-portal",
                 "td-review",
                 "td-seatd",
@@ -8637,6 +8662,7 @@ mod tests {
                 "td-open",
                 "td-pass",
                 "td-photo",
+                "td-pinentry",
                 "td-portal",
                 "td-review",
                 "td-seatd",
@@ -9055,6 +9081,35 @@ mod tests {
         }
         let staged = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
         assert!(!staged.contains(name), "{name} now enters a recipe closure");
+    }
+
+    /// td-pinentry's arm selects the cargo-test preflight alone because no
+    /// recipe builds it; a recipe that came to would need recipe-checks.
+    #[test]
+    fn pinentry_reaches_no_recipe() {
+        let root = repo_root();
+        if discover_gate_crates(&root).is_err() {
+            eprintln!("SKIP: no roster crates (builder-only sandbox)");
+            return;
+        }
+        let mut recipes = Vec::new();
+        collect_rs_recursive(&root.join("recipes/src"), &mut recipes);
+        assert!(!recipes.is_empty());
+        for path in recipes {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for spelling in ["td-pinentry", "td_pinentry"] {
+                assert!(
+                    !text.contains(spelling),
+                    "{} names {spelling}; revisit its affected-check mapping",
+                    path.display()
+                );
+            }
+        }
+        let staged = std::fs::read_to_string(root.join("seed/local-source-roster.txt")).unwrap();
+        assert!(
+            !staged.contains("td-pinentry"),
+            "td-pinentry now enters a recipe closure"
+        );
     }
 
     #[test]
