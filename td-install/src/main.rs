@@ -15,13 +15,13 @@
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code)]
 mod protocol;
-// The real-regular-bounded file rule, td-boot's and now shared rather than
+// The real-regular-bounded file rule, td-fs's and shared rather than
 // reimplemented here — DESIGN §10 item 10b. A rule spelled in both crates is
 // one they can come to disagree about, and this one did, three ways, on the
 // day the second copy was written.
-#[path = "../../td-boot/src/realfile.rs"]
+#[path = "../../td-fs/src/lib.rs"]
 #[allow(dead_code)]
-mod realfile;
+mod td_fs;
 // `gpt.rs` reaches its checksum as `crate::crc32`, the spelling that resolves
 // identically inside the engine lib and here, so the two are declared as a PAIR.
 #[path = "../../engine/src/cpio.rs"]
@@ -253,7 +253,7 @@ struct BootInput {
 impl BootInput {
     fn open(path: &Path, destination: &File) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
-        let (file, metadata) = realfile::open_real_file(path, "EFI input")?;
+        let (file, metadata) = td_fs::open_real_file(path, "EFI input")?;
         let target = destination.metadata()?;
         if metadata.dev() == target.dev() && metadata.ino() == target.ino() {
             return Err(invalid(format!(
@@ -468,7 +468,7 @@ fn selector_parts(
             trusted_key.display()
         )));
     }
-    let (file, metadata) = realfile::open_real_file(template, "selector template")?;
+    let (file, metadata) = td_fs::open_real_file(template, "selector template")?;
     let len = metadata.len();
     let uuid_line = format!("{}\n", uuid.0);
     let mut entries: Vec<cpio::Entry> = Vec::new();
@@ -1313,7 +1313,7 @@ const BOOTED_DEPLOYMENT: &str = "/run/td-deployment";
 /// The running root was authenticated as `deployment`, by the record a live
 /// boot's init writes.
 fn booted_as(record: &Path, deployment: &str) -> io::Result<()> {
-    let booted = realfile::read_bounded_real_file(record, "booted deployment record", 65)?;
+    let booted = td_fs::read_bounded_real_file(record, "booted deployment record", 65)?;
     if booted.strip_suffix(b"\n") != Some(deployment.as_bytes()) {
         return Err(invalid(format!(
             "{} does not name deployment {deployment}",
@@ -1451,7 +1451,7 @@ impl LiveExecution {
         // What the selector copied to the ESP must be, through the descriptor
         // the copy reads, and read back afterwards: the private copy prepared
         // above, which nothing else writes.
-        let selector_sha256 = realfile::open_real_file(&workspace.selector, "prepared selector")
+        let selector_sha256 = td_fs::open_real_file(&workspace.selector, "prepared selector")
             .and_then(|(mut file, metadata)| digest_range(&mut file, 0, metadata.len()))
             .map_err(&verification)?;
         let formatted = format_held(
@@ -1487,7 +1487,7 @@ impl LiveExecution {
     /// manifest is the one the plan names.
     fn kernel_digest(&self, deployment: &[u8; 32]) -> io::Result<[u8; 32]> {
         let path = self.source.join(protocol::MANIFEST_NAME);
-        let manifest = realfile::read_bounded_real_file(
+        let manifest = td_fs::read_bounded_real_file(
             &path,
             "deployment manifest",
             protocol::MAX_MANIFEST_BYTES,
@@ -1528,7 +1528,7 @@ impl LiveExecution {
 /// Copy the source kernel, a real regular file of at most the EFI bound,
 /// to `private`, created fresh at mode 0600.
 fn stage_kernel(source: &Path, private: &Path) -> io::Result<()> {
-    let (file, metadata) = realfile::open_real_file(source, "EFI kernel")?;
+    let (file, metadata) = td_fs::open_real_file(source, "EFI kernel")?;
     let len = metadata.len();
     if len == 0 || len > MAX_BOOT_FILE {
         return Err(invalid(format!(
@@ -3033,14 +3033,14 @@ fn zero_edges(file: &mut File, offset: u64, len: u64) -> io::Result<()> {
 }
 
 /// Read the trusted key under td-boot's rule, which is now literally
-/// td-boot's: `realfile.rs` is one implementation both crates include.
+/// td-boot's: td-fs is one implementation both crates include.
 ///
 /// Applied here rather than left to td-boot because this program SNAPSHOTS
 /// the key and hands td-boot the copy — a copy is a small regular file
 /// whatever the original was, so without this the snapshot would launder a
 /// key past every refusal the real reader makes.
 fn read_trusted_key(path: &Path) -> io::Result<Vec<u8>> {
-    realfile::read_bounded_real_file(
+    td_fs::read_bounded_real_file(
         path,
         "trusted deployment key",
         protocol::MAX_PUBLIC_KEY_BYTES,
@@ -3847,7 +3847,7 @@ fn prepare_volume_image(
         )));
     }
 
-    let (image, prepared) = realfile::open_real_file(&image_path, "prepared Btrfs image")?;
+    let (image, prepared) = td_fs::open_real_file(&image_path, "prepared Btrfs image")?;
     {
         use std::os::unix::fs::MetadataExt;
         if created.dev() != prepared.dev() || created.ino() != prepared.ino() {
@@ -6929,7 +6929,7 @@ mod tests {
     /// one argument an operator is most likely to mistype, and the one that is
     /// a device node on a real install — refused with a bare `No such file or
     /// directory` on a command line naming up to five paths. The key already
-    /// named itself, through `realfile`; this is the rest of them.
+    /// named itself, through `td_fs`; this is the rest of them.
     ///
     /// Both verbs, because they open the destination independently and only
     /// `layout` was ever driven with a bad one.
@@ -6971,7 +6971,7 @@ mod tests {
             "layout must name a destination that is not a file, got {refused:?}"
         );
 
-        // The key's own refusal is `realfile`'s and predates this; asserted
+        // The key's own refusal is `td_fs`'s and predates this; asserted
         // here so the property is stated over every path the verbs take.
         let refused = read_trusted_key(&absent).unwrap_err().to_string();
         assert!(
@@ -7035,7 +7035,7 @@ mod tests {
                 seen, expected,
                 "{label}: the allow sits on an item this test does not know — \
                  either an allow moved, or a choke point's signature changed \
-                 under MAIN_CHOKE/REALFILE_CHOKE/SHA256_CHOKE"
+                 under MAIN_CHOKE/TD_FS_CHOKE/SHA256_CHOKE"
             );
         }
     }
@@ -7258,9 +7258,9 @@ mod tests {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
-                "realfile.rs",
-                include_str!("../../td-boot/src/realfile.rs"),
-                REALFILE_CHOKE.as_slice(),
+                "lib.rs",
+                include_str!("../../td-fs/src/lib.rs"),
+                TD_FS_CHOKE.as_slice(),
             ),
             (
                 "gpt.rs",
@@ -7527,10 +7527,10 @@ mod tests {
     /// calls; it names its path like every other choke wrapper.
     const SHA256_CHOKE: [&str; 1] = ["pub fn sha256_file(p: &Path) -> std::io::Result<String> {"];
 
-    /// `realfile.rs`'s two, which are functions rather than a module: td-boot
+    /// td-fs's two, which are functions rather than a module: td-boot
     /// compiles that file too and has no `clippy.toml`, so the allow there is
     /// inert for it and load-bearing here.
-    const REALFILE_CHOKE: [&str; 2] = [
+    const TD_FS_CHOKE: [&str; 2] = [
         "pub fn open_real_file(path: &Path, label: &str) -> io::Result<(File, Metadata)> {",
         "fn open_checked(path: &Path, expected: &Metadata, label: &str) -> io::Result<(File, Metadata)> {",
     ];
@@ -7569,7 +7569,7 @@ mod tests {
     ///
     /// A brace WALK would have to know which braces are inside a string, and
     /// that lexer is what this commit deleted. Every item here closes at
-    /// column 0 — `mod paths`, both `realfile.rs` functions and `sha256_file`
+    /// column 0 — `mod paths`, both td-fs functions and `sha256_file`
     /// are top-level — which is a property of the file's layout that a reader
     /// can check and `rustfmt` keeps.
     fn region<'a>(label: &str, source: &'a str, marker: &str) -> &'a str {

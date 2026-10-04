@@ -13,7 +13,7 @@ const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
-const REALFILE_RS: &str = include_str!("../../../td-boot/src/realfile.rs");
+const TD_FS_RS: &str = include_str!("../../../td-fs/src/lib.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
 const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
@@ -74,8 +74,8 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
-            path: "{src}/td-boot/src/realfile.rs".into(),
-            content: REALFILE_RS.into(),
+            path: "{src}/td-fs/src/lib.rs".into(),
+            content: TD_FS_RS.into(),
             exec: false,
         },
         Step::WriteFile {

@@ -1,7 +1,7 @@
 //! Read-only geographic catalog. The deployment owns the immutable root;
 //! regular-file reads reject symlink leaves but do not anchor its parents.
 
-use super::realfile;
+use super::td_fs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
@@ -24,7 +24,7 @@ struct Zone {
 }
 
 fn table(root: &Path, name: &str) -> io::Result<String> {
-    let bytes = realfile::read_bounded_real_file(&root.join(name), name, MAX_TABLE)?;
+    let bytes = td_fs::read_bounded_real_file(&root.join(name), name, MAX_TABLE)?;
     let text = String::from_utf8(bytes).map_err(|_| invalid(format!("{name}: invalid UTF-8")))?;
     for (index, line) in text.lines().enumerate() {
         if line.len() > MAX_LINE || line.chars().any(|c| c.is_control() && c != '\t') {
@@ -210,7 +210,7 @@ impl Catalog {
         // Validate every advertised file before writing even the JSON prefix.
         // This is header screening; the tzdata recipe owns transition validation.
         for id in zones.keys() {
-            let bytes = realfile::read_bounded_real_file(&root.join(id), id, MAX_TZIF)?;
+            let bytes = td_fs::read_bounded_real_file(&root.join(id), id, MAX_TZIF)?;
             if bytes.len() < 44
                 || bytes.get(..4) != Some(b"TZif")
                 || !matches!(bytes.get(4), Some(b'2' | b'3'))

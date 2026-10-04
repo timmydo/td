@@ -12,12 +12,12 @@ mod measurement;
 mod protocol;
 #[path = "volume.rs"]
 mod volume;
-// The real-regular-bounded file rule, shared with `td-install` for
-// `protocol.rs`'s reason — and with the same redundant `#[path]` the fixture
-// carries below, so the staging guard sees it. Unlike the fixture this one IS
-// staged: it is in the target binary.
-#[path = "realfile.rs"]
-mod realfile;
+// The real-regular-bounded file rule, td-fs's, shared with `td-install` for
+// `protocol.rs`'s reason. It lives outside this crate, so the `#[path]` is
+// required, and the recipe stages it at `{src}/td-fs/src/lib.rs`: it is in
+// the target binary.
+#[path = "../../td-fs/src/lib.rs"]
+mod td_fs;
 // The committed fixture deployment, in its own file because the `td-install`
 // recipe check stages the SAME one and the signatures are over the manifest
 // its payloads hash to. `cfg(test)` keeps it out of the target binary, which
@@ -547,7 +547,7 @@ fn require_real_directory(path: &Path, label: &str) -> io::Result<()> {
     }
 }
 
-use realfile::{open_real_file, read_bounded_real_file};
+use td_fs::{open_real_file, read_bounded_real_file};
 
 use protocol::valid_digest;
 
@@ -3163,7 +3163,7 @@ fn update_decision(
     // goes on to be read. `starts_with` is lexical — it compares components and
     // normalizes nothing — so `<volume>/../forged.pub` is "under the volume" to
     // it and `/run/forged.pub` to the kernel; an intermediate symlink escapes
-    // the same way, since `realfile`'s `O_NOFOLLOW` binds only the last
+    // the same way, since `td_fs`'s `O_NOFOLLOW` binds only the last
     // component. Reading the resolved path is also what stops the check and the
     // read disagreeing: judging one name and opening another leaves a window in
     // which the name can be repointed.
@@ -3174,7 +3174,7 @@ fn update_decision(
         )
     })?;
     // Resolving the key would otherwise make `update` the one verb in this file
-    // that accepts a SYMLINKED trust root: `realfile` refuses one by lstat and
+    // that accepts a SYMLINKED trust root: `td_fs` refuses one by lstat and
     // `O_NOFOLLOW`, and a path that has already been resolved never reaches
     // that. Refused here instead, so the invariant holds for every verb and the
     // resolution below is only ever normalizing `..` and the directories above.
@@ -5177,7 +5177,7 @@ mod tests {
         // `Path::starts_with` compares components and normalizes nothing, so a
         // `..` walks straight out of the volume while still "starting with" it.
         // Review found this; the same resolution is what stops an intermediate
-        // symlink escaping, which `realfile`'s `O_NOFOLLOW` cannot since it
+        // symlink escaping, which `td_fs`'s `O_NOFOLLOW` cannot since it
         // binds only the final component.
         let escaped = Path::new("/proc/..").join(
             key.strip_prefix("/")
@@ -5203,7 +5203,7 @@ mod tests {
 
         // A SYMLINK is refused outright rather than resolved and admitted.
         // Resolving the key would otherwise make `update` the one verb here
-        // that takes one, since `realfile`'s lstat and `O_NOFOLLOW` never see a
+        // that takes one, since `td_fs`'s lstat and `O_NOFOLLOW` never see a
         // path that has already been resolved.
         let link = fixture.root.join("linked.pub");
         std::os::unix::fs::symlink(&key, &link).unwrap();

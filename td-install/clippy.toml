@@ -4,7 +4,7 @@
 # `io::Error` holds an errno and no filename, so a call that propagates one
 # raw refuses with `No such file or directory` on a command line naming five
 # paths. `mod paths` pairs each operation with the path it was given;
-# `td-boot/src/realfile.rs`, compiled in through a `#[path]`, is the second
+# `td-fs/src/lib.rs`, compiled in through a `#[path]`, is the second
 # such point and already named its own.
 #
 # CLIPPY rather than a source scan, because these are resolved by the

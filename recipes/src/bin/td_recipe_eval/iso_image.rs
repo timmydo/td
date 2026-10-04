@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use td_engine::{fat, gpt, iso9660};
 
-use td_recipe::td_boot_realfile as realfile;
+use td_recipe::td_fs;
 
 const MIB: u64 = 1024 * 1024;
 const ESP_BYTES: u64 = 64 * MIB;
@@ -49,7 +49,7 @@ struct Input {
 impl Input {
     fn open(path: &Path, limit: u64) -> Result<Self, String> {
         let (file, meta) =
-            realfile::open_real_file(path, "ISO input").map_err(|error| error.to_string())?;
+            td_fs::open_real_file(path, "ISO input").map_err(|error| error.to_string())?;
         if meta.len() == 0 || meta.len() > limit {
             return Err(format!(
                 "ISO input {} must contain 1..={limit} bytes",

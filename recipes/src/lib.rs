@@ -35,13 +35,12 @@ pub mod permissions {
 #[path = "../../td-boot/src/protocol.rs"]
 #[allow(dead_code)]
 pub mod td_boot_protocol;
-// Keep the ISO composer's shared file admission inside the catalog scan.
-#[path = "../../td-boot/src/realfile.rs"]
-pub mod td_boot_realfile;
-// Shared check assertions must participate in the catalog dependency scan.
-use td_boot_realfile as realfile;
 #[path = "../../td-civil/src/tzif.rs"]
 pub mod td_civil_tzif;
+// Keep the ISO composer's shared file admission inside the catalog scan; the
+// installer's zone table, compiled below, reaches it as `super::td_fs`.
+#[path = "../../td-fs/src/lib.rs"]
+pub mod td_fs;
 #[path = "../../td-install/src/timezones.rs"]
 pub mod td_install_timezones;
 

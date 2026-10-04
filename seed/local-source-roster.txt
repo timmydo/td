@@ -13,7 +13,7 @@
 td-editor-source td-editor td-civil,td-ui,td-compositor
 td-install-qemu-test-source td-install-qemu-test
 td-mail-source td-mail td-civil,td-encoding,td-fetch-client,td-html,td-json,td-kv,td-regex,td-toml,td-ui,td-compositor
-td-net-source net engine,td-boot
+td-net-source net engine,td-boot,td-fs
 td-news-source td-news td-civil,td-fetch-client,td-html,td-json,td-kv,td-toml,td-ui,td-compositor
 td-open-source td-open td-busd,td-secret
 td-pass-source td-pass td-secret,td-ui,td-compositor,td-authd,td-busd,td-firstboot,engine,td-tpm

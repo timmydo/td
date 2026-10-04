@@ -265,8 +265,8 @@ path.** `io::Error` carries an errno and no filename, and one command line
 here names as many as five paths — so `No such file or directory` alone is
 a diagnostic an operator cannot act on. This crate's SHIPPED source reaches
 the filesystem only through `mod paths`, whose wrappers each pair the
-operation with the path they were given; `realfile.rs`, which the crate
-compiles in, is the second such point and already named its own, and
+operation with the path they were given; td-fs's `src/lib.rs`, which the
+crate compiles in, is the second such point and already named its own, and
 `engine/src/sha256.rs`'s `sha256_file` is the third: the crate compiles
 that file for its digests, never calls the helper (a test pins that), and
 the helper names its path for every consumer. ONE
@@ -2424,9 +2424,9 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    `update` is consistent with what it is. A separate crate would have needed
    a manifest and lock, two `affected.rs` rosters, a target recipe and image
    inclusion before any behaviour landed, plus a third `#[path]` copy of both
-   `protocol.rs` and `realfile.rs` — and would still have had to exec td-boot,
-   putting the channel logic and the publish logic in two processes with argv
-   between them.
+   `protocol.rs` and the real-file rule now in td-fs — and would still have
+   had to exec td-boot, putting the channel logic and the publish logic in two
+   processes with argv between them.
 
    What that costs is real and worth naming: the SELECTOR initramfs packs
    td-boot, so it now carries channel code it never reaches. That is dead
@@ -2581,7 +2581,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    open, an oversized read truncated rather than refused), all found by review
    rather than by anything that runs. So the pair moved to
    `td-boot/src/realfile.rs`, which all three `#[path]`-include as they already
-   do `protocol.rs`.
+   do `protocol.rs`; it has since become `td-fs/src/lib.rs`, the crate td's
+   other programs take their file helpers from.
 
    The signer matters most of the three and was the one nobody would have
    thought to check. Its own comment gives the reason to share rather than
@@ -2600,14 +2601,15 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    the file and the recipe, instead of failing the target build an hour later
    inside `recipe-checks`. `td-net` needs no stage: no recipe builds it.
 
-   That last fact is also why `realfile.rs` needed a ROUTING rule of its own,
-   beside the one `protocol.rs` already had. No gate builds td-net from source
-   — the recipe-graph warm does, which is a chain target — so a file td-net
-   `#[path]`-includes must select those targets or an edit that breaks only
-   the signer compiles td-boot and td-install and builds no net at all. There
-   are two files in that class now and `builder/src/affected.rs` pins both,
-   with `td-boot/src/main.rs` pinned to select NONE of them: the rule has to
-   be about these files rather than about the crate.
+   That last fact is also why the real-file rule needed a ROUTING rule of its
+   own, beside the one `protocol.rs` already had. No gate builds td-net from
+   source — the recipe-graph warm does, which is a chain target — so a file
+   td-net `#[path]`-includes must select those targets or an edit that breaks
+   only the signer compiles td-boot and td-install and builds no net at all.
+   There are two in that class now, `protocol.rs` and the `td-fs/` tree the
+   rule moved into, and `builder/src/affected.rs` pins both, with
+   `td-boot/src/main.rs` pinned to select NONE of them: the rule has to be
+   about these files rather than about the crate.
 
    **10c closed the residual race, once, for all three.** The type is settled
    by `lstat` and the open follows it, so the entry can be replaced in between
@@ -2834,9 +2836,9 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
      and normalizes nothing — so `<volume>/../forged.pub` is inside the volume
      to it and `/run/forged.pub` to the kernel, which is the whole gate
      defeated by one `..`; an intermediate symlink escapes the same way, since
-     `realfile`'s `O_NOFOLLOW` binds only the final component. A symlink AT the
+     td-fs's `O_NOFOLLOW` binds only the final component. A symlink AT the
      key is refused outright rather than resolved, because resolving it would
-     otherwise make `update` the one verb here that accepts one — `realfile`
+     otherwise make `update` the one verb here that accepts one — td-fs
      refuses a symlink by lstat and `O_NOFOLLOW`, and neither ever sees a path
      already resolved.
 

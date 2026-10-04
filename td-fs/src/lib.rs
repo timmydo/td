@@ -1,8 +1,14 @@
-//! Opening and reading a file that must be a REAL, BOUNDED regular file.
+//! td's shared file helpers, one std-only file. A crate cargo builds
+//! depends on td-fs by path; a crate a recipe compiles with a direct rustc
+//! includes this file by `#[path]` as its `td_fs` module, as td-boot,
+//! td-install, td-net and the recipe library do.
 //!
-//! Shared for `protocol.rs`'s reason: td-boot verifies, `td-install` carries
-//! the trust root onto the volume, and `td-net` signs — all three must refuse
-//! the same files, or a bundle that signs is one that fails at boot.
+//! Its first rule opens and reads a file that must be a REAL, BOUNDED
+//! regular file. td-boot, td-install and td-net shared it before td-fs
+//! held it, for `protocol.rs`'s reason: td-boot verifies, td-install
+//! carries the trust root onto the volume, and td-net signs — all three
+//! must refuse the same files, or a bundle that signs is one that fails at
+//! boot.
 //!
 //! Each rule answers something that cannot be observed after the fact:
 //!
@@ -18,8 +24,8 @@
 //!   a file that grew after the stat would otherwise be cut to exactly the
 //!   limit and carried on as if it had always been that size.
 //!
-//! Std-only and importing nothing from any of them, as `fixture.rs` is, so
-//! including it cannot drag anything into the crate that includes it.
+//! Std-only and importing nothing from any crate that includes it, so
+//! including it cannot drag anything into that crate.
 
 use std::fs::{File, Metadata};
 use std::io::{self, Read};
@@ -38,7 +44,7 @@ use std::path::Path;
 /// `td-init` already use for their syscall numbers, rather than by a
 /// whitelist of architectures that look close enough.
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-compile_error!("realfile.rs pins O_NONBLOCK/O_NOFOLLOW for x86_64-linux only");
+compile_error!("td-fs pins O_NONBLOCK/O_NOFOLLOW for x86_64-linux only");
 const O_NONBLOCK: i32 = 0o4000;
 const O_NOFOLLOW: i32 = 0o400000;
 
@@ -148,12 +154,13 @@ pub fn read_bounded_real_file(path: &Path, label: &str, limit: u64) -> io::Resul
     Ok(bytes)
 }
 
-// Tested HERE, at the rule, rather than only through each caller: this file is
-// `#[path]`-included by three crates, so these run in each of them and prove
-// the rule holds in every inclusion context. The cases are the three the
-// td-install copy got wrong before it was deleted, which is why they are the
-// ones written down.
+// Tested HERE, at the rule, rather than only through each caller: td-fs's
+// own crate runs these, and so does every crate that `#[path]`-includes the
+// file, proving the rule holds in each inclusion context. The cases are the
+// three the td-install copy got wrong before it was deleted, which is why
+// they are the ones written down.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -175,7 +182,7 @@ mod tests {
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "td-realfile-{tag}-{}-{:?}",
+            "td-fs-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

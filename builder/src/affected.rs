@@ -1177,17 +1177,20 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // which is a chain target. So this file takes the td-boot rule plus those,
     // or a change here that breaks only the signer runs nothing.
     //
-    // `realfile.rs` joined it in that class when the real-bounded-file rule
-    // stopped being written three times: td-net includes it for the same
-    // reason — the signer must refuse exactly what the verifier refuses — so
-    // it needs the same chain targets. The rule is about these two FILES and
-    // not about the crate, which is why `td-boot/src/main.rs` is pinned to the
-    // narrower one beside the assertions below.
-    if p == "td-boot/src/protocol.rs" || p == "td-boot/src/realfile.rs" {
+    // td-fs joined it in that class: its real-bounded-file rule began as
+    // td-boot's `realfile.rs`, and td-net includes it for the same reason —
+    // the signer must refuse exactly what the verifier refuses — so it needs
+    // the same chain targets. td-fs is also the crate the cargo-built
+    // programs depend on, whose checks are a subset of these. The rule is
+    // about protocol.rs and not about td-boot, which is why
+    // `td-boot/src/main.rs` is pinned to the narrower one beside the
+    // assertions below.
+    if p == "td-boot/src/protocol.rs" || (p.starts_with("td-fs/") && !p.contains("..")) {
         sel.add_preflight("cargo-test");
-        // Both are `#[path]`-included by td-net, and `td-boot/` is staged into
-        // td-net's seed, but that identity is re-derived LIVE from the checkout
-        // (re #469 local-source-roster split) — no local-source preflight to select.
+        // Both are `#[path]`-included by td-net, and `td-boot/` and `td-fs/`
+        // are staged into td-net's seed, but that identity is re-derived LIVE
+        // from the checkout (re #469 local-source-roster split) — no
+        // local-source preflight to select.
         sel.add_target("check");
         sel.add_target("recipe-checks");
         add_chain_targets(sel);
@@ -2035,6 +2038,8 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
 /// The crates the system image boots through or the oracles drive: init,
 /// the shell its scripts run in, the boot protocol and kexec, login, the
 /// service supervisor, first boot, and the installer with its test driver.
+/// td-fs, which td-boot and the installer compile in, is left out by
+/// decision: its changes run the gates on a branch and the oracles on main.
 /// A change to one's code, manifest, lock or build script, or to its recipe
 /// file of the same name, opts a branch into the integration tier, which
 /// otherwise runs on main alone. Its tests, docs and ignore files do not.
@@ -3041,7 +3046,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-boot/src/main.rs", "recipe-checks");
     assert_no_preflight!("td-boot/src/main.rs", "local-source-roster");
     assert_no_preflight!("td-boot/src/protocol.rs", "local-source-roster");
-    assert_no_preflight!("td-boot/src/realfile.rs", "local-source-roster");
+    assert_no_preflight!("td-fs/src/lib.rs", "local-source-roster");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
     // protocol.rs is the deployment contract three OTHER trees compile: two
@@ -3066,25 +3071,22 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "bootstrap-x86_64-self-gcc-store-native"
     );
     assert_preflight!("td-boot/src/protocol.rs", "cargo-test");
-    // realfile.rs is in that same class and pinned the same way: td-net
+    // td-fs is in that same class and pinned the same way: td-net
     // `#[path]`-includes it so the signer refuses what the verifier refuses,
     // and without the chain targets an edit here that breaks only the signer
     // would compile td-boot and td-install and build no net at all.
-    assert_target!("td-boot/src/realfile.rs", "check");
-    assert_target!("td-boot/src/realfile.rs", "recipe-checks");
+    assert_target!("td-fs/src/lib.rs", "check");
+    assert_target!("td-fs/src/lib.rs", "recipe-checks");
     assert_target!(
-        "td-boot/src/realfile.rs",
+        "td-fs/src/lib.rs",
         "bootstrap-x86_64-toolchain-store-native"
     );
     assert_target!(
-        "td-boot/src/realfile.rs",
+        "td-fs/src/lib.rs",
         "bootstrap-x86_64-native-gcc-store-native"
     );
-    assert_target!(
-        "td-boot/src/realfile.rs",
-        "bootstrap-x86_64-self-gcc-store-native"
-    );
-    assert_preflight!("td-boot/src/realfile.rs", "cargo-test");
+    assert_target!("td-fs/src/lib.rs", "bootstrap-x86_64-self-gcc-store-native");
+    assert_preflight!("td-fs/src/lib.rs", "cargo-test");
     assert_no_target!(
         "td-boot/src/main.rs",
         "bootstrap-x86_64-toolchain-store-native"
@@ -6307,6 +6309,8 @@ mod tests {
             "td-sh/tests/posix.rs",
             "td-bootx/src/main.rs",
             "recipes/src/recipes/td-bootx.rs",
+            "td-fs/src/lib.rs",
+            "td-fs/Cargo.toml",
             "recipes/src/recipes/uutils.rs",
             "td-compositor/src/main.rs",
             "builder/src/main.rs",

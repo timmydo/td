@@ -14,7 +14,7 @@ use crate::types::Recipe;
 pub fn recipe() -> Recipe {
     Recipe::rust("td-net", "0.1.0")
         .local_source("net")
-        .local_source_trees(&["engine", "td-boot"])
+        .local_source_trees(&["engine", "td-boot", "td-fs"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -39,7 +39,11 @@ mod tests {
         assert_eq!(recipe.local_source.as_deref(), Some("net"));
         assert_eq!(
             recipe.local_source_trees,
-            Some(vec!["engine".to_string(), "td-boot".to_string()])
+            Some(vec![
+                "engine".to_string(),
+                "td-boot".to_string(),
+                "td-fs".to_string()
+            ])
         );
         assert_eq!(recipe.cargo_subdir.as_deref(), Some("net"));
         assert_eq!(recipe.cargo_lock.as_deref(), Some("net/Cargo.lock"));

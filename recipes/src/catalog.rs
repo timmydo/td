@@ -509,6 +509,7 @@ mod tests {
                 "td-encoding",
                 "td-fetch-client",
                 "td-firstboot",
+                "td-fs",
                 "td-html",
                 "td-install",
                 "td-json",
@@ -701,8 +702,8 @@ mod named_dirs_tests {
             shared_embeds(),
             [
                 file("td-boot", "src/protocol.rs"),
-                file("td-boot", "src/realfile.rs"),
                 file("td-civil", "src/tzif.rs"),
+                file("td-fs", "src/lib.rs"),
                 file("td-install-qemu-test", "src/protocol.rs"),
                 file("td-install", "src/timezones.rs"),
                 file("td-profiler", "src/contract.rs"),

@@ -81,7 +81,7 @@ fn sign_manifest(manifest: &Path, pkcs8: &[u8]) -> Result<String, String> {
 /// td-boot has an opinion about — an empty manifest simply fails its header
 /// check — but signing nothing is worth refusing where the signature is made.
 fn read_as_td_boot_would(path: &Path) -> Result<Vec<u8>, String> {
-    let bytes = crate::realfile::read_bounded_real_file(path, "the manifest", MAX_MANIFEST_BYTES)
+    let bytes = crate::td_fs::read_bounded_real_file(path, "the manifest", MAX_MANIFEST_BYTES)
         .map_err(|error| error.to_string())?;
     if bytes.is_empty() {
         return Err(format!(
