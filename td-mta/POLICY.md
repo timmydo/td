@@ -314,9 +314,10 @@ any invalid byte makes that occurrence malformed, including legacy unlabelled
 8-bit values. Unquoted non-ASCII or embedded spaces are also malformed.
 Validate the complete field before retaining its head or any parameter. Skip
 a malformed occurrence rather than repairing its tail into a different type,
-boundary or charset. Nesting, job-work and aggregate interpretation limits
-retire the whole metadata selection; neither a later duplicate nor a default
-may turn a resource refusal into success.
+boundary or charset. Nesting, raw-header limits, truncated resident prefixes,
+job-work and aggregate interpretation limits retire the whole metadata
+selection; neither a later duplicate nor a default may turn a refusal into
+success.
 
 For example, `text/html; charset=UTF-8;` is malformed and cannot override the
 root default; a later valid occurrence may be selected. Preserve this
@@ -326,6 +327,14 @@ selects text/html here, while a tolerant client may see multipart. With no
 valid type, the default can likewise collapse malformed multipart into one
 text leaf. The complete raw list remains available; syntax acceptance does
 not promise that another MIME parser chooses the same structure.
+
+After skipping every malformed Content-Type occurrence, apply the same
+context default as for a missing field: text/plain normally and
+message/rfc822 for a multipart/digest child. The digest-child choice is an
+explicit recovery rule. RFC 2045 section 5.2 recommends text/plain for an
+invalid type; a parser following that recommendation inside a digest can
+therefore see a text leaf where td sees an embedded message. Preserve the
+complete raw header list and do not claim parser agreement for this case.
 
 Quoted syntax retains the existing obsolete ASCII control and quoted-pair
 admission (API.md section 1.32). Derived metadata separately checks boundary

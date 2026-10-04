@@ -1693,6 +1693,17 @@ Initial independently landable increments:
   cases. Pin the local manifest/lock and source staging without widening the
   private crypto graph. Metadata assembly and part traversal remain open.
 
+- **M06bq — first-valid MIME metadata fields:** compose one raw-header scan
+  with the complete resident MIME field grammar. Retain one validated
+  Field/Head per kind, skip malformed occurrences and ignore later duplicates
+  after success. Apply normal/digest-child type defaults only after the whole
+  section completes. Retire all selection on raw-header/depth/job/aggregate
+  refusal; carry original budgets and fixed state through final admission.
+  Cover defaults, source extents, prefix/EOF, long Unicode and all partial
+  budgets, cached completion, compile-fail ownership and allocation-free
+  constructor/drain/refusal. Case/value projection, RFC 2231 assembly and
+  MIME part traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

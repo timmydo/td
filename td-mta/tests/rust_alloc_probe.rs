@@ -867,6 +867,130 @@ fn store_read_pool() {
     }
 }
 
+fn mime_metadata() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        mime_headers,
+        mime_metadata::{Budgeted, ContentType, Context, DefaultType, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        concat!(
+            "Content-Type: ({0})text/plain; name=\"{0}\"; x={1}\r\n",
+            "Content-Disposition: attachment; filename*1*=b; ",
+            "filename*0*=utf-8''a\r\n",
+            "Content-Transfer-Encoding: BASE64\r\n\r\nbody"
+        ),
+        "🐈".repeat(8192),
+        "a".repeat(65_536)
+    );
+    let nested = format!(
+        "Content-Type: text/plain\r\nContent-Disposition: attachment {}x{}\r\n\r\n",
+        "(".repeat(33),
+        ")".repeat(33)
+    );
+    let before = COUNTERS.snapshot();
+    for (source, context, limit, field, error) in [
+        (
+            long.as_bytes(),
+            Context::Normal,
+            long.len() as u64,
+            true,
+            None,
+        ),
+        (
+            b"Content-Type: text/html;\r\nContent-Type: text/plain\r\n\r\n",
+            Context::Normal,
+            1000,
+            true,
+            None,
+        ),
+        (
+            b"Content-Type: text/html;\r\n\r\n",
+            Context::Normal,
+            1000,
+            false,
+            None,
+        ),
+        (b"\r\n", Context::DigestChild, 1000, false, None),
+        (
+            nested.as_bytes(),
+            Context::Normal,
+            1000,
+            false,
+            Some(Error::NestingLimit),
+        ),
+        (
+            b"Content-Type: text/plain\r\nX-Long: aaaaa\r\n\r\n",
+            Context::Normal,
+            30,
+            false,
+            Some(Error::Headers(mime_headers::Error::HeaderLimit)),
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 16 * 1024 * 1024,
+                records: 2_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Budgeted::new(
+            black_box(source),
+            0,
+            limit,
+            context,
+            SourceEnd::Eof,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(std::mem::size_of_val(&cursor) <= 1024);
+        assert_eq!(cursor.selection(), Ok(None));
+        let result = loop {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete) => break None,
+                Err(error) => break Some(error),
+            }
+        };
+        assert_eq!(result, error);
+        if let Some(error) = result {
+            assert_eq!(cursor.selection(), Err(error));
+            assert_eq!(cursor.poll(Tick(1)), Err(error));
+        } else {
+            let selection = cursor.selection().unwrap().unwrap();
+            assert_eq!(
+                matches!(selection.content_type, ContentType::Field(_)),
+                field
+            );
+            if !field {
+                let expected = if context == Context::DigestChild {
+                    DefaultType::MessageRfc822
+                } else {
+                    DefaultType::TextPlain
+                };
+                assert_eq!(selection.content_type, ContentType::Default(expected));
+            }
+            black_box(selection);
+            cursor.check_deadline(Tick(1)).unwrap();
+            assert_eq!(
+                cursor.check_deadline(Tick(100)),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(cursor.selection(), Err(Error::Work(Stop::Deadline)));
+            assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME metadata selection allocated");
+}
+
 fn mime_fields() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -5946,6 +6070,7 @@ fn main() {
         mime_input();
         mime_headers();
         mime_fields();
+        mime_metadata();
         body_value();
         mime_text();
         body_charset();
@@ -6086,6 +6211,7 @@ fn main() {
     mime_input();
     mime_headers();
     mime_fields();
+    mime_metadata();
     body_value();
     mime_text();
     body_charset();

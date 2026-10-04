@@ -3310,9 +3310,72 @@ Tests pin raw extents, ordering, quote/fold/UTF-8 validation,
 complete-suffix failure, nesting, long inputs, original-budget
 accounting, every partial aggregate admission and final deadline
 retirement. Allocation intervals cover construction, long
-comments/tokens/quotes and late refusal. Derived metadata selection, RFC
-2231 assembly, part traversal, response retention and combined
-worker/native memory qualification remain open.
+comments/tokens/quotes and late refusal. RFC 2231 assembly, part traversal,
+response retention and combined worker/native memory qualification remain
+open. Section 1.70 provides first-valid metadata field selection.
+
+### 1.70 First-valid resident MIME metadata fields
+
+M06bq adds mime_metadata::Cursor over an authorized immutable resident header
+section. Construction checks base plus source length; the caller supplies the
+absolute base, raw-header byte limit, Context and SourceEnd. Eof denotes actual
+source EOF. Prefix requires a definitive scanner boundary: a blank separator
+or an invalid field/unattached continuation as specified in section 1.14.
+An ambiguous partial name or value remains Truncated. End.body_start is
+authoritative even after tentative body lookahead. This borrowed view grants
+no blob/part location authority and does not make a prefix into EOF.
+
+The owner scans once with mime_headers, compares names ASCII case insensitively
+against the three fixed MIME field names and validates each eligible candidate
+with mime_fields. Only complete syntax may retain its Field and Head. A
+malformed occurrence is skipped; after one valid occurrence of a kind, later
+duplicates are ignored. Comments, quotes and the entire parameter suffix are
+validated even though this increment retains no parameter collection. Nesting,
+raw-header limits, truncation, job work and aggregate interpretation refusal
+retire the whole selection. They cannot select a later duplicate or default.
+
+Context::Normal defaults an unselected type to text/plain; DigestChild defaults
+it to message/rfc822. This applies after all malformed type occurrences too,
+with the parser disagreement described in POLICY.md. Selected heads retain
+literal case. Field offsets are absolute; Head offsets are relative to the
+selected Field's exact value slice. Content-Disposition and transfer encoding
+remain optional validated source views; an unknown syntactic token is valid.
+Case folding, transfer-token classification, charset/boundary validation and
+RFC 2231 assembly require their own bounded work. No supplied name is a path.
+
+Poll returns only Yield or Complete. selection returns None until the entire
+raw header section validates and a separately charged final completion turn
+passes. After Complete it returns the fixed Selection containing the type or
+its default, two optional source views and scanner End. On failure it returns
+the same latched error; no earlier candidate becomes public. These events and
+views are parsing results, not authorization or publication evidence.
+
+Each plain turn performs one scanner operation, one fixed-name comparison, one
+MIME syntax operation or one scalar transition. Bounds are 256 source visits
+and 32 job records. The longest compared name is 25 bytes and its two sides
+charge fifty visits; token validation retains its 160-visit/32-record ceiling.
+No output bytes, growing field/parameter list, copied value, recursion or new
+arena is added. Cursor and Budgeted each fit 1 KiB in the existing 16 KiB parser
+reservation; their three selected views are fixed inline state.
+
+Budgeted retains the original job Meter and email HeaderBudget through every
+candidate and the final scanner turn. One private credit prepays at most sixteen
+steps per job record. Its scanner yields after at most 255 transitions, leaving
+one emission step; syntax keeps its existing admission seam. Bounds are 256
+visits, 256 aggregate steps and sixteen job records per turn. Cached completion
+and selection access are inert. Budgeted::check_deadline supplies fresh final
+admission and can retire cached metadata; its failure latches across later
+calls. Plain Cursor callers check fresh admission externally. Callers retain
+fresh clocks, cancellation, source authorization and publication checks.
+Neither live owner is Clone or Copy.
+
+Tests cover independent kinds, case/comment/fold preservation, malformed tails,
+first-valid duplicates, defaults, prefix truncation/separators, nonzero bases,
+invalid ranges, long Unicode, late header/nesting refusal, all partial work and
+aggregate cuts, final deadlines and cached-result retirement. Allocation probe
+intervals cover constructor/selection/drains/defaults and late refusals. These
+are component evidence; MIME value derivation, traversal, response retention
+and complete worker/native memory qualification remain open.
 
 ## 2. Read views and change history
 

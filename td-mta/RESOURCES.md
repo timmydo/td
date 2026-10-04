@@ -1028,6 +1028,19 @@ quotes/tokens, construction, malformed suffixes, nesting and final deadline
 refusal. Metadata assembly, part traversal and combined worker/native/RSS
 qualification remain open.
 
+M06bq's first-valid MIME metadata Cursor and Budgeted each fit 1 KiB in the
+existing 16 KiB parser reservation, including one scanner, one inline field
+syntax cursor and three fixed optional Field/Head views. There is no source
+copy, parameter vector, output arena or allocation during construction,
+selection, defaulting or refusal. Plain turns use at most 256 source visits
+and 32 job records; budgeted turns use at most 256 visits, 256 aggregate
+steps and sixteen job records. Original job/email budgets and private credit
+span every candidate and final admission. Cached access is inert; explicit
+fresh deadline refusal retires retained metadata. Allocation intervals cover
+long comments/quotes/tokens, malformed-first duplicates, defaults, nesting
+and raw-header limits. Value derivation, part traversal and combined
+worker/native/RSS qualification remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

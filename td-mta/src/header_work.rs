@@ -1,7 +1,7 @@
-//! Scan visits and transitions can share the email interpretation budget.
+//! Header scanning and MIME syntax share the email interpretation budget.
 use crate::{
     admission::work::{Charge as JobCharge, Meter},
-    decode_work::Error,
+    decode_work::{self, Error},
     nfc::HeaderBudget,
     ports::Tick,
 };
@@ -61,5 +61,15 @@ impl Work for Aggregate<'_> {
         self.budget
             .charge(self.work, now, charge.visits, charge.steps, self.credit)
             .map_err(Error::from)
+    }
+}
+
+impl decode_work::Work for Aggregate<'_> {
+    fn charge(&mut self, now: Tick, charge: JobCharge) -> Result<(), Error> {
+        decode_work::Work::charge(
+            &mut decode_work::Parsing::new(self.work, self.budget, self.credit),
+            now,
+            charge,
+        )
     }
 }
