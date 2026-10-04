@@ -203,14 +203,18 @@ pub struct Row {
     pub state: RowState,
     /// The human paused it: messages from other conversations wait.
     pub paused: bool,
-    /// What it works in; the status row names it.
+    /// What it works in; the list's Workspace column names it.
     pub workspace: Option<Workspace>,
+    /// The human archived it: the list hides it unless archived ones
+    /// show, and it opens only once unarchived.
+    pub archived: bool,
 }
 
 impl Row {
     /// Its state as the list names it.
     pub fn word(&self) -> &'static str {
         match self.state {
+            _ if self.archived => "archived",
             RowState::Closed | RowState::Idle if self.paused => "paused",
             state => state.word(),
         }
@@ -252,6 +256,8 @@ pub enum Request {
     Export,
     /// Delete this conversation for good, as the human confirmed.
     Delete(Id),
+    /// Archive this conversation, or bring it back, from its row's menu.
+    Archive { id: Id, archived: bool },
     /// Make this the default model, from Conversation → Default model….
     SetDefault(String),
     /// The human decided a card: whether call `call` of `conversation`
@@ -507,6 +513,8 @@ pub struct App {
     log: crate::notes::Log,
     /// Each row's workspace as the list's third column names it.
     labels: Vec<String>,
+    /// Whether the list shows archived conversations.
+    show_archived: bool,
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
@@ -576,6 +584,8 @@ pub struct App {
     /// The menu's revision: it is built again, from the state of the
     /// moment, each time it opens.
     menu_revision: u64,
+    /// The conversation the menu is the row menu of, while it is one.
+    menu_row: Option<Id>,
     credit: Option<String>,
     today: Option<u64>,
     limits: cost::Limits,
@@ -643,6 +653,7 @@ impl App {
             mode,
             log: crate::notes::Log::default(),
             labels: Vec::new(),
+            show_archived: false,
             todo: Vec::new(),
             todo_open: false,
             messages: Vec::new(),
@@ -676,6 +687,7 @@ impl App {
             settle: CARD_SETTLE,
             card_trouble: None,
             menu_revision: 1,
+            menu_row: None,
             credit: None,
             today: None,
             limits: cost::Limits {
@@ -749,6 +761,7 @@ impl App {
                 }
                 .to_string(),
                 failed: row.state == RowState::Failed,
+                archived: row.archived,
             })
             .collect()
     }
@@ -901,10 +914,46 @@ impl App {
         self.templates = templates;
     }
 
-    /// The most recently active conversation's id, when the list holds
-    /// any.
+    /// The most recently active conversation's id, archived ones aside,
+    /// when the list holds any.
     pub fn most_recent(&self) -> Option<Id> {
-        self.rows.first().map(|r| r.id.clone())
+        self.rows.iter().find(|r| !r.archived).map(|r| r.id.clone())
+    }
+
+    /// The conversation the open menu is the row menu of.
+    pub fn menu_row(&self) -> Option<&Id> {
+        self.menu_row.as_ref().filter(|_| self.menu.is_open())
+    }
+
+    /// Whether the list shows archived conversations.
+    pub fn shows_archived(&self) -> bool {
+        self.show_archived
+    }
+
+    /// Shows archived conversations in the list, or hides them again, as
+    /// Conversation → Show archived does.
+    pub fn toggle_archived(&mut self) {
+        self.show_archived = !self.show_archived;
+        self.refresh_list();
+    }
+
+    /// Conversation `id` is archived, or back: the list hides an archived
+    /// one unless archived ones show, and it is closed when it was open.
+    pub fn set_archived(&mut self, id: &Id, archived: bool) {
+        if let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) {
+            row.archived = archived;
+            if archived {
+                row.state = RowState::Closed;
+            }
+        }
+        if archived {
+            self.background_turns.retain(|(of, _)| of != id);
+            if self.active.as_ref() == Some(id) {
+                self.active = None;
+                self.clear_transcript();
+            }
+        }
+        self.refresh_list();
     }
 
     /// The default model is now `model`.
@@ -1058,6 +1107,8 @@ impl App {
         self.active = Some(id);
         self.clear_transcript();
         self.refresh_list();
+        // The selection follows the conversation opened.
+        self.list.select(self.shown_active(), true);
         self.offer();
     }
 
@@ -1964,8 +2015,15 @@ impl App {
     }
 
     /// Orders the rows, the most recently active first, and gives the
-    /// list a model of them.
+    /// list a model of them. The selected row stays selected while it is
+    /// shown, so an update does not move the keyboard's place; else the
+    /// open conversation is.
     fn refresh_list(&mut self) {
+        let kept = self
+            .list
+            .selected()
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.id.clone());
         self.rows
             .sort_by(|a, b| b.activity.cmp(&a.activity).then(a.id.cmp(&b.id)));
         self.labels = self
@@ -1982,8 +2040,13 @@ impl App {
                 Some(workspace) => workspace.label(),
             })
             .collect();
-        let tree: Vec<TreeRow<usize>> = (0..self.rows.len())
-            .map(|id| TreeRow {
+        let show = self.show_archived;
+        let tree: Vec<TreeRow<usize>> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| show || !row.archived)
+            .map(|(id, _)| TreeRow {
                 id,
                 parent: None,
                 depth: 0,
@@ -1999,12 +2062,24 @@ impl App {
             }
             Err(e) => self.note(format!("the list: {e}")),
         }
-        let selected = self
-            .active
-            .as_ref()
-            .and_then(|id| self.rows.iter().position(|r| &r.id == id));
+        let selected = kept
+            .and_then(|id| {
+                self.rows
+                    .iter()
+                    .position(|r| r.id == id && (show || !r.archived))
+            })
+            .or_else(|| self.shown_active());
         self.list.select(selected, true);
         self.touch();
+    }
+
+    /// The open conversation's index in `rows`, when the list shows it.
+    fn shown_active(&self) -> Option<usize> {
+        self.active.as_ref().and_then(|id| {
+            self.rows
+                .iter()
+                .position(|r| &r.id == id && (self.show_archived || !r.archived))
+        })
     }
 
     // --- input ------------------------------------------------------
@@ -2153,17 +2228,23 @@ impl App {
     }
 
     /// The conversation `step` rows from the active one, opened.
+    /// Archived conversations are passed over.
     fn switch(&mut self, step: isize) {
+        let live: Vec<&Id> = self
+            .rows
+            .iter()
+            .filter(|r| !r.archived)
+            .map(|r| &r.id)
+            .collect();
         let at = self
             .active
             .as_ref()
-            .and_then(|id| self.rows.iter().position(|r| &r.id == id));
+            .and_then(|id| live.iter().position(|r| *r == id));
         let next = match at {
             Some(at) => at.checked_add_signed(step),
             None => Some(0),
         };
-        if let Some(row) = next.and_then(|i| self.rows.get(i)) {
-            let id = row.id.clone();
+        if let Some(id) = next.and_then(|i| live.get(i)).map(|id| (*id).clone()) {
             self.open(id);
         }
     }
@@ -2171,6 +2252,16 @@ impl App {
     /// Opens conversation `id`; opening the one already open again
     /// retries it when its process failed.
     fn open(&mut self, id: Id) {
+        if let Some(row) = self.rows.iter().find(|r| r.id == id && r.archived) {
+            let said = format!(
+                "{:?} is archived: Unarchive in its row's menu opens it again",
+                row.title
+            );
+            // The list's selection goes back to the open one.
+            self.list.select(self.shown_active(), false);
+            self.touch();
+            return self.note(said);
+        }
         if self.active.as_ref() != Some(&id) || self.active_failed() {
             self.set_active(id.clone());
             self.requests.push(Request::Open(id));
@@ -2298,7 +2389,8 @@ impl App {
                 ..
             } => self.pointer(phase, x, y, extend, clipboard),
             Input::CancelPointer => self.cancel_pointer(),
-            Input::Hover(_) | Input::Context { .. } => {}
+            Input::Hover(_) => {}
+            Input::Context { x, y } => self.context(x, y),
             Input::Wheel { rows, columns } => {
                 let changed = match self.focus {
                     Focus::List => {
@@ -2466,7 +2558,11 @@ impl App {
                 self.touch();
                 self.menu_action(action);
             }
-            Ok(Outcome::Changed | Outcome::Dismissed | Outcome::Stale) => self.touch(),
+            Ok(Outcome::Dismissed | Outcome::Stale) => {
+                self.menu_row = None;
+                self.touch();
+            }
+            Ok(Outcome::Changed) => self.touch(),
             Ok(Outcome::Ignored | Outcome::Consumed) => {}
             Err(e) => {
                 self.menu.dismiss();
@@ -2490,6 +2586,87 @@ impl App {
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
             // The list is the window's: `input_live` reports the choice.
             menu::Action::Keys => self.keys_chosen = true,
+            menu::Action::ShowArchived => self.toggle_archived(),
+            menu::Action::Archive => self.archive_row(true),
+            menu::Action::Unarchive => self.archive_row(false),
+            menu::Action::DeleteRow => {
+                if let Some(id) = self.menu_row.take() {
+                    self.ask_delete(id);
+                }
+            }
+        }
+    }
+
+    /// Archives the row menu's conversation, or brings it back.
+    fn archive_row(&mut self, archived: bool) {
+        if let Some(id) = self.menu_row.take() {
+            self.requests.push(Request::Archive { id, archived });
+            self.touch();
+        }
+    }
+
+    /// A right press: over a conversation's row, that row's menu at the
+    /// pointer; anywhere else, nothing.
+    fn context(&mut self, x: i64, y: i64) {
+        // An open modal or menu has taken the press before this.
+        if self.modal() || self.menu.is_open() {
+            return;
+        }
+        let Some(tree_table::Target::Row(index)) = self.list.target(x, y) else {
+            return;
+        };
+        if let Some(id) = self.rows.get(index).map(|r| r.id.clone()) {
+            self.open_row_menu(id, x, y);
+        }
+    }
+
+    /// Opens a row's menu under its row, as a right press there does:
+    /// with the list focused, the selected row's, so the keyboard reaches
+    /// an archived one; else the open conversation's. At the list's
+    /// corner when the row is out of view.
+    pub fn open_key_row_menu(&mut self) {
+        if self.modal() {
+            return;
+        }
+        let selected = match self.focus {
+            Focus::List => self.list.selected(),
+            _ => None,
+        };
+        let Some(index) = selected.or_else(|| self.shown_active()) else {
+            return self.note("no conversation is open or selected");
+        };
+        let (Some(regions), Some(id)) = (self.regions, self.rows.get(index).map(|r| r.id.clone()))
+        else {
+            return;
+        };
+        let under = self
+            .list
+            .model()
+            .find(index)
+            .and_then(|at| self.list.geometry()?.row(at))
+            .map(|rect| (rect.x, rect.y.saturating_add(i64::from(rect.height))));
+        let (x, y) = under.unwrap_or((regions.list.x, regions.list.y));
+        self.open_row_menu(id, x, y);
+    }
+
+    /// Opens conversation `id`'s row menu at `x`, `y`, in the menu's
+    /// controller: Archive, or Unarchive, then Delete….
+    fn open_row_menu(&mut self, id: Id, x: i64, y: i64) {
+        let Some(archived) = self.rows.iter().find(|r| r.id == id).map(|r| r.archived) else {
+            return;
+        };
+        self.cancel_pointer();
+        let revision = self.menu_revision.wrapping_add(1);
+        let opened = menu::row(self.surface, archived, revision)
+            .and_then(|mut row| row.open_context(x, y).map(|()| row));
+        match opened {
+            Ok(row) => {
+                self.menu = row;
+                self.menu_revision = revision;
+                self.menu_row = Some(id);
+                self.touch();
+            }
+            Err(e) => self.note(format!("the row's menu: {e}")),
         }
     }
 
@@ -2506,11 +2683,13 @@ impl App {
             open: self.active.is_some(),
             effort: self.effort(),
             reasoning: self.reasoning(model),
+            show_archived: self.show_archived,
         };
         match menu::menu(self.surface, state, revision) {
             Ok(menu) => {
                 self.menu = menu;
                 self.menu_revision = revision;
+                self.menu_row = None;
             }
             Err(e) => self.note(format!("the menu: {e}")),
         }
@@ -2843,10 +3022,22 @@ impl App {
         if self.modal() {
             return;
         }
-        let Some(row) = self.active_row() else {
+        let Some(id) = self.active.clone() else {
             return self.note("no conversation is open to delete");
         };
-        let (id, title, workspace) = (row.id.clone(), row.title.clone(), row.workspace.clone());
+        self.ask_delete(id);
+    }
+
+    /// Asks whether to delete conversation `id`, open or not, as its row
+    /// menu's Delete… does.
+    fn ask_delete(&mut self, id: Id) {
+        if self.modal() {
+            return;
+        }
+        let Some(row) = self.rows.iter().find(|r| r.id == id) else {
+            return;
+        };
+        let (title, workspace) = (row.title.clone(), row.workspace.clone());
         self.cancel_pointer();
         self.menu.dismiss();
         self.confirm_revision = self.confirm_revision.wrapping_add(1);
@@ -3148,6 +3339,7 @@ impl App {
         }
         match chord {
             menu::OPEN if !repeat => return self.open_menu(),
+            menu::ROW_MENU if !repeat => return self.open_key_row_menu(),
 
             "C-n" if !repeat => return self.new_conversation(),
             "C-S-m" if !repeat => return self.open_messages(),
@@ -3610,6 +3802,7 @@ pub mod tests {
             state: RowState::Closed,
             paused: false,
             workspace: None,
+            archived: false,
         }
     }
 
@@ -4866,6 +5059,125 @@ pub mod tests {
             regions.status.y + i64::from(regions.status.height),
             app.surface.height as i64
         );
+    }
+
+    /// Where conversation `n`'s row is drawn in the list.
+    fn row_at(app: &App, n: u8) -> (i64, i64) {
+        let index = app.rows().iter().position(|r| r.id == id(n)).unwrap();
+        let at = app.list.model().find(index).unwrap();
+        let rect = app.list.geometry().unwrap().row(at).unwrap();
+        (rect.x + 8, rect.y + 4)
+    }
+
+    fn context(app: &mut App, (x, y): (i64, i64)) {
+        app.input(Input::Context { x, y }, &mut NoClipboard);
+    }
+
+    /// The conversations the list shows, in its order.
+    fn shown(app: &App) -> Vec<Id> {
+        app.list
+            .model()
+            .rows()
+            .iter()
+            .map(|r| app.rows()[r.id].id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_rows_menu_archives_unarchives_and_deletes_its_conversation() {
+        let mut app = app();
+        assert_eq!(shown(&app), [id(1), id(3), id(2)]);
+        // A right press on a row opens its menu at the pointer, and not
+        // its conversation.
+        let at = row_at(&app, 3);
+        context(&mut app, at);
+        assert!(app.menu_open());
+        assert_eq!(app.menu_row(), Some(&id(3)));
+        assert_eq!(app.active(), Some(&id(1)));
+        assert!(text(&app).contains(menu::ARCHIVE), "{}", text(&app));
+        key(&mut app, "Return");
+        assert!(!app.menu_open());
+        assert_eq!(
+            app.take_requests(),
+            [Request::Archive {
+                id: id(3),
+                archived: true
+            }]
+        );
+        // Archived, the list hides it and C-PageDown passes over it.
+        app.set_archived(&id(3), true);
+        assert_eq!(shown(&app), [id(1), id(2)]);
+        key(&mut app, "C-PageDown");
+        assert_eq!(app.take_requests(), [Request::Open(id(2))]);
+        // Show archived shows it, archived, and opening it is refused.
+        app.menu_action(menu::Action::ShowArchived);
+        assert!(app.shows_archived());
+        assert_eq!(shown(&app), [id(1), id(3), id(2)]);
+        let at = app.rows().iter().position(|r| r.id == id(3)).unwrap();
+        assert_eq!(app.cell(at, 1).text(), "archived");
+        let (x, y) = row_at(&app, 3);
+        press(&mut app, x, y);
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().unwrap().contains("is archived"));
+        assert_eq!(app.active(), Some(&id(2)));
+        assert_eq!(app.list.selected(), app.shown_active());
+        // From the keyboard, S-F10 in the list opens the selected row's,
+        // archived or not, and closes it again.
+        app.set_focus(Focus::List);
+        let three = app.rows().iter().position(|r| r.id == id(3)).unwrap();
+        app.list.select(Some(three), true);
+        // An update to the list keeps the selection where it is.
+        app.set_rows(app.rows().to_vec());
+        key(&mut app, "S-F10");
+        assert_eq!(app.menu_row(), Some(&id(3)));
+        assert!(text(&app).contains(menu::UNARCHIVE));
+        key(&mut app, "S-F10");
+        assert!(!app.menu_open());
+        // Its menu unarchives it, or asks whether to delete it.
+        let at = row_at(&app, 3);
+        context(&mut app, at);
+        assert!(text(&app).contains(menu::UNARCHIVE));
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Archive {
+                id: id(3),
+                archived: false
+            }]
+        );
+        let at = row_at(&app, 3);
+        context(&mut app, at);
+        key(&mut app, "Down");
+        key(&mut app, "Return");
+        assert!(matches!(
+            app.confirm().map(Confirm::purpose),
+            Some(confirm::Purpose::Delete(of)) if *of == id(3)
+        ));
+        key(&mut app, "Escape");
+        assert!(app.confirm().is_none() && app.take_requests().is_empty());
+        // The bar's menu is back at F10.
+        key(&mut app, "F10");
+        assert!(app.menu_row().is_none());
+        assert!(text(&app).contains("New conversation"));
+        key(&mut app, "Escape");
+        // Away from the list, S-F10 opens the open conversation's under
+        // its row.
+        app.set_focus(Focus::Composer);
+        key(&mut app, "S-F10");
+        assert_eq!(app.menu_row(), Some(&id(2)));
+        assert!(app.menu.panel(0).unwrap().y > row_at(&app, 2).1);
+        key(&mut app, "Escape");
+        // A right press off the rows opens nothing.
+        let list = app.regions.unwrap().list;
+        context(&mut app, (list.x + 8, list.y + list.height as i64 - 4));
+        assert!(!app.menu_open());
+        // Archiving the open one closes it, and the most recent is the
+        // most recent not archived.
+        app.set_archived(&id(3), false);
+        app.set_archived(&id(1), true);
+        app.set_archived(&id(2), true);
+        assert_eq!(app.active(), None);
+        assert_eq!(app.most_recent(), Some(id(3)));
     }
 
     #[test]

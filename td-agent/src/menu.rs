@@ -8,6 +8,10 @@
 //! through the same paths as the item's chord. The Conversation menu
 //! shows the open conversation's effort checked, so the window builds the
 //! menu again, at a new revision, from the state of the moment it opens.
+//! A conversation's row has a context menu of its own (`row`), which the
+//! window opens in the same controller at a right press on the row or at
+//! `ROW_MENU` for the open conversation's, and puts the bar's back in
+//! when it next opens the bar.
 
 use td_ui::chrome::{Bar, Row};
 use td_ui::keys;
@@ -20,6 +24,9 @@ use crate::config::EFFORTS;
 pub const LABELS: &[&str] = &["File", "Conversation", keys::BUTTON];
 /// The chord that opens the File menu, and closes it while it is open.
 pub const OPEN: &str = "F10";
+/// The chord that opens the open conversation's row menu, as a right
+/// press on its row does.
+pub const ROW_MENU: &str = "S-F10";
 
 /// What a menu item does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +53,14 @@ pub enum Action {
     Delete,
     /// Choose the model new conversations start with.
     DefaultModel,
+    /// Show archived conversations in the list, or hide them again.
+    ShowArchived,
+    /// The row menu's: archive its conversation.
+    Archive,
+    /// The row menu's: bring its archived conversation back.
+    Unarchive,
+    /// The row menu's: ask whether to delete its conversation.
+    DeleteRow,
 }
 
 /// The File menu's items: label, the chord shown beside it (one that
@@ -70,14 +85,23 @@ pub const EFFORT: &str = "Effort";
 pub const DEFAULT_MODEL: &str = "Default model\u{2026}";
 /// The Conversation menu's item that asks to delete the open one.
 pub const DELETE: &str = "Delete conversation\u{2026}";
+/// The Conversation menu's item, checked while archived conversations
+/// show in the list.
+pub const SHOW_ARCHIVED: &str = "Show archived";
+/// The row menu's items.
+pub const ARCHIVE: &str = "Archive";
+pub const UNARCHIVE: &str = "Unarchive";
+pub const DELETE_ROW: &str = "Delete\u{2026}";
 
 /// What the Conversation menu shows: whether a conversation is open, its
-/// effort, and whether its model takes one.
+/// effort, whether its model takes one, and whether archived
+/// conversations show.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct State<'a> {
     pub open: bool,
     pub effort: &'a str,
     pub reasoning: bool,
+    pub show_archived: bool,
 }
 
 pub type Menu = Controller<'static, Action, u64>;
@@ -138,6 +162,11 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         row: row(DELETE, "", state.open, false),
         item: Item::Action(Action::Delete),
     });
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(SHOW_ARCHIVED, "", true, state.show_archived),
+        item: Item::Action(Action::ShowArchived),
+    });
     let help = nodes.len();
     nodes.push(Node {
         parent: None,
@@ -156,8 +185,38 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
     )
 }
 
+/// A conversation's row menu over `surface` at `revision`, closed:
+/// Archive, or Unarchive for an archived conversation, then Delete….
+pub fn row(surface: Surface, archived: bool, revision: u64) -> Result<Menu, menus::Error> {
+    let item = |label, action| Node {
+        parent: None,
+        row: Row {
+            label,
+            shortcut: "",
+            enabled: true,
+            checked: false,
+        },
+        item: Item::Action(action),
+    };
+    let first = if archived {
+        item(UNARCHIVE, Action::Unarchive)
+    } else {
+        item(ARCHIVE, Action::Archive)
+    };
+    Controller::new(
+        Model::new(
+            Kind::Context,
+            revision,
+            &[first, item(DELETE_ROW, Action::DeleteRow)],
+        )?,
+        surface,
+        Fit::Adaptive,
+    )
+}
+
 /// A key while the menu is open, as the controller reads it: td-editor's
-/// set, `F10` closing it as it opened it; every other chord is consumed.
+/// set, `F10` or `S-F10` closing it as either opened it; every other
+/// chord is consumed.
 pub fn event(chord: &str, repeated: bool) -> Event {
     let key = match chord {
         "Up" => Key::Up,
@@ -166,7 +225,7 @@ pub fn event(chord: &str, repeated: bool) -> Event {
         "Right" => Key::Right,
         "Return" | "Space" | " " => Key::Activate,
         "Escape" => Key::Escape,
-        OPEN => Key::Dismiss,
+        OPEN | ROW_MENU => Key::Dismiss,
         _ => return Event::Other,
     };
     Event::Key { key, repeated }
@@ -183,6 +242,7 @@ mod tests {
         open: true,
         effort: "high",
         reasoning: true,
+        show_archived: false,
     };
 
     fn surface() -> Surface {
@@ -261,6 +321,53 @@ mod tests {
         assert!(enabled(OPENED, DELETE) && !enabled(closed, DELETE));
         // The default is chosen with or without one open.
         assert!(enabled(closed, DEFAULT_MODEL) && enabled(OPENED, DEFAULT_MODEL));
+        // Show archived is checked while they show.
+        let checked = |state: State<'static>| {
+            nodes(&menu(surface(), state, 1).unwrap())
+                .into_iter()
+                .find(|node| node.row.label == SHOW_ARCHIVED)
+                .unwrap()
+                .row
+                .checked
+        };
+        let shown = State {
+            show_archived: true,
+            ..closed
+        };
+        assert!(!checked(OPENED) && checked(shown) && enabled(shown, SHOW_ARCHIVED));
+    }
+
+    #[test]
+    fn a_rows_menu_archives_or_unarchives_it_and_asks_to_delete_it() {
+        for (archived, first) in [(false, Action::Archive), (true, Action::Unarchive)] {
+            let mut menu = row(surface(), archived, 1).unwrap();
+            assert!(!menu.is_open());
+            assert!(menu.open_bar(0).is_err(), "a context menu has no bar");
+            menu.open_context(300, 200).unwrap();
+            let panel = menu.panel(0).unwrap();
+            assert_eq!((panel.x, panel.y), (300, 200));
+            assert_eq!(key(&mut menu, "Return"), Outcome::Activated(first));
+            menu.open_context(300, 200).unwrap();
+            assert_eq!(key(&mut menu, "Down"), Outcome::Changed);
+            assert_eq!(
+                key(&mut menu, "Return"),
+                Outcome::Activated(Action::DeleteRow)
+            );
+            menu.open_context(300, 200).unwrap();
+            assert_eq!(key(&mut menu, "Escape"), Outcome::Dismissed);
+        }
+        let labels: Vec<&str> = nodes(&row(surface(), true, 1).unwrap())
+            .iter()
+            .map(|node| node.row.label)
+            .collect();
+        assert_eq!(labels, [UNARCHIVE, DELETE_ROW]);
+        // S-F10 closes it as it opened it.
+        let mut menu = row(surface(), false, 1).unwrap();
+        menu.open_context(300, 200).unwrap();
+        assert_eq!(key(&mut menu, ROW_MENU), Outcome::Dismissed);
+        assert!(crate::control::BINDINGS
+            .iter()
+            .any(|b| b.chord == Some(ROW_MENU)));
     }
 
     #[test]

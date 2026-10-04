@@ -382,14 +382,14 @@ a workspace or a conversation.
 (§12):
 
 - `conversations`: every conversation's id, workspace, state (idle,
-  running, waiting for approval, paused, failed), background process
-  count, cost and last activity, which td-agent itself writes, most
-  recently active first; with repository workspaces (increment 11),
+  running, waiting for approval, paused, failed, archived), background
+  process count, cost and last activity, which td-agent itself writes,
+  most recently active first; with repository workspaces (increment 11),
   each worktree's state as well. Model-written fields, the title, the
   todo item in progress (§12) and background command lines, and what
   comes from refs a jail wrote, a worktree's branch and its commits
-  ahead of and behind its base, are shown only for the caller itself,
-  so the listing is not a channel between conversations.
+  ahead of and behind its base, are shown only for the caller itself, so
+  the listing is not a channel between conversations.
 - `send_message {to, text}`: queues a message for another conversation,
   which the window process routes. A message is delivered between turns:
   when the receiver's running turn ends, or at once if it is idle, it
@@ -524,9 +524,9 @@ increments of §18:
 workspace's tools after them (§12). The crossing rules are those above:
 a conversation reads its own log, and every read of another's and every
 message to another is a crossing, decided as "As built (peers)" says.
-No conversation messages itself. Archived conversations do not exist
-until the archive step (§18): a send to an id the store does not hold is
-refused by name, and the archived check joins it then. `conversations`
+No conversation messages itself. A send to an id the store does not
+hold is refused by name, and one to an archived conversation is refused
+saying so (§7, As built (archiving)). `conversations`
 lists at most 200, the most recently active first, with how many more
 there are.
 
@@ -854,6 +854,30 @@ columns fit a window 1024 pixels wide. The driven action is
 `messages`, and the state gains `notes` (`open` or `closed`), `unread`
 and `note`, the newest note whole on one line.
 
+**As built (row menus).** A right press on a conversation's row (td-ui's
+`Context`, td-ui/DESIGN.md, "Widget window") opens its row menu at the
+pointer: `Archive`, or `Unarchive` for an archived conversation, then
+`Delete…`, which puts the deletion question of that row's conversation,
+open or not. `S-F10` opens a row's menu under its row, at the list's
+corner when the row is out of view: with the list focused, the selected
+row's, so the keyboard reaches an archived conversation, and otherwise
+the open conversation's; it closes an open row menu as `F10` closes the
+bar's. The list keeps the row selected through updates, so the
+keyboard's place holds until the human moves it or opens another
+conversation. A right press elsewhere opens nothing, and opening a row's
+menu does not open its conversation. The row menu is td-ui's shared menu
+controller in its context kind, held in the bar menu's place while it is
+open, so it takes the keys and the pointer as the bar's does and a right
+press with either open closes it; the bar's comes back when the bar next
+opens. An archived conversation (§7) leaves the list until Conversation
+→ `Show archived`, checked while they show, shows archived ones too,
+their state `archived`; opening one is refused with a note naming
+Unarchive, `C-PageUp` and `C-PageDown` pass over it, and the window
+starts with the most recently active conversation not archived. The
+driven actions are `row-menu` and `show-archived`, and the state gains
+`archived` (how many there are), `shown` (`all` or `unarchived`) and
+`row-menu` (the conversation the open row menu is of, else `none`).
+
 **As built (the key list).** `F1` shows td-ui's key list over the
 window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
 of the driven action table, `control::BINDINGS`, with its help line, so
@@ -991,8 +1015,8 @@ sections shows the first fourteen and says how many more there are.
 
 **As built (deleting a conversation).** Conversation → `Delete
 conversation…` deletes the open conversation for good, whichever it is;
-it is off only with none open. The context menus step puts it on a
-row's context menu too (§4, Left).
+it is off only with none open. A row's menu asks it of that row's
+conversation, open or not (As built (row menus), below).
 
 - **The question** is td-ui's confirmation dialog (td-ui/DESIGN.md),
   modal and centred over the window's body: it names the conversation
@@ -1901,6 +1925,31 @@ remove`, which would run git over jail-written content. The store is
 left alone. An unarchived conversation whose repository workspace was
 removed keeps its log; its file, shell and git tools then refuse,
 saying the workspace went with the archive.
+
+**As built (archiving).** `meta` holds `archived`, absent and false in
+one written before. Only the window writes it, under the conversation's
+lock, once the conversation's processes, open, in the background or
+retiring, are killed and waited for and its cards withdrawn, as a
+deletion's are, unless its `meta` cannot be read, as while it is still
+being made, which is refused before anything stops; a turn under way
+ends without a question, since archiving loses nothing and is undone by
+Unarchive. A lock not taken within two seconds leaves the conversation
+unarchived, which is said, and opens it again if it was open; one that
+was in the background starts again only when a message or the human
+opens it. A failure after the new `meta` is in place, syncing its
+directory, is judged by reading the mark back: stored, the conversation
+is archived and the trouble said. The human's messages it had not taken
+wait for its next process. What other conversations queued for it stays
+in the outbox, which hands nothing to an archived conversation and so
+starts no process for it, and the window refuses a new `send_message` to
+it saying it is archived; `conversations` names its state `archived`.
+Unarchiving clears the mark; what waited in the outbox is then handed to
+it, which starts its process in the background as any message does, and
+that process takes the human's messages parked with it; with nothing
+waiting, nothing starts until the human opens it. A conversation's own
+process keeps the mark as it found it when it rewrites `meta`. A scratch
+workspace stays with it; repository workspaces, and so the cleanup
+above, come with increment 11, and there are no schedules yet to stop.
 
 ## 8. The workspace jail
 
@@ -3710,6 +3759,28 @@ list's Workspace column, a directory by its folder's name; the key
 tests hold that no note kept, not only the newest, carries the key. And
 `src/control.rs` drives `messages` and reads `notes`, `unread` and
 `note`.
+
+For row menus and archiving, `src/menu.rs` covers the row menu's items
+for a live and an archived conversation, each activating its action,
+and Show archived checked while they show; `src/store.rs` holds that
+`archived` is written under the conversation's lock, refused while its
+process holds it, kept by a process that rewrites `meta`, and never
+makes a conversation the store does not hold; `src/post.rs` refuses a
+message to an archived conversation. The window's units cover a right
+press on a row opening that row's menu without opening it, one
+elsewhere opening nothing, `S-F10` under the open row, Archive and
+Unarchive asked of the window, Delete… putting the question of that
+row's conversation, an archived conversation hidden, shown with Show
+archived, refused when opened, passed over by `C-PageDown` and not
+the most recent, `S-F10` reaching the selected archived row from the
+list, kept selected through an update, the open one closed when
+archived, and the bar's menu back at
+`F10` after a row menu; `src/menu.rs` also holds `S-F10` closing a row
+menu. The window's own archiving, its processes ended, its refusal for
+a conversation whose `meta` is not yet written, its lock failure and a
+read-back after a failed sync, is not unit-tested: the window session
+has no test seam of its own; and `src/control.rs` drives `row-menu`
+and `show-archived` and reads `archived`, `shown` and `row-menu`.
 
 `tests/control_process.rs` gains two native cases. In the default build,
 `F10` through the seat opens the File menu, `Down` and `Return` open the

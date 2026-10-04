@@ -2238,6 +2238,7 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
                 id: meta.id,
                 state: "idle".into(),
                 failed: false,
+                archived: meta.archived,
             })
             .collect()
     };

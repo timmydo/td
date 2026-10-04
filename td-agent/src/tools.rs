@@ -249,7 +249,7 @@ fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::Conversations => (
-            "List the conversations td-agent holds, the most recently active first: each one's id, workspace, state (idle, running, paused, failed), background processes, cost and last activity. The title and the todo item in progress are shown for this conversation only, since other conversations' models wrote them.".to_string(),
+            "List the conversations td-agent holds, the most recently active first: each one's id, workspace, state (idle, running, paused, failed, archived), background processes, cost and last activity. The title and the todo item in progress are shown for this conversation only, since other conversations' models wrote them.".to_string(),
             schema(Vec::new(), &[]),
         ),
         Tool::SendMessage => (

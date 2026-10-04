@@ -224,6 +224,9 @@ pub struct Entry {
     pub state: String,
     /// Its process failed: nothing wakes it until the human opens it.
     pub failed: bool,
+    /// The human archived it: it takes no message, and what is queued
+    /// for it waits until it is unarchived.
+    pub archived: bool,
 }
 
 /// Whether a message from `from` to `to` may be queued (DESIGN.md §3),
@@ -242,6 +245,11 @@ fn check(
     }
     if !known(to) {
         return Err(format!("there is no conversation {to}"));
+    }
+    if directory.iter().any(|e| &e.id == to && e.archived) {
+        return Err(format!(
+            "conversation {to} is archived; it takes messages again once the human unarchives it"
+        ));
     }
     tools::crossing(from, to, Op::Message)?;
     if text.trim().is_empty() || text.len() > tools::MAX_MESSAGE {
@@ -342,7 +350,7 @@ impl Post {
         for message in &self.outbox.queued {
             let to = &message.to;
             let known = directory.iter().find(|e| &e.id == to);
-            if known.is_some_and(|e| e.failed)
+            if known.is_some_and(|e| e.failed || e.archived)
                 || self.stuck.contains(to)
                 || supervisor.holds(to, &message.delivery)
             {
@@ -392,6 +400,7 @@ mod tests {
             id: id(n),
             state: "idle".into(),
             failed: false,
+            archived: false,
         }
     }
 
@@ -480,6 +489,43 @@ mod tests {
         assert!(!state.root().join("outbox").join(id(1).as_str()).exists());
     }
 
+    /// What is queued for an archived receiver waits: no process is
+    /// started for it, nor said to have failed to start.
+    #[test]
+    fn nothing_is_delivered_to_an_archived_receiver() {
+        let scratch = Scratch::new("archived");
+        let state = scratch.state();
+        let (mut outbox, _) = Outbox::load(&state);
+        outbox.post(id(2), id(1), "hi".into()).unwrap();
+        let mut post = Post::new(outbox);
+        // A program that cannot start, so a wake would be said.
+        let setup = Down::Setup {
+            key: Err("no key".into()),
+            client: crate::config::Client::default(),
+        };
+        let mut supervisor = Supervisor::new(
+            state.root().join("no-such-program"),
+            state.root().to_path_buf(),
+            setup,
+        );
+        let archived = [
+            entry(1),
+            Entry {
+                archived: true,
+                ..entry(2)
+            },
+        ];
+        assert!(post.deliver(&mut supervisor, &archived).is_empty());
+        assert!(!supervisor.running(&id(2)));
+        assert_eq!(post.outbox().count(&id(2)), 1, "it waits");
+        // Unarchived, it is woken for it, here in vain.
+        let notes = post.deliver(&mut supervisor, &[entry(1), entry(2)]);
+        assert!(
+            notes.iter().any(|n| n.contains("could not be started")),
+            "{notes:?}"
+        );
+    }
+
     #[test]
     fn a_message_is_checked_again_by_the_window() {
         let scratch = Scratch::new("check");
@@ -501,5 +547,15 @@ mod tests {
         }
         let full = ok(&outbox, 2, 1).unwrap_err();
         assert!(full.contains("16 messages undelivered"), "{full}");
+        // An archived receiver takes none.
+        let directory = [
+            entry(1),
+            Entry {
+                archived: true,
+                ..entry(2)
+            },
+        ];
+        let refused = check(&outbox, &directory, &id(1), &id(2), "hi").unwrap_err();
+        assert!(refused.contains("is archived"), "{refused}");
     }
 }

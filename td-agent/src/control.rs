@@ -120,6 +120,18 @@ pub const BINDINGS: &[Binding] = &[
         help: "Open the File menu, or close it: arrows move, Return chooses, Escape closes.",
     },
     Binding {
+        name: "row-menu",
+        chord: Some("S-F10"),
+        arguments: "",
+        help: "Open a row's menu, as a right press on a row does: the selected row's while the list has the keyboard, else the open conversation's; Archive, or Unarchive, and Delete...",
+    },
+    Binding {
+        name: "show-archived",
+        chord: None,
+        arguments: "",
+        help: "Conversation > Show archived: show archived conversations in the list, or hide them again.",
+    },
+    Binding {
         name: "set-key",
         chord: None,
         arguments: "",
@@ -189,7 +201,12 @@ impl Controller for Remote<'_> {
         // Through the menu's own paths, as a choice of its item.
         if matches!(
             name,
-            "set-key" | "model" | "export-diagnostics" | "delete-conversation" | "default-model"
+            "set-key"
+                | "model"
+                | "export-diagnostics"
+                | "delete-conversation"
+                | "default-model"
+                | "show-archived"
         ) {
             let before = self.app.generation();
             match name {
@@ -197,6 +214,7 @@ impl Controller for Remote<'_> {
                 "model" => self.app.open_picker(),
                 "delete-conversation" => self.app.open_delete(),
                 "default-model" => self.app.open_default_picker(),
+                "show-archived" => self.app.toggle_archived(),
                 _ => self.app.export_diagnostics(),
             }
             return Ok(self.outcome(before));
@@ -276,7 +294,7 @@ impl Controller for Remote<'_> {
             |chooser| chooser.folder().display().to_string(),
         );
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tarchived={}\tshown={}\trow-menu={}\tstatus={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
@@ -296,6 +314,9 @@ impl Controller for Remote<'_> {
             },
             app.unread(),
             app.notice().unwrap_or("").replace(['\t', '\n'], " "),
+            app.rows().iter().filter(|r| r.archived).count(),
+            if app.shows_archived() { "all" } else { "unarchived" },
+            app.menu_row().map_or("none", |id| id.as_str()),
             app.status_line().replace(['\t', '\n'], " "),
         ))
     }
@@ -359,6 +380,36 @@ mod tests {
 
     fn hex(text: &str) -> String {
         text.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The open conversation's row menu and Show archived through the
+    /// seam, the state counting the archived and naming the row menu's.
+    #[test]
+    fn the_row_menu_and_show_archived_are_driven() {
+        let mut app = crate::ui::tests::app();
+        let mut remote = Remote { app: &mut app };
+        let state = remote.state().unwrap();
+        assert!(
+            state.contains("\tarchived=0\tshown=unarchived\trow-menu=none\t"),
+            "{state}"
+        );
+        assert!(driven::request(&mut remote, b"1\t1\taction\trow-menu").ends_with("changed"));
+        let active = remote.app.active().unwrap().to_string();
+        let state = remote.state().unwrap();
+        assert!(state.contains(&format!("\trow-menu={active}\t")), "{state}");
+        assert!(state.contains("menu=open"));
+        driven::request(
+            &mut remote,
+            format!("1\t2\tkey\t{}", hex("Return")).as_bytes(),
+        );
+        let archive = remote.app.take_requests();
+        assert!(
+            matches!(&archive[..], [Request::Archive { id, archived: true }] if id.as_str() == active),
+            "{archive:?}"
+        );
+        assert!(remote.state().unwrap().contains("\trow-menu=none\t"));
+        assert!(driven::request(&mut remote, b"1\t3\taction\tshow-archived").ends_with("changed"));
+        assert!(remote.state().unwrap().contains("\tshown=all\t"));
     }
 
     /// The File menu and the key dialog through the seam: opened, typed

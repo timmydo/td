@@ -391,6 +391,25 @@ impl StateDir {
         (metas, problems)
     }
 
+    /// Marks conversation `id` archived, or not, in its `meta` (DESIGN.md
+    /// §7), under its lock, waiting `wait` for it: the window's to write
+    /// once the conversation's process has ended, which held it.
+    pub fn set_archived(&self, id: &Id, archived: bool, wait: Duration) -> Result<(), String> {
+        let dir = self.conversation(id);
+        let lock = lock_conversation(&dir, wait)?;
+        let written = read_meta(&dir).and_then(|mut meta| {
+            meta.archived = archived;
+            replace(&dir, "meta", meta.to_json().to_string().as_bytes())
+        });
+        drop(lock);
+        written
+    }
+
+    /// Whether conversation `id`'s `meta` says it is archived, as stored.
+    pub fn archived(&self, id: &Id) -> Result<bool, String> {
+        read_meta(&self.conversation(id)).map(|meta| meta.archived)
+    }
+
     /// The split's preferred share as the window last saved it, in its
     /// own pixels: first and total.
     pub fn load_share(&self) -> Option<(u32, u32)> {
@@ -536,6 +555,10 @@ pub struct Meta {
     /// What it works in (DESIGN.md §7), fixed when it is created; null
     /// for a conversation with none.
     pub workspace: Option<Workspace>,
+    /// The human archived it (DESIGN.md §7): the window starts no
+    /// process for it and routes no message to it until unarchived. Only
+    /// the window writes it; absent and false in a meta written before.
+    pub archived: bool,
 }
 
 impl Meta {
@@ -557,6 +580,7 @@ impl Meta {
             ("created".into(), Json::from(self.created)),
             ("paused".into(), Json::Bool(self.paused)),
             ("effort".into(), or_null(&self.effort)),
+            ("archived".into(), Json::Bool(self.archived)),
         ])
     }
 
@@ -586,6 +610,12 @@ impl Meta {
                 Some(workspace) => {
                     Some(Workspace::from_json(workspace).map_err(|e| format!("meta: {e}"))?)
                 }
+            },
+            archived: match value.get("archived") {
+                None => false,
+                Some(archived) => archived
+                    .as_bool()
+                    .ok_or("meta's archived is not a boolean")?,
             },
         })
     }
@@ -1406,6 +1436,7 @@ impl Conversation {
                     model: None,
                     effort: None,
                     workspace,
+                    archived: false,
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
@@ -2262,6 +2293,38 @@ pub mod tests {
         drop(conversation);
         let (metas, _) = state.list();
         assert!(metas.iter().all(|m| !m.paused), "and `meta` is written");
+    }
+
+    #[test]
+    fn archiving_is_kept_in_meta_under_the_conversations_lock() {
+        let scratch = Scratch::new("archive");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let (conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        assert!(!conversation.meta().archived);
+        // Its process holds the lock: the window waits, then says so.
+        let refused = state
+            .set_archived(&id, true, Duration::from_millis(50))
+            .unwrap_err();
+        assert!(refused.contains("lock"), "{refused}");
+        drop(conversation);
+        state.set_archived(&id, true, LOCK_WAIT).unwrap();
+        let (metas, _) = state.list();
+        assert!(metas.iter().all(|m| m.archived && m.id == id));
+        // A process that opens it keeps it, and writes it back with what
+        // it writes itself.
+        let (mut conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert!(conversation.meta().archived);
+        conversation.set_paused(true).unwrap();
+        drop(conversation);
+        assert!(state.list().0.iter().all(|m| m.archived && m.paused));
+        state.set_archived(&id, false, LOCK_WAIT).unwrap();
+        assert!(state.list().0.iter().all(|m| !m.archived && m.paused));
+        // A conversation the store does not hold is not made.
+        let other = Id::random().unwrap();
+        assert!(state.set_archived(&other, true, LOCK_WAIT).is_err());
+        assert!(!state.conversation(&other).exists());
     }
 
     #[test]

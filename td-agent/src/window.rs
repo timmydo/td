@@ -241,6 +241,7 @@ impl Session {
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
                 Request::Export => self.export(),
                 Request::Delete(id) => self.delete(&id),
+                Request::Archive { id, archived } => self.archive(&id, archived),
                 // To whichever conversation asked, open or not; one whose
                 // process has gone asks again from nothing.
                 Request::Decide {
@@ -373,6 +374,7 @@ impl Session {
             state: RowState::Starting,
             paused: false,
             workspace: workspace.clone(),
+            archived: false,
         });
         self.app.set_active(id.clone());
         match workspace {
@@ -559,6 +561,68 @@ impl Session {
         }
         self.app.remove_row(id);
         self.app.note(said);
+        if was_open {
+            if let Some(next) = self.app.most_recent() {
+                self.app.set_active(next.clone());
+                self.open(next, None);
+            }
+        }
+    }
+
+    /// Archives conversation `id`, or brings it back (DESIGN.md §7). An
+    /// archived conversation has no process: its own and its background
+    /// ones end first, as a deletion's do, and the human's messages it had
+    /// not taken wait for its next. Messages for it wait in the outbox.
+    fn archive(&mut self, id: &Id, archived: bool) {
+        // One still being made has no `meta` to mark: stopping its
+        // process would leave it half made.
+        if let Err(e) = self.state.archived(id) {
+            return self
+                .app
+                .note(format!("the conversation cannot be archived yet: {e}"));
+        }
+        let was_open = self.app.active() == Some(id);
+        let held = if archived {
+            let held = self.supervisor.remove(id);
+            self.ledger.forget(id);
+            self.app.withdraw(id, None);
+            held
+        } else {
+            Vec::new()
+        };
+        let done = if archived { "archived" } else { "unarchived" };
+        let mut trouble = None;
+        if let Err(e) = self
+            .state
+            .set_archived(id, archived, Duration::from_secs(2))
+        {
+            eprintln!("td-agent: {done} {id}: {e}");
+            // A failure after the new `meta` was put in place, syncing
+            // its directory, still marked it: what is stored decides.
+            if self.state.archived(id) != Ok(archived) {
+                self.app
+                    .note(format!("the conversation was not {done}: {e}"));
+                self.supervisor.park(id.clone(), held);
+                if was_open {
+                    self.open(id.clone(), None);
+                }
+                return;
+            }
+            trouble = Some(e);
+        }
+        self.supervisor.park(id.clone(), held);
+        self.app.set_archived(id, archived);
+        let title = self
+            .app
+            .rows()
+            .iter()
+            .find(|r| &r.id == id)
+            .map(|r| r.title.clone())
+            .unwrap_or_default();
+        self.app.note(match trouble {
+            None => format!("{title:?} is {done}"),
+            Some(e) => format!("{title:?} is {done}, though writing it said: {e}"),
+        });
         if was_open {
             if let Some(next) = self.app.most_recent() {
                 self.app.set_active(next.clone());
@@ -865,6 +929,7 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
                 state: RowState::Closed,
                 paused: meta.paused,
                 workspace: meta.workspace,
+                archived: meta.archived,
             }
         })
         .collect();
