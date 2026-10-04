@@ -92,10 +92,332 @@ pub fn atom<E>(
     }
     Ok(Some(first))
 }
+/// One strict UTF-8 character assembled from logical octets.
+/// Escape provenance belongs to the first logical octet, including its fold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Character {
+    pub value: char,
+    pub next: usize,
+    pub escaped: bool,
+}
+/// Projection/admission refusal or invalid logical UTF-8 spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CharacterError<E> {
+    Projection(Error<E>),
+    /// The separate local UTF-8 inspection was refused.
+    Verify(E),
+    InvalidUtf8,
+}
+impl<E: std::fmt::Display> std::fmt::Display for CharacterError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Projection(error) => error.fmt(f),
+            Self::Verify(error) => write!(f, "projection verification: {error}"),
+            Self::InvalidUtf8 => f.write_str("invalid projected UTF-8"),
+        }
+    }
+}
+impl<E: std::error::Error> std::error::Error for CharacterError<E> {}
+/// Assemble at most four logical octets without retaining source or admission.
+/// `read` admits each source access as for `atom`. After assembly, `verify`
+/// admits the separate local UTF-8 inspection of one to four buffered bytes.
+/// Both callbacks borrow the same caller-owned context sequentially; neither
+/// receives a copied allowance. At most 24 read calls and one verification call
+/// occur. Refusals return immediately and must retire the enclosing owner.
+/// EOF before the first octet returns None; truncation after it is InvalidUtf8.
+/// No control filtering, normalization or word-placement authority follows.
+pub fn character<C: ?Sized, E>(
+    at: usize,
+    quoted: bool,
+    context: &mut C,
+    mut read: impl FnMut(&mut C, usize) -> Result<Option<u8>, E>,
+    mut verify: impl FnMut(&mut C, usize) -> Result<(), E>,
+) -> Result<Option<Character>, CharacterError<E>> {
+    let Some(first) =
+        atom(at, quoted, |at| read(context, at)).map_err(CharacterError::Projection)?
+    else {
+        return Ok(None);
+    };
+    let width = match first.value {
+        0..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return Err(CharacterError::InvalidUtf8),
+    };
+    let mut bytes = [first.value, 0, 0, 0];
+    let mut next = first.next;
+    for cell in bytes.get_mut(1..width).ok_or(CharacterError::InvalidUtf8)? {
+        let octet = atom(next, quoted, |at| read(context, at))
+            .map_err(CharacterError::Projection)?
+            .ok_or(CharacterError::InvalidUtf8)?;
+        *cell = octet.value;
+        next = octet.next;
+    }
+    verify(context, width).map_err(CharacterError::Verify)?;
+    let value = std::str::from_utf8(bytes.get(..width).ok_or(CharacterError::InvalidUtf8)?)
+        .map_err(|_| CharacterError::InvalidUtf8)?
+        .chars()
+        .next()
+        .ok_or(CharacterError::InvalidUtf8)?;
+    Ok(Some(Character {
+        value,
+        next,
+        escaped: first.escaped,
+    }))
+}
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    #[test]
+    fn characters_preserve_first_octet_provenance_and_admit_local_verification() {
+        for (source, quoted, value, next, escaped, positions, width) in [
+            (b"a".as_slice(), false, 'a', 1, false, vec![0], 1),
+            ("é".as_bytes(), true, 'é', 2, false, vec![0, 1], 2),
+            ("例".as_bytes(), true, '例', 3, false, vec![0, 1, 2], 3),
+            ("🐈".as_bytes(), true, '🐈', 4, false, vec![0, 1, 2, 3], 4),
+            (b"\\\xc3\\\xa9", true, 'é', 4, true, vec![0, 1, 2, 3], 2),
+            (b"\xc3\\\xa9", true, 'é', 3, false, vec![0, 1, 2], 2),
+            (
+                b"\\\r\\\n\\\t",
+                true,
+                '\t',
+                6,
+                true,
+                vec![0, 1, 2, 3, 4, 5],
+                1,
+            ),
+            (b"\r\n ", false, ' ', 3, false, vec![0, 1, 2], 1),
+            (b"\\\0", true, '\0', 2, true, vec![0, 1], 1),
+            (
+                "\u{10ffff}".as_bytes(),
+                false,
+                '\u{10ffff}',
+                4,
+                false,
+                vec![0, 1, 2, 3],
+                4,
+            ),
+        ] {
+            let mut calls = Vec::new();
+            let actual = character(
+                0,
+                quoted,
+                &mut calls,
+                |calls, at| {
+                    calls.push((false, at));
+                    Ok::<_, u8>(source.get(at).copied())
+                },
+                |calls, width| {
+                    calls.push((true, width));
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                actual,
+                Ok(Some(Character {
+                    value,
+                    next,
+                    escaped
+                })),
+                "{source:?}"
+            );
+            let mut expected: Vec<_> = positions.into_iter().map(|at| (false, at)).collect();
+            expected.push((true, width));
+            assert_eq!(calls, expected);
+            assert!(calls.len() <= 25);
+            // Every source and verification refusal stops at that callback.
+            for cut in 0..calls.len() {
+                let mut attempted = 0;
+                let actual = character(
+                    0,
+                    quoted,
+                    &mut attempted,
+                    |n, at| {
+                        *n += 1;
+                        if *n > cut {
+                            Err(7)
+                        } else {
+                            Ok(source.get(at).copied())
+                        }
+                    },
+                    |n, _| {
+                        *n += 1;
+                        if *n > cut {
+                            Err(7)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert_eq!(
+                    actual,
+                    Err(if calls.get(cut).unwrap().0 {
+                        CharacterError::Verify(7)
+                    } else {
+                        CharacterError::Projection(Error::Read(7))
+                    })
+                );
+                assert_eq!(attempted, cut + 1);
+            }
+        }
+    }
+    #[test]
+    fn maximal_escaped_scalar_and_malformed_folds_have_bounded_callback_counts() {
+        let malformed = [
+            b'\\', 0xf0, b'\\', b'\r', b'\\', b'\n', b'\\', b' ', b'\\', b'\r', b'\\', b'\n',
+            b'\\', b' ', b'\\', b'\r', b'\\', b'\n', b'\\', b' ',
+        ];
+        for (source, visits, expected) in [
+            (
+                b"\\\xf0\\\x9f\\\x90\\\x88".as_slice(),
+                8,
+                Ok(Some(Character {
+                    value: '🐈',
+                    next: 8,
+                    escaped: true,
+                })),
+            ),
+            (malformed.as_slice(), 20, Err(CharacterError::InvalidUtf8)),
+        ] {
+            let mut calls = Vec::new();
+            assert_eq!(
+                character(
+                    0,
+                    true,
+                    &mut calls,
+                    |calls, at| {
+                        calls.push((false, at));
+                        Ok::<_, u8>(source.get(at).copied())
+                    },
+                    |calls, width| {
+                        calls.push((true, width));
+                        Ok(())
+                    }
+                ),
+                expected
+            );
+            let mut expected_calls: Vec<_> = (0..visits).map(|at| (false, at)).collect();
+            expected_calls.push((true, 4));
+            assert_eq!(calls, expected_calls);
+            assert!(visits <= 24);
+        }
+    }
+    #[test]
+    fn character_errors_do_not_grant_validation_or_recover_bad_utf8() {
+        for (source, positions, verify_width) in [
+            (b"\x80".as_slice(), vec![0], None),
+            (b"\xc0\x80", vec![0], None),
+            (b"\xc3", vec![0, 1], None),
+            (b"\xc3a", vec![0, 1], Some(2)),
+            (b"\xe0\x80\x80", vec![0, 1, 2], Some(3)),
+            (b"\xed\xa0\x80", vec![0, 1, 2], Some(3)),
+            (b"\xf4\x90\x80\x80", vec![0, 1, 2, 3], Some(4)),
+        ] {
+            let mut calls = Vec::new();
+            assert_eq!(
+                character(
+                    0,
+                    true,
+                    &mut calls,
+                    |calls, at| {
+                        calls.push((false, at));
+                        Ok::<_, u8>(source.get(at).copied())
+                    },
+                    |calls, width| {
+                        calls.push((true, width));
+                        Ok(())
+                    }
+                ),
+                Err(CharacterError::InvalidUtf8),
+                "{source:?}"
+            );
+            let mut expected: Vec<_> = positions.into_iter().map(|at| (false, at)).collect();
+            if let Some(width) = verify_width {
+                expected.push((true, width));
+            }
+            assert_eq!(calls, expected, "{source:?}");
+            for cut in 0..calls.len() {
+                let mut attempted = 0;
+                let result = character(
+                    0,
+                    true,
+                    &mut attempted,
+                    |n, at| {
+                        *n += 1;
+                        if *n > cut {
+                            Err(7)
+                        } else {
+                            Ok(source.get(at).copied())
+                        }
+                    },
+                    |n, _| {
+                        *n += 1;
+                        if *n > cut {
+                            Err(7)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert_eq!(
+                    result,
+                    Err(if expected.get(cut).unwrap().0 {
+                        CharacterError::Verify(7)
+                    } else {
+                        CharacterError::Projection(Error::Read(7))
+                    })
+                );
+                assert_eq!(attempted, cut + 1);
+            }
+        }
+        assert_eq!(
+            character(
+                0,
+                true,
+                &mut (),
+                |_, at| Ok::<_, ()>(b"\\".get(at).copied()),
+                |_, _| Ok(())
+            ),
+            Err(CharacterError::Projection(Error::IncompletePair))
+        );
+        assert_eq!(
+            character(
+                usize::MAX,
+                false,
+                &mut (),
+                |_, _| Ok::<_, ()>(Some(b'a')),
+                |_, _| Ok(())
+            ),
+            Err(CharacterError::Projection(Error::InvalidState))
+        );
+        let mut calls = 0;
+        assert_eq!(
+            character(
+                0,
+                false,
+                &mut calls,
+                |n, _| {
+                    *n += 1;
+                    Ok::<_, ()>(None)
+                },
+                |_, _| panic!("verification after EOF")
+            ),
+            Ok(None)
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            character(
+                0,
+                false,
+                &mut (),
+                |_, _| Err::<Option<u8>, _>(7),
+                |_, _| panic!("verification after refusal")
+            ),
+            Err(CharacterError::Projection(Error::Read(7)))
+        );
+    }
     #[test]
     fn literal_pairs_folds_and_escape_provenance_have_exact_reads() {
         for (source, quoted, expected, positions) in [

@@ -50,6 +50,35 @@ impl From<crate::encoded_word::decode::Error> for Error {
     }
 }
 
+/// Keep mail verification admission and invariant mapping shared across readers.
+pub(crate) fn projected_character<E: From<crate::decode_work::Error>, W: Work>(
+    at: usize,
+    quoted: bool,
+    now: Tick,
+    work: &mut W,
+    read: impl FnMut(&mut W, usize) -> Result<Option<u8>, E>,
+) -> Result<Option<td_header::projection::Character>, E> {
+    use td_header::projection::{CharacterError, Error as ProjectionError};
+    td_header::projection::character(at, quoted, work, read, |work, width| {
+        work.charge(
+            now,
+            Charge {
+                io_bytes: width as u64,
+                ..Charge::default()
+            },
+        )
+        .map_err(E::from)
+    })
+    .map_err(|error| match error {
+        CharacterError::Projection(ProjectionError::Read(error))
+        | CharacterError::Verify(error) => error,
+        CharacterError::Projection(
+            ProjectionError::IncompletePair | ProjectionError::InvalidState,
+        )
+        | CharacterError::InvalidUtf8 => E::from(crate::decode_work::Error::InvalidState),
+    })
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Grammar {
     Text,
@@ -340,8 +369,7 @@ impl<'a> Cursor<'a> {
             Decoded::Complete => Err(Error::InvalidState),
             Decoded::Scalar('\0') => Ok(Status::Yield),
             Decoded::Scalar(value) => {
-                let code = u32::from(value);
-                if matches!(code, 0xfdd0..=0xfdef) || code & 0xffff >= 0xfffe {
+                if crate::unicode::is_noncharacter(value) {
                     self.problem = true;
                     Ok(Status::Scalar('\u{fffd}'))
                 } else {

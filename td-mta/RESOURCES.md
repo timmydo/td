@@ -1151,6 +1151,19 @@ and extended malformed/fallback/empty values, Name and late refusal. Retained
 output/capacity, NFC checkpoint composition, complete worker stack, native/RSS,
 selected boundary and MIME traversal qualification remain open.
 
+M06by's stateless shared character reader holds only four local octets and
+scalar positions; it retains no source, cursor or work owner. At most four
+atoms make at most 24 read callback calls, followed by one admitted local
+verification of at most four bytes. These are helper callback ceilings,
+not new parser turn budgets. The migrated readers preserve their exact
+source/EOF and verification charges, inline cursor state and all existing
+turn/reservation limits. Caller-owned context is borrowed sequentially
+rather than cloned. The centralized noncharacter predicate is table-free
+and allocation-free; control filtering, diagnostics and retained-output
+charging remain with each caller. Existing phrase/comment/parameter and
+body/header allocation intervals qualify the migrated paths, not complete
+worker/native/RSS bounds.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

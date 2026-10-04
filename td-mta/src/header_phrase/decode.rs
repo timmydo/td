@@ -158,6 +158,22 @@ impl<'a> Cursor<'a> {
             Some(b' ' | b'\t')
         ))
     }
+    fn projected_byte(
+        &self,
+        at: usize,
+        now: Tick,
+        work: &mut impl Work,
+    ) -> Result<Option<u8>, Error> {
+        if at == self.token.end {
+            return Ok(None);
+        }
+        if at > self.token.end {
+            return Err(Error::InvalidState);
+        }
+        self.byte(at, now, work)?
+            .ok_or(Error::InvalidState)
+            .map(Some)
+    }
     // Unquote first, then unfold the logical bytes, including escaped CR/LF.
     fn atom(
         &self,
@@ -166,15 +182,7 @@ impl<'a> Cursor<'a> {
         work: &mut impl Work,
     ) -> Result<Option<(u8, usize)>, Error> {
         td_header::projection::atom(at, self.kind == Kind::Quoted, |at| {
-            if at == self.token.end {
-                return Ok(None);
-            }
-            if at > self.token.end {
-                return Err(Error::InvalidState);
-            }
-            self.byte(at, now, work)?
-                .ok_or(Error::InvalidState)
-                .map(Some)
+            self.projected_byte(at, now, work)
         })
         .map(|atom| atom.map(|atom| (atom.value, atom.next)))
         .map_err(|error| match error {
@@ -184,41 +192,23 @@ impl<'a> Cursor<'a> {
         })
     }
     fn literal(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
-        let Some((first, mut next)) = self.atom(self.scan, now, work)? else {
+        let Some(td_header::projection::Character { value, next, .. }) =
+            crate::header_text::projected_character(
+                self.scan,
+                self.kind == Kind::Quoted,
+                now,
+                work,
+                |work, at| self.projected_byte(at, now, work),
+            )?
+        else {
             self.phase = Phase::Replay(self.resume.replay());
             return Ok(Status::Yield);
         };
-        let width = match first {
-            0..=0x7f => 1,
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => return Err(Error::InvalidState),
-        };
-        let mut bytes = [first, 0, 0, 0];
-        for cell in bytes.get_mut(1..width).ok_or(Error::InvalidState)? {
-            let (byte, end) = self.atom(next, now, work)?.ok_or(Error::InvalidState)?;
-            *cell = byte;
-            next = end;
-        }
-        work.charge(
-            now,
-            Charge {
-                io_bytes: width as u64,
-                ..Charge::default()
-            },
-        )?;
-        let value = std::str::from_utf8(bytes.get(..width).ok_or(Error::InvalidState)?)
-            .map_err(|_| Error::InvalidState)?
-            .chars()
-            .next()
-            .ok_or(Error::InvalidState)?;
         self.scan = next;
         if value == '\0' {
             return Ok(Status::Yield);
         }
-        let code = u32::from(value);
-        if matches!(code, 0xfdd0..=0xfdef) || code & 0xffff >= 0xfffe {
+        if crate::unicode::is_noncharacter(value) {
             self.problem = true;
             return Ok(Status::Scalar('\u{fffd}'));
         }

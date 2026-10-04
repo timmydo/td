@@ -150,8 +150,7 @@ impl Plain {
         now: Tick,
         meter: &mut Meter,
     ) -> Result<Progress, Error> {
-        let scalar = u32::from(value);
-        let value = if matches!(scalar, 0xfdd0..=0xfdef) || scalar & 0xffff >= 0xfffe {
+        let value = if crate::unicode::is_noncharacter(value) {
             self.problem = true;
             '\u{fffd}'
         } else {

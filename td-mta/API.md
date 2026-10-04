@@ -3723,6 +3723,36 @@ and empty/fallback values, Name and late refusal are Rust-allocation intervals.
 Complete worker stack, native/RSS, NFC/output retention, selected boundary and
 MIME traversal qualification remain open.
 
+### 1.78 Shared charged character projection
+
+M06by replaces strict logical UTF-8 assembly in phrase, comment and ordinary
+MIME parameter display readers with td-header::projection::character. The
+stateless helper composes up to four shared atoms in a four-byte local
+array. Separate source-read and local-verification callbacks borrow the same
+original caller context sequentially. Verification admits one local
+inspection of one to four bytes before strict decoding; at most 24
+source-read callback calls and one verification callback occur. Caller EOF
+charges, errors, clock, job/header allowances and private credit remain
+unchanged.
+
+The result contains a scalar, next source position and the first logical
+octet's escape provenance, including escaped folds. Continuation escapes
+never change the first octet's provenance. Invalid/truncated logical UTF-8
+is a typed error; source-read and local-verification refusals remain
+distinct. One private mail adapter owns the shared verification charge and
+exhaustively maps errors, preserving the caller error and invariant outcome.
+Mail callers map spelling invariant failures to their existing InvalidState
+and latch refusal in the original owner. No new source validity or
+original-placement proof follows. NUL, controls and noncharacters remain
+scalars for caller policy.
+
+All eight existing mail noncharacter checks now share the table-free Unicode
+predicate. Their different NUL/encoded-control filtering and
+diagnostic/output rules remain in their original owners. Placement machines
+and normalization are unchanged. No live cursor, quota, output backing or
+dependency is added; existing turn/cursor bounds and allocation intervals
+remain the contract.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

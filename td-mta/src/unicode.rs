@@ -3,6 +3,12 @@
 mod tables;
 use std::cmp::Ordering;
 
+/// Table-free scalar classification; callers own filtering and diagnostics.
+pub(crate) fn is_noncharacter(value: char) -> bool {
+    let code = u32::from(value);
+    matches!(code, 0xfdd0..=0xfdef) || (code & 0xffff) >= 0xfffe
+}
+
 /// A compiled table violated its checked generation contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidTable;
@@ -132,6 +138,16 @@ pub fn simple_lowercase(value: char) -> Result<char, InvalidTable> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+    #[test]
+    fn noncharacter_classification_is_exact_across_all_scalar_values() {
+        for value in (0..=0x10ffff).filter_map(char::from_u32) {
+            let code = u32::from(value);
+            let expected = (0xfdd0..=0xfdef).contains(&code)
+                || (0..=16)
+                    .any(|plane| code == plane * 65536 + 65534 || code == plane * 65536 + 65535);
+            assert_eq!(is_noncharacter(value), expected, "{code:x}");
+        }
+    }
     #[test]
     fn every_table_entry_and_class_boundary_is_reachable() {
         assert!(std::mem::size_of::<Decomposition>() <= 20);

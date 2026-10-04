@@ -103,40 +103,24 @@ impl<'a> Cursor<'a> {
         };
     }
     fn literal(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
-        let Some(first) = self.atom(self.position, now, work)? else {
+        let Some(td_header::projection::Character {
+            value,
+            next,
+            escaped,
+        }) = crate::header_text::projected_character(
+            self.position,
+            self.quoted,
+            now,
+            work,
+            |work, at| self.byte(at, now, work),
+        )?
+        else {
             self.phase = Phase::Complete;
             return Ok(Status::Complete);
         };
-        let width = match first.value {
-            0..=0x7f => 1,
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => return Err(Error::InvalidState),
-        };
-        let mut next = first.next;
-        let mut bytes = [first.value, 0, 0, 0];
-        for cell in bytes.get_mut(1..width).ok_or(Error::InvalidState)? {
-            let octet = self.atom(next, now, work)?.ok_or(Error::InvalidState)?;
-            *cell = octet.value;
-            next = octet.next;
-        }
-        // Verify the local UTF-8 spelling separately from source projection.
-        work.charge(
-            now,
-            Charge {
-                io_bytes: width as u64,
-                ..Charge::default()
-            },
-        )?;
-        let value = std::str::from_utf8(bytes.get(..width).ok_or(Error::InvalidState)?)
-            .map_err(|_| Error::InvalidState)?
-            .chars()
-            .next()
-            .ok_or(Error::InvalidState)?;
         self.position = next;
         if !matches!(self.phase, Phase::EmitGap) {
-            self.phase = if !first.escaped && matches!(value, ' ' | '\t') {
+            self.phase = if !escaped && matches!(value, ' ' | '\t') {
                 Phase::Boundary
             } else {
                 Phase::Literal

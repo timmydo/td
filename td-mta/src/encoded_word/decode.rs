@@ -280,7 +280,7 @@ impl<'a> Cursor<'a> {
                 if matches!(code, 0..=0x1f | 0x7f..=0x9f) {
                     return Ok(Status::Yield);
                 }
-                if matches!(code, 0xfdd0..=0xfdef) || code & 0xffff >= 0xfffe {
+                if crate::unicode::is_noncharacter(value) {
                     self.problem = true;
                     return Ok(Status::Scalar('\u{fffd}'));
                 }

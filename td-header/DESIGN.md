@@ -95,6 +95,23 @@ proof or original-source encoded-word placement follows from projected
 octets. This helper has no poll/cached state and does not change the lexical
 cursor limits below.
 
+projection::character assembles one strict UTF-8 scalar using at most four
+atoms and a four-byte local array. The original position, quoted flag and
+caller-owned context are passed to separate read and verification
+callbacks; they borrow that same context sequentially, never a copied
+allowance. The read callback retains the atom source/EOF contract. After
+assembly, the verification callback admits the separate local UTF-8
+inspection of one to four bytes before that inspection occurs. At most 24
+read calls and one verification call occur. Source-read and
+local-verification refusals are separate typed errors and propagate
+immediately; truncated or invalid logical UTF-8 is a typed failure. EOF
+before the first atom returns absence. The returned next position and
+first logical octet's escape/fold provenance are passive; later
+continuation escapes do not change the first octet's provenance. NUL,
+controls and noncharacters remain scalars for caller policy. There is no
+retained state, control filtering, normalization, placement proof or
+change to the lexical cursor maxima.
+
 None of these helpers discovers raw-message field boundaries, selects
 fields, decodes encoded words or charsets, normalizes Unicode, assembles
 addresses/parameters, creates protocol output or grants

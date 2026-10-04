@@ -106,8 +106,7 @@ impl<'a> Cursor<'a> {
                 if value == '\0' {
                     return Ok(Status::Yield);
                 }
-                let scalar = u32::from(value);
-                if matches!(scalar, 0xfdd0..=0xfdef) || scalar & 0xffff >= 0xfffe {
+                if crate::unicode::is_noncharacter(value) {
                     self.noncharacter = true;
                     Ok(Status::Scalar('\u{fffd}'))
                 } else {

@@ -289,8 +289,7 @@ impl<'a> Cursor<'a> {
                 }
             }
             Decoded::Scalar(value) => {
-                let scalar = u32::from(value);
-                let value = if matches!(scalar, 0xfdd0..=0xfdef) || scalar & 0xffff >= 0xfffe {
+                let value = if crate::unicode::is_noncharacter(value) {
                     self.encoding_problem = true;
                     '\u{fffd}'
                 } else {

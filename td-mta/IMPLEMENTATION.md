@@ -1777,6 +1777,16 @@ Initial independently landable increments:
   precedence, output retention, boundaries, traversal and complete-worker
   resource qualification remain open.
 
+- **M06by — shared charged character projection:** extract strict logical
+  UTF-8 assembly into td-header; migrate phrase, comment and ordinary MIME
+  display consumers atomically. Retain exact source/EOF and local verification
+  charges, first-octet escape provenance and existing placement machines.
+  Centralize all mail noncharacter predicates while keeping caller-specific
+  control/output rules. Qualify UTF-8 widths/errors, every callback refusal,
+  existing work/placement/NFC fixtures and Rust allocation intervals. NFC
+  engine extraction, parameter checkpoints, retention and traversal remain
+  open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

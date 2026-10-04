@@ -297,11 +297,18 @@ parsing steps or prepaid credit.
 The passive language-tag feed state is shared by parameter prefixes and
 encoded-word qualifiers; recognition retains its precharged 75-byte ceiling.
 Stateless shared projection now unquotes/folds MIME value, phrase and
-comment octets through one reader. Caller callbacks preserve source bounds,
-distinct errors and EOF charges; escaped-fold provenance remains available
-to mail display consumers. Original placement, scalar decoding/filtering,
-normalization and sticky admission/failure ownership remain in mail.
-Projected bytes create no lexical validity or display-word placement proof.
+comment octets through one reader. Caller callbacks preserve source
+bounds, distinct errors and EOF charges; escaped-fold provenance remains
+available to mail display consumers. Strict logical character assembly is
+also shared: separate read/local verification callbacks borrow the
+original work context sequentially. The first logical octet retains escape
+provenance; filtering and placement remain mail policy. All mail
+display/body noncharacter checks use one table-free Unicode predicate
+without changing their distinct control/output rules. Original placement,
+charset decoding/filtering, normalization and sticky admission/failure
+ownership remain in mail. Projected bytes create no lexical validity or
+display-word placement proof.
+
 Complete parameter-family selection remains mail policy. The fixed-state
 owner validates the whole field, classifies names, then replays every numbered
 index under the original work and header allowance. It retains only source

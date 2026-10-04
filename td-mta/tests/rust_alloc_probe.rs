@@ -3015,6 +3015,72 @@ fn header_single_mailbox() {
     assert_eq!(before, after, "mailbox parsing allocated");
 }
 
+fn shared_character_projection() {
+    use td_header::projection::{character, CharacterError, Error};
+    let before = COUNTERS.snapshot();
+    for source in [
+        b"a".as_slice(),
+        "é".as_bytes(),
+        "例".as_bytes(),
+        "🐈".as_bytes(),
+        b"\\\xc3\\\xa9",
+        b"\\\r\\\n\\\t",
+        b"\\\0",
+        "\u{10ffff}".as_bytes(),
+        b"\xed\xa0\x80",
+        b"\\",
+        b"",
+    ] {
+        let mut count = 0;
+        let _ = black_box(character(
+            0,
+            true,
+            &mut count,
+            |count, at| {
+                *count += 1;
+                Ok::<_, u8>(black_box(source).get(at).copied())
+            },
+            |count, width| {
+                *count += 1;
+                black_box(width);
+                Ok(())
+            },
+        ));
+        for cut in 0..count {
+            let mut attempted = 0;
+            let result = character(
+                0,
+                true,
+                &mut attempted,
+                |n, at| {
+                    *n += 1;
+                    if *n > cut {
+                        Err(7)
+                    } else {
+                        Ok(source.get(at).copied())
+                    }
+                },
+                |n, _| {
+                    *n += 1;
+                    if *n > cut {
+                        Err(7)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(CharacterError::Projection(Error::Read(7)) | CharacterError::Verify(7))
+            ));
+            assert_eq!(attempted, cut + 1);
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "shared character projection allocated");
+}
+
 fn header_phrase_display() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6579,6 +6645,7 @@ fn main() {
         header_single_mailbox();
         header_phrase_tokens();
         header_phrase_replay();
+        shared_character_projection();
         header_phrase_display();
         header_single_addr_spec();
         header_date_projection();
@@ -6726,6 +6793,7 @@ fn main() {
     header_single_mailbox();
     header_phrase_tokens();
     header_phrase_replay();
+    shared_character_projection();
     header_phrase_display();
     header_single_addr_spec();
     header_date_projection();

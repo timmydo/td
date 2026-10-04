@@ -137,38 +137,21 @@ impl<'a> Cursor<'a> {
         Status::Yield
     }
     fn literal(&mut self, now: Tick, work: &mut impl Work) -> Result<Status, Error> {
-        let Some((first, mut next, escaped)) = self.atom(self.position, now, work)? else {
+        let Some(td_header::projection::Character {
+            value,
+            next,
+            escaped,
+        }) =
+            crate::header_text::projected_character(self.position, true, now, work, |work, at| {
+                self.byte(at, now, work)
+            })?
+        else {
             self.phase = Phase::Complete;
             return Ok(Status::Complete);
         };
-        let width = match first {
-            0..=0x7f => 1,
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => return Err(Error::InvalidState),
-        };
-        let mut bytes = [first, 0, 0, 0];
-        for cell in bytes.get_mut(1..width).ok_or(Error::InvalidState)? {
-            let (byte, end, _) = self.atom(next, now, work)?.ok_or(Error::InvalidState)?;
-            *cell = byte;
-            next = end;
-        }
-        work.charge(
-            now,
-            Charge {
-                io_bytes: width as u64,
-                ..Charge::default()
-            },
-        )?;
-        let value = std::str::from_utf8(bytes.get(..width).ok_or(Error::InvalidState)?)
-            .map_err(|_| Error::InvalidState)?
-            .chars()
-            .next()
-            .ok_or(Error::InvalidState)?;
         self.position = next;
         self.previous_word = false;
-        self.phase = if escaped || matches!(first, b'(' | b')') {
+        self.phase = if escaped || matches!(value, '(' | ')') {
             Phase::Boundary
         } else {
             Phase::Literal
@@ -176,8 +159,7 @@ impl<'a> Cursor<'a> {
         if value == '\0' {
             return Ok(Status::Yield);
         }
-        let code = u32::from(value);
-        if matches!(code, 0xfdd0..=0xfdef) || code & 0xffff >= 0xfffe {
+        if crate::unicode::is_noncharacter(value) {
             self.problem = true;
             return Ok(Status::Scalar('\u{fffd}'));
         }

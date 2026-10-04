@@ -12,8 +12,7 @@ fn filter(value: char, problem: &mut bool) -> Option<char> {
     if value == '\0' {
         return None;
     }
-    let code = u32::from(value);
-    if matches!(code, 0xfdd0..=0xfdef) || code & 0xffff >= 0xfffe {
+    if crate::unicode::is_noncharacter(value) {
         *problem = true;
         Some('\u{fffd}')
     } else {
