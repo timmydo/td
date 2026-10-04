@@ -1229,6 +1229,137 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn resident_mime_delimiters() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_delimiter::{Cursor, Error, Status},
+        ports::{Deadline, Tick},
+    };
+    let boundary = "x".repeat(70);
+    let source = format!(
+        "{}\r\n--{}\r\nHeader: value\r\n\r\nbody\r\n--{}-- \t\r\nepilogue",
+        "a".repeat(127),
+        boundary,
+        boundary
+    );
+    let before = COUNTERS.snapshot();
+    for (input, selected, expected_count) in [
+        (source.as_bytes(), boundary.as_bytes(), 2),
+        (b"--b\n--b\r\n--b--".as_slice(), b"b".as_slice(), 3),
+        (b"bare\r--b\n--b---other\r", b"b", 1),
+        (b"preamble only", b"b", 0),
+        (b"", b"b", 0),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                ..Charge::default()
+            },
+        );
+        let pointer = std::ptr::from_ref(&work);
+        let mut cursor = Cursor::new(black_box(input), 7, black_box(selected), &mut work).unwrap();
+        let mut count = 0;
+        let mut done = false;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1)).unwrap() {
+                Status::Yield => {}
+                Status::Delimiter(d) => {
+                    count += 1;
+                    assert!(d.preceding_end <= d.line_start);
+                    assert!(d.line_start <= d.after_line);
+                }
+                Status::Complete => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        assert_eq!(count, expected_count);
+        assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+        let work = cursor.finish(Tick(1)).unwrap();
+        assert_eq!(std::ptr::from_ref(work), pointer);
+    }
+    for (io, records, now, selected, error) in [
+        (
+            0,
+            100_000,
+            Tick(1),
+            b"b".as_slice(),
+            Error::Work(Stop::IoBytes),
+        ),
+        (100_000, 0, Tick(1), b"b", Error::Work(Stop::Records)),
+        (
+            100_000,
+            100_000,
+            Tick(100),
+            b"b",
+            Error::Work(Stop::Deadline),
+        ),
+        (100_000, 100_000, Tick(1), b"bad ", Error::InvalidBoundary),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: io,
+                records,
+                ..Charge::default()
+            },
+        );
+        let mut cursor = Cursor::new(
+            black_box(source.as_bytes()),
+            0,
+            black_box(selected),
+            &mut work,
+        )
+        .unwrap();
+        let mut refused = false;
+        for _ in 0..100_000 {
+            match cursor.poll(now) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e, error);
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused);
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+        assert!(cursor.finish(Tick(1)).is_err());
+    }
+    let mut work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000,
+            records: 100_000,
+            ..Charge::default()
+        },
+    );
+    let mut cursor = Cursor::new(
+        black_box(source.as_bytes()),
+        0,
+        black_box(boundary.as_bytes()),
+        &mut work,
+    )
+    .unwrap();
+    let mut done = false;
+    for _ in 0..100_000 {
+        if matches!(cursor.poll(Tick(1)).unwrap(), Status::Complete) {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert!(cursor.finish(Tick(100)).is_err());
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "resident MIME delimiter scanning allocated");
+}
+
 fn mime_protocol_parameters() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -7451,6 +7582,7 @@ fn main() {
         mime_parameter_nfc();
         mime_filename_retention();
         mime_protocol_parameters();
+        resident_mime_delimiters();
         body_value();
         mime_text();
         body_charset();
@@ -7602,6 +7734,7 @@ fn main() {
     mime_parameter_nfc();
     mime_filename_retention();
     mime_protocol_parameters();
+    resident_mime_delimiters();
     body_value();
     mime_text();
     body_charset();

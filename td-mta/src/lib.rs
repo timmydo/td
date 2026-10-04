@@ -42,6 +42,7 @@ pub mod merge;
 pub mod mime_attribute;
 pub mod mime_base64;
 pub mod mime_charset;
+pub mod mime_delimiter;
 pub mod mime_fields;
 pub mod mime_filename;
 pub mod mime_headers;

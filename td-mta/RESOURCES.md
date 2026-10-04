@@ -1233,6 +1233,24 @@ field byte bounds one retained token byte. No intermediate vector or new
 arena is allocated. Layout/counting evidence does not qualify whole worker,
 native compiler stack, portable backend or RSS.
 
+M06cd's resident delimiter cursor fits 160 bytes in the existing parser
+reservation; the shared pure line matcher fits 24 bytes. It retains
+source and boundary views, fixed prefix/suffix state and one pending CR,
+never an input-sized line buffer or a descriptor list. One active poll
+charges one job record and examines at most 128 body bytes,
+conservatively funding two I/O visits per body byte (source plus at most
+one selected-boundary comparison). Initial grammar validation examines
+at most 70 boundary bytes with one visit each in one separate turn
+phase, including a final-byte grammar failure. Every poll's I/O ceiling
+is 256 and job-record ceiling is one. Bytewise funding keeps exact cut
+accounting and checks the same supplied clock value before each bounded
+access. Delayed CR classification spends the prior funded comparison
+under a new live turn's original admission. No aggregate header
+interpretation allowance is spent on these raw body bytes. This
+qualifies resident scanner state/work only, not DFS composition,
+complete worker/native stack or RSS. Child extent clipping and
+body/descriptor reservations remain those of the later traversal owner.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

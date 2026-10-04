@@ -1,10 +1,12 @@
-# Bounded header lexical primitives
+# Bounded header and MIME lexical primitives
 
 This std-only crate owns resident lexical syntax, not protocol or admission
 policy. It has no dependencies, clock, crypto, I/O or source ownership. The
 enclosing grammar supplies a complete immutable field-value or
-parameter-name/value slice, any required exact start offset, and permission for
-the lexical token at that location.
+parameter-name/value slice or one logical delimiter line, any required exact
+start offset, and permission for the lexical token at that location. The MIME
+line matcher owns no body traversal, transfer decoding, active-boundary
+precedence or source authorization.
 
 cfws scans optional comments and folding whitespace, leaves the first
 non-CFWS byte untouched, and returns original top-level comment extents.
@@ -167,3 +169,18 @@ source admission or multipart authority. Callers fund each bounded feed,
 consume the entire selected value, and retain their original budgets.
 Normative grammar: https://datatracker.ietf.org/doc/html/rfc2046#section-5.1.1
 and https://datatracker.ietf.org/doc/html/rfc2045#section-5.1.
+
+mime_boundary::Line recognizes a single logical delimiter line with <=24
+bytes of pure fixed state including a borrowed 1..70-byte boundary view.
+Its caller validates boundary grammar and funds each transition plus at
+most one boundary comparison. Match only the leading -- and complete
+boundary prefix. The first two bytes of a suffix beginning with --
+close; other non-SP/HTAB suffix bytes are diagnostic. EOF classifies a
+lone suffix hyphen as opening with a diagnostic. The enclosing caller
+excludes accepted line endings before feeding and owns file line-ending
+CR/LF, active-boundary precedence, complete entity extent, original work
+and publication. Prefix Match evidence does not authorize multipart
+structure. reset clears only pure line progress and retains the same
+boundary view; boundary() returns that passive view, neither validating
+it nor admitting another scan. Enclosing owner refusal remains sticky
+across line resets.

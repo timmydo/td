@@ -325,6 +325,13 @@ permissive or RFC 2231-unaware clients; POLICY.md owns that parser differential
 and the explicit unreadable-content/raw-download recovery, not a fallback to
 an alternative boundary interpretation.
 
+M06cd supplies raw resident delimiter events before child header parsing.
+Pure shared line matching uses selected boundary prefixes; mail owns CRLF/LF
+versus bare CR, checked absolute offsets and original job admission. Events
+are provisional and the later explicit-frame traversal must discard them on
+any final refusal. The later traversal must exclude delimiter-leading endings from child headers;
+parent clipping, header admission and descriptor authority remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in

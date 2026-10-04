@@ -1821,6 +1821,13 @@ Initial independently landable increments:
   Qualify bounded turns, sticky refusal and fresh passive handoff. Multipart
   traversal, body defaults/recovery and complete worker/RSS remain open.
 
+- **M06cd — resident MIME delimiter events:** extract pure bounded line-prefix
+  matching into td-header, compose original-job body scanning and exact
+  accepted-ending extents in mail, and preserve deterministic prefix/suffix
+  recovery. Qualify turn seams, checked offsets and sticky/fresh refusal.
+  Parent-first child clipping, explicit-frame traversal, transfer sizing and
+  descriptor/publication authority remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

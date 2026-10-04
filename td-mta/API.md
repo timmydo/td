@@ -3937,6 +3937,42 @@ handoff yields no bytes. Publication still needs the enclosing owner's fresh
 final admission after all metadata/structure succeeds. Backing is not erased.
 RESOURCES.md owns layout, work ceilings and bounded output reservations.
 
+### 1.83 Resident MIME delimiter scanning
+
+M06cd adds mime_delimiter::Cursor over one complete authorized resident entity
+body, checked absolute base and one boundary. Source completeness/authorization
+belong to the enclosing owner. Constructor checks range and boundary length;
+original-work polls validate the entire boundary grammar before body scanning.
+The shared td-header::mime_boundary::Line owns only pure prefix/suffix state;
+mail owns source extents, accepted file endings, work, deadline and retirement.
+
+Scan raw line starts for -- followed immediately by the complete
+selected boundary. A suffix beginning with -- closes; SP/HTAB transport
+padding is ignored, other suffix bytes set ignored_suffix and do not
+change deterministic prefix recovery. CRLF and LF end lines, excluding
+those endings from classification; bare CR stays data. Preserve a
+pending CR across bounded turns. Definitive entity EOF classifies an
+unterminated final line. No allocating line buffer or Unicode/transfer
+decoder participates.
+
+Delimiter reports checked absolute line_start, after_line and preceding_end,
+which excludes only the previous accepted line ending. A future child owner
+must clamp preceding_end at its child start for an immediately following
+delimiter. Events remain provisional offsets, never complete-tree, leaf,
+partId or blob authority; they cannot revoke previously copied passive data.
+The enclosing traversal must discard every provisional event on later error.
+Closing events do not stop this raw scanner; the enclosing container owns
+preamble/epilogue, active-boundary precedence and missing-close recovery.
+
+Every active poll funds bounded body/boundary accesses using the original Meter.
+HeaderBudget is not charged for raw body bytes. Work refusal is sticky and
+prevents more events; check_deadline rechecks original admission, even after
+Complete. Cached Complete is inert; finish(now) requires healthy Complete
+and fresh admission and returns the original Meter. Final structure publication
+still requires the enclosing owner's admission after all other work succeeds.
+RESOURCES.md owns fixed work/layout ceilings. Parent-first extent clipping,
+header counting, explicit DFS, transfer sizes and locator issuance remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
