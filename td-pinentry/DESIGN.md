@@ -187,6 +187,18 @@ even when it has a terminal or no `DISPLAY` (OpenSSH 8.4 or later), and
 `GIT_ASKPASS` naming it, which git prefers to `core.askPass` and
 `SSH_ASKPASS`; git asks `SSH_ASKPASS` when neither of the others is set.
 
+On a host, td-review sets `SSH_ASKPASS` and `SSH_ASKPASS_REQUIRE=force`
+for the git commands it runs through its one command path when
+td-pinentry is an executable file in its own executable's directory,
+links resolved, as `./install-apps` places them. It sets nothing when its
+own environment already holds a non-empty `SSH_ASKPASS`, `GIT_ASKPASS` or
+`SSH_ASKPASS_REQUIRE`, a choice the person made (an editor terminal's
+`GIT_ASKPASS` included), or no non-empty `WAYLAND_DISPLAY`, where ssh
+keeps asking on its terminal; it leaves `GIT_ASKPASS` alone, so a
+configured `core.askPass` still answers git's own prompts. A display
+inherited but not in front of the person, as in tmux reattached over
+ssh, still gets the window, and ssh waits on it until its timeout.
+
 ## Tests
 
 The crate's tests drive the window state headless: an answer typed and

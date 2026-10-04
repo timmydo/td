@@ -302,7 +302,13 @@ local or draft work.
 A single integrator lands from another clone with `td-review`, which opens a
 td-ui window on the session's Wayland compositor: `/bin/td-review` in a
 td image, or `~/.local/bin/td-review` on a host after `./install-apps`
-(rerun it after a pull to replace an older copy). It lists remote
+(rerun it after a pull to replace an older copy). Its git has no terminal
+to ask on. On a host with td-pinentry beside it, as `./install-apps`
+places it, and a `WAYLAND_DISPLAY`, ssh's passphrase and git's password
+prompts open td-pinentry's window, unless the environment already names
+an askpass program or git's `core.askPass` answers git's; a gpg
+passphrase does once `~/.gnupg/gpg-agent.conf` names it as
+`pinentry-program` (td-pinentry/DESIGN.md). It lists remote
 branches and their review records, `r` replays the branch's commits onto main,
 `p` pushes, and `w` sweeps fully landed worktrees. Rebase landing preserves
 each commit, subject, body, and review record. The post-push branch and worktree

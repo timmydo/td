@@ -1,10 +1,12 @@
 //! Capturing wrapper around the `git` CLI plus the few queries the review window
 //! needs. Everything runs with the pager and colour disabled so parsed output
 //! is plain text, and with `GIT_TERMINAL_PROMPT=0` and stdin closed so a
-//! credential prompt fails loudly instead of waiting on a terminal nobody is
-//! looking at.
+//! credential prompt never waits on a terminal nobody is looking at. With
+//! td-pinentry beside this program, ssh's and git's prompts ask in its window
+//! instead; without it they fail loudly.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -346,6 +348,62 @@ impl Git {
     }
 }
 
+/// The program that answers a git child's passphrase and password prompts:
+/// td-pinentry beside this executable, links resolved (`./install-apps`
+/// copies both into `~/.local/bin`). Looked for at each command, so one
+/// installed while the window runs is used from the next. td-review has no
+/// terminal for ssh or git to ask on. gpg-agent's pinentry is its own
+/// configuration's, never ours.
+fn prompter() -> Option<PathBuf> {
+    beside(&std::env::current_exe().ok()?)
+}
+
+/// td-pinentry in the directory of `exe`, when it is an executable file.
+fn beside(exe: &Path) -> Option<PathBuf> {
+    let path = exe.parent()?.join("td-pinentry");
+    let meta = std::fs::metadata(&path).ok()?;
+    (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(path)
+}
+
+/// The askpass names whose presence in td-review's own environment means
+/// the person chose how prompts are answered, a choice kept over ours.
+const ASKPASS: &[&str] = &["SSH_ASKPASS", "GIT_ASKPASS", "SSH_ASKPASS_REQUIRE"];
+
+/// What a git child is given so its prompts reach `prompter`: ssh's askpass,
+/// forced so ssh asks it with no `DISPLAY` and no terminal (OpenSSH 8.4 or
+/// later), which git also asks after `GIT_ASKPASS` and `core.askPass`, so a
+/// configured `core.askPass` still answers git's own prompts. `inherited`
+/// says whether td-review's environment holds a name, set and not empty:
+/// an empty display opens nothing, an empty `SSH_ASKPASS` names no program
+/// (ssh would exec "" and fail), and an empty `SSH_ASKPASS_REQUIRE` is
+/// ssh's default.
+/// An empty `GIT_ASKPASS` turns git's own askpass off, so then only ssh's
+/// prompts reach the window. Nothing when there is no prompter, when it
+/// holds any of `ASKPASS` (even `GIT_ASKPASS`, which ssh never reads: one
+/// left by an editor's terminal is kept with the rest), or when it holds
+/// no `WAYLAND_DISPLAY` for the window to open on: a terminal session
+/// without one (`--land --push` over ssh) keeps ssh asking on its terminal.
+/// A display inherited but not the person's (tmux reattached over ssh)
+/// still opens the window there.
+fn prompt_env(
+    prompter: Option<&Path>,
+    inherited: &dyn Fn(&str) -> bool,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let ours = inherited("WAYLAND_DISPLAY") && !ASKPASS.iter().any(|name| inherited(name));
+    match prompter {
+        Some(prompter) if ours => vec![
+            ("SSH_ASKPASS", prompter.as_os_str().to_owned()),
+            ("SSH_ASKPASS_REQUIRE", "force".into()),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an environment value counts as set for `prompt_env`.
+fn held(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
 /// Variables that point git at a repository other than the one it would
 /// find from its working directory.
 const LOCATION: &[&str] = &[
@@ -383,7 +441,29 @@ impl Git {
     /// through verbatim, and `from_utf8_lossy` would rewrite the bytes of a
     /// message that is not valid UTF-8 into U+FFFD.
     pub fn run_raw(&self, args: &[&str]) -> io::Result<RawRun> {
-        let out = Command::new("git")
+        let inherited = |name: &str| held(std::env::var_os(name).as_deref());
+        let out = self
+            .command(args, prompter().as_deref(), &inherited)
+            .output()
+            .map_err(|e| io::Error::new(e.kind(), format!("running git: {e}")))?;
+        Ok(RawRun {
+            ok: out.status.success(),
+            code: out.status.code(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+
+    /// The git command `run_raw` runs: no pager, no colour, no terminal, and
+    /// prompts sent to `prompter` as `prompt_env` decides.
+    fn command(
+        &self,
+        args: &[&str],
+        prompter: Option<&Path>,
+        inherited: &dyn Fn(&str) -> bool,
+    ) -> Command {
+        let mut command = Command::new("git");
+        command
             .current_dir(&self.repo)
             .arg("--no-pager")
             // color.ui=false alone is overridden by a per-command
@@ -393,14 +473,8 @@ impl Git {
             .stdin(Stdio::null())
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_PAGER", "cat")
-            .output()
-            .map_err(|e| io::Error::new(e.kind(), format!("running git: {e}")))?;
-        Ok(RawRun {
-            ok: out.status.success(),
-            code: out.status.code(),
-            stdout: out.stdout,
-            stderr: out.stderr,
-        })
+            .envs(prompt_env(prompter, inherited));
+        command
     }
 
     /// The squash message exactly as git stored it. Returned as bytes: it is
@@ -1291,6 +1365,63 @@ mod tests {
 
     fn names(branches: &[Branch]) -> Vec<&str> {
         branches.iter().map(|b| b.refname.as_str()).collect()
+    }
+
+    #[test]
+    fn td_pinentry_answers_prompts_only_when_beside_this_program() {
+        let dir = std::env::temp_dir().join(format!("td-review-prompter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let exe = dir.join("td-review");
+        assert_eq!(beside(&exe), None);
+        let prompter = dir.join("td-pinentry");
+        std::fs::write(&prompter, b"").unwrap();
+        // A file that cannot run answers nothing.
+        assert_eq!(beside(&exe), None);
+        std::fs::set_permissions(&prompter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(beside(&exe).as_deref(), Some(prompter.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // The command run_raw runs, its askpass variables alone.
+        let git = Git::new(PathBuf::from("/nonexistent"));
+        let envs = |prompter: Option<&Path>, inherited: &[&str]| {
+            let inherited = |name: &str| inherited.contains(&name);
+            let command = git.command(&["push"], prompter, &inherited);
+            let mut envs: Vec<(String, String)> = command
+                .get_envs()
+                .map(|(name, value)| {
+                    let text = |s: &std::ffi::OsStr| s.to_string_lossy().into_owned();
+                    (text(name), value.map(text).unwrap_or_default())
+                })
+                .filter(|(name, _)| name.contains("ASKPASS"))
+                .collect();
+            envs.sort();
+            envs
+        };
+        let wayland = "WAYLAND_DISPLAY";
+        assert!(envs(None, &[wayland]).is_empty());
+        let path = Path::new("/home/a/.local/bin/td-pinentry");
+        let named = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+        assert_eq!(
+            envs(Some(path), &[wayland]),
+            [
+                named("SSH_ASKPASS", "/home/a/.local/bin/td-pinentry"),
+                named("SSH_ASKPASS_REQUIRE", "force"),
+            ]
+        );
+        // Without a display the window cannot open, so ssh keeps its
+        // terminal.
+        assert!(envs(Some(path), &[]).is_empty());
+        // A choice the person made is theirs: any askpass variable already
+        // set leaves the child's as it was.
+        for name in ASKPASS {
+            assert!(envs(Some(path), &[wayland, name]).is_empty(), "{name}");
+        }
+        // An empty value is no value: an exported `WAYLAND_DISPLAY=` names
+        // no display.
+        assert!(!held(None));
+        assert!(!held(Some(std::ffi::OsStr::new(""))));
+        assert!(held(Some(std::ffi::OsStr::new("wayland-0"))));
     }
 
     /// A rename must not launder a source file into a `docs-only` waiver.
