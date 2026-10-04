@@ -1760,8 +1760,11 @@ Every instance has:
   `off`; that listener is inside the instance's own namespace, and
   nothing else leaves.
 - **Unix sockets:** a seccomp policy that refuses `socket(AF_UNIX, ...)`
-  and admits `socketpair(AF_UNIX, SOCK_STREAM, ...)` alone, the type
-  compared with `SOCK_NONBLOCK` and `SOCK_CLOEXEC` masked off. A network
+  and admits `socketpair(AF_UNIX, ...)` for `SOCK_STREAM` and
+  `SOCK_SEQPACKET` alone, the type compared with `SOCK_NONBLOCK` and
+  `SOCK_CLOEXEC` masked off; Rust's `Command::spawn` makes a
+  sequenced-packet pair for every child, and a connected one cannot
+  address another socket. A network
   namespace does not separate pathname Unix sockets, so without that
   refusal a socket a host service publishes in a worktree or shared
   directory would be a way out; and a datagram pair could still address
@@ -1982,6 +1985,33 @@ creates; the capability its stage 1 raises is the new namespace's. The
 
 If that amendment is not made, tool execution is refused by name on a
 host. There is no silent unconfined fallback.
+
+**As built (increment 10, the td-jail kind).** The `workspace` kind is
+APPLICATIONS.md §C's `td-jail --workspace LAUNCHER-PID SPEC [ARG...]`,
+with §X.8
+naming its host divergences, and it settles four things this section
+left open. The spec is td-agent's to write, per instance, not
+`./agent`'s: an ordered keyfile of the entry and td-txt, the home, the
+worktrees and the shared directories, read-only or read-write, kept
+outside every directory it grants, since the instance runs as the
+caller and could otherwise rewrite the next instance's spec. The
+lifetime pipe is the channel itself: td-jail requires the instance's
+standard input and output to be one stream socket, the tool host's
+framed protocol runs over it, and the tool host ends when it closes;
+for an entry that is not reading, the outer process's parent-death
+signal, checked against its parent as stage 1's is, ends the instance
+with its launcher, so td-agent starts td-jail from the conversation
+process's main thread. `/tmp` and `/var/tmp` are fresh, private and
+executable, since worktrees are executable anyway and test suites run
+scripts they write to `TMPDIR`; the home is `noexec`. Until increment 11
+brings the git chain, the kind refuses every overlap between its
+directories rather than admitting the chain's nesting. td-agent's own
+refusals above (its state, credential locations, `workspace_root`) are
+td-agent's, applied before it writes a spec; td-jail's are the reserved
+trees, the caller's real home, overlap and links. The killed-launcher
+tests named above run with td-agent's launch in the next commit; the
+kind's own live test launches it on a socket, reads its plan back from
+inside, and is ignored where unprivileged user namespaces are absent.
 
 **Unconfined workspaces.** The one way to run tools without a jail is a
 choice the human makes when creating a directory or scratch workspace;

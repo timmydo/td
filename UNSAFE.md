@@ -1807,11 +1807,56 @@ terminal state. The readiness socket is same-UID evidence rather than an
 authenticated peer: another uid-1000 process can satisfy the probe, so this is
 an image-test oracle, not hostile-payload attestation.
 
+The `workspace` launch kind (APPLICATIONS.md §C and §X.8) adds no
+syscall, operation, flag value or unshare set. It is reached only as the
+exact `td-jail --workspace LAUNCHER-PID SPEC`, refused where the
+product configuration is installed. Before the session bootstrap its
+outer process sets the existing `PR_SET_PDEATHSIG=SIGKILL` and then
+requires its direct parent, read from procfs, to be the named launcher:
+a new caller of an existing operation, binding the instance to its
+launcher as stage 1 is bound to td-jail. Stage 1 always selects the isolated
+unshare set and loopback, and maps the caller to itself. Its mount plan
+is the compiled base plan, with `/tmp` and `/var/tmp` executable; the
+host's compiled system-tree list bound recursively read-only, `nosuid`
+and `nodev`, or recreated as the same link; a `/run` holding only a
+compiled link name, to a target inside a bound tree; an `/etc` tmpfs of
+synthesized files and a compiled allowlist of host entries, bound
+read-only and `noexec`; at most four admitted program files, read-only
+and executable, device and inode checked; and the admitted directories
+at their real paths through the same grant bind and hardening loop,
+`noexec` but for worktrees, which keeps a flag the host set on a row;
+admission refuses a pseudo-filesystem mounted below any of them. Stage
+2 reads it all back, down to every scaffold directory's names and the
+absence of any unplanned mount, before it clears capabilities, then
+installs
+the second compiled program, `WORKSPACE_FILTER`: the standard filter but
+for its socket rules, which refuse `socket(2)` for `AF_UNIX` with
+`EPERM` and admit `socketpair(2)` only for `AF_UNIX` with `SOCK_STREAM`
+or `SOCK_SEQPACKET`, `SOCK_NONBLOCK` and `SOCK_CLOEXEC` masked off. The kind selects
+the program; no caller does. The interpreter test runs both programs
+over the roster and requires them to differ only in those rules; the C
+kernel probe covers the standard program alone, and the workspace
+program's kernel behaviour is the ignored live launch tests', which
+need unprivileged user namespaces: a Rust probe inside an instance finds
+a Unix socket refused, a stream pair made, a datagram pair refused, a
+child spawned on std's fork path (which makes a sequenced-packet pair),
+and loopback alone. The launcher's stdin and stdout
+must be one socket, by `fstat` identity, and an unnamed, connected Unix
+stream socket by its row in `/proc/net/unix`, read before the unshare in
+the launcher's network namespace: safe file I/O, not `getsockopt`.
+Stage 1 keeps it as its
+stdio, stage 2 receives the proof pipe, a clone of the socket as stdout
+(checked to be a socket, with a zero controlling-terminal field) and the
+diagnostic pipe, and the entry receives two clones of the socket and the
+null device. Stage 2 sets no data limit: the instance keeps whatever it
+inherits. Non-dumpability, the liveness watcher and the reaping are an
+application launch's.
+
 There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
 supplied namespace, mount set, or BPF program. A fifteenth syscall, a ninth
 prctl operation, a second seccomp operation, a seccomp flag outside the exact
-`{0, SECCOMP_FILTER_FLAG_LOG}` set, a fourth ambient sub-operation, or a third
-unshare flag set is an amendment here.
+`{0, SECCOMP_FILTER_FLAG_LOG}` set, a fourth ambient sub-operation, a third
+unshare flag set, or a third compiled seccomp program is an amendment here.
 
 ## 10. `td-busd` — the session bus broker
 

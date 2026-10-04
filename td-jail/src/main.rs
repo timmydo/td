@@ -31,6 +31,7 @@ mod primary_account;
 mod seccomp;
 mod sys;
 mod transition;
+mod workspace;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -41,6 +42,7 @@ const RESERVED_LAUNCHER_NAMES: &[&str] = &["td-jail", "td-jail-reaper-probe"];
 enum ApplicationLaunchKind {
     Product,
     Host,
+    Workspace,
 }
 
 fn run() -> std::io::Result<()> {
@@ -59,7 +61,13 @@ fn run() -> std::io::Result<()> {
             .args(arguments)
             .exec());
     }
-    if application_launch_kind(name, arguments.peek()).is_some() {
+    if let Some(kind) = application_launch_kind(name, arguments.peek()) {
+        if kind == ApplicationLaunchKind::Workspace {
+            // `--workspace LAUNCHER-PID SPEC [ARG...]`
+            let arguments: Vec<std::ffi::OsString> = arguments.collect();
+            transition::tie_workspace_to_launcher(arguments.get(1))?;
+            return transition::spawn_application_session(argv0, arguments);
+        }
         return transition::spawn_application_session(argv0, arguments);
     }
     match transition::parse_mode(arguments)? {
@@ -132,6 +140,13 @@ where
                 arguments,
             )?)
         }
+        Some(ApplicationLaunchKind::Workspace) => {
+            drop(arguments.next());
+            // The launcher's pid, which the outer process was tied to.
+            drop(arguments.next());
+            let spec = arguments.next().ok_or_else(host_usage_error)?;
+            transition::launch_workspace(workspace::resolve(&spec, arguments)?)
+        }
         None => Err(host_usage_error()),
     }
 }
@@ -148,13 +163,18 @@ fn application_launch_kind(
     {
         return Some(ApplicationLaunchKind::Host);
     }
+    if name == "td-jail"
+        && first_argument.is_some_and(|argument| workspace::is_workspace_argument(argument))
+    {
+        return Some(ApplicationLaunchKind::Workspace);
+    }
     None
 }
 
 fn host_usage_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        "host usage: td-jail --host CONFIG APPLICATION [ARG ...]",
+        "host usage: td-jail --host CONFIG APPLICATION [ARG ...] | td-jail --workspace LAUNCHER-PID SPEC [ARG ...]",
     )
 }
 
@@ -184,6 +204,7 @@ mod confinement {
     const SECCOMP: &str = include_str!("seccomp.rs");
     const SYS: &str = include_str!("sys.rs");
     const TRANSITION: &str = include_str!("transition.rs");
+    const WORKSPACE: &str = include_str!("workspace.rs");
 
     #[test]
     fn unsafe_is_confined_to_one_syscall_instruction() {
@@ -209,6 +230,8 @@ mod confinement {
         assert_eq!(SECCOMP.matches("unsafe {").count(), 0);
         assert_eq!(TRANSITION.matches("#[allow(unsafe_code)]").count(), 0);
         assert_eq!(TRANSITION.matches("unsafe {").count(), 0);
+        assert!(!WORKSPACE.contains("unsafe"));
+        assert!(!WORKSPACE.contains("sys::"));
     }
 
     #[test]
@@ -219,6 +242,97 @@ mod confinement {
         assert!(AUTHORITY.contains("match fs::symlink_metadata(CONFIG_PATH)"));
         assert!(AUTHORITY.contains(
             "host mode is unavailable when the product application configuration is installed"
+        ));
+    }
+
+    /// The workspace kind (APPLICATIONS.md §C) is selected only by the exact
+    /// `td-jail --workspace`, is refused where the product configuration is
+    /// installed, and ties the outer process to its launcher before anything
+    /// else; its stage 2 reads its plan back, then confines, then starts the
+    /// entry on the channel.
+    #[test]
+    fn the_workspace_kind_is_host_only_tied_and_ordered() {
+        let shipped_main = MAIN.split_once("#[cfg(test)]").unwrap().0;
+        assert!(shipped_main.contains(
+            "first_argument.is_some_and(|argument| workspace::is_workspace_argument(argument))"
+        ));
+        assert!(shipped_main.contains(
+            "if kind == ApplicationLaunchKind::Workspace {\n            // `--workspace LAUNCHER-PID SPEC [ARG...]`\n            let arguments: Vec<std::ffi::OsString> = arguments.collect();\n            transition::tie_workspace_to_launcher(arguments.get(1))?;\n            return transition::spawn_application_session(argv0, arguments);"
+        ));
+        assert!(WORKSPACE
+            .contains("authority::require_no_product_configuration(\"the workspace kind\")?;"));
+        assert!(AUTHORITY.contains("pub(crate) fn require_no_product_configuration(what: &str)"));
+        let tie = TRANSITION
+            .split_once("pub fn tie_workspace_to_launcher(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let at = |body: &str, needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("workspace path no longer contains {needle}"))
+        };
+        assert!(
+            at(tie, "parse_launcher(launcher)?") < at(tie, "sys::set_parent_death_signal()?;")
+                && at(tie, "sys::set_parent_death_signal()?;") < at(tie, "require_direct_parent(")
+        );
+        let launch = TRANSITION
+            .split_once("pub fn launch_workspace(")
+            .unwrap()
+            .1
+            .split_once("\nfn stage2_workspace_arguments(")
+            .unwrap()
+            .0;
+        assert!(
+            at(launch, "require_workspace_channel()?;")
+                < at(launch, "sys::unshare_namespaces(true)")
+                && at(launch, "sys::bring_up_loopback()")
+                    < at(launch, "close_inherited_descriptors(None)?;")
+                && at(launch, "close_inherited_descriptors(None)?;")
+                    < at(
+                        launch,
+                        "prepare_workspace_mount_plan(&plan, inside_identity)?;"
+                    )
+                && at(launch, "prepare_capability_bridge()?;") < at(launch, "command.spawn()?")
+                && at(launch, "require_child_pid_namespace_changed(")
+                    < at(launch, "proof_writer.write_all(&token)")
+        );
+        let stage2 = TRANSITION
+            .split_once("fn run_stage2_workspace(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            at(stage2, "require_workspace_mount_plan(plan, token)?;")
+                < at(stage2, "clear_and_require_empty_capabilities()?;")
+                && at(stage2, "clear_and_require_empty_capabilities()?;")
+                    < at(stage2, "install_workspace_seccomp_filter()?;")
+                && at(stage2, "install_workspace_seccomp_filter()?;")
+                    < at(stage2, "sys::set_dumpable(false)?;")
+                && at(stage2, "sys::set_dumpable(false)?;")
+                    < at(stage2, "start_stage1_liveness_watcher()?;")
+                && at(stage2, "start_stage1_liveness_watcher()?;") < at(stage2, "command.spawn()")
+        );
+        // The channel is the entry's input and output; nothing else reaches it.
+        assert!(stage2.contains(".stdin(Stdio::from(channel.as_fd().try_clone_to_owned()?))"));
+        assert!(stage2.contains(".stdout(Stdio::from(channel.as_fd().try_clone_to_owned()?))"));
+        assert!(stage2
+            .contains(".stderr(Stdio::from(\n            OpenOptions::new().write(true).open(\"/dev/null\")?,\n        ))"));
+        // Stage 2 checks its channel before it builds anything.
+        let run = TRANSITION.split_once("pub fn run_stage2(").unwrap().1;
+        assert!(
+            at(run, "require_stage2_channel()?;") < at(run, "enter_mount_plan()?;")
+                && at(run, "enter_mount_plan()?;")
+                    < at(
+                        run,
+                        "return run_stage2_workspace(&plan, &mount_probe_token, identity);"
+                    )
+        );
+        assert!(TRANSITION.contains(
+            "fn install_workspace_seccomp_filter() -> io::Result<()> {\n    let program = seccomp::workspace_program()?;"
         ));
     }
 
@@ -580,10 +694,18 @@ mod confinement {
         assert_eq!(bootstrap.matches("sys::start_new_session()?").count(), 1);
         assert_eq!(watcher.matches("sys::start_new_session()?").count(), 1);
         assert_eq!(TRANSITION.matches(".current_dir(\"/\")").count(), 2);
-        // The entry is the ONLY thing that ever starts anywhere but stage
-        // 2's own `/`: three `current_dir` calls in the file, the two
-        // explicit `/` above and the entry's. A fourth reds this.
-        assert_eq!(TRANSITION.matches(".current_dir(").count(), 3);
+        // The entries are the ONLY things that ever start anywhere but stage
+        // 2's own `/`: four `current_dir` calls in the file, the two
+        // explicit `/` above, the application entry's and the workspace
+        // entry's, which is its plan's own admitted directory. A fifth reds
+        // this.
+        assert_eq!(TRANSITION.matches(".current_dir(").count(), 4);
+        assert_eq!(
+            TRANSITION
+                .matches(".current_dir(&plan.working_directory);")
+                .count(),
+            1
+        );
         assert_eq!(
             TRANSITION
                 .matches("command.current_dir(directory);")
@@ -1008,7 +1130,15 @@ mod confinement {
                 .count(),
             1
         );
-        assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 2);
+        // The probe's, the application launch's and the workspace launch's,
+        // which always isolates the network.
+        assert_eq!(TRANSITION.matches("sys::unshare_namespaces(").count(), 3);
+        assert_eq!(
+            TRANSITION
+                .matches("sys::unshare_namespaces(true).map_err(|error|")
+                .count(),
+            1
+        );
         assert!(TRANSITION
             .contains("sys::unshare_namespaces(application.isolate_network).map_err(|error|"));
         assert!(TRANSITION
@@ -1018,13 +1148,34 @@ mod confinement {
         assert!(TRANSITION.contains(
             "let flags = sys::MS_BIND\n        | if source_kind == FilesystemSourceKind::Directory {\n            sys::MS_REC"
         ));
-        assert_eq!(TRANSITION.matches("mount_bind_kind(").count(), 3);
+        // The definition, its two application callers, and the workspace
+        // kind's system trees, /etc files and directories, and programs.
+        assert_eq!(TRANSITION.matches("mount_bind_kind(").count(), 7);
+        // A flag the host set is kept: read-only and noexec only ever add.
         assert_eq!(
             TRANSITION
-                .matches("let flags = grant_mount_policy_flags(read_only || row.read_only);")
+                .matches(
+                    "let flags = grant_mount_policy_flags(\n            read_only || row.read_only,\n            executable && !row.options.contains(\"noexec\"),\n        );"
+                )
                 .count(),
             1
         );
+        // Exec is granted only to the workspace kind's worktrees, programs
+        // and host system trees; every application grant passes `false`.
+        assert_eq!(TRANSITION.matches("mount_grant(tree, true)?;").count(), 1);
+        assert_eq!(
+            TRANSITION
+                .matches("apply_grant_mount_policy(Path::new(&target), true, true)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            TRANSITION
+                .matches("apply_grant_mount_policy(&target, true, true)?;")
+                .count(),
+            1
+        );
+        assert!(TRANSITION.contains("fn mount_filesystem_grant(grant: &FilesystemGrant) -> io::Result<()> {\n    mount_grant(grant, false)\n}"));
         let grant_flags = TRANSITION
             .split_once("fn grant_mount_policy_flags")
             .unwrap()
@@ -1033,8 +1184,9 @@ mod confinement {
             .unwrap()
             .0;
         assert!(grant_flags.contains(
-            "sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC"
+            "let mut flags = sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV;"
         ));
+        assert!(grant_flags.contains("if !executable {\n        flags |= sys::MS_NOEXEC;\n    }"));
         assert!(grant_flags.contains("flags |= sys::MS_RDONLY;"));
         for call in [
             "sys::close(",
@@ -1062,11 +1214,19 @@ mod confinement {
         ] {
             assert!(TRANSITION.contains(call), "missing syscall caller: {call}");
         }
+        // One caller per kind, each installing exactly one filter.
         assert_eq!(
             TRANSITION.matches("sys::install_seccomp_filter(").count(),
-            1,
+            2,
             "two observed filters prove Firefox nested its own filter only while td-jail installs exactly one"
         );
+        assert_eq!(
+            TRANSITION
+                .matches("sys::install_seccomp_filter(program.instructions(), false)?;")
+                .count(),
+            1
+        );
+        assert!(TRANSITION.contains("install_workspace_seccomp_filter()?;"));
         assert_eq!(FIREFOX.matches("sandbox.filters >= 2").count(), 1);
         assert!(TRANSITION.contains("sys::terminate_namespace,"));
         assert!(!shipped_main.contains("sys::"));
@@ -1083,8 +1243,16 @@ mod confinement {
         assert!(TRANSITION
             .contains("install_standard_seccomp_filter(firefox_seccomp_probe).map_err(|error|"));
         assert!(TRANSITION.contains("probe_pid1_lifecycle()?;"));
-        assert_eq!(TRANSITION.matches(".env_clear()").count(), 4);
-        assert_eq!(TRANSITION.matches(".envs(").count(), 1);
+        // The workspace kind's stage 2 and entry add two; its entry's
+        // environment is the fixed `workspace::environment`.
+        assert_eq!(TRANSITION.matches(".env_clear()").count(), 6);
+        assert_eq!(TRANSITION.matches(".envs(").count(), 2);
+        assert_eq!(
+            TRANSITION
+                .matches(".envs(workspace::environment(&plan.home))")
+                .count(),
+            1
+        );
         assert!(SECCOMP.contains("pub(crate) const STANDARD_FILTER:"));
         assert!(SECCOMP.contains("const OFFSET_NR: u32 = 0;"));
         assert!(SECCOMP.contains("const OFFSET_ARCH: u32 = 4;"));

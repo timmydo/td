@@ -1,0 +1,843 @@
+//! The `workspace` launch kind (APPLICATIONS.md §C, td-agent/DESIGN.md §8):
+//! a development-host launch whose policy is a spec file its launcher
+//! writes, for an agent's tools. It runs a program the launcher names, not
+//! a package; binds the launcher's worktrees read-write and executable at
+//! their real paths, shared directories at theirs, a private home, and the
+//! host's own system trees read-only; and grants no Wayland, bus, audio,
+//! fetch, tty or network. Its entry's standard input and output are one
+//! stream socket the launcher holds the other end of.
+//!
+//! This module reads and admits the spec, as `authority` does a package's;
+//! `transition` performs it.
+
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use crate::authority::{
+    self, path_is_same_or_child, paths_overlap, FilesystemGrant, FilesystemSourceKind,
+};
+
+/// The argument after the exact `td-jail` argv[0] that selects this kind.
+pub(crate) const WORKSPACE_ARG: &str = "--workspace";
+/// Where the spec's programs are bound, each under its own file name.
+pub(crate) const PROGRAM_DIR: &str = "/opt/workspace/bin";
+/// The entry's `PATH`, `TMPDIR` and `LANG`; `HOME` is the spec's home.
+/// The system profiles of store-based hosts (Guix, NixOS) follow the
+/// ordinary directories; on another host they are absent and cost a
+/// lookup.
+pub(crate) const PATH: &str =
+    "/usr/local/bin:/usr/bin:/bin:/run/current-system/profile/bin:/run/current-system/sw/bin";
+pub(crate) const TMPDIR: &str = "/tmp";
+pub(crate) const LANG: &str = "C.UTF-8";
+pub(crate) const TERM: &str = "dumb";
+/// The host's trees bound read-only and executable, as the host has them:
+/// a link stays the same link, and a tree the host lacks is absent. `gnu`
+/// and `nix` are the stores where Guix and NixOS keep every program.
+pub(crate) const SYSTEM_TREES: &[&str] = &[
+    "bin", "gnu", "lib", "lib32", "lib64", "libx32", "nix", "sbin", "usr",
+];
+/// The host's links under `/run` repeated in the jail's otherwise empty
+/// one: a store-based host's current system, which its `/etc` entries and
+/// `PATH` name.
+pub(crate) const RUN_LINKS: &[&str] = &["current-system"];
+/// The host `/etc` entries bound read-only beside the synthesized account,
+/// group, host and name-service files: what a compiler, git and a shell
+/// read, and no credential.
+pub(crate) const HOST_ETC: &[&str] = &[
+    "alternatives",
+    "ca-certificates",
+    "ca-certificates.conf",
+    "gitconfig",
+    "inputrc",
+    "ld.so.cache",
+    "ld.so.conf",
+    "ld.so.conf.d",
+    "localtime",
+    "mime.types",
+    "os-release",
+    "pki",
+    "profile",
+    "protocols",
+    "services",
+    "shells",
+    "ssl",
+    "terminfo",
+    "timezone",
+];
+/// The files the plan writes into its `/etc`.
+pub(crate) const SYNTHESIZED_ETC: &[&str] =
+    &["group", "hostname", "hosts", "nsswitch.conf", "passwd"];
+/// What no admitted directory may be, contain or lie inside: the jail's
+/// own mount points and the host trees bound for it.
+const RESERVED: &[&str] = &[
+    "/bin", "/boot", "/dev", "/etc", "/gnu", "/lib", "/lib32", "/lib64", "/libx32", "/nix", "/opt",
+    "/proc", "/run", "/sbin", "/sys", "/tmp", "/usr", "/var/tmp",
+];
+const FORMAT_LINE: &str = "format=1";
+const O_NOFOLLOW: i32 = 0o400_000;
+const O_NONBLOCK: i32 = 0o4000;
+/// `/proc/net/unix`'s type and state for a connected stream socket.
+const UNIX_STREAM: &str = "0001";
+const UNIX_CONNECTED: &str = "03";
+const MAX_SPEC_BYTES: u64 = 64 * 1024;
+const MAX_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_PROGRAMS: usize = 4;
+pub(crate) const MAX_TREES: usize = 32;
+/// Filesystems no admitted tree may carry in below it: each reaches past
+/// the jail (procfs's `/proc/<pid>/root` and `environ` of the caller's own
+/// processes, the same uid) or the kernel.
+const PSEUDO_FILESYSTEMS: &[&str] = &[
+    "autofs",
+    "binfmt_misc",
+    "bpf",
+    "cgroup",
+    "cgroup2",
+    "configfs",
+    "debugfs",
+    "devpts",
+    "devtmpfs",
+    "efivarfs",
+    "fusectl",
+    "mqueue",
+    "nsfs",
+    "proc",
+    "pstore",
+    "securityfs",
+    "sysfs",
+    "tracefs",
+];
+const MAX_PROGRAM_NAME: usize = 64;
+
+/// A program bound read-only and executable under `PROGRAM_DIR`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Program {
+    pub(crate) name: String,
+    pub(crate) source: PathBuf,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+impl Program {
+    pub(crate) fn target(&self) -> PathBuf {
+        Path::new(PROGRAM_DIR).join(&self.name)
+    }
+}
+
+/// An admitted spec: what `transition::launch_workspace` performs.
+#[derive(Debug)]
+pub(crate) struct WorkspacePlan {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// The first program, which is the entry.
+    pub(crate) programs: Vec<Program>,
+    /// Read-write, not executable.
+    pub(crate) home: FilesystemGrant,
+    /// Read-write and executable: what the tools build and run.
+    pub(crate) worktrees: Vec<FilesystemGrant>,
+    /// Read-only or read-write, not executable.
+    pub(crate) shared: Vec<FilesystemGrant>,
+    pub(crate) arguments: Vec<OsString>,
+}
+
+impl WorkspacePlan {
+    /// Where the entry starts: the first worktree, else the home.
+    pub(crate) fn working_directory(&self) -> &Path {
+        self.worktrees
+            .first()
+            .map_or(&self.home.target, |tree| &tree.target)
+    }
+}
+
+/// The entry's whole environment.
+pub(crate) fn environment(home: &Path) -> Vec<(OsString, OsString)> {
+    vec![
+        ("HOME".into(), home.as_os_str().to_os_string()),
+        ("LANG".into(), LANG.into()),
+        ("PATH".into(), PATH.into()),
+        ("TERM".into(), TERM.into()),
+        ("TMPDIR".into(), TMPDIR.into()),
+    ]
+}
+
+pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
+    argument == WORKSPACE_ARG
+}
+
+/// The spec as written, before admission.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct Spec {
+    programs: Vec<PathBuf>,
+    home: PathBuf,
+    worktrees: Vec<PathBuf>,
+    read: Vec<PathBuf>,
+    write: Vec<PathBuf>,
+}
+
+/// The exact, ordered keyfile: `format=1`, one `entry`, any `program`s,
+/// one `home`, then any `worktree`, `read` and `write` lines, each group
+/// in that order.
+fn parse_spec(text: &str) -> io::Result<Spec> {
+    let mut lines = text.lines();
+    if lines.next() != Some(FORMAT_LINE) {
+        return Err(invalid("workspace spec does not begin with format=1"));
+    }
+    const ORDER: &[&str] = &["entry", "program", "home", "worktree", "read", "write"];
+    let mut spec = Spec::default();
+    let mut last = 0usize;
+    let mut home = None;
+    let mut entry = false;
+    for line in lines {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| invalid(format!("workspace spec line {line:?} has no `=`")))?;
+        let rank = ORDER
+            .iter()
+            .position(|known| *known == key)
+            .ok_or_else(|| invalid(format!("workspace spec has an unknown key {key:?}")))?;
+        let once = matches!(key, "entry" | "home");
+        if rank < last || (once && rank == last && (entry || home.is_some())) {
+            return Err(invalid(format!(
+                "workspace spec key {key:?} is out of order or repeated"
+            )));
+        }
+        last = rank;
+        let path = spec_path(key, value)?;
+        match key {
+            "entry" => {
+                entry = true;
+                spec.programs.push(path);
+            }
+            "program" if entry => spec.programs.push(path),
+            "program" => return Err(invalid("workspace spec names a program before its entry")),
+            "home" => home = Some(path),
+            "worktree" => spec.worktrees.push(path),
+            "read" => spec.read.push(path),
+            _ => spec.write.push(path),
+        }
+    }
+    if !entry {
+        return Err(invalid("workspace spec names no entry"));
+    }
+    spec.home = home.ok_or_else(|| invalid("workspace spec names no home"))?;
+    if spec.programs.len() > MAX_PROGRAMS {
+        return Err(invalid(format!(
+            "workspace spec names more than {MAX_PROGRAMS} programs"
+        )));
+    }
+    if spec.worktrees.len() + spec.read.len() + spec.write.len() > MAX_TREES {
+        return Err(invalid(format!(
+            "workspace spec names more than {MAX_TREES} directories"
+        )));
+    }
+    Ok(spec)
+}
+
+fn spec_path(key: &str, value: &str) -> io::Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if value.len() > MAX_PATH_BYTES || value.contains('\0') {
+        return Err(invalid(format!(
+            "workspace spec {key} is not a bounded path"
+        )));
+    }
+    authority::validate_filesystem_target(&path)
+        .map_err(|_| invalid(format!("workspace spec {key} {value:?} is not canonical")))?;
+    Ok(path)
+}
+
+/// Reads and admits `spec_path` for the calling identity (§C's source
+/// checks, with the workspace kind's departures, APPLICATIONS.md §C).
+pub(crate) fn resolve<I>(spec_path: &OsStr, arguments: I) -> io::Result<WorkspacePlan>
+where
+    I: Iterator<Item = OsString>,
+{
+    authority::require_no_product_configuration("the workspace kind")?;
+    let (uid, gid) = authority::caller_identity()?;
+    if uid == 0 || gid == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the workspace kind requires a nonzero identity",
+        ));
+    }
+    let spec_path = Path::new(spec_path);
+    let text = read_spec(spec_path, uid)?;
+    let spec = parse_spec(&text)?;
+    let real_home = authority::account_home(uid)?;
+    // The home as the account names it and as it resolves, which differ
+    // where `/home` is a link (`/var/home` on OSTree hosts).
+    let real_home = match fs::canonicalize(&real_home) {
+        Ok(resolved) if resolved != real_home => vec![real_home, resolved],
+        _ => vec![real_home],
+    };
+    let arguments = authority::collect_arguments(arguments)?;
+    admit(spec, spec_path, uid, gid, &real_home, arguments, RESERVED)
+}
+
+/// The spec: a direct regular file of the caller's that no one else can
+/// write, bounded.
+fn read_spec(path: &Path, uid: u32) -> io::Result<String> {
+    if !path.is_absolute() {
+        return Err(invalid("workspace spec path is not absolute"));
+    }
+    // The file opened, not followed, is the one checked and read.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o022 != 0
+        || fs::canonicalize(path)? != path
+    {
+        return Err(invalid(format!(
+            "workspace spec {} is not a direct regular file only its owner, the caller, can write",
+            path.display()
+        )));
+    }
+    let mut text = String::new();
+    (&mut file)
+        .take(MAX_SPEC_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_SPEC_BYTES {
+        return Err(invalid("workspace spec is too large"));
+    }
+    Ok(text)
+}
+
+fn admit(
+    spec: Spec,
+    spec_path: &Path,
+    uid: u32,
+    gid: u32,
+    real_home: &[PathBuf],
+    arguments: Vec<OsString>,
+    reserved: &[&str],
+) -> io::Result<WorkspacePlan> {
+    let mut programs: Vec<Program> = Vec::new();
+    for source in spec.programs {
+        let program = admit_program(&source)?;
+        if programs.iter().any(|known| known.name == program.name) {
+            return Err(invalid(format!(
+                "workspace programs share the file name {:?}",
+                program.name
+            )));
+        }
+        programs.push(program);
+    }
+    let home = admit_directory(&spec.home, false)?;
+    let home_metadata = fs::symlink_metadata(&spec.home)?;
+    if home_metadata.uid() != uid || home_metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(invalid(format!(
+            "workspace home {} is not the caller's private 0700 directory",
+            spec.home.display()
+        )));
+    }
+    let worktrees = spec
+        .worktrees
+        .iter()
+        .map(|tree| admit_directory(tree, false))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut shared = spec
+        .read
+        .iter()
+        .map(|tree| admit_directory(tree, true))
+        .collect::<io::Result<Vec<_>>>()?;
+    for tree in &spec.write {
+        shared.push(admit_directory(tree, false)?);
+    }
+    let all: Vec<&FilesystemGrant> = std::iter::once(&home)
+        .chain(worktrees.iter())
+        .chain(shared.iter())
+        .collect();
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
+    let reserved_mounts = reserved_identities(&mountinfo, reserved)?;
+    // Each spelling of the home that exists, by identity; one that cannot
+    // be placed refuses the launch rather than going unchecked.
+    let mut homes = Vec::new();
+    for home in real_home {
+        if fs::symlink_metadata(home).is_ok() {
+            homes.push(authority::mount_identity_for_path(&mountinfo, home)?);
+        }
+    }
+    // The spec lies outside every tree it grants, by path and through any
+    // mount: an instance runs as the caller and could rewrite the next
+    // instance's policy.
+    let spec_dir = spec_path
+        .parent()
+        .map(|dir| authority::mount_identity_for_path(&mountinfo, dir))
+        .transpose()?;
+    let mut identities = Vec::new();
+    for grant in &all {
+        refuse_reserved(&grant.source, real_home, reserved)?;
+        refuse_pseudo_filesystems(&mountinfo, &grant.source)?;
+        let mounts = authority::mount_tree_identities(&mountinfo, &grant.source)?;
+        // The tree itself and every mount below it, any of which may be a
+        // bind of the home or of a directory above it.
+        if mounts
+            .iter()
+            .any(|mount| homes.iter().any(|home| contains_by_identity(mount, home)))
+        {
+            return Err(invalid(format!(
+                "workspace directory {} is or contains the caller's home through a mount",
+                grant.source.display()
+            )));
+        }
+        if path_is_same_or_child(spec_path, &grant.source)
+            || spec_dir
+                .as_ref()
+                .is_some_and(|dir| mounts.iter().any(|mount| contains_by_identity(mount, dir)))
+        {
+            return Err(invalid(format!(
+                "workspace spec {} lies in the directory {} it grants",
+                spec_path.display(),
+                grant.source.display()
+            )));
+        }
+        if authority::mount_identity_sets_overlap(&mounts, &reserved_mounts) {
+            return Err(invalid(format!(
+                "workspace directory {} aliases a reserved tree",
+                grant.source.display()
+            )));
+        }
+        identities.push((grant.source.clone(), mounts));
+    }
+    for (index, (source, mounts)) in identities.iter().enumerate() {
+        for (other, other_mounts) in identities.iter().skip(index + 1) {
+            if paths_overlap(source, other)
+                || authority::mount_identity_sets_overlap(mounts, other_mounts)
+            {
+                return Err(invalid(format!(
+                    "workspace directories {} and {} overlap",
+                    source.display(),
+                    other.display()
+                )));
+            }
+        }
+    }
+    Ok(WorkspacePlan {
+        uid,
+        gid,
+        programs,
+        home,
+        worktrees,
+        shared,
+        arguments,
+    })
+}
+
+/// A program: a canonical, executable regular file, named for its file
+/// name in `PROGRAM_DIR`.
+fn admit_program(source: &Path) -> io::Result<Program> {
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_file()
+        || metadata.permissions().mode() & 0o100 == 0
+        || fs::canonicalize(source)? != source
+    {
+        return Err(invalid(format!(
+            "workspace program {} is not a direct executable regular file",
+            source.display()
+        )));
+    }
+    let name = source
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| valid_program_name(name))
+        .ok_or_else(|| {
+            invalid(format!(
+                "workspace program {} has no plain file name",
+                source.display()
+            ))
+        })?
+        .to_string();
+    Ok(Program {
+        name,
+        source: source.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+pub(crate) fn valid_program_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PROGRAM_NAME
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// A directory, canonical with no link anywhere in it, bound at its own
+/// path.
+fn admit_directory(source: &Path, read_only: bool) -> io::Result<FilesystemGrant> {
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_dir() || fs::canonicalize(source)? != source {
+        return Err(invalid(format!(
+            "workspace directory {} is not a direct directory",
+            source.display()
+        )));
+    }
+    Ok(FilesystemGrant {
+        source: source.to_path_buf(),
+        target: source.to_path_buf(),
+        read_only,
+        source_kind: FilesystemSourceKind::Directory,
+        source_device: metadata.dev(),
+        source_inode: metadata.ino(),
+    })
+}
+
+/// No directory may overlap the jail's own trees, nor be the caller's
+/// home or contain it: the home is absent but for what lies inside it
+/// and is admitted.
+fn refuse_reserved(source: &Path, real_home: &[PathBuf], reserved: &[&str]) -> io::Result<()> {
+    if source == Path::new("/") {
+        return Err(invalid("workspace directory / is the whole host"));
+    }
+    if let Some(reserved) = reserved
+        .iter()
+        .find(|reserved| paths_overlap(source, Path::new(reserved)))
+    {
+        return Err(invalid(format!(
+            "workspace directory {} overlaps the reserved tree {reserved}",
+            source.display()
+        )));
+    }
+    if let Some(home) = real_home
+        .iter()
+        .find(|home| path_is_same_or_child(home, source))
+    {
+        return Err(invalid(format!(
+            "workspace directory {} is or contains the caller's home {}",
+            source.display(),
+            home.display()
+        )));
+    }
+    Ok(())
+}
+
+/// No mount at or below `source` is a pseudo-filesystem.
+pub(crate) fn refuse_pseudo_filesystems(mountinfo: &str, source: &Path) -> io::Result<()> {
+    for line in mountinfo.lines() {
+        let (left, right) = line
+            .split_once(" - ")
+            .ok_or_else(|| invalid("mountinfo row has no separator"))?;
+        let mountpoint = left
+            .split_whitespace()
+            .nth(4)
+            .ok_or_else(|| invalid("mountinfo row has no mount point"))?;
+        let mountpoint = authority::decode_mountinfo_path(mountpoint)?;
+        let fstype = right.split_whitespace().next().unwrap_or_default();
+        if path_is_same_or_child(&mountpoint, source) && PSEUDO_FILESYSTEMS.contains(&fstype) {
+            return Err(invalid(format!(
+                "{} carries a {fstype} mount at {}, which would reach past the jail",
+                source.display(),
+                mountpoint.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `outer` is `inner` or one of its ancestors in the same filesystem,
+/// however either is mounted: a bind of `/home` elsewhere contains the
+/// home as surely as `/home` does.
+fn contains_by_identity(
+    outer: &authority::MountIdentity,
+    inner: &authority::MountIdentity,
+) -> bool {
+    outer.device == inner.device && path_is_same_or_child(&inner.root, &outer.root)
+}
+
+fn reserved_identities(
+    mountinfo: &str,
+    reserved: &[&str],
+) -> io::Result<std::collections::BTreeSet<authority::MountIdentity>> {
+    let mut identities = std::collections::BTreeSet::new();
+    for reserved in reserved {
+        // A reserved tree that is a link (`/bin` to `usr/bin`) reserves
+        // what it resolves to.
+        let Ok(path) = fs::canonicalize(reserved) else {
+            continue;
+        };
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+            identities.extend(authority::mount_tree_identities(mountinfo, &path)?);
+        }
+    }
+    Ok(identities)
+}
+
+/// The channel, by its inode in the launcher's `/proc/net/unix`: an
+/// unnamed, connected Unix stream socket. A datagram socket could address
+/// any pathname socket on the host with `sendto`, and the jail's filter
+/// leaves `sendto` alone.
+pub(crate) fn require_stream_pair(table: &str, inode: u64) -> io::Result<()> {
+    let inode = inode.to_string();
+    let row = table
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|fields| fields.get(6) == Some(&inode.as_str()))
+        .ok_or_else(|| invalid("the workspace channel is not a Unix socket of this namespace"))?;
+    if row.get(4) != Some(&UNIX_STREAM) || row.get(5) != Some(&UNIX_CONNECTED) || row.len() != 7 {
+        return Err(invalid(
+            "the workspace channel is not an unnamed, connected Unix stream socket",
+        ));
+    }
+    Ok(())
+}
+
+/// The passwd row the plan writes: the caller, at the workspace home.
+pub(crate) fn passwd(uid: u32, gid: u32, home: &Path) -> String {
+    format!("td:x:{uid}:{gid}:td:{}:/bin/sh\n", home.display())
+}
+
+pub(crate) fn group(gid: u32) -> String {
+    format!("td:x:{gid}:\n")
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    #[test]
+    fn the_spec_is_an_exact_ordered_keyfile() {
+        let spec = parse_spec(
+            "format=1\nentry=/w/bin/td-agent\nprogram=/w/bin/td-txt\nhome=/s/home\n\
+             worktree=/w/a\nworktree=/w/b\nread=/d\nwrite=/e\n",
+        )
+        .unwrap();
+        assert_eq!(spec.programs.len(), 2);
+        assert_eq!(spec.home, PathBuf::from("/s/home"));
+        assert_eq!(spec.worktrees.len(), 2);
+        assert_eq!((spec.read.len(), spec.write.len()), (1, 1));
+        for bad in [
+            "",
+            "format=2\nentry=/a\nhome=/h\n",
+            "format=1\nhome=/h\n",
+            "format=1\nentry=/a\n",
+            "format=1\nentry=/a\nentry=/b\nhome=/h\n",
+            "format=1\nentry=/a\nhome=/h\nhome=/i\n",
+            "format=1\nentry=/a\nhome=/h\nprogram=/b\n",
+            "format=1\nentry=/a\nhome=/h\nread=/r\nworktree=/w\n",
+            "format=1\nentry=/a\nhome=/h\nnetwork=on\n",
+            "format=1\nentry=a\nhome=/h\n",
+            "format=1\nentry=/a/../b\nhome=/h\n",
+            "format=1\nentry=/a//b\nhome=/h\n",
+            "format=1\nentry=/a\nhome=/h\nworktree\n",
+        ] {
+            assert!(parse_spec(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_trees_and_the_home_are_refused() {
+        let home = &[PathBuf::from("/home/u"), PathBuf::from("/var/home/u")];
+        for refused in [
+            "/",
+            "/usr",
+            "/usr/lib",
+            "/etc",
+            "/home",
+            "/home/u",
+            "/opt/workspace",
+            "/proc/1",
+            "/run/user",
+            "/tmp",
+            "/var/tmp/x",
+            "/sys",
+            "/gnu/store",
+            "/nix",
+            "/opt/project",
+        ] {
+            assert!(
+                refuse_reserved(Path::new(refused), home, RESERVED).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(refuse_reserved(Path::new("/var/home"), home, RESERVED).is_err());
+        for admitted in ["/home/u/src/td", "/srv/data", "/var/lib/x"] {
+            assert!(
+                refuse_reserved(Path::new(admitted), home, RESERVED).is_ok(),
+                "{admitted}"
+            );
+        }
+    }
+
+    /// Admission over real directories, under a scratch directory the
+    /// reserved list this test passes leaves out (production reserves
+    /// `/tmp`, where the scratch directory usually is).
+    #[test]
+    fn admission_requires_direct_private_disjoint_trees() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("td-jail-workspace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        let uid = fs::metadata(&base).unwrap().uid();
+        let dir = |name: &str, mode: u32| {
+            let path = base.join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let home = dir("home", 0o700);
+        let tree = dir("tree", 0o755);
+        let shared = dir("shared", 0o755);
+        let loose = dir("loose", 0o755);
+        let entry = base.join("td-agent");
+        fs::write(&entry, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = base.join("plain");
+        fs::write(&plain, b"").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&tree, base.join("link")).unwrap();
+        let real_home = &[PathBuf::from("/nonexistent-td-jail-home")];
+        let spec = |programs: &[&Path], home: &Path, worktrees: &[&Path], read: &[&Path]| Spec {
+            programs: programs.iter().map(|path| path.to_path_buf()).collect(),
+            home: home.to_path_buf(),
+            worktrees: worktrees.iter().map(|path| path.to_path_buf()).collect(),
+            read: read.iter().map(|path| path.to_path_buf()).collect(),
+            write: Vec::new(),
+        };
+        let spec_path = base.join("spec");
+        let admit_spec = |spec: Spec| {
+            admit(
+                spec,
+                &spec_path,
+                uid,
+                uid,
+                real_home,
+                Vec::new(),
+                &["/proc"],
+            )
+        };
+
+        let plan = admit_spec(spec(&[&entry], &home, &[&tree], &[&shared])).unwrap();
+        assert_eq!(
+            plan.programs[0].target(),
+            Path::new("/opt/workspace/bin/td-agent")
+        );
+        assert_eq!(plan.working_directory(), tree);
+        assert!(plan.shared[0].read_only && !plan.home.read_only);
+
+        // A home that others can enter.
+        assert!(admit_spec(spec(&[&entry], &loose, &[&tree], &[])).is_err());
+        // A program that cannot run, or is a directory.
+        assert!(admit_spec(spec(&[&plain], &home, &[&tree], &[])).is_err());
+        assert!(admit_spec(spec(&[&tree], &home, &[], &[])).is_err());
+        // Two programs with one file name.
+        assert!(admit_spec(spec(&[&entry, &entry], &home, &[], &[])).is_err());
+        // A spec inside a tree it grants.
+        assert!(admit(
+            spec(&[&entry], &home, &[&tree], &[]),
+            &tree.join("spec"),
+            uid,
+            uid,
+            real_home,
+            Vec::new(),
+            &["/proc"],
+        )
+        .is_err());
+        // A link, rather than the directory it names.
+        assert!(admit_spec(spec(&[&entry], &home, &[&base.join("link")], &[])).is_err());
+        // Overlap, by path or as the same directory twice.
+        assert!(admit_spec(spec(&[&entry], &home, &[&base], &[])).is_err());
+        assert!(admit_spec(spec(&[&entry], &home, &[&tree], &[&tree])).is_err());
+        // A tree containing the caller's real home.
+        assert!(admit(
+            spec(&[&entry], &home, &[&tree], &[]),
+            &spec_path,
+            uid,
+            uid,
+            &[PathBuf::from("/elsewhere"), tree.join("me")],
+            Vec::new(),
+            &["/proc"],
+        )
+        .is_err());
+        // A reserved tree.
+        assert!(admit(
+            spec(&[&entry], &home, &[&tree], &[]),
+            &spec_path,
+            uid,
+            uid,
+            real_home,
+            Vec::new(),
+            &[base.to_str().unwrap()],
+        )
+        .is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn pseudo_filesystems_below_a_tree_are_refused() {
+        let mountinfo = "1 0 0:1 / / rw - btrfs /dev/a rw\n\
+            2 1 0:2 / /w/a/chroot/proc rw,nosuid - proc proc rw\n\
+            3 1 0:3 / /w/b/tmp rw - tmpfs tmpfs rw\n\
+            4 1 0:4 / /w/c\\040d/sys rw - sysfs sysfs rw\n";
+        assert!(refuse_pseudo_filesystems(mountinfo, Path::new("/w/a")).is_err());
+        assert!(refuse_pseudo_filesystems(mountinfo, Path::new("/w/a/chroot/proc")).is_err());
+        assert!(refuse_pseudo_filesystems(mountinfo, Path::new("/w/b")).is_ok());
+        assert!(refuse_pseudo_filesystems(mountinfo, Path::new("/w/c d")).is_err());
+        assert!(refuse_pseudo_filesystems(mountinfo, Path::new("/w/ab")).is_ok());
+    }
+
+    #[test]
+    fn a_bind_of_the_home_contains_it() {
+        let identity = |device: &str, root: &str| authority::MountIdentity {
+            device: device.into(),
+            root: root.into(),
+        };
+        let home = identity("0:5", "/@home/u");
+        assert!(contains_by_identity(&identity("0:5", "/@home"), &home));
+        assert!(contains_by_identity(&identity("0:5", "/@home/u"), &home));
+        assert!(!contains_by_identity(
+            &identity("0:5", "/@home/u/src"),
+            &home
+        ));
+        assert!(!contains_by_identity(&identity("0:6", "/@home"), &home));
+        assert!(!contains_by_identity(
+            &identity("0:5", "/@home/user"),
+            &home
+        ));
+    }
+
+    #[test]
+    fn the_channel_is_a_connected_stream_pair() {
+        let table = "Num       RefCount Protocol Flags    Type St Inode Path\n\
+            00000000aae3d76a: 00000003 00000000 00000000 0001 03 11\n\
+            00000000aae3d76b: 00000002 00000000 00000000 0002 03 12\n\
+            00000000aae3d76c: 00000002 00000000 00000000 0005 03 13\n\
+            00000000aae3d76d: 00000002 00000000 00010000 0001 01 14 /run/s\n\
+            00000000aae3d76e: 00000003 00000000 00000000 0001 03 15 /run/t\n";
+        assert!(require_stream_pair(table, 11).is_ok());
+        for refused in [12, 13, 14, 15, 16, 1] {
+            assert!(require_stream_pair(table, refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn program_names_are_plain() {
+        for good in ["td-agent", "td-txt", "a.b_c"] {
+            assert!(valid_program_name(good));
+        }
+        for bad in ["", ".hidden", "a/b", "a b", &"x".repeat(65)] {
+            assert!(!valid_program_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_environment_is_fixed_but_for_home() {
+        let environment = environment(Path::new("/s/home"));
+        let keys: Vec<_> = environment.iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(keys, ["HOME", "LANG", "PATH", "TERM", "TMPDIR"]);
+        assert_eq!(environment[0].1, "/s/home");
+    }
+}

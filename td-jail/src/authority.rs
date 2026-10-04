@@ -372,6 +372,32 @@ where
     )
 }
 
+/// The development-host kinds are absent where the product configuration
+/// is installed, as `--host` is.
+pub(crate) fn require_no_product_configuration(what: &str) -> io::Result<()> {
+    match fs::symlink_metadata(CONFIG_PATH) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{what} is unavailable when the product application configuration is installed"
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("inspect product application configuration: {error}"),
+        )),
+    }
+}
+
+pub(crate) fn caller_identity() -> io::Result<(u32, u32)> {
+    effective_identity()
+}
+
+pub(crate) fn account_home(uid: u32) -> io::Result<PathBuf> {
+    passwd_home(uid)
+}
+
 pub(crate) fn is_host_argument(argument: &OsStr) -> bool {
     argument == HOST_ARG
 }
@@ -2033,7 +2059,7 @@ fn mount_identities_overlap(left: &MountIdentity, right: &MountIdentity) -> bool
     left.device == right.device && paths_overlap(&left.root, &right.root)
 }
 
-fn mount_identity_sets_overlap(
+pub(crate) fn mount_identity_sets_overlap(
     left: &BTreeSet<MountIdentity>,
     right: &BTreeSet<MountIdentity>,
 ) -> bool {

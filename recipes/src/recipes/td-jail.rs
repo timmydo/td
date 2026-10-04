@@ -30,6 +30,10 @@ const MODULES: &[(&str, &str)] = &[
         "transition",
         include_str!("../../../td-jail/src/transition.rs"),
     ),
+    (
+        "workspace",
+        include_str!("../../../td-jail/src/workspace.rs"),
+    ),
 ];
 
 #[cfg(test)]
@@ -521,7 +525,9 @@ mod tests {
         assert!(transition.contains("sys::set_dumpable(false)?;"));
         assert!(transition.contains("sys::set_parent_death_signal()?;"));
         assert!(transition.contains("start_stage1_liveness_watcher()?;"));
-        assert_eq!(transition.matches("sys::bring_up_loopback()").count(), 2);
+        // The application launch's, and the workspace launch's, which
+        // always isolates the network.
+        assert_eq!(transition.matches("sys::bring_up_loopback()").count(), 3);
         assert!(transition
             .contains(".require_application_change(&before, application.isolate_network)?;"));
         assert!(transition

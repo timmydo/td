@@ -3501,6 +3501,129 @@ nested seccomp filter in every live required child role. This combines the
 global Linux support-page facts with per-process kernel evidence instead of
 pretending `about:support` exposes a per-class level that it does not.
 
+### The `workspace` kind
+
+The third launch kind, beside an application launch and §X.1's host
+launch, runs an agent's tools rather than a package (td-agent/DESIGN.md
+§8). It is a development-host kind: selected only by the exact
+
+```text
+td-jail --workspace LAUNCHER-PID SPEC [ARG...]
+```
+
+under the exact `td-jail` argv[0], never inferred, and refused, as
+`--host` is, wherever the product configuration is installed. Its policy
+is a spec its launcher writes: a direct regular file of the caller's that
+no one else can write, at most 64 KiB, and an exact, ordered keyfile:
+
+```text
+format=1
+entry=/absolute/td-agent
+program=/absolute/td-txt
+home=/absolute/private/home
+worktree=/absolute/worktree
+read=/absolute/shared/read-only
+write=/absolute/shared/read-write
+```
+
+`entry` and `home` appear once; `program` (with `entry`, at most four),
+`worktree`, `read` and `write` repeat, at most 32 directories in all; keys
+appear in that order. Admission is §C's filesystem-grant source checks
+with the kind's own departures:
+
+- **Programs**, the entry first, are direct executable regular files,
+  bound read-only and executable at `/opt/workspace/bin/<file name>`,
+  their device and inode checked before and after the bind. The entry
+  runs as the first of them. No package, manifest or permission file is
+  involved, so nothing of §B's identity reaches the instance.
+- **Directories** are canonical, links refused, and bound at their own
+  real paths rather than below `/home/td`. Any two of them overlapping by
+  path or by mount identity is refused, as is any overlap with the
+  reserved trees (`/bin`, `/boot`, `/dev`, `/etc`, `/gnu`, `/lib*`,
+  `/nix`, `/opt`, `/proc`, `/run`, `/sbin`, `/sys`, `/tmp`, `/usr`,
+  `/var/tmp`, a linked one by what it resolves to), by path or by mount
+  identity, and one that is or contains the caller's own home, as passwd
+  spells it, as it resolves, or through a bind mount of it or of a
+  directory above it anywhere in the tree: the home is absent except for
+  what lies inside it and was admitted. A tree carrying a
+  pseudo-filesystem below it (procfs, sysfs, cgroupfs, devpts and their
+  kin) is refused, since a procfs reaches the caller's own processes and
+  through them the whole host; so is a system tree carrying one. The spec
+  home must be the caller's, mode 0700. The spec itself must lie outside
+  every directory it grants, since the caller's own jailed tools run as
+  the caller.
+- **Mount flags.** Every directory is `nosuid,nodev`. The home and the
+  shared directories are `noexec`; worktrees are not, because the
+  agent's shell runs what it builds there. `read` directories are
+  read-only. The hardening loop keeps a flag the host already set on a
+  row, read-only and `noexec` included, so a grant is never wider than
+  its source.
+
+The rest of the plan is fixed. The base trees are an application's:
+`/dev`, procfs, devpts, `/dev/shm`, and fresh `/tmp` and `/var/tmp`,
+which here are executable, since a worktree is anyway. The host's
+`/bin`, `/gnu`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/nix`, `/sbin`
+and `/usr` are bound recursively read-only, `nosuid,nodev`, executable,
+or recreated as the same link, and are absent where the host lacks them;
+`/usr` is required. `/run` holds only a store-based host's
+`current-system` link, to its resolved target when that lies in a bound
+tree. `/etc` is a tmpfs holding synthesized account, group, host,
+hostname and NSS files, the account the caller's identity with the
+spec's home, and a compiled allowlist of host entries, a link among them
+pointing where it resolves when that is in a bound tree (the dynamic
+loader's cache and configuration, certificates, `gitconfig`,
+`localtime`, `os-release`, `terminfo` and similar), bound read-only and
+`noexec`. There is no `/home` but the admitted directories, no `/sys`,
+no cgroupfs, and no Wayland, bus, audio, fetch, tty or runtime
+directory. Stage 2 reads all of it back before confinement: the exact
+names of the root, of every directory between it and an admitted tree,
+and of `/run`, `/etc` and `/opt/workspace`; every program's flags; every
+mount row below every directory; and that no mount exists the plan did
+not make.
+
+The instance always isolates the network, with loopback up, and keeps
+§C's user, mount, PID and UTS namespaces, but maps the caller to itself
+rather than to uid 1000, so a worktree keeps its owner and git's
+ownership check reads it as outside. Its seccomp program is a second
+compiled one, identical to the standard filter except for its socket
+rules: `socket(AF_UNIX, ...)` is refused with `EPERM` and
+`socketpair(2)` is admitted for `AF_UNIX` with `SOCK_STREAM` or
+`SOCK_SEQPACKET` alone, the type compared with `SOCK_NONBLOCK` and
+`SOCK_CLOEXEC` masked off. A network namespace does not separate
+pathname Unix sockets, so without that refusal a socket a host service
+publishes in a worktree or shared directory would be a way out, and a
+datagram pair could address one with `sendto`; a connected
+sequenced-packet pair cannot, since the kernel discards its destination,
+and Rust's `Command::spawn` creates one for every child it starts.
+
+The launcher's standard input and output must be one stream socket, the
+channel: td-jail checks that they are one socket and, in the launcher's
+`/proc/net/unix` before it leaves that network namespace, that it is an
+unnamed, connected Unix stream socket, since a datagram one could
+address any pathname socket on the host (an accepted socket, which
+carries its listener's name, is refused too). Stage 2 receives a clone
+as its
+stdout and checks it is a socket and that no terminal controls it, and
+the entry receives two clones as its standard input and output, with the
+null device as standard error. Its environment is exactly `HOME` (the
+spec's home), `LANG=C.UTF-8`, `PATH` (the ordinary directories, then a
+store-based host's system profile), `TERM=dumb` and `TMPDIR=/tmp`; it
+starts in the first worktree, else in the home. No cgroup is created and
+no data limit set: an instance keeps its launcher's cgroup and whatever
+limit it inherits, and says so with one named diagnostic,
+`workspace-memory-task-and-cpu-caps=unenforced`.
+
+**Tied to its launcher.** The launcher names its own pid. td-jail's
+outer process, before it starts the session bootstrap, arms the
+parent-death signal and then requires its direct parent to be that pid,
+so a launcher that has already gone, leaving td-jail another parent, is
+refused.
+Stage 1 dies with that process as it does in every launch, so killing
+the launcher with `SIGKILL` ends the instance and every process in it.
+The death signal follows the thread that started td-jail, so a launcher
+starts it from a thread that lives as long as the process does; a
+closed channel ends an entry that reads it.
+
 ### `UNSAFE.md` surface #9 (landed target state)
 
 The normative `UNSAFE.md` roster grew with the implementation. Rung 9 landed
@@ -10347,7 +10470,8 @@ The CA bundle is a mandatory direct, bounded regular file and the resolver
 file is an optional direct, bounded regular file used only by a
 `shared=network` launch. The host acceptance recipe points the former at the
 same pinned `ca-certificates` output the image uses and materializes the latter
-as fixture data; td-jail never borrows the host's ambient `/etc`.
+as fixture data; an application launch never borrows the host's ambient
+`/etc`, and the `workspace` kind's allowlisted borrowing is §X.8's.
 
 ### X.2 What is missing on a host, and what answers it
 
@@ -10632,6 +10756,30 @@ of that name beside the binary the link resolves to, so an installed
 td-news is served as `./news` serves the checkout's. The installed
 program finds no service of its own any other way, and the session's
 `td-fetch/socket` is still never touched.
+
+### X.8 The `workspace` kind on a host
+
+§C's `workspace` kind is a development-host kind by construction, and
+its divergences from §X.1 are availability ones, named here as the
+two-configuration rule requires:
+
+- **(a) A program, not a package.** It runs the checkout's own td-agent
+  tool host and td-txt, bound read-only, with no package root, registry,
+  Wayland or bus. Its spec is written by its launcher, not by td-builder.
+- **(b) The host's tools.** §X.1 never borrows the host's own `/etc` or
+  system trees; a coding agent's tools on a host are the host's: its
+  compiler, git and shell. The `workspace` kind binds the host's system
+  trees read-only and an allowlisted selective `/etc`, for that kind
+  alone.
+- **(c) The caller's own identity.** §X.1 maps the caller to uid 1000;
+  the `workspace` kind maps it to itself, because its directories sit at
+  their real paths and keep their owner.
+
+User namespaces and the workspace seccomp program are fatal
+prerequisites, as for §X.1; the unenforced aggregate caps are one named
+diagnostic. A launch from §X.7's unjailed `./agent` is how td-agent
+reaches this kind on a host; that wiring is td-agent's (its DESIGN.md
+§8 and §18).
 
 ## Z. No server infrastructure
 

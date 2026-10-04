@@ -4,6 +4,7 @@ use crate::{
         FilesystemGrant, FilesystemSourceKind, LaunchPlan, ResolvedFile, ResolvedResourceLimits,
     },
     cgroup, firefox, seccomp, sys,
+    workspace::{self, WorkspacePlan},
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr, OsString};
@@ -49,6 +50,11 @@ const STAGE2_ENVIRONMENT_ARG: &str = "--environment";
 const STAGE2_FILESYSTEMS_ARG: &str = "--filesystems";
 const STAGE2_RESOURCES_ARG: &str = "--resources";
 const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
+const STAGE2_WORKSPACE_ARG: &str = "--workspace";
+const STAGE2_PROGRAMS_ARG: &str = "--programs";
+const STAGE2_HOME_ARG: &str = "--home";
+const STAGE2_WORKTREES_ARG: &str = "--worktrees";
+const STAGE2_SHARED_ARG: &str = "--shared";
 const NO_CGROUP_MEMBERSHIP: &str = "none";
 /// Stage 2's spelling for "this launch carries no zone". A tzdb zone name
 /// starts every component with a capital, so no zone can be spelled this.
@@ -73,6 +79,8 @@ const KILL_REAPS_APPLICATION: &str = "td-jail-cleanup";
 pub const TRANSITION_MARKER: &str = "TD-JAIL-TRANSITION-OK";
 pub const HOST_DEGRADATION_CGROUP: &str =
     "TD-JAIL-HOST-DEGRADATION aggregate-memory-task-and-cpu-caps=unenforced reason=no-delegated-cgroup";
+pub const WORKSPACE_DEGRADATION: &str =
+    "TD-JAIL-HOST-DEGRADATION workspace-memory-task-and-cpu-caps=unenforced reason=launcher-cgroup";
 pub const HOST_DEGRADATION_WAYLAND: &str =
     "TD-JAIL-HOST-DEGRADATION wayland-global-filter=unenforced reason=direct-host-socket";
 const STAGE2_MARKER: &str = "TD-JAIL-STAGE2-OK";
@@ -403,6 +411,36 @@ pub enum Stage2Action {
         cgroup_membership: String,
     },
     Launch(Box<Stage2Launch>),
+    /// The `workspace` kind: its own plan, filter and channel stdio.
+    Workspace(Box<Stage2Workspace>),
+}
+
+/// What stage 2 of a `workspace` launch was told: the plan it reads back
+/// and the entry it starts. The environment is not carried; it follows
+/// from `home` (`workspace::environment`).
+#[derive(Debug, Eq, PartialEq)]
+pub struct Stage2Workspace {
+    programs: Vec<String>,
+    home: PathBuf,
+    worktrees: Vec<PathBuf>,
+    shared: Vec<Stage2Filesystem>,
+    working_directory: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+impl Stage2Workspace {
+    fn entry(&self) -> io::Result<PathBuf> {
+        self.programs
+            .first()
+            .map(|name| Path::new(workspace::PROGRAM_DIR).join(name))
+            .ok_or_else(usage_error)
+    }
+
+    fn trees(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.home.as_path())
+            .chain(self.worktrees.iter().map(PathBuf::as_path))
+            .chain(self.shared.iter().map(|grant| grant.target.as_path()))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -686,6 +724,9 @@ where
         }
         cgroup::validate_expected_membership(&cgroup_membership)?;
         return Ok(Stage2Action::KillHold { cgroup_membership });
+    }
+    if action == STAGE2_WORKSPACE_ARG {
+        return parse_stage2_workspace(args).map(|plan| Stage2Action::Workspace(Box::new(plan)));
     }
     if action == STAGE2_LAUNCH_ARG {
         let entry = args
@@ -1480,6 +1521,11 @@ fn mount_bind_kind(
 }
 
 fn mount_filesystem_grant(grant: &FilesystemGrant) -> io::Result<()> {
+    mount_grant(grant, false)
+}
+
+/// A grant bound at its target, noexec unless `executable`.
+fn mount_grant(grant: &FilesystemGrant, executable: bool) -> io::Result<()> {
     authority::validate_filesystem_target(&grant.target)?;
     require_filesystem_source_identity(grant)?;
     let target = prepare_filesystem_target(&grant.target, grant.source_kind)?;
@@ -1489,7 +1535,7 @@ fn mount_filesystem_grant(grant: &FilesystemGrant) -> io::Result<()> {
         grant.source_kind,
         "filesystem grant",
     )?;
-    apply_grant_mount_policy(&target, grant.read_only)?;
+    apply_grant_mount_policy(&target, grant.read_only, executable)?;
     let target_metadata = fs::symlink_metadata(&target)?;
     if target_metadata.dev() != grant.source_device
         || target_metadata.ino() != grant.source_inode
@@ -1507,13 +1553,14 @@ fn mount_filesystem_grant(grant: &FilesystemGrant) -> io::Result<()> {
     require_filesystem_source_identity(grant)?;
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
     require_bind_source(&mountinfo, &grant.source, &target)?;
-    require_grant_mount_policy(
+    require_tree_mount_policy(
         &mountinfo,
         &Stage2Filesystem {
             target,
             read_only: grant.read_only,
             source_kind: grant.source_kind,
         },
+        executable,
     )
 }
 
@@ -1645,7 +1692,7 @@ fn sort_grant_mount_rows(rows: &mut [MountPolicyRow]) {
     });
 }
 
-fn apply_grant_mount_policy(target: &Path, read_only: bool) -> io::Result<()> {
+fn apply_grant_mount_policy(target: &Path, read_only: bool, executable: bool) -> io::Result<()> {
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
     let mut rows = grant_mount_rows(&mountinfo, target)?;
     sort_grant_mount_rows(&mut rows);
@@ -1657,7 +1704,11 @@ fn apply_grant_mount_policy(target: &Path, read_only: bool) -> io::Result<()> {
             ))
         })?;
         let target_c = cstring(path)?;
-        let flags = grant_mount_policy_flags(read_only || row.read_only);
+        // A flag the host set stays set: a user namespace cannot clear it.
+        let flags = grant_mount_policy_flags(
+            read_only || row.read_only,
+            executable && !row.options.contains("noexec"),
+        );
         sys::mount(None, &target_c, None, flags, None).map_err(|error| {
             io::Error::other(format!(
                 "apply filesystem grant policy at {}: {error}",
@@ -1668,9 +1719,11 @@ fn apply_grant_mount_policy(target: &Path, read_only: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn grant_mount_policy_flags(read_only: bool) -> usize {
-    let mut flags =
-        sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC;
+fn grant_mount_policy_flags(read_only: bool, executable: bool) -> usize {
+    let mut flags = sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV;
+    if !executable {
+        flags |= sys::MS_NOEXEC;
+    }
     if read_only {
         flags |= sys::MS_RDONLY;
     }
@@ -1678,10 +1731,33 @@ fn grant_mount_policy_flags(read_only: bool) -> usize {
 }
 
 fn require_grant_mount_policy(mountinfo: &str, filesystem: &Stage2Filesystem) -> io::Result<()> {
+    require_tree_mount_policy(mountinfo, filesystem, false)
+}
+
+/// Every mount at and below a grant's target is nosuid and nodev, and
+/// noexec unless it is `executable`, where the target itself must not be;
+/// read-only throughout for a read-only grant, and writable at its target
+/// otherwise.
+fn require_tree_mount_policy(
+    mountinfo: &str,
+    filesystem: &Stage2Filesystem,
+    executable: bool,
+) -> io::Result<()> {
     let rows = grant_mount_rows(mountinfo, &filesystem.target)?;
+    let required: &[&str] = if executable {
+        &["nosuid", "nodev"]
+    } else {
+        &["nosuid", "nodev", "noexec"]
+    };
     for row in rows {
-        for required in ["nosuid", "nodev", "noexec"] {
-            if !row.options.contains(required) {
+        if executable && row.mountpoint == filesystem.target && row.options.contains("noexec") {
+            return Err(io::Error::other(format!(
+                "executable grant target {} is noexec",
+                row.mountpoint.display()
+            )));
+        }
+        for required in required {
+            if !row.options.contains(*required) {
                 return Err(io::Error::other(format!(
                     "filesystem grant mount {} lacks {required}",
                     row.mountpoint.display()
@@ -1917,7 +1993,7 @@ fn mount_runtime_etc_entry(entry: &RuntimeEtcEntry, etc: &Path) -> io::Result<()
         entry.source_kind,
         "runtime configuration",
     )?;
-    apply_grant_mount_policy(&target, true)?;
+    apply_grant_mount_policy(&target, true, false)?;
     let target_metadata = fs::symlink_metadata(&target)?;
     if entry.source_device != target_metadata.dev()
         || entry.source_inode != target_metadata.ino()
@@ -2094,6 +2170,73 @@ fn prepare_etc(application: &LaunchPlan) -> io::Result<()> {
     remount_read_only(etc_text, sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC)
 }
 
+/// The fresh `/dev`, its devpts and `/dev/shm`, and `/tmp` and `/var/tmp`,
+/// under the new root every plan shares; returns `/dev`'s path, which the
+/// plan remounts read-only last. The scratch trees are noexec unless
+/// `executable_scratch`, the workspace kind's, whose worktrees are
+/// executable anyway.
+fn prepare_base_mounts(
+    identity: Identity,
+    terminal: bool,
+    executable_scratch: bool,
+) -> io::Result<String> {
+    let dev = format!("{NEW_ROOT}/dev");
+    mount_tmpfs(&dev, sys::MS_NOSUID | sys::MS_NOEXEC, "mode=0755")?;
+    create_dir(&format!("{dev}/pts"), 0o755)?;
+    create_dir(&format!("{dev}/shm"), 0o1777)?;
+    for (name, _, _) in device_nodes(terminal) {
+        let target = format!("{dev}/{name}");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?;
+        mount_bind_read_only(&format!("/dev/{name}"), &target)?;
+    }
+
+    mount_tmpfs(
+        &format!("{dev}/shm"),
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        "mode=1777,size=536870912",
+    )?;
+    let devpts = cstring("devpts")?;
+    let pts = cstring(&format!("{dev}/pts"))?;
+    let pts_data = cstring(&format!(
+        "newinstance,ptmxmode=0666,mode=0620,gid={}",
+        identity.gid
+    ))?;
+    sys::mount(
+        Some(&devpts),
+        &pts,
+        Some(&devpts),
+        sys::MS_NOSUID | sys::MS_NOEXEC,
+        Some(&pts_data),
+    )
+    .map_err(|e| io::Error::other(format!("mount fresh devpts: {e}")))?;
+
+    symlink("pts/ptmx", format!("{dev}/ptmx"))?;
+    symlink("/proc/self/fd", format!("{dev}/fd"))?;
+    symlink("/proc/self/fd/0", format!("{dev}/stdin"))?;
+    symlink("/proc/self/fd/1", format!("{dev}/stdout"))?;
+    symlink("/proc/self/fd/2", format!("{dev}/stderr"))?;
+
+    let scratch = if executable_scratch {
+        sys::MS_NOSUID | sys::MS_NODEV
+    } else {
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC
+    };
+    mount_tmpfs(
+        &format!("{NEW_ROOT}/tmp"),
+        scratch,
+        "mode=1777,size=268435456",
+    )?;
+    mount_tmpfs(
+        &format!("{NEW_ROOT}/var/tmp"),
+        scratch,
+        "mode=1777,size=268435456",
+    )?;
+    Ok(dev)
+}
+
 fn prepare_mount_plan(
     identity: Identity,
     executable: &Path,
@@ -2134,56 +2277,8 @@ fn prepare_mount_plan(
         }
     }
 
-    let dev = format!("{NEW_ROOT}/dev");
-    mount_tmpfs(&dev, sys::MS_NOSUID | sys::MS_NOEXEC, "mode=0755")?;
-    create_dir(&format!("{dev}/pts"), 0o755)?;
-    create_dir(&format!("{dev}/shm"), 0o1777)?;
     let terminal = application.is_some_and(|plan| plan.terminal);
-    for (name, _, _) in device_nodes(terminal) {
-        let target = format!("{dev}/{name}");
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)?;
-        mount_bind_read_only(&format!("/dev/{name}"), &target)?;
-    }
-
-    mount_tmpfs(
-        &format!("{dev}/shm"),
-        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
-        "mode=1777,size=536870912",
-    )?;
-    let devpts = cstring("devpts")?;
-    let pts = cstring(&format!("{dev}/pts"))?;
-    let pts_data = cstring(&format!(
-        "newinstance,ptmxmode=0666,mode=0620,gid={}",
-        identity.gid
-    ))?;
-    sys::mount(
-        Some(&devpts),
-        &pts,
-        Some(&devpts),
-        sys::MS_NOSUID | sys::MS_NOEXEC,
-        Some(&pts_data),
-    )
-    .map_err(|e| io::Error::other(format!("mount fresh devpts: {e}")))?;
-
-    symlink("pts/ptmx", format!("{dev}/ptmx"))?;
-    symlink("/proc/self/fd", format!("{dev}/fd"))?;
-    symlink("/proc/self/fd/0", format!("{dev}/stdin"))?;
-    symlink("/proc/self/fd/1", format!("{dev}/stdout"))?;
-    symlink("/proc/self/fd/2", format!("{dev}/stderr"))?;
-
-    mount_tmpfs(
-        &format!("{NEW_ROOT}/tmp"),
-        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
-        "mode=1777,size=268435456",
-    )?;
-    mount_tmpfs(
-        &format!("{NEW_ROOT}/var/tmp"),
-        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
-        "mode=1777,size=268435456",
-    )?;
+    let dev = prepare_base_mounts(identity, terminal, false)?;
     if let Some(application) = application {
         if let Some(probe) = &application.firefox_seccomp_probe {
             create_dir(&format!("{NEW_ROOT}/opt"), 0o555)?;
@@ -3318,45 +3413,14 @@ struct Stage2MountExpectation<'a> {
     terminal: bool,
 }
 
-fn require_mount_plan(
-    expected: Stage2MountExpectation<'_>,
+/// The readback of what `prepare_base_mounts` and `enter_mount_plan` made:
+/// the read-only root, `/dev` and its nodes, the fresh procfs holding only
+/// PID 1, and the writable scratch trees; returns the mountinfo it read.
+fn require_base_plan(
     token: &[u8; TOKEN_LEN],
-    identity: Identity,
-) -> io::Result<()> {
-    let Stage2MountExpectation {
-        filesystems,
-        etc,
-        runtime_aliases,
-        pulse,
-        pulse_socket_mode,
-        firefox_seccomp_probe,
-        fetch_socket,
-        terminal,
-    } = expected;
-    let application = filesystems.is_some();
-    if fs::symlink_metadata(OLD_ROOT).is_ok()
-        || (!application && fs::symlink_metadata("/etc").is_ok())
-    {
-        return Err(io::Error::other(
-            "detached host root remains reachable in the fresh root",
-        ));
-    }
-    for (path, expected) in grant_scaffold_names(
-        application,
-        runtime_aliases,
-        firefox_seccomp_probe,
-        filesystems.unwrap_or_default(),
-    )? {
-        let path_text = path
-            .to_str()
-            .ok_or_else(|| io::Error::other("filesystem scaffold path is not UTF-8"))?;
-        if read_dir_names(path_text)? != expected {
-            return Err(io::Error::other(format!(
-                "fresh scaffold {} entries do not match the mount plan",
-                path.display()
-            )));
-        }
-    }
+    terminal: bool,
+    executable_scratch: bool,
+) -> io::Result<String> {
     require_mode("/", 0o755)?;
     require_mode("/dev", 0o755)?;
     require_mode("/dev/shm", 0o1777)?;
@@ -3401,14 +3465,13 @@ fn require_mount_plan(
         &["ro", "nosuid", "noexec"],
         &["rw", "nodev"],
     )?;
+    let (scratch, not_scratch): (&[&str], &[&str]) = if executable_scratch {
+        (&["rw", "nosuid", "nodev"], &["ro", "noexec"])
+    } else {
+        (&["rw", "nosuid", "nodev", "noexec"], &["ro"])
+    };
     for path in ["/tmp", "/var/tmp"] {
-        require_mount(
-            &mountinfo,
-            path,
-            Some("tmpfs"),
-            &["rw", "nosuid", "nodev", "noexec"],
-            &["ro"],
-        )?;
+        require_mount(&mountinfo, path, Some("tmpfs"), scratch, not_scratch)?;
         require_mount_super_option(&mountinfo, path, "size=262144k")?;
         require_writable_directory(path, token)?;
     }
@@ -3436,6 +3499,49 @@ fn require_mount_plan(
             &["rw", "nodev"],
         )?;
     }
+    Ok(mountinfo)
+}
+
+fn require_mount_plan(
+    expected: Stage2MountExpectation<'_>,
+    token: &[u8; TOKEN_LEN],
+    identity: Identity,
+) -> io::Result<()> {
+    let Stage2MountExpectation {
+        filesystems,
+        etc,
+        runtime_aliases,
+        pulse,
+        pulse_socket_mode,
+        firefox_seccomp_probe,
+        fetch_socket,
+        terminal,
+    } = expected;
+    let application = filesystems.is_some();
+    if fs::symlink_metadata(OLD_ROOT).is_ok()
+        || (!application && fs::symlink_metadata("/etc").is_ok())
+    {
+        return Err(io::Error::other(
+            "detached host root remains reachable in the fresh root",
+        ));
+    }
+    for (path, expected) in grant_scaffold_names(
+        application,
+        runtime_aliases,
+        firefox_seccomp_probe,
+        filesystems.unwrap_or_default(),
+    )? {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| io::Error::other("filesystem scaffold path is not UTF-8"))?;
+        if read_dir_names(path_text)? != expected {
+            return Err(io::Error::other(format!(
+                "fresh scaffold {} entries do not match the mount plan",
+                path.display()
+            )));
+        }
+    }
+    let mountinfo = require_base_plan(token, terminal, false)?;
 
     if application {
         let filesystems = filesystems.unwrap_or_default();
@@ -5117,6 +5223,9 @@ pub fn run_stage2(
     require_only_stdio_descriptors()?;
     let terminal = matches!(&action, Stage2Action::Launch(launch) if launch.terminal);
     require_stage2_terminal(terminal, matches!(&action, Stage2Action::Launch(_)))?;
+    if matches!(&action, Stage2Action::Workspace(_)) {
+        require_stage2_channel()?;
+    }
 
     let status = fs::read_to_string("/proc/self/status")?;
     let identity = Identity {
@@ -5142,12 +5251,17 @@ pub fn run_stage2(
     require_stage2_capabilities()?;
     enter_mount_plan()?;
     let mount_probe_token = random_token()?;
+    if let Stage2Action::Workspace(plan) = action {
+        return run_stage2_workspace(&plan, &mount_probe_token, identity);
+    }
     let host_mode = matches!(
         &action,
         Stage2Action::Launch(launch) if launch.cgroup_membership == NO_CGROUP_MEMBERSHIP
     );
     let (filesystems, etc, runtime_aliases, pulse, firefox_seccomp_probe, fetch_socket) =
         match &action {
+            // Its own plan, returned to above.
+            Stage2Action::Workspace(_) => return Err(usage_error()),
             Stage2Action::Probe | Stage2Action::KillHold { .. } => (
                 None,
                 EtcBinding {
@@ -5214,6 +5328,7 @@ pub fn run_stage2(
         }
     })?;
     match action {
+        Stage2Action::Workspace(_) => Err(usage_error()),
         Stage2Action::Probe => {
             probe_pid1_lifecycle()?;
             writeln!(io::stdout(), "{STAGE2_MARKER} pid=1")
@@ -5543,6 +5658,12 @@ fn run_application(
     };
     let child = spawn_entry(working_directory, &mut start)
         .map_err(|e| io::Error::other(format!("launch application entry {entry}: {e}")))?;
+    reap_entry(child)
+}
+
+/// Waits as PID 1 for the entry, reaping whatever else ends meanwhile,
+/// then terminates and reaps the survivors; the entry's status decides.
+fn reap_entry(child: Child) -> io::Result<()> {
     let application_pid = i32::try_from(child.id())
         .map_err(|e| io::Error::other(format!("application PID is invalid: {e}")))?;
     drop(child);
@@ -6237,11 +6358,911 @@ pub fn write_standard_filter() -> io::Result<()> {
     seccomp::write_standard_filter(io::stdout().lock())
 }
 
+// The `workspace` kind (APPLICATIONS.md §C). Its stages are the
+// application launch's, with three differences: a plan of the host's own
+// system trees and the spec's directories at their real paths rather than
+// a package; its own seccomp program; and stdio that is one stream socket,
+// the launcher's channel to the entry, rather than null devices.
+
+/// The outer process, before it starts the session bootstrap: it dies with
+/// the program that launched it, as stage 1 dies with it, so killing or
+/// losing the launcher ends the instance. The launcher names its own pid,
+/// which the direct parent must be once the signal is armed: a launcher
+/// that ended first has left td-jail some other parent, and is refused.
+pub fn tie_workspace_to_launcher(launcher: Option<&OsString>) -> io::Result<()> {
+    let launcher = parse_launcher(launcher)?;
+    sys::set_parent_death_signal()?;
+    require_direct_parent(launcher, &fs::read_to_string("/proc/self/stat")?)
+}
+
+fn parse_launcher(launcher: Option<&OsString>) -> io::Result<u32> {
+    launcher
+        .and_then(|pid| pid.to_str())
+        .filter(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace usage: td-jail --workspace LAUNCHER-PID SPEC [ARG...]",
+            )
+        })
+}
+
+/// The launcher's channel: standard input and output are one stream socket.
+fn require_workspace_channel() -> io::Result<()> {
+    let input = fs::File::from(io::stdin().as_fd().try_clone_to_owned()?).metadata()?;
+    let output = fs::File::from(io::stdout().as_fd().try_clone_to_owned()?).metadata()?;
+    if !input.file_type().is_socket() || (input.dev(), input.ino()) != (output.dev(), output.ino())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a workspace launch's standard input and output must be one socket, its channel",
+        ));
+    }
+    // Read in the launcher's network namespace, before the unshare.
+    workspace::require_stream_pair(&fs::read_to_string("/proc/net/unix")?, input.ino())
+}
+
+/// Stage 2's side of it: its stdout is the channel, and no terminal
+/// controls it.
+fn require_stage2_channel() -> io::Result<()> {
+    let containment = process_containment(&fs::read_to_string("/proc/self/stat")?)?;
+    if containment.terminal != 0 {
+        return Err(io::Error::other(format!(
+            "workspace stage 2 has controlling terminal {}",
+            terminal_field(containment.terminal)
+        )));
+    }
+    let output = fs::File::from(io::stdout().as_fd().try_clone_to_owned()?).metadata()?;
+    if !output.file_type().is_socket() {
+        return Err(io::Error::other(
+            "workspace stage 2 stdout is not the channel socket",
+        ));
+    }
+    Ok(())
+}
+
+pub fn launch_workspace(plan: WorkspacePlan) -> io::Result<()> {
+    let outside_identity = current_identity()?;
+    if outside_identity.uid == 0
+        || outside_identity.gid == 0
+        || outside_identity.uid != plan.uid
+        || outside_identity.gid != plan.gid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace launch identity changed after admission",
+        ));
+    }
+    require_workspace_channel()?;
+    // The caller is itself inside: worktrees keep their owner, so git's
+    // ownership check and a listing read as they do outside.
+    let inside_identity = outside_identity;
+    let before = NamespaceSnapshot::read()?;
+    let token = random_token()?;
+    let executable = std::env::current_exe()?;
+    writeln!(io::stderr(), "{WORKSPACE_DEGRADATION}")?;
+    sys::unshare_namespaces(true).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("the workspace kind requires namespace confinement: {error}"),
+        )
+    })?;
+    install_launch_identity_maps(inside_identity, outside_identity, true)?;
+    NamespaceSnapshot::read()?.require_application_change(&before, true)?;
+    sys::bring_up_loopback()
+        .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
+    close_inherited_descriptors(None)?;
+    prepare_workspace_mount_plan(&plan, inside_identity)?;
+    prepare_capability_bridge()?;
+
+    let (proof_reader, mut proof_writer) = io::pipe()?;
+    let (mut stage2_error, stage2_error_writer) = io::pipe()?;
+    let arguments = stage2_workspace_arguments(
+        &token,
+        LaunchIdentityMap {
+            inside: inside_identity,
+            outside: outside_identity,
+        },
+        &plan,
+    );
+    // The channel travels as stage 2's stdout, cloned after the sweep as
+    // the terminal is.
+    let channel = io::stdout().as_fd().try_clone_to_owned()?;
+    let mut command = Command::new(executable);
+    command
+        .args(&arguments)
+        .env_clear()
+        .stdin(Stdio::from(proof_reader))
+        .stdout(Stdio::from(channel))
+        .stderr(Stdio::from(stage2_error_writer));
+    let mut child = command.spawn()?;
+    drop(command);
+    let abandon = |child: &mut Child, stage2_error: &mut io::PipeReader, what: String| {
+        let _ = child.kill();
+        let status = match child.wait() {
+            Ok(status) => status.to_string(),
+            Err(wait_error) => format!("wait failed: {wait_error}"),
+        };
+        let diagnostic = match read_launch_diagnostic(stage2_error) {
+            Ok(response) if response.trim().is_empty() => String::new(),
+            Ok(response) => format!("; diagnostic: {}", response.trim()),
+            Err(read_error) => format!("; diagnostic unavailable: {read_error}"),
+        };
+        io::Error::other(format!("{what}; stage 2 {status}{diagnostic}"))
+    };
+    if let Err(error) = require_child_pid_namespace_changed(&before, child.id()) {
+        drop(proof_writer);
+        return Err(abandon(
+            &mut child,
+            &mut stage2_error,
+            format!("verify workspace stage PID namespace: {error}"),
+        ));
+    }
+    if let Err(error) = proof_writer.write_all(&token) {
+        drop(proof_writer);
+        return Err(abandon(
+            &mut child,
+            &mut stage2_error,
+            format!("write workspace stage proof: {error}"),
+        ));
+    }
+    let response = match read_launch_diagnostic(&mut stage2_error) {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let status = child.wait()?;
+    drop(proof_writer);
+    let detail = response.trim();
+    match (status.success(), detail.is_empty()) {
+        (true, true) => Ok(()),
+        (true, false) => Err(io::Error::other(format!(
+            "successful workspace jail returned a diagnostic: {detail:?}"
+        ))),
+        (false, true) => Err(io::Error::other(format!(
+            "workspace jail exited unsuccessfully: {status}"
+        ))),
+        (false, false) => Err(io::Error::other(format!(
+            "workspace jail exited unsuccessfully: {status}: {detail}"
+        ))),
+    }
+}
+
+fn stage2_workspace_arguments(
+    token: &[u8; TOKEN_LEN],
+    identity_map: LaunchIdentityMap,
+    plan: &WorkspacePlan,
+) -> Vec<OsString> {
+    let mut stage2 = vec![
+        OsString::from(STAGE2_ARG),
+        OsString::from(encode_token(token)),
+        OsString::from(identity_map.inside.uid.to_string()),
+        OsString::from(identity_map.inside.gid.to_string()),
+        OsString::from(identity_map.outside.uid.to_string()),
+        OsString::from(identity_map.outside.gid.to_string()),
+        OsString::from(STAGE2_WORKSPACE_ARG),
+        OsString::from(STAGE2_PROGRAMS_ARG),
+        OsString::from(plan.programs.len().to_string()),
+    ];
+    stage2.extend(
+        plan.programs
+            .iter()
+            .map(|program| OsString::from(&program.name)),
+    );
+    stage2.push(OsString::from(STAGE2_HOME_ARG));
+    stage2.push(plan.home.target.as_os_str().to_os_string());
+    stage2.push(OsString::from(STAGE2_WORKTREES_ARG));
+    stage2.push(OsString::from(plan.worktrees.len().to_string()));
+    stage2.extend(
+        plan.worktrees
+            .iter()
+            .map(|tree| tree.target.as_os_str().to_os_string()),
+    );
+    stage2.push(OsString::from(STAGE2_SHARED_ARG));
+    stage2.push(OsString::from(plan.shared.len().to_string()));
+    for grant in &plan.shared {
+        stage2.push(grant.target.as_os_str().to_os_string());
+        stage2.push(OsString::from(if grant.read_only { "ro" } else { "rw" }));
+    }
+    stage2.push(OsString::from(STAGE2_WORKING_DIRECTORY_ARG));
+    stage2.push(plan.working_directory().as_os_str().to_os_string());
+    stage2.push(OsString::from(STAGE2_ARGUMENTS_ARG));
+    stage2.extend(plan.arguments.iter().cloned());
+    stage2
+}
+
+fn parse_stage2_workspace<I>(args: &mut I) -> io::Result<Stage2Workspace>
+where
+    I: Iterator<Item = OsString>,
+{
+    let expect = |flag: &str, args: &mut I| {
+        if args.next().as_deref() == Some(OsStr::new(flag)) {
+            Ok(())
+        } else {
+            Err(usage_error())
+        }
+    };
+    let tree = |value: Option<OsString>| -> io::Result<PathBuf> {
+        let path = PathBuf::from(value.ok_or_else(usage_error)?);
+        authority::validate_filesystem_target(&path)?;
+        Ok(path)
+    };
+    expect(STAGE2_PROGRAMS_ARG, args)?;
+    let count = parse_count(args.next(), "program count")?;
+    if count == 0 || count > workspace::MAX_PROGRAMS {
+        return Err(usage_error());
+    }
+    let mut programs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        if !workspace::valid_program_name(&name) || programs.contains(&name) {
+            return Err(usage_error());
+        }
+        programs.push(name);
+    }
+    expect(STAGE2_HOME_ARG, args)?;
+    let home = tree(args.next())?;
+    expect(STAGE2_WORKTREES_ARG, args)?;
+    let count = parse_count(args.next(), "worktree count")?;
+    if count > workspace::MAX_TREES {
+        return Err(usage_error());
+    }
+    let worktrees = (0..count)
+        .map(|_| tree(args.next()))
+        .collect::<io::Result<Vec<_>>>()?;
+    expect(STAGE2_SHARED_ARG, args)?;
+    let count = parse_count(args.next(), "shared count")?;
+    if count.saturating_add(worktrees.len()) > workspace::MAX_TREES {
+        return Err(usage_error());
+    }
+    let mut shared = Vec::with_capacity(count);
+    for _ in 0..count {
+        let target = tree(args.next())?;
+        let read_only = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("ro") => true,
+            Some("rw") => false,
+            _ => return Err(usage_error()),
+        };
+        shared.push(Stage2Filesystem {
+            target,
+            read_only,
+            source_kind: FilesystemSourceKind::Directory,
+        });
+    }
+    expect(STAGE2_WORKING_DIRECTORY_ARG, args)?;
+    let working_directory = tree(args.next())?;
+    if working_directory != worktrees.first().unwrap_or(&home).as_path() {
+        return Err(usage_error());
+    }
+    expect(STAGE2_ARGUMENTS_ARG, args)?;
+    let plan = Stage2Workspace {
+        programs,
+        home,
+        worktrees,
+        shared,
+        working_directory,
+        arguments: authority::collect_arguments(args)?,
+    };
+    let trees: Vec<&Path> = plan.trees().collect();
+    for (index, tree) in trees.iter().enumerate() {
+        if trees
+            .iter()
+            .skip(index + 1)
+            .any(|other| paths_overlap(tree, other))
+        {
+            return Err(usage_error());
+        }
+    }
+    Ok(plan)
+}
+
+/// Stage 1's plan for a workspace: the base trees, the host's system
+/// trees and selective `/etc`, the programs, the home, the worktrees and
+/// the shared directories.
+fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io::Result<()> {
+    let root = cstring("/")?;
+    sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
+        .map_err(|e| io::Error::other(format!("make mount tree private: {e}")))?;
+    mount_tmpfs(
+        SCRATCH_ROOT,
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        "mode=0700",
+    )?;
+    create_dir(NEW_ROOT, 0o755)?;
+    mount_tmpfs(NEW_ROOT, sys::MS_NOSUID | sys::MS_NODEV, "mode=0755")?;
+    for (path, mode) in [
+        (format!("{NEW_ROOT}/dev"), 0o755),
+        (format!("{NEW_ROOT}/proc"), 0o555),
+        (format!("{NEW_ROOT}/tmp"), 0o1777),
+        (format!("{NEW_ROOT}/var"), 0o755),
+        (format!("{NEW_ROOT}/etc"), 0o755),
+        (format!("{NEW_ROOT}/opt"), 0o755),
+        (format!("{NEW_ROOT}/run"), 0o755),
+        (PUT_OLD.to_string(), 0o700),
+    ] {
+        create_dir(&path, mode)?;
+    }
+    create_dir(&format!("{NEW_ROOT}/var/tmp"), 0o1777)?;
+    create_dir(&format!("{NEW_ROOT}/opt/workspace"), 0o755)?;
+    // Each to where the host's link resolves, when that lies in a system
+    // tree the plan binds; a chain through an unbound tree, such as Guix's
+    // `/var/guix/profiles`, would otherwise dangle.
+    for name in workspace::RUN_LINKS {
+        let host = Path::new("/run").join(name);
+        if !fs::symlink_metadata(&host).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            continue;
+        }
+        // A dangling link, or one leaving the bound trees, has nothing to
+        // point the jail's at.
+        let Ok(resolved) = fs::canonicalize(&host) else {
+            continue;
+        };
+        if in_system_tree(&resolved) {
+            symlink(&resolved, format!("{NEW_ROOT}/run/{name}"))?;
+        }
+    }
+    create_dir(&format!("{NEW_ROOT}{}", workspace::PROGRAM_DIR), 0o755)?;
+    let dev = prepare_base_mounts(identity, false, true)?;
+    for name in workspace::SYSTEM_TREES {
+        bind_system_tree(name)?;
+    }
+    if !fs::symlink_metadata(format!("{NEW_ROOT}/usr")).is_ok_and(|usr| usr.is_dir()) {
+        return Err(io::Error::other(
+            "the host has no /usr directory for the workspace kind to bind",
+        ));
+    }
+    prepare_workspace_etc(plan, identity)?;
+    for program in &plan.programs {
+        mount_workspace_program(program)?;
+    }
+    mount_grant(&plan.home, false)?;
+    for tree in &plan.worktrees {
+        mount_grant(tree, true)?;
+    }
+    for grant in &plan.shared {
+        mount_grant(grant, false)?;
+    }
+    remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
+}
+
+/// One host system tree as the host has it: a link is the same link, a
+/// directory a read-only, executable recursive bind, and an absent tree
+/// absent.
+fn bind_system_tree(name: &str) -> io::Result<()> {
+    let host = Path::new("/").join(name);
+    let target = format!("{NEW_ROOT}/{name}");
+    match fs::symlink_metadata(&host) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            symlink(fs::read_link(&host)?, &target)
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            workspace::refuse_pseudo_filesystems(
+                &fs::read_to_string("/proc/self/mountinfo")?,
+                &host,
+            )?;
+            create_dir(&target, 0o555)?;
+            mount_bind_kind(
+                &host,
+                Path::new(&target),
+                FilesystemSourceKind::Directory,
+                "host system tree",
+            )?;
+            apply_grant_mount_policy(Path::new(&target), true, true)
+        }
+        Ok(_) => Err(io::Error::other(format!(
+            "host system tree {} is neither a directory nor a link",
+            host.display()
+        ))),
+    }
+}
+
+/// Whether `path` lies in a host system tree the plan binds.
+fn in_system_tree(path: &Path) -> bool {
+    workspace::SYSTEM_TREES
+        .iter()
+        .any(|tree| path_is_same_or_child(path, &Path::new("/").join(tree)))
+}
+
+/// What a host `/etc` link becomes in the jail: the host's own text when
+/// that already names a bound tree, since tools read a zone's name from
+/// `/etc/localtime`'s; else where it resolves when that is in one, since a
+/// chain through an unbound tree (NixOS's `/etc/static`) would dangle;
+/// else the host's text.
+fn bound_link_target(host: &Path) -> io::Result<PathBuf> {
+    let text = fs::read_link(host)?;
+    if text.is_absolute() && in_system_tree(&text) {
+        return Ok(text);
+    }
+    match fs::canonicalize(host) {
+        Ok(resolved) if in_system_tree(&resolved) => Ok(resolved),
+        _ => Ok(text),
+    }
+}
+
+/// The selective `/etc`: synthesized account, group and host files, and the
+/// allowlisted host entries, each as the host has it, read-only.
+fn prepare_workspace_etc(plan: &WorkspacePlan, identity: Identity) -> io::Result<()> {
+    let etc = PathBuf::from(format!("{NEW_ROOT}/etc"));
+    let etc_text = etc
+        .to_str()
+        .ok_or_else(|| io::Error::other("jail etc path is not UTF-8"))?;
+    mount_tmpfs(
+        etc_text,
+        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+        &format!("mode=0755,size={ETC_SIZE_BYTES}"),
+    )?;
+    let hostname = inherited_hostname()?;
+    for (name, contents) in [
+        (
+            "passwd",
+            workspace::passwd(identity.uid, identity.gid, &plan.home.target),
+        ),
+        ("group", workspace::group(identity.gid)),
+        ("nsswitch.conf", NSSWITCH_CONF.to_string()),
+        ("hostname", format!("{hostname}\n")),
+        ("hosts", hosts(&hostname)),
+    ] {
+        create_file(&etc.join(name), contents.as_bytes(), 0o444)?;
+    }
+    for name in workspace::HOST_ETC {
+        let host = Path::new("/etc").join(name);
+        let target = etc.join(name);
+        match fs::symlink_metadata(&host) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlink(bound_link_target(&host)?, &target)?;
+            }
+            Ok(metadata) if metadata.is_file() => {
+                create_file(&target, b"", 0o444)?;
+                mount_bind_kind(
+                    &host,
+                    &target,
+                    FilesystemSourceKind::File,
+                    "host /etc entry",
+                )?;
+                apply_grant_mount_policy(&target, true, false)?;
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                create_dir(
+                    target
+                        .to_str()
+                        .ok_or_else(|| io::Error::other("jail etc entry is not UTF-8"))?,
+                    0o555,
+                )?;
+                mount_bind_kind(
+                    &host,
+                    &target,
+                    FilesystemSourceKind::Directory,
+                    "host /etc entry",
+                )?;
+                apply_grant_mount_policy(&target, true, false)?;
+            }
+            // A device, socket or FIFO under /etc is no configuration.
+            Ok(_) => {}
+        }
+    }
+    remount_read_only(etc_text, sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC)
+}
+
+/// A program, read-only and executable at its file name under
+/// `workspace::PROGRAM_DIR`, the same file it was admitted as.
+fn mount_workspace_program(program: &workspace::Program) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(&program.source)?;
+    if !metadata.is_file() || (metadata.dev(), metadata.ino()) != (program.device, program.inode) {
+        return Err(io::Error::other(format!(
+            "workspace program {} changed after admission",
+            program.source.display()
+        )));
+    }
+    let target = PathBuf::from(format!("{NEW_ROOT}{}", program.target().display()));
+    drop(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)?,
+    );
+    mount_bind_kind(
+        &program.source,
+        &target,
+        FilesystemSourceKind::File,
+        "workspace program",
+    )?;
+    apply_grant_mount_policy(&target, true, true)?;
+    let bound = fs::symlink_metadata(&target)?;
+    if (bound.dev(), bound.ino()) != (program.device, program.inode) {
+        return Err(io::Error::other(format!(
+            "workspace program target {} is not the admitted file",
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Stage 2's readback of a workspace plan.
+fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN]) -> io::Result<()> {
+    if fs::symlink_metadata(OLD_ROOT).is_ok() {
+        return Err(io::Error::other(
+            "detached host root remains reachable in the fresh root",
+        ));
+    }
+    let mountinfo = require_base_plan(token, false, true)?;
+    // The root holds the fixed trees, the host's system trees and the
+    // first component of each admitted directory, and nothing else.
+    let mut fixed: BTreeSet<String> = ["dev", "etc", "opt", "proc", "run", "tmp", "var"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    for tree in plan.trees() {
+        if let Some(first) = tree
+            .components()
+            .nth(1)
+            .and_then(|component| component.as_os_str().to_str())
+        {
+            fixed.insert(first.to_string());
+        }
+    }
+    let present = read_dir_names("/")?;
+    if let Some(missing) = fixed.difference(&present).next() {
+        return Err(io::Error::other(format!("workspace root lacks /{missing}")));
+    }
+    if let Some(stray) = present
+        .difference(&fixed)
+        .find(|name| !workspace::SYSTEM_TREES.contains(&name.as_str()))
+    {
+        return Err(io::Error::other(format!(
+            "workspace root holds /{stray}, which its plan does not"
+        )));
+    }
+    require_workspace_scaffolds(plan)?;
+    require_planned_rows(plan, &mountinfo)?;
+    for name in workspace::SYSTEM_TREES {
+        let path = format!("/{name}");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && *name != "usr" => {}
+            Err(error) => return Err(error),
+            Ok(metadata) if metadata.file_type().is_symlink() && *name != "usr" => {}
+            Ok(metadata) if metadata.is_dir() => {
+                for row in grant_mount_rows(&mountinfo, Path::new(&path))? {
+                    for required in ["ro", "nosuid", "nodev"] {
+                        if !row.options.contains(required) {
+                            return Err(io::Error::other(format!(
+                                "host system tree mount {} lacks {required}",
+                                row.mountpoint.display()
+                            )));
+                        }
+                    }
+                }
+            }
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "workspace {path} is neither the host's tree nor its link"
+                )))
+            }
+        }
+    }
+    for name in read_dir_names("/run")? {
+        if !workspace::RUN_LINKS.contains(&name.as_str())
+            || !fs::symlink_metadata(format!("/run/{name}"))?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(io::Error::other(format!(
+                "workspace /run holds {name}, which its plan does not"
+            )));
+        }
+    }
+    require_mount(
+        &mountinfo,
+        "/etc",
+        Some("tmpfs"),
+        &["ro", "nosuid", "nodev", "noexec"],
+        &["rw"],
+    )?;
+    let etc = read_dir_names("/etc")?;
+    for name in workspace::SYNTHESIZED_ETC {
+        if !etc.contains(*name) {
+            return Err(io::Error::other(format!("workspace /etc lacks {name}")));
+        }
+    }
+    if let Some(stray) = etc.iter().find(|name| {
+        !workspace::SYNTHESIZED_ETC.contains(&name.as_str())
+            && !workspace::HOST_ETC.contains(&name.as_str())
+    }) {
+        return Err(io::Error::other(format!(
+            "workspace /etc holds {stray}, which its plan does not"
+        )));
+    }
+    for row in grant_mount_rows(&mountinfo, Path::new("/etc"))? {
+        for required in ["ro", "nosuid", "nodev", "noexec"] {
+            if !row.options.contains(required) {
+                return Err(io::Error::other(format!(
+                    "workspace /etc mount {} lacks {required}",
+                    row.mountpoint.display()
+                )));
+            }
+        }
+    }
+    require_names("/opt", &["workspace"])?;
+    require_names("/opt/workspace", &["bin"])?;
+    let names: Vec<&str> = plan.programs.iter().map(String::as_str).collect();
+    require_names(workspace::PROGRAM_DIR, &names)?;
+    for name in &names {
+        let path = format!("{}/{name}", workspace::PROGRAM_DIR);
+        if !fs::symlink_metadata(&path)?.is_file() {
+            return Err(io::Error::other(format!(
+                "workspace program {path} is not a regular file"
+            )));
+        }
+        require_mount(
+            &mountinfo,
+            &path,
+            None,
+            &["ro", "nosuid", "nodev"],
+            &["rw", "noexec"],
+        )?;
+    }
+    let home = Stage2Filesystem {
+        target: plan.home.clone(),
+        read_only: false,
+        source_kind: FilesystemSourceKind::Directory,
+    };
+    require_tree_mount_policy(&mountinfo, &home, false)?;
+    for tree in &plan.worktrees {
+        let tree = Stage2Filesystem {
+            target: tree.clone(),
+            read_only: false,
+            source_kind: FilesystemSourceKind::Directory,
+        };
+        require_tree_mount_policy(&mountinfo, &tree, true)?;
+    }
+    for grant in &plan.shared {
+        require_tree_mount_policy(&mountinfo, grant, false)?;
+    }
+    for writable in std::iter::once(&plan.home)
+        .chain(plan.worktrees.iter())
+        .chain(
+            plan.shared
+                .iter()
+                .filter(|grant| !grant.read_only)
+                .map(|grant| &grant.target),
+        )
+    {
+        let text = writable
+            .to_str()
+            .ok_or_else(|| io::Error::other("workspace directory is not UTF-8"))?;
+        require_writable_directory(text, token)?;
+    }
+    Ok(())
+}
+
+/// Every directory between the root and an admitted tree holds exactly the
+/// next component of the trees below it, and `/var` its `tmp` besides.
+fn require_workspace_scaffolds(plan: &Stage2Workspace) -> io::Result<()> {
+    let mut expected: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+    expected
+        .entry(PathBuf::from("/var"))
+        .or_default()
+        .insert("tmp".into());
+    for tree in plan.trees() {
+        let mut parent = PathBuf::from("/");
+        for component in tree.components().skip(1) {
+            let name = component
+                .as_os_str()
+                .to_str()
+                .ok_or_else(|| io::Error::other("workspace directory is not UTF-8"))?;
+            if parent != Path::new("/") {
+                expected
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(name.to_string());
+            }
+            parent.push(name);
+        }
+    }
+    for (directory, names) in &expected {
+        let present = read_dir_names(
+            directory
+                .to_str()
+                .ok_or_else(|| io::Error::other("workspace scaffold is not UTF-8"))?,
+        )?;
+        if &present != names {
+            return Err(io::Error::other(format!(
+                "workspace scaffold {} holds {present:?}, its plan {names:?}",
+                directory.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every mount in the instance is one the plan made: the root, the base
+/// trees, `/etc`, the programs, the host's system trees and the admitted
+/// directories, or one inside them.
+fn require_planned_rows(plan: &Stage2Workspace, mountinfo: &str) -> io::Result<()> {
+    let mut planned: Vec<PathBuf> = ["/dev", "/proc", "/tmp", "/var/tmp", "/etc"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    planned.push(PathBuf::from(workspace::PROGRAM_DIR));
+    planned.extend(
+        workspace::SYSTEM_TREES
+            .iter()
+            .map(|name| Path::new("/").join(name)),
+    );
+    planned.extend(plan.trees().map(Path::to_path_buf));
+    for row in grant_mount_rows(mountinfo, Path::new("/"))? {
+        if row.mountpoint != Path::new("/")
+            && !planned
+                .iter()
+                .any(|root| path_is_same_or_child(&row.mountpoint, root))
+        {
+            return Err(io::Error::other(format!(
+                "workspace mount {} is not one its plan made",
+                row.mountpoint.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn install_workspace_seccomp_filter() -> io::Result<()> {
+    let program = seccomp::workspace_program()?;
+    sys::set_no_new_privileges()?;
+    if !sys::no_new_privileges()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "PR_SET_NO_NEW_PRIVS succeeded without changing its readback",
+        ));
+    }
+    sys::install_seccomp_filter(program.instructions(), false)?;
+    require_runtime_confinement()
+}
+
+/// Stage 2 of a workspace launch after its mounts: the readback, the
+/// filter, then the entry, given the channel as its standard input and
+/// output. No data limit is set: an instance's limits are its launcher's
+/// (td-agent/DESIGN.md §8).
+fn run_stage2_workspace(
+    plan: &Stage2Workspace,
+    token: &[u8; TOKEN_LEN],
+    identity: Identity,
+) -> io::Result<()> {
+    require_workspace_mount_plan(plan, token)?;
+    if current_identity()? != identity {
+        return Err(io::Error::other("workspace stage 2 identity changed"));
+    }
+    clear_and_require_empty_capabilities()?;
+    install_workspace_seccomp_filter()?;
+    sys::set_dumpable(false)?;
+    if sys::dumpable()? {
+        return Err(io::Error::other("workspace PID 1 remained dumpable"));
+    }
+    start_stage1_liveness_watcher()?;
+    let entry = plan.entry()?;
+    let channel = io::stdout();
+    let mut command = Command::new(&entry);
+    command
+        .args(&plan.arguments)
+        .env_clear()
+        .envs(workspace::environment(&plan.home))
+        .stdin(Stdio::from(channel.as_fd().try_clone_to_owned()?))
+        .stdout(Stdio::from(channel.as_fd().try_clone_to_owned()?))
+        .stderr(Stdio::from(
+            OpenOptions::new().write(true).open("/dev/null")?,
+        ))
+        .current_dir(&plan.working_directory);
+    let child = command.spawn().map_err(|e| {
+        io::Error::other(format!("launch workspace entry {}: {e}", entry.display()))
+    })?;
+    drop(command);
+    reap_entry(child)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn stage2_workspace_arguments_round_trip_and_refuse_overlap() {
+        let grant = |path: &str, read_only: bool| FilesystemGrant {
+            source: PathBuf::from(path),
+            target: PathBuf::from(path),
+            read_only,
+            source_kind: FilesystemSourceKind::Directory,
+            source_device: 1,
+            source_inode: 2,
+        };
+        let plan = WorkspacePlan {
+            uid: 1000,
+            gid: 1000,
+            programs: vec![
+                workspace::Program {
+                    name: "td-agent".into(),
+                    source: "/w/bin/td-agent".into(),
+                    device: 1,
+                    inode: 3,
+                },
+                workspace::Program {
+                    name: "td-txt".into(),
+                    source: "/w/bin/td-txt".into(),
+                    device: 1,
+                    inode: 4,
+                },
+            ],
+            home: grant("/s/home", false),
+            worktrees: vec![grant("/w/a", false)],
+            shared: vec![grant("/d", true), grant("/e", false)],
+            arguments: vec!["tool-host".into(), "--root".into()],
+        };
+        let identity = Identity {
+            uid: 1000,
+            gid: 1000,
+        };
+        let arguments = stage2_workspace_arguments(
+            &[7; TOKEN_LEN],
+            LaunchIdentityMap {
+                inside: identity,
+                outside: identity,
+            },
+            &plan,
+        );
+        let mut rest = arguments.into_iter().skip(7);
+        let parsed = parse_stage2_workspace(&mut rest).unwrap();
+        assert_eq!(parsed.programs, ["td-agent", "td-txt"]);
+        assert_eq!(
+            parsed.entry().unwrap(),
+            Path::new("/opt/workspace/bin/td-agent")
+        );
+        assert_eq!(parsed.home, Path::new("/s/home"));
+        assert_eq!(parsed.worktrees, [PathBuf::from("/w/a")]);
+        assert_eq!(parsed.working_directory, Path::new("/w/a"));
+        assert_eq!(
+            parsed
+                .shared
+                .iter()
+                .map(|grant| (grant.target.clone(), grant.read_only))
+                .collect::<Vec<_>>(),
+            [(PathBuf::from("/d"), true), (PathBuf::from("/e"), false)]
+        );
+        assert_eq!(parsed.arguments, ["tool-host", "--root"]);
+
+        let words = |text: &str| -> Vec<OsString> { text.split(' ').map(OsString::from).collect() };
+        for bad in [
+            // A working directory that is not the first worktree.
+            "--programs 1 a --home /h --worktrees 1 /w --shared 0 --working-directory /h --arguments",
+            // Overlapping trees.
+            "--programs 1 a --home /h --worktrees 1 /h/w --shared 0 --working-directory /h/w --arguments",
+            "--programs 1 a --home /h --worktrees 0 --shared 2 /d ro /d/e rw --working-directory /h --arguments",
+            // A program name that is a path.
+            "--programs 1 ../a --home /h --worktrees 0 --shared 0 --working-directory /h --arguments",
+            "--programs 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments",
+            "--programs 1 a --home /h --worktrees 0 --shared 1 /d rx --working-directory /h --arguments",
+            "--programs 1 a --home h --worktrees 0 --shared 0 --working-directory h --arguments",
+            "--programs 1 a --home /h --worktrees 0 --shared 0 --working-directory /h",
+        ] {
+            assert!(
+                parse_stage2_workspace(&mut words(bad).into_iter()).is_err(),
+                "{bad}"
+            );
+        }
+        let good =
+            "--programs 1 a --home /h --worktrees 0 --shared 0 --working-directory /h --arguments";
+        assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
+    }
     use crate::authority::{
         mount_identities_outside_allowed_home, mount_tree_identities,
         require_grant_mount_identities, MountIdentity,
@@ -8681,8 +9702,16 @@ mod tests {
     fn grant_mount_policy_flags_are_exact() {
         let hardened =
             sys::MS_REMOUNT | sys::MS_BIND | sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC;
-        assert_eq!(grant_mount_policy_flags(false), hardened);
-        assert_eq!(grant_mount_policy_flags(true), hardened | sys::MS_RDONLY);
+        assert_eq!(grant_mount_policy_flags(false, false), hardened);
+        assert_eq!(
+            grant_mount_policy_flags(true, false),
+            hardened | sys::MS_RDONLY
+        );
+        // Only the workspace kind's worktrees and system trees are executable.
+        assert_eq!(
+            grant_mount_policy_flags(false, true),
+            hardened & !sys::MS_NOEXEC
+        );
     }
 
     #[test]

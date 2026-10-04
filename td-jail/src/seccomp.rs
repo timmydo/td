@@ -34,6 +34,7 @@ const OFFSET_ARG1_LOW: u32 = 24;
 
 const SYS_IOCTL: u32 = 16;
 const SYS_SOCKET: u32 = 41;
+const SYS_SOCKETPAIR: u32 = 53;
 const SYS_CLONE: u32 = 56;
 const SYS_GETPPID: u32 = 110;
 const SYS_PERSONALITY: u32 = 135;
@@ -66,6 +67,10 @@ const AF_UNIX: u32 = 1;
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
 const AF_NETLINK: u32 = 16;
+const SOCK_STREAM: u32 = 1;
+const SOCK_SEQPACKET: u32 = 5;
+const SOCK_NONBLOCK: u32 = 0o4000;
+const SOCK_CLOEXEC: u32 = 0o2_000_000;
 
 const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
     SockFilter { code, jt, jf, k }
@@ -101,6 +106,14 @@ macro_rules! count_items {
 macro_rules! define_filter {
     ($($item:expr),+ $(,)?) => {
         pub(crate) const STANDARD_FILTER: [SockFilter; count_items!($($item),+)] = [
+            $($item),+
+        ];
+    };
+}
+
+macro_rules! define_workspace_filter {
+    ($($item:expr),+ $(,)?) => {
+        pub(crate) const WORKSPACE_FILTER: [SockFilter; count_items!($($item),+)] = [
             $($item),+
         ];
     };
@@ -162,6 +175,81 @@ macro_rules! define_policy {
 
             // cBPF cannot inspect clone3's pointed-to flags. ENOSYS makes
             // libc retry with clone, whose inline flags are checked above.
+            jump_eq(SYS_CLONE3, 0, 1),
+            ret(errno(ENOSYS)),
+
+            $(jump_eq($denied, 0, 1), ret(errno(EPERM)),)+
+            ret(SECCOMP_RET_ALLOW),
+        );
+
+        // The `workspace` kind's program (APPLICATIONS.md §C): the standard
+        // program but for its socket rules. A tool may make no Unix socket,
+        // so it can reach none published in a worktree, and its only Unix
+        // sockets are stream pairs: what a build's or test's own processes
+        // talk over, and nothing anyone outside the pair can name.
+        define_workspace_filter!(
+            load(OFFSET_ARCH),
+            jump_eq(AUDIT_ARCH_X86_64, 1, 0),
+            ret(SECCOMP_RET_KILL_PROCESS),
+
+            load(OFFSET_NR),
+            and(X32_SYSCALL_MASK),
+            jump_eq(X32_SYSCALL_BIT, 0, 1),
+            ret(SECCOMP_RET_KILL_PROCESS),
+            load(OFFSET_NR),
+
+            // A Unix socket is refused outright; the other three families
+            // as the standard program has them.
+            jump_eq(SYS_SOCKET, 0, 10),
+            load(OFFSET_ARG0_LOW),
+            jump_eq(AF_UNIX, 0, 1),
+            ret(errno(EPERM)),
+            jump_eq(AF_INET, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            jump_eq(AF_INET6, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            jump_eq(AF_NETLINK, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            ret(errno(EAFNOSUPPORT)),
+
+            // A pair only of connected Unix sockets, stream or
+            // sequenced-packet, its type compared with the two flag bits a
+            // caller may add masked off. Neither can address another
+            // socket: the kernel ignores a sequenced-packet pair's
+            // destination. Rust's own `Command::spawn` makes the latter.
+            jump_eq(SYS_SOCKETPAIR, 0, 8),
+            load(OFFSET_ARG0_LOW),
+            jump_eq(AF_UNIX, 0, 5),
+            load(OFFSET_ARG1_LOW),
+            and(!(SOCK_NONBLOCK | SOCK_CLOEXEC)),
+            jump_eq(SOCK_STREAM, 1, 0),
+            jump_eq(SOCK_SEQPACKET, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            ret(errno(EPERM)),
+
+            jump_eq(SYS_PERSONALITY, 0, 6),
+            load(OFFSET_ARG0_LOW),
+            jump_eq(0, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            jump_eq(u32::MAX, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            ret(errno(EPERM)),
+
+            jump_eq(SYS_IOCTL, 0, 6),
+            load(OFFSET_ARG1_LOW),
+            jump_eq(TIOCSTI, 0, 1),
+            ret(errno(EPERM)),
+            jump_eq(TIOCLINUX, 0, 1),
+            ret(errno(EPERM)),
+            load(OFFSET_NR),
+
+            jump_eq(SYS_CLONE, 0, 4),
+            load(OFFSET_ARG0_LOW),
+            and(CLONE_NEWUSER),
+            jump_eq(0, 1, 0),
+            ret(errno(EPERM)),
+            load(OFFSET_NR),
+
             jump_eq(SYS_CLONE3, 0, 1),
             ret(errno(ENOSYS)),
 
@@ -521,6 +609,10 @@ pub(crate) fn standard_program() -> io::Result<Program<'static>> {
     validate(&STANDARD_FILTER, STANDARD_FILTER.len())
 }
 
+pub(crate) fn workspace_program() -> io::Result<Program<'static>> {
+    validate(&WORKSPACE_FILTER, WORKSPACE_FILTER.len())
+}
+
 pub(crate) fn write_standard_filter(mut output: impl Write) -> io::Result<()> {
     let program = standard_program()?;
     let len = u16::try_from(program.instructions().len()).map_err(|_| {
@@ -822,6 +914,91 @@ mod tests {
                 "syscall {syscall}"
             );
         }
+    }
+
+    #[test]
+    fn the_workspace_program_differs_only_in_its_socket_rules() {
+        let program = workspace_program().unwrap();
+        assert_eq!(program.instructions(), WORKSPACE_FILTER);
+        let mut unix = data(SYS_SOCKET as i32);
+        unix.args[0] = u64::from(AF_UNIX);
+        assert_eq!(interpret(&WORKSPACE_FILTER, unix).unwrap(), errno(EPERM));
+        for family in [AF_INET, AF_INET6, AF_NETLINK] {
+            let mut call = data(SYS_SOCKET as i32);
+            call.args[0] = u64::from(family);
+            assert_eq!(
+                interpret(&WORKSPACE_FILTER, call).unwrap(),
+                SECCOMP_RET_ALLOW
+            );
+        }
+        for family in [0, 3, 17, u32::MAX] {
+            let mut call = data(SYS_SOCKET as i32);
+            call.args[0] = u64::from(family);
+            assert_eq!(
+                interpret(&WORKSPACE_FILTER, call).unwrap(),
+                errno(EAFNOSUPPORT)
+            );
+        }
+        let pair = |family: u32, kind: u32| {
+            let mut call = data(SYS_SOCKETPAIR as i32);
+            call.args[0] = u64::from(family);
+            call.args[1] = u64::from(kind);
+            interpret(&WORKSPACE_FILTER, call).unwrap()
+        };
+        for flags in [0, SOCK_NONBLOCK, SOCK_CLOEXEC, SOCK_NONBLOCK | SOCK_CLOEXEC] {
+            assert_eq!(pair(AF_UNIX, SOCK_STREAM | flags), SECCOMP_RET_ALLOW);
+            assert_eq!(pair(AF_UNIX, SOCK_SEQPACKET | flags), SECCOMP_RET_ALLOW);
+        }
+        // Datagram, raw and reliable-datagram pairs, another family, and a
+        // stream or sequenced-packet type with any other bit, are refused.
+        for (family, kind) in [
+            (AF_UNIX, 2),
+            (AF_UNIX, 3),
+            (AF_UNIX, 4),
+            (AF_UNIX, 6),
+            (AF_UNIX, SOCK_STREAM | 0x100),
+            (AF_UNIX, SOCK_SEQPACKET | 0x100),
+            (AF_INET, SOCK_STREAM),
+            (0, SOCK_STREAM),
+        ] {
+            assert_eq!(pair(family, kind), errno(EPERM), "{family} {kind:#x}");
+        }
+        // The standard program leaves socketpair to the kernel.
+        let mut datagram = data(SYS_SOCKETPAIR as i32);
+        datagram.args[0] = u64::from(AF_UNIX);
+        datagram.args[1] = 2;
+        assert_eq!(
+            interpret(&STANDARD_FILTER, datagram).unwrap(),
+            SECCOMP_RET_ALLOW
+        );
+        // Everything else is the standard program's answer.
+        for syscall in 0_u32..=471 {
+            if matches!(syscall, SYS_SOCKET | SYS_SOCKETPAIR) {
+                continue;
+            }
+            let mut call = data(syscall as i32);
+            for args in [
+                [0_u64; 6],
+                [u64::from(CLONE_NEWUSER), u64::from(TIOCSTI), 0, 0, 0, 0],
+            ] {
+                call.args = args;
+                assert_eq!(
+                    interpret(&WORKSPACE_FILTER, call).unwrap(),
+                    interpret(&STANDARD_FILTER, call).unwrap(),
+                    "syscall {syscall}"
+                );
+            }
+        }
+        let mut wrong = data(0);
+        wrong.arch = 0x4000_0003;
+        assert_eq!(
+            interpret(&WORKSPACE_FILTER, wrong).unwrap(),
+            SECCOMP_RET_KILL_PROCESS
+        );
+        assert_eq!(
+            interpret(&WORKSPACE_FILTER, data((X32_SYSCALL_BIT | 1) as i32)).unwrap(),
+            SECCOMP_RET_KILL_PROCESS
+        );
     }
 
     fn audit_line(uid: u32, syscall: u32, code: u32, signal: u32, executable: &str) -> String {
