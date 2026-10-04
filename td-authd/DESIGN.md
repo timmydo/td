@@ -1507,7 +1507,8 @@ connect at all, the socket being mode 0600 and the wizard's. The service is
 /run/td-media /run/td-volume/td/trusted.pub / /bin/td-firstboot`, with an
 empty environment, cwd `/`, the accepted socket as stdin, one end of a new
 socketpair as stdout and authority stderr: td-install/INSTALLER.md
-"Installation service core" says what it admits. td-authd keeps the other
+"Installation service core" says what it admits, including the supervisor's
+orderly reboot once its installation is complete. td-authd keeps the other
 end, nonblocking, and speaks td-install/INSTALLER.md "Installation consent
 channel" on it, compiling the service's own codec, with at most four reads
 and four writes per heartbeat. It sends its greeting, requires the

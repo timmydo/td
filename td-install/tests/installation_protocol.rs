@@ -74,6 +74,7 @@ fn requests() -> Vec<Request> {
         Request::Status,
         Request::Withdraw(nonce()),
         Request::Timezones,
+        Request::Restart(nonce()),
     ]
 }
 
@@ -103,7 +104,7 @@ fn replies() -> Vec<Reply> {
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS02\n");
+    assert_eq!(GREETING, b"TDINS03\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
@@ -111,7 +112,17 @@ fn wire_bytes_are_independently_specified() {
     execute.extend(plan_bytes());
     let mut withdraw = vec![0x05];
     withdraw.extend([7; 32]);
-    let expected: [&[u8]; 6] = [&[0x01], &propose, &execute, &[0x04], &withdraw, &[0x06]];
+    let mut restart = vec![0x07];
+    restart.extend([7; 32]);
+    let expected: [&[u8]; 7] = [
+        &[0x01],
+        &propose,
+        &execute,
+        &[0x04],
+        &withdraw,
+        &[0x06],
+        &restart,
+    ];
     for (request, bytes) in requests().iter().zip(expected) {
         assert_eq!(request.encode(), bytes, "{request:?}");
         assert_eq!(&Request::decode(bytes).unwrap(), request);
@@ -175,6 +186,7 @@ fn wire_bytes_are_independently_specified() {
             Reply::Refused(Refusal::TimezonesUnavailable),
             vec![0x84, 14],
         ),
+        (Reply::Refused(Refusal::RestartUnavailable), vec![0x84, 15]),
         (
             Reply::Timezones(zones()),
             b"\x85TDZONE01\0\x02\0\x13America/Los_Angeles\0\x07Etc/UTC".to_vec(),
@@ -202,7 +214,7 @@ fn every_message_round_trips_and_codes_are_dense() {
     let expect = |count: u8| (1..=count).collect::<Vec<_>>();
     assert_eq!(
         codes(Refusal::ALL.iter().map(|&r| Reply::Refused(r)).collect()),
-        expect(14)
+        expect(15)
     );
     let status = |state| Reply::Status(state);
     assert_eq!(
@@ -340,7 +352,7 @@ fn every_truncation_and_extension_refuses() {
 #[test]
 fn unknown_tags_codes_and_zero_nonces_refuse() {
     for tag in 0..=255u8 {
-        let known_request = (0x01..=0x06).contains(&tag);
+        let known_request = (0x01..=0x07).contains(&tag);
         let known_reply = (0x81..=0x85).contains(&tag);
         if !known_request {
             assert_eq!(
@@ -382,7 +394,7 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
             );
         }
     }
-    for code in (0..=255).filter(|c| *c == 0 || *c > 14) {
+    for code in (0..=255).filter(|c| *c == 0 || *c > 15) {
         assert_eq!(
             Reply::decode(&[0x84, code]).unwrap_err(),
             "unknown installation refusal"
@@ -392,9 +404,12 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
     zero_status.extend([0; 32]);
     let mut zero_withdraw = vec![0x05];
     zero_withdraw.extend([0; 32]);
+    let mut zero_restart = vec![0x07];
+    zero_restart.extend([0; 32]);
     for error in [
         Reply::decode(&zero_status).unwrap_err(),
         Request::decode(&zero_withdraw).unwrap_err(),
+        Request::decode(&zero_restart).unwrap_err(),
     ] {
         assert_eq!(error, "installation review nonce cannot be zero");
     }
@@ -413,8 +428,8 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS02\n").is_ok());
-    for other in [b"TDINS01\n", b"TDAT001\n", b"TDUPD01\n", b"TDINS02\0"] {
+    assert!(check_greeting(b"TDINS03\n").is_ok());
+    for other in [b"TDINS02\n", b"TDAT001\n", b"TDUPD01\n", b"TDINS03\0"] {
         assert_eq!(
             check_greeting(other).unwrap_err(),
             "unsupported installation protocol greeting"
@@ -531,7 +546,9 @@ fn replies_pair_only_with_their_requests() {
         (_, Reply::Refused(_)) => true,
         (Request::Destinations, Reply::Destinations(_)) => true,
         (Request::Propose { .. }, Reply::Reviewed(_)) => true,
-        (Request::Execute(_) | Request::Withdraw(_), Reply::Status(_)) => true,
+        (Request::Execute(_) | Request::Withdraw(_) | Request::Restart(_), Reply::Status(_)) => {
+            true
+        }
         (Request::Timezones, Reply::Timezones(_)) => true,
         _ => false,
     };

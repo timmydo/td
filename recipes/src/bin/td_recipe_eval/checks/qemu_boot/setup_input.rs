@@ -89,6 +89,36 @@ pub(super) fn matches(state: &str, wanted: &str) -> bool {
     wanted.split(' ').all(|field| fields.contains(&field))
 }
 
+/// How long the guest may take, once the wizard's restart is asked for,
+/// to tear down in order and leave QEMU.
+pub(super) const RESTART_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// After the script's last key: td-setup saying its restart was refused or
+/// can no longer be asked for, a lost evidence line, or a guest still up
+/// past `RESTART_TIMEOUT`, fails the boot.
+pub(super) fn restart_progress(
+    evidence: &ConsoleEvidence,
+    asked: Instant,
+    now: Instant,
+) -> Result<(), String> {
+    if let Some(lost) = &evidence.td_setup_lost {
+        return Err(lost.clone());
+    }
+    if let Some((_, state)) = evidence.td_setup_shown.iter().find(|(_, shown)| {
+        matches(shown, "page=complete restart=refused")
+            || matches(shown, "page=complete restart=unavailable")
+    }) {
+        return Err(format!("td-setup showed {state:?}"));
+    }
+    if now.saturating_duration_since(asked) > RESTART_TIMEOUT {
+        return Err(format!(
+            "the guest did not restart within {}s",
+            RESTART_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `key` is one the wizard's oracle may press.
 pub(super) fn setup_key(key: &str) -> bool {
     LETTERS.contains(&key) || matches!(key, "minus" | "slash" | "tab" | "down" | "ret" | "esc")
@@ -577,6 +607,41 @@ mod tests {
 
     fn background() -> Vec<u8> {
         [24, 32, 40].repeat(1280 * 800)
+    }
+
+    /// After the last key, only the guest's own exit may end the boot: a
+    /// refused or unavailable restart, a lost line or the bound fails it.
+    #[test]
+    fn a_restart_asked_for_fails_on_refusal_loss_or_its_bound() {
+        let asked = Instant::now();
+        let shown = |extra: Option<String>| {
+            let mut evidence = ConsoleEvidence::default();
+            evidence
+                .td_setup_shown
+                .push((1, "page=complete restart=offered".into()));
+            evidence
+                .td_setup_shown
+                .push((2, "page=complete restart=asked".into()));
+            evidence
+                .td_setup_shown
+                .extend(extra.map(|state| (3, state)));
+            evidence
+        };
+        let evidence = shown(None);
+        assert_eq!(restart_progress(&evidence, asked, asked), Ok(()));
+        let late = asked + RESTART_TIMEOUT + Duration::from_secs(1);
+        assert!(restart_progress(&evidence, asked, late)
+            .unwrap_err()
+            .contains("did not restart"));
+        for ended in ["refused", "unavailable"] {
+            let evidence = shown(Some(format!("page=complete restart={ended}")));
+            assert!(restart_progress(&evidence, asked, asked)
+                .unwrap_err()
+                .contains(ended));
+        }
+        let mut lost = shown(None);
+        lost.td_setup_lost = Some("td-setup's evidence line 3 was lost".into());
+        assert!(restart_progress(&lost, asked, asked).is_err());
     }
 
     /// Draws `text` at `top` as the prompt draws a row: Unifont at twice size.

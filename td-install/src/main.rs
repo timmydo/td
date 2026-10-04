@@ -87,6 +87,7 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 /// The sector size assumed for a regular file, and the smallest a disk may
 /// report. A 4Kn device says so itself — see `logical_sector_size`.
@@ -1180,6 +1181,101 @@ impl installation_service::Host for LiveHost {
                 io::Error::new(error.kind(), format!("read {}: {error}", urandom.display()))
             })?;
         Ok(plan_identity(bytes))
+    }
+
+    fn restart(&mut self) -> Result<(), installation_protocol::Refusal> {
+        let supervisor = self.root.join("bin/td-svc");
+        request_reboot(&supervisor, RESTART_TIMEOUT)
+            .map_err(|error| refuse(installation_protocol::Refusal::RestartUnavailable, error))
+    }
+}
+
+/// How long td-svc's client may take to have the reboot accepted; the
+/// supervisor answers before it stops anything.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Asks the supervisor at `supervisor` for its orderly reboot (td-svc/DESIGN.md
+/// section 8): its client, with nothing of the service's, and only its two
+/// acceptances count.
+fn request_reboot(supervisor: &Path, timeout: Duration) -> io::Result<()> {
+    // A socket rather than a pipe, so the read is nonblocking and the one
+    // deadline bounds it, whatever holds the other end.
+    let (mut reply, output) = std::os::unix::net::UnixStream::pair()?;
+    reply.set_nonblocking(true)?;
+    let mut child = std::process::Command::new(supervisor)
+        .arg("reboot")
+        .env_clear()
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+            output,
+        )))
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("start {}: {error}", supervisor.display()),
+            )
+        })?;
+    let result = settle_reboot(&mut child, &mut reply, timeout);
+    if result.is_err() {
+        // Only the child this call started.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn settle_reboot(
+    child: &mut std::process::Child,
+    output: &mut std::os::unix::net::UnixStream,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| invalid("restart deadline overflow".into()))?;
+    let mut reply = Vec::new();
+    let mut buffer = [0; 128];
+    let mut ended = false;
+    let mut exited = None;
+    let status = loop {
+        if !ended {
+            match output.read(&mut buffer) {
+                Ok(0) => ended = true,
+                Ok(read) => {
+                    reply.extend_from_slice(buffer.get(..read).unwrap_or_default());
+                    if reply.len() > 128 {
+                        return Err(invalid("the supervisor's answer is too long".into()));
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if exited.is_none() {
+            exited = child.try_wait()?;
+        }
+        if let (Some(status), true) = (exited, ended) {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(invalid("the supervisor did not answer the restart".into()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    match reply.as_slice() {
+        b"reboot requested\n" | b"shutdown already in progress (reboot)\n" if status.success() => {
+            Ok(())
+        }
+        _ => Err(invalid(format!(
+            "the supervisor did not accept the restart ({status}): {}",
+            String::from_utf8_lossy(&reply).trim_end()
+        ))),
     }
 }
 
@@ -4191,6 +4287,68 @@ mod tests {
         }
     }
 
+    /// The restart runs the supervisor's client with nothing of the
+    /// service's and counts only td-svc's two acceptances; a client that
+    /// says anything else, fails, or does not answer in time refuses.
+    #[test]
+    fn a_restart_counts_only_the_supervisors_acceptance() {
+        let dir = ScratchDirectory(scratch::path("restart"));
+        std::fs::create_dir(&dir.0).unwrap();
+        let client = |name: &str, body: &str| {
+            let path = dir.0.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            path
+        };
+        // A script just written may be busy while another test's child is
+        // between fork and exec: ask again only then.
+        let request_reboot = |path: &std::path::Path, timeout| loop {
+            match request_reboot(path, timeout) {
+                Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                result => break result,
+            }
+        };
+        let timeout = Duration::from_secs(5);
+        for (name, body, accepted) in [
+            (
+                "requested",
+                "[ \"$*\" = reboot ] && [ -z \"$HOME\" ] && echo 'reboot requested'",
+                true,
+            ),
+            (
+                "again",
+                "echo 'shutdown already in progress (reboot)'",
+                true,
+            ),
+            ("poweroff", "echo 'poweroff requested'", false),
+            ("failed", "echo 'reboot requested'; exit 1", false),
+            ("silent", "exit 0", false),
+        ] {
+            let result = request_reboot(&client(name, body), timeout);
+            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+        }
+        // A descendant that keeps the output open cannot hold the service
+        // past the deadline either.
+        let held = client(
+            "held",
+            "(i=0; while [ $i -lt 1000000 ]; do i=$((i + 1)); done) & echo 'reboot requested'",
+        );
+        let started = std::time::Instant::now();
+        assert!(request_reboot(&held, Duration::from_millis(50)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let started = std::time::Instant::now();
+        let hung = request_reboot(
+            &client("hung", "while :; do :; done"),
+            Duration::from_millis(200),
+        );
+        assert!(hung.unwrap_err().to_string().contains("did not answer"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(request_reboot(&dir.0.join("absent"), timeout).is_err());
+    }
+
     /// Under serve, standard input is the installer's channel and standard
     /// output td-authd's, so no child may inherit either: each child this
     /// file starts, and no other production module starts one, has its
@@ -4210,7 +4368,7 @@ mod tests {
             );
             children += 1;
         }
-        assert_eq!(children, 5);
+        assert_eq!(children, 6);
     }
 
     #[test]

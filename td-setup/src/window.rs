@@ -93,6 +93,25 @@ enum Asked {
     Withdraw,
     Execute,
     Status,
+    Restart,
+}
+
+/// Where the completion page's restart stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Restart {
+    Offered,
+    /// Return was pressed; the request is not yet sent.
+    Wanted,
+    Sent,
+    /// The supervisor accepted it; the session is ending.
+    Accepted,
+    Refused(&'static str),
+    /// The connection is gone, and only welcome connects: nothing here can
+    /// ask any more.
+    Unavailable,
+    /// The connection ended with the restart asked for and unanswered: the
+    /// supervisor may have accepted it, its teardown ending the connection.
+    Unknown,
 }
 
 /// What the wizard knows of the service's time zone catalog.
@@ -145,6 +164,20 @@ const REVIEW_KEYS: &[(&str, &str)] = &[
 ];
 const CONSENT_KEYS: &[(&str, &str)] =
     &[("Escape", "withdraw the review and go back to the settings")];
+const COMPLETE_KEYS: &[(&str, &str)] = &[(
+    "Return",
+    "restart the computer; remove the installation media once it has restarted",
+)];
+
+/// Shown on completion while the restart is asked for.
+const ASKING_RESTART: &str = "Asking the installer service to restart the computer\u{2026}";
+/// Shown on completion once the supervisor accepted the restart.
+const RESTARTING: &str = "Restarting\u{2026}";
+/// Shown on completion once nothing can ask for the restart.
+const RESTART_UNAVAILABLE: &str = "The installer service has ended; restart the computer yourself.";
+/// Shown on completion once an asked restart's answer cannot come.
+const RESTART_UNKNOWN: &str =
+    "The computer may be restarting; if it does not, restart it yourself.";
 
 /// Shown on settings while a proposal is with the service.
 const REVIEWING: &str = "Asking the installer service for a review\u{2026}";
@@ -193,6 +226,9 @@ struct Wizard {
     poll_due: bool,
     /// The review the withdraw last sent names.
     withdrawing: Option<[u8; 32]>,
+    /// The complete installation's review, which a restart names.
+    completed: Option<[u8; 32]>,
+    restart: Restart,
 }
 
 impl Wizard {
@@ -217,6 +253,8 @@ impl Wizard {
             review_notice: None,
             poll_due: false,
             withdrawing: None,
+            completed: None,
+            restart: Restart::Offered,
         }
     }
 
@@ -274,6 +312,11 @@ impl Wizard {
                 self.review_page = 0;
                 self.page = Page::Settings;
             }
+            // Only a complete installation's own review restarts, once
+            // asked, or again after a refusal.
+            (Page::Complete, "Return") if self.restartable() => {
+                self.restart = Restart::Wanted;
+            }
             // Nothing here undoes an installation or hides its outcome.
             (Page::Progress(_) | Page::Complete, _) => {}
             (Page::Review, "PageDown") => self.review_page = self.review_page.saturating_add(1),
@@ -320,6 +363,7 @@ impl Wizard {
             Some(zone),
             Some(Section::new("Review", REVIEW_KEYS)),
             Some(Section::new("Consent", CONSENT_KEYS)),
+            Some(Section::new("Complete", COMPLETE_KEYS)),
         ];
         let leads: &[usize] = match &self.page {
             Page::Welcome => &[0],
@@ -328,8 +372,10 @@ impl Wizard {
             Page::Settings => &[2],
             Page::Review => &[4],
             Page::Progress(Progress::Consent) => &[5],
+            Page::Complete if self.restartable() => &[6],
+            Page::Complete => &[],
             // These take no key.
-            Page::Progress(_) | Page::Complete => &[],
+            Page::Progress(_) => &[],
         };
         let mut ordered = Vec::with_capacity(sections.len());
         ordered.extend(
@@ -391,6 +437,7 @@ impl Wizard {
             (Page::Settings, Catalog::Unasked) => Some(Asked::Zones),
             (Page::Settings, _) if self.proposal.is_some() => Some(Asked::Review),
             (Page::Review, _) if self.execute.is_some() => Some(Asked::Execute),
+            (Page::Complete, _) if self.restart == Restart::Wanted => Some(Asked::Restart),
             _ if self.poll_due && self.executing.is_some() && self.following() => {
                 Some(Asked::Status)
             }
@@ -498,6 +545,10 @@ impl Wizard {
                     Stage::Reviewed | Stage::AwaitingConsent | Stage::Running(_) => {}
                 }
             }
+            (Some(Asked::Restart), Ok(Answer::Restarting)) => self.restart = Restart::Accepted,
+            (Some(Asked::Restart), Ok(Answer::Refused(reason))) => {
+                self.restart = Restart::Refused(reason);
+            }
             (Some(Asked::Withdraw), Ok(Answer::Withdrawn)) => {
                 let released = self.withdrawing.take();
                 if released.is_some() && self.executing == released {
@@ -520,6 +571,12 @@ impl Wizard {
         }
     }
 
+    /// Whether Return on completion may ask for the restart: once, or
+    /// again after a refusal, while the connection lasts.
+    fn restartable(&self) -> bool {
+        self.completed.is_some() && matches!(self.restart, Restart::Offered | Restart::Refused(_))
+    }
+
     /// Whether the shown page follows an installation's state.
     fn following(&self) -> bool {
         matches!(
@@ -532,10 +589,16 @@ impl Wizard {
     /// review's own report moves on; any other state, idle included, is
     /// an outcome the installer cannot know.
     fn follow(&mut self, standing: Standing) {
-        let stage = match standing {
-            Standing::Review { nonce, stage } if self.executing == Some(nonce) => stage,
-            _ => Stage::Reviewed,
+        let (review, stage) = match standing {
+            Standing::Review { nonce, stage } if self.executing == Some(nonce) => {
+                (Some(nonce), stage)
+            }
+            _ => (None, Stage::Reviewed),
         };
+        if stage == Stage::Complete {
+            self.completed = review;
+            self.restart = Restart::Offered;
+        }
         let page = match stage {
             Stage::AwaitingConsent => Page::Progress(Progress::Consent),
             Stage::Running(phase) => Page::Progress(Progress::Running(phase)),
@@ -586,6 +649,17 @@ impl Wizard {
             self.page,
             Page::Complete | Page::Progress(Progress::Failed(_))
         );
+        // Completion can no longer ask for a restart; one asked for may
+        // still be under way.
+        if self.page == Page::Complete {
+            self.restart = match self.restart {
+                Restart::Accepted => Restart::Accepted,
+                Restart::Sent | Restart::Unknown => Restart::Unknown,
+                Restart::Offered | Restart::Wanted | Restart::Refused(_) | Restart::Unavailable => {
+                    Restart::Unavailable
+                }
+            };
+        }
         if reported {
             self.executing = None;
         } else if self.executing.take().is_some() || matches!(self.page, Page::Progress(_)) {
@@ -653,7 +727,18 @@ impl Wizard {
             Page::Progress(Progress::Running(_)) => state.push_str("running"),
             Page::Progress(Progress::Failed(_)) => state.push_str("failed"),
             Page::Progress(Progress::Unknown) => state.push_str("unknown"),
-            Page::Complete => state.push_str("complete"),
+            Page::Complete => {
+                state.push_str("complete");
+                let restart = match self.restart {
+                    Restart::Offered => "offered",
+                    Restart::Wanted | Restart::Sent => "asked",
+                    Restart::Accepted => "accepted",
+                    Restart::Refused(_) => "refused",
+                    Restart::Unavailable => "unavailable",
+                    Restart::Unknown => "unknown",
+                };
+                field(&mut state, "restart", restart);
+            }
         }
         state
     }
@@ -750,6 +835,10 @@ impl Front {
                 None => return,
             },
             Asked::Status => service.status(),
+            Asked::Restart => match self.wizard.completed {
+                Some(nonce) => service.restart(nonce),
+                None => return,
+            },
         };
         match sent {
             Ok(()) => {
@@ -757,6 +846,7 @@ impl Front {
                     Asked::Execute => self.wizard.executing = names,
                     Asked::Withdraw => self.wizard.withdrawing = names,
                     Asked::Status => self.next_poll = self.now.saturating_add(POLL),
+                    Asked::Restart => self.wizard.restart = Restart::Sent,
                     _ => {}
                 }
                 self.wizard.sent(asked);
@@ -1009,9 +1099,20 @@ impl Window {
                 ProgressPage::new(surface, progress)
                     .map(|view| Box::new(view) as Box<dyn Composition>),
             ),
-            Page::Complete => Some(
-                CompletionPage::new(surface).map(|view| Box::new(view) as Box<dyn Composition>),
-            ),
+            Page::Complete => {
+                let notice = match wizard.restart {
+                    Restart::Offered => None,
+                    Restart::Wanted | Restart::Sent => Some(ASKING_RESTART),
+                    Restart::Accepted => Some(RESTARTING),
+                    Restart::Refused(reason) => Some(reason),
+                    Restart::Unavailable => Some(RESTART_UNAVAILABLE),
+                    Restart::Unknown => Some(RESTART_UNKNOWN),
+                };
+                Some(
+                    CompletionPage::new(surface)
+                        .map(|view| Box::new(view.with_notice(notice)) as Box<dyn Composition>),
+                )
+            }
             _ => None,
         };
         let Window {
@@ -1395,7 +1496,7 @@ mod tests {
         for (page, state) in [
             (Page::Progress(Progress::Consent), "page=consent"),
             (Page::Progress(Progress::Unknown), "page=unknown"),
-            (Page::Complete, "page=complete"),
+            (Page::Complete, "page=complete restart=offered"),
             (Page::Unavailable, "page=unavailable"),
             (Page::Refused("busy"), "page=refused"),
         ] {
@@ -1630,6 +1731,69 @@ mod tests {
         // A completion reported stands when the service goes.
         wizard.answered(Err("the installer service connection ended".into()));
         assert_eq!(wizard.page, Page::Complete);
+    }
+
+    /// Return on completion asks, once, for the restart of the review
+    /// that completed; a refusal or a lost connection is shown and Return
+    /// asks again, and an accepted restart takes no more keys.
+    #[test]
+    fn a_complete_installation_restarts_on_return() {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::Complete)));
+        assert_eq!(wizard.page, Page::Complete);
+        assert_eq!(wizard.completed, Some(nonce));
+        assert_eq!(wizard.state(), "page=complete restart=offered");
+        assert_eq!(
+            wizard.key_sections().first().map(|s| s.title),
+            Some("Complete")
+        );
+        for chord in ["Escape", "PageUp", "a"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.wanted(), None);
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Restart));
+        wizard.restart = Restart::Sent;
+        wizard.sent(Asked::Restart);
+        assert_eq!(wizard.state(), "page=complete restart=asked");
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), None);
+        wizard.answered(Ok(Answer::Refused("the computer could not be restarted")));
+        assert_eq!(
+            wizard.restart,
+            Restart::Refused("the computer could not be restarted")
+        );
+        assert_eq!(wizard.state(), "page=complete restart=refused");
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), Some(Asked::Restart));
+        wizard.restart = Restart::Sent;
+        wizard.sent(Asked::Restart);
+        wizard.answered(Ok(Answer::Restarting));
+        assert_eq!(wizard.state(), "page=complete restart=accepted");
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), None);
+        assert!(wizard.key_sections().first().map(|s| s.title) != Some("Complete"));
+        // The session ends with the connection; the page stands.
+        wizard.lost();
+        assert_eq!(wizard.page, Page::Complete);
+        assert_eq!(wizard.restart, Restart::Accepted);
+        // A connection lost before the answer, or before Return, leaves
+        // nothing to ask: the page says to restart by other means.
+        for (before, after, state) in [
+            (Restart::Offered, Restart::Unavailable, "unavailable"),
+            (Restart::Refused("no"), Restart::Unavailable, "unavailable"),
+            (Restart::Sent, Restart::Unknown, "unknown"),
+        ] {
+            wizard.restart = before;
+            wizard.lost();
+            assert_eq!(wizard.page, Page::Complete);
+            assert_eq!(wizard.restart, after);
+            assert_eq!(wizard.state(), format!("page=complete restart={state}"));
+            wizard.key("Return");
+            assert_eq!(wizard.wanted(), None);
+        }
     }
 
     #[test]
@@ -2028,6 +2192,16 @@ mod tests {
                 Page::Complete,
             ]
         );
+        // Return restarts the installation that completed, on the same
+        // connection.
+        front.key("Return", &intake);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.restart != Restart::Accepted {
+            assert!(Instant::now() < deadline, "{:?}", front.wizard.restart);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(front.wizard.completed, Some([7; 32]));
     }
 
     /// A front end at the consent view of an `installing` service.
@@ -2152,6 +2326,7 @@ mod tests {
             "Time zone",
             "Review",
             "Consent",
+            "Complete",
         ];
         assert_eq!(titles(&wizard), order);
         let sections = wizard.key_sections();
@@ -2201,7 +2376,8 @@ mod tests {
                 "Welcome",
                 "Disks",
                 "Review",
-                "Consent"
+                "Consent",
+                "Complete"
             ]
         );
         let mut wizard = on_review();
@@ -2215,6 +2391,10 @@ mod tests {
         assert_eq!(wizard.page, Page::Progress(Progress::Consent));
         assert_eq!(titles(&wizard)[0], "Consent");
         wizard.page = Page::Complete;
+        assert_eq!(titles(&wizard)[0], "Welcome");
+        wizard.completed = Some([1; 32]);
+        assert_eq!(titles(&wizard)[0], "Complete");
+        wizard.page = Page::Progress(Progress::Unknown);
         assert_eq!(titles(&wizard), order);
     }
 

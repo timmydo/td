@@ -10,7 +10,7 @@ use crate::installation_plan::{
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINS02\n";
+pub const GREETING: &[u8; 8] = b"TDINS03\n";
 /// Root admits only this much from the unprivileged side.
 pub const MAX_REQUEST_BYTES: usize = 1 + MAX_BYTES;
 pub const MAX_REPLY_BYTES: usize = 1 + if MAX_CANDIDATE_BYTES > MAX_ZONE_BYTES {
@@ -25,6 +25,7 @@ const EXECUTE: u8 = 0x03;
 const STATUS: u8 = 0x04;
 const WITHDRAW: u8 = 0x05;
 const TIMEZONES: u8 = 0x06;
+const RESTART: u8 = 0x07;
 // Replies set the high bit, so a reflected frame never decodes.
 const DESTINATIONS_REPLY: u8 = 0x81;
 const REVIEWED: u8 = 0x82;
@@ -235,6 +236,8 @@ pub enum Refusal {
     ConsentUnavailable,
     /// The time zone catalog could not be read.
     TimezonesUnavailable,
+    /// The supervisor did not accept the restart.
+    RestartUnavailable,
 }
 
 impl Refusal {
@@ -253,6 +256,7 @@ impl Refusal {
         Self::NoReview,
         Self::ConsentUnavailable,
         Self::TimezonesUnavailable,
+        Self::RestartUnavailable,
     ];
 
     fn code(self) -> u8 {
@@ -271,6 +275,7 @@ impl Refusal {
             Self::NoReview => 12,
             Self::ConsentUnavailable => 13,
             Self::TimezonesUnavailable => 14,
+            Self::RestartUnavailable => 15,
         }
     }
 
@@ -292,6 +297,7 @@ impl Refusal {
             12 => Ok(Self::NoReview),
             13 => Ok(Self::ConsentUnavailable),
             14 => Ok(Self::TimezonesUnavailable),
+            15 => Ok(Self::RestartUnavailable),
             _ => Err("unknown installation refusal".into()),
         }
     }
@@ -317,6 +323,9 @@ pub enum Request {
     Withdraw(ReviewNonce),
     /// The time zones settings may choose, from the service's catalog.
     Timezones,
+    /// Restart the computer into the installation the nonce names, which
+    /// must be complete: the supervisor's orderly reboot.
+    Restart(ReviewNonce),
 }
 
 impl Request {
@@ -342,6 +351,10 @@ impl Request {
                 out.extend_from_slice(nonce.as_bytes());
             }
             Self::Timezones => out.push(TIMEZONES),
+            Self::Restart(nonce) => {
+                out.push(RESTART);
+                out.extend_from_slice(nonce.as_bytes());
+            }
         }
         out
     }
@@ -363,6 +376,7 @@ impl Request {
             STATUS => Self::Status,
             WITHDRAW => Self::Withdraw(ReviewNonce::new(reader.array()?)?),
             TIMEZONES => Self::Timezones,
+            RESTART => Self::Restart(ReviewNonce::new(reader.array()?)?),
             _ => return Err("unknown installation request".into()),
         };
         reader.finish()?;
@@ -479,7 +493,7 @@ impl Reply {
         match request {
             Request::Destinations => matches!(self, Self::Destinations(_) | Self::Refused(_)),
             Request::Propose { .. } => matches!(self, Self::Reviewed(_) | Self::Refused(_)),
-            Request::Execute(_) | Request::Withdraw(_) => {
+            Request::Execute(_) | Request::Withdraw(_) | Request::Restart(_) => {
                 matches!(self, Self::Status(_) | Self::Refused(_))
             }
             Request::Status => matches!(self, Self::Status(_)),

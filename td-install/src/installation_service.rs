@@ -36,6 +36,9 @@ pub(crate) trait Host {
     fn recheck(&mut self, destination: &Destination, claim: &mut Self::Claim) -> bool;
     /// A proposal nonce and volume UUID. Failure ends the service.
     fn entropy(&mut self) -> io::Result<([u8; 32], [u8; 16])>;
+    /// Asks the supervisor for its orderly reboot; `Ok` once it has
+    /// accepted, before anything is stopped.
+    fn restart(&mut self) -> Result<(), Refusal>;
 }
 
 /// Writes a consented installation under its claim, on its own thread.
@@ -155,7 +158,26 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                 Ok(zones) => Reply::Timezones(zones),
                 Err(refusal) => Reply::Refused(refusal),
             },
+            Request::Restart(nonce) => self.restart(nonce),
         })
+    }
+
+    /// Only a complete installation, named by its nonce, restarts the
+    /// computer, and only into the supervisor's orderly reboot.
+    fn restart(&mut self, nonce: ReviewNonce) -> Reply {
+        match self.held {
+            Held::Complete(complete) if complete == nonce => match self.host.restart() {
+                Ok(()) => Reply::Status(self.state()),
+                Err(refusal) => Reply::Refused(refusal),
+            },
+            Held::Complete(_) => Reply::Refused(Refusal::StaleReview),
+            Held::Running(..) => Reply::Refused(Refusal::Busy),
+            Held::Idle
+            | Held::Reviewed { .. }
+            | Held::AwaitingConsent { .. }
+            | Held::Failed(..)
+            | Held::Abandoned(..) => Reply::Refused(Refusal::NoReview),
+        }
     }
 
     fn propose(
@@ -772,6 +794,7 @@ mod tests {
         zones: Result<(), Refusal>,
         /// Proposals so far; each draws its own nonce.
         drawn: u8,
+        restart: Result<(), Refusal>,
     }
     impl Fake {
         fn new() -> Self {
@@ -786,6 +809,7 @@ mod tests {
                 entropy: true,
                 zones: Ok(()),
                 drawn: 0,
+                restart: Ok(()),
             }
         }
         fn call(&self, name: &'static str) {
@@ -846,6 +870,10 @@ mod tests {
             nonce[31] = nonce[31].wrapping_add(self.drawn);
             self.drawn += 1;
             Ok((nonce, uuid))
+        }
+        fn restart(&mut self) -> Result<(), Refusal> {
+            self.call("restart");
+            self.restart
         }
     }
 
@@ -1391,6 +1419,84 @@ mod tests {
                 service.answer(request).unwrap(),
                 Reply::Refused(Refusal::NoReview)
             );
+        }
+        // A restart names the completed installation; the supervisor
+        // refusing it is the person's to see.
+        let calls = |service: &Service<Fake, _>| {
+            service
+                .host
+                .log
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|call| **call == "restart")
+                .count()
+        };
+        assert_eq!(
+            service
+                .answer(Request::Restart(ReviewNonce::new([4; 32]).unwrap()))
+                .unwrap(),
+            Reply::Refused(Refusal::StaleReview)
+        );
+        assert_eq!(calls(&service), 0);
+        service.host.restart = Err(Refusal::RestartUnavailable);
+        assert_eq!(
+            service.answer(Request::Restart(nonce)).unwrap(),
+            Reply::Refused(Refusal::RestartUnavailable)
+        );
+        service.host.restart = Ok(());
+        assert_eq!(
+            service.answer(Request::Restart(nonce)).unwrap(),
+            Reply::Status(State::Complete(nonce))
+        );
+        assert_eq!(calls(&service), 2);
+        assert_eq!(service.state(), State::Complete(nonce));
+        assert!(service.take_reports().is_empty());
+    }
+
+    /// Nothing but a complete installation restarts the computer.
+    #[test]
+    fn only_a_complete_installation_restarts() {
+        let mut held = Service::new(Fake::new());
+        let plan = reviewed(&mut held);
+        let mut displayed = Service::new(Fake::new());
+        reviewed(&mut displayed);
+        if let Held::Reviewed { plan, claim } = std::mem::replace(&mut displayed.held, Held::Idle) {
+            displayed.held = Held::AwaitingConsent { plan, claim };
+        }
+        let mut services = vec![
+            (Refusal::NoReview, Service::new(Fake::new())),
+            (Refusal::NoReview, held),
+            (Refusal::NoReview, displayed),
+        ];
+        let mut later = vec![(Refusal::Busy, Held::Running(nonce(), Phase::VerifyingBoot))];
+        later.extend(
+            Failure::ALL
+                .iter()
+                .map(|f| (Refusal::NoReview, Held::Failed(nonce(), *f))),
+        );
+        later.extend(
+            Abandon::ALL
+                .iter()
+                .map(|c| (Refusal::NoReview, Held::Abandoned(nonce(), *c))),
+        );
+        for (refusal, held) in later {
+            let mut service = Service::new(Fake::new());
+            service.held = held;
+            services.push((refusal, service));
+        }
+        for (refusal, mut service) in services {
+            let state = service.state();
+            for named in [nonce(), ReviewNonce::from(&plan)] {
+                assert_eq!(
+                    service.answer(Request::Restart(named)).unwrap(),
+                    Reply::Refused(refusal),
+                    "{state:?}"
+                );
+            }
+            assert_eq!(service.state(), state);
+            assert!(!service.host.log.lock().unwrap().calls.contains(&"restart"));
         }
     }
 

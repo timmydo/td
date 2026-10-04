@@ -1155,6 +1155,13 @@ also requests only `poweroff` through this existing control socket, after
 validating the compositor-owned fixed VM request. It runs after and requires
 seat setup, uses ordinary process-group supervision, and has no authority
 channel exposed to the human UID. See [td-vm-guest](../td-vm-guest/DESIGN.md#fixed-root-power-worker).
+The root installation service (`td-install serve`) runs `/bin/td-svc reboot`
+likewise, only for the restart the live installer asks for once an
+installation is complete (td-install/INSTALLER.md "Installation service
+protocol"), and accepts only the client's two replies for a reboot this
+socket accepted (`reboot requested`, `shutdown already in progress
+(reboot)`). Unlike `vm-power`'s, this request is reachable from a non-root
+identity: the live wizard's, UID 990, over td-authd's setup intake.
 Before td-svc they inlined `{ /etc/shutdown; exec /bin/reboot; }`
 themselves, which was right when nothing was supervised and resets a machine
 with live services now that something is.

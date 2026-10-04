@@ -27,9 +27,11 @@
 //! the account and the deployment's prefix reviewed (Enter again while the
 //! prompt stays and nothing is written, since the compositor drops an Enter
 //! stamped before its receipt); then Escape from the installed notice, by
-//! which the target must have been written. The live phase ends once
-//! td-setup says the installation completed, and the target must then hold the
-//! installer's whole GPT layout.
+//! which the target must have been written. Once td-setup says the
+//! installation completed, Return asks for its restart, and the live phase
+//! ends only when the guest has torn down in order, the kernel restarting
+//! rather than powering off, and QEMU has left by itself under `-no-reboot`;
+//! the target must then hold the installer's whole GPT layout.
 //!
 //! With the medium detached, the installed disk then cold-boots through
 //! firmware twice, alone and then renamed behind a decoy disk, and each boot
@@ -203,8 +205,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
          in {ZONE}, released it untouched and reviewed again; consent went \
          through the compositor's secure attention prompt showing exactly that \
          disk, its size and serial, host, account and deployment prefix, \
-         td-setup said the installation completed, and the target holds the \
-         installer's GPT layout; with the medium detached, the installed disk \
+         td-setup said the installation completed, Return on its \
+         completion page restarted the guest through the supervisor's \
+         orderly teardown, and the target holds the installer's GPT layout; with the medium detached, the installed disk \
          cold-booted through firmware twice, alone and renamed behind a decoy, \
          as a healthy {USERNAME}@{HOSTNAME} with its volume {uuid} bound, a \
          fresh machine identity and /var/home/{USERNAME} created then found, \
@@ -367,24 +370,48 @@ fn script(rows: &[String]) -> Result<Vec<SetupStep>, String> {
         within: STEP_TIMEOUT,
     });
     // td-authd ends the attention only once the installation finished, so
-    // td-setup's next poll says so.
+    // td-setup's next poll says so; Return then restarts the computer.
     steps.push(SetupStep {
-        shown: "page=complete".into(),
-        act: Act::Keys(Vec::new()),
+        shown: "page=complete restart=offered".into(),
+        act: Act::Keys(vec!["ret"]),
         untouched: false,
         within: STEP_TIMEOUT,
     });
     Ok(steps)
 }
 
+/// The kernel's own line for a restart, which a power-off does not print.
+const KERNEL_RESTART: &str = "reboot: Restarting system";
+
+/// Whether the console's tail shows the teardown's marker and, after it,
+/// the kernel restarting rather than powering off.
+fn restarted(console: &str) -> bool {
+    let lines: Vec<&str> = console.lines().map(str::trim_end).collect();
+    let shutdown = lines
+        .iter()
+        .rposition(|line| *line == td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER);
+    let restart = lines
+        .iter()
+        .rposition(|line| line.ends_with(KERNEL_RESTART));
+    matches!((shutdown, restart), (Some(shutdown), Some(restart)) if shutdown < restart)
+}
+
 /// The live session reported the wizard's window focused with the intake
-/// bound, and the script ran to its end.
+/// bound, the script ran to its restart, and the guest then shut down in
+/// order and left QEMU by itself under `-no-reboot`.
 fn require_live_session(result: &BootResult) -> Result<(), String> {
     let ready = result
         .console
         .lines()
         .any(|line| line.trim_end() == TD_SETUP_LIVE_MARKER);
-    if !result.marker_killed || !result.evidence.target || !ready {
+    if !result.evidence.td_setup_script_complete
+        || !result.exited_clean
+        || result.evidence.kernel_panic
+        || !result.evidence.shutdown
+        || !restarted(&result.console)
+        || !result.evidence.target
+        || !ready
+    {
         return Err(format!(
             "the live session did not carry the installer wizard through its review \
              and consent to an installation: {}\n{}",
@@ -400,12 +427,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_an_orderly_restart_ends_the_live_session() {
+        let marker = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
+        assert!(restarted(&format!(
+            "{marker}\n[  812.004211] reboot: Restarting system\n"
+        )));
+        for console in [
+            format!("{marker}\n[  812.004211] reboot: Power down\n"),
+            format!("[  812.004211] reboot: Restarting system\n{marker}\n"),
+            "[  812.004211] reboot: Restarting system\n".to_string(),
+            format!("{marker}\n"),
+        ] {
+            assert!(!restarted(&console), "{console}");
+        }
+    }
+
+    #[test]
     fn the_script_types_only_its_closed_keys_and_waits_on_distinct_states() {
         let rows = vec!["ROW".to_string()];
         let script = script(&rows).unwrap();
         let typed_keys = USERNAME.len() + HOSTNAME.len() + ZONE_SEEK.len();
         // The three tabs and Enter; Escape; Enter from the release and from
-        // the second review; consent; and the completion.
+        // the second review; consent; and the completion's restart.
         assert_eq!(script.len(), 3 + typed_keys + 4 + 1 + 2 + 1 + 1);
         let (consent, last) = (&script[script.len() - 2], &script[script.len() - 1]);
         for step in &script[..script.len() - 2] {
@@ -427,8 +470,9 @@ mod tests {
         assert!(untouched[0].ends_with(" withdrawal=none"));
         assert_eq!(untouched[1], "page=consent");
         assert!(matches!(&consent.act, Act::Consent(shown) if *shown == rows));
-        assert_eq!(last.shown, "page=complete");
-        assert!(matches!(&last.act, Act::Keys(keys) if keys.is_empty()));
+        // Return on the completion page restarts the computer.
+        assert_eq!(last.shown, "page=complete restart=offered");
+        assert!(matches!(&last.act, Act::Keys(keys) if keys == &["ret"]));
         assert_eq!(last.within, STEP_TIMEOUT);
         // The same review is asked twice, and consent follows the second.
         let reviews: Vec<usize> = (0..script.len())

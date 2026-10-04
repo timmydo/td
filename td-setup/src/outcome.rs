@@ -225,6 +225,7 @@ impl Composition for ProgressPage {
 pub struct CompletionPage {
     surface: Surface,
     footer: Status,
+    notice: Option<&'static str>,
 }
 
 impl CompletionPage {
@@ -233,7 +234,14 @@ impl CompletionPage {
         Some(Self {
             surface,
             footer: Status::new(surface),
+            notice: None,
         })
+    }
+
+    /// What became of the restart, under the instruction.
+    pub fn with_notice(mut self, notice: Option<&'static str>) -> Self {
+        self.notice = notice;
+        self
     }
 }
 
@@ -255,10 +263,27 @@ impl Composition for CompletionPage {
         row(
             self.surface,
             6,
-            "Remove the installation media, then reboot from the installed disk.",
+            "Press Return to restart the computer. Keep the installation media",
             damage,
             sink,
         );
+        row(
+            self.surface,
+            7,
+            "in until it has restarted and shows its startup screen, then",
+            damage,
+            sink,
+        );
+        row(
+            self.surface,
+            8,
+            "remove it, so that it starts the installed system.",
+            damage,
+            sink,
+        );
+        if let Some(notice) = self.notice {
+            row(self.surface, 10, notice, damage, sink);
+        }
         self.footer.emit(COMPLETE_FOOTER.chars(), damage, sink);
     }
 }
@@ -373,7 +398,10 @@ mod tests {
         let complete = CompletionPage::new(screen).unwrap();
         let painted = glyphs(&complete, screen);
         assert!(painted.contains("Installation complete"));
-        assert!(painted.contains("Remove the installation media"));
+        assert!(painted.contains("Press Return to restart the computer"));
+        assert!(painted.contains("Keep the installation media"));
+        let notice = glyphs(&complete.with_notice(Some("Restarting")), screen);
+        assert!(notice.contains("Restarting"));
         assert!(painted.contains(COMPLETE_FOOTER));
         assert!(
             ProgressPage::new(surface(752, 480), Progress::Running(Phase::PreparingDisk)).is_some()

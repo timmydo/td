@@ -447,15 +447,10 @@ const FINAL_DRAIN_PASSES: usize = 24;
 /// evidence; floods are rejected directly before a result is returned.
 enum EndReason {
     MarkerSeen,
-    /// The scripted wizard input ran to its end.
-    InputComplete,
     QemuExited(ExitStatus),
     TimedOut(u64),
     Flooded(u64),
-    AudioFlooded {
-        bytes: u64,
-        ceiling: u64,
-    },
+    AudioFlooded { bytes: u64, ceiling: u64 },
 }
 
 /// Outcome of a boot attempt.
@@ -528,6 +523,9 @@ struct ConsoleEvidence {
     td_setup_shown: Vec<(u32, String)>,
     /// Why a said state is missing from `td_setup_shown`, once one is.
     td_setup_lost: Option<String>,
+    /// Set by the boot loop, not the console: the wizard's script ran to
+    /// its last key, after which only the guest ends the boot.
+    td_setup_script_complete: bool,
     td_term_clipboard_target: Option<TerminalClipboardTarget>,
     td_term_clipboard_selection: bool,
     td_term_clipboard: bool,
@@ -4785,8 +4783,8 @@ fn boot_source(
             || !plan.disk.as_ref().is_some_and(|disk| disk.read_only))
     {
         return Err(
-            "the live setup boot needs its read-only medium, no Firefox input, and its \
-             script, not its marker, to end it"
+            "the live setup boot needs its read-only medium, no Firefox input, and the \
+             restart its script asks for, not its marker, to end it"
                 .into(),
         );
     }
@@ -5141,6 +5139,7 @@ fn boot_source(
     };
     let mut end;
     let mut marker_killed = false;
+    let mut restart_asked = None;
     loop {
         if let Err(error) = drain_console(
             &console_path,
@@ -5169,15 +5168,27 @@ fn boot_source(
                 ));
             }
         }
-        if let Some(controller) = setup_input.as_mut() {
+        // Its last key restarts the guest, whose own exit ends the boot;
+        // a restart refused, or a guest still up past its bound, fails then.
+        if let Some(asked) = restart_asked {
+            if let Err(error) = setup_input::restart_progress(&evidence, asked, Instant::now()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let console = String::from_utf8_lossy(&buf);
+                return Err(format!(
+                    "restart after the wizard's installation: {error}. Last serial output:\n{}",
+                    tail(&console, 80)
+                ));
+            }
+        }
+        if let Some(controller) = setup_input
+            .as_mut()
+            .filter(|_| !evidence.td_setup_script_complete)
+        {
             match controller.progress(&evidence) {
                 Ok(true) => {
-                    let sent = child.kill().is_ok();
-                    marker_killed = child
-                        .wait()
-                        .is_ok_and(|status| sent && status.signal() == Some(9));
-                    end = EndReason::InputComplete;
-                    break;
+                    evidence.td_setup_script_complete = true;
+                    restart_asked = Some(Instant::now());
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -6086,7 +6097,6 @@ fn validate_boot_plan_tokens(extra_append: &str) -> Result<(), String> {
 fn format_end_reason(end: EndReason, target_seen: bool) -> String {
     match end {
         EndReason::MarkerSeen => "the marker was seen".to_string(),
-        EndReason::InputComplete => "the scripted wizard input completed".to_string(),
         EndReason::QemuExited(status) if target_seen => {
             format!("qemu exited on its own after the marker ({status})")
         }

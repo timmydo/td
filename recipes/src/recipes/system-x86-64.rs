@@ -3525,8 +3525,9 @@ fn build_profile(sys: &SystemDef) -> String {
     // line the qemu-boot-system oracle keys on.
     s.push_str(&format!("echo {GREETER_MARKER}\n"));
     // The wizard oracle drives a live session for as long as its script
-    // takes, and its host ends the run: the greeter parks rather than let a
-    // live boot's settled health transaction reboot the machine under it.
+    // takes, and only the wizard's restart ends it: the greeter parks rather
+    // than let a live boot's settled health transaction reboot the machine
+    // under it.
     s.push_str(&format!(
         "case \" $(/bin/td-util cat /proc/cmdline) \" in *\" {SETUP_INPUT_CMDLINE_TOKEN} \"*) \
          while :; do /bin/td-util sleep 300; done;; esac\n"
