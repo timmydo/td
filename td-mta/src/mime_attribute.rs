@@ -106,12 +106,12 @@ impl<'a, 'w> Budgeted<'a, 'w> {
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         self.cursor
             .inner
-            .check_work(&mut Admission {
+            .check_work(&mut decode_work::Admission::new(
                 now,
-                work: self.work,
-                budget: self.budget,
-                credit: &mut self.credit,
-            })
+                self.work,
+                self.budget,
+                &mut self.credit,
+            ))
             .map_err(Error::from)
     }
     /// Cached completion is inert; use check_deadline for fresh admission.
@@ -120,24 +120,6 @@ impl<'a, 'w> Budgeted<'a, 'w> {
             now,
             &mut decode_work::Parsing::new(self.work, self.budget, &mut self.credit),
         )
-    }
-}
-
-struct Admission<'w> {
-    now: Tick,
-    work: &'w mut Meter,
-    budget: &'w mut HeaderBudget,
-    credit: &'w mut u8,
-}
-impl td_header::Work for Admission<'_> {
-    type Error = decode_work::Error;
-    fn charge(&mut self, charge: td_header::Charge) -> Result<(), Self::Error> {
-        if charge != td_header::Charge::default() {
-            return Err(decode_work::Error::InvalidState);
-        }
-        self.budget
-            .charge(self.work, self.now, 0, 0, self.credit)
-            .map_err(decode_work::Error::from)
     }
 }
 

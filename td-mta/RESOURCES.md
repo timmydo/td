@@ -1053,6 +1053,23 @@ Allocation intervals cover constructor, long names, malformed suffixes,
 index overflow and late refusal. Value assembly, part traversal and combined
 worker/native qualification remain open.
 
+M06bs's shared MIME value cursor and thin mail facade fit 160 bytes;
+Budgeted fits 192 in the existing 16 KiB parser-state reservation. Validation
+reuses one fixed shared delimited owner; projection has scalar positions and
+language-tag counters, no backing or segment collection. A shared private
+mail Admission adapter binds zero-count fresh checks without spending steps
+or prepaid record credit. Ordinary and extended octet events remain parsing
+evidence; the owner charges output capacity before retained copying.
+
+Each turn visits at most 160 source bytes and charges 32 lexical records.
+Budgeted turns cap aggregate steps at 192 and job records at 12, including
+original credit. Validation, logical-fold lookahead and percent-source
+rereads are charged. Projection emits at most one octet per turn; labels and
+all events remain provisional until complete candidate validation. Constructor,
+long drain, quoted/percent bytes and malformed/late refusal are Rust-allocation
+probe intervals. These are fixed state/counter-model claims, not complete
+worker, native/RSS or source-buffer qualification.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

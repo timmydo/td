@@ -284,11 +284,24 @@ The mail hot path uses only its incremental string API, whose state and
 caller-provided output are fixed; its allocating Json value/parser API is not
 admitted there. td-json owns no mail, clock, crypto or scheduler policy.
 
-The reusable CFWS, delimited-token and MIME parameter-name cursors live in
-td-header with generic caller-owned admission. Mail grammar placement,
+The reusable CFWS, delimited-token and MIME parameter-name/value cursors
+live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in
 td-mta. The shared lexical crate owns no field selection, display policy,
 clock or crypto and retains the existing fixed-work/source-extent contract.
+The value cursor validates complete raw token/quoted spelling before
+projecting provisional octets with ordinary/extended prefix roles. Candidate
+assembly and charset/display/boundary conversion remain in mail. Zero-count
+fresh admission is shared by the name/value wrappers without spending
+parsing steps or prepaid credit.
+The passive language-tag feed state is shared by parameter prefixes and
+encoded-word qualifiers; recognition retains its precharged 75-byte ceiling.
+The unquote/fold projection overlaps existing phrase/comment readers. A
+later shared extraction must preserve their original-source placement and
+escaped-byte provenance, their distinct invariant errors and EOF charge
+contracts; the value cursor alone grants no display-word placement. That
+migration remains open rather than widening this lexical increment into
+those display consumers without their dedicated qualification.
 New extractions must preserve the caller's bounded-work and memory contract.
 
 The core may contain owned tables generated from the approved, checksummed

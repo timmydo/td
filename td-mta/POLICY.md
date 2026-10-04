@@ -296,10 +296,25 @@ attacker-selected subset. Prefer a valid extended filename,
 then ordinary filename, then valid extended Content-Type name*, then ordinary
 Content-Type name. Ordinary filename/name accept properly placed RFC 2047
 encoded words as a compatibility rule. For duplicate ordinary parameters use
-the first complete value. Unknown extended charset uses the same replacement
-policy. Never use a supplied name as a filesystem path. Header names/values
-generated from JMAP must reject injection; only the serializer adds folding
+the first complete value. Never use a supplied name as a filesystem path.
+Header names/values generated from JMAP must reject injection; only the serializer adds folding
 and delimiters.
+
+Extended parameter values admit quoted wrappers as a compatibility rule:
+unquote and unfold logical folds first, then require charset'language'
+delimiters for initial encoded values and complete percent triplets within
+each encoded section. Accept either hexadecimal case. The octet cursor
+preserves empty labels without choosing a charset. Later conversion uses
+explicit UTF-8 replacement recovery for an unknown or empty label, with a
+diagnostic; this recovery does not assign an RFC charset default.
+Language is passive metadata with
+the same lexical tag rule as section 2, without registry lookup. Unencoded
+sections remain literal and mixed sections share one later charset state;
+percent triplets cannot span sections. Quoted spaces and other forbidden
+extended logical bytes require percent encoding. Neither unquoting nor
+percent decoding creates encoded-word placement authority. Scalar control
+filtering and NFC belong to display metadata after complete candidate
+validation; boundary comparison retains its separately admitted ASCII octets.
 
 ## 3. MIME and stable transfer decoding
 

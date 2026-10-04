@@ -1713,6 +1713,18 @@ Initial independently landable increments:
   and allocation-free construction/drain. Full candidate validation, value
   assembly and MIME part traversal remain open.
 
+- **M06bs — shared MIME parameter octets:** validate complete token/quoted
+  spelling and project bounded ordinary/extended octet events through
+  std-only td-header. Remove quotes/pairs and logical folds, distinguish
+  charset/language/data, require prefix delimiters and complete percent
+  triplets, and preserve decoded NUL/non-UTF-8 for later conversion. Bind
+  original work through a thin mail facade, share zero-count admission with
+  the name classifier, and share passive language grammar with encoded
+  words. Cover complete/malformed values, all decoded octets, long fixed
+  turns, every job/aggregate refusal, sticky final checks,
+  ownership and allocation-free construction/drain. Numbered candidate
+  replay, display conversion, boundaries and MIME traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

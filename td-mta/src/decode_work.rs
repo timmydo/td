@@ -120,3 +120,37 @@ impl<W: Work> td_header::Work for Lexical<'_, W> {
         )
     }
 }
+
+/// Zero-count live header admission; does not spend parsing steps or credit.
+pub(crate) struct Admission<'w> {
+    now: Tick,
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: &'w mut u8,
+}
+impl<'w> Admission<'w> {
+    pub(crate) const fn new(
+        now: Tick,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+        credit: &'w mut u8,
+    ) -> Self {
+        Self {
+            now,
+            work,
+            budget,
+            credit,
+        }
+    }
+}
+impl td_header::Work for Admission<'_> {
+    type Error = Error;
+    fn charge(&mut self, charge: td_header::Charge) -> Result<(), Error> {
+        if charge != td_header::Charge::default() {
+            return Err(Error::InvalidState);
+        }
+        self.budget
+            .charge(self.work, self.now, 0, 0, self.credit)
+            .map_err(Error::from)
+    }
+}

@@ -3427,6 +3427,60 @@ long replay, malformed spelling/overflow and late refusal. Parameter-value
 assembly, MIME part traversal and combined worker/native qualification remain
 open.
 
+### 1.72 Bounded MIME parameter octets
+
+M06bs adds mime_value::Cursor as a thin facade over std-only
+td-header::mime_value. Supply one complete raw parameter value, including
+quotes when quoted=true, from an authorized complete selected MIME field.
+The helper validates the whole token/quoted spelling first, then returns
+provisional Octet { role, value } events. Complete covers this value only;
+no field, candidate, blob, boundary, charset or publication authority follows.
+Every event retires if later value, candidate or enclosing derivation fails.
+
+Mode::Ordinary removes quoted delimiters/pairs and unfolds logical CRLF or
+bare LF followed by SP/HTAB; it preserves the following whitespace. The
+quoted lexical validator retains its existing UTF-8/control rules. An
+ordinary unquoted value is a nonempty ASCII MIME token; a quoted value may
+be empty. No trimming, encoded-word decoding, scalar filtering or NFC occurs.
+Escaped CR/LF are unfolded after unquoting using the same logical-fold rule.
+Without following WSP they remain literal octets for later control filtering.
+
+ExtendedInitial additionally requires charset'language'data. Both apostrophe
+delimiters are mandatory even when either label is empty. Roles distinguish
+Charset, Language and Data octets. Charset label bytes use attribute-char
+syntax; empty or unknown labels do not establish a charset default. Language
+uses the existing lexical 1..8-letter primary and hyphenated 1..8-letter/digit
+subtag rule through shared language_tag::Tag, with no registry lookup.
+Encoded-word qualifiers use that same feed state under their existing
+precharged bounded recognition. ExtendedContinuation has data only.
+After unquoting/unfolding, data consists of ASCII attribute chars or exact
+percent triplets. Both hexadecimal cases are admitted. Quoted wrappers are
+an explicit compatibility admission; spaces or other forbidden logical bytes
+still invalidate extended data unless percent encoded. Triplets cannot span
+separate values/sections. The cursor emits decoded octets including NUL and
+invalid UTF-8; charset conversion/filtering and cross-section scalar state
+belong to the enclosing owner. Bytes introduced by this projection never
+authorize encoded-word recognition. Ordinary filename/name compatibility
+retains a separate original-source placement path.
+
+The shared Work callback admits before each source access or transition.
+Plain turns cap visits at 160 and records at 32; projection emits at most
+one octet per turn. Validation and logical fold lookahead/rereads are charged.
+The mail Budgeted owner retains the same original Meter, HeaderBudget and
+private record credit; turns cap visits at 160, aggregate steps at 192 and
+job records at 12. Octet events are parsing evidence, with no retained output
+buffer, so these helpers charge no output-byte capacity. The owner charges
+output before copying bytes into retained materialization. Cursor fits 160
+bytes and Budgeted fits 192 in the existing 16 KiB parser reservation.
+
+Live owners are neither Clone nor Copy. Cached completion is inert. Plain
+check_deadline(now, work) and Budgeted::check_deadline(now) explicitly bind
+zero-count live admission to shared check_work, latching refusal in that
+same shared cursor even after completion. Replacement meters/callbacks cannot
+revive any failure. No additional failure cache, collection or heap backing
+is introduced. Numbered candidate replay, duplicate/gap validation, display
+conversion, body-part traversal and full worker qualification remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

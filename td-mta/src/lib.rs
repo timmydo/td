@@ -49,6 +49,7 @@ pub mod mime_metadata;
 pub mod mime_qp;
 pub mod mime_text;
 pub mod mime_unfold;
+pub mod mime_value;
 pub mod nfc;
 pub mod observability;
 pub mod overlay;

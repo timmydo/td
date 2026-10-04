@@ -867,6 +867,86 @@ fn store_read_pool() {
     }
 }
 
+fn mime_value() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_value::{Budgeted, Error, Mode, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("\"{}\"", "a".repeat(65_536));
+    let unicode = format!("\"{}\"", "🐈".repeat(4096));
+    let before = COUNTERS.snapshot();
+    for (source, quoted, mode, expected) in [
+        (long.as_bytes(), true, Mode::Ordinary, Ok(())),
+        (unicode.as_bytes(), true, Mode::Ordinary, Ok(())),
+        (
+            b"UTF-8'en'%E2%82%AC%00".as_slice(),
+            false,
+            Mode::ExtendedInitial,
+            Ok(()),
+        ),
+        (
+            b"\"''%3D%3Futf-8%3FQ%3Fx%3F%3D\"",
+            true,
+            Mode::ExtendedInitial,
+            Ok(()),
+        ),
+        (
+            b"abc%",
+            false,
+            Mode::ExtendedContinuation,
+            Err(Error::Malformed),
+        ),
+        (b"\"a\r\n\tb\"", true, Mode::Ordinary, Ok(())),
+        (
+            b"utf-8'en-'x",
+            false,
+            Mode::ExtendedInitial,
+            Err(Error::Malformed),
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 1_000_000,
+                records: 1_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Budgeted::new(black_box(source), quoted, mode, &mut work, &mut budget);
+        assert!(std::mem::size_of_val(&cursor) <= 192);
+        loop {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Octet { role, value }) => {
+                    black_box((role, value));
+                }
+                Ok(Status::Complete) => {
+                    assert_eq!(expected, Ok(()));
+                    assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+                    assert_eq!(
+                        cursor.check_deadline(Tick(100)),
+                        Err(Error::Work(Stop::Deadline))
+                    );
+                    assert_eq!(cursor.poll(Tick(1)), Err(Error::Work(Stop::Deadline)));
+                    break;
+                }
+                Err(error) => {
+                    assert_eq!(expected, Err(error));
+                    assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    break;
+                }
+            }
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "MIME parameter octet projection allocated");
+}
+
 fn mime_attribute() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6124,6 +6204,7 @@ fn main() {
         mime_fields();
         mime_metadata();
         mime_attribute();
+        mime_value();
         body_value();
         mime_text();
         body_charset();
@@ -6266,6 +6347,7 @@ fn main() {
     mime_fields();
     mime_metadata();
     mime_attribute();
+    mime_value();
     body_value();
     mime_text();
     body_charset();

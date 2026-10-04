@@ -130,14 +130,8 @@ fn token_char(byte: u8) -> bool {
     byte != b'\\' && (b'!'..=b'~').contains(&byte) && !b"()<>@,;:\"/[]?.=".contains(&byte)
 }
 fn language_shape(tag: &[u8]) -> bool {
-    let mut parts = tag.split(|byte| *byte == b'-');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    (1..=8).contains(&first.len())
-        && first.iter().all(u8::is_ascii_alphabetic)
-        && parts
-            .all(|part| (1..=8).contains(&part.len()) && part.iter().all(u8::is_ascii_alphanumeric))
+    let mut shape = td_header::language_tag::Tag::new();
+    tag.iter().copied().all(|byte| shape.feed(byte)) && shape.is_complete()
 }
 
 #[cfg(test)]
