@@ -275,7 +275,7 @@ impl<T: Transport> Client<T> {
         }
         command.extend_from_slice(parameters);
         let response = self.transport.exchange(&command);
-        command.fill(0);
+        zero(&mut command);
         let mut response = response?;
         let result = (|| {
             let mut reader = Reader(&response);
@@ -330,7 +330,7 @@ impl<T: Transport> Client<T> {
             };
             Ok((handle, parameters))
         })();
-        response.fill(0);
+        zero(&mut response);
         result
     }
 
@@ -508,7 +508,7 @@ impl<T: Transport> Client<T> {
         payload: &mut [u8],
     ) -> Result<SealedObject, String> {
         if payload.is_empty() || payload.len() > MAX_SEALED_PAYLOAD {
-            payload.fill(0);
+            zero(payload);
             return Err("sealed TPM payload must hold 1 to 128 bytes".into());
         }
         let sealed = (|| {
@@ -528,23 +528,23 @@ impl<T: Transport> Client<T> {
             let mut sensitive = Vec::with_capacity(4 + payload.len());
             put_blob(&mut sensitive, &[])?;
             let marshaled = put_blob(&mut sensitive, payload);
-            payload.fill(0);
+            zero(payload);
             if let Err(error) = marshaled {
-                sensitive.fill(0);
+                zero(&mut sensitive);
                 return Err(error);
             }
             let mut parameters = Vec::with_capacity(2 + sensitive.len() + 2 + public.len() + 6);
             let marshaled = put_blob(&mut parameters, &sensitive)
                 .and_then(|()| put_blob(&mut parameters, &public))
                 .and_then(|()| put_blob(&mut parameters, &[]));
-            sensitive.fill(0);
+            zero(&mut sensitive);
             if let Err(error) = marshaled {
-                parameters.fill(0);
+                zero(&mut parameters);
                 return Err(error);
             }
             put32(&mut parameters, 0);
             let result = self.call(CREATE, &[parent], Some(PASSWORD), &parameters, false);
-            parameters.fill(0);
+            zero(&mut parameters);
             let (_, out) = result?;
             let mut reader = Reader(&out);
             let private = reader.blob()?.to_vec();
@@ -554,7 +554,7 @@ impl<T: Transport> Client<T> {
             validate_sealed_public(&public, &policy.digest())?;
             Ok(SealedObject { public, private })
         })();
-        payload.fill(0);
+        zero(payload);
         sealed
     }
 
@@ -569,14 +569,7 @@ impl<T: Transport> Client<T> {
     ) -> Result<Vec<u8>, String> {
         validate_sealed_public(public, &policy.digest())?;
         let (parent, _) = self.storage_primary(binding)?;
-        let mut parameters = Vec::new();
-        put_blob(&mut parameters, private)?;
-        put_blob(&mut parameters, public)?;
-        let (handle, out) = self.call(LOAD, &[parent], Some(PASSWORD), &parameters, true)?;
-        let handle = handle.ok_or("missing sealed object handle")?;
-        let mut reader = Reader(&out);
-        check_name(public, reader.blob()?)?;
-        reader.end()?;
+        let handle = self.load(parent, public, private)?;
         let session = self.policy_session(policy, false)?;
         let (_, mut out) = self.call(UNSEAL, &[handle], Some(session), &[], false)?;
         // Unseal consumed the session: continueSession was clear.
@@ -590,9 +583,49 @@ impl<T: Transport> Client<T> {
             }
             Ok(payload.to_vec())
         })();
-        out.fill(0);
+        zero(&mut out);
         result
     }
+
+    /// Load a sealed pair under the storage primary for `binding`, then
+    /// flush the object and the primary. The TPM refuses a private area
+    /// whose integrity does not verify under that parent; nothing is
+    /// unsealed, and the public area's format is the caller's to check.
+    pub fn load_and_flush(
+        &mut self,
+        binding: Option<&[u8; 32]>,
+        public: &[u8],
+        private: &[u8],
+    ) -> Result<(), String> {
+        let (parent, _) = self.storage_primary(binding)?;
+        let loaded = self
+            .load(parent, public, private)
+            .and_then(|handle| self.flush(handle));
+        let flushed = self.flush(parent);
+        loaded.and(flushed)
+    }
+
+    /// TPM2_Load under `parent`, checking the returned Name.
+    fn load(&mut self, parent: u32, public: &[u8], private: &[u8]) -> Result<u32, String> {
+        let mut parameters = Vec::new();
+        put_blob(&mut parameters, private)?;
+        put_blob(&mut parameters, public)?;
+        let (handle, out) = self.call(LOAD, &[parent], Some(PASSWORD), &parameters, true)?;
+        let handle = handle.ok_or("missing sealed object handle")?;
+        let mut reader = Reader(&out);
+        check_name(public, reader.blob()?)?;
+        reader.end()?;
+        Ok(handle)
+    }
+}
+
+/// Zero a buffer that held secret material. `black_box` keeps the stores
+/// observable so they are not elided before the buffer is freed; this is
+/// best effort in safe Rust and does not reach copies the allocator or
+/// the kernel made.
+pub fn zero(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(bytes);
 }
 
 /// The selection bit of one of PCRs 0 through 15.
@@ -1079,9 +1112,11 @@ mod tests {
             .is_err());
     }
 
-    /// TPM_RC_VALUE on parameter 1 and TPM_RC_POLICY_FAIL on session 1.
+    /// TPM_RC_VALUE on parameter 1, TPM_RC_POLICY_FAIL on session 1, and
+    /// TPM_RC_INTEGRITY on parameter 1 for a private area that fails Load.
     const RC_VALUE: u32 = 0x1c4;
     const RC_POLICY_FAIL: u32 = 0x99d;
+    const RC_INTEGRITY: u32 = 0x19f;
 
     /// A scripted TPM with PCR state. A real policy session's PolicyPCR
     /// refuses a composite that differs from its PCRs, a trial session
@@ -1308,7 +1343,10 @@ mod tests {
                     let mut fields = Reader(public);
                     fields.take(8).unwrap();
                     let policy = fields.blob().unwrap().to_vec();
-                    let data = private.strip_prefix(b"scripted:").unwrap().to_vec();
+                    let Some(data) = private.strip_prefix(b"scripted:") else {
+                        return response(NO_SESSIONS, RC_INTEGRITY, &[]);
+                    };
+                    let data = data.to_vec();
                     let handle = 0x8000_0000 + self.next;
                     self.objects.push((handle, policy, data));
                     out_handle = Some(handle);
@@ -1443,6 +1481,42 @@ mod tests {
             .unwrap_err()
             .contains("0x17f refused"));
         assert!(!tpm.codes().contains(&UNSEAL));
+    }
+
+    #[test]
+    fn load_and_flush_loads_the_pair_and_leaves_no_handle() {
+        let tpm = Scripted::new();
+        let policy = PcrPolicy {
+            selection: PcrSelection::new(1 << 12).unwrap(),
+            pcr_digest: pcr_digest(&[[0; 32]]),
+        };
+        let mut payload = [0x21; 32];
+        let sealed = tpm
+            .client()
+            .seal_object(&policy, None, &mut payload)
+            .unwrap();
+        tpm.codes();
+        let mut client = tpm.client();
+        client
+            .load_and_flush(None, &sealed.public, &sealed.private)
+            .unwrap();
+        assert_eq!(client.owned_handles(), 0);
+        assert_eq!(
+            tpm.codes(),
+            [CREATE_PRIMARY, LOAD, FLUSH_CONTEXT, FLUSH_CONTEXT]
+        );
+        assert!(tpm.0.borrow().objects.is_empty());
+
+        let mut private = sealed.private.clone();
+        private[2] ^= 1;
+        assert_eq!(
+            client
+                .load_and_flush(None, &sealed.public, &private)
+                .unwrap_err(),
+            "TPM command 0x157 refused: 0x19f"
+        );
+        assert_eq!(client.owned_handles(), 0);
+        assert_eq!(tpm.codes(), [CREATE_PRIMARY, LOAD, FLUSH_CONTEXT]);
     }
 
     #[test]

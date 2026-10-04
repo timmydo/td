@@ -134,8 +134,9 @@ keyboard layout. The installer displays it once on its completion screen,
 requires it to be typed back, and stores no copy. After sealing and before
 declaring success, the installer verifies that the recovery keyslot and the
 first-boot keyslot each open the volume, the latter with the secret it
-still holds, and that the sealed object's public authPolicy equals the
-PCR-12-at-zero policy computed in a trial session. The live selector has
+still holds, that the sealed object's public authPolicy equals the
+PCR-12-at-zero policy computed in a trial session, and that the TPM loads
+the sealed object under the storage primary. The live selector has
 already capped PCR 12, so the first-boot protector's first TPM release is
 on the installed first boot, and the typed-back recovery key covers its
 failure. The review discloses that the recovery key is the only way back if
@@ -148,8 +149,11 @@ then a changed selector reaches recovery and its confirmed reseal.
 
 TPM bus interposition is an invasive hardware attack, outside Scope; this
 tier's unseal sessions need not be salted or encrypted. The protector
-formats and policies are disk-specific; they share the td-tpm client
-crate with td-secret but not its application-secret formats.
+formats and policies are disk-specific: td-protector
+([td-protector/DESIGN.md](../td-protector/DESIGN.md)) carries the
+policies, protector secret and release cap that the installer and
+selector share. It runs over the td-tpm client crate shared with
+td-secret, but not over td-secret's application-secret formats.
 
 Without a usable TPM 2.0, the installer offers no device-bound volume and no
 passphrase substitute. A usable TPM has a SHA-256 PCR bank, and the live
@@ -286,7 +290,10 @@ same-uid process may impersonate the trusted UI or approve a request.
 4. Share td-secret's dependency-free TPM 2.0 client with the disk
    protector: seal to observed PCR 4 and PCR 9 values plus a literal-zero
    PCR 12, unseal under that policy, and extend and read back the release
-   cap. Application secret formats and policy do not change.
+   cap. Application secret formats and policy do not change. td-tpm and
+   td-protector carry this increment, and the selector's PCR 11
+   measurement runs over the same client; the LUKS2 token format is
+   increments 5 and 6.
 5. Add installer formatting, the first-boot protector, the recovery key,
    the no-TPM disclosure and crash-safe enrollment; preserve file-image
    testing and the single deployment publisher. Replace the retained

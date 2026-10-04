@@ -2,14 +2,14 @@
 
 td-tpm is td's shared TPM 2.0 client. AGENTS.md principle 2 puts code
 two crates need in one sibling crate, so td-secret's credential stores
-and the disk protector of `td-install/ENCRYPTION.md` increment 4 run
-over this crate instead of each carrying a copy. td-boot's selector
-PCR 11 measurement reads, extends and reads back through `read_pcr` and
-`extend_pcr`; the client's unit tests and td-boot's pin those exact
-command bytes. It is pure `std`, depends on no crate, compiles the
-engine's SHA-256 as shared source, and forbids `unsafe`; it adds no
-syscall surface to `UNSAFE.md`. The device is opened through safe file
-I/O.
+and td-protector, the disk protector of `td-install/ENCRYPTION.md`
+increment 4, run over this crate instead of each carrying a copy.
+td-boot's selector PCR 11 measurement reads, extends and reads back
+through `read_pcr` and `extend_pcr`; the client's unit tests and
+td-boot's pin those exact command bytes. It is pure `std`, depends on
+no crate, compiles the engine's SHA-256 as shared source, and forbids
+`unsafe`; it adds no syscall surface to `UNSAFE.md`. The device is
+opened through safe file I/O.
 
 ## API boundary
 
@@ -28,7 +28,9 @@ The crate owns the protocol and nothing a consumer persists or decides:
   that carry secrets (the sealed sensitive area, the Create parameters,
   `call`'s command and reply buffers, and the Unseal reply parameters)
   are allocated once at their final size, so no reallocation leaves a
-  copy, and are zeroed on every return path; the payload
+  copy, and are zeroed on every return path with `zero`, which keeps the
+  stores observable through `black_box` so they are not elided before
+  the buffer is freed. This is best effort in safe Rust. The payload
   `unseal_object` returns is the caller's to zero. A refused command is
   an error naming its code and response code; there is no retry or
   fallback.
@@ -58,6 +60,10 @@ The crate owns the protocol and nothing a consumer persists or decides:
   as it is marshaled. `unseal_object` validates the stored public area,
   loads the object under the same primary, checks its Name, unseals in a
   real policy session and returns the payload for the caller to zero.
+  `load_and_flush` loads a public and private pair under that primary,
+  checks the Name and flushes the object and the primary, so the TPM
+  verifies the private area without an unseal; the public area's format
+  is the caller's to check.
 - **PCR read and extend.** `read_pcrs` returns the selected values in
   ascending order after checking the bank, bitmap and count; it does not
   judge the values. `read_pcr` reads one. `extend_pcr` extends one with
@@ -72,8 +78,9 @@ whether an unmeasured or nonzero PCR is acceptable, the order of release
 and capping steps, and every recovery decision belong to the consumer
 and its normative document. td-secret's `TDTPM001` and `TDBOUND1`
 envelopes, its owner-UID payload prefix and its all-zero PCR refusal are
-specified in `td-secret/DESIGN.md`; the disk protector's tokens, PCR 12
-cap and recovery flow in `td-install/ENCRYPTION.md`.
+specified in `td-secret/DESIGN.md`; the disk protector's policies,
+secret and PCR 12 cap in `td-protector/DESIGN.md`, and its tokens and
+recovery flow in `td-install/ENCRYPTION.md`.
 
 Sessions are neither salted nor parameter-encrypted. Physical TPM-bus
 interposition is outside every current consumer's boundary.
@@ -95,7 +102,8 @@ payload and public-area bounds before any TPM I/O, and, against a
 scripted TPM that evaluates the policy itself, seal then unseal through
 the public API (including a policy over a PCR value supplied by the
 caller rather than read), an Unseal refused for a mismatched session
-policy, and extend then read. td-secret's tests pin
+policy, `load_and_flush` leaving no handle and refusing a private area
+the TPM will not load, and extend then read. td-secret's tests pin
 the complete seal and unseal command stream against a scripted TPM and
 its persisted envelope bytes, and its pinned-emulator and QEMU guest
 oracles exercise this client against a TPM.

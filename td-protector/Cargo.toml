@@ -1,0 +1,31 @@
+[package]
+name = "td-protector"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "td's device-bound disk protector: PCR policies, sealing, unsealing and the PCR 12 release cap over td-tpm"
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[workspace]
+
+[dependencies]
+td-tpm = { path = "../td-tpm" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true
