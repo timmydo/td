@@ -2181,8 +2181,7 @@ fn getopts_lookup(optstring: &str, c: char) -> Option<bool> {
     None
 }
 
-/// ash's `read`: busybox's `shell_builtin_read` (shell/shell_common.c), driven by
-/// `readcmd`'s `nextopt("p:u:rt:n:sd:")` (ash.c:14297). Options cluster and a
+/// ash's `read`, with its option set `-p -u -r -t -n -s -d`. Options cluster and a
 /// value-taking letter swallows the rest of its word (`-rn1`) or the next one.
 /// Where dash has only `-r`/`-p` and insists on a variable name, this takes
 /// `-n -s -t -u -d` and, given NO names, sets `REPLY` unsplit and untrimmed. An
@@ -2372,25 +2371,32 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
     let ifs = crate::expand::ifs_value(sh);
     let ifs_bytes: Vec<u8> = ifs.as_bytes().to_vec();
     let is_ifs = |c: u8| ifs_bytes.contains(&c);
-    // C's `isspace` in the C locale, which is what `shell_builtin_read` uses to
-    // tell a whitespace IFS char from a delimiting one.
+    // IFS white space is the C locale's `isspace`, so a byte decides it alone.
     let is_space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
-    // `-d ''` leaves `opt_d[0]` at the terminator, so the delimiter is NUL -- and
-    // because the NUL skip below comes AFTER the delimiter test, that works.
+    // An empty `-d` names NUL as the delimiter, which works because the
+    // delimiter is tested before NUL bytes are dropped.
     let delim: u8 = match &opt_d {
         Some(d) => d.as_bytes().first().copied().unwrap_or(0),
         None => b'\n',
     };
 
+    // POSIX 2.6.5's separator: any IFS white space, plus at most ONE other
+    // IFS character. `in_field` is whether a field is being read; outside one,
+    // `sep_has_delim` is whether the separator being read already holds its
+    // one other character, so that a second one ends an empty field. The
+    // start counts as just past a separator that has it, which is why a
+    // leading `:` under `IFS=:` is an empty first field.
+    let mut in_field = false;
+    let mut sep_has_delim = true;
     let mut buffer: Vec<u8> = Vec::new();
-    let mut startword = 1i32;
     let mut backslash = false;
     let mut vi = 0usize;
     let mut code = 0i32;
     // `-n 0` is no limit at all, so it is the absence of one rather than a count.
     let mut remaining: Option<i64> = if nchars > 0 { Some(nchars) } else { None };
-    // What one input byte does. `Stop` is the C `break` -- it does NOT tick the
-    // `-n` count -- while `Skip` is its `continue`, which does.
+    // What one input byte does. `Stop`, the delimiter, ends the read and does
+    // NOT count toward `-n`; a `Skip`ped byte -- a separator, a dropped NUL,
+    // an escaping backslash -- does count, like a `Put` one.
     enum Step {
         Put,
         Skip,
@@ -2468,32 +2474,39 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
                 break 'step Step::Skip;
             }
             // Splitting happens ONLY with names: `read` and `read REPLY` differ.
-            if !names.is_empty() {
-                let ifs_here = is_ifs(c);
-                if startword > 0 && ifs_here {
-                    if is_space(c) {
-                        break 'step Step::Skip;
-                    }
-                    // A non-space IFS char: the first one after a field still
-                    // separates, a second one starts an empty field.
-                    startword -= 1;
-                    if startword == 1 {
-                        break 'step Step::Skip;
-                    }
+            if names.is_empty() {
+                break 'step Step::Put;
+            }
+            if !is_ifs(c) {
+                in_field = true;
+                break 'step Step::Put;
+            }
+            if !in_field {
+                if is_space(c) {
+                    break 'step Step::Skip;
                 }
-                startword = 0;
-                if vi + 1 < names.len() && ifs_here {
-                    let value = String::from_utf8_lossy(&buffer).into_owned();
-                    buffer.clear();
-                    if let Some(name) = names.get(vi) {
-                        sh.set_var(name, &value)?;
-                    }
-                    vi += 1;
-                    startword = if is_space(c) { 2 } else { 1 };
+                if !sep_has_delim {
+                    sep_has_delim = true;
                     break 'step Step::Skip;
                 }
             }
-            Step::Put
+            // `c` ends a field, possibly an empty one. Each field but the last
+            // is assigned as soon as it ends, which is why a timeout leaves the
+            // earlier ones set; the last name takes the rest of the line,
+            // separators and all.
+            if vi + 1 >= names.len() {
+                in_field = true;
+                break 'step Step::Put;
+            }
+            let value = String::from_utf8_lossy(&buffer).into_owned();
+            buffer.clear();
+            if let Some(name) = names.get(vi) {
+                sh.set_var(name, &value)?;
+            }
+            vi += 1;
+            in_field = false;
+            sep_has_delim = !is_space(c);
+            Step::Skip
         };
         match step {
             Step::Stop => break,
@@ -2514,29 +2527,20 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         let value = String::from_utf8_lossy(&buffer).into_owned();
         sh.set_var("REPLY", &value)?;
     } else {
-        while buffer.last().is_some_and(|&b| is_space(b) && is_ifs(b)) {
-            buffer.pop();
-        }
-        // The last variable takes the remainder INCLUDING delimiters, but a
-        // single trailing non-space delimiter is eaten when there were exactly
-        // as many fields as names: `IFS=: read x y` gives `Y` for `X:Y:` and
-        // `Y:Z:` for `X:Y:Z:`.
-        if buffer.last().is_some_and(|&b| is_ifs(b)) {
-            let mut keep = buffer.len() - 1;
-            while keep > 0 {
-                let prev = buffer.get(keep - 1).copied().unwrap_or(0);
-                if is_space(prev) && is_ifs(prev) {
-                    keep -= 1;
-                } else {
-                    break;
-                }
-            }
-            let first_ifs = buffer
-                .iter()
-                .position(|&b| is_ifs(b))
-                .unwrap_or(buffer.len());
-            if first_ifs >= keep {
-                buffer.truncate(keep);
+        let ifs_space = |b: &u8| is_space(*b) && is_ifs(*b);
+        let end = buffer.len() - buffer.iter().rev().take_while(|b| ifs_space(b)).count();
+        buffer.truncate(end);
+        // The last name keeps its separators, except when the rest is ONE
+        // field and then one separator reaching the end: that separator goes.
+        // With `IFS=,` and two names, `1,2,` leaves `2` in the second, but
+        // `1,2,3,` leaves `2,3,`, whose rest holds two fields.
+        if let Some(sep) = buffer.iter().position(|&b| is_ifs(b)) {
+            let one_separator = buffer
+                .get(sep..)
+                .and_then(|tail| tail.split_last())
+                .is_some_and(|(&end, white)| is_ifs(end) && white.iter().all(ifs_space));
+            if one_separator {
+                buffer.truncate(sep);
             }
         }
         let value = String::from_utf8_lossy(&buffer).into_owned();
@@ -3084,9 +3088,10 @@ fn eval(sh: &mut Shell, argv: &[String]) -> R<()> {
     exec::run_source(sh, &joined)
 }
 
-/// dash's `updatepwd`: build the LOGICAL path `dir` names from `curdir`, purely
-/// lexically. `..` pops the previous component off the string without looking at
-/// the filesystem -- which is why `cd nonexistent/..` succeeds, and why a path
+/// The LOGICAL path `dir` names from `curdir`, built purely lexically as dash
+/// builds it (POSIX `cd -L` would check the component before each `..`).
+/// `..` pops the previous component off the string without looking at the
+/// filesystem -- which is why `cd nonexistent/..` succeeds, and why a path
 /// through a symlink keeps the name it was reached by rather than its target.
 fn update_pwd(curdir: &std::path::Path, dir: &str) -> std::path::PathBuf {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -3095,13 +3100,13 @@ fn update_pwd(curdir: &std::path::Path, dir: &str) -> std::path::PathBuf {
     // UTF-8 passes through untouched rather than becoming U+FFFD.
     let curdir = curdir.as_os_str().as_bytes();
     let dir = dir.as_bytes();
-    // `floor` is dash's `lim`: `..` may walk up to the root and no further -- NOT
-    // merely back to where this started, so `cd ../..` from /tmp reaches /. Two
-    // leading slashes are implementation-defined, and dash keeps them as the
-    // floor instead. The two branches test that differently, and deliberately:
-    // an ABSOLUTE operand must have exactly two (`dir[1] == '/' && dir[2] != '/'`,
-    // so `///` collapses to one), while for a relative one dash looks only at
-    // `curdir[1]`, so a curdir of `///x` still floors at two.
+    // `..` may walk up to the root, `floor`, and no further -- NOT merely back
+    // to where this started, so `cd ../..` from /tmp reaches /. Two leading
+    // slashes are implementation-defined, and dash keeps them as the floor
+    // instead. The two branches test that differently, as dash does: an
+    // ABSOLUTE operand must begin with exactly two slashes (`///` collapses to
+    // one), while a relative one floors at two whenever curdir's second byte is
+    // a slash, so a curdir of `///x` still floors at two.
     let (mut out, floor): (Vec<u8>, usize) = if dir.starts_with(b"/") {
         if dir.starts_with(b"//") && !dir.starts_with(b"///") {
             (b"//".to_vec(), 2)
@@ -7174,7 +7179,7 @@ mod tests {
     }
 
     #[test]
-    fn read_ifs_follows_the_c_locale_and_the_two_step_word_state() {
+    fn read_ifs_follows_the_c_locale_and_posix_separators() {
         // `isspace` in the C locale, which is what decides a whitespace IFS byte
         // from a delimiting one, includes CR -- so a doubled `\r` separates two
         // fields rather than leaving one in the second.
@@ -7183,9 +7188,9 @@ mod tests {
             "[a][b]"
         );
         // After a field ends on a WHITESPACE delimiter, one following non-space
-        // delimiter still separates rather than opening an empty field: ash tracks
-        // that with a two-step `startword`, and collapsing it to one step makes
-        // this `[X][:Y]`.
+        // delimiter still separates rather than opening an empty field -- one
+        // separator is white space plus at most one other IFS character --
+        // where treating each separator character alone makes this `[X][:Y]`.
         assert_eq!(
             run_capturing(
                 "printf 'X :Y\\n' | { IFS=': ' read x y; printf '[%s][%s]' \"$x\" \"$y\"; }"
