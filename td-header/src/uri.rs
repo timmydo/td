@@ -1,4 +1,4 @@
-//! Generic RFC 3986 URI syntax; no scheme-specific interpretation.
+//! Generic RFC 3986 URI and reference syntax; no resolution or scheme policy.
 use crate::{Charge, Work};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error<E> {
@@ -30,6 +30,8 @@ fn pchar(b: u8) -> bool {
 }
 #[derive(Clone, Copy)]
 enum Phase {
+    ReferenceStart,
+    ReferencePrefix { scheme: bool },
     SchemeStart,
     Scheme,
     Hierarchy,
@@ -92,6 +94,13 @@ impl<E: Copy> Validator<E> {
             failure: None,
         }
     }
+    /// URI-reference spelling, including relative and empty references.
+    /// The caller retains feed/EOF admission; no base or resolution is supplied.
+    pub const fn reference() -> Self {
+        let mut validator = Self::new();
+        validator.phase = Phase::ReferenceStart;
+        validator
+    }
     pub fn is_complete(&self) -> bool {
         self.failure.is_none() && self.complete
     }
@@ -128,6 +137,36 @@ impl<E: Copy> Validator<E> {
             return Ok(());
         }
         match self.phase {
+            Phase::ReferenceStart => match b {
+                b'/' => self.phase = Phase::Slash,
+                b'?' => self.phase = Phase::Query,
+                b'#' => self.phase = Phase::Fragment,
+                b':' => return Err(Error::Malformed),
+                _ => {
+                    self.phase = Phase::ReferencePrefix {
+                        scheme: b.is_ascii_alphabetic(),
+                    };
+                    self.path(b)?;
+                }
+            },
+            Phase::ReferencePrefix { scheme } => {
+                if b == b':' {
+                    if !scheme {
+                        return Err(Error::Malformed);
+                    }
+                    self.phase = Phase::Hierarchy;
+                } else if matches!(b, b'/' | b'?' | b'#') {
+                    // Reuse path's query/fragment delimiter transitions.
+                    self.phase = Phase::Path;
+                    self.path(b)?;
+                } else {
+                    self.phase = Phase::ReferencePrefix {
+                        scheme: scheme
+                            && (b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')),
+                    };
+                    self.path(b)?;
+                }
+            }
             Phase::SchemeStart => {
                 if !b.is_ascii_alphabetic() {
                     return Err(Error::Malformed);
@@ -359,6 +398,171 @@ mod tests {
             }
         }
         (validator.finish(), work)
+    }
+    fn validate_reference(source: &[u8]) -> (Result<(), Error<u8>>, Counter) {
+        let mut work = Counter::default();
+        let mut validator = Validator::reference();
+        for byte in source {
+            if let Err(error) = validator.push(*byte, &mut work) {
+                return (Err(error), work);
+            }
+        }
+        (validator.finish(), work)
+    }
+    #[test]
+    fn literal_rfc_relative_references_and_scheme_disambiguation() {
+        for source in [
+            "",
+            "g:h",
+            "g",
+            "./g",
+            "g/",
+            "/g",
+            "//g",
+            "?y",
+            "g?y",
+            "#s",
+            "g#s",
+            "g?y#s",
+            ";x",
+            "g;x",
+            "g;x?y#s",
+            ".",
+            "./",
+            "..",
+            "../",
+            "../g",
+            "../..",
+            "../../",
+            "../../g",
+            "../../../g",
+            "../../../../g",
+            "/./g",
+            "/../g",
+            "g.",
+            ".g",
+            "g..",
+            "..g",
+            "./../g",
+            "./g/.",
+            "g/./h",
+            "g/../h",
+            "g;x=1/./y",
+            "g;x=1/../y",
+            "g?y/./x",
+            "g?y/../x",
+            "g#s/./x",
+            "g#s/../x",
+            "http:g",
+            "http://user:pass@host:42/a",
+            "http://[::1]/",
+            "g:h/i",
+            "A+1.-:x",
+            "./g:h",
+            "/g:h",
+            "1g/h:i",
+            "g%3Ah",
+            "g?x:y",
+            "g#x:y",
+            "//user:pass@host:42/a",
+            "//[::1]/",
+            "//[v1.a:!]/",
+            "//",
+            "/",
+            "///x",
+        ] {
+            let (result, work) = validate_reference(source.as_bytes());
+            assert_eq!(result, Ok(()), "{source}");
+            assert_eq!(work.records, if source.contains("[::") { 64 } else { 0 });
+        }
+        for source in ["", "g", "./g", "/g", "//g", "?y", "#s", ".", ".."] {
+            assert_eq!(
+                validate(source.as_bytes()).0,
+                Err(Error::Malformed),
+                "absolute {source}"
+            );
+        }
+    }
+    #[test]
+    fn malformed_reference_tails_and_first_segment_colons_latch() {
+        for source in [
+            ":x",
+            "1g:h",
+            "+g:h",
+            ".:x",
+            "g_h:x",
+            "%67:h",
+            "g%20:h",
+            "%",
+            "g%a",
+            "g%xx",
+            "g h",
+            "g\\h",
+            "g#x#y",
+            "//host:bad/",
+            "//[1::2::3]/",
+            "//[v.abc]/",
+            "//[::1]x/",
+            "[x]",
+            "é",
+        ] {
+            assert_eq!(
+                validate_reference(source.as_bytes()).0,
+                Err(Error::Malformed),
+                "{source}"
+            );
+        }
+        let mut validator = Validator::reference();
+        let mut work = Counter::default();
+        for byte in b"1g" {
+            validator.push(*byte, &mut work).unwrap();
+        }
+        assert_eq!(validator.push(b':', &mut work), Err(Error::Malformed));
+        assert_eq!(
+            validator.push(b'/', &mut Counter::default()),
+            Err(Error::Malformed)
+        );
+        assert_eq!(validator.finish(), Err(Error::Malformed));
+        assert!(!validator.is_complete());
+    }
+    #[test]
+    fn reference_ipv6_and_empty_completion_refusals_are_sticky() {
+        let mut work = Counter {
+            refuse: true,
+            ..Counter::default()
+        };
+        let mut validator = Validator::reference();
+        for byte in b"//[::1" {
+            validator.push(*byte, &mut work).unwrap();
+        }
+        assert_eq!(work.calls, 0);
+        assert_eq!(validator.push(b']', &mut work), Err(Error::Work(77)));
+        assert_eq!(work.calls, 1);
+        assert!(!validator.is_complete());
+        assert_eq!(validator.finish(), Err(Error::Work(77)));
+        assert_eq!(
+            validator.check_work(&mut Counter::default()),
+            Err(Error::Work(77))
+        );
+        let mut empty = Validator::reference();
+        empty.finish().unwrap();
+        assert!(empty.is_complete());
+        empty.finish().unwrap();
+        assert_eq!(empty.check_work(&mut work), Err(Error::Work(77)));
+        assert!(!empty.is_complete());
+        assert_eq!(empty.finish(), Err(Error::Work(77)));
+        let mut fresh = Counter::default();
+        assert_eq!(empty.push(b'x', &mut fresh), Err(Error::Work(77)));
+        assert_eq!(empty.check_work(&mut fresh), Err(Error::Work(77)));
+        assert_eq!(fresh.calls, 0);
+        let mut finished = Validator::reference();
+        finished.finish().unwrap();
+        assert_eq!(finished.push(b'x', &mut fresh), Err(Error::InvalidState));
+        assert!(!finished.is_complete());
+        assert_eq!(finished.finish(), Err(Error::InvalidState));
+        assert_eq!(finished.check_work(&mut fresh), Err(Error::InvalidState));
+        assert_eq!(fresh.calls, 0);
+        assert!(std::mem::size_of::<Validator<u8>>() <= 128);
     }
     #[test]
     fn literal_uri_spelling_with_required_scheme() {

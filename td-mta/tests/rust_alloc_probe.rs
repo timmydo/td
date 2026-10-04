@@ -1229,6 +1229,82 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn uri_reference_values() {
+    use td_header::uri::{Error, Validator};
+    struct RefWork {
+        records: u64,
+        refuse: bool,
+    }
+    impl td_header::Work for RefWork {
+        type Error = u8;
+        fn charge(&mut self, charge: td_header::Charge) -> Result<(), u8> {
+            assert_eq!(charge.visits, 0);
+            if self.refuse {
+                return Err(77);
+            }
+            self.records = self.records.checked_sub(charge.records).ok_or(77)?;
+            Ok(())
+        }
+    }
+    let long = format!(
+        "./{}?{}#{}",
+        "a/".repeat(4096),
+        "x%20".repeat(4096),
+        "s".repeat(4096)
+    );
+    let before = COUNTERS.snapshot();
+    for (source, expected, records) in [
+        (b"".as_slice(), None, 64),
+        (b"../g?x#s", None, 64),
+        (long.as_bytes(), None, 64),
+        (b"http://user:pass@host:42/a", None, 64),
+        (b"http://[::1]/", None, 64),
+        (b"//[::1]/", None, 64),
+        (b"//[v1.a:!]/", None, 64),
+        (b"1g:h", Some(Error::Malformed), 64),
+        (b"g%a", Some(Error::Malformed), 64),
+        (b"//[1::2::3]/", Some(Error::Malformed), 64),
+        (b"//[::1]/", Some(Error::Work(77)), 0),
+    ] {
+        let mut work = RefWork {
+            records,
+            refuse: false,
+        };
+        let mut validator = Validator::reference();
+        let mut result = Ok(());
+        for byte in source {
+            if let Err(error) = validator.push(*byte, &mut work) {
+                result = Err(error);
+                break;
+            }
+        }
+        if result.is_ok() {
+            result = validator.finish();
+        }
+        assert_eq!(result.err(), expected);
+        if let Some(error) = expected {
+            assert!(!validator.is_complete());
+            assert_eq!(validator.finish(), Err(error));
+            assert_eq!(validator.push(b'x', &mut work), Err(error));
+            assert_eq!(validator.check_work(&mut work), Err(error));
+        } else {
+            assert!(validator.is_complete());
+            validator.finish().unwrap();
+            let remaining = work.records;
+            validator.check_work(&mut work).unwrap();
+            assert_eq!(work.records, remaining);
+            work.refuse = true;
+            assert_eq!(validator.check_work(&mut work), Err(Error::Work(77)));
+            assert!(!validator.is_complete());
+            assert_eq!(validator.finish(), Err(Error::Work(77)));
+            assert_eq!(validator.push(b'x', &mut work), Err(Error::Work(77)));
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "URI-reference spelling allocated");
+}
+
 fn content_id_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -8107,6 +8183,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        uri_reference_values();
         content_id_values();
         content_language_values();
         body_value();
@@ -8264,6 +8341,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    uri_reference_values();
     content_id_values();
     content_language_values();
     body_value();

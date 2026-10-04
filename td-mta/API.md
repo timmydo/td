@@ -4231,6 +4231,24 @@ fresh final admission and retiring the enclosing owner after refusal. The
 shared spelling result is passive and grants no I/O/publication authority.
 RESOURCES.md scopes shared state and consumer accounting qualification.
 
+### 1.92 Shared URI-reference syntax
+
+M06cm adds td_header::uri::Validator::reference for RFC 3986 URI-reference
+spelling, including empty references, relative paths, network paths and
+query/fragment-only references. A colon in the first segment requires a
+valid scheme prefix; percent spelling cannot manufacture a scheme. Paths
+preserve dots and delimiters without base resolution or normalization.
+The existing new constructor still requires a scheme, so public mail URL
+forms keep their prior grammar and accounting.
+
+Reference state shares fixed percent, host/port, IPv6/IPvFuture validation
+and sticky work/syntax refusal. Feed/EOF admission and enclosing source
+identity remain with the caller. Cached syntax completion and fresh
+zero-count check_work retain their original contracts. Callers decide
+whether empty references or particular schemes are valid in a field.
+Content-Location CFWS/folding/encoded-word decoding, first-valid part
+selection, retained JSON and worker/native/RSS remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

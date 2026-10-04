@@ -393,6 +393,11 @@ admission and typed errors. Internal IPv6 parsing keeps the same prepaid
 work and bounded buffer. No second URI parser remains in mail; relative
 Content-Location spelling and its projection are subsequent work.
 
+M06cm adds generic URI-reference spelling to the shared validator with
+fixed scheme-prefix disambiguation. Existing mail URL consumers retain the
+scheme-required constructor and original grammar/work; no base resolution,
+Content-Location field placement or retained metadata authority is added.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

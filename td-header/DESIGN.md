@@ -227,16 +227,23 @@ output retention admission remain external.
 Normative grammar: https://www.rfc-editor.org/rfc/rfc3282.html#section-2
 and https://www.rfc-editor.org/rfc/rfc3066.html#section-2.1.
 
-uri::Validator consumes already admitted ASCII octets of one URI with a
-required scheme under RFC 3986 section 3, including fragments. This is the
-URI rule; section 4.3's narrower absolute-URI rule excludes fragments. It
-retains fixed scheme/hierarchy, authority/userinfo/host/port,
-path/query/fragment and percent-triplet state. No scheme policy,
-relative-reference parsing, header whitespace/CFWS, resolution, fetching,
-source bounds or output authority follows. Empty hierarchies and empty
-generic authorities remain permitted. Percent triplets retain spelling and
-are never decoded; non-ASCII input fails. Query and fragment brackets
-require percent spelling; raw [ and ] reject under this generic URI grammar.
+uri::Validator consumes already admitted ASCII octets. new requires a scheme
+under RFC 3986 section 3, including fragments. This is the URI rule; section
+4.3's narrower absolute-URI rule excludes fragments. reference admits
+URI-reference spelling, including relative and empty references. Both retain
+fixed scheme/hierarchy, authority/userinfo/host/port, path/query/fragment
+and percent-triplet state. Neither supplies scheme policy, header
+whitespace/CFWS, resolution, fetching, source bounds or output authority.
+Empty hierarchies and empty generic authorities remain permitted. Percent
+triplets retain spelling and are never decoded; non-ASCII input fails. Query
+and fragment brackets require percent spelling; raw [ and ] reject under
+this generic URI grammar.
+
+The reference constructor uses fixed prefix state: before the first
+slash/query/fragment delimiter, a colon selects a scheme only after ALPHA
+followed by scheme characters; otherwise reject it under path-noscheme.
+Percent spelling cannot manufacture a scheme. Paths retain dot segments, and
+callers decide whether empty references are valid in their field.
 
 The caller funds each bounded feed and EOF decision before providing an
 owned octet or calling finish. A feed performs one fixed state transition;
@@ -252,4 +259,6 @@ work and retires completion on refusal. It grants no enclosing complete
 source proof. Live state is neither Copy nor Clone; enclosing callers retain
 their original allowances and latch their own refused source reads.
 
-Normative grammar: https://www.rfc-editor.org/rfc/rfc3986.html#section-3.
+Normative grammar: https://www.rfc-editor.org/rfc/rfc3986.html#section-3,
+https://www.rfc-editor.org/rfc/rfc3986.html#section-4.1
+and https://www.rfc-editor.org/rfc/rfc3986.html#section-4.2.

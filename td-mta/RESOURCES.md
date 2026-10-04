@@ -1432,6 +1432,19 @@ fixtures qualify generic syntax. Existing full wrapped mail suites pin exact
 two-pass/IPv6 costs, bounded turns and warm/measured Rust allocations.
 Relative values and worker/native/RSS remain unqualified.
 
+M06cm's URI-reference mode adds fixed prefix/scheme-disambiguation state
+inside the same 128-byte concrete shared validator ceiling. Default mail
+URL consumers retain their constructor and original source/job/header work.
+Relative and empty references use the same bounded feed and optional
+64-record <=45-byte IPv6 parse; no prefix buffer, heap list, decoded URL,
+base resolver or growing state is introduced. Shared literal RFC references,
+first-segment colon/percent tails, authority failures and sticky live/final
+refusal qualify syntax. Existing wrapped mail tests qualify default-mode
+compatibility. Warm/measured Rust allocation intervals exercise relative,
+empty, long, IPv6/IPvFuture, malformed, prepaid-work and fresh-final refusal
+paths with fixed caller work; they do not qualify mail field admission.
+Content-Location integration and worker/native/RSS remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

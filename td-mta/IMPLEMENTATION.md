@@ -1887,6 +1887,13 @@ Initial independently landable increments:
   qualify the move. Relative Content-Location values, selected metadata and
   worker/native/RSS remain open.
 
+- **M06cm — shared URI references:** add fixed-state relative/empty reference
+  spelling and first-segment scheme/colon disambiguation. Preserve default
+  scheme-required mail URL behavior and original bounds. Qualify literal RFC
+  examples, malformed percent/authority/colon tails and sticky refusal.
+  Content-Location field decoding/selection, retained metadata and
+  worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
