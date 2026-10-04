@@ -406,6 +406,11 @@ of its own files may name each module.
   (`SEARCH_DEPTH`, `SEARCH_ENTRIES`); `INSTALL_HINT`, what a program
   without the face says to do; and `read`, the bounded read of one file.
   td-term reads the four styles through it.
+- `text`: `wrap`, the greedy word wrap of a string into rows of at most
+  a number of characters (whitespace runs as one space, an overlong word
+  split, empty text one empty row, no columns the whole text as one
+  row); pure. The key help, td-pass's prompt and td-setup's welcome
+  page wrap through it.
 - `theme`: `Theme` (`name`, `colors` in `KEYS` order; `map`, a colour
   as the theme draws it; `primitive`, a draw's colours mapped; `next`),
   `ROLES` and `KEYS`, the shared palette's colour for each role; the six

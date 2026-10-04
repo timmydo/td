@@ -117,7 +117,7 @@ fn pure_files_reach_no_system_vault_or_compositor() {
         ] {
             assert!(!text.contains(denied), "{name} names {denied}");
         }
-        // Of the toolkit, only the drawing, widget and editor modules,
+        // Of the toolkit, only the drawing, text, widget and editor modules,
         // none of which reaches the system.
         for module in td_ui_modules(&text) {
             assert!(
@@ -135,6 +135,7 @@ fn pure_files_reach_no_system_vault_or_compositor() {
                     "keys",
                     "list_model",
                     "raster",
+                    "text",
                     "window",
                 ]
                 .contains(&module.as_str()),

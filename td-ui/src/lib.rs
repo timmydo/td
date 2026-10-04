@@ -104,6 +104,7 @@ pub mod reportable;
 pub mod sfnt;
 pub mod split;
 mod sys;
+pub mod text;
 pub mod theme;
 pub mod theme_file;
 pub mod tree_table;

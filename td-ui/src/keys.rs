@@ -297,7 +297,7 @@ pub fn lines(sections: &[Section], columns: usize) -> Vec<Line> {
         for row in &section.rows {
             let head = format!("  {:width$}  ", row.keys);
             let room = columns.saturating_sub(head.chars().count()).max(MIN_WRAP);
-            let mut parts = wrap(&sentence(row.what), room).into_iter();
+            let mut parts = crate::text::wrap(&sentence(row.what), room).into_iter();
             out.push(plain(format!("{head}{}", parts.next().unwrap_or_default())));
             let indent = " ".repeat(width + 4);
             out.extend(parts.map(|part| plain(format!("{indent}{part}"))));
@@ -320,35 +320,6 @@ pub fn sentence(what: &str) -> String {
     out.push_str(chars.as_str());
     if !what.ends_with(['.', '?', '!', ':']) {
         out.push('.');
-    }
-    out
-}
-
-/// `text` in pieces of at most `room` characters, broken at spaces where
-/// a word allows, a run of spaces read as one; one empty piece for empty
-/// text.
-fn wrap(text: &str, room: usize) -> Vec<String> {
-    let room = room.max(1);
-    let mut out = Vec::new();
-    let mut line: Vec<char> = Vec::new();
-    for word in text.split_whitespace() {
-        let mut word: Vec<char> = word.chars().collect();
-        if !line.is_empty() && line.len() + 1 + word.len() > room {
-            out.push(line.drain(..).collect());
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.append(&mut word);
-        // Only a word wider than the room leaves the line wider.
-        while line.len() > room {
-            let rest = line.split_off(room);
-            out.push(line.drain(..).collect());
-            line = rest;
-        }
-    }
-    if !line.is_empty() || out.is_empty() {
-        out.push(line.into_iter().collect());
     }
     out
 }

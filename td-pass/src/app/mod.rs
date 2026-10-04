@@ -2193,8 +2193,8 @@ fn prompt_view(surface: Surface, ask: &Ask) -> (layout::Prompt, Vec<String>, Vec
     let columns = layout::prompt_columns(surface);
     let pin = ask.pin.is_some();
     let rows = layout::prompt_text_rows(surface, pin);
-    let mut line = wrap(&instruction(ask), columns);
-    let mut title = wrap(ask.operation, columns);
+    let mut line = td_ui::text::wrap(&instruction(ask), columns);
+    let mut title = td_ui::text::wrap(ask.operation, columns);
     shorten(&mut line, rows.saturating_sub(1).max(1), columns);
     shorten(&mut title, rows.saturating_sub(line.len()).max(1), columns);
     let view = layout::prompt(surface, pin, title.len(), line.len());
@@ -2214,43 +2214,6 @@ fn shorten(rows: &mut Vec<String>, keep: usize, columns: usize) {
         }
         last.push('…');
     }
-}
-
-/// `text` broken at spaces into rows of at most `columns` characters, a
-/// word longer than a row split across rows. No columns is one row.
-fn wrap(text: &str, columns: usize) -> Vec<String> {
-    if columns == 0 {
-        return vec![text.to_owned()];
-    }
-    let mut rows = Vec::new();
-    let mut row = String::new();
-    let mut width = 0;
-    for word in text.split_whitespace() {
-        let length = word.chars().count();
-        if width > 0 && width + 1 + length <= columns {
-            row.push(' ');
-            row.push_str(word);
-            width += 1 + length;
-            continue;
-        }
-        if width > 0 {
-            rows.push(std::mem::take(&mut row));
-        }
-        let mut rest = word;
-        while let Some((at, _)) = rest.char_indices().nth(columns) {
-            let Some((head, tail)) = rest.split_at_checked(at) else {
-                break;
-            };
-            rows.push(head.to_owned());
-            rest = tail;
-        }
-        row.push_str(rest);
-        width = rest.chars().count();
-    }
-    if width > 0 || rows.is_empty() {
-        rows.push(row);
-    }
-    rows
 }
 
 #[cfg(test)]

@@ -50,8 +50,9 @@ const BODY_Y: usize = 3 * ROW;
 
 /// Word-wraps `paragraphs` to `columns` cells, one blank line between
 /// paragraphs, so the result drops straight into a `Block` without the
-/// block re-wrapping. A word longer than `columns` is hard-broken rather
-/// than overrun. Every line is at most `columns` characters.
+/// block re-wrapping. Each paragraph is `td_ui::text::wrap`'s: a word
+/// longer than `columns` is hard-broken rather than overrun, and every
+/// line is at most `columns` characters.
 pub fn wrap(paragraphs: &[&str], columns: usize) -> Vec<String> {
     let columns = columns.max(1);
     let mut lines = Vec::new();
@@ -59,70 +60,9 @@ pub fn wrap(paragraphs: &[&str], columns: usize) -> Vec<String> {
         if index > 0 {
             lines.push(String::new());
         }
-        let start = lines.len();
-        wrap_paragraph(paragraph, columns, &mut lines);
-        if lines.len() == start {
-            lines.push(String::new());
-        }
+        lines.extend(td_ui::text::wrap(paragraph, columns));
     }
     lines
-}
-
-fn wrap_paragraph(paragraph: &str, columns: usize, lines: &mut Vec<String>) {
-    let mut line = String::new();
-    let mut length = 0;
-    for word in paragraph.split_whitespace() {
-        let word_length = word.chars().count();
-        if word_length > columns {
-            if length > 0 {
-                lines.push(std::mem::take(&mut line));
-                length = 0;
-            }
-            for chunk in chunks(word, columns) {
-                lines.push(chunk);
-            }
-            if let Some(last) = lines.pop() {
-                length = last.chars().count();
-                line = last;
-            }
-            continue;
-        }
-        let separator = usize::from(length > 0);
-        if length + separator + word_length > columns {
-            lines.push(std::mem::take(&mut line));
-            line.push_str(word);
-            length = word_length;
-        } else {
-            if separator == 1 {
-                line.push(' ');
-            }
-            line.push_str(word);
-            length += separator + word_length;
-        }
-    }
-    if length > 0 {
-        lines.push(line);
-    }
-}
-
-/// Splits `word` into pieces of at most `columns` characters.
-fn chunks(word: &str, columns: usize) -> Vec<String> {
-    let columns = columns.max(1);
-    let mut pieces = Vec::new();
-    let mut piece = String::new();
-    let mut length = 0;
-    for character in word.chars() {
-        if length == columns {
-            pieces.push(std::mem::take(&mut piece));
-            length = 0;
-        }
-        piece.push(character);
-        length += 1;
-    }
-    if length > 0 {
-        pieces.push(piece);
-    }
-    pieces
 }
 
 /// The installer's welcome page over one surface: the wrapped disclosure

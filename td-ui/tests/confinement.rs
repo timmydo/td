@@ -58,6 +58,7 @@ const PURE: &[&str] = &[
     "repeat.rs",
     "sfnt.rs",
     "split.rs",
+    "text.rs",
     "theme.rs",
     "tree_table.rs",
     "tree_table_geometry.rs",

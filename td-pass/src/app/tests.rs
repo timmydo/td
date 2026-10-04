@@ -2563,27 +2563,6 @@ fn closing_while_swap_is_asked_about_quits_with_nothing_open() {
 }
 
 #[test]
-fn wrapping_keeps_every_word_whole_within_its_columns() {
-    let text = "create a portable vault: enroll the separate backup key";
-    let rows = wrap(text, 20);
-    assert_eq!(
-        rows,
-        [
-            "create a portable",
-            "vault: enroll the",
-            "separate backup key"
-        ]
-    );
-    assert_eq!(rows.join(" "), text);
-    // A word longer than a row is split; nothing fits, nothing is broken.
-    assert_eq!(wrap("0123456789ab cd", 5), ["01234", "56789", "ab cd"]);
-    assert_eq!(wrap("exactly five", 5), ["exact", "ly", "five"]);
-    assert_eq!(wrap("", 10), [""]);
-    assert_eq!(wrap("one two", 0), ["one two"]);
-    assert_eq!(wrap("é é é", 3), ["é é", "é"]);
-}
-
-#[test]
 fn a_prompt_shows_its_words_and_keeps_its_field_and_buttons_on_the_window() {
     let operations = [
         "create a portable vault: enroll the primary key",
@@ -2692,10 +2671,10 @@ fn a_prompt_shows_its_words_and_keeps_its_field_and_buttons_on_the_window() {
         assert_eq!(asking(&asked), format!("{said}, to {}", operations[1]));
     }
     // Cut short, a text ends in an ellipsis within its columns.
-    let mut rows = wrap("one two three four five six", 9);
+    let mut rows = td_ui::text::wrap("one two three four five six", 9);
     shorten(&mut rows, 2, 9);
     assert_eq!(rows, ["one two", "three…"]);
-    let mut rows = wrap("abcdefghijk", 4);
+    let mut rows = td_ui::text::wrap("abcdefghijk", 4);
     shorten(&mut rows, 2, 4);
     assert_eq!(rows, ["abcd", "efg…"]);
 }
