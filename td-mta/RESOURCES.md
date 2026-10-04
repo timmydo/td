@@ -1196,6 +1196,24 @@ and a dedicated Rust allocation interval qualify this source composition.
 State-size overlap sums are layout evidence, not native compiler stack or
 complete worker/RSS qualification. Retained output remains the later owner.
 
+M06cb qualifies the retained filename owner plus HeaderBudget within 4800
+bytes of the existing 16 KiB parser reservation. It owns one parameter NFC
+cursor at a time, preserves M06ca's source/temporary bounds and borrows the
+same exclusive 3072-byte conversion scratch. One newly active field transition
+costs one aggregate step; source turns retain the 225-visit/457-step/30-record
+ceilings. Each emitted scalar adds bounded UTF-8 output admission/copy. Output
+is caller-reserved backing charged to the enclosing response/work reservation;
+no decoded intermediate, per-part string or new ledger pool is allocated.
+capacity_bound(n) supplies a checked conservative 16*n UTF-8 byte bound for
+one raw selected field value: decoding emits at most one scalar per original
+field byte, canonical decomposition emits at most four scalars, and each
+scalar needs at most four UTF-8 bytes. Filtering/composition cannot enlarge
+that bound; replay does not duplicate retained output. This arithmetic bound
+does not authorize allocating an arena of that size: callers reserve within
+their existing bounded work window and may refuse an oversized valid name.
+Capacity failure retires the entire value. Layout evidence does not qualify
+native compiler stack, complete worker composition or RSS.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

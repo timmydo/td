@@ -867,6 +867,368 @@ fn store_read_pool() {
     }
 }
 
+fn mime_filename_retention() {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        mime_filename::{Cursor, Fields, Origin, Status},
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        "attachment;filename=\"a{}{}x\"",
+        "\u{301}".repeat(257),
+        "\u{327}".repeat(257)
+    );
+    let long_normalized = format!("á{}{}x", "\u{327}".repeat(257), "\u{301}".repeat(256));
+    assert!(std::mem::size_of::<Cursor<'_, '_>>() + std::mem::size_of::<HeaderBudget>() <= 4800);
+    let nested = format!("{}{}text/plain;name=f", "(".repeat(33), ")".repeat(33));
+    let exhausting = format!("{}: one\n{}: two\n\n", "x".repeat(4096), "x".repeat(4096));
+    let key = format!("header:{}:all", "x".repeat(4096));
+    let mut property =
+        td_mta::header_property::Cursor::new(&key, td_mta::header_property::Context::Email);
+    let mut prep = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 100_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut selected = None;
+    for _ in 0..10_000 {
+        if let td_mta::header_property::Status::Complete(value) =
+            property.poll(Tick(1), &mut prep).unwrap()
+        {
+            selected = value;
+            break;
+        }
+    }
+    let selected = selected.unwrap();
+    let before = COUNTERS.snapshot();
+    for (disposition, content_type, expected, origin, rejected, problem) in [
+        (
+            Some(long.as_bytes()),
+            None,
+            Some(long_normalized.as_str()),
+            Some(Origin::Disposition),
+            false,
+            false,
+        ),
+        (
+            Some(b"attachment;filename*=utf-8''%xx".as_slice()),
+            Some(b"text/plain;name*=utf-8'en'e%CC%81".as_slice()),
+            Some("é"),
+            Some(Origin::ContentType),
+            true,
+            false,
+        ),
+        (
+            Some(b"attachment;filename=\"=?utf-8?Q?e?= =?utf-8?Q?=CC=81?=\"".as_slice()),
+            Some(b"text/plain;name=other".as_slice()),
+            Some("é"),
+            Some(Origin::Disposition),
+            false,
+            false,
+        ),
+        (
+            Some(b"attachment;filename=\"\"".as_slice()),
+            Some(b"text/plain;name=other".as_slice()),
+            Some(""),
+            Some(Origin::Disposition),
+            false,
+            false,
+        ),
+        (
+            Some(b"attachment;filename*=utf-8''%FF".as_slice()),
+            None,
+            Some("�"),
+            Some(Origin::Disposition),
+            false,
+            true,
+        ),
+        (None, None, None, None, false, false),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 100_000_000,
+                output_bytes: 100_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut output = [0; 2048];
+        let mut cursor = Cursor::new(
+            Fields {
+                disposition: black_box(disposition),
+                content_type: black_box(content_type),
+            },
+            &mut output,
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        );
+        assert!(cursor.value().is_none());
+        let mut finished = false;
+        for _ in 0..100_000 {
+            if let Status::Complete(end) = cursor.poll(Tick(1)).unwrap() {
+                assert_eq!(cursor.value(), expected.map(str::as_bytes));
+                assert_eq!(end.origin, origin);
+                assert_eq!(end.invalid_extended, rejected);
+                assert_eq!(end.is_encoding_problem, problem);
+                assert_eq!(end.bytes, expected.map_or(0, str::len));
+                assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete(end)));
+                cursor.check_deadline(Tick(1)).unwrap();
+                let error = cursor.check_deadline(Tick(100)).err().unwrap();
+                assert!(cursor.value().is_none());
+                assert_eq!(cursor.poll(Tick(1)), Err(error));
+                assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished);
+        assert!(cursor.finish(Tick(1)).is_err());
+    }
+    // Healthy handoff retains bytes while returning the exact original owners.
+    {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let addresses = (&work as *const _, &budget as *const _, &scratch as *const _);
+        let mut output = [0; 16];
+        let mut cursor = Cursor::new(
+            Fields {
+                disposition: black_box(Some(b"attachment;filename=a".as_slice())),
+                content_type: None,
+            },
+            &mut output,
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        );
+        let mut finished = false;
+        for _ in 0..100_000 {
+            if let Status::Complete(_) = cursor.poll(Tick(1)).unwrap() {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished);
+        let (retained, work, budget, scratch) = cursor.finish(Tick(1)).unwrap();
+        assert_eq!(retained.value(), Some(b"a".as_slice()));
+        assert_eq!(
+            addresses,
+            (work as *const _, budget as *const _, scratch as *const _)
+        );
+    }
+    for capacity in 0..3 {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut output = [0; 3];
+        let mut cursor = Cursor::new(
+            Fields {
+                disposition: Some(b"attachment;filename*=utf-8''e%CC%81x"),
+                content_type: Some(b"text/plain;name=f"),
+            },
+            output.get_mut(..capacity).unwrap(),
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        );
+        let mut error = None;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete(_)) => panic!("short filename backing completed"),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        let error = error.unwrap();
+        assert_eq!(error, td_mta::mime_filename::Error::OutputCapacity);
+        assert!(cursor.value().is_none());
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+    }
+    for charge in [
+        Charge {
+            io_bytes: 0,
+            records: 100_000,
+            output_bytes: 100_000,
+            ..Charge::default()
+        },
+        Charge {
+            io_bytes: 100_000,
+            records: 0,
+            output_bytes: 100_000,
+            ..Charge::default()
+        },
+        Charge {
+            io_bytes: 100_000,
+            records: 100_000,
+            output_bytes: 0,
+            ..Charge::default()
+        },
+    ] {
+        let mut work = Meter::new(Deadline::after(Tick(0), 100).unwrap(), charge);
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut output = [0; 16];
+        let mut cursor = Cursor::new(
+            Fields {
+                disposition: Some(b"attachment;filename*=utf-8''e%CC%81x"),
+                content_type: Some(b"text/plain;name=f"),
+            },
+            &mut output,
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        );
+        let mut error = None;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete(_)) => panic!("refused filename completed"),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        let error = error.unwrap();
+        assert!(cursor.value().is_none());
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+    }
+    for source in [b"text/plain;name=f;broken".as_slice(), nested.as_bytes()] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut output = [0; 16];
+        let mut cursor = Cursor::new(
+            Fields {
+                disposition: None,
+                content_type: black_box(Some(source)),
+            },
+            &mut output,
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        );
+        let mut error = None;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete(_)) => panic!("malformed filename field completed"),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        let error = error.unwrap();
+        assert!(matches!(error, td_mta::mime_filename::Error::Decode(_)));
+        assert!(cursor.value().is_none());
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+    }
+    // Exhaust the same aggregate through another public interpretation owner.
+    {
+        use td_mta::header_select::{
+            Cursor as Select, Error as SelectError, SourceEnd, Status as Selected,
+        };
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 100_000_000,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut exhausted = false;
+        for _ in 0..2000 {
+            let mut cursor = Select::new(
+                black_box(exhausting.as_bytes()),
+                0,
+                exhausting.len() as u64,
+                selected,
+                SourceEnd::Prefix,
+            );
+            let mut complete = false;
+            for _ in 0..10_000 {
+                match cursor.poll_with_budget(Tick(1), &mut work, &mut budget) {
+                    Ok(Selected::Complete(_)) => {
+                        complete = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(SelectError::InterpretationLimit) => {
+                        exhausted = true;
+                        break;
+                    }
+                    Err(e) => panic!("unexpected aggregate refusal: {e}"),
+                }
+            }
+            assert!(complete || exhausted);
+            if exhausted {
+                break;
+            }
+        }
+        assert!(exhausted);
+        let mut scratch = Scratch::new();
+        let mut output = [0; 16];
+        let mut cursor = Cursor::new(
+            Fields {
+                disposition: Some(b"attachment;filename=a"),
+                content_type: None,
+            },
+            &mut output,
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        );
+        let error =
+            td_mta::mime_filename::Error::Admission(td_mta::nfc::Error::InterpretationLimit);
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+        assert!(cursor.value().is_none());
+        assert!(cursor.finish(Tick(1)).is_err());
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "filename retention allocated");
+}
+
 fn mime_parameter_nfc() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -6863,6 +7225,7 @@ fn main() {
         mime_parameter_scalars();
         mime_parameter_display();
         mime_parameter_nfc();
+        mime_filename_retention();
         body_value();
         mime_text();
         body_charset();
@@ -7012,6 +7375,7 @@ fn main() {
     mime_parameter_scalars();
     mime_parameter_display();
     mime_parameter_nfc();
+    mime_filename_retention();
     body_value();
     mime_text();
     body_charset();

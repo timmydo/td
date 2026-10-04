@@ -3848,6 +3848,53 @@ cuts, final output/deadline cuts and Rust allocation intervals qualify this
 composition. No external dependency, manifest/lock, feature, unsafe, crypto
 backend or staging-policy change is introduced.
 
+### 1.81 Retained MIME filename precedence
+
+M06cb adds mime_filename::Cursor over exact first-valid selected disposition
+and type field values. Those borrowed views and their entity/header authority
+belong to the metadata owner. Fields must never include later duplicates.
+The cursor tries disposition Filename first and type Name only when no plan
+was selected. Each field's selector retains its complete extended-family over
+first ordinary preference. Malformed extended-family diagnostics accumulate
+across the attempted fields, separately from final charset/display diagnostics.
+A present empty candidate, including one emptied by scalar filtering, wins;
+absence is not inferred from normalized output length. Malformed whole-field,
+nesting, work and interpretation refusals retire the cursor without fallback.
+
+The owner borrows original Meter/HeaderBudget/Scratch and caller-reserved UTF-8
+output backing. It owns at most one parameter normalization cursor. Each field
+transition is admitted against the original aggregate allowance; every source
+turn retains M06ca's ceilings. Normalized scalars are output-charged before
+copying whole UTF-8 encodings into checked backing. Insufficient backing is
+OutputCapacity, never truncation or a reason to select a lower-priority name.
+No source, label, intermediate value or output Vec/String is allocated here.
+
+value() returns validated UTF-8 bytes without rescanning them, and no bytes
+before Complete. It distinguishes absent from present
+empty. Complete carries Origin, exact UTF-8 byte length and passive diagnostics.
+Final source completion receives fresh admission before release; cached
+Complete/value are inert and cannot authorize publication after time passes.
+check_deadline obtains fresh admission and hides the value on any refusal,
+including after cached completion. Refusal preserves its original typed error:
+Admission carries every original work/deadline/interpretation refusal across
+all phases; Decode preserves source syntax/normalization invariant errors.
+Both are fatal; either retires the borrowed source owner and clears logical output length/result.
+Backing bytes are not erased; this is logical retirement, not secret erasure.
+The enclosing metadata/job owner must obtain final admission before publication.
+A returned display name is never a filesystem path or blob/locator authority.
+finish(now) requires healthy Complete and fresh admission, returning passive
+Retained UTF-8 bytes/End plus original work/header/scratch references. This
+permits further metadata under those original owners without copying the name
+or rebuilding a slice from a saved End. Failed or premature finish yields no
+retained view. All handed-off results remain provisional at the enclosing job
+boundary and require its fresh final publication admission.
+
+RESOURCES.md owns the cursor, scratch and caller-backing reservations and
+capacity_bound(field_bytes)'s checked conservative UTF-8 size bound. The
+invalid_extended flag aggregates rejected families in any attempted field;
+Origin names only the selected field. POLICY.md owns display-name use.
+Complete worker/native/RSS qualification and MIME part traversal remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

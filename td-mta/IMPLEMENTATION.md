@@ -1805,6 +1805,14 @@ Initial independently landable increments:
   reservations without widening header-source ceilings. Filename precedence,
   retention, selected boundary metadata and traversal remain open.
 
+- **M06cb — retained filename precedence:** use exact first-valid selected
+  disposition/type fields and complete extended/ordinary candidate rules.
+  Treat selected empty output as present. Normalize into caller-reserved
+  backing, charge each scalar before copying and retire on capacity/work/
+  interpretation failure. Qualify original cuts, sticky retirement and
+  fresh final admission. Selected boundary/charset metadata, traversal and
+  complete worker/native/RSS qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

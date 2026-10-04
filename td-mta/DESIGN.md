@@ -304,6 +304,14 @@ existing parser/conversion reservations and preserves the smaller header
 source enum. Completion remains provisional metadata, with filename
 precedence/retention and complete MIME traversal still separate increments.
 
+M06cb retains derived filenames in caller-reserved backing under one original
+work/header owner. Disposition filename precedes type name; a present empty
+plan wins. Only absent plans continue to the next field. Whole-field syntax,
+work, interpretation and output-capacity failures retire retained bytes rather
+than choosing a lower-priority candidate. Completed display bytes are passive
+metadata, never paths or locator authority; enclosing publication needs fresh
+admission. This adds no per-part heap strings or resource arena.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in
