@@ -1911,6 +1911,15 @@ Initial independently landable increments:
   composition suites retain their bounds. Content-Location fixed scratch,
   placement/CFWS policy, retained metadata and worker/native/RSS remain open.
 
+- **M06cp — selected URI encoded words:** compose shared wire unfolding,
+  complete recognition and private payload-free decoding through fixed
+  75-octet movable scratch. Relative metadata preserves borrowed word shape
+  and language without self references. Unknown/oversized candidates request
+  whole literal replay; malformed late folds fail before scalar emission.
+  Original job/header owners and consuming fresh handoff govern provisional
+  scalars. Whole Content-Location CFWS/placement, URI validation, retained
+  metadata and worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

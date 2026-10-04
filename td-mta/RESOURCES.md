@@ -1690,6 +1690,19 @@ source admission. Existing warm/measured allocation intervals exercise the
 public wrapper's migrated core; they do not qualify a future scratch-backed
 Content-Location pipeline or complete worker/native/RSS bounds.
 
+M06cp's selected URI word cursor plus HeaderBudget fits 512 bytes in the
+existing parser region. Its only payload scratch is a fixed 75-octet array;
+private relative Descriptor fits 16 bytes and the actual mail-error URI
+unfolder fits 64 bytes. No second header arena is introduced. Each poll
+visits at most 225 source/scratch bytes, spends at most 452 interpretation
+steps and 29 job records, and emits at most one scalar with up to four UTF-8
+output bytes. Recognition prepays bounded scans once; reconstruction reads
+relative metadata without rescanning bytes. Oversized candidates retain no
+growing buffer and continue complete wire validation before literal fallback.
+The selected-reader allocation intervals cover folded Q/Base64 success,
+repair, unknown/oversized fallback and late malformed/fresh deadline refusal.
+Whole-field placement, pipeline/worker/native/RSS qualification remain open.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

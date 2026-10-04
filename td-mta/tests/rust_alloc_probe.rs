@@ -1229,6 +1229,98 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn uri_word_values() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_location_word::{Cursor, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let maximum = format!("=?ascii?Q?{}\r\n     {}?=", "a".repeat(31), "a".repeat(32));
+    let boundary = format!("=?ascii?Q?{}?=", "a".repeat(64));
+    let oversized = format!("=?ascii?Q?{}?=", "a".repeat(100));
+    let mut bad_tail = oversized.clone();
+    bad_tail.push_str("\r\n");
+    let before = COUNTERS.snapshot();
+    for (source, recognized, fault) in [
+        (b"=?utf-8?Q?e=CC\r\n =81?=".as_slice(), true, None),
+        (b"=?ascii*en?B?Zm 9v?=", true, None),
+        (b"=?utf-8?Q?=FF=00=EF=B7=90?=", true, None),
+        (b"=?ascii?B?Zh==?=", true, None),
+        (b"=?unknown?Q?a?=", false, None),
+        (maximum.as_bytes(), true, None),
+        (boundary.as_bytes(), false, None),
+        (oversized.as_bytes(), false, None),
+        (bad_tail.as_bytes(), false, Some(Error::MalformedFold)),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: 100_000,
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(source, &mut work, &mut budget);
+        let mut result = None;
+        let mut complete = false;
+        for _ in 0..10_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Scalar(value)) => {
+                    black_box(value);
+                }
+                Ok(Status::Yield) => {}
+                Ok(Status::Complete) => {
+                    complete = true;
+                    break;
+                }
+                Err(error) => {
+                    result = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(result, fault);
+        if let Some(error) = fault {
+            assert_eq!(cursor.end(), None);
+            assert_eq!(cursor.poll(Tick(1)), Err(error));
+        } else {
+            assert!(complete);
+            assert_eq!(cursor.end().unwrap().recognized, recognized);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            let (work, budget, end) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(end.recognized, recognized);
+            let mut cursor = Cursor::new(source, work, budget);
+            let mut complete = false;
+            for _ in 0..10_000 {
+                match cursor.poll(Tick(1)).unwrap() {
+                    Status::Scalar(value) => {
+                        black_box(value);
+                    }
+                    Status::Yield => {}
+                    Status::Complete => {
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+            assert!(complete);
+            assert_eq!(cursor.end().unwrap().recognized, recognized);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            assert_eq!(
+                cursor.check_deadline(Tick(100)),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert!(cursor.finish(Tick(1)).is_err());
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "URI selected word allocated");
+}
+
 fn uri_unfold_values() {
     use td_header::uri::unfold::{Cursor, Error, Status};
     struct UnfoldWork {
@@ -8259,6 +8351,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        uri_word_values();
         uri_unfold_values();
         uri_reference_values();
         content_id_values();
@@ -8418,6 +8511,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    uri_word_values();
     uri_unfold_values();
     uri_reference_values();
     content_id_values();

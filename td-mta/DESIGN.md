@@ -415,6 +415,19 @@ provided the same recognized logical bytes remain immutable. Shape checks
 cover charset, encoding and length, not byte identity or placement. This
 supplies no new field grammar or Content-Location label authority.
 
+M06cp composes URI wire unfolding and complete encoded-word recognition
+for one caller-selected, placement-authorized candidate. A fixed 75-octet
+scratch remains immutable during decoding; private relative word metadata
+reconstructs views after moves without self references or repeated scans.
+Oversized or unknown candidates request whole literal replay. All wire folds
+are validated before scalar emission, including tails after scratch fills.
+Recognition uses the Text Q alphabet because the authorized candidate is
+neither a phrase nor a comment; parentheses and quotes remain payload data,
+without granting placement. The original job/header owners charge source,
+scratch transitions, recognition, decoding and output. Whole-field
+CFWS/placement and URI label validity remain
+open; the helper grants no Content-Location or publication authority.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

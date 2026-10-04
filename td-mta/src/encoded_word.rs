@@ -1,6 +1,8 @@
 //! Bounded encoded-word recognition/decoding; the caller owns lexical placement.
 pub mod decode;
 
+pub(crate) const MAX_TOKEN_OCTETS: usize = 75;
+
 use crate::{
     admission::work::{Charge, Meter, Stop},
     mime_charset::Charset,
@@ -25,7 +27,69 @@ pub struct Word<'a> {
     charset: Charset,
     encoding: Encoding,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Span {
+    start: u8,
+    end: u8,
+}
+impl Span {
+    fn within(source: &[u8], part: &[u8]) -> Option<Self> {
+        let start = (part.as_ptr() as usize).checked_sub(source.as_ptr() as usize)?;
+        let end = start.checked_add(part.len())?;
+        source.get(start..end)?;
+        Some(Self {
+            start: u8::try_from(start).ok()?,
+            end: u8::try_from(end).ok()?,
+        })
+    }
+    fn view(self, source: &[u8]) -> Option<&[u8]> {
+        source.get(usize::from(self.start)..usize::from(self.end))
+    }
+}
+/// Private relative metadata for already recognized bytes in movable scratch.
+/// The owner keeps logical bytes immutable and retains placement/admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Descriptor {
+    length: u8,
+    payload: Span,
+    language: Option<Span>,
+    charset: Charset,
+    encoding: Encoding,
+}
+impl Descriptor {
+    pub(crate) fn resume(self, source: &[u8]) -> Option<Word<'_>> {
+        if source.len() != usize::from(self.length) {
+            return None;
+        }
+        Some(Word {
+            payload: self.payload.view(source)?,
+            language: match self.language {
+                Some(span) => Some(span.view(source)?),
+                None => None,
+            },
+            charset: self.charset,
+            encoding: self.encoding,
+        })
+    }
+}
 impl<'a> Word<'a> {
+    /// Metadata only; the exact recognized token remains immutable in its owner.
+    pub(crate) fn descriptor(self, source: &[u8]) -> Option<Descriptor> {
+        if source.len() > MAX_TOKEN_OCTETS {
+            return None;
+        }
+        Some(Descriptor {
+            length: u8::try_from(source.len()).ok()?,
+            payload: Span::within(source, self.payload)?,
+            language: match self.language {
+                Some(language) => Some(Span::within(source, language)?),
+                None => None,
+            },
+            charset: self.charset,
+            encoding: self.encoding,
+        })
+    }
     /// Supply a complete token whose surrounding grammar permits an encoded word.
     /// None means retain the literal token, never decode a convenient prefix.
     pub fn recognize(
@@ -53,7 +117,7 @@ impl<'a> Word<'a> {
             records: 1,
             ..Charge::default()
         })?;
-        if !(9..=75).contains(&token.len()) {
+        if !(9..=MAX_TOKEN_OCTETS).contains(&token.len()) {
             return Ok(None);
         }
         // Precharge three bounded scans and one fixed charset lookup (above).
@@ -151,6 +215,29 @@ mod tests {
     }
     fn parse(token: &[u8], context: Context) -> Option<Word<'_>> {
         Word::recognize(token, context, Tick(1), &mut meter()).unwrap()
+    }
+    #[test]
+    fn relative_descriptor_reconstructs_relocated_recognized_views() {
+        assert!(std::mem::size_of::<Descriptor>() <= 16);
+        for token in [b"=?utf-8*en-GB?Q?a=CC=81?=".as_slice(), b"=?ascii?B?Zm9v?="] {
+            let source = token.to_vec();
+            let relocated = token.to_vec();
+            let word = parse(&source, Context::Text).unwrap();
+            let descriptor = word.descriptor(&source).unwrap();
+            assert_eq!(word.descriptor(&relocated), None);
+            assert_eq!(
+                descriptor.resume(&relocated),
+                parse(&relocated, Context::Text)
+            );
+            assert_eq!(
+                descriptor.resume(relocated.get(..relocated.len() - 1).unwrap()),
+                None
+            );
+            assert!(std::ptr::eq(
+                descriptor.resume(&relocated).unwrap().payload(),
+                parse(&relocated, Context::Text).unwrap().payload()
+            ));
+        }
     }
     #[test]
     fn known_labels_encodings_and_language_qualifiers_are_borrowed() {

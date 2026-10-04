@@ -4296,6 +4296,35 @@ live enclosing owner. Existing source-bound checkpoints may copy pure progress
 without copying or replacing admission. No public source-free decoder or
 Content-Location composition is introduced.
 
+### 1.95 Selected URI encoded-word reader
+
+M06cp adds mime_location_word::Cursor over one caller-selected and
+placement-authorized URI encoded-word wire spelling, excluding surrounding
+CFWS and the final header line ending. It removes wire whitespace through
+the shared URI unfold cursor before recognizing a complete encoded word.
+Complete fold validation precedes every scalar; malformed tails fail even
+when the logical candidate exceeds the 75-octet fixed scratch buffer.
+Unknown charset, invalid word syntax or oversized candidates complete with
+End.recognized false and no scalars. The enclosing owner replays that whole
+literal token; this reader supplies no prefix fallback or URI validation.
+
+Recognized logical bytes stay immutable in the owned fixed scratch through
+decoding. Private relative Descriptor metadata reconstructs borrowed Word
+views after cursor moves, preserving language metadata without source
+pointers, byte scans or repeated recognition. The cursor funds recognition
+and decoding through its original job/header owners. The caller separately
+funds placement and source selection.
+Descriptor reconstruction grants no admission and does not bind byte content.
+
+Cursor is neither Copy nor Clone and retains the original job Meter and
+aggregate HeaderBudget. Scalars have separately charged UTF-8 output and
+remain provisional until Complete and fresh original admission. end returns
+recognition and repair diagnostics only at healthy completion. Cached
+Complete is inert; check_deadline retires even completed results on refusal.
+Consuming finish(now) checks fresh admission and returns the original owners
+and End only after healthy completion. No NFC, CFWS selection, word placement,
+whole Content-Location parsing, label resolution or publication is provided.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
