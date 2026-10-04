@@ -756,6 +756,8 @@ painted after the window's frame. File's items are:
   chord;
 - `Export diagnostics`, the diagnostics export (below, "As built (the
   diagnostics export)"); it has no chord;
+- `Messages…`, shown with `C-S-m`, which does what `C-S-m` does: the
+  Messages window (below, "As built (the Messages window)");
 - `Quit`, which closes the window as the compositor's close does; it has
   no chord.
 
@@ -816,9 +818,41 @@ out of what the window shows the driven seam; it does not stop another
 client drawing a look-alike, which is why the dialog is the host-run
 path's alone and the key on td is the portal credential (§6).
 
-Without a key the status row says `no key: File → Set OpenRouter key…
-(F10)` after the state, until one is stored, when the notice says where
-it was stored and that every conversation uses it from now on.
+Without a key the status row says `no key: F10` after the state, until
+one is stored, when a note says where it was stored and that every
+conversation uses it from now on.
+
+**As built (the Messages window).** The status row keeps to items of a
+fixed width: the state, `C-r asks again` while a turn may be asked
+again, `no key: F10`, a count of the notes not yet read (`2 new
+messages: C-S-m`), the model and effort, the context, the cost, today
+and the credit, the mode, `no limits` and `0 background`. A note, which
+the row used to show cut to fit (a refusal said by name, a step done, a
+background conversation's notice under its title), goes to a log of the
+last 500, each with the time it came and kept whole up to 16 KiB, a
+longer one cut and saying so. `C-S-m` or File → `Messages…` opens the
+Messages window, modal over the body as the picker is: a title row and
+td-ui's message list (td-ui/DESIGN.md, "Shared message list"), a note
+to a message headed by its time in UTC, oldest first and following the
+newest, its keys the transcript's (`C-c` copies the selection, `C-S-c`
+the focused note); `Escape` or `C-S-m` closes it. Opening it reads
+every note, and a note that comes while it is open joins it, read; a
+paste while it is open is dropped and said. A held `Escape` or
+`C-S-m` closes nothing; only a press does. It does not open over
+another modal, and the key dialog replaces it. It always opens, so what
+it holds is never out of reach: where its list has no room it says so
+under its title and lays the list out once a resize gives it room, and
+a window too small for the split still draws it. A note the list
+refuses past its bounds takes the oldest shown with it, as the
+transcript's do, and the list keeps no more notes than the log. The
+workspace a conversation works in, which the row named, is the list's
+third column, `Workspace`: `none`, `scratch`, `template NAME`, or a
+directory by its folder's name (the deletion question names it whole,
+so two folders of one name tell apart there).
+The list's default share is a third of the body, so that its three
+columns fit a window 1024 pixels wide. The driven action is
+`messages`, and the state gains `notes` (`open` or `closed`), `unread`
+and `note`, the newest note whole on one line.
 
 **As built (the key list).** `F1` shows td-ui's key list over the
 window (td-ui/DESIGN.md, "Key list"). Its first section is every chord
@@ -1704,8 +1738,9 @@ list binds the top-level one, as Empty does; one no longer configured,
 removed or renamed, binds none, so that no edit widens what its old
 conversations reach without the human choosing it. When the lists
 would take more than half of a setup frame they are not handed on,
-said in a note, and template workspaces bind none. The status row and
-the `conversations` tool name the workspace `template NAME`, and the
+said in a note, and template workspaces bind none. The list's
+Workspace column and the `conversations` tool name the workspace
+`template NAME`, and the
 question before a deletion says, by the workspace's kind and not its
 name, that a template's scratch directory goes with the conversation.
 A template naming repositories is listed, the finder's note saying it
@@ -1808,39 +1843,37 @@ template.
 
 **As built (increment 10, workspaces).** File had two workspace items,
 which the templates step folded into the chooser as its built-ins: New
-scratch conversation became Empty, and New conversation in a
-directory… became Directory…, which opens td-ui's finder over the
-human's folders (Return enters one, Backspace
-goes up, Control+Return chooses the one listed; a repository's top is
-marked `git`, a link `link`, hidden names left out). The window admits
-the directory when it is chosen, before the conversation exists, and
-says a refusal by name (§8, Admission). A repository's top, a work
-tree's or a bare one, and anything inside a git directory are refused
-too; a work tree's subdirectory is admitted, since its `.git` is out of
-the jail's reach. The shared directories, `[[shared]]` in configuration
-and `~/Downloads` read-only by default, are admitted once at the
-window's start, each refused one named and left out. Without
-`./agent`'s td-jail and td-txt no workspace is made (As built
-(templates)). A conversation's `meta` records its workspace,
+scratch conversation became Empty, and New conversation in a directory…
+became Directory…, which opens td-ui's finder over the human's folders
+(Return enters one, Backspace goes up, Control+Return chooses the one
+listed; a repository's top is marked `git`, a link `link`, hidden names
+left out). The window admits the directory when it is chosen, before the
+conversation exists, and says a refusal by name (§8, Admission). A
+repository's top, a work tree's or a bare one, and anything inside a git
+directory are refused too; a work tree's subdirectory is admitted, since
+its `.git` is out of the jail's reach. The shared directories,
+`[[shared]]` in configuration and `~/Downloads` read-only by default,
+are admitted once at the window's start, each refused one named and left
+out. Without `./agent`'s td-jail and td-txt no workspace is made (As
+built (templates)). A conversation's `meta` records its workspace,
 `{"kind": "scratch"}` or `{"kind": "directory", "path": …}`, fixed at
 creation; its jail directory is `$XDG_STATE_HOME/td-agent/jail/<id>/`,
 holding the instances' `home/`, a scratch workspace's `scratch/`, and
 `specs/`, which its process clears whenever it starts. A directory
-workspace is the human's and is never removed. Deleting the
-conversation renames its jail directory out of the way and removes it
-on a thread of its own, with the walk Archiving and deleting describes;
-the window's start does the same for one left without its conversation
-or cut short.
+workspace is the human's and is never removed. Deleting the conversation
+renames its jail directory out of the way and removes it on a thread of
+its own, with the walk Archiving and deleting describes; the window's
+start does the same for one left without its conversation or cut short.
 The walk goes through directory descriptors opened without following a
 link, so a process still running in the tree cannot turn it out of the
 tree, and holds at most 256 open, moving a deeper directory up within
-the tree. The status row names the workspace; the deletion question
-says whether a scratch workspace goes with the conversation; and the
-diagnostics export leaves `jail/` out, since it holds the human's work,
-and writes its archive, which holds every conversation's log, to the
-home directory rather than a `~/Downloads` that a workspace reaches.
-The model's tools in a workspace are §12's (As built (increment 10,
-the tools)), each change and command decided by the human (§11).
+the tree. The list's Workspace column names the workspace; the deletion
+question says whether a scratch workspace goes with the conversation;
+and the diagnostics export leaves `jail/` out, since it holds the
+human's work, and writes its archive, which holds every conversation's
+log, to the home directory rather than a `~/Downloads` that a workspace
+reaches. The model's tools in a workspace are §12's (As built (increment
+10, the tools)), each change and command decided by the human (§11).
 
 **Archiving and deleting.** The human archives or deletes a conversation
 from its row in the list (§4); no model can. Archiving keeps the
@@ -3663,6 +3696,21 @@ pause still goes ahead of the messages before it. A umask that takes the
 owner's read access is not covered: std cannot set one without a foreign
 call, and it is the whole process's, which would race the other tests.
 
+For the Messages window, `src/notes.rs` covers the log's bound, its
+oldest dropped, a long note cut on a character boundary with the walk
+back taken, the unread count, the window's keys with a held one closing
+nothing, a refused copy said, a window too small saying so and laying
+out once resized, and a full window dropping its oldest as the log
+does. The window's units cover notes counted and not shown in the row,
+`C-S-m` and the File item opening it modal, a note joining it while
+open, a paste dropped, its closing, its refusal over another modal, the
+key dialog replacing it, its drawing in a window too narrow for the
+split, a background notice kept under its conversation's title, and the
+list's Workspace column, a directory by its folder's name; the key
+tests hold that no note kept, not only the newest, carries the key. And
+`src/control.rs` drives `messages` and reads `notes`, `unread` and
+`note`.
+
 `tests/control_process.rs` gains two native cases. In the default build,
 `F10` through the seat opens the File menu, `Down` and `Return` open the
 dialog, a key typed on the seat reaches the masked entry, which the
@@ -3784,7 +3832,7 @@ in parallel with it.
     - **Messages window.** The status row keeps only items of a fixed
       width (the state, model and effort, context, cost, today, credit,
       mode, limits and background count); td-agent's notes to the
-      human, which the row now shows cut to fit, go instead to a
+      human, which the row showed cut to fit, go instead to a
       Messages window that keeps them whole, in order and with their
       times, which the human opens to read them (§4).
     - **Context menus and archive.** A context menu on a conversation's

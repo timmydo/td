@@ -71,17 +71,24 @@ const TODO_ROWS: usize = 12;
 /// The split's child minima, in logical pixels.
 const LIST_MIN: u32 = 160;
 const CONVERSATION_MIN: u32 = 320;
-/// The list's columns.
-const COLUMNS: [Column<'static>; 2] = [
+/// The list's columns, which fit the list at its default share of a
+/// window 1024 pixels wide.
+const COLUMNS: &[Column<'static>] = &[
     Column {
         title: "Conversation",
         minimum: 120,
-        preferred: 200,
+        preferred: 152,
         numeric: false,
     },
     Column {
         title: "State",
         minimum: 72,
+        preferred: 72,
+        numeric: false,
+    },
+    Column {
+        title: "Workspace",
+        minimum: 96,
         preferred: 96,
         numeric: false,
     },
@@ -496,7 +503,10 @@ pub struct App {
     focused: bool,
     capture: Option<Capture>,
     mode: Mode,
-    notice: Option<String>,
+    /// td-agent's notes, which the Messages window shows.
+    log: crate::notes::Log,
+    /// Each row's workspace as the list's third column names it.
+    labels: Vec<String>,
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
@@ -536,6 +546,8 @@ pub struct App {
     /// The picker while it is open, modal over the window, and what it
     /// chooses.
     picker: Option<Picker>,
+    /// The Messages window while it is open, modal over the window.
+    notes: Option<crate::notes::Panel>,
     picking: Picking,
     /// The configured templates the template chooser lists after the
     /// built-ins, each a name and whether it names repositories.
@@ -601,7 +613,7 @@ impl App {
     pub fn new(surface: Surface, share: Option<(u32, u32)>, mode: Mode) -> Result<Self, String> {
         let share = share
             .and_then(|(first, total)| split::Share::new(first, total))
-            .unwrap_or_else(|| split::Share::new(2, 7).unwrap_or_default());
+            .unwrap_or_else(|| split::Share::new(1, 3).unwrap_or_default());
         let split = split::Controller::new(
             split::Config {
                 axis: split::Axis::Horizontal,
@@ -613,7 +625,7 @@ impl App {
             body(surface),
         )
         .map_err(|e| e.to_string())?;
-        let model = Model::new(&[], &COLUMNS).map_err(|e| e.to_string())?;
+        let model = Model::new(&[], COLUMNS).map_err(|e| e.to_string())?;
         let mut app = Self {
             surface,
             rows: Vec::new(),
@@ -629,7 +641,8 @@ impl App {
             focused: true,
             capture: None,
             mode,
-            notice: None,
+            log: crate::notes::Log::default(),
+            labels: Vec::new(),
             todo: Vec::new(),
             todo_open: false,
             messages: Vec::new(),
@@ -647,6 +660,7 @@ impl App {
             asked: VecDeque::new(),
             system_shown: false,
             picker: None,
+            notes: None,
             picking: Picking::Model,
             templates: Vec::new(),
             chooser: None,
@@ -756,8 +770,19 @@ impl App {
         &self.transcript
     }
 
+    /// The newest note.
     pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+        self.log.last()
+    }
+
+    /// The notes not yet shown in the Messages window.
+    pub fn unread(&self) -> usize {
+        self.log.unread()
+    }
+
+    /// The Messages window, while it is open.
+    pub fn messages_window(&self) -> Option<&crate::notes::Panel> {
+        self.notes.as_ref()
     }
 
     /// The status row's line.
@@ -767,27 +792,19 @@ impl App {
             .as_ref()
             .and_then(|id| self.rows.iter().find(|r| &r.id == id));
         let state = row.map_or("no conversation", Row::word);
-        let workspace = row
-            .and_then(|r| r.workspace.as_ref())
-            .map(|w| format!(" | in {}", w.label()))
-            .unwrap_or_default();
-        // A notice goes next to the state, where a narrow row still
-        // shows it.
-        let notice = self
-            .notice
-            .as_deref()
-            .map(|n| format!(" | {n}"))
-            .unwrap_or_default();
+        // Only items of a fixed width: a note, however long, is counted
+        // here and read whole in the Messages window.
+        let unread = match self.log.unread() {
+            0 => String::new(),
+            1 => " | 1 new message: C-S-m".to_string(),
+            n => format!(" | {n} new messages: C-S-m"),
+        };
         let retry = if self.meter.retry {
             " | C-r asks again"
         } else {
             ""
         };
-        let keyless = if self.keyed {
-            ""
-        } else {
-            " | no key: File \u{2192} Set OpenRouter key\u{2026} (F10)"
-        };
+        let keyless = if self.keyed { "" } else { " | no key: F10" };
         let model = self.model();
         let effort = if self.reasoning(model) {
             self.effort()
@@ -820,7 +837,7 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{workspace}{retry}{keyless}{notice} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
+            "{state}{retry}{keyless}{unread} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
             of(self.meter.spent, self.limits.conversation),
             self.mode.word()
         )
@@ -983,9 +1000,15 @@ impl App {
 
     // --- what the session tells it ----------------------------------
 
-    /// Shows `message` in the status row until the next one.
+    /// Keeps `message` for the Messages window, which shows it at once
+    /// when open; the status row counts it until then.
     pub fn note(&mut self, message: impl Into<String>) {
-        self.notice = Some(message.into());
+        let at = crate::store::now();
+        let text = self.log.push(at, message.into()).to_string();
+        if let Some(panel) = self.notes.as_mut() {
+            self.log.read();
+            panel.push(at, &text, &self.log);
+        }
         self.touch();
     }
 
@@ -1182,6 +1205,7 @@ impl App {
         let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) else {
             return;
         };
+        let mut notice = None;
         let state = match update {
             Update::Up(Up::Event(Event {
                 seq,
@@ -1229,8 +1253,7 @@ impl App {
                 kind: Kind::Notice { text },
                 ..
             })) => {
-                let note = format!("{}: {text}", row.title);
-                self.notice = Some(note);
+                notice = Some(format!("{}: {text}", row.title));
                 None
             }
             Update::Failed { .. } => Some(RowState::Failed),
@@ -1244,6 +1267,9 @@ impl App {
             row.state = state;
         }
         self.refresh_list();
+        if let Some(notice) = notice {
+            self.note(notice);
+        }
     }
 
     fn active_row(&mut self) -> Option<&mut Row> {
@@ -1942,6 +1968,20 @@ impl App {
     fn refresh_list(&mut self) {
         self.rows
             .sort_by(|a, b| b.activity.cmp(&a.activity).then(a.id.cmp(&b.id)));
+        self.labels = self
+            .rows
+            .iter()
+            .map(|row| match &row.workspace {
+                None => "none".to_string(),
+                // The folder's own name, which the column has room for;
+                // the deletion question names it whole.
+                Some(Workspace::Directory(path)) => path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                ),
+                Some(workspace) => workspace.label(),
+            })
+            .collect();
         let tree: Vec<TreeRow<usize>> = (0..self.rows.len())
             .map(|id| TreeRow {
                 id,
@@ -1951,7 +1991,7 @@ impl App {
                 expanded: false,
             })
             .collect();
-        match Model::new(&tree, &COLUMNS) {
+        match Model::new(&tree, COLUMNS) {
             Ok(model) => {
                 if let Err(e) = self.list.replace(model) {
                     self.note(format!("the list: {e}"));
@@ -1998,6 +2038,10 @@ impl App {
                 self.close_picker();
                 self.note("the window is now too small for the picker, which is closed");
             }
+        }
+        // Too small for its list, it stays open and says so.
+        if let Some(notes) = self.notes.as_mut() {
+            notes.resize(self.surface, body(self.surface));
         }
         if let Some(chooser) = self.chooser.as_mut() {
             if !chooser.resize(self.surface, body(self.surface)) {
@@ -2084,6 +2128,7 @@ impl App {
             self.focused
                 && self.dialog.is_none()
                 && self.picker.is_none()
+                && self.notes.is_none()
                 && self.chooser.is_none()
                 && self.confirm.is_none()
                 && self.focus == f
@@ -2095,6 +2140,10 @@ impl App {
         };
         let (list, transcript, composer) = (list_focus, on(Focus::Transcript), on(Focus::Composer));
         let _ = self.list.set_focus(list);
+        let notes_focus = self.focused && self.dialog.is_none();
+        if let Some(notes) = self.notes.as_mut() {
+            notes.focus(notes_focus);
+        }
         self.transcript.event(
             messages::Event::Focus(transcript),
             &mut td_ui::window::NoClipboard,
@@ -2227,6 +2276,9 @@ impl App {
         if self.picker.is_some() {
             return self.picker_input(input);
         }
+        if self.notes.is_some() {
+            return self.notes_input(input, clipboard);
+        }
         if self.chooser.is_some() {
             return self.chooser_input(input);
         }
@@ -2301,6 +2353,9 @@ impl App {
         if self.picker.is_some() {
             return self.note("a paste that came while the picker was open is dropped");
         }
+        if self.notes.is_some() {
+            return self.note("a paste that came while the Messages window was open is dropped");
+        }
         if self.chooser.is_some() {
             return self.note("a paste that came while the directory chooser was open is dropped");
         }
@@ -2332,6 +2387,11 @@ impl App {
                 self.composer.event(PaneEvent::CancelPointer);
             }
             None => {}
+        }
+        // The Messages window holds no capture of the window's: its drag
+        // is its own list's.
+        if let Some(notes) = self.notes.as_mut() {
+            notes.cancel();
         }
         self.apply_focus();
     }
@@ -2414,6 +2474,7 @@ impl App {
     fn menu_action(&mut self, action: menu::Action) {
         match action {
             menu::Action::New => self.new_conversation(),
+            menu::Action::Messages => self.open_messages(),
             menu::Action::SetKey => self.open_key_dialog(),
             menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
@@ -2533,13 +2594,69 @@ impl App {
         self.show_picker(opened, Picking::Template);
     }
 
-    /// Whether a modal is open: the picker, the chooser, the key dialog
-    /// or the question.
+    /// Whether a modal is open: the picker, the Messages window, the
+    /// chooser, the key dialog or the question.
     fn modal(&self) -> bool {
         self.picker.is_some()
+            || self.notes.is_some()
             || self.chooser.is_some()
             || self.dialog.is_some()
             || self.confirm.is_some()
+    }
+
+    /// Opens the Messages window, as `C-S-m` and File → Messages… do:
+    /// every note kept, whole and with its time, and none unread after.
+    pub fn open_messages(&mut self) {
+        if self.modal() {
+            return;
+        }
+        self.cancel_pointer();
+        self.menu.dismiss();
+        match crate::notes::Panel::open(self.surface, body(self.surface), &self.log) {
+            Ok(panel) => {
+                self.notes = Some(panel);
+                self.log.read();
+                self.apply_focus();
+                self.touch();
+            }
+            Err(why) => self.note(why),
+        }
+    }
+
+    fn close_messages(&mut self) {
+        self.notes = None;
+        self.apply_focus();
+        self.touch();
+        self.offer();
+    }
+
+    /// An input while the Messages window is open, which is its own, as
+    /// the picker's are.
+    fn notes_input(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        match input {
+            Input::Resize(surface) => return self.resize(surface),
+            Input::Focus(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.cancel_pointer();
+                }
+                return self.apply_focus();
+            }
+            _ => {}
+        }
+        let clock = self.clock;
+        let Some(notes) = self.notes.as_mut() else {
+            return;
+        };
+        match notes.input(&input, clipboard, clock) {
+            crate::notes::Reply::Stay(changed) => {
+                if changed {
+                    self.touch();
+                }
+            }
+            crate::notes::Reply::Closed => self.close_messages(),
+            crate::notes::Reply::Refused(why) => self.note(format!("copy: {why}")),
+        }
     }
 
     /// Opens the directory chooser, as the template chooser's Directory…
@@ -2851,8 +2968,9 @@ impl App {
         match KeyDialog::open(self.surface, &path) {
             Ok(dialog) => {
                 // One modal at a time: the dialog replaces the picker, the
-                // chooser and the question.
+                // Messages window, the chooser and the question.
                 self.picker = None;
+                self.notes = None;
                 self.chooser = None;
                 self.confirm = None;
                 self.dialog = Some(dialog);
@@ -3008,6 +3126,9 @@ impl App {
         if self.picker.is_some() {
             return self.picker_input(Input::Key { chord, repeat });
         }
+        if self.notes.is_some() {
+            return self.notes_input(Input::Key { chord, repeat }, clipboard);
+        }
         if self.chooser.is_some() {
             return self.chooser_input(Input::Key { chord, repeat });
         }
@@ -3021,6 +3142,7 @@ impl App {
             menu::OPEN if !repeat => return self.open_menu(),
 
             "C-n" if !repeat => return self.new_conversation(),
+            "C-S-m" if !repeat => return self.open_messages(),
             "C-t" if !repeat => {
                 if self.todo.is_empty() {
                     self.note("the conversation has no todo list");
@@ -3279,11 +3401,15 @@ impl App {
 
     /// A conversation's cell in the list.
     fn cell(&self, index: usize, column: usize) -> Cell<'_> {
-        let text = self.rows.get(index).map_or("", |row| match column {
+        let Some(row) = self.rows.get(index) else {
+            return Cell::empty();
+        };
+        let text = match column {
             0 => row.title.as_str(),
-            _ if self.cards.iter().any(|c| c.conversation == row.id) => ASKS,
-            _ => row.word(),
-        });
+            1 if self.cards.iter().any(|c| c.conversation == row.id) => ASKS,
+            1 => row.word(),
+            _ => self.labels.get(index).map_or("", String::as_str),
+        };
         Cell::new(text).unwrap_or_else(|_| Cell::empty())
     }
 
@@ -3377,7 +3503,8 @@ impl Composition for App {
             },
         });
         let Some(regions) = self.regions else {
-            // Too small for the split: say so rather than draw over itself.
+            // Too small for the split: say so rather than draw over itself,
+            // and still draw a modal that is open, which has the keys.
             raster::text_run(
                 self.surface.scale,
                 "window too small".chars(),
@@ -3391,7 +3518,7 @@ impl Composition for App {
                 damage,
                 sink,
             );
-            return;
+            return self.emit_modals(damage, sink);
         };
         self.split.emit(damage, sink);
         self.list.emit(
@@ -3417,11 +3544,21 @@ impl Composition for App {
         self.emit_status(regions.status, damage, sink);
         menu::bar(self.surface).emit(damage, sink);
         self.menu.emit(damage, sink);
+        self.emit_modals(damage, sink);
+    }
+}
+
+impl App {
+    /// The modals over everything else, the one with the keys last.
+    fn emit_modals(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         if let Some(picker) = &self.picker {
             picker.emit(damage, sink);
         }
         if let Some(chooser) = &self.chooser {
             chooser.emit(damage, sink);
+        }
+        if let Some(notes) = &self.notes {
+            notes.emit(damage, sink);
         }
         if let Some(confirm) = &self.confirm {
             confirm.emit(damage, sink);
@@ -3590,9 +3727,14 @@ pub mod tests {
         );
         app.set_today(cost::ONE / 4);
         app.set_credit(Some("credit $7.5000".into()));
+        // The note is counted, not shown: the row keeps a fixed width.
+        assert_eq!(
+            app.notice(),
+            Some("dropped a torn final log line of 7 bytes")
+        );
         assert_eq!(
             app.status_line(),
-            "idle | dropped a torn final log line of 7 bytes | m/default medium | ctx 0/200k | cost $0.0000 \
+            "idle | 1 new message: C-S-m | m/default medium | ctx 0/200k | cost $0.0000 \
              | today $0.2500 | credit $7.5000 | mode auto | no limits | 0 background"
         );
         // Each total against its limit, where one is set.
@@ -4701,7 +4843,7 @@ pub mod tests {
             "{}\n{}\n{}\n{:?}",
             text(app),
             app.status_line(),
-            app.notice().unwrap_or(""),
+            app.log.texts().collect::<Vec<_>>().join("\n"),
             app.dialog()
         )
     }
@@ -4739,8 +4881,8 @@ pub mod tests {
         assert_eq!(app.picking(), "template");
         key(&mut app, "Escape");
         // A press on the header opens it; one on the third row exports,
-        // and one on the fourth quits.
-        for (row, request) in [(2, Request::Export), (3, Request::Quit)] {
+        // and one on the fifth quits.
+        for (row, request) in [(2, Request::Export), (4, Request::Quit)] {
             press(&mut app, CELL_WIDTH as i64 + 4, 4);
             assert!(app.menu_open());
             let panel = app.menu.panel(0).unwrap();
@@ -4847,11 +4989,97 @@ pub mod tests {
     }
 
     #[test]
-    fn without_a_key_the_status_row_points_to_the_dialog_until_one_is_stored() {
+    fn notes_are_counted_in_the_row_and_read_whole_in_the_messages_window() {
+        let mut app = app();
+        let long = format!("a refusal said by name: {}", "why ".repeat(200));
+        app.note(long.clone());
+        app.note("a second note");
+        assert_eq!(app.unread(), 2);
+        assert!(app.status_line().contains("| 2 new messages: C-S-m |"));
+        assert!(!app.status_line().contains("refusal"));
+        // C-S-m opens it, modal: every note whole, none unread after.
+        key(&mut app, "C-S-m");
+        let window = app.messages_window().unwrap();
+        assert_eq!(window.len(), 2);
+        assert_eq!(app.unread(), 0);
+        assert!(!app.status_line().contains("new message"));
+        assert!(text(&app).contains(crate::notes::TITLE), "{}", text(&app));
+        // The window has every key: C-n starts nothing.
+        key(&mut app, "C-n");
+        assert!(app.take_requests().is_empty() && app.picker().is_none());
+        // A note while it is open joins it and is read.
+        app.note("a third note");
+        assert_eq!(app.messages_window().unwrap().len(), 3);
+        assert_eq!(app.unread(), 0);
+        // A paste is not the window's: dropped, and said.
+        app.input(Input::Paste("x"), &mut NoClipboard);
+        assert!(app.notice().unwrap().contains("Messages window was open"));
+        assert_eq!(app.messages_window().unwrap().len(), 4);
+        key(&mut app, "Escape");
+        assert!(app.messages_window().is_none());
+        assert_eq!(app.focus(), Focus::Composer);
+        // File → Messages… opens it too, and C-S-m closes it.
+        app.menu_action(menu::Action::Messages);
+        assert!(app.messages_window().is_some());
+        key(&mut app, "C-S-m");
+        assert!(app.messages_window().is_none());
+        // Over another modal it does not open.
+        key(&mut app, "C-n");
+        key(&mut app, "C-S-m");
+        assert!(app.messages_window().is_none() && app.picker().is_some());
+        key(&mut app, "Escape");
+        // Held, its chord opens it once and closes nothing.
+        key(&mut app, "C-S-m");
+        app.input(
+            Input::Key {
+                chord: "C-S-m",
+                repeat: true,
+            },
+            &mut NoClipboard,
+        );
+        assert!(app.messages_window().is_some());
+        // A window too narrow for the split still shows it, and it has
+        // the keys.
+        let narrow = Surface::new(400, 640, Scale::default()).unwrap();
+        app.resize(narrow);
+        assert!(app.regions.is_none());
+        assert!(text(&app).contains("Messages:"), "{}", text(&app));
+        key(&mut app, "Escape");
+        assert!(app.messages_window().is_none());
+        app.resize(Surface::new(1024, 640, Scale::default()).unwrap());
+        // The key dialog replaces it: one modal at a time.
+        app.set_key_path(Some(PATH.into()));
+        key(&mut app, "C-S-m");
+        app.open_key_dialog();
+        assert!(app.dialog().is_some() && app.messages_window().is_none());
+    }
+
+    #[test]
+    fn a_note_from_a_conversation_in_the_background_is_kept_with_its_title() {
+        let mut app = app();
+        app.background(
+            &id(2),
+            &Update::Up(Up::Event(Event {
+                seq: 9,
+                time: 0,
+                kind: Kind::Notice {
+                    text: crate::wake::notice(),
+                },
+            })),
+            0,
+        );
+        assert_eq!(app.unread(), 1);
+        assert!(
+            app.notice().unwrap().starts_with("title 2: "),
+            "{:?}",
+            app.notice()
+        );
+    }
+
+    #[test]
+    fn without_a_key_the_status_row_says_so_until_one_is_stored() {
         let mut app = keyless();
-        assert!(app
-            .status_line()
-            .contains("| no key: File \u{2192} Set OpenRouter key\u{2026} (F10) |"));
+        assert!(app.status_line().contains("| no key: F10 |"));
         assert!(text(&app).contains("Set OpenRouter key"));
         // The dialog is modal: the window's chords are its, consumed.
         for chord in ["C-n", "C-PageDown", "F6", "C-t"] {
@@ -4881,7 +5109,7 @@ pub mod tests {
         app.key_saved(PATH);
         assert!(app.dialog().is_none());
         assert!(!app.status_line().contains("no key"));
-        assert!(app.status_line().contains("the key is stored in"));
+        assert!(app.notice().unwrap().contains("the key is stored in"));
         assert!(!said(&app).contains(KEY));
     }
 
@@ -5130,14 +5358,28 @@ pub mod tests {
         key(&mut app, "Escape");
         assert!(app.chooser().is_none() && app.confirm().is_some());
         app.withdraw(&id(1), None);
-        // The status row names the open conversation's workspace.
+        // The list's third column names each conversation's workspace;
+        // the status row, of fixed width, does not.
         app.add_row(Row {
-            workspace: Some(Workspace::Scratch),
+            workspace: Some(Workspace::Template("notes".into())),
             ..row(9, 1)
         });
         app.set_active(id(9));
+        let at = app.rows().iter().position(|r| r.id == id(9)).unwrap();
+        assert_eq!(app.labels[at], "template notes");
+        // The columns fit the list at its default share of a window 1024
+        // pixels wide: no sideways scrollbar.
+        assert!(app.list.geometry().unwrap().horizontal().is_none());
+        // A directory by its folder's name, which the column has room for.
+        app.add_row(Row {
+            workspace: Some(Workspace::Directory("/home/u/src/notes".into())),
+            ..row(8, 2)
+        });
+        let at = app.rows().iter().position(|r| r.id == id(8)).unwrap();
+        assert_eq!(app.labels[at], "notes");
+        assert!(app.labels.iter().any(|label| label == "none"));
         assert!(
-            app.status_line().contains(" | in scratch"),
+            !app.status_line().contains("notes"),
             "{}",
             app.status_line()
         );

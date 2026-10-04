@@ -48,6 +48,12 @@ pub const BINDINGS: &[Binding] = &[
         help: "File > New conversation...: open the template chooser (Return chooses, Escape cancels), or, when no workspace can be made, start a conversation with none.",
     },
     Binding {
+        name: "messages",
+        chord: Some("C-S-m"),
+        arguments: "",
+        help: "File > Messages...: open the Messages window, td-agent's notes whole and with their times; Escape closes it.",
+    },
+    Binding {
         name: "previous",
         chord: Some("C-PageUp"),
         arguments: "",
@@ -263,14 +269,14 @@ impl Controller for Remote<'_> {
         let (picker, query) = app.picker().map_or(("none", ""), |picker| {
             (picker.selected().unwrap_or("nothing"), picker.query())
         });
-        // The chooser's folder: a path of the human's, as the status row
-        // would name it once chosen.
+        // The chooser's folder: a path of the human's, as the deletion
+        // question would name it once chosen.
         let chooser = app.chooser().map_or_else(
             || "none".to_string(),
             |chooser| chooser.folder().display().to_string(),
         );
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tstatus={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
@@ -283,6 +289,13 @@ impl Controller for Remote<'_> {
             app.effort(),
             app.default_model(),
             chooser.replace(['\t', '\n'], " "),
+            if app.messages_window().is_some() {
+                "open"
+            } else {
+                "closed"
+            },
+            app.unread(),
+            app.notice().unwrap_or("").replace(['\t', '\n'], " "),
             app.status_line().replace(['\t', '\n'], " "),
         ))
     }
@@ -359,10 +372,22 @@ mod tests {
         app.set_keyed(false);
         let mut remote = Remote { app: &mut app };
         assert!(remote.state().unwrap().contains("menu=closed\tdialog=none"));
-        assert!(remote
-            .state()
-            .unwrap()
-            .contains("no key: File \u{2192} Set OpenRouter key\u{2026} (F10)"));
+        // `messages` opens the Messages window; the state says so, counts
+        // the unread and carries the newest note whole.
+        remote.app.note("a note\twith a tab");
+        let state = remote.state().unwrap();
+        assert!(
+            state.contains("notes=closed\tunread=1\tnote=a note with a tab\t"),
+            "{state}"
+        );
+        assert!(driven::request(&mut remote, b"1\t90\taction\tmessages").ends_with("changed"));
+        assert!(remote.state().unwrap().contains("notes=open\tunread=0\t"));
+        driven::request(
+            &mut remote,
+            format!("1\t91\tkey\t{}", hex("Escape")).as_bytes(),
+        );
+        assert!(remote.state().unwrap().contains("notes=closed"));
+        assert!(remote.state().unwrap().contains("| no key: F10 |"));
         assert!(driven::request(&mut remote, b"1\t1\taction\tmenu").ends_with("changed"));
         assert!(remote.state().unwrap().contains("menu=open"));
         // Down to Set OpenRouter key…, below New conversation…, and

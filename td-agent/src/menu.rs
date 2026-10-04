@@ -26,6 +26,8 @@ pub const OPEN: &str = "F10";
 pub enum Action {
     /// Choose a new conversation's workspace template, as `C-n` does.
     New,
+    /// Open the Messages window, as `C-S-m` does.
+    Messages,
     /// Open the dialog that stores the OpenRouter key.
     SetKey,
     /// Write the diagnostics archive (DESIGN.md §4).
@@ -52,6 +54,7 @@ pub const FILE: &[(&str, &str, Action)] = &[
     ("New conversation\u{2026}", "C-n", Action::New),
     ("Set OpenRouter key\u{2026}", "", Action::SetKey),
     ("Export diagnostics", "", Action::Export),
+    ("Messages\u{2026}", "C-S-m", Action::Messages),
     ("Quit", "", Action::Quit),
 ];
 /// The Help menu's items, as `FILE`'s: the key list, shown with td-ui's

@@ -12,7 +12,8 @@
 //! read by `sse` and put back together by `assemble`, its money `cost`
 //! and `accounts`, what it knows of the provider's models `models`; the
 //! window reads the API key (`key`) and hands it down, and stores one
-//! from its File menu (`menu`) through the key dialog (`keydialog`). The
+//! from its File menu (`menu`) through the key dialog (`keydialog`), and
+//! keeps its notes to the human for the Messages window (`notes`). The
 //! conversation tools (DESIGN.md §3, §12) are `tools`, their reads of a
 //! log `history` and their wake budget `wake`; the window routes the
 //! messages they send between conversations through `post`. The tool
@@ -44,6 +45,7 @@ pub mod key;
 pub mod keydialog;
 pub mod menu;
 pub mod models;
+pub mod notes;
 pub mod picker;
 pub mod post;
 pub mod prompt;

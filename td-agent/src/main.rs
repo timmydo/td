@@ -25,7 +25,9 @@ C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
 C-n starts a conversation from a workspace template\n\
 (Empty, Directory... or one configured; td-agent/DESIGN.md §7), or\n\
 with no workspace when ./agent's jail is absent; C-PageUp and C-PageDown\n\
-open the one above or below; F6 and S-F6 move the focus between the\n\
+open the one above or below; C-S-m opens the Messages window, which\n\
+keeps td-agent's notes whole and with their times (the status row\n\
+counts the unread); F6 and S-F6 move the focus between the\n\
 list, the transcript and the composer; F10 opens the menus: File's\n\
 Set OpenRouter key... stores the key and Export diagnostics writes an\n\
 archive of the state and configuration, never the key file, to\n\

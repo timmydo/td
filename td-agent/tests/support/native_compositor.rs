@@ -515,7 +515,7 @@ fn the_file_menu_opens_a_masked_key_dialog() {
         compositor.focused("td-agent").then_some(())
     });
     wait(&agent, "the window says there is no key", || {
-        agent.state().contains("no key: File").then_some(())
+        agent.state().contains("no key: F10").then_some(())
     });
     compositor.chord(&[], KEY_F10);
     wait(&agent, "F10 opens the File menu", || {
