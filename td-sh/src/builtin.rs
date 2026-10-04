@@ -1313,50 +1313,39 @@ fn read_dec(chars: &[char], start: usize) -> (i64, usize) {
     (v, j)
 }
 
-/// One escape, from `bb_process_escape_sequence`
-/// (libbb/process_escape_sequence.c). `i` points just PAST the backslash.
-/// Returns the byte and the index to resume at; an unrecognised sequence returns
-/// a literal backslash and the SAME index, so the offending char is emitted next
-/// as ordinary text.
-///
-/// Every backslash td-sh expands now comes through here, as in busybox, where
-/// `echo -e`, `printf %b` and printf's format string all call this. It knows
-/// `\e`, takes `\xHH` (two digits, where `\x` with no digit is literal), accepts
-/// an octal run without the leading `0`, and stops a digit run at the first
-/// digit that would carry the value past a byte -- leaving that digit as text,
-/// which is why `\0400` is a space followed by `0`.
+/// One escape after a backslash, as `echo -e`, `printf %b` and printf's
+/// format string all decode it; `i` is just past the backslash. `\x` takes
+/// one or two hex digits; otherwise up to three octal digits are taken,
+/// with no leading `0` needed, while the value still fits a byte, so the
+/// digit that would overflow stays text (`\400` is a space, then `0`).
+/// With no digit, one of the letters below names a byte, `\e` included.
+/// Anything else, and `\x` with no hex digit after it, is a literal
+/// backslash, and the next character is read again as text. Returns the
+/// byte and the index to resume at.
 fn echo_escape(chars: &[char], i: usize) -> (u8, usize) {
-    let start = i;
-    let mut i = i;
-    let mut base = 8u32;
-    let mut digits = 0u32;
-    if chars.get(i) == Some(&'x') {
-        i += 1;
-        base = 16;
-        digits = 1; // so hex takes two digits where octal takes three
-    }
-    let mut n = 0u32;
-    while digits < 3 {
-        let Some(d) = chars.get(i).and_then(|c| c.to_digit(base)) else {
-            if base == 16 {
-                // Cannot underflow: the hex branch seeds `digits` at 1.
-                digits -= 1;
-                if digits == 0 {
-                    return (b'\\', start); // `\x` with no hex digit: literal
-                }
-            }
+    let (radix, most, first) = if chars.get(i) == Some(&'x') {
+        (16, 2, i + 1)
+    } else {
+        (8, 3, i)
+    };
+    let mut value = 0u32;
+    let mut taken = 0usize;
+    while taken < most {
+        let Some(digit) = chars.get(first + taken).and_then(|c| c.to_digit(radix)) else {
             break;
         };
-        let r = n * base + d;
-        if r > u32::from(u8::MAX) {
+        let next = value * radix + digit;
+        if next > u32::from(u8::MAX) {
             break;
         }
-        n = r;
-        i += 1;
-        digits += 1;
+        value = next;
+        taken += 1;
     }
-    if digits > 0 {
-        return (n as u8, i);
+    if taken > 0 {
+        return (u8::try_from(value).unwrap_or(u8::MAX), first + taken);
+    }
+    if radix == 16 {
+        return (b'\\', i);
     }
     let byte = match chars.get(i) {
         Some('a') => 0x07,
@@ -3262,126 +3251,117 @@ fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
     ok(sh)
 }
 
-/// The bits `bb_parse_mode` works in: the nine rwx bits plus setuid, setgid and
-/// sticky. A umask carries only the nine, but the parser handles all twelve and
-/// the CALLER rejects a result that outgrew 0777 -- which is how `a+t` becomes
-/// an illegal mode while `o=rwxs` is a legal one that changes nothing.
-const S_ISUID: u32 = 0o4000;
-const S_ISGID: u32 = 0o2000;
-const S_ISVTX: u32 = 0o1000;
-const FILEMODEBITS: u32 = S_ISUID | S_ISGID | S_ISVTX | 0o777;
+/// The bits a mode operand speaks for: the nine permission bits with
+/// setuid, setgid and sticky. A umask holds only the nine, so the CALLER
+/// refuses a result above 0o777: `a+t` is an illegal mode, while `o=rwxs`
+/// is a legal one that changes nothing.
+const MODE_BITS: u32 = 0o7777;
 
-const WHO_CHARS: &[u8] = b"augo";
-const WHO_MASK: [u32; 4] = [FILEMODEBITS, S_ISUID | 0o700, S_ISGID | 0o070, 0o007];
-const PERM_CHARS: &[u8] = b"rwxXst";
-const PERM_MASK: [u32; 6] = [0o444, 0o222, 0o111, 0o111, S_ISUID | S_ISGID, S_ISVTX];
+/// The bits a `who` letter names: its class's permissions, the set-ID bit of
+/// `u` or `g`, and for `a` every mode bit, sticky included.
+fn who_bits(letter: u8) -> Option<u32> {
+    match letter {
+        b'u' => Some(0o4700),
+        b'g' => Some(0o2070),
+        b'o' => Some(0o0007),
+        b'a' => Some(MODE_BITS),
+        _ => None,
+    }
+}
 
-/// `umask`'s mode operand, ported from busybox `libbb/parse_mode.c`.
-///
-/// `current_mode` is what the clauses start from -- for a symbolic operand ash
-/// hands in the PERMITTED bits, so `-` really does subtract permission. A clause
-/// holds a LIST of actions (`u+r-w`), and each action sees what the last one
-/// left. `umask_now` is the process mask, which limits a clause that names no
-/// `who`. `None` is the mode ash calls illegal.
+/// `umask`'s mode operand applied to `current_mode`, after POSIX `chmod`'s
+/// grammar. An operand whose FIRST character is an octal digit is one octal
+/// number, every character a digit (`0778` is not 077) and at most
+/// `MODE_BITS`; `8` is not octal, so it reaches the symbolic grammar and
+/// fails there. Otherwise the operand is comma-separated clauses, an empty
+/// one changing nothing: a `who` list of `ugoa`, then actions, each `+`,
+/// `-` or `=` followed by permission letters `rwxXst` or by one copy
+/// letter `ugo`, which reads that class's bits as the mode stands. `=`
+/// clears before its permissions are read, so `X` (execute only where some
+/// execute bit is set) and a copy see the cleared mode. In a clause naming
+/// no `who`, the permissions an action adds or removes reach only the bits
+/// `umask_now`, the process mask, permits (its `=` still clears them all) --
+/// POSIX's rule, and it is the mask, not the value being built, so an
+/// earlier clause cannot widen it. A `who` list that ends its clause, or
+/// anything after an action other than another action, is illegal: `None`.
 fn parse_mode(text: &str, current_mode: u32, umask_now: u32) -> Option<u32> {
-    let b = text.as_bytes();
-    // Numeric only when the FIRST character is an octal digit; `8` falls through
-    // to the symbolic parser, which rejects it as a bad `who`.
-    if b.first().is_some_and(|c| (b'0'..=b'7').contains(c)) {
-        let mut v: u32 = 0;
-        for c in b {
-            if !(b'0'..=b'7').contains(c) {
-                // `strtoul`'s trailing-character check: `0778` is not 077.
-                return None;
-            }
-            v = v.checked_mul(8)?.checked_add(u32::from(c - b'0'))?;
-        }
-        return if v > FILEMODEBITS { None } else { Some(v) };
+    let bytes = text.as_bytes();
+    if bytes.first().is_some_and(|c| matches!(c, b'0'..=b'7')) {
+        let value = bytes.iter().try_fold(0u32, |value, &c| {
+            let digit = char::from(c).to_digit(8)?;
+            value.checked_mul(8)?.checked_add(digit)
+        })?;
+        return (value <= MODE_BITS).then_some(value);
     }
+    bytes
+        .split(|&c| c == b',')
+        .try_fold(current_mode, |mode, clause| {
+            apply_clause(clause, mode, umask_now)
+        })
+}
 
-    let mut new_mode = current_mode;
-    let mut i = 0usize;
-    while i < b.len() {
-        if b.get(i) == Some(&b',') {
-            // Empty clauses are allowed, and an empty mode changes nothing.
-            i += 1;
-            continue;
-        }
-        // A `who` list. Running off the end inside one is an error rather than
-        // an implicit empty action, so `umask u` is illegal.
-        let mut wholist = 0u32;
-        while let Some(k) = b.get(i).and_then(|c| WHO_CHARS.iter().position(|w| w == c)) {
-            wholist |= *WHO_MASK.get(k)?;
-            i += 1;
-            if i >= b.len() {
-                return None;
-            }
-        }
-        loop {
-            let op = *b.get(i)?;
-            if op != b'+' && op != b'-' {
-                if op != b'=' {
-                    return None;
-                }
-                // `=` clears BEFORE the perms are read, which is why `X` and a
-                // permcopy in the same clause see the cleared value: `umask 0;
-                // umask a=X` leaves execute off and so is 0777, not 0666.
-                new_mode &= if wholist != 0 {
-                    !wholist
-                } else {
-                    !FILEMODEBITS
-                };
-            }
-            i += 1;
-
-            // A permcopy (`u=g`) reads the running value, and only from u/g/o.
-            let copy = b.get(i).and_then(|c| b"ugo".iter().position(|w| w == c));
-            let mut permlist = match copy {
-                Some(k) => {
-                    let mut pl = *WHO_MASK.get(k + 1)? & 0o777 & new_mode;
-                    for m in [0o444u32, 0o222, 0o111] {
-                        if pl & m != 0 {
-                            pl |= m;
-                        }
-                    }
-                    i += 1;
-                    pl
-                }
-                None => {
-                    let mut pl = 0u32;
-                    while let Some(k) = b
-                        .get(i)
-                        .and_then(|c| PERM_CHARS.iter().position(|p| p == c))
-                    {
-                        // `X` is execute only where execute already is.
-                        if PERM_CHARS.get(k) != Some(&b'X') || new_mode & 0o111 != 0 {
-                            pl |= *PERM_MASK.get(k)?;
-                        }
-                        i += 1;
-                    }
-                    pl
-                }
-            };
-            if permlist != 0 {
-                // A clause naming no `who` is limited by the CURRENT process
-                // mask -- POSIX's rule, and note it is the mask, not the value
-                // being built, so an earlier clause cannot widen it.
-                permlist &= if wholist != 0 { wholist } else { !umask_now };
-                if op == b'-' {
-                    new_mode &= !permlist;
-                } else {
-                    new_mode |= permlist;
-                }
-            }
-            // Anything left that is not a separator must be another action, so
-            // `u=gr` is an error rather than a silently truncated `u=g`.
-            match b.get(i) {
-                None | Some(&b',') => break,
-                _ => {}
-            }
-        }
+/// One clause of a symbolic mode, applied to `mode`.
+fn apply_clause(clause: &[u8], mut mode: u32, umask_now: u32) -> Option<u32> {
+    if clause.is_empty() {
+        return Some(mode);
     }
-    Some(new_mode)
+    let named = clause
+        .iter()
+        .take_while(|&&c| who_bits(c).is_some())
+        .count();
+    let (who_letters, mut actions) = clause.split_at_checked(named)?;
+    if actions.is_empty() {
+        return None;
+    }
+    let who = who_letters
+        .iter()
+        .filter_map(|&c| who_bits(c))
+        .fold(0, |all, bits| all | bits);
+    let reach = if who == 0 { !umask_now } else { who };
+    while let Some((&op, rest)) = actions.split_first() {
+        match op {
+            b'=' => mode &= !(if who == 0 { MODE_BITS } else { who }),
+            b'+' | b'-' => {}
+            _ => return None,
+        }
+        let (bits, rest) = permissions(rest, mode)?;
+        if op == b'-' {
+            mode &= !(bits & reach);
+        } else {
+            mode |= bits & reach;
+        }
+        actions = rest;
+    }
+    Some(mode)
+}
+
+/// The permissions an action names, read against `mode`, and what follows
+/// them: one copy letter, whose class's three bits are granted to every
+/// class, or a run of permission letters, possibly empty.
+fn permissions(text: &[u8], mode: u32) -> Option<(u32, &[u8])> {
+    let copied = match text.first() {
+        Some(b'u') => Some(6),
+        Some(b'g') => Some(3),
+        Some(b'o') => Some(0),
+        _ => None,
+    };
+    if let Some(shift) = copied {
+        return Some((((mode >> shift) & 0o7) * 0o111, text.get(1..)?));
+    }
+    let letters = text.iter().take_while(|c| b"rwxXst".contains(c)).count();
+    let (named, rest) = text.split_at_checked(letters)?;
+    let bits = named.iter().fold(0, |bits, &c| {
+        bits | match c {
+            b'r' => 0o444,
+            b'w' => 0o222,
+            b'x' => 0o111,
+            b'X' if mode & 0o111 != 0 => 0o111,
+            b's' => 0o6000,
+            b't' => 0o1000,
+            _ => 0,
+        }
+    });
+    Some((bits, rest))
 }
 
 /// `umask -S`'s output: the bits a new file WOULD get, not the mask itself.
