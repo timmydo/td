@@ -266,6 +266,10 @@ pub struct Service {
     pair: Option<crate::pair::Cohort>,
     /// Automatic restart policy is applied only after paired containment drains.
     pair_resume: Option<(Phase, Option<Instant>)>,
+    /// `unless-exists=` has been asked; it is asked once.
+    skip_decided: bool,
+    /// Settled `Ready` by `unless-exists=` without running.
+    skipped: bool,
 }
 
 impl Service {
@@ -294,6 +298,8 @@ impl Service {
             pair: None,
             pair_resume: None,
             retired: false,
+            skip_decided: false,
+            skipped: false,
         }
     }
 
@@ -1532,6 +1538,35 @@ impl Runtime {
         })
     }
 
+    /// Decides `unless-exists=` once, when the unit would first start, its
+    /// ordering and strict dependencies met: a unit whose path exists then
+    /// never starts and settles `Ready`, so it satisfies `after=` and
+    /// `requires=` alike (DESIGN.md §3). Later starts, an operator's
+    /// included, do not ask again.
+    fn skip_once(&mut self, index: usize) -> bool {
+        let Some(service) = self.services.get_mut(index) else {
+            return false;
+        };
+        if service.skip_decided {
+            return false;
+        }
+        service.skip_decided = true;
+        // I5: the table refuses the key on a console; this is the second line.
+        if service.unit.is_console() {
+            return false;
+        }
+        let Some(path) = service.unit.unless_exists.as_deref() else {
+            return false;
+        };
+        if std::fs::symlink_metadata(path).is_err() {
+            return false;
+        }
+        service.phase = Phase::Ready;
+        service.skipped = true;
+        log(&format!("{}: skipped, {path} exists", service.unit.name));
+        true
+    }
+
     /// Start every unit whose turn has come, returning the earliest pending
     /// wake-up so the loop's block stays bounded.
     fn start_eligible(&mut self) -> Option<Instant> {
@@ -1603,6 +1638,9 @@ impl Runtime {
                     service.retry_at = None;
                 }
                 log(&format!("{name}: skipped, requires '{dep}' which failed"));
+                continue;
+            }
+            if self.skip_once(index) {
                 continue;
             }
             self.start(index);
@@ -3073,6 +3111,8 @@ impl Runtime {
         // decide what to do about it, from one that is actually serving.
         let state = if service.stopping {
             "stopping"
+        } else if service.skipped && service.phase == Phase::Ready {
+            "skipped"
         } else {
             service.phase.label()
         };
@@ -3131,6 +3171,11 @@ impl Runtime {
         service.retry_at = None;
         service.stopping = false;
         service.start_after_stop = false;
+        // An operator's start runs the unit, whether or not its table
+        // skipped it or a failed requirement kept the question from being
+        // asked.
+        service.skipped = false;
+        service.skip_decided = true;
         format!("{name}: starting\n")
     }
 
@@ -6964,6 +7009,136 @@ mod tests {
             Phase::Stopped,
             "the unit reported stopped without its containment being checked"
         );
+    }
+
+    /// `unless-exists=` (DESIGN.md §3): a unit whose path exists when it is
+    /// first eligible settles `Ready` without running, satisfies a strict
+    /// dependent and reads `skipped`; it is asked once, and an operator's
+    /// start runs it.
+    #[test]
+    fn a_unit_whose_unless_exists_path_exists_is_skipped_once() {
+        let mut rt = runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\nunless-exists=/\n\
+             [b]\ntype=oneshot\nexec=/bin/true\nrequires=a\n\
+             [c]\ntype=oneshot\nexec=/bin/true\nunless-exists=/td-svc-no-such-path\n",
+        );
+        let a = rt.index_of("a").unwrap();
+        assert!(rt.skip_once(a));
+        assert_eq!(rt.lookup("a").unwrap().phase, Phase::Ready);
+        assert!(rt.lookup("a").unwrap().pid.is_none());
+        assert_eq!(rt.status_line(a), "a skipped pid=- failures=0\n");
+        let b = rt.lookup("b").unwrap().unit.clone();
+        assert_eq!(rt.requires_failed(&b), None);
+        assert!(!rt.skip_once(a), "asked twice");
+        let c = rt.index_of("c").unwrap();
+        assert!(!rt.skip_once(c));
+        assert_eq!(rt.lookup("c").unwrap().phase, Phase::Down);
+        assert_eq!(rt.control_start("a"), "a: starting\n");
+        assert!(!rt.skip_once(a), "an operator's start was skipped");
+        assert_eq!(rt.status_line(a), "a down pid=- failures=0\n");
+    }
+
+    /// An operator's start runs a unit whose skip was never decided because
+    /// a strict dependency had failed at its start point.
+    #[test]
+    fn an_operators_start_is_never_skipped() {
+        let mut rt = runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [c]\ntype=daemon\nexec=/x\nrequires=a\nunless-exists=/\n",
+        );
+        rt.lookup_mut("a").unwrap().phase = Phase::Failed;
+        rt.start_eligible();
+        assert_eq!(rt.lookup("c").unwrap().phase, Phase::Failed);
+        rt.lookup_mut("a").unwrap().phase = Phase::Ready;
+        assert_eq!(rt.control_start("c"), "c: starting\n");
+        let c = rt.index_of("c").unwrap();
+        assert!(!rt.skip_once(c), "an operator's start was skipped");
+    }
+
+    /// I5's runtime line: a console is never skipped, even one the table
+    /// could not have admitted with the key.
+    #[test]
+    fn a_console_is_never_skipped() {
+        let unit = Unit {
+            name: "greeter".into(),
+            kind: crate::table::Kind::Daemon,
+            argv: vec!["/x".into()],
+            tty: Some("ttyS0".into()),
+            unless_exists: Some("/".into()),
+            ..Unit::default()
+        };
+        let mut rt = Runtime::new(vec![unit], "<test>").0;
+        let greeter = rt.index_of("greeter").unwrap();
+        assert!(!rt.skip_once(greeter));
+        assert!(!rt.lookup("greeter").unwrap().skipped);
+    }
+
+    /// A skip settles in the pass that decides it, so a dependent later in
+    /// the start order is decided in the same pass, with no event to wait
+    /// for; a dangling symlink exists for the question; and a skipped unit
+    /// stops and restarts as one with no process.
+    #[test]
+    fn a_skipped_unit_releases_its_dependents_at_once_and_stops_like_a_dead_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-svc-unless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let link = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("absent"), &link).unwrap();
+        let mut rt = runtime(&format!(
+            "[b]\ntype=daemon\nexec=/x\nrestart=always\nafter=a\nunless-exists={0}\n\
+             [a]\ntype=daemon\nexec=/x\nrestart=always\nunless-exists={0}\n",
+            link.display()
+        ));
+        rt.start_eligible();
+        std::fs::remove_dir_all(&dir).unwrap();
+        for name in ["a", "b"] {
+            let service = rt.lookup(name).unwrap();
+            assert!(service.skipped && service.phase == Phase::Ready, "{name}");
+            assert!(service.pid.is_none(), "{name}");
+        }
+        assert_eq!(
+            rt.control_stop("a", false),
+            "a: was not running; marked stopped\n"
+        );
+        let a = rt.index_of("a").unwrap();
+        assert_eq!(rt.status_line(a), "a stopped pid=- failures=0\n");
+        assert_eq!(rt.control_stop("b", true), "b: starting\n");
+        assert!(!rt.lookup("b").unwrap().skipped);
+        assert_eq!(rt.lookup("b").unwrap().phase, Phase::Down);
+    }
+
+    /// The skip is decided where a start would be: after the unit's ordering
+    /// settles, and never over an unmet strict dependency, which still fails
+    /// the unit rather than reading it ready.
+    #[test]
+    fn unless_exists_is_asked_only_once_a_start_is_due() {
+        let mut rt = runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [b]\ntype=daemon\nexec=/x\nafter=a\nunless-exists=/\n\
+             [c]\ntype=daemon\nexec=/x\nrequires=a\nunless-exists=/\n",
+        );
+        rt.lookup_mut("a").unwrap().phase = Phase::Starting;
+        rt.start_eligible();
+        for name in ["b", "c"] {
+            let service = rt.lookup(name).unwrap();
+            assert_eq!(service.phase, Phase::Down, "{name}");
+            assert!(
+                !service.skip_decided,
+                "{name} was asked before its ordering settled"
+            );
+        }
+        rt.lookup_mut("a").unwrap().phase = Phase::Failed;
+        rt.start_eligible();
+        let b = rt.index_of("b").unwrap();
+        assert_eq!(rt.status_line(b), "b skipped pid=- failures=0\n");
+        assert_eq!(rt.lookup("c").unwrap().phase, Phase::Failed);
+        assert!(!rt.lookup("c").unwrap().skipped);
     }
 
     /// `requires=` asks whether the dependency is THERE. A service an operator

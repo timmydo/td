@@ -225,8 +225,8 @@ ISO alone:
 
 It boots from optical media or a USB stick and runs the system from the
 medium, with all writes in RAM; see "Live boot" in [the media
-contract](td-install/MEDIA.md). It opens the graphical installer, which
-erases one chosen whole disk and installs td onto it, offline. Storage is
+contract](td-install/MEDIA.md). It opens the graphical installer alone,
+which erases one chosen whole disk and installs td onto it, offline. Storage is
 unencrypted, the installed account logs in automatically, and root keeps
 the stock image's empty password field ([AGENTS.md](AGENTS.md) principle 7
 owns that cutover). Version 1 is validated on x86-64 UEFI under QEMU only;

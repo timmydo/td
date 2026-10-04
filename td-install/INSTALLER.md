@@ -11,8 +11,7 @@ the medium as USB storage, `./test-iso` boots it as optical media by hand,
 and `qemu-boot-media` and `qemu-install-system` boot their own media both
 ways. Within version 1's scope remain a keyboard layout other than `us`,
 which waits for a keyboard catalog; the completion page's orderly reboot
-offer; keeping a late window from taking the wizard's place and keys ("Live
-startup"); and moving the remaining home-path consumers onto the installed
+offer; and moving the remaining home-path consumers onto the installed
 account ("Media, boot and persistence").
 
 ## Version 1
@@ -133,29 +132,33 @@ active (increment 7), with the parts named at the top remaining.
 
 ### Live startup
 
-The system image carries td-setup, and on a live boot (`td.live=1`, which
-only the live selector's handoff sets; td-install/MEDIA.md "Live boot") the
-session's `[setup]` td-svc unit starts it once the compositor runs, the
-session's own windows are placed and Firefox's window has mapped (on a live
-boot Firefox is ready only then, unless its readiness times out first): as
+The system image carries td-setup, and a live boot (`td.live=1`, which only
+the live selector's handoff sets; td-install/MEDIA.md "Live boot") opens it
+and nothing else: the live session is for installing td. Every stock session
+unit that opens a window (the shell's terminal, Firefox, mail and news),
+places those windows, or proves them in the autotest evidence names the live
+medium's mount, `/run/td-media`, in td-svc's `unless-exists=`
+(td-svc/DESIGN.md §3), so it settles ready without running and what requires
+it, such as boot health after the terminal, still runs. The session's
+services, the secure attention path and td-authd's authority run as on an
+installed boot. The `[setup]` td-svc unit starts the wizard once the
+compositor serves (under the autotest token, also once TLS setup's console
+output has ended); the compositor prepares its session with td-authd, which
+binds the setup intake, before its display listener exists. It runs as
 `tdi1000` through td-login's checked service path, in its own service
 cgroup, unjailed and without disk authority, on the compositor's socket by
 `WAYLAND_DISPLAY`. The compositor admits that identity as a display client
-only, never as the human. A Firefox slow enough to time out its readiness
-can still map after the wizard, as can a restarted Firefox, terminal or
-application, on the wizard's workspace and with the keyboard, since the
-compositor focuses what it maps; keeping a late window from taking the
-wizard's place and keys is a follow-up. The unit first makes the empty
-third workspace active, so the wizard maps there alone, with the whole
-output and the keyboard; a third tile beside the shell and Firefox would be
-smaller than its smallest page. A window that maps later, such as a
-restarted terminal or Firefox, still maps on the active workspace and
-shares it. The unit is ready when the compositor's layout report names a
-window with td-setup's app id; it is never restarted, so a wizard that
-exits is not relaunched behind the person, and an installed boot's unit
-exits at once. Under the autotest token a live boot prints
-`TD-SETUP-LIVE-READY` once td-setup's is the one window with its app id,
-visible, focused and at least 752x480, and td-authd's setup intake exists.
+only, never as the human. The wizard maps alone on the first workspace,
+where the session begins, with the whole output and the keyboard. A person
+can still open a terminal or the launcher's programs; such a window maps
+beside the wizard and takes the keyboard as any newly mapped window does.
+The unit is ready when the compositor's layout report names a window with
+td-setup's app id; it is never restarted, so a wizard that exits is not
+relaunched behind the person, and an installed boot's unit exits at once.
+Under the autotest token a live boot prints `TD-SETUP-LIVE-READY` once
+td-setup's is the session's one window, the first workspace active and the
+only one occupied, visible, focused and at least 752x480, and td-authd's
+setup intake exists.
 
 When the command line also holds `td.setup-input=1`, td-setup says on
 standard error, which the unit leaves on the console, one
@@ -211,13 +214,10 @@ installer's GPT layout, primary and backup whole. A lost or garbled
 evidence line fails the run as soon as a later line shows the gap, and a
 state that does not follow its act within five minutes, or an installed
 notice that does not follow consent within half an hour, fails it then; so
-does td-setup saying the installation failed. Under that token the session
-keeps the drive's keyboard: the autotest Claude terminal evidence, whose
-window would map on the wizard's workspace and take the keys, does not run;
-the wizard waits for the autotest Firefox's window, by the clock and no
-longer than Firefox's own evidence polls for it, and does not start if it
-never maps, saying so on the console; and the greeter parks rather than
-reboot the live boot when its health transaction settles. With the medium detached, the installed disk then
+does td-setup saying the installation failed. Under that token the
+greeter parks rather than reboot the live boot when its health transaction
+settles; no autotest window evidence runs on a live boot, so nothing else
+maps to take the drive's keys. With the medium detached, the installed disk then
 cold-boots through firmware twice, alone and then renamed behind a decoy
 disk: each boot must bind the volume UUID read from the image's own
 superblock and the medium's deployment, activate the wizard's account and
@@ -253,15 +253,16 @@ drive a review to the consent prompt. Nothing unprivileged becomes
 setuid, switches credentials only for root. Root is outside this boundary
 and could write a disk without the installer (the stock image leaves its
 password field empty, but nothing in the live session enters it); through
-the installation service, erasure still needs the person's physical
-consent. Programs of the session can still disturb the wizard without
-driving it, among them: the compositor's control socket moves, regroups and
-resizes its window and changes its workspace, a late window takes its focus
-(above), a window with td-setup's app id satisfies the unit's diagnostic
-readiness probe, the session's clients can fill the compositor's public
-client slots or `/tmp` first, and files squatting td-ui's predictable
-buffer names in `/tmp` can leave it unable to draw. Synthetic input is
-refused while trusted attention is enabled, so none can type into it.
+the installation service, erasure still needs the person's physical consent.
+Programs of the session can still disturb the wizard without driving it,
+among them: the compositor's control socket moves, regroups and resizes its
+window and changes its workspace, a window mapped later, such as one a
+person opens, takes its focus (above), a window with td-setup's app id
+satisfies the unit's diagnostic readiness probe, the session's clients can
+fill the compositor's public client slots or `/tmp` first, and files
+squatting td-ui's predictable buffer names in `/tmp` can leave it unable to
+draw. Synthetic input is refused while trusted attention is enabled, so none
+can type into it.
 
 The destination page is a pure view over `Destination` values supplied by
 the service. It shows capacity, model, kernel name, device number, sequence,

@@ -51,6 +51,9 @@ pub struct Unit {
     /// What this unit's own leaf bounds. Refused unless `cgroup=service`, so a
     /// limit is never written where the unit's processes will not be.
     pub limits: Limits,
+    /// `unless-exists=`: a path whose presence, when the unit would first
+    /// start, skips it (DESIGN.md §3).
+    pub unless_exists: Option<String>,
 }
 
 /// Where a unit's processes are accounted.
@@ -151,6 +154,7 @@ impl Default for Unit {
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             cgroup: Cgroup::Service,
             limits: Limits::default(),
+            unless_exists: None,
         }
     }
 }
@@ -499,6 +503,13 @@ fn apply(unit: &mut Unit, key: &str, value: &str, stanza: &mut Stanza) -> Result
         "timeout" => unit.timeout = Some(parse_duration(value)?),
         "ready-timeout" => unit.ready_timeout = parse_duration(value)?,
         "stop-timeout" => unit.stop_timeout = parse_duration(value)?,
+        "unless-exists" => {
+            // Absolute for the reason `log=` is: td-svc's directory is PID 1's.
+            if !value.starts_with('/') {
+                return Err("unless-exists= needs an absolute path".into());
+            }
+            unit.unless_exists = Some(value.to_string());
+        }
         other => return Err(format!("unknown key '{other}'")),
     }
     Ok(())
@@ -610,6 +621,12 @@ fn finish(unit: Unit, stanza: Stanza, units: &mut Vec<Unit>, problems: &mut Vec<
     if unit.is_console() && !unit.requires.is_empty() {
         problems.push(format!(
             "{name}: a console unit (tty=) may not declare requires= — the console is never skippable"
+        ));
+        ok = false;
+    }
+    if unit.is_console() && unit.unless_exists.is_some() {
+        problems.push(format!(
+            "{name}: a console unit (tty=) may not declare unless-exists= — the console is never skippable"
         ));
         ok = false;
     }
@@ -820,6 +837,35 @@ mod tests {
         assert!(units.is_empty(), "a relative log path was admitted");
         assert!(
             problems.iter().any(|p| p.contains("absolute")),
+            "{problems:?}"
+        );
+    }
+
+    /// `unless-exists=` names a path, absolutely, and never on a console:
+    /// a console is never skippable (DESIGN.md I5).
+    #[test]
+    fn unless_exists_is_an_absolute_path_and_never_on_a_console() {
+        let (units, problems) =
+            parse("[w]\ntype=daemon\nexec=/x\nrestart=always\nunless-exists=/run/td-media\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            units.first().and_then(|u| u.unless_exists.as_deref()),
+            Some("/run/td-media")
+        );
+        let (units, problems) = parse("[w]\ntype=oneshot\nexec=/x\nunless-exists=run/x\n");
+        assert!(
+            units.is_empty(),
+            "a relative unless-exists path was admitted"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("absolute")),
+            "{problems:?}"
+        );
+        let (units, problems) =
+            parse("[g]\ntype=daemon\nexec=/x\ntty=ttyS0\nunless-exists=/run/td-media\n");
+        assert!(units.is_empty(), "a skippable console was admitted");
+        assert!(
+            problems.iter().any(|p| p.contains("never skippable")),
             "{problems:?}"
         );
     }

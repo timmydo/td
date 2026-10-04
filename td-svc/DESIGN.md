@@ -97,7 +97,9 @@ place more slowly. Hence four defences, not three: the table refuses
 `requires=` on a `tty=` unit, the plan refuses to skip one, the runtime
 refuses to skip one, and a console's wait for its dependencies is bounded
 (`CONSOLE_PATIENCE`) after which it starts with its ordering ignored. The
-first three reason about the GRAPH; only the fourth catches a stall.
+first three reason about the GRAPH; only the fourth catches a stall. The
+table refuses `unless-exists=` on a `tty=` unit for the same reason it
+refuses `requires=`.
 
 I5 has exactly one limit, and it is **I6**: once a shutdown begins, nothing
 starts, a `tty=` unit included. The two invariants want opposite things there
@@ -285,7 +287,23 @@ restart=always
 Keys: `type` (`oneshot` | `daemon`), `exec`, `after`, `requires`, `restart`
 (`always` | `on-failure` | `never`), `tty`, `log`, `console` (`yes` | `no`),
 `timeout`, `ready`, `ready-timeout`, `stop-timeout`, `cgroup`
-(`service` | `session`), `memory-max`, `pids-max`, `cpu-weight`, `pair-exec`.
+(`service` | `session`), `memory-max`, `pids-max`, `cpu-weight`, `pair-exec`,
+`unless-exists`.
+
+`unless-exists` names an absolute path. When the unit is first eligible to
+start, its ordering satisfied and no strict dependency failed, td-svc asks
+once whether the path exists (a dangling symlink counts); if it does, the
+unit never runs and settles `Ready`, which satisfies `after=` and
+`requires=` alike, and `status` reads it `skipped`. It is not asked again: a
+later restart, or an operator's `start`, runs the unit. The decision is the
+running supervisor's: a td-svc that PID 1 respawns asks afresh. The shipped
+table uses it for a live boot, whose initramfs alone mounts the install
+medium at `/run/td-media`: the stock session's window units name that path,
+so the live session opens only the installer (td-install/INSTALLER.md "Live
+startup") while boot health, which requires the terminal, still runs.
+Exiting 0 from a gated `exec=` would not do: a `restart=always` daemon that
+exits is restarted into the capped hold, and its strict dependents are
+skipped. Per **I5** a `tty=` unit may not declare it.
 
 `pair-exec` names a second literal argv, parsed exactly as `exec`. It requires
 `type=daemon`, `cgroup=service`, no `tty`, and a nonempty `ready` probe that

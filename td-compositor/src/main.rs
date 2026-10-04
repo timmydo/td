@@ -1291,6 +1291,12 @@ mod confinement {
         assert!(
             run.find("authority::Launcher::connect()").unwrap() < run.find("input::start").unwrap()
         );
+        // The prepared session binds a live boot's setup intake, so the
+        // wizard, started once the display probe answers, finds it.
+        assert!(
+            run.find("authority::Launcher::connect()").unwrap()
+                < run.find("server::serve(").unwrap()
+        );
     }
 
     #[test]

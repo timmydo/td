@@ -337,14 +337,9 @@ const FIREFOX_SOAK_BRACKET_MARGIN_SECS: u16 = 30;
 // exponential restart backoff. Autotest allows two cold starts plus margin.
 const FIREFOX_EVIDENCE_WAIT_ITERATIONS: u16 =
     FIREFOX_READY_TIMEOUT_SECS * FIREFOX_READY_ATTEMPTS + FIREFOX_RETRY_MARGIN_SECS;
-/// Under the setup-input token the live wizard waits this long, by the
-/// clock, for the autotest Firefox's window, no longer than Firefox's
-/// evidence polls for it: its readiness can time out under TCG before it
-/// maps, and a window mapped later takes the keyboard.
-const SETUP_FIREFOX_WAIT_SECS: u16 = FIREFOX_EVIDENCE_WAIT_ITERATIONS;
-/// The wizard's readiness outlasts that wait by its last layout query and
-/// its own window's 30 seconds.
-const SETUP_READY_TIMEOUT_SECS: u16 = SETUP_FIREFOX_WAIT_SECS + 60;
+/// The wizard's window maps while a first boot's probes still run under
+/// TCG; Firefox, a far larger client, is given 180 seconds.
+const SETUP_READY_TIMEOUT_SECS: u16 = 120;
 // `after=` releases this daemon when firefox-evidence starts, not when its
 // atomic completion appears. Cover the evidence poll loop plus every support
 // session that can legally extend one of those iterations.
@@ -1258,10 +1253,11 @@ const SETUP_APP_ID: &str = "td-setup";
 /// td-authd's setup intake on a live boot (td-authd/src/disk_install.rs).
 const SETUP_INTAKE_SOCKET: &str = "/run/td-authd/1000/setup";
 
-/// The empty workspace a live boot's wizard maps on alone: its pages need
-/// a tile of at least td-setup's minimum, which no third tile beside the
-/// shell and Firefox on the first is.
-const SETUP_WORKSPACE: u8 = 3;
+/// Where a live boot's initramfs moves the install medium (td-install/MEDIA.md
+/// "Live boot"). It exists on a live boot alone, so the stock session's
+/// windows and their evidence name it in `unless-exists=`: a live session
+/// opens the wizard and nothing else.
+const LIVE_MEDIUM: &str = "/run/td-media";
 /// td-setup's smallest supported page (td-setup/src/lib.rs).
 const SETUP_MIN_WIDTH: u16 = 752;
 const SETUP_MIN_HEIGHT: u16 = 480;
@@ -1744,9 +1740,13 @@ fn build_td_svc_conf() -> String {
          # CHOSE, a PTY the kernel agrees is that grid, and a started child --\n\
          # more than the demo's probe proved, except that the demo also required\n\
          # a seat advertising a POINTER and this needs only a keyboard.\n\
+         # A live boot skips it and every window unit below but the wizard's:\n\
+         # unless-exists= settles them ready unstarted, so what requires them\n\
+         # still runs.\n\
          [terminal]\n\
          type=daemon\n\
          cgroup=session\n\
+         unless-exists={live_medium}\n\
          exec=/bin/td-login exec-primary -- /bin/env TD_CONTROL_SOCKET={control_socket} /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/{ui_uid}/td-term-ready\n\
          after=wayland\n\
          requires=wayland\n\
@@ -1778,6 +1778,7 @@ fn build_td_svc_conf() -> String {
          [applications-workspace]\n\
          type=oneshot\n\
          cgroup=session\n\
+         unless-exists={live_medium}\n\
          exec=/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {application_workspace}\n\
          after=terminal\n\
          requires=wayland\n\
@@ -1788,6 +1789,7 @@ fn build_td_svc_conf() -> String {
          [mail]\n\
          type=daemon\n\
          cgroup=session\n\
+         unless-exists={live_medium}\n\
          exec=/bin/td-authd application-start {ui_uid} {mail_name} direct --\n\
          after=busd,portal,mail-fetch,mail-files,applications-workspace,firefox-tls-setup\n\
          requires=wayland,busd,mail-fetch,mail-files,td-firstboot\n\
@@ -1805,6 +1807,7 @@ fn build_td_svc_conf() -> String {
          # otherwise prefix it. Mutable user state cannot block bootsuccess.\n\
          [mail-evidence]\n\
          type=oneshot\n\
+         unless-exists={live_medium}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-service-as tda65537 -- /bin/td-jail --probe-process-token {mail_name} {mail_program} && /bin/echo {mail_marker}'\n\
          after=mail,firefox-tls-setup\n\
          requires=mail\n\
@@ -1818,6 +1821,7 @@ fn build_td_svc_conf() -> String {
          [news]\n\
          type=daemon\n\
          cgroup=session\n\
+         unless-exists={live_medium}\n\
          exec=/bin/td-authd application-start {ui_uid} {news_name} direct --\n\
          after=busd,news-fetch,applications-workspace\n\
          requires=wayland,busd,news-fetch,td-firstboot\n\
@@ -1828,6 +1832,7 @@ fn build_td_svc_conf() -> String {
          # As mail-evidence, for news.\n\
          [news-evidence]\n\
          type=oneshot\n\
+         unless-exists={live_medium}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; /bin/td-util sleep {application_settle}; /bin/td-login exec-service-as tda65538 -- /bin/td-jail --probe-process-token {news_name} {news_program} && /bin/echo {news_marker}'\n\
          after=news,firefox-tls-setup\n\
          requires=news\n\
@@ -1838,6 +1843,7 @@ fn build_td_svc_conf() -> String {
          [shell-workspace]\n\
          type=oneshot\n\
          cgroup=session\n\
+         unless-exists={live_medium}\n\
          exec=/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace 1\n\
          after=mail,news\n\
          requires=wayland\n\
@@ -1852,41 +1858,43 @@ fn build_td_svc_conf() -> String {
          # marker waits for TLS setup like the other exact lines.\n\
          [placement-evidence]\n\
          type=oneshot\n\
+         unless-exists={live_medium}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) || exit 1; /bin/echo \"$layout\" | /bin/grep -qxF \"workspace active=1 occupied=1,{application_workspace}\" && /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"^window id=[^ ]* object=[^ ]* workspace=1 \")\" -eq 1 && /bin/echo {placed_marker}'\n\
          after=shell-workspace,firefox-tls-setup\n\
          requires=shell-workspace\n\
          timeout={application_place}\n\
          \n\
          # The installer wizard, on a live boot only (td-install/INSTALLER.md):\n\
-         # once the session's own windows are placed and Firefox's has mapped\n\
-         # (Firefox is ready on a live boot only then, unless its readiness\n\
-         # times out; under the setup-input token the wizard waits for the\n\
-         # window itself),\n\
-         # the view moves to an empty workspace and the wizard maps there\n\
-         # alone, whole-output and holding the keyboard. It runs as its own\n\
-         # service identity, unjailed and without disk authority, and reaches\n\
-         # root's installation service only through td-authd's setup intake,\n\
-         # which admits that identity alone. An\n\
+         # the session's one window, on the first workspace, whole-output and\n\
+         # holding the keyboard. The compositor's session is prepared, and with\n\
+         # it the setup intake bound, before its display listener exists. Its\n\
+         # evidence lines are exact console lines, so it waits for TLS setup\n\
+         # as the other evidence does: the key generator's dots would split\n\
+         # them. It\n\
+         # runs as its own service identity, unjailed and without disk\n\
+         # authority, and reaches root's installation service only through\n\
+         # td-authd's setup intake, which admits that identity alone. An\n\
          # installed boot's exec exits 0 at once and its probe passes.\n\
          # restart=never: a wizard that exits is not relaunched behind the\n\
          # person mid-installation.\n\
          [setup]\n\
          type=daemon\n\
          cgroup=service\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) case \" $(/bin/cat /proc/cmdline) \" in *\" {setup_input_cmdline_token} \"*) start=$(/bin/date +%s) || exit 1; while :; do layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{firefox_app_id} title=\" && break; now=$(/bin/date +%s) || exit 1; if [ $((now - start)) -ge {setup_firefox_wait} ]; then /bin/echo \"td-setup: the autotest Firefox window did not map in {setup_firefox_wait}s; not starting the wizard it would take the keyboard from\"; exit 1; fi; /bin/td-util sleep 1; done;; esac; /bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} workspace {setup_workspace} || exit 1; exec /bin/td-login exec-service-as {installer_user} -- /bin/env -u HOME WAYLAND_DISPLAY={wayland_socket} /bin/td-setup;; *) exit 0;; esac'\n\
-         after=wayland,placement-evidence,firefox\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) exec /bin/td-login exec-service-as {installer_user} -- /bin/env -u HOME WAYLAND_DISPLAY={wayland_socket} /bin/td-setup;; *) exit 0;; esac'\n\
+         after=wayland,firefox-tls-setup\n\
          requires=wayland\n\
          ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{setup_app_id} title=\"'\n\
          ready-timeout={setup_ready_timeout}\n\
          restart=never\n\
          \n\
          # Boot evidence on a live boot under the autotest token only: the\n\
-         # wizard's is the one window with its app id, visible and focused,\n\
-         # its tile holds td-setup's smallest page, and td-authd's live setup\n\
-         # intake is bound for it. The record's sizes precede its title.\n\
+         # wizard's is the session's one window, on the first workspace and\n\
+         # the only one occupied, visible and focused, its tile holds\n\
+         # td-setup's smallest page, and td-authd's live setup intake is\n\
+         # bound for it. The record's sizes precede its title.\n\
          [setup-evidence]\n\
          type=oneshot\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) || exit 1; /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"{window_record}{setup_app_id} title=\")\" -eq 1 || exit 1; window=$(/bin/echo \"$layout\" | /bin/grep \"{focused_record}{setup_app_id} title=\") || exit 1; width=${{window#* width=}}; width=${{width%% *}}; height=${{window#* height=}}; height=${{height%% *}}; /bin/td-util test \"$width\" -ge {setup_min_width} && /bin/td-util test \"$height\" -ge {setup_min_height} && /bin/td-util test -e {setup_intake} && /bin/echo {setup_marker}'\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) :;; *) exit 0;; esac; layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) || exit 1; /bin/echo \"$layout\" | /bin/grep -qxF \"workspace active=1 occupied=1\" || exit 1; /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"^window \")\" -eq 1 || exit 1; /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \"{window_record}{setup_app_id} title=\")\" -eq 1 || exit 1; window=$(/bin/echo \"$layout\" | /bin/grep \"{focused_record}{setup_app_id} title=\") || exit 1; width=${{window#* width=}}; width=${{width%% *}}; height=${{window#* height=}}; height=${{height%% *}}; /bin/td-util test \"$width\" -ge {setup_min_width} && /bin/td-util test \"$height\" -ge {setup_min_height} && /bin/td-util test -e {setup_intake} && /bin/echo {setup_marker}'\n\
          after=setup,firefox-tls-setup\n\
          requires=setup\n\
          timeout={application_place}\n\
@@ -1935,10 +1943,11 @@ fn build_td_svc_conf() -> String {
          [firefox]\n\
          type=daemon\n\
          cgroup=session\n\
+         unless-exists={live_medium}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct -- --marionette --remote-allow-system-access --profile {firefox_autotest_profile} {firefox_tls_url};; *) exec /bin/td-authd application-start {ui_uid} {firefox_name} direct --;; esac'\n\
          after=audio,busd,portal,wayland,firefox-files,firefox-handoff,firefox-autotest,firefox-tls-origin,placement-evidence\n\
          requires=wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot\n\
-         ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live_cmdline_token} \"*) layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket {control_socket} layout) && /bin/echo \"$layout\" | /bin/grep -q \"{window_record}{firefox_app_id} title=\" || exit 1;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
+         ready=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) exec /bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} --quiet;; *) exit 0;; esac'\n\
          ready-timeout={firefox_ready_timeout}\n\
          restart=always\n\
          \n\
@@ -1955,6 +1964,7 @@ fn build_td_svc_conf() -> String {
          # the authority.\n\
          [firefox-evidence]\n\
          type=daemon\n\
+         unless-exists={live_medium}\n\
          exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; s=0; while [ \"$n\" -lt {firefox_evidence_wait} ]; do if application=$(/bin/td-login exec-primary -- /bin/td-compositor probe-application {firefox_window_ready_socket} {firefox_app_id} {firefox_content_rgb_a} {firefox_content_rgb_b} 2>/dev/null) && content=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} -contentproc 2>/dev/null) && /bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-resource-caps {firefox_name}; then if support=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-support); then network=; case \" $(/bin/cat /proc/cmdline) \" in *\" {nettest_cmdline_token} \"*) network=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-firefox-network) || exit 1; [ \"$network\" = {firefox_network_marker} ] || exit 1;; esac; /bin/rm -f {firefox_evidence_tmp_path} {firefox_completion_tmp_path} && /bin/td-util printf \"%s\\n\" {firefox_evidence} > {firefox_evidence_tmp_path} && /bin/td-util chmod 0644 {firefox_evidence_tmp_path} && /bin/mv {firefox_evidence_tmp_path} {firefox_evidence_path} && /bin/td-util printf \"%s\\n\" \"$application\" && /bin/td-util printf \"%s\\n\" \"$content\" && /bin/td-util printf \"%s\\n\" \"$support\" && /bin/td-util printf \"%s\\n\" \"$network\" && /bin/echo {firefox_marker} && /bin/echo {firefox_content_marker} && /bin/echo {firefox_support_marker} && /bin/td-util printf \"%s\\n\" {firefox_completion} > {firefox_completion_tmp_path} && /bin/td-util chmod 0644 {firefox_completion_tmp_path} && /bin/mv {firefox_completion_tmp_path} {firefox_completion_path} && exit 0; exit 1; fi; s=$((s+1)); [ \"$s\" -lt {firefox_support_attempts} ] || exit 1; fi; n=$((n+1)); /bin/td-util sleep 1; done; exit 1'\n\
          after=firefox,netup\n\
          restart=never\n\
@@ -2022,7 +2032,8 @@ fn build_td_svc_conf() -> String {
          # for.\n\
          [claude-evidence]\n\
          type=daemon\n\
-         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {setup_input_cmdline_token} \"*) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
+         unless-exists={live_medium}\n\
+         exec=/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {autotest_cmdline_token} \"*) :;; *) exit 0;; esac; n=0; while [ \"$n\" -lt {claude_pre_run_wait} ]; do firefox=$(/bin/td-util cat {firefox_completion_path} 2>/dev/null); if [ \"$firefox\" = {firefox_completion} ]; then case \" $(/bin/cat /proc/cmdline) \" in *\" {firefox_input_cmdline_token} \"*) input=$(/bin/td-util cat {firefox_input_completion_path} 2>/dev/null); [ \"$input\" = {firefox_input_final_completion} ] && break;; *) break;; esac; fi; n=$((n+1)); /bin/td-util sleep 1; done; [ \"$n\" -lt {claude_pre_run_wait} ] || exit 1; /bin/rm -f {claude_error_path} {claude_completion_tmp_path} || exit 1; process_before=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; bus_before=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; if refused=$(/bin/td-login exec-service-as tda65539 -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then /bin/echo \"td-claude-evidence: a launch with no terminal of its own ran\"; exit 1; fi; if [ \"$refused\" = \"{claude_refused_line}\" ]; then :; else /bin/td-util printf \"%s\\n\" \"$refused\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch with no terminal was refused for another reason, kept in {claude_error_path}\"; exit 1; fi; ran=$(/bin/td-login exec-service-as tda65539 -- /bin/td-term run --socket {wayland_socket} --ready-socket /run/user/65539/td-claude-evidence-ready --command /bin/{claude_name} --version 2>&1 </dev/null); if /bin/td-util printf \"%s\\n\" \"$ran\" | /bin/rg --quiet --line-regexp \"td-term: the terminal.s child exited with status 0\"; then :; else /bin/td-util printf \"%s\\n\" \"$ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: the launch inside a terminal did not report its child at status 0, kept in {claude_error_path}\"; exit 1; fi; if shell_ran=$(/bin/td-login exec-primary -- /bin/env TERM=td-term /bin/{claude_name} --version 2>&1 </dev/null); then :; else /bin/td-util printf \"%s\\n\" \"$shell_ran\" > {claude_error_path}; /bin/echo \"td-claude-evidence: human shell launch failed, kept in {claude_error_path}\"; exit 1; fi; process_after=$(/bin/td-login exec-service-as tda65536 -- /bin/td-jail --probe-process-token {firefox_name} --marionette) || exit 1; [ \"$process_after\" = \"$process_before\" ] || exit 1; bus_after=$(/bin/td-login exec-primary -- /bin/td-busd application {bus_socket} {firefox_name}) || exit 1; [ \"$bus_after\" = \"$bus_before\" ] || exit 1; /bin/echo \"{claude_marker}\" && /bin/td-util printf \"%s\\n\" {claude_completion} > {claude_completion_tmp_path} && /bin/td-util chmod 0644 {claude_completion_tmp_path} && /bin/mv {claude_completion_tmp_path} {claude_completion_path} && exit 0; exit 1'\n\
          after=firefox-soak,claude-files,claude-launch\n\
          requires=td-firstboot,claude-files,claude-launch\n\
          restart=never\n\
@@ -2130,12 +2141,10 @@ fn build_td_svc_conf() -> String {
         setup_intake = SETUP_INTAKE_SOCKET,
         installer_user = INSTALLER_USER,
         setup_marker = TD_SETUP_LIVE_MARKER,
-        setup_input_cmdline_token = SETUP_INPUT_CMDLINE_TOKEN,
         setup_min_height = SETUP_MIN_HEIGHT,
         setup_min_width = SETUP_MIN_WIDTH,
-        setup_workspace = SETUP_WORKSPACE,
-        setup_firefox_wait = SETUP_FIREFOX_WAIT_SECS,
         setup_ready_timeout = SETUP_READY_TIMEOUT_SECS,
+        live_medium = LIVE_MEDIUM,
         mail_marker = TD_MAIL_BOOT_MARKER,
         news_marker = TD_NEWS_BOOT_MARKER,
         fetch_marker = TD_FETCH_BOOT_MARKER,
@@ -6463,15 +6472,10 @@ mod tests {
             Some("wayland,firefox-autotest,firefox-tls-origin,firefox-files,td-firstboot")
         );
         let firefox_ready = unit_key("firefox", "ready").unwrap_or_default();
-        let live = td_boot_protocol::LIVE_CMDLINE_TOKEN;
         assert_eq!(
             firefox_ready,
             format!(
-                "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in *\" {live} \"*) \
-                 layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket \
-                 {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | \
-                 /bin/grep -q \"{WINDOW_RECORD}{FIREFOX_APP_ID} title=\" || exit 1;; \
-                 esac; case \" $(/bin/cat /proc/cmdline) \" in \
+                "/bin/sh -c 'case \" $(/bin/cat /proc/cmdline) \" in \
                  *\" {AUTOTEST_CMDLINE_TOKEN} \"*) exec /bin/td-login exec-primary -- \
                  /bin/td-compositor probe-application \
                  {FIREFOX_WINDOW_READY_SOCKET} {FIREFOX_APP_ID} \
@@ -7755,10 +7759,63 @@ mod tests {
         }
     }
 
-    /// The wizard is in the image and starts only on a live boot, as the
-    /// human user on the compositor's socket, once the session's own windows
-    /// are placed; its evidence needs both tokens and names its window
-    /// focused and td-authd's intake bound.
+    /// A live session opens the wizard alone (td-install/INSTALLER.md "Live
+    /// startup"): exactly the stock session's window units and their
+    /// evidence name the live medium in unless-exists=, which td-svc settles
+    /// ready unstarted, so what requires the terminal still runs. The path
+    /// is where the live initramfs moves the medium and td-authd serves it.
+    #[test]
+    fn a_live_session_skips_every_window_but_the_wizards() {
+        let mut skipped: Vec<String> = parse_td_svc_conf()
+            .into_iter()
+            .filter_map(|(name, keys)| {
+                let paths: Vec<&String> = keys
+                    .iter()
+                    .filter(|(key, _)| key == "unless-exists")
+                    .map(|(_, value)| value)
+                    .collect();
+                match paths.as_slice() {
+                    [] => None,
+                    [path] => {
+                        assert_eq!(path.as_str(), LIVE_MEDIUM, "{name}");
+                        Some(name)
+                    }
+                    _ => panic!("{name}: more than one unless-exists="),
+                }
+            })
+            .collect();
+        skipped.sort();
+        let mut expected = vec![
+            "applications-workspace",
+            "claude-evidence",
+            "firefox",
+            "firefox-evidence",
+            "mail",
+            "mail-evidence",
+            "news",
+            "news-evidence",
+            "placement-evidence",
+            "shell-workspace",
+            "terminal",
+        ];
+        expected.sort();
+        assert_eq!(skipped, expected);
+        // The firefox unit's readiness no longer special-cases a live boot.
+        assert!(!unit_key("firefox", "ready")
+            .unwrap()
+            .contains(td_boot_protocol::LIVE_CMDLINE_TOKEN));
+        let init = build_deployment_init(&SYSTEM);
+        assert!(init.contains(&format!(
+            "/bin/mount -o move /media /sysroot{LIVE_MEDIUM}\n"
+        )));
+        assert!(include_str!("../../../td-authd/src/disk_install.rs")
+            .contains(&format!("\"{LIVE_MEDIUM}\",")));
+    }
+
+    /// The wizard is in the image and starts only on a live boot, under its
+    /// own identity on the compositor's socket, as the session's one window;
+    /// its evidence needs both tokens and names its window alone on the
+    /// first workspace, focused, and td-authd's intake bound.
     #[test]
     fn the_installer_wizard_starts_only_on_a_live_boot() {
         let recipe = recipe();
@@ -7780,28 +7837,17 @@ mod tests {
         let gate =
             |token: &str| format!("case \" $(/bin/cat /proc/cmdline) \" in *\" {token} \"*)");
         let live = gate(td_boot_protocol::LIVE_CMDLINE_TOKEN);
-        // Firefox's readiness can time out before its window maps under
-        // TCG; while the oracle types, the wizard waits for that window by
-        // the clock, since the compositor focuses what it maps, and does not
-        // start without it.
-        let input = gate(SETUP_INPUT_CMDLINE_TOKEN);
-        let wait = SETUP_FIREFOX_WAIT_SECS;
+        // Nothing else opens a window on a live boot (the next test), so the
+        // wizard starts once the compositor serves, on the first workspace.
         assert_eq!(
             unit_key("setup", "exec").unwrap(),
             format!(
-                "/bin/sh -c '{live} {input} start=$(/bin/date +%s) || exit 1; while :; \
-                 do layout=$(/bin/td-login exec-primary -- /bin/td-ctl --socket \
-                 {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | /bin/grep -q \
-                 \"{WINDOW_RECORD}{FIREFOX_APP_ID} title=\" && break; \
-                 now=$(/bin/date +%s) || exit 1; if [ $((now - start)) -ge {wait} ]; then \
-                 /bin/echo \"td-setup: the autotest Firefox window did not map in {wait}s; \
-                 not starting the wizard it would take the keyboard from\"; exit 1; fi; \
-                 /bin/td-util sleep 1; done;; esac; /bin/td-login exec-primary -- \
-                 /bin/td-ctl --socket {CONTROL_SOCKET} workspace {SETUP_WORKSPACE} || exit 1; \
-                 exec /bin/td-login exec-service-as {INSTALLER_USER} -- /bin/env -u HOME \
-                 WAYLAND_DISPLAY={WAYLAND_SOCKET} /bin/td-setup;; *) exit 0;; esac'"
+                "/bin/sh -c '{live} exec /bin/td-login exec-service-as {INSTALLER_USER} -- \
+                 /bin/env -u HOME WAYLAND_DISPLAY={WAYLAND_SOCKET} /bin/td-setup;; \
+                 *) exit 0;; esac'"
             )
         );
+        assert!(!unit_key("setup", "exec").unwrap().contains("workspace"));
         // The wizard's identity is the one the compositor admits to the
         // display beside the human and the one td-authd's setup intake admits
         // alone; td-login gives it no session cgroup.
@@ -7832,20 +7878,6 @@ mod tests {
             unit_key("setup", "ready-timeout").as_deref(),
             Some(SETUP_READY_TIMEOUT_SECS.to_string().as_str())
         );
-        // As long as Firefox's own evidence waits for it, and readiness
-        // outlasts the wait by the last query and the wizard's own window.
-        assert_eq!(wait, FIREFOX_EVIDENCE_WAIT_ITERATIONS);
-        assert_eq!(SETUP_READY_TIMEOUT_SECS, wait + 60);
-        // An empty workspace: neither the shell's nor the applications'.
-        assert!((2..=9).contains(&SETUP_WORKSPACE));
-        assert_ne!(SETUP_WORKSPACE, TERMINAL_APPLICATION_WORKSPACE);
-        // Firefox is ready on a live boot only once its window has mapped,
-        // so it cannot map after the wizard and take its keyboard.
-        assert!(unit_key("firefox", "ready").unwrap().starts_with(&format!(
-            "/bin/sh -c '{live} layout=$(/bin/td-login exec-primary -- /bin/td-ctl \
-             --socket {CONTROL_SOCKET} layout) && /bin/echo \"$layout\" | \
-             /bin/grep -q \"{WINDOW_RECORD}{FIREFOX_APP_ID} title=\" || exit 1;; esac; "
-        )));
         let ready = unit_key("setup", "ready").unwrap();
         assert!(ready.starts_with(&format!("/bin/sh -c '{live} :;; *) exit 0;; esac; ")));
         assert!(ready.contains(&format!("{WINDOW_RECORD}{SETUP_APP_ID} title=")));
@@ -7853,12 +7885,10 @@ mod tests {
             ("type", "daemon"),
             ("cgroup", "service"),
             ("restart", "never"),
+            ("after", "wayland,firefox-tls-setup"),
             ("requires", "wayland"),
         ] {
             assert_eq!(unit_key("setup", key).as_deref(), Some(value), "{key}");
-        }
-        for earlier in ["wayland", "placement-evidence", "firefox"] {
-            assert!(ordered_before(earlier, "setup"), "{earlier}");
         }
         let evidence = unit_key("setup-evidence", "exec").unwrap();
         assert!(evidence.starts_with(&format!(
@@ -7866,6 +7896,10 @@ mod tests {
             gate(AUTOTEST_CMDLINE_TOKEN)
         )));
         for part in [
+            "/bin/echo \"$layout\" | /bin/grep -qxF \"workspace active=1 occupied=1\" \
+             || exit 1; /bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \
+             \"^window \")\" -eq 1 || exit 1; "
+                .to_string(),
             format!(
                 "/bin/td-util test \"$(/bin/echo \"$layout\" | /bin/grep -c \
                  \"{WINDOW_RECORD}{SETUP_APP_ID} title=\")\" -eq 1 || exit 1; "
@@ -7889,6 +7923,8 @@ mod tests {
             unit_key("setup-evidence", "requires").as_deref(),
             Some("setup")
         );
+        // Exact console lines: after TLS setup's unframed progress.
+        assert_eq!(unit_after("setup-evidence"), ["setup", "firefox-tls-setup"]);
         // The names are the ones their owners use.
         assert!(include_str!("../../../td-authd/src/disk_install.rs")
             .contains(&format!("const SOCKET: &str = \"{SETUP_INTAKE_SOCKET}\";")));
@@ -7911,14 +7947,6 @@ mod tests {
             crate::ladder::TD_SETUP_SHOWN_PREFIX
         )));
         assert_eq!(unit_key("setup", "log"), None);
-        // Its terminal window would map on the wizard's workspace and take
-        // the keyboard from under the drive.
-        assert!(unit_key("claude-evidence", "exec")
-            .unwrap()
-            .contains(&format!(
-                "esac; case \" $(/bin/cat /proc/cmdline) \" in *\" {} \"*) exit 0;; esac; n=0;",
-                crate::ladder::SETUP_INPUT_CMDLINE_TOKEN
-            )));
         // Nor does the autotest greeter reboot the live session under it.
         let profile = build_profile(&SYSTEM);
         let park = format!(

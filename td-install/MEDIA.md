@@ -348,9 +348,9 @@ to `/run/td-media` so it stays mounted under the loop. The live volume's
 both before kexec and in `live-seed`, so a live installer can authenticate
 its source under the key that booted it. A live session has no bundled
 `td/source`, and everything it writes is lost at power-off. Its graphical
-session differs from an installed one in its installer units: it starts the
-installer wizard on a workspace of its own (INSTALLER.md "Live startup"),
-which `qemu-boot-live` proves on this medium, and td-authd binds its setup
-intake in place of the deployment intake.
+session differs from an installed one in its windows: it opens the
+installer wizard and no other (INSTALLER.md "Live startup"), which
+`qemu-boot-live` proves on this medium, and td-authd binds its setup intake
+in place of the deployment intake.
 
 `build-iso` ("Live installation media") provisions the live selector.

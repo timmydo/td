@@ -50,7 +50,7 @@ use super::setup_input::{disk_prompt_rows, typed, Act, SetupStep, STEP_TIMEOUT};
 use super::*;
 
 const TD_SETUP_LIVE_MARKER: &str = td_recipe::ladder::TD_SETUP_LIVE_MARKER;
-/// The live volume is half of RAM and the stock session runs on the rest.
+/// The live volume is half of RAM and the live session runs on the rest.
 const LIVE_MEMORY_MIB: &str = "4096";
 /// The destination the wizard should list: the only virtio disk. The
 /// medium, USB storage attached read-only, is excluded twice: as the
@@ -140,7 +140,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             kill_on_marker: false,
             extra_append: &tokens,
             user_net: false,
-            // The stock session supervises the emulated sound device.
+            // The live session's audio service supervises the emulated sound
+            // device, as an installed one does.
             audio: true,
             physical_input: false,
             capture_firefox_audio: false,
