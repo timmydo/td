@@ -4893,9 +4893,11 @@ const WORKSPACE_EXEMPT: [(&str, &[&str]); 2] = [
 /// and the builder's own tests name the one crate no recipe embeds. A path
 /// names the roster crate whose directory holds it; that crate's commands
 /// run, and so do those of every crate that READS it — closed transitively,
-/// since a reader of a reader saw the change too. Anything the rule does not
-/// recognise — `builder/`, `recipes/`, `engine/`, an unmapped path, a `..`,
-/// an empty diff — takes the whole list, so every unknown fails safe.
+/// since a reader of a reader saw the change too. A builder file no crate
+/// leg observes adds no crate, only the workspace commands. Anything the
+/// rule does not recognise — a crate-leg builder source, `recipes/`,
+/// `engine/`, an unmapped path, a `..`, an empty diff — takes the whole
+/// list, so every unknown fails safe.
 fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, String> {
     let all = cargo_test_cmds_all(root)?;
     let roster = discover_gate_crates(root)?;
@@ -4904,8 +4906,11 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     };
     let readers = crate_readers(root, &roster)?;
     close_over_readers(&mut selected, &readers);
+    // A builder path beside the one crate owes the workspace legs it alone
+    // would have taken.
+    let builder = changed.iter().any(|p| builder_workspace_only(p));
     let exempt = match selected.as_slice() {
-        [only] => WORKSPACE_EXEMPT.iter().find(|(name, _)| name == only),
+        [only] if !builder => WORKSPACE_EXEMPT.iter().find(|(name, _)| name == only),
         _ => None,
     };
     if let Some((name, pinned)) = exempt {
@@ -4943,16 +4948,57 @@ fn cargo_test_cmds(root: &Path, changed: &[String]) -> Result<Vec<String>, Strin
     }
 }
 
+/// The builder files that decide how a roster crate's legs are built or
+/// what they check, or that run code only a crate leg reaches: the roster,
+/// its commands and lock guards (`affected.rs`, which `main.rs` dispatches
+/// `gate-crates` to in one line), the crypto admission, its cargo driver
+/// and vendor preparation (`host_bin.rs`), the native compositor test
+/// driver, the check spine with its crypto warm, the in-sandbox cargo gate,
+/// and the test runner's trusted-root path (`run_capped.rs`, `test_root.rs`
+/// and the `sandbox.rs` and `sys.rs` it enters), which only crates that
+/// opt in take. A change to one of these takes every crate's legs; any
+/// other builder file is the builder's own, and its workspace legs test it.
+const CRATE_LEG_SOURCES: &[&str] = &[
+    "builder/src/affected.rs",
+    "builder/src/check_loop.rs",
+    "builder/src/crypto_build.rs",
+    "builder/src/crypto_headers.rs",
+    "builder/src/crypto_isolated.rs",
+    "builder/src/crypto_policy.rs",
+    "builder/src/crypto_portable.rs",
+    "builder/src/gate_defs/325-cargo-test.rs",
+    "builder/src/host_bin.rs",
+    "builder/src/native_tests.rs",
+    "builder/src/run_capped.rs",
+    "builder/src/sandbox.rs",
+    "builder/src/sys.rs",
+    "builder/src/test_root.rs",
+];
+
+/// A builder path no crate leg can observe: its workspace legs, which run
+/// whenever crate legs are narrowed, are the whole of what it owes.
+fn builder_workspace_only(p: &str) -> bool {
+    (p.starts_with("builder/src/") || p == "builder/Cargo.toml") && !CRATE_LEG_SOURCES.contains(&p)
+}
+
 /// The roster crates a change is confined to, in first-seen order, or None
-/// where any path is not inside one: `builder/`, an unmapped file, an empty
-/// diff, or a `..`, which is refused rather than resolved since
-/// `td-review/../td-sh/x.rs` starts with one crate and names another (git
-/// never emits one, so it is reachable only through `--path`).
+/// where any path is not inside one: `recipes/`, `engine/`, a crate-leg
+/// builder source, an unmapped file, an empty diff, or a `..`, which is
+/// refused rather than resolved since `td-review/../td-sh/x.rs` starts with
+/// one crate and names another (git never emits one, so it is reachable only
+/// through `--path`). A builder path no crate leg observes
+/// (`builder_workspace_only`) selects no crate, so a diff of only those is
+/// `Some` of none: the workspace legs alone.
 fn changed_roster_crates(roster: &[GateCrate], changed: &[String]) -> Option<Vec<String>> {
     let mut selected: Vec<String> = Vec::new();
+    let mut workspace_only = false;
     for p in changed {
         if p.contains("..") {
             return None;
+        }
+        if builder_workspace_only(p) {
+            workspace_only = true;
+            continue;
         }
         // The separator matters: `td-reviewer/x` is not `td-review/x`.
         let owner = roster
@@ -4960,7 +5006,7 @@ fn changed_roster_crates(roster: &[GateCrate], changed: &[String]) -> Option<Vec
             .find(|c| p.starts_with(&c.name) && p.as_bytes().get(c.name.len()) == Some(&b'/'))?;
         push_unique(&mut selected, &owner.name);
     }
-    (!selected.is_empty()).then_some(selected)
+    (workspace_only || !selected.is_empty()).then_some(selected)
 }
 
 /// Close `selected` over the reader graph: a crate pushed here is itself
@@ -5003,6 +5049,11 @@ fn check_scope(root: &Path, changed: &[String], targets: &[String]) -> Option<Ve
     let (sources, rest): (Vec<&String>, Vec<&String>) =
         changed.iter().partition(|p| p.starts_with(RECIPE_SOURCES));
     let rest: Vec<String> = rest.into_iter().cloned().collect();
+    // The builder runs every recipe check, so a builder path leaves the run
+    // unscoped, though its crate legs may narrow to the workspace.
+    if rest.iter().any(|p| p.starts_with("builder/")) {
+        return None;
+    }
     let mut crates = if rest.is_empty() {
         Vec::new()
     } else {
@@ -8721,7 +8772,7 @@ mod tests {
                 &root,
                 &[
                     "td-review/src/land.rs".to_string(),
-                    "builder/src/gates.rs".to_string()
+                    "recipes/src/catalog.rs".to_string()
                 ]
             )
             .expect("narrowing")
@@ -8729,6 +8780,35 @@ mod tests {
             all,
             "a mixed diff must take the whole table"
         );
+        // A builder file no crate leg observes takes the workspace alone, and
+        // beside a crate adds nothing to it; a crate-leg source takes all.
+        let workspace =
+            cargo_test_cmds(&root, &["builder/src/main.rs".to_string()]).expect("narrowing");
+        assert!(names(&workspace).is_empty(), "{workspace:?}");
+        assert!(
+            workspace.iter().any(|c| c.contains("--workspace")),
+            "{workspace:?}"
+        );
+        assert!(
+            workspace.iter().any(|c| is_format_check(c)),
+            "{workspace:?}"
+        );
+        assert_eq!(
+            cargo_test_cmds(
+                &root,
+                &[
+                    "td-review/src/land.rs".to_string(),
+                    "builder/src/gates.rs".to_string()
+                ]
+            )
+            .expect("narrowing"),
+            one("td-review/src/land.rs")
+        );
+        for source in CRATE_LEG_SOURCES {
+            assert!(root.join(source).is_file(), "{source} is not in the tree");
+            assert_eq!(one(source).len(), all, "{source}");
+        }
+        assert_eq!(one("Cargo.lock").len(), all);
     }
 
     #[test]
@@ -9368,6 +9448,25 @@ mod tests {
         )
         .unwrap();
         assert!(both.iter().any(|c| c.contains("--workspace")));
+        // A builder file beside either exempt crate keeps the workspace legs
+        // that file alone would take, and the crate's own.
+        for one in ["td-agent/src/main.rs", "td-mta/src/lib.rs"] {
+            let mixed = cargo_test_cmds(
+                &root,
+                &[one.to_string(), "builder/src/ready.rs".to_string()],
+            )
+            .unwrap();
+            for action in ["cargo test", "cargo clippy"] {
+                assert!(
+                    mixed
+                        .iter()
+                        .any(|c| c.contains(action) && c.contains("--workspace")),
+                    "{one}: no workspace {action}: {mixed:?}"
+                );
+            }
+            let owner = one.split('/').next();
+            assert!(mixed.iter().any(|c| cmd_manifest_crate(c) == owner));
+        }
     }
 
     /// An edge td-agent gains or loses is a graph the workspace's reader
@@ -9468,8 +9567,12 @@ mod tests {
         // The workspace suite rides every narrowed run, and the line says so.
         assert!(line.contains("--workspace"), "{line:?}");
         // …and the unnarrowed line is unchanged from what it always printed.
-        let full = preflight_cmd(&root, "cargo-test", &["builder/src/main.rs".to_string()])
-            .unwrap_or_default();
+        let full = preflight_cmd(
+            &root,
+            "cargo-test",
+            &["builder/src/affected.rs".to_string()],
+        )
+        .unwrap_or_default();
         assert!(full.starts_with(
             "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path "
         ));
@@ -10965,7 +11068,8 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                &full_cargo,
+                // No crate leg observes main.rs: the workspace legs alone.
+                "  rustfmt --check (every Rust file) + cargo test + clippy --frozen --workspace (builder/recipes/engine)",
                 "  td-builder check check-engine check",
                 &deferred,
                 "",

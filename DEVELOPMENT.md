@@ -244,6 +244,18 @@ readers also include test-only and prose readers, and readers no recipe
 builds at all. A scope none of whose crates any recipe reads runs every
 check and says so.
 
+A file under `builder/src/`, or `builder/Cargo.toml`, runs the
+builder/recipes/engine workspace legs, not every crate's, unless it is
+part of how crate legs are built or checked or runs code only they
+reach: `affected.rs`, the crypto cargo driver, its policy and vendor
+preparation, the native compositor test driver, the check spine, the
+in-sandbox cargo gate, and the test runner's trusted-root path
+(`run_capped.rs`, `test_root.rs`, `sandbox.rs`, `sys.rs`); the list is
+`CRATE_LEG_SOURCES`. Those still take every crate, as does any other
+builder path. Beside a crate the narrowed file still owes its workspace
+legs, and a builder path leaves the recipe-checks run unscoped either
+way.
+
 Recipe sources scope the same way, beside crate paths or alone. A recipe
 file reaches its own recipe and the recipes whose code names its module,
 a file a recipe embeds (a `.mk`, a patch, a fixture) reaches that recipe,
