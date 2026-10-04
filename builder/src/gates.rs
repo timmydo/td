@@ -1557,54 +1557,10 @@ fn print_gate_output(name: &str, log_path: &Path, outcome: Outcome, non_blocking
     let _ = lock.flush();
 }
 
-/// The verdict journal for one tree key: a line per gate that passed.
-fn journal_path(root: &Path, key: &str) -> PathBuf {
-    root.join(".td-build-cache/gate-verdicts").join(key)
-}
-
-fn journal_read(root: &Path, key: &str) -> HashSet<String> {
-    std::fs::read_to_string(journal_path(root, key))
-        .map(|t| t.lines().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-/// Serializes this process's journal writes: gates finish on parallel
-/// threads, and a forget is a read, filter and rename that a concurrent
-/// one would otherwise undo, putting back a pass it had removed.
-static JOURNAL: Mutex<()> = Mutex::new(());
-
-/// Remove `gate` from every journal before it runs, under any key: a pass
-/// whose rerun was asked for (TD_CHECK_FULL, a doubted host, a changed
-/// scope) is no longer a proof, whether the rerun fails, is stopped, or
-/// never finishes. Losing another tree's line costs a rerun, never a
-/// wrong skip. Best-effort like the append, but a journal it cannot
-/// rewrite is removed, so a stale pass cannot outlive a failed forget.
-fn journal_forget(root: &Path, gate: &str) {
-    let _held = JOURNAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Ok(entries) = std::fs::read_dir(root.join(".td-build-cache/gate-verdicts")) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if !text.lines().any(|l| l == gate) {
-            continue;
-        }
-        let kept: String = text
-            .lines()
-            .filter(|l| *l != gate)
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, kept).is_err() || std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+/// The gate verdict journal (`--resume`): a line per gate that passed, per
+/// content key. A gate is forgotten under every key before it runs.
+fn gate_journal(root: &Path) -> crate::verdict_journal::Journal {
+    crate::verdict_journal::Journal::new(root.join(".td-build-cache/gate-verdicts"))
 }
 
 /// Whether a gate's log says it passed with checks it could not run (the
@@ -1618,24 +1574,6 @@ fn passed_partially(log: &Path) -> bool {
             .map_while(Result::ok)
             .any(|l| l.contains(crate::check_loop::GATES_SKIPPED_SENTINEL))
     })
-}
-
-/// Append one PASS (best-effort — journaling must never affect a verdict).
-fn journal_pass(root: &Path, key: &str, gate: &str) {
-    let _held = JOURNAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let p = journal_path(root, key);
-    if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&p)
-    {
-        let _ = writeln!(f, "{gate}");
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1672,8 +1610,8 @@ struct RunCfg {
     log_dir: PathBuf,
     remove_logs: bool,
     /// The working-tree content key (TD_CHECK_TREE, computed host-side by
-    /// `td-builder check` from HEAD's tree + dirty diff + untracked contents
-    /// + the gate runner's bytes).
+    /// `td-builder check` from HEAD's tree, the dirty diff, untracked
+    /// contents and the gate runner's bytes).
     /// When present, every PASS is journaled under it; None disables journaling.
     tree_key: Option<String>,
     /// --resume: skip gates journaled green for THIS tree key (issue #320).
@@ -1777,12 +1715,20 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
         })
         .collect();
 
+    // The journal is held for the whole run (verdict_journal::hold_run): a
+    // second run in this worktree waits, and without the hold no gate is
+    // skipped or recorded.
+    let held = cfg
+        .tree_key
+        .as_ref()
+        .and_then(|_| gate_journal(&cfg.root).hold_run());
+    let tree_key = &cfg.tree_key.clone().filter(|_| held.is_some());
     // --resume: gates journaled green for THIS tree key start as Done — loudly,
     // so a green-with-skips run is visually distinct from a full green run.
     let mut initial: HashMap<usize, St> = selected.iter().map(|i| (*i, St::Pending)).collect();
     if cfg.resume {
-        if let Some(key) = &cfg.tree_key {
-            let green = journal_read(&cfg.root, key);
+        if let Some(key) = &tree_key {
+            let green = gate_journal(&cfg.root).read(key);
             let mut skipped = 0usize;
             for (&i, st) in initial.iter_mut() {
                 let Some(g) = set.gates.get(i) else { continue };
@@ -1892,7 +1838,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     }
                 }
                 let log_path = cfg.log_dir.join(format!("{}.log", g.name));
-                journal_forget(&cfg.root, &g.name);
+                gate_journal(&cfg.root).forget(&g.name);
                 let started = std::time::Instant::now();
                 let job_budget_bytes = slot_hold
                     .as_ref()
@@ -1936,8 +1882,8 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 // or a pass with unprovisioned checks inside it, must re-run on
                 // a provisioned host, so neither is recorded green for --resume.
                 if outcome == Outcome::Passed && !partial {
-                    if let Some(key) = &cfg.tree_key {
-                        journal_pass(&cfg.root, key, &g.name);
+                    if let Some(key) = tree_key {
+                        gate_journal(&cfg.root).record(key, &g.name);
                     }
                 }
                 let mut s = lock_sched(&sched);

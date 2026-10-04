@@ -3507,9 +3507,33 @@ fn cargo_group_key(cmd: &str) -> Option<String> {
 /// run's build jobs through `CARGO_BUILD_JOBS` — the caller's count when it
 /// set one, the CPUs otherwise, split as `cargo_group_plan` says; the test
 /// harnesses still take every thread, and the kernel shares them.
+///
+/// A command that passed before on the same content, under the same
+/// td-builder and host toolchain, is not run again (`preflight_key`): a
+/// `ready` stopped to amend a message keeps the suites it had finished.
+/// Each command is forgotten under every key before it runs and recorded
+/// only when it passes, as the gates are (`verdict_journal`), and
+/// TD_CHECK_FULL runs every one.
 fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
+    run_cargo_groups_with(root, cmds, std::env::var_os("TD_CHECK_FULL").is_none())
+}
+
+/// `run_cargo_groups`, with whether a journaled pass may answer a command
+/// given rather than read from the environment.
+fn run_cargo_groups_with(root: &Path, cmds: &[String], reuse: bool) -> i32 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
+    let journal =
+        crate::verdict_journal::Journal::new(root.join(".td-build-cache/preflight-verdicts"));
+    // Held to the end of the run; without it nothing is reused or recorded.
+    let held = journal.hold_run();
+    let host = held.as_ref().and_then(|_| preflight_host(root));
+    let key = host.as_deref().and_then(|h| preflight_key(root, h));
+    let passed = match &key {
+        Some(k) if reuse => journal.read(k),
+        _ => std::collections::HashSet::new(),
+    };
+    let reused = AtomicUsize::new(0);
     let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
     for cmd in cmds {
         let key = cargo_group_key(cmd);
@@ -3544,6 +3568,7 @@ fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
     std::thread::scope(|scope| {
         for _ in 0..width {
             let (next, codes, pen, groups, jobs) = (&next, &codes, &pen, &groups, &jobs);
+            let (journal, key, host, passed, reused) = (&journal, &key, &host, &passed, &reused);
             scope.spawn(move || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some((_, list)) = groups.get(i) else {
@@ -3551,6 +3576,13 @@ fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
                 };
                 let mut code = 0;
                 for cmd in list {
+                    if passed.contains(cmd) {
+                        let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
+                        println!("================ {cmd}: REUSED (passed on this content) ================");
+                        reused.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    journal.forget(cmd);
                     {
                         let _held = pen.lock().unwrap_or_else(PoisonError::into_inner);
                         println!("affected-checks: running: {cmd}");
@@ -3584,6 +3616,13 @@ fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
                         code = got;
                         break;
                     }
+                    // Only if the content is still what the run started on:
+                    // a pass over an edit made meanwhile proves neither.
+                    if let (Some(k), Some(h)) = (key, host) {
+                        if preflight_key(root, h).as_ref() == Some(k) {
+                            journal.record(k, cmd);
+                        }
+                    }
                 }
                 if let Some(cell) = codes.get(i) {
                     *cell.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
@@ -3591,6 +3630,14 @@ fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
             });
         }
     });
+    let reused = reused.load(Ordering::Relaxed);
+    if reused > 0 {
+        println!(
+            "affected-checks: {reused} of {} cargo command(s) reused from passes on this content \
+             (TD_CHECK_FULL=1 runs them again)",
+            cmds.len()
+        );
+    }
     for cell in &codes {
         // A group nothing reported is a group that did not run to its end,
         // which is a failure, not a pass.
@@ -3601,6 +3648,109 @@ fn run_cargo_groups(root: &Path, cmds: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// The key the cargo preflights journal their passes under: the gates'
+/// content key (`check_loop::tree_key`) over this td-builder, which runs
+/// the format check, and `host`. None when the content cannot be keyed.
+fn preflight_key(root: &Path, host: &[u8]) -> Option<String> {
+    let me = std::env::current_exe().ok()?;
+    let tree = crate::check_loop::tree_key(root, &me)?;
+    let mut h = crate::sha256::Sha256::new();
+    h.update(tree.as_bytes());
+    h.update(host);
+    Some(crate::sha256::to_base16(&h.finalize()))
+}
+
+/// What selects and configures the toolchain a cargo preflight runs, which
+/// the tree does not pin: the variables cargo and rustc read for it, every
+/// cargo config cargo merges (the repository's own is in the tree; one
+/// above it, as a worktree under the main checkout has, or in CARGO_HOME
+/// is not), the test runner the repository's config names, and the
+/// versions of the compiler cargo would pick, cargo, clippy, rustfmt, and
+/// what the crypto legs build with. None when a required tool cannot be
+/// asked, and then nothing is reused or recorded.
+fn preflight_host(root: &Path) -> Option<Vec<u8>> {
+    // Every variable cargo or rustc may read config from (`CARGO_*`,
+    // including the per-target runner and linker, and `RUST*`), but the
+    // ones that set only parallelism or output, which `ready` varies per
+    // run; and td's own toolchain and memory-cap variables.
+    let volatile = |name: &str| {
+        matches!(name, "CARGO_BUILD_JOBS" | "CARGO_MAKEFLAGS") || name.starts_with("CARGO_TERM_")
+    };
+    let mut vars: Vec<(String, std::ffi::OsString)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v)))
+        .filter(|(k, _)| {
+            (k.starts_with("CARGO_") || k.starts_with("RUST")) && !volatile(k)
+                || matches!(
+                    k.as_str(),
+                    "TD_CC_HOME" | "TD_RUN_CAPPED_MIB" | "TD_RUST_HOME"
+                )
+        })
+        .collect();
+    vars.sort();
+    let mut h = crate::sha256::Sha256::new();
+    let mut field = |name: &str, value: Option<&[u8]>| {
+        h.update(name.as_bytes());
+        match value {
+            Some(v) => {
+                h.update(b"=");
+                h.update(&(v.len() as u64).to_le_bytes());
+                h.update(v);
+            }
+            None => h.update(b"\0absent"),
+        }
+    };
+    field("vars", Some(&(vars.len() as u64).to_le_bytes()));
+    for (name, value) in &vars {
+        field(name, Some(value.as_encoded_bytes()));
+    }
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cargo")));
+    let configs = root
+        .ancestors()
+        .map(|dir| dir.join(".cargo"))
+        .chain(cargo_home);
+    for dir in configs {
+        for name in ["config.toml", "config"] {
+            let path = dir.join(name);
+            let bytes = std::fs::read(&path).ok();
+            field(&path.display().to_string(), bytes.as_deref());
+        }
+    }
+    let runner = crate::check_loop::file_digest(&root.join("target/release/td-builder"));
+    field("runner", runner.as_deref());
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let probe = |program: &str, args: &[&str]| -> Option<Vec<u8>> {
+        let out = Command::new(program)
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    // PATH's rustc as well as $RUSTC's: the crypto legs provision theirs
+    // from PATH whatever RUSTC says.
+    for (program, args) in [
+        (rustc.as_str(), &["-vV"][..]),
+        ("rustc", &["-vV"][..]),
+        ("cargo", &["-V"][..]),
+        ("cargo", &["clippy", "-V"][..]),
+        ("rustfmt", &["--version"][..]),
+    ] {
+        let out = probe(program, args)?;
+        field(&format!("{program} {}", args.join(" ")), Some(&out));
+    }
+    // Optional: a host without them runs no crypto leg that passes.
+    let cc = probe("cc", &["--version"]);
+    field("cc --version", cc.as_deref());
+    if let Some(home) = std::env::var_os("TD_RUST_HOME") {
+        let rustc = Path::new(&home).join("bin/rustc");
+        let out = probe(&rustc.to_string_lossy(), &["-vV"]);
+        field("TD_RUST_HOME rustc -vV", out.as_deref());
+    }
+    Some(h.finalize().to_vec())
 }
 
 /// How many cargo groups run at once: a quarter of the CPUs, at least one
@@ -9740,6 +9890,104 @@ mod tests {
         );
     }
 
+    /// A cargo command that passed on this content is not run again, across
+    /// a message-only amend too; a forced run that reds leaves nothing to
+    /// reuse; an edit runs everything.
+    #[test]
+    fn a_cargo_command_that_passed_on_this_content_is_reused() {
+        let bash = Command::new("bash")
+            .args(["-c", "true"])
+            .stdin(std::process::Stdio::null())
+            .status();
+        if !bash.is_ok_and(|s| s.success())
+            || Command::new("git").arg("--version").output().is_err()
+        {
+            eprintln!("SKIP: no bash or no git (the in-sandbox gate)");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("td-preflight-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(base.clone());
+        // The repo is the content; the counters live beside it, so running
+        // a command does not itself change the key.
+        let (repo, out) = (base.join("repo"), base.join("out"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join(".gitignore"), ".td-build-cache/\n").unwrap();
+        std::fs::write(repo.join("code.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "seed"]);
+        if preflight_host(&repo).is_none() {
+            eprintln!("SKIP: the host toolchain cannot be asked (no rustfmt or clippy?)");
+            return;
+        }
+        let o = out.display();
+        let cmds = vec![
+            format!("echo run >> {o}/one"),
+            format!("echo run >> {o}/two; test ! -e {o}/broken"),
+        ];
+        let runs = |f: &str| {
+            std::fs::read_to_string(out.join(f))
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let counts = || (runs("one"), runs("two"));
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(counts(), (1, 1));
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(counts(), (1, 1), "both reused on the same content");
+        git(&["commit", "--amend", "-qm", "a new message"]);
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(counts(), (1, 1), "a message-only amend keeps the key");
+        // A forced run that reds leaves no pass for the next one to reuse.
+        std::fs::write(out.join("broken"), "").unwrap();
+        assert_ne!(run_cargo_groups_with(&repo, &cmds, false), 0);
+        assert_eq!(counts(), (2, 2));
+        assert_ne!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(counts(), (2, 3), "the red one reruns, the other is reused");
+        // An edit is new content: everything runs.
+        std::fs::remove_file(out.join("broken")).unwrap();
+        std::fs::write(repo.join("code.rs"), "fn main() { () }\n").unwrap();
+        assert_eq!(run_cargo_groups_with(&repo, &cmds, true), 0);
+        assert_eq!(counts(), (3, 4));
+        // A command that edits the content as it runs proves nothing about
+        // the content the run started on: its pass is not recorded, so with
+        // the content put back it runs again while the other is reused.
+        let r = repo.display();
+        let editing = vec![
+            format!("echo run >> {o}/one"),
+            format!("echo run >> {o}/three; echo '// edited' >> {r}/code.rs"),
+        ];
+        assert_eq!(run_cargo_groups_with(&repo, &editing, true), 0);
+        std::fs::write(repo.join("code.rs"), "fn main() { () }\n").unwrap();
+        assert_eq!(run_cargo_groups_with(&repo, &editing, true), 0);
+        assert_eq!((runs("one"), runs("three")), (3, 2));
+    }
+
     /// The cargo groups: one per manifest in table order, run to their end,
     /// with the first non-zero exit in table order as the verdict, and no
     /// group's output torn by another's. Real children, since the capture and
@@ -9782,7 +10030,7 @@ mod tests {
             "echo a-clippy --manifest-path a/Cargo.toml; touch a-clippy-ran".to_string(),
             "echo b-clippy --manifest-path b/Cargo.toml; touch b-clippy-ran; exit 5".to_string(),
         ];
-        let code = run_cargo_groups(&root, &cmds);
+        let code = run_cargo_groups_with(&root, &cmds, false);
         // a's failure comes first in table order, so it is the verdict even
         // though b failed too...
         assert_eq!(code, 3);

@@ -726,6 +726,22 @@ fn s(v: &str) -> String {
     v.to_string()
 }
 
+/// sha256 of a file's bytes, streamed rather than read whole. None when it
+/// cannot be read.
+pub(crate) fn file_digest(path: &Path) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut h = crate::sha256::Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        h.update(buf.get(..n)?);
+    }
+    Some(h.finalize().to_vec())
+}
+
 /// The working-tree content key for the verdict journal (issue #320): sha256
 /// over HEAD's tree + the full dirty diff + every untracked file's bytes —
 /// ANY content change yields a new key, so a --resume skip can never survive
@@ -735,7 +751,7 @@ fn s(v: &str) -> String {
 /// commit message, so an amend that changes only the message keeps the key
 /// and `ready` reuses what already passed. None when git is unavailable
 /// (resume then refuses to run).
-fn tree_key(root: &Path, gate_runner: &Path) -> Option<String> {
+pub(crate) fn tree_key(root: &Path, gate_runner: &Path) -> Option<String> {
     let git = |args: &[&str]| -> Option<Vec<u8>> {
         let mut cmd = Command::new("git");
         cmd.args(args).current_dir(root);
@@ -746,21 +762,9 @@ fn tree_key(root: &Path, gate_runner: &Path) -> Option<String> {
         }
         Some(out.stdout)
     };
-    // The runner enters as its own fixed-length digest, streamed rather
-    // than read whole, and resolved as the loop runs it, from `root`.
-    let runner = {
-        let mut file = std::fs::File::open(root.join(gate_runner)).ok()?;
-        let mut h = crate::sha256::Sha256::new();
-        let mut buf = vec![0u8; 1 << 16];
-        loop {
-            let n = std::io::Read::read(&mut file, &mut buf).ok()?;
-            if n == 0 {
-                break;
-            }
-            h.update(buf.get(..n)?);
-        }
-        h.finalize()
-    };
+    // The runner enters as its own fixed-length digest, resolved as the
+    // loop runs it, from `root`.
+    let runner = file_digest(&root.join(gate_runner))?;
     let mut h = crate::sha256::Sha256::new();
     h.update(&runner);
     h.update(&git(&["rev-parse", "HEAD^{tree}"])?);

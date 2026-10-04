@@ -87,8 +87,20 @@ reads history or a message, so a run stopped to amend a commit message
 and started again runs only the gates it had not passed. A gate that
 runs first drops its pass under every key, so a rerun that fails or is
 stopped leaves nothing to resume, and a pass with unprovisioned checks
-inside it is not journaled. The journal does not see the host either;
-`TD_CHECK_FULL` runs every gate, forgetting each pass as it goes.
+inside it is not journaled. The cargo preflights (each crate's tests and
+clippy, the workspace's, the format check) keep the same journal per
+command in `.td-build-cache/preflight-verdicts/`, and say which they
+reused. Their key adds what picks and configures the toolchain: the
+`rustc` cargo would run, `cargo`, `clippy`, `rustfmt` and `cc` versions,
+every `CARGO_*` and `RUST*` variable but those that set only
+parallelism or output, `TD_RUST_HOME`, `TD_CC_HOME` and the memory cap,
+every cargo config cargo merges from above the repository or in
+`CARGO_HOME`, and the test runner's bytes; a pass is recorded only if
+the content is unchanged when it finishes. A run holds its journal
+throughout, so a second run in the worktree waits. A gate does not
+recheck the content, so do not edit a worktree under a running `ready`.
+The journals do not see the rest of the host; `TD_CHECK_FULL` runs every
+gate and preflight, forgetting each pass as it goes.
 
 The recipe-checks gate answers a check from its verdict memo when that check
 passed on this host before and nothing it reads has changed since: the

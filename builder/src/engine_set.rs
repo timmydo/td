@@ -62,6 +62,7 @@ pub const HOST_ONLY: &[&str] = &[
     "install_fonts.rs",
     "integration.rs",
     "ready.rs",
+    "verdict_journal.rs",
 ];
 
 /// The verbs whose dispatch arms may name a host-only module: the ones no

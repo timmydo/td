@@ -77,6 +77,7 @@ mod sys;
 mod tar;
 mod test_root;
 mod toolchain_x86_64;
+mod verdict_journal;
 mod xz;
 
 // The JSON value/parser/canonical writer, SHA-256 and CRC-32 live in the
