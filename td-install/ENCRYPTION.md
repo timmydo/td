@@ -278,8 +278,9 @@ same-uid process may impersonate the trusted UI or approve a request.
    skcipher interfaces and the HMAC, SHA-256 and XTS-AES algorithms that
    backend uses; td-jail's socket-family filter already keeps confined
    applications from AF_ALG. The same increment amends DESIGN.md D6 to make
-   cryptsetup its boot-path exception, bound at build time as D7 binds
-   `mkfs.btrfs`. Do not replace this with a new cryptographic disk format.
+   cryptsetup its boot-path exception; the build-time binding D7 requires
+   lands with its first exec. Do not replace this with a new cryptographic
+   disk format.
    New Rust syscall surfaces amend UNSAFE.md with their component contract
    in the same increment.
 4. Share td-secret's dependency-free TPM 2.0 client with the disk
@@ -291,10 +292,13 @@ same-uid process may impersonate the trusted UI or approve a request.
    testing and the single deployment publisher. Replace the retained
    plaintext scratch-image path for private material, account for header and
    re-encryption space, and identify backing devices without `/dev/vda` pins.
+   Carry D6's cryptsetup binding: the image check names the binary and its
+   debug companion.
 6. Add selector release, the PCR 12 cap in the installed and live
    selectors (amending MEDIA.md), the first-boot transition, the
    recovery flow with its confirmed reseal, the volatile `kexec` handoff and
-   deployment-initramfs unlock. Exercise them together before activation.
+   deployment-initramfs unlock, extending D6's binding to both initramfs.
+   Exercise them together before activation.
 7. Activate the device-bound tier as the installer default on machines with
    a usable TPM 2.0 whose selector console accepts keyboard input, amending
    INSTALLER.md's disclosures in the same landing. A platform without such a
