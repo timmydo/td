@@ -1,7 +1,7 @@
 # td-install — the deployment path
 
 [INSTALLER.md](INSTALLER.md) specifies the offline graphical installer and
-hybrid installation media workstream. Its v1 deliberately defers the
+its hybrid installation media. Its v1 deliberately defers the
 encrypted profile in [ENCRYPTION.md](ENCRYPTION.md). The contracts below
 continue to own disk layout, deployment publication and signature checks.
 
@@ -75,7 +75,8 @@ flush, atomically rename to the deployment id, then update `previous` and
 attached to a loop device; `@var` carries mutable state; `/run` and `/tmp`
 are tmpfs.
 
-What is **missing**, and what this workstream is:
+What was **missing** when this workstream began; each has since landed, the
+installer image in INSTALLER.md and the rest in the sections below:
 
 - No installer on any IMAGE. `td-install` writes the layout and a recipe now
   links it statically for the target, but nothing packs it anywhere a person
@@ -336,8 +337,9 @@ recovery requires explicit reprovisioning of both the identity and selector.
 This primitive uses td-net's existing reviewed ring signer and never executes
 inside a target derivation. `/bin/td-deploy` exposes the installed source-built
 multicall. The primitive supplies no elevation, installation consent, hardware
-sealing or application credential storage. The future installer operation
-owns those boundaries and must not rely on `su`. `td-recipe-eval bundle --installation --out DIR` creates a private VM
+sealing or application credential storage. The installer's operation
+(INSTALLER.md) owns those boundaries and does not rely on `su`.
+`td-recipe-eval bundle --installation --out DIR` creates a private VM
 installation. It builds the source-built signer along with the system,
 generates a fresh key outside the artifact graph, signs the initial
 deployment, provisions the matching selector and volume public keys, and
@@ -586,7 +588,7 @@ owns its binary output contract and its lack of retained authority.
 compares a bounded reviewed plan with two complete inventories and the
 opened block device, then releases the claim after its observation report.
 Read-write access mirrors formatter admission and refuses devices where the
-future destructive path could not obtain its required claim.
+destructive path could not obtain its required claim.
 The report grants no authority to a later formatter invocation.
 
 ### Prepared volume image admission
@@ -1335,11 +1337,13 @@ An installation can carry two copies of this key: the selector initramfs's
 `etc/td/deployment.pub` and the volume's `td/trusted.pub`. The layout and
 volume primitives do not check their agreement. Layout treats the selector
 as opaque bytes, while volume authenticates under its explicitly supplied
-key. The installation coordinator must provision and verify their agreement
-before activating a complete installation; that coordinator is still
-required. A mismatch can accept an update that the selector refuses to
-boot. The diagnostic EFI oracle carries no signed deployment or volume key
-and does not claim to test this integration boundary.
+key. The installation service is the coordinator that keeps them in
+agreement: it prepares the selector with the trusted key it serves under
+and seeds the volume with that same key ("Executing a consented
+installation"). A mismatch, which only the primitives used directly can
+produce, can accept an update that the selector refuses to boot. The
+diagnostic EFI oracle carries no signed deployment or volume key and does
+not claim to test this integration boundary.
 
 Against the threat this signature exists for — a hostile or compromised
 update source — the two are equivalent: that attacker supplies bytes and
@@ -1755,8 +1759,8 @@ diagnostic scaffolding, not production consent. Installed boots exercise
 the read-only resolver above, including changed disk ordering and duplicate
 identity refusal before selection. Linux mounts its ISO payload files
 read-only before installation; the live initramfs holds tools and the public
-trust root. Machine settings and a production installer remain required by
-INSTALLER.md. This fixture does not enforce selector/volume key
+trust root. Machine settings and the production installer are
+INSTALLER.md's. This fixture does not enforce selector/volume key
 agreement for arbitrary caller-provided inputs.
 
 The small fixture also interrupts the real publisher while its staged kernel

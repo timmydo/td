@@ -120,7 +120,7 @@ The preflight uses the publisher's bundle verifier, retaining manifest-only
 bytes stay stable on the read-only ISO across preflight and publication;
 the result is not a retained snapshot. Volume publication still repeats
 authentication and verifies copied payload hashes. Space, firmware-selector
-and target admission remain requirements for the production installer service.
+and target admission are the production installer service's requirements.
 
 After the combined formatting command, the guest asks td-init to reread the
 target's partition table. It resolves the configured UUID through the
@@ -343,8 +343,9 @@ the oracle's fixed topology; it does not establish exclusive admission.
 The small fixture does not launch the compositor, configure an account or
 retain an installation signing key. The separate full-system diagnostic
 uses the ordinary system init after installation to test the desktop.
-The final installer still needs the activation evidence in
-../td-install/INSTALLER.md, including a complete desktop installation and settings.
+The production installer's end-to-end evidence, a complete desktop
+installation with its settings, is `qemu-boot-live` in
+../td-install/INSTALLER.md.
 
 All operations use safe Rust and existing td-init/td-boot applets. No syscall
 surface or external dependency is added. Unit tests cover refusal outside
@@ -454,7 +455,7 @@ size in Linux 512-byte units, checks conversion to bytes and supplies that
 capacity and the observed logical sector size. This placement preserves
 the negative cases' direct exercise of the real layout writer: a preview
 refusal cannot replace an undersized or read-only formatter refusal.
-It is diagnostic sequencing, not the future wizard's review sequence.
+It is diagnostic sequencing, not the wizard's review sequence.
 
 Inventory and preview share the same owned-child capture and reaping
 path. Preview stdout is bounded at 1024 bytes including its final newline.

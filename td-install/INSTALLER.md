@@ -1,9 +1,19 @@
 # Offline graphical installation
 
-This is the target contract for the `installer-rolling` workstream. It
-extends [DESIGN.md](DESIGN.md), which owns the disk layout and the single
-deployment publisher. Nothing in this document alone activates a new boot
-profile or claims that an installation image exists.
+This is the contract for td's offline graphical installer. It extends
+[DESIGN.md](DESIGN.md), which owns the disk layout and the single
+deployment publisher. Version 1's profile is active, which claims this:
+`./build-iso` composes its installation image ([README](../README.md),
+[MEDIA.md](MEDIA.md)), and that image installs td onto a disk under QEMU
+with UEFI, as increment 7's end-to-end evidence shows. `qemu-boot-live` is
+that evidence, run on demand rather than by `check` or `ready`; it boots
+the medium as USB storage, `./test-iso` boots it as optical media by hand,
+and `qemu-boot-media` and `qemu-install-system` boot their own media both
+ways. Within version 1's scope remain a keyboard layout other than `us`,
+which waits for a keyboard catalog; the completion page's orderly reboot
+offer; keeping a late window from taking the wizard's place and keys ("Live
+startup"); and moving the remaining home-path consumers onto the installed
+account ("Media, boot and persistence").
 
 ## Version 1
 
@@ -115,10 +125,11 @@ repainted for the list saying nothing new. A native compositor case presses F1 o
 and finds welcome around the panel and its title bar in the selection's
 colour, Return reaching no page while it is open, and Escape painting
 welcome whole again.
-Its library also has pure, unconnected progress and completion views. A
-live boot starts the window in the graphical session ("Live startup"); the
-end-to-end installation evidence is in place with the medium booted as
-USB mass storage; activating the release profile remains (increment 7).
+Its progress and completion views are pure views of the service's
+reports, described below. A live boot starts the window in the graphical
+session ("Live startup"); the end-to-end installation evidence is in place
+with the medium booted as USB mass storage, and version 1's profile is
+active (increment 7), with the parts named at the top remaining.
 
 ### Live startup
 
@@ -432,23 +443,22 @@ disk erasure, unencrypted storage and automatic login; these policies
 are not caller-selectable flags.
 
 The public `DestinationObservation` names each unvalidated input field;
-`Destination::new` validates and copies it. Construction and decoding
-admit the wire representation only. Destination names have 1..=64 ASCII
-letters, digits, underscores or hyphens; major and disk sequence are
-nonzero. Capacity is nonzero and aligned to the admitted 512- or
-4096-byte logical sector. Labels retain up to 256 UTF-8 bytes exactly,
-matching discovery's representation. Missing, present-empty, and
-nonempty labels are distinct; no trimming or normalization occurs here.
-They are untrusted display data: a future renderer must escape control
-characters and handle directionality without letting a label impersonate
-trusted prompt text. Choices are nonempty printable ASCII without
-spaces, bounded to 32, 63, 64 and 64 bytes respectively. These bounds do
-not establish account name grammar, hostname policy, keyboard support or
-timezone membership. Account, hostname and timezone checks remain
-mandatory before review; keyboard catalog admission must be implemented
-before that choice is used. Wire admission deliberately does not claim a
-disk fits a deployment or is an eligible whole disk. Device labels are
-observations, not authentication.
+`Destination::new` validates and copies it. Construction and decoding admit
+the wire representation only. Destination names have 1..=64 ASCII letters,
+digits, underscores or hyphens; major and disk sequence are nonzero.
+Capacity is nonzero and aligned to the admitted 512- or 4096-byte logical
+sector. Labels retain up to 256 UTF-8 bytes exactly, matching discovery's
+representation. Missing, present-empty, and nonempty labels are distinct;
+no trimming or normalization occurs here. They are untrusted display data:
+a renderer must escape control characters and handle directionality without
+letting a label impersonate trusted prompt text. Choices are nonempty
+printable ASCII without spaces, bounded to 32, 63, 64 and 64 bytes
+respectively. These bounds do not establish account name grammar, hostname
+policy, keyboard support or timezone membership. Account, hostname and
+timezone checks remain mandatory before review; keyboard catalog admission
+must be implemented before that choice is used. Wire admission deliberately
+does not claim a disk fits a deployment or is an eligible whole disk.
+Device labels are observations, not authentication.
 
 `Plan::encode` produces one canonical binary record. `Plan::decode`
 rejects inputs over 2048 bytes before parsing, unknown versions,
@@ -771,8 +781,8 @@ service responsibilities; retrying this command chooses a different value.
 a private selector copy that trusts the given key and is bound to the
 chosen volume. The UUID must be canonical,
 nonzero lowercase text, using the same admission as `format --uuid`.
-The future service chooses it once for its plan and passes the same value
-to this operation and formatting. This command neither generates an
+The installation service chooses it once for its plan and passes the same
+value to this operation and formatting. This command neither generates an
 identity nor authorizes a disk operation.
 
 The caller supplies an already verified selector template, the trusted
@@ -869,8 +879,8 @@ application accounts. Account databases, home paths, application grants,
 service configuration and automatic login must agree before the session
 starts. Existing `/home/tester` assumptions need an atomic cutover in the
 installed profile. Grant preparation and jail admission already share a
-validated UID-1000 account lookup; account publication and remaining
-home-path consumers still need that cutover. Authd's Claude workspace mapping
+validated UID-1000 account lookup; remaining home-path consumers still
+need that cutover. Authd's Claude workspace mapping
 and task directory and the jail's Firefox download probe use the same
 primary-account lookup. The compositor sends typed launch requests without
 paths in the installed authority profile; its direct development launcher
@@ -1163,9 +1173,9 @@ Malformed shared state therefore prevents acknowledgement across deployments;
 rolling back does not repair it. Recovery requires restoring a canonical,
 root-owned mode-0644 `lib/td/hostname` in the volume's `@var` subvolume from
 a trusted recovery environment. There is no supported in-system rename or
-repair UI yet. The saved account and hostname activate at boot, while the
-user-facing setup and recovery flows remain to be implemented. The current
-`su` escape hatch is not their intended API.
+repair UI yet. The saved account and hostname activate at boot. The
+installer sets them up; a user-facing recovery flow remains to be
+implemented, and the current `su` escape hatch is not its intended API.
 The QEMU installer selects `td-qemu-installed`, checks its saved bytes
 alongside timezone state, and requires activation on both full-system
 cold boots and the additional application-evidence boot. Unit tests retain
@@ -1178,9 +1188,8 @@ reviewed Freedesktop runtime data. Missing runtime zones refuse launch.
 The compositor snapshots the saved name and source-built TZif rules at
 startup, rendering local civil time with its actual UTC offset. Invalid
 settings or unsupported data show `CLOCK ?`; an absent setting stays UTC.
-See `td-compositor/DESIGN.md` for reader bounds and DST proof. Account and
-keyboard settings and a post-install timezone setter remain separate
-increments.
+See `td-compositor/DESIGN.md` for reader bounds and DST proof. Post-install
+account, keyboard and timezone setters remain separate increments.
 
 The `tzdata` recipe compiles the approved IANA 2026d data-only source
 with td's existing source-built glibc `zic`. Its output contains fat
@@ -1235,7 +1244,7 @@ not discover `/etc/zoneinfo` automatically.
    with physical keys through the service's review and the compositor's
    consent to an installed disposable disk, which then cold-boots through
    firmware as the configured account and host.
-7. Activate the complete profile only after the end-to-end QEMU evidence:
+7. Activate version 1's profile only after the end-to-end QEMU evidence:
    boot the ISO, complete the UI flow onto a disposable disk, detach the
    media, boot that disk through firmware, and observe the configured
    account in the compositor with its settings and persistent home.
@@ -1243,7 +1252,8 @@ not discover `/etc/zoneinfo` automatically.
    host and home reported, the zone named by the compositor's clock and
    shown on it, and the account's login shell keeping a file in the same
    home across both boots, and `qemu-boot-live` boots the ISO itself
-   through firmware as USB mass storage. Activating the profile remains.
+   through firmware as USB mass storage. The profile is active; the parts
+   of version 1 named at the top of this document remain.
 
 Use per-run disposable disks and firmware variables. No test discovers or
 opens an operator's real disk for writing. Exercise both supported media
@@ -1474,19 +1484,19 @@ The output is deterministic and newline-terminated. Invalid inputs produce
 no partial report; output/flush errors return failure and may leave partial
 bytes, so consumers require both complete JSON and successful exit.
 
-This is a geometry preview for a future disk-review page, not an immutable
-installation plan or a destination eligibility decision. It describes the
-numbers supplied by its caller and does not bind a device identity. It
-does not establish source authenticity, boot-file fit, payload capacity,
-scratch availability, settings validity, exclusive admission or trusted
-destructive consent. Those checks remain required before installation.
+This is a geometry preview, not an immutable installation plan or a
+destination eligibility decision. It describes the numbers supplied by its
+caller and does not bind a device identity. It does not establish source
+authenticity, boot-file fit, payload capacity, scratch availability,
+settings validity, exclusive admission or trusted destructive consent.
+Those checks remain required before installation.
 
 The QEMU installation diagnostics also invoke this command on actual
 virtio/NVMe 512-byte/4Kn and AHCI 512-byte disk geometry. Their host compares
 its complete partition report against the attached private disk and GPT
 boundaries, alongside post-format inventory and detached firmware boots.
 The diagnostic queries after successful layout so negative cases still
-exercise formatter refusal; this is not the future wizard's sequencing.
+exercise formatter refusal; this is not the wizard's sequencing.
 
 ## Session validation
 

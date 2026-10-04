@@ -219,9 +219,15 @@ ISO alone:
 ```
 
 It boots from optical media or a USB stick and runs the system from the
-medium, with all writes in RAM; see "Live boot" in
-[the media contract](td-install/MEDIA.md). The graphical installer and
-installation onto a disk are still in progress.
+medium, with all writes in RAM; see "Live boot" in [the media
+contract](td-install/MEDIA.md). It opens the graphical installer, which
+erases one chosen whole disk and installs td onto it, offline. Storage is
+unencrypted, the installed account logs in automatically, and root keeps
+the stock image's empty password field ([AGENTS.md](AGENTS.md) principle 7
+owns that cutover). Version 1 is validated on x86-64 UEFI under QEMU only;
+real hardware is the next milestone. [The installer
+contract](td-install/INSTALLER.md) says what version 1 does and what of it
+remains.
 
 To compose a retained optical/USB ISO from other prepared boot files and
 payloads, use `td-recipe-eval compose-iso OUTPUT KERNEL INITRAMFS

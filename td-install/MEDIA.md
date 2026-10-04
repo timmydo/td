@@ -4,8 +4,9 @@ The offline installer uses one image for optical and USB boot, as required
 by [INSTALLER.md](INSTALLER.md). `engine/src/iso9660.rs` defines the initial
 metadata writer. It is a pure formatter: it neither opens a destination nor
 supplies the FAT contents, deployment, signatures or a live boot profile.
-Its unit tests establish layout properties; firmware and installed-session
-proofs remain separate activation requirements.
+Its unit tests establish layout properties; `qemu-boot-media` below proves
+firmware loading, and `qemu-boot-live` ([INSTALLER.md](INSTALLER.md)) the
+live and installed sessions booted as USB storage.
 
 The format uses a primary ISO-9660 descriptor, a flat root directory and
 level-3 file sections. It follows
@@ -86,8 +87,8 @@ boot artifacts, signed deployment, and matching public trust roots required
 by INSTALLER.md. Arbitrary command-line files carry no source-bootstrap claim.
 No host executable is added to the image by this tool. The same writer is
 used by the optical/USB boot and native installation oracles; those callers
-own their diagnostic profiles and signing. A complete desktop installation
-profile remains an independent activation requirement.
+own their diagnostic profiles and signing. `./build-iso` composes the
+desktop installation profile ([INSTALLER.md](INSTALLER.md)).
 
 The output parent must exist and support hard links and directory sync.
 The caller controls its writable ancestors and keeps the namespace and
@@ -190,9 +191,10 @@ printed before cleanup. Set `TMPDIR` to choose where the sparse disk grows.
 `TD_QEMU_EFI_CODE` and `TD_QEMU_EFI_VARS` select the same optional
 firmware pair as the existing firmware oracles.
 
-This runner is useful for a retained development ISO now. The complete
-desktop installer producer and its automated end-to-end oracle remain the
-activation requirements in INSTALLER.md.
+This runner is how a person tries a `./build-iso` medium by hand, and the
+one that boots the live profile as optical media; `qemu-boot-live` is the
+automated end-to-end oracle, which boots it as USB storage
+([INSTALLER.md](INSTALLER.md)).
 
 ## Repeatable firmware oracle
 
@@ -209,10 +211,11 @@ firmware discovery and configuration requirements are the same as
 Both attachments must reach the diagnostic initramfs's actual userspace
 marker. This proves firmware loading of the shared ESP, kernel and initrd;
 it does not prove the kernel can mount the ISO, authenticate a deployment,
-run the compositor or boot an installed disk. Those remain live-profile
-and installed-session activation requirements. The command accepts no
-output or device destination; exclusive files in its private scratch
-directory are removed on completion.
+run the compositor or boot an installed disk; `qemu-boot-live` proves
+those for the live profile booted as USB storage and the disk it installs
+([INSTALLER.md](INSTALLER.md)). `qemu-boot-media` accepts no output or
+device destination; exclusive files in its private scratch directory are
+removed on completion.
 
 ## Linux payload access
 
