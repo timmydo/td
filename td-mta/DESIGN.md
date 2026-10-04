@@ -362,6 +362,14 @@ policy; replay counts work without counting the same raw headers twice.
 Content-ID/language/location, body-list/JSON composition, authenticated
 locators and streaming/worker qualification remain separate.
 
+M06ch classifies retained selected headers and derives resident body lists
+with explicit frames, scope-local alternative masks and bounded fallback.
+Completed preorder evidence and classifications remain caller-pinned. A final
+membership sweep applies both RFC attachment conditions after fallback;
+results stay hidden until all tree validation/work completes. Original job
+and email budgets survive fresh completion. No locator or wire authority is
+introduced; automatic composition and body JSON remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,
 scalar decoding, normalization, deadlines and budget adapters remain in

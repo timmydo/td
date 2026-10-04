@@ -1229,6 +1229,133 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn mime_body_list_selection() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        limits::Limits,
+        mime_body_lists::{Backing, Class, Cursor, Disposition, Error, Media, Node, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    fn node(parent: u16, depth: u8, media: Media) -> Node {
+        Node {
+            parent,
+            depth,
+            class: Class {
+                media,
+                ..Class::default()
+            },
+        }
+    }
+    let simple = [node(0, 1, Media::Plain)];
+    let mut nested = [
+        node(0, 1, Media::Alternative),
+        node(1, 2, Media::Multipart),
+        node(2, 3, Media::Plain),
+        node(2, 3, Media::InlineMedia),
+        node(1, 2, Media::Related),
+        node(5, 3, Media::Html),
+        node(5, 3, Media::InlineMedia),
+    ];
+    nested.get_mut(3).unwrap().class.disposition = Disposition::Inline;
+    let invalid = [node(0, 1, Media::Plain), node(0, 0, Media::Plain)];
+    let limits = Limits {
+        mime_depth: 64,
+        mime_parts: 4096,
+        ..Limits::default()
+    };
+    let mut deep = [Node::default(); 64];
+    for (index, slot) in deep.iter_mut().enumerate() {
+        *slot = node(
+            index as u16,
+            (index + 1) as u8,
+            if index == 63 {
+                Media::Plain
+            } else {
+                Media::Alternative
+            },
+        );
+    }
+    let mut t = [0; 64];
+    let mut h = [0; 64];
+    let mut a = [0; 64];
+    let mut f = [0; 64];
+    let before = COUNTERS.snapshot();
+    for (nodes, failure) in [
+        (simple.as_slice(), None),
+        (nested.as_slice(), None),
+        (deep.as_slice(), None),
+        (invalid.as_slice(), Some(Error::InvalidTree)),
+        (simple.as_slice(), Some(Error::Work(Stop::Records))),
+        (simple.as_slice(), Some(Error::OutputCapacity)),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000,
+                records: if failure == Some(Error::Work(Stop::Records)) {
+                    0
+                } else {
+                    100_000
+                },
+                output_bytes: 100_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(
+            nodes,
+            &limits,
+            Backing {
+                text: if failure == Some(Error::OutputCapacity) {
+                    &mut []
+                } else {
+                    &mut t
+                },
+                html: &mut h,
+                attachments: &mut a,
+                membership: &mut f,
+            },
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut done = false;
+        for _ in 0..100_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(cursor.value().is_none()),
+                Ok(Status::Complete) => {
+                    assert!(failure.is_none());
+                    done = true;
+                    break;
+                }
+                Err(error) => {
+                    assert_eq!(Some(error), failure);
+                    assert!(cursor.value().is_none());
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    done = true;
+                    break;
+                }
+            }
+        }
+        assert!(done);
+        if failure.is_none() {
+            assert!(cursor.value().is_some());
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            assert_eq!(
+                cursor.check_deadline(Tick(100)),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert!(cursor.value().is_none());
+        }
+    }
+    assert_eq!(
+        before,
+        COUNTERS.snapshot(),
+        "MIME body-list selection allocated"
+    );
+}
+
 fn resident_part_headers() {
     use td_mta::{
         admission::work::{Charge, Meter},
@@ -1298,8 +1425,10 @@ fn resident_part_headers() {
         if !failed {
             assert!(cursor.value().is_some());
             assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
-            let value = cursor.finish(Tick(1)).unwrap().0;
-            black_box(value);
+            let (value, work, budget, _) = cursor.finish(Tick(1)).unwrap();
+            let class =
+                td_mta::mime_body_lists::Class::from_headers(value, Tick(1), work, budget).unwrap();
+            black_box((value, class));
         }
     }
     assert_eq!(
@@ -7828,6 +7957,7 @@ fn main() {
         resident_mime_delimiters();
         resident_mime_traversal();
         resident_part_headers();
+        mime_body_list_selection();
         body_value();
         mime_text();
         body_charset();
@@ -7982,6 +8112,7 @@ fn main() {
     resident_mime_delimiters();
     resident_mime_traversal();
     resident_part_headers();
+    mime_body_list_selection();
     body_value();
     mime_text();
     body_charset();

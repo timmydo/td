@@ -4104,6 +4104,51 @@ streaming and worker/native stack/RSS qualification remain open.
 RESOURCES.md qualifies its fixed state and Rust allocation checks
 separately.
 
+### 1.87 Iterative resident body lists
+
+M06ch adds mime_body_lists. Class::from_headers classifies one healthy
+retained part-header View with fixed comparisons under original
+Meter/HeaderBudget. It expects canonical lowercase heads from the preceding
+cursor, preserves attachment/inline distinction and treats a selected empty
+name as unnamed only for body selection. Its generated Class is passive
+data. Caller Node slots supply that classification plus completed traversal
+parent/depth; implicit ordinals are slot indices plus one. The caller pins
+correspondence, complete source authorization and original retention
+admission, including matching Node parent/depth and multipart classification
+to each traversal Part.
+
+Cursor validates the configured depth/part limits and preorder shape while
+building text/html ordinal lists in separate fixed caller windows. Its 65
+frames include a virtual mixed scope, supporting 64 actual entity levels.
+One turn enters a node, closes one frame, copies one fallback ordinal or
+sweeps one attachment. Multipart containers recurse through frames
+regardless of their own disposition; attached message types remain leaves.
+Related permits an inline leaf only at its first immediate-child position,
+regardless of name; all later leaf children become attachments. In other
+multipart scopes, later named text is an attachment, while empty names
+remain eligible. Alternative selection uses scope-local channel masks and
+bounded fallback copying, including POLICY.md's explicit disabled-channel
+rule. A final preorder sweep derives attachments from both RFC membership
+conditions, never duplicate provisional append decisions. has_attachment
+requires an attachment whose disposition is not Inline.
+
+Lists and has_attachment appear only after complete success. Capacity,
+malformed tree, work/interpretation refusal and late deadlines are sticky;
+backing is not wiped and carries no completion/publication authority. Cached
+Complete is inert. check_deadline and consuming finish freshly check the
+original owners; finish returns passive slices and those same owners. No
+header bytes/steps are renewed or consumed by typed tree/list work; all
+node, membership and fallback visits, structural turns and writes spend
+original job allowances. HeaderBudget remains exclusively borrowed and its
+existing sticky refusal still retires completion.
+
+RESOURCES.md qualifies state, turns and Rust allocations. Nodes/lists are
+caller-supplied evidence without partId/blobId or wire authorization.
+Retained list windows need separate aggregate output admission; no body-work
+scratch partition is claimed for them. Automatic traversal/metadata
+coordination, JSON/body values, remaining part headers, authenticated
+locators and streaming/worker/native/RSS remain open.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

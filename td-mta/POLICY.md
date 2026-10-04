@@ -474,7 +474,21 @@ between plain/HTML alternatives and related/inline-media behavior with the
 RFC's A..K example. Derive attachments depth-first by the RFC's two
 conditions, without duplicate entries. hasAttachment is true when this list
 contains a part whose disposition is not inline; no hidden CID-image heuristic
-in v1. Preview is the first 256 Unicode scalars of display text, preferring
+in v1.
+
+In nested alternatives, an already disabled text/HTML channel stays disabled
+in the child scope; never append through a null channel or resurrect it there.
+Alternative fallback copies only the current container's new entries when
+both channels are enabled in that scope. A child's local channel suppression
+does not change its parent scope. Derive attachments from final body-list
+membership after all fallback, preserving both RFC conditions even for leaves
+that a suppressed channel could not display. This makes the suggested
+JavaScript's null-channel case explicit rather than dropping an unlisted leaf.
+For alternative > mixed > [plain, image], outer fallback puts both leaves in
+both body lists, so final attachments is empty. The suggested script's
+provisional image append is not retained after that fallback.
+
+Preview is the first 256 Unicode scalars of display text, preferring
 textBody, falling back to HTML extraction below, collapsing ASCII whitespace
 to one SP and trimming edges. It has no HTML markup or attachment metadata
 appended.

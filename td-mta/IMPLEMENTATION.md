@@ -1851,6 +1851,14 @@ Initial independently landable increments:
   fresh handoff and Rust allocations. Content-ID/language/location, body lists,
   JSON, locators and streaming/worker/native/RSS remain open.
 
+- **M06ch — iterative resident body lists:** classify complete retained heads,
+  consume complete preorder evidence with fixed frames, apply scoped alternative
+  fallback/related/name rules and derive attachments from final membership.
+  Qualify the RFC A..K oracle, nested disabled channels, structural/capacity/work
+  cuts, fresh original handoff and Rust allocation. Automatic composition,
+  remaining part headers, JSON, locators and streaming/worker/native/RSS remain
+  open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

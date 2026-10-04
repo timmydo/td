@@ -1348,6 +1348,42 @@ original handoff. The dedicated warm/measured Rust probe covers
 completion, defaults and sticky capacity retirement. No native compiler
 stack, whole worker or RSS is claimed.
 
+M06ch's body-list cursor plus HeaderBudget fits the existing 16 KiB parser
+reservation and runs after traversal and selected-header projection release
+that state. Its fixed 65 frames include a virtual mixed scope and 64 entity
+levels. There is no recursive production call or per-container heap list.
+
+Part plus Node plus one membership byte fits the existing 64-byte per-part
+reservation, enforced together at compile time. Node carries only parent,
+depth and compact Class; it is supplied separately from the retained
+traversal Part. Class comparison conservatively funds 64 header visits/steps
+and its actual emitted cell bytes through the original owners. It assumes
+canonical retained metadata, not an independent source or authorization.
+
+At most three u16 ordinal lists with 4096 entries each require 24 KiB of
+separately admitted caller aggregate output backing. The 96 KiB body-work
+reservation is fully partitioned and supplies no retained list storage.
+Lists outlive the cursor and may coexist with subsequent
+decoding/conversion; automatic worker coordination must reserve that
+simultaneous retention before use. Fixed frames remain in parser state.
+Backing is never enlarged. Body/list work retains the original HeaderBudget
+exclusively and freshly checks it without changing its byte/step counters.
+Each poll funds one structural job record, at most eight
+node/membership/fallback I/O bytes and seven emitted bytes. One fallback
+entry is copied per turn; no whole-list copy or repeated source-prefix scan
+occurs. Membership is initialized as each node validates, with no unbudgeted
+refusal wipe. Final attachment classification scans one node per turn after
+fallback.
+
+Tests pin the RFC's literal A..K lists, sole-alternative fallback, related
+and named/empty behavior, inherited disabled channels, final attachment
+membership, invalid preorder, full depth/parts, all output windows, every
+job allowance cut, sticky header refusal and every live deadline turn. Rust
+warm/measured allocation intervals cover simple/nested/deep success,
+malformed tree, work and capacity failure and late retirement. State/cell
+ceilings are independent of native compiler stack, complete worker, portable
+provider or RSS evidence.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64
