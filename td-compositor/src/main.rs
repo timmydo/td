@@ -59,6 +59,7 @@ mod session;
 mod socket;
 mod sys;
 mod text;
+#[cfg_attr(not(feature = "target-recipe"), path = "../../td-civil/src/tzif.rs")]
 mod timezone;
 mod ui;
 mod vm_bridge;
@@ -1095,6 +1096,7 @@ mod confinement {
         "face.rs",
         "face_file.rs",
         "sfnt.rs",
+        "timezone.rs",
     ];
 
     const OTHER: &[(&str, &str)] = &[
@@ -1140,7 +1142,7 @@ mod confinement {
         ("sfnt.rs", include_str!("../../td-ui/src/sfnt.rs")),
         ("socket.rs", include_str!("socket.rs")),
         ("text.rs", include_str!("text.rs")),
-        ("timezone.rs", include_str!("timezone.rs")),
+        ("timezone.rs", include_str!("../../td-civil/src/tzif.rs")),
         ("ui.rs", include_str!("ui.rs")),
         ("vm_bridge.rs", include_str!("vm_bridge.rs")),
         ("vm_wire.rs", include_str!("vm_wire.rs")),

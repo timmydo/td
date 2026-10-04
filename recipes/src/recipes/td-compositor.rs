@@ -125,10 +125,7 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
     ("text", include_str!("../../../td-compositor/src/text.rs")),
-    (
-        "timezone",
-        include_str!("../../../td-compositor/src/timezone.rs"),
-    ),
+    ("timezone", include_str!("../../../td-civil/src/tzif.rs")),
     ("ui", include_str!("../../../td-compositor/src/ui.rs")),
     (
         "vm_bridge",

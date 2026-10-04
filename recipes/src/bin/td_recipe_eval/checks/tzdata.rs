@@ -6,7 +6,7 @@ use std::path::Path;
 use super::rust_toolchain::{path_basename, GLIBC_STAGE};
 use crate::check_runner::{RecipeCheckRunner, TD_STORE_DIR};
 
-use td_recipe::td_compositor_timezone::Zone;
+use td_recipe::td_civil_tzif::Zone;
 use td_recipe::td_install_timezones as installer_timezones;
 
 const TABLES: &[&str] = &["iso3166.tab", "zone.tab", "zone1970.tab", "zonenow.tab"];

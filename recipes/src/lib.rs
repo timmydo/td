@@ -40,8 +40,8 @@ pub mod td_boot_protocol;
 pub mod td_boot_realfile;
 // Shared check assertions must participate in the catalog dependency scan.
 use td_boot_realfile as realfile;
-#[path = "../../td-compositor/src/timezone.rs"]
-pub mod td_compositor_timezone;
+#[path = "../../td-civil/src/tzif.rs"]
+pub mod td_civil_tzif;
 #[path = "../../td-install/src/timezones.rs"]
 pub mod td_install_timezones;
 
@@ -65,7 +65,7 @@ mod timezone_catalog_tests {
         let shared = crate::catalog::shared_embeds();
         for (dir, file) in [
             ("td-install", "/src/timezones.rs"),
-            ("td-compositor", "/src/timezone.rs"),
+            ("td-civil", "/src/tzif.rs"),
         ] {
             let path = [dir, file].concat();
             assert!(shared.contains(&path.as_str()), "{shared:?}");

@@ -10973,9 +10973,9 @@ chmod 755 '{}'
             .map(|(s, _)| (*s).to_string())
             .collect();
         for scope in [
-            "td-compositor/src/timezone.rs",
-            "td-compositor",
-            "td-compositor/src",
+            "td-civil/src/tzif.rs",
+            "td-civil",
+            "td-civil/src",
             "td-boot/src/protocol.rs",
             "td-boot",
         ] {

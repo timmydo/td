@@ -374,8 +374,11 @@ are the installer catalog's name rules. The immutable deployment owns
 the zone tree; this is not a filesystem confinement boundary for an
 adversary replacing trusted root-owned paths.
 
-The Rust reader implements the deployment's leap-free TZif v2/v3 files
-under [RFC 9636](https://www.rfc-editor.org/rfc/rfc9636.html). It skips the
+The Rust reader is td-civil's `tzif.rs`, compiled in as the `timezone`
+module; td-civil's `Zone`, through which td-mail and td-news read
+`/etc/localtime`, is built on it, as is the tzdata recipe check. It
+implements the deployment's leap-free TZif v2/v3 files under
+[RFC 9636](https://www.rfc-editor.org/rfc/rfc9636.html). It skips the
 32-bit block, bounds the 64-bit arrays before allocating, checks ordered
 transitions, type indices, offset range -89999 through 93599, designation
 terminators with at most 64 bytes per designation and standard/UT

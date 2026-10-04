@@ -1,5 +1,7 @@
-//! Bounded TZif v2/v3 rules for the status clock (RFC 9636).
-//! No environment, filesystem, process-global timezone, or leap-second scale.
+//! Bounded, strict TZif v2/v3 rules (RFC 9636): td-civil's `Zone` and the
+//! compositor's status clock. No environment, filesystem, process-global
+//! timezone, or leap-second scale; `std` alone, so td-compositor compiles
+//! this file as a module by `#[path]`.
 
 pub const MAX_BYTES: usize = 65_536;
 const DAY: i64 = 86_400;
@@ -118,6 +120,24 @@ impl Zone {
             }
         };
         (kind.name != b"-00").then_some(kind.offset)
+    }
+
+    /// Every offset `offset_at` can answer, sorted, each once.
+    #[allow(
+        dead_code,
+        reason = "td-civil's inversion; the compositor's copy never asks"
+    )]
+    pub fn offsets(&self) -> Vec<i32> {
+        let mut offsets: Vec<i32> = self.kinds.iter().map(|kind| kind.offset).collect();
+        if let Some(future) = &self.future {
+            offsets.push(future.standard.offset);
+            if let Some((daylight, _, _)) = &future.daylight {
+                offsets.push(daylight.offset);
+            }
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets
     }
 }
 
@@ -416,11 +436,12 @@ impl Rule {
     }
 }
 
-fn leap(year: i64) -> bool {
+pub fn leap(year: i64) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
-fn month_days(year: i64, month: u8) -> Option<u8> {
+/// Length of a month, or `None` if `month` is not 1..=12.
+pub fn month_days(year: i64, month: u8) -> Option<u8> {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
         4 | 6 | 9 | 11 => Some(30),
@@ -429,7 +450,8 @@ fn month_days(year: i64, month: u8) -> Option<u8> {
     }
 }
 
-fn days_from_civil(year: i64, month: u8, day: u8) -> i128 {
+/// Signed Unix days of a proleptic Gregorian date (Hinnant).
+pub fn days_from_civil(year: i64, month: u8, day: u8) -> i128 {
     let year = i128::from(year) - i128::from(month <= 2);
     let era = year.div_euclid(400);
     let y = year.rem_euclid(400);
@@ -647,8 +669,10 @@ mod tests {
         assert!(Zone::parse(&fixture(&[(100, 1)], &[(0, false, "UTC")], "UTC0")).is_none());
         assert!(Zone::parse(&fixture(&[(100, 0)], &[(3600, false, "UTC")], "UTC0")).is_none());
         assert!(Zone::parse(&fixture(&[(100, 0)], &[(0, false, "GMT")], "UTC0")).is_none());
+        // A whole leap record, so the count alone is what refuses.
         let mut leap = valid.clone();
         leap[51 + 28..51 + 32].copy_from_slice(&1u32.to_be_bytes());
+        leap.splice(105..105, [0; 12]);
         assert!(Zone::parse(&leap).is_none());
         let mut indicators = valid.clone();
         indicators[51 + 20..51 + 24].copy_from_slice(&1u32.to_be_bytes());
