@@ -91,6 +91,7 @@ fn provenance_rejection(stem: &str, input: &str) -> String {
 }
 
 pub fn cli(args: &[String]) -> Result<(), String> {
+    let entered = std::time::Instant::now();
     let stem = args.first().ok_or_else(usage)?.as_str();
     let index = parse_index(args.get(1))?;
     if args.get(2).is_some() {
@@ -128,13 +129,19 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     // worktree's climb is part of what it saves.
     let components = runner.check_verdict_components(stem, index)?;
     let key = verdict_key_of(&components);
+    let mut phases = CheckPhases {
+        setup: started.duration_since(entered),
+        key: started.elapsed(),
+        ..CheckPhases::default()
+    };
     let bypassed = check_memo_bypassed();
-    let memo_hit = |why: &str| {
+    let memo_hit = |why: &str, phases: &CheckPhases| {
         say_memoized(stem, index, &key);
-        runner.record_check_history(stem, index, "memo", started.elapsed(), &key, why);
+        runner.record_check_history(stem, index, "memo", entered.elapsed(), &key, why, phases);
     };
     if !bypassed && reap_then_check_memoized(&runner, stem, index, &key) {
-        memo_hit("");
+        phases.key = started.elapsed();
+        memo_hit("", &phases);
         return Ok(());
     }
     // Why this check runs rather than answering from a pass on record: the
@@ -148,29 +155,40 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         "   [memo] {stem}#{index} runs (key {}): {why}",
         key.get(..12).unwrap_or(&key)
     );
+    phases.key = started.elapsed();
+    let waited = std::time::Instant::now();
     let _lock = lock_ladder_for_run(&runner)?;
     // Asked again under the lock: a peer running this same check — beside
     // this run, since the lock is shared by default, or ahead of it while
     // this run waited on an exclusive one — may have recorded the pass this
     // run was about to earn.
     if !bypassed && runner.check_verdict_memoized(stem, index, &key) {
-        memo_hit("a peer recorded the pass while this run waited");
+        phases.lock = waited.elapsed();
+        memo_hit("a peer recorded the pass while this run waited", &phases);
         return Ok(());
     }
     // The pass on record, if any, is forgotten BEFORE the run, not after a
     // failure: a `TD_CHECK_FULL=1` rerun that fails, or dies, must not leave
     // the pass it was sent to doubt for the next ordinary run to answer from.
     runner.forget_check_verdict(stem, index, &key)?;
-    if let Err(e) = crate::checks::run(check_runner, &runner, stem) {
+    phases.lock = waited.elapsed();
+    let ran = std::time::Instant::now();
+    let result = crate::checks::run(check_runner, &runner, stem);
+    phases.build = runner.build_clock.total();
+    phases.test = ran.elapsed().saturating_sub(phases.build);
+    // Where this run's time went: the line that answers "why is this
+    // check slow", beside the history that keeps it.
+    println!("   [time] {stem}#{index}: {}", phases.describe());
+    if let Err(e) = result {
         let outcome = if e.starts_with(HOST_GAP) {
             "host-gap"
         } else {
             "fail"
         };
-        runner.record_check_history(stem, index, outcome, started.elapsed(), &key, &why);
+        runner.record_check_history(stem, index, outcome, entered.elapsed(), &key, &why, &phases);
         return Err(e);
     }
-    runner.record_check_history(stem, index, "pass", started.elapsed(), &key, &why);
+    runner.record_check_history(stem, index, "pass", entered.elapsed(), &key, &why, &phases);
     // Recorded only after a PASS — a failure or a host-gap skip returned Err
     // above — and only if the key still matches: the inputs were hashed before
     // a run that reads them, and the ladder lock does not serialize
@@ -188,6 +206,53 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         Err(e) => eprintln!("check: verdict memo not recorded (re-key failed, non-fatal): {e}"),
     }
     Ok(())
+}
+
+/// Where one check run's wall time went, end to end: the phases sum to the
+/// run's recorded seconds. `setup` plans the closure and its provenance;
+/// `key` hashes the verdict key's components and asks the memo (reaping
+/// abandoned scratch on the way, and explaining a miss); `lock` waits for
+/// the ladder, readies this run's scratch and cache under it and asks the
+/// memo again; `build` is spent in the runner's builds and their graph
+/// preparation (`BuildClock`); `test` is the rest of the check body.
+#[derive(Default)]
+struct CheckPhases {
+    setup: std::time::Duration,
+    key: std::time::Duration,
+    lock: std::time::Duration,
+    build: std::time::Duration,
+    test: std::time::Duration,
+}
+
+impl CheckPhases {
+    fn named(&self) -> [(&'static str, std::time::Duration); 5] {
+        [
+            ("setup", self.setup),
+            ("key", self.key),
+            ("lock", self.lock),
+            ("build", self.build),
+            ("test", self.test),
+        ]
+    }
+
+    fn describe(&self) -> String {
+        let parts: Vec<String> = self
+            .named()
+            .iter()
+            .map(|(name, d)| format!("{name} {:.1}s", d.as_secs_f64()))
+            .collect();
+        parts.join(", ")
+    }
+
+    /// The history's form: `name=secs` pairs, space-separated.
+    fn record(&self) -> String {
+        let parts: Vec<String> = self
+            .named()
+            .iter()
+            .map(|(name, d)| format!("{name}={:.1}", d.as_secs_f64()))
+            .collect();
+        parts.join(" ")
+    }
 }
 
 fn say_memoized(stem: &str, index: usize, key: &str) {
@@ -2162,6 +2227,7 @@ fn check_history_line(
     took: std::time::Duration,
     key: &str,
     why: &str,
+    phases: &str,
 ) -> String {
     use td_engine::json::Json;
     let record = Json::Obj(vec![
@@ -2169,6 +2235,7 @@ fn check_history_line(
         ("check".to_string(), Json::Str(check.to_string())),
         ("key".to_string(), Json::Str(key.to_string())),
         ("outcome".to_string(), Json::Str(outcome.to_string())),
+        ("phases".to_string(), Json::Str(phases.to_string())),
         (
             "secs".to_string(),
             Json::Num(format!("{:.1}", took.as_secs_f64())),
@@ -2287,7 +2354,21 @@ fn summarize_check_history(text: &str, only: &[String], now: u64) -> Vec<String>
         }
         if runs.last.as_ref().is_none_or(|(t, ..)| at >= *t) {
             let why = field("why").unwrap_or_default();
-            runs.last = Some((at, outcome, format!("{secs:.1}s"), why));
+            // Where the last run's time went, from its `name=secs` phases:
+            // only the phases that took a tenth of a second or more.
+            let phases: Vec<String> = field("phases")
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|p| p.split_once('='))
+                .filter(|(_, v)| v.parse::<f64>().is_ok_and(|v| v >= 0.1))
+                .map(|(n, v)| format!("{n} {v}s"))
+                .collect();
+            let secs = if phases.is_empty() {
+                format!("{secs:.1}s")
+            } else {
+                format!("{secs:.1}s ({})", phases.join(", "))
+            };
+            runs.last = Some((at, outcome, secs, why));
         }
     }
     let mut rows: Vec<(f64, String)> = by_check
@@ -2354,7 +2435,7 @@ fn recorded_history_line(args: &[String], at: u64) -> Result<String, String> {
         .ok()
         .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
         .ok_or_else(|| format!("check-history --record: `{secs}` is not seconds"))?;
-    Ok(check_history_line(at, check, outcome, took, "", ""))
+    Ok(check_history_line(at, check, outcome, took, "", "", ""))
 }
 
 /// What changed between the components of a recorded pass (`was`) and this
@@ -2641,6 +2722,54 @@ fn lock_file(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
+/// Wall time summed over the outermost builds only: `build_and_stage` calls
+/// `build_plan`, and a nested call must not count twice.
+#[derive(Default)]
+struct BuildClock {
+    depth: std::sync::atomic::AtomicUsize,
+    nanos: std::sync::atomic::AtomicU64,
+}
+
+/// One entry into `BuildClock::time`; the exit is on drop, so an unwind
+/// cannot leave the depth raised and every later build uncounted.
+struct ClockEntry<'a> {
+    clock: &'a BuildClock,
+    outer: bool,
+    started: std::time::Instant,
+}
+
+impl Drop for ClockEntry<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.outer {
+            let took = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.clock.nanos.fetch_add(took, Relaxed);
+        }
+        self.clock.depth.fetch_sub(1, Relaxed);
+    }
+}
+
+impl BuildClock {
+    /// Time `f` as build time. Builds nest (`build_and_stage` plans through
+    /// `build_plan`), so only the outermost entry counts. A check builds on
+    /// one thread; two overlapping on separate threads would count as one.
+    fn time<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _entry = ClockEntry {
+            clock: self,
+            outer: self
+                .depth
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0,
+            started: std::time::Instant::now(),
+        };
+        f()
+    }
+
+    fn total(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.nanos.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 pub(crate) struct RecipeCheckRunner {
     root: PathBuf,
     tb: PathBuf,
@@ -2648,6 +2777,9 @@ pub(crate) struct RecipeCheckRunner {
     /// every check keys on it twice, and the builder does not change under
     /// a run.
     engine_fp: std::sync::OnceLock<Result<String, String>>,
+    /// Wall time spent inside this runner's builds, so a check's log and
+    /// history can split building its inputs from running its assertions.
+    build_clock: BuildClock,
     builder_path: String,
     builder_store: PathBuf,
     builder_db: PathBuf,
@@ -2838,6 +2970,7 @@ impl RecipeCheckRunner {
             root,
             tb,
             engine_fp: std::sync::OnceLock::new(),
+            build_clock: BuildClock::default(),
             builder_path: cb,
             builder_store: stage0_base.join("store"),
             builder_db: stage0_base.join("builder.db"),
@@ -3724,6 +3857,11 @@ impl RecipeCheckRunner {
     }
 
     pub(crate) fn prepare_recipe_target(&self, target: &str) -> Result<(), String> {
+        self.build_clock
+            .time(|| self.prepare_recipe_target_timed(target))
+    }
+
+    fn prepare_recipe_target_timed(&self, target: &str) -> Result<(), String> {
         self.ensure_build_allowed(target)?;
         let graph = recipe_closure(&[target])?;
         // ensure_graph_inputs re-derives, pin-verifies, interns, and STAGES every
@@ -3912,6 +4050,10 @@ impl RecipeCheckRunner {
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
+        self.build_clock.time(|| self.build_plan_timed(target))
+    }
+
+    fn build_plan_timed(&self, target: &str) -> Result<PathBuf, String> {
         self.ensure_build_allowed(target)?;
         // The auto map is the FRESH per-run map prepare_recipe_target wrote from this
         // graph's re-derived, pin-verified seeds (every non-owned input is an interned
@@ -4255,6 +4397,15 @@ impl RecipeCheckRunner {
         target: &str,
         outputs: &[&str],
     ) -> Result<Vec<PathBuf>, String> {
+        self.build_clock
+            .time(|| self.build_and_stage_timed(target, outputs))
+    }
+
+    fn build_and_stage_timed(
+        &self,
+        target: &str,
+        outputs: &[&str],
+    ) -> Result<Vec<PathBuf>, String> {
         self.ensure_build_allowed(target)?;
         let fingerprint = self.evaluator_fingerprint(target)?;
         if let Some(staged) = self.reuse_build_run(target, &fingerprint, outputs)? {
@@ -4526,6 +4677,7 @@ impl RecipeCheckRunner {
         took: std::time::Duration,
         key: &str,
         why: &str,
+        phases: &CheckPhases,
     ) {
         let line = check_history_line(
             std::time::SystemTime::now()
@@ -4536,6 +4688,7 @@ impl RecipeCheckRunner {
             took,
             key.get(..12).unwrap_or(key),
             why,
+            &phases.record(),
         );
         if let Err(e) = append_check_history(&check_history_path(&self.lw), &line) {
             eprintln!("check: history not recorded (non-fatal): {e}");
@@ -9429,6 +9582,7 @@ chmod 755 '{}'
             root: PathBuf::new(),
             tb: PathBuf::new(),
             engine_fp: std::sync::OnceLock::new(),
+            build_clock: BuildClock::default(),
             builder_path: String::new(),
             builder_store: PathBuf::new(),
             builder_db: PathBuf::new(),
@@ -10413,6 +10567,7 @@ chmod 755 '{}'
             root: PathBuf::new(),
             tb: PathBuf::new(),
             engine_fp: std::sync::OnceLock::new(),
+            build_clock: BuildClock::default(),
             builder_path: String::new(),
             builder_store: PathBuf::new(),
             builder_db: PathBuf::new(),
@@ -11131,6 +11286,52 @@ chmod 755 '{}'
         let _ = fs::remove_dir_all(&lw);
     }
 
+    /// A nested build counts once, at the outermost call; the phases print
+    /// and record the same five names; the summary shows where the last
+    /// run's time went, leaving out the phases that took none.
+    #[test]
+    fn a_check_run_says_where_its_time_went() {
+        let clock = BuildClock::default();
+        clock.time(|| {
+            clock.time(|| std::thread::sleep(std::time::Duration::from_millis(200)));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        // 220ms once; counting the nested call too would make it 420.
+        let total = clock.total().as_millis();
+        assert!((220..400).contains(&total), "{total}ms");
+        // A build that unwinds still leaves: the next one counts.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            clock.time(|| panic!("a build that unwinds"))
+        }));
+        assert!(unwound.is_err());
+        clock.time(|| std::thread::sleep(std::time::Duration::from_millis(200)));
+        let total = clock.total().as_millis();
+        assert!((420..700).contains(&total), "{total}ms");
+
+        let secs = std::time::Duration::from_secs_f64;
+        let phases = CheckPhases {
+            setup: secs(1.2),
+            key: secs(0.04),
+            lock: secs(0.0),
+            build: secs(15.1),
+            test: secs(3.2),
+        };
+        assert_eq!(
+            phases.describe(),
+            "setup 1.2s, key 0.0s, lock 0.0s, build 15.1s, test 3.2s"
+        );
+        assert_eq!(
+            phases.record(),
+            "setup=1.2 key=0.0 lock=0.0 build=15.1 test=3.2"
+        );
+        let line = check_history_line(5, "a#1", "pass", secs(19.5), "k", "", &phases.record());
+        let rows = summarize_check_history(&line, &[], 10);
+        assert!(
+            rows[0].contains("; last pass 19.5s (setup 1.2s, build 15.1s, test 3.2s) 5s ago"),
+            "{rows:?}"
+        );
+    }
+
     /// A recorded integration step is checked before it is written, and the
     /// summary narrows to the tier by its name before the `:`.
     #[test]
@@ -11172,8 +11373,17 @@ chmod 755 '{}'
             secs(10.0),
             "k",
             "x changed",
+            "",
         ));
-        text.push_str(&check_history_line(200, "a#1", "memo", secs(0.2), "k", ""));
+        text.push_str(&check_history_line(
+            200,
+            "a#1",
+            "memo",
+            secs(0.2),
+            "k",
+            "",
+            "",
+        ));
         text.push_str(&check_history_line(
             150,
             "b#1",
@@ -11181,6 +11391,7 @@ chmod 755 '{}'
             secs(30.0),
             "k",
             "TD_CHECK_FULL is set",
+            "",
         ));
         text.push_str(&check_history_line(
             160,
@@ -11189,6 +11400,7 @@ chmod 755 '{}'
             secs(50.0),
             "k",
             "y \"quoted\"",
+            "",
         ));
         text.push_str(&check_history_line(
             90,
@@ -11196,6 +11408,7 @@ chmod 755 '{}'
             "host-gap",
             secs(0.1),
             "k",
+            "",
             "",
         ));
         text.push_str("not json\n");

@@ -111,7 +111,11 @@ run, memoized or not, appends a line to
 that reason — shared by every worktree and kept by `clear-store`;
 `td-recipe-eval check-history [CHECK...]` sums it per check, costliest
 first, to say where check time goes. A run that fails before the check
-starts (the ladder lock, the memo dir) writes no record.
+starts (the ladder lock, the memo dir) writes no record. A check that
+runs also prints `[time] CHECK: setup, key, lock, build, test` seconds
+and records them; the summary shows the last run's. A small check's
+time is mostly `build`: re-planning and staging its whole closure from
+stage0, already-built rungs included.
 
 The memo does not see the host — its qemu, kernel, or toolchain — so after
 such a change, or when a recorded pass is in doubt, run everything:

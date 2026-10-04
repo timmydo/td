@@ -682,12 +682,12 @@ fn shared_file_entry(repo: &Path, file: &str) -> Result<String, Box<dyn Error>> 
 /// key holds it in place of reading those trees at run time: a key read
 /// from the tree names the tree at that moment, and a check whose
 /// assertions were compiled from older sources could record a pass under a
-/// newer key. Every file is
-/// declared to cargo, and every directory for its adds and removes, so an
-/// edit reruns this script and re-keys. A hidden entry — an editor's swap
-/// file, its lock link, a scratch directory — is skipped, file or directory
-/// alike; any other symlink is an error, since the walk does not follow one
-/// and skipping it would fingerprint less than the compiler reads.
+/// newer key. Every file is declared to cargo, and every directory for its
+/// adds and removes, so an edit reruns this script and re-keys. A hidden
+/// entry — an editor's swap file, its lock link, a scratch directory — is
+/// skipped, file or directory alike; any other symlink is an error, since
+/// the walk does not follow one and skipping it would fingerprint less than
+/// the compiler reads.
 fn evaluator_source_fingerprint(
     manifest_dir: &Path,
     shared_embeds: &[String],
