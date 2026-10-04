@@ -781,6 +781,119 @@ fn oracle_host(uefi: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The boot timeout override an oracle reads (`qemu_boot`'s ceiling, and the
+/// guest's success wait the live and install boots derive from it).
+const BOOT_TIMEOUT_ENV: &str = "TD_QEMU_BOOT_TIMEOUT_SECS";
+
+/// The host oracles the integration tier runs, with the recipes each builds.
+/// One table, so a CLI and its memo key cannot disagree about what an
+/// oracle boots.
+const ORACLES: &[(&str, &[&str])] = &[
+    (
+        "qemu-boot-system",
+        &[
+            "system-x86-64",
+            "btrfs-progs-x86-64",
+            "td-jail-seccomp-probe",
+        ],
+    ),
+    ("qemu-boot-live", &["system-x86-64"]),
+    (
+        "qemu-install-system",
+        &["system-x86-64", "td-install-qemu-test"],
+    ),
+];
+
+fn oracle_targets(name: &str) -> Result<&'static [&'static str], String> {
+    ORACLES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, targets)| *targets)
+        .ok_or_else(|| {
+            let names: Vec<&str> = ORACLES.iter().map(|(n, _)| *n).collect();
+            format!(
+                "no host oracle `{name}`; the oracles are {}",
+                names.join(", ")
+            )
+        })
+}
+
+/// What an oracle may build: its targets' closure, which is what its key
+/// reads. A build outside it is refused, as a check's is, so a pass is never
+/// recorded for a boot of something the key did not see.
+fn oracle_reach(targets: &[&str]) -> Result<BTreeSet<String>, String> {
+    Ok(recipe_closure(targets)?
+        .into_iter()
+        .map(|node| node.stem)
+        .collect())
+}
+
+/// An oracle's verdict memo lives beside the checks', as pseudo-check 0.
+fn oracle_memo_stem(name: &str) -> String {
+    format!("oracle-{name}")
+}
+
+/// `td-recipe-eval oracle-memo ORACLE [--forget KEY | --record KEY]` — the
+/// integration tier's result memo. Alone it prints `hit KEY` when this
+/// oracle passed before with every input it boots unchanged (the same
+/// components as a check's key over its recipes, beside the oracle's name,
+/// the accelerator it would use and the boot timeout it would pass the
+/// guest), else `miss KEY WHY`; under `TD_CHECK_FULL` it is always a miss,
+/// as a check is. `--forget KEY` removes a pass recorded under KEY, which the
+/// tier does before every boot so a doubted pass that then fails is not
+/// answered from; `--record KEY` records a pass for KEY if the inputs still
+/// key to it.
+pub fn oracle_memo_cli(args: &[String]) -> Result<(), String> {
+    let usage = || "usage: oracle-memo ORACLE [--forget KEY | --record KEY]".to_string();
+    let name = args.first().ok_or_else(usage)?;
+    let (forget, record) = match args.get(1..).unwrap_or(&[]) {
+        [] => (None, None),
+        [flag, key] if flag == "--forget" => (Some(key.as_str()), None),
+        [flag, key] if flag == "--record" => (None, Some(key.as_str())),
+        _ => return Err(usage()),
+    };
+    // A key names a file under the memo dir: only a digest is one.
+    let digest =
+        |k: &str| k.len() == 64 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if forget.or(record).is_some_and(|k| !digest(k)) {
+        return Err(format!(
+            "oracle-memo: a KEY is a sha256 hex digest\n{}",
+            usage()
+        ));
+    }
+    let targets = oracle_targets(name)?;
+    let stem = oracle_memo_stem(name);
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name("oracle-memo", &[name]))?;
+    if let Some(doubted) = forget {
+        return runner.forget_check_verdict(&stem, 0, doubted);
+    }
+    let components = runner.oracle_verdict_components(name, targets)?;
+    let key = verdict_key_of(&components);
+    match record {
+        Some(earned) if earned == key => {
+            runner.write_check_verdict_memo(&stem, 0, &key, &components)
+        }
+        Some(_) => {
+            eprintln!("oracle-memo: {name}'s pass not recorded: its inputs changed during the run");
+            Ok(())
+        }
+        None if check_memo_bypassed() => {
+            println!("miss {key} {CHECK_FULL_ENV} is set");
+            Ok(())
+        }
+        None if runner.check_verdict_memoized(&stem, 0, &key) => {
+            println!("hit {key}");
+            Ok(())
+        }
+        None => {
+            let why = runner.explain_verdict_miss(&stem, 0, &key, &components);
+            println!("miss {key} {why}");
+            Ok(())
+        }
+    }
+}
+
 /// Boot the production live medium into its session and the installer wizard.
 pub fn qemu_boot_live_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
@@ -788,13 +901,14 @@ pub fn qemu_boot_live_cli(args: &[String]) -> Result<(), String> {
         return Err("usage: qemu-boot-live [system-x86-64]".into());
     }
     oracle_host(true)?;
-    let targets = [STEM];
-    ensure_targets_provenance(&targets)?;
+    let targets = oracle_targets("qemu-boot-live")?;
+    ensure_targets_provenance(targets)?;
     let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
     let name = scratch_name("qemu-boot-live", &[STEM]);
-    let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
-    if let Err(error) = crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Automatic)
-    {
+    let runner = RecipeCheckRunner::new(root, &name)?
+        .with_streamed_progress()
+        .with_allowed_builds(oracle_reach(targets)?);
+    if let Err(error) = crate::warm::preflight(&runner, targets, crate::warm::WarmMode::Automatic) {
         eprintln!("   [warm] {error} — continuing; the build reports what it cannot resolve");
     }
     let _lock = lock_ladder_for_run(&runner)?;
@@ -808,14 +922,15 @@ pub fn qemu_install_system_cli(args: &[String]) -> Result<(), String> {
         return Err("usage: qemu-install-system [system-x86-64]".into());
     }
     oracle_host(true)?;
-    let targets = [STEM, "td-install-qemu-test"];
-    ensure_targets_provenance(&targets)?;
+    let targets = oracle_targets("qemu-install-system")?;
+    ensure_targets_provenance(targets)?;
     let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
     let name = scratch_name("qemu-install-system", &[STEM]);
-    let runner = RecipeCheckRunner::new(root, &name)?.with_streamed_progress();
+    let runner = RecipeCheckRunner::new(root, &name)?
+        .with_streamed_progress()
+        .with_allowed_builds(oracle_reach(targets)?);
     // Warm before unattended builds too; recipe admission remains authoritative.
-    if let Err(error) = crate::warm::preflight(&runner, &targets, crate::warm::WarmMode::Automatic)
-    {
+    if let Err(error) = crate::warm::preflight(&runner, targets, crate::warm::WarmMode::Automatic) {
         eprintln!("   [warm] {error} — continuing; the build reports what it cannot resolve");
     }
     let _lock = lock_ladder_for_run(&runner)?;
@@ -905,15 +1020,17 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     oracle_host(false)?;
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    let targets = [stem, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
-    ensure_targets_provenance(&targets)?;
+    let targets = oracle_targets("qemu-boot-system")?;
+    ensure_targets_provenance(targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
     // a killed system boot's per-boot directories (it can hold a multi-GiB kernel build).
     let scratch_name = scratch_name("qemu-boot", &[stem]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
-    warm_operator_inputs(&runner, &targets);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?
+        .with_streamed_progress()
+        .with_allowed_builds(oracle_reach(targets)?);
+    warm_operator_inputs(&runner, targets);
     let _lock = lock_ladder_for_run(&runner)?;
     crate::checks::qemu_boot::run_system(&runner)
 }
@@ -2425,9 +2542,9 @@ fn recorded_history_line(args: &[String], at: u64) -> Result<String, String> {
     let [check, outcome, secs] = args else {
         return Err("usage: check-history --record CHECK OUTCOME SECS".to_string());
     };
-    if !["pass", "fail", "host-gap"].contains(&outcome.as_str()) {
+    if !["pass", "fail", "host-gap", "memo"].contains(&outcome.as_str()) {
         return Err(format!(
-            "check-history --record: outcome `{outcome}` is not pass, fail or host-gap"
+            "check-history --record: outcome `{outcome}` is not pass, fail, host-gap or memo"
         ));
     }
     let took = secs
@@ -2557,8 +2674,9 @@ pub(crate) const CHECK_BUILDS_ENV: &str = "TD_CHECK_BUILDS";
 fn undeclared_build(target: &str) -> String {
     format!(
         "check builds `{target}', which neither its owner's closure nor its runner's \
-         declared builds hold — add it to `CheckRunner::extra_builds` (types.rs) so the \
-         verdict key and the check's reach read it"
+         declared builds hold — add it to `CheckRunner::extra_builds` (types.rs), or for \
+         a host oracle to `ORACLES` (check_runner.rs), so the verdict key and the reach \
+         read it"
     )
 }
 
@@ -4557,7 +4675,18 @@ impl RecipeCheckRunner {
                 Ok(())
             })?,
         ));
-        let closure = recipe_closure(&check_roots(stem, check.runner))?;
+        out.extend(self.closure_verdict_components(&check_roots(stem, check.runner))?);
+        Ok(out)
+    }
+
+    /// The key components of building `roots`: each closure recipe's value and
+    /// source digest, the builder engine, the seed patches, the closure's
+    /// cargo locks and local sources, and the evaluator. A check's key is
+    /// these beside its own; a host oracle's is these beside its name and
+    /// accelerator (`oracle_verdict_components`).
+    fn closure_verdict_components(&self, roots: &[&str]) -> Result<Vec<(String, String)>, String> {
+        let mut out = Vec::new();
+        let closure = recipe_closure(roots)?;
         // In stem order, not walk order: the walk is deterministic today, and
         // the key should not depend on that staying so.
         let mut nodes: Vec<&RecipeNode> = closure.iter().collect();
@@ -4600,6 +4729,47 @@ impl RecipeCheckRunner {
             "evaluator".to_string(),
             env!("TD_EVALUATOR_SOURCE_FINGERPRINT").to_string(),
         ));
+        Ok(out)
+    }
+
+    /// A host oracle's key components: what its recipes are built from, its
+    /// name, the accelerator it would boot on, since a KVM pass is not
+    /// evidence for a TCG boot, and the boot timeout override, which reaches
+    /// the guest's command line as well as the host's deadline.
+    fn oracle_verdict_components(
+        &self,
+        name: &str,
+        targets: &[&str],
+    ) -> Result<Vec<(String, String)>, String> {
+        let accel = crate::checks::accel::from_env()?;
+        let mut out = vec![
+            (
+                "oracle".to_string(),
+                digest_of(|h| {
+                    hash_field(h, name.as_bytes());
+                    Ok(())
+                })?,
+            ),
+            (
+                "accelerator".to_string(),
+                digest_of(|h| {
+                    for accel in accel.names {
+                        hash_field(h, accel.as_bytes());
+                    }
+                    Ok(())
+                })?,
+            ),
+            (
+                "boot-timeout".to_string(),
+                digest_of(|h| {
+                    let set = env::var_os(BOOT_TIMEOUT_ENV);
+                    hash_field(h, if set.is_some() { b"set" } else { b"unset" });
+                    hash_field(h, set.as_deref().unwrap_or_default().as_encoded_bytes());
+                    Ok(())
+                })?,
+            ),
+        ];
+        out.extend(self.closure_verdict_components(targets)?);
         Ok(out)
     }
 
@@ -11283,6 +11453,54 @@ chmod 755 '{}'
             runner.check_verdict_key("rust-toolchain", 1).ok(),
             Some(verdict_key_of(&parts))
         );
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    /// A host oracle keys on its name, its accelerator and everything its
+    /// recipes are built from, the same closure components a check's key
+    /// holds; two oracles over the same image key apart; a pass recorded
+    /// under the key is found by it, as a check's is.
+    #[test]
+    fn an_oracle_keys_on_its_image_its_name_and_its_accelerator() {
+        let lw = env::temp_dir().join(format!("td-oracle-key-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let mut runner = shared_test_runner(&lw);
+        runner.root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        runner.engine_fp.set(Ok("e".repeat(64))).unwrap();
+        let parts = |name: &str| {
+            runner
+                .oracle_verdict_components(name, oracle_targets(name).unwrap())
+                .unwrap()
+        };
+        let system = parts("qemu-boot-system");
+        let names: Vec<&str> = system.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names.get(..3),
+            Some(&["oracle", "accelerator", "boot-timeout"][..])
+        );
+        assert_eq!(names.last(), Some(&"evaluator"));
+        for name in [
+            "recipe system-x86-64",
+            "sources system-x86-64",
+            "recipe btrfs-progs-x86-64",
+            "builder-engine",
+            "seed-patches",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        let live = parts("qemu-boot-live");
+        assert_ne!(verdict_key_of(&system), verdict_key_of(&live));
+        assert!(oracle_targets("qemu-boot-nothing").is_err());
+        let stem = oracle_memo_stem("qemu-boot-live");
+        let key = verdict_key_of(&live);
+        assert!(!runner.check_verdict_memoized(&stem, 0, &key));
+        runner
+            .write_check_verdict_memo(&stem, 0, &key, &live)
+            .unwrap();
+        assert!(runner.check_verdict_memoized(&stem, 0, &key));
         let _ = fs::remove_dir_all(&lw);
     }
 

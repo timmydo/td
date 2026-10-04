@@ -19,6 +19,11 @@
 //!                         per check, from this machine's check history: runs
 //!                         executed and memoized, median and longest wall time,
 //!                         and the last run's outcome and why it ran
+//!   oracle-memo ORACLE [--forget KEY | --record KEY]
+//!                         the integration tier's result memo: `hit KEY` when
+//!                         ORACLE passed here with every input it boots
+//!                         unchanged, else `miss KEY WHY`; forget or record a
+//!                         pass under KEY
 //!   clear-store           reset the ladder work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
 //!                         cold-climbs. The only path that clears persisted state
@@ -379,6 +384,12 @@ fn main() {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::check_history_cli(rest) {
                 die(&e);
+            }
+        }
+        Some("oracle-memo") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::oracle_memo_cli(rest) {
+                die_runner(&e);
             }
         }
         Some("clear-store") => {

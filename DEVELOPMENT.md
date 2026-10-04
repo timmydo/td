@@ -293,8 +293,17 @@ emulation, several times slower. It needs the host's qemu, and OVMF for
 the last two (found beside qemu or in /usr/share/OVMF, or named by
 `TD_QEMU_EFI_CODE` and `TD_QEMU_EFI_VARS`). An oracle the host cannot
 run is an unprovisioned skip; when none could run the tier exits 69,
-which `ready` does not take for a pass. It keeps no verdict journal, so
-each run boots again.
+which `ready` does not take for a pass. An oracle that passed before
+with every input it boots unchanged (the same components as a recipe
+check's key over its recipes, beside its name, its accelerator list and
+`TD_QEMU_BOOT_TIMEOUT_SECS`) answers from its memo and boots nothing,
+as `td-recipe-eval oracle-memo ORACLE` reports; when all three do, the
+warm is skipped too. Each is asked again when its step is reached, its
+pass is forgotten before it boots, and `TD_CHECK_FULL=1` boots them all,
+so a doubted pass that fails is gone; an oracle whose question failed
+boots without forgetting or recording. The memo does not see the host's
+qemu or firmware, nor whether a `KVM, TCG fallback` boot fell back; the
+key is read when asked and again when a pass is recorded, not between.
 
 It belongs to main: after a landing, an agent on a provisioned host runs
 `td-builder check integration` on main, and a red one is healed as any
