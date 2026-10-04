@@ -7,9 +7,10 @@ normal/build features
 for the initial x86-64 Linux GNU/musl host targets. The portable musl artifact
 and its compiler/sysroot pins remain M03b2.
 
-The mail lock additionally includes local std-only td-header and td-json.
-They add no registry source or private backend input; their exact manifests,
-locks and source staging are admitted alongside td-crypto and td-mta.
+The mail lock additionally includes local std-only td-header, td-json and
+td-nfc. They add no registry source or private backend input; their exact
+manifests, locks and source staging are admitted alongside td-crypto and
+td-mta.
 
 Direct inputs are Rustls 0.23.45 (std, TLS 1.2, AWS-LC), aws-lc-rs 1.18.1
 (alloc, non-FIPS), and webpki-roots 1.0.8 (compiled Mozilla root data).

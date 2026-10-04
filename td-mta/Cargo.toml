@@ -15,6 +15,7 @@ clippy-all-targets = true
 td-crypto = { path = "../td-crypto" }
 td-header = { path = "../td-header" }
 td-json = { path = "../td-json" }
+td-nfc = { path = "../td-nfc" }
 
 [[test]]
 name = "rust_alloc_probe"

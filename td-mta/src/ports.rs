@@ -595,7 +595,8 @@ mod crypto_boundary_tests {
             [
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
-                r#"td-json = { path = "../td-json" }"#
+                r#"td-json = { path = "../td-json" }"#,
+                r#"td-nfc = { path = "../td-nfc" }"#
             ]
         );
     }

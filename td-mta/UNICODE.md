@@ -277,6 +277,19 @@ intervals compose proof validation and normalization, including refusal.
 Initial grammar and complete field admission remain caller-owned; whole-field
 response publication and worker/RSS qualification remain open.
 
+M06bz extracts this same engine into std-only td-nfc; the old mail engine is
+removed in the same landing. Mail retains all Unicode 17 tables, source
+validation/decoding/filtering, canonical decomposition and class lookups. Pure
+Copy source checkpoints retain exact decoder/pending-decomposition identity;
+separate generic admission borrows the original mail budgets/credit and real
+supplied Tick. Source callbacks and engine transitions preserve exact charges,
+one/32-transition quanta and the existing source/cursor/scratch ceilings.
+Standalone engine correctness is conditional on caller-supplied deterministic
+canonical source/tables; its API owns no ambient Unicode version. The official
+vectors and all adversarial mail replay/budget/allocation fixtures remain the
+consumer oracle. Passive borrowed phase/checkpoint inspection is not a restore
+API or output validity proof. Parameter checkpoint composition remains open.
+
 ## Acceptance evidence owned by M06
 
 Run the complete pinned NormalizationTest file's NFC equations, normalization

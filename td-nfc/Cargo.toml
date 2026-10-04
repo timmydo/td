@@ -1,0 +1,20 @@
+[package]
+name = "td-nfc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded canonical composition over caller-owned source checkpoints"
+
+[workspace]
+
+[package.metadata.td-gate]
+clippy-all-targets = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"

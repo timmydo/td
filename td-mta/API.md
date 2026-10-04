@@ -3753,6 +3753,50 @@ and normalization are unchanged. No live cursor, quota, output backing or
 dependency is added; existing turn/cursor bounds and allocation intervals
 remain the contract.
 
+### 1.79 Shared bounded canonical composition
+
+M06bz extracts the existing NFC ordering/composition engine into std-only
+td-nfc. nfc::Scratch and Status re-export the shared types; public mail entry
+points, errors, original work/header references, private credit and real
+supplied Tick remain unchanged. A private context admits each engine
+transition and invokes the existing charged source/decomposition reader.
+Unicode 17 lookup/decomposition/classification/composition stays in mail.
+
+The shared Source is a quota-free Copy checkpoint whose identity includes
+exact source/decoder progress and pending decomposition. A generic Reader
+borrows the original admission context for each bounded source operation.
+No clock, meter, credit or retained output owner lives in checkpoints.
+At most 1..=32 admitted transitions emit one provisional scalar; mail retains
+its one-transition header and 32-transition valid-UTF8 policies. The shared
+algorithm preserves stable ordering, blocking, starter composition and exact
+unfinished-segment replay without completed-prefix scans. Its Unicode result
+is conditional on the caller's deterministic canonical source/table contract.
+
+The shared owner exclusively borrows the same 3072-byte scratch and is neither
+Clone nor Copy. Generic size depends on Source/Error; mail still pins Source
+at most 256 bytes and Cursor plus HeaderBudget at 1024. Passive borrowed inspection
+supports existing adversarial checkpoint tests without a mutable restore API
+or source/output validity authority. No larger parameter source is added to
+this fixed header enum. A later parameter owner must qualify its own state.
+
+poll/check failures remain sticky across replacement contexts. Cached Complete
+is inert; the mail output-charge method binds fresh admission through check,
+including after completion. Scratch release requires healthy Done; Done may
+coincide with the final Scalar, whose output admission/copy still belongs to
+the caller before publication. Mail retains its original error mapping and
+whole-property discard rule. Existing official Unicode vectors, fast/overflow
+replay, pending decomposition, prefix visits, aggregate/job cuts, deadlines and
+allocation intervals remain consumer qualification. Standalone shared tests
+qualify generic engine ownership/admission/replay, not a new Unicode database
+or complete worker/native/RSS bounds.
+
+The new internal path dependency joins ordinary roster discovery and has its
+own package-only lock. All five local crypto-consumer manifests/locks and the
+active graph remain explicitly pinned; td-nfc is std-only, not an external
+crypto admission. Preparation/staging uses the same compiled local-source
+list, with build scripts refused. Routing checks the primitive and mail reader
+without claiming distribution image or portable-artifact qualification.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -1164,6 +1164,19 @@ charging remain with each caller. Existing phrase/comment/parameter and
 body/header allocation intervals qualify the migrated paths, not complete
 worker/native/RSS bounds.
 
+M06bz moves deterministic ordering/composition into shared td-nfc without
+changing mail's resource contract. Scratch remains exactly 3072 bytes, Source
+at most 256 and Cursor plus HeaderBudget at most 1024. The shared engine holds
+four pure source checkpoints and the exclusive scratch borrow; mail retains
+live Meter/HeaderBudget, credit and supplied Tick in its enclosing owner/context.
+Generic shared cursor size depends on Source/Error and is not a universal
+mail-size claim. One/32-transition source quanta and every scan/insertion/
+replay/composition/emission charge retain their existing counts. Existing
+Unicode, adversarial checkpoint/prefix, budget and allocation fixtures qualify
+the migrated consumer. Larger parameter sources must use their own qualified
+parser reservation rather than widening the fixed header Source enum.
+Output capacity, complete worker/native/RSS and MIME traversal remain open.
+
 Shared td-json framing plus its private mail adapter fits 32 bytes and owns no
 source or work reference. This is the bound with the mail error enum; generic
 Frame<E> size also depends on E. The public borrowed adapter still fits 64

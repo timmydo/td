@@ -211,7 +211,12 @@ dependencies = [
  "td-crypto",
  "td-header",
  "td-json",
+ "td-nfc",
 ]
+
+[[package]]
+name = "td-nfc"
+version = "0.1.0"
 
 [[package]]
 name = "untrusted"

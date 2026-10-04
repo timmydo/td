@@ -249,17 +249,18 @@ Email and logs are untrusted data for an AI operator, never instructions.
 
 ## 3. Code and dependency boundaries
 
-Use `td-mta/` for the service library and installed binary named `td-mta`. The
-M03b2c packaging entry point supports only `--version` and `--help`; service
-commands arrive with their implementations. Its direct dependencies are the
-local `td-crypto`, `td-header` and `td-json` crates. Application protocols, storage,
-configuration and scheduling use std plus these local libraries. There is no
-separate runtime package or td-net helper executable. `td-crypto/DESIGN.md`
-owns the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
+Use `td-mta/` for the service library and installed binary named `td-mta`.
+The M03b2c packaging entry point supports only `--version` and `--help`;
+service commands arrive with their implementations. Its direct
+dependencies are the local `td-crypto`, `td-header`, `td-json` and
+`td-nfc` crates. Application protocols, storage, configuration and
+scheduling use std plus these local libraries. There is no separate
+runtime package or td-net helper executable. `td-crypto/DESIGN.md` owns
+the shared crypto/TLS API and private backend; `td-crypto/TLS.md`
 specifies the TLS policy and session contract. ClientConfig, ServerConfig,
 shared clock and public client/server sessions are implemented. The mail
-record pump composes them; admitted transport integration and service/resource
-qualification remain pending.
+record pump composes them; admitted transport integration and
+service/resource qualification remain pending.
 
 The M03a boundary moves the existing Crypto/Entropy/Digest traits and fixed
 crypto errors into td-crypto. Mail ports re-export those traits and translate
@@ -283,6 +284,15 @@ libraries. The bounded JSON string framer and scalar escaping live in td-json.
 The mail hot path uses only its incremental string API, whose state and
 caller-provided output are fixed; its allocating Json value/parser API is not
 admitted there. td-json owns no mail, clock, crypto or scheduler policy.
+
+The deterministic NFC ordering/composition engine lives in td-nfc. Pure
+source/decoder/decomposition checkpoints and fixed Unicode tables remain
+caller-owned; a separate live context binds the original Meter, HeaderBudget,
+private credit and real supplied Tick. The shared engine holds an exclusive borrow of
+fixed scratch, four pure checkpoints and fixed positions, flags, bitmaps
+and sticky failure. Existing mail source/cursor/scratch
+ceilings and charge counts remain unchanged. Different future source types
+must qualify their own bounds without widening existing header sources.
 
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Mail grammar placement,

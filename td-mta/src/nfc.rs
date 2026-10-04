@@ -90,36 +90,8 @@ impl HeaderBudget {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Cell {
-    value: char,
-    class: u8,
-}
-impl Cell {
-    const EMPTY: Self = Self {
-        value: '\0',
-        class: 0,
-    };
-}
-/// Allocate/touch once before admission and lend exclusively to one cursor.
-pub struct Scratch {
-    cells: [Cell; 256],
-    counts: [u32; 256],
-}
-impl Default for Scratch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl Scratch {
-    pub const fn new() -> Self {
-        Self {
-            cells: [Cell::EMPTY; 256],
-            counts: [0; 256],
-        }
-    }
-}
-
+pub use td_nfc::Scratch;
+use td_nfc::{Cell, Read};
 struct DecodeWork<'w> {
     work: &'w mut Meter,
     budget: &'w mut HeaderBudget,
@@ -158,11 +130,6 @@ struct Source<'a> {
     pending: Option<Decomposition>,
     next: u8,
 }
-enum Read {
-    Cell(Cell),
-    Yield,
-    End,
-}
 impl<'a> Source<'a> {
     fn new(text: &'a str) -> Self {
         Self {
@@ -192,7 +159,7 @@ impl<'a> Source<'a> {
             next: 0,
         }
     }
-    fn at(&self, other: &Self) -> bool {
+    fn same_checkpoint(&self, other: &Self) -> bool {
         let same = match (self.input, other.input) {
             (
                 Input::Utf8 { text, position },
@@ -214,7 +181,7 @@ impl<'a> Source<'a> {
             Input::Header(_) | Input::Phrase(_) | Input::Comment(_)
         )
     }
-    fn is_encoding_problem(&self) -> bool {
+    fn source_problem(&self) -> bool {
         match self.input {
             Input::Header(cursor) => cursor.is_encoding_problem(),
             Input::Phrase(cursor) => cursor.is_encoding_problem(),
@@ -317,53 +284,57 @@ impl<'a> Source<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Phase {
-    Scan,
-    Insert { cell: Cell, at: usize },
-    Compute,
-    EmitStarter,
-    Emit,
-    Boundary,
-    Done,
-}
-enum Ordered {
-    Cell(Cell),
-    Yield,
-    End,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Status {
-    Scalar(char),
-    Yield,
-    Complete,
-}
-
+pub use td_nfc::Status;
 /// The borrowed work meters cannot be replaced or copied by checkpoints.
 pub struct Cursor<'a, 'w> {
-    scratch: &'w mut Scratch,
+    engine: td_nfc::Cursor<'w, Source<'a>>,
     work: &'w mut Meter,
     budget: &'w mut HeaderBudget,
-    scan: Source<'a>,
-    start: Source<'a>,
-    end: Source<'a>,
-    resume: Source<'a>,
-    phase: Phase,
-    initial: Option<char>,
-    composed: Option<char>,
-    held: Option<char>,
-    boundary: Option<char>,
-    last_class: u8,
-    unconsumed: bool,
-    used: usize,
-    overflow: bool,
-    classes: [u64; 4],
-    ordered_index: usize,
-    ordered_class: Option<u8>,
-    ordered_left: u32,
-    failure: Option<Error>,
     work_credit: u8,
-    encoding_problem: bool,
+}
+struct Context<'w> {
+    work: &'w mut Meter,
+    budget: &'w mut HeaderBudget,
+    credit: &'w mut u8,
+    now: Tick,
+}
+impl td_nfc::Admission for Context<'_> {
+    type Error = Error;
+    fn step(&mut self) -> Result<(), Error> {
+        self.budget.charge(self.work, self.now, 0, 1, self.credit)
+    }
+}
+impl td_nfc::Source for Source<'_> {
+    type Error = Error;
+    fn at(&self, other: &Self) -> bool {
+        self.same_checkpoint(other)
+    }
+    fn compose(a: char, b: char) -> Result<Option<char>, Error> {
+        unicode::compose(a, b).map_err(|_| Error::InvalidTable)
+    }
+    fn is_encoding_problem(&self) -> bool {
+        self.source_problem()
+    }
+    fn turns(&self) -> u8 {
+        if self.is_header() {
+            1
+        } else {
+            32
+        }
+    }
+}
+impl td_nfc::Reader<Context<'_>> for Source<'_> {
+    fn read(&mut self, ctx: &mut Context<'_>) -> Result<Read, Error> {
+        self.read(ctx.work, ctx.budget, ctx.credit, ctx.now)
+    }
+}
+impl From<td_nfc::Error<Error>> for Error {
+    fn from(error: td_nfc::Error<Error>) -> Self {
+        match error {
+            td_nfc::Error::Source(error) => error,
+            td_nfc::Error::InvalidState => Self::InvalidState,
+        }
+    }
 }
 impl<'a, 'w> Cursor<'a, 'w> {
     #[cfg(test)]
@@ -438,351 +409,54 @@ impl<'a, 'w> Cursor<'a, 'w> {
         budget: &'w mut HeaderBudget,
     ) -> Self {
         Self {
-            scratch,
+            engine: td_nfc::Cursor::new(source, scratch),
             work,
             budget,
-            scan: source,
-            start: source,
-            end: source,
-            resume: source,
-            phase: Phase::Scan,
-            initial: None,
-            composed: None,
-            held: None,
-            boundary: None,
-            last_class: 0,
-            unconsumed: false,
-            used: 0,
-            overflow: false,
-            classes: [0; 4],
-            ordered_index: 0,
-            ordered_class: None,
-            ordered_left: 0,
-            failure: None,
             work_credit: 0,
-            encoding_problem: false,
         }
     }
     /// Final at completion; source malformation is distinct from budget refusal.
     pub const fn is_encoding_problem(&self) -> bool {
-        self.encoding_problem
+        self.engine.is_encoding_problem()
     }
-    /// The owner must serialize the last scalar and finish its JSON frame first.
-    /// Done may already hold when poll returns that final scalar.
+    /// Serialize the last scalar and finish its JSON frame before release.
+    /// Done may coincide with that final scalar.
     pub(crate) fn finish(
         self,
     ) -> Result<(&'w mut Meter, &'w mut HeaderBudget, &'w mut Scratch), Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if !matches!(self.phase, Phase::Done) {
-            return Err(Error::InvalidState);
-        }
-        Ok((self.work, self.budget, self.scratch))
+        Ok((
+            self.work,
+            self.budget,
+            self.engine.into_scratch().map_err(Error::from)?,
+        ))
     }
     /// Charge actual serialized bytes, or zero for a post-turn deadline check.
     /// Refusal retires the cursor even after its final scalar was returned.
     pub fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        let result = self
-            .work
-            .charge(
-                now,
-                Charge {
-                    output_bytes: bytes,
-                    ..Charge::default()
-                },
-            )
-            .map_err(Error::Work);
-        if let Err(error) = result {
-            self.failure = Some(error);
-        }
-        result
+        self.engine
+            .check(|| {
+                self.work
+                    .charge(
+                        now,
+                        Charge {
+                            output_bytes: bytes,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(Error::Work)
+            })
+            .map_err(Error::from)
     }
     /// Callers bracket turns with clock/cancellation checks and charge output.
     pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if matches!(self.phase, Phase::Done) {
-            return Ok(Status::Complete);
-        }
-        let result = self.advance(now);
-        if let Err(error) = result {
-            self.failure = Some(error);
-        }
-        result
-    }
-    fn advance(&mut self, now: Tick) -> Result<Status, Error> {
-        let turns = if self.scan.is_header() { 1 } else { 32 };
-        for _ in 0..turns {
-            self.budget
-                .charge(self.work, now, 0, 1, &mut self.work_credit)?;
-            if let Some(status) = self.step(now)? {
-                return Ok(status);
-            }
-        }
-        Ok(Status::Yield)
-    }
-    fn step(&mut self, now: Tick) -> Result<Option<Status>, Error> {
-        match self.phase {
-            Phase::Scan => {
-                let before = self.scan;
-                let read = self
-                    .scan
-                    .read(self.work, self.budget, &mut self.work_credit, now)?;
-                self.encoding_problem |= self.scan.is_encoding_problem();
-                match read {
-                    Read::Cell(cell) if cell.class == 0 => {
-                        if self.initial.is_none() && self.used == 0 && !self.overflow {
-                            self.initial = Some(cell.value);
-                            self.start = self.scan;
-                        } else {
-                            self.boundary = Some(cell.value);
-                            self.end = before;
-                            self.resume = self.scan;
-                            self.prepare()?;
-                        }
-                    }
-                    Read::Cell(cell) => self.mark(cell)?,
-                    Read::Yield => return Ok(Some(Status::Yield)),
-                    Read::End => {
-                        // Header EOF advances its cursor; exclude that turn from replay.
-                        self.boundary = None;
-                        self.end = before;
-                        self.resume = self.scan;
-                        self.prepare()?;
-                    }
-                }
-            }
-            Phase::Insert { cell, at } => {
-                if let Some(previous) = at.checked_sub(1) {
-                    let old = *self
-                        .scratch
-                        .cells
-                        .get(previous)
-                        .ok_or(Error::InvalidState)?;
-                    if old.class > cell.class {
-                        *self.scratch.cells.get_mut(at).ok_or(Error::InvalidState)? = old;
-                        self.phase = Phase::Insert { cell, at: previous };
-                        return Ok(None);
-                    }
-                }
-                *self.scratch.cells.get_mut(at).ok_or(Error::InvalidState)? = cell;
-                self.used = self.used.checked_add(1).ok_or(Error::InvalidState)?;
-                self.phase = Phase::Scan;
-            }
-            Phase::Compute => match self.ordered(now)? {
-                Ordered::Cell(cell) => {
-                    if !self.absorb(cell)? {
-                        self.unconsumed = true;
-                    }
-                }
-                Ordered::Yield => {}
-                Ordered::End => {
-                    self.held = self.composed;
-                    if self.unconsumed {
-                        self.composed = self.initial;
-                        self.last_class = 0;
-                        self.reset_order()?;
-                        self.phase = Phase::EmitStarter;
-                    } else {
-                        self.phase = Phase::Boundary;
-                    }
-                }
-            },
-            Phase::EmitStarter => {
-                self.phase = Phase::Emit;
-                if let Some(value) = self.held.take() {
-                    return Ok(Some(Status::Scalar(value)));
-                }
-            }
-            Phase::Emit => match self.ordered(now)? {
-                Ordered::Cell(cell) => {
-                    if !self.absorb(cell)? {
-                        return Ok(Some(Status::Scalar(cell.value)));
-                    }
-                }
-                Ordered::Yield => {}
-                Ordered::End => {
-                    self.held = None;
-                    self.phase = Phase::Boundary;
-                }
-            },
-            Phase::Boundary => {
-                if let Some(next) = self.boundary.take() {
-                    let mut output = None;
-                    let starter = if let Some(old) = self.held.take() {
-                        if let Some(composed) =
-                            unicode::compose(old, next).map_err(|_| Error::InvalidTable)?
-                        {
-                            composed
-                        } else {
-                            output = Some(old);
-                            next
-                        }
-                    } else {
-                        next
-                    };
-                    self.initial = Some(starter);
-                    self.used = 0;
-                    self.overflow = false;
-                    self.classes = [0; 4];
-                    self.scan = self.resume;
-                    self.start = self.resume;
-                    self.phase = Phase::Scan;
-                    if let Some(value) = output {
-                        return Ok(Some(Status::Scalar(value)));
-                    }
-                } else {
-                    self.phase = Phase::Done;
-                    return Ok(Some(
-                        self.held.take().map_or(Status::Complete, Status::Scalar),
-                    ));
-                }
-            }
-            Phase::Done => return Ok(Some(Status::Complete)),
-        }
-        Ok(None)
-    }
-    fn mark(&mut self, cell: Cell) -> Result<(), Error> {
-        let class = usize::from(cell.class);
-        let mask = self
-            .classes
-            .get_mut(class / 64)
-            .ok_or(Error::InvalidState)?;
-        let bit = 1u64 << (class % 64);
-        let count = self
-            .scratch
-            .counts
-            .get_mut(class)
-            .ok_or(Error::InvalidState)?;
-        *count = if *mask & bit == 0 {
-            1
-        } else {
-            count.checked_add(1).ok_or(Error::InvalidState)?
-        };
-        *mask |= bit;
-        if !self.overflow && self.used < self.scratch.cells.len() {
-            self.phase = Phase::Insert {
-                cell,
-                at: self.used,
-            };
-        } else {
-            self.overflow = true;
-        }
-        Ok(())
-    }
-    fn prepare(&mut self) -> Result<(), Error> {
-        self.composed = self.initial;
-        self.last_class = 0;
-        self.unconsumed = false;
-        if self.used == 0 && !self.overflow {
-            self.held = self.initial;
-            self.phase = Phase::Boundary;
-        } else {
-            self.reset_order()?;
-            self.phase = if self.initial.is_none() {
-                Phase::Emit
-            } else {
-                Phase::Compute
-            };
-        }
-        Ok(())
-    }
-    fn next_class(&self, after: u16) -> Option<u8> {
-        let mut word_index = usize::from(after / 64);
-        let mut shift = u32::from(after % 64);
-        while let Some(word) = self.classes.get(word_index) {
-            let available = *word & (u64::MAX << shift);
-            if available != 0 {
-                return u8::try_from(word_index * 64 + available.trailing_zeros() as usize).ok();
-            }
-            word_index += 1;
-            shift = 0;
-        }
-        None
-    }
-    fn reset_order(&mut self) -> Result<(), Error> {
-        self.ordered_index = 0;
-        self.ordered_class = self.next_class(1);
-        self.scan = self.start;
-        self.ordered_left = match self.ordered_class {
-            Some(class) => *self
-                .scratch
-                .counts
-                .get(usize::from(class))
-                .ok_or(Error::InvalidState)?,
-            None => 0,
-        };
-        Ok(())
-    }
-    fn ordered(&mut self, now: Tick) -> Result<Ordered, Error> {
-        if !self.overflow {
-            if self.ordered_index == self.used {
-                return Ok(Ordered::End);
-            }
-            let cell = *self
-                .scratch
-                .cells
-                .get(self.ordered_index)
-                .ok_or(Error::InvalidState)?;
-            self.ordered_index += 1;
-            return Ok(Ordered::Cell(cell));
-        }
-        let Some(class) = self.ordered_class else {
-            return Ok(Ordered::End);
-        };
-        if self.scan.at(&self.end) {
-            if self.ordered_left != 0 {
-                return Err(Error::InvalidState);
-            }
-            self.ordered_class = self.next_class(u16::from(class) + 1);
-            self.scan = self.start;
-            self.ordered_left = match self.ordered_class {
-                Some(next) => *self
-                    .scratch
-                    .counts
-                    .get(usize::from(next))
-                    .ok_or(Error::InvalidState)?,
-                None => return Ok(Ordered::End),
-            };
-            return Ok(Ordered::Yield);
-        }
-        let read = self
-            .scan
-            .read(self.work, self.budget, &mut self.work_credit, now)?;
-        self.encoding_problem |= self.scan.is_encoding_problem();
-        let cell = match read {
-            Read::Cell(cell) => cell,
-            Read::Yield => return Ok(Ordered::Yield),
-            Read::End => return Err(Error::InvalidState),
-        };
-        if cell.class == class {
-            self.ordered_left = self
-                .ordered_left
-                .checked_sub(1)
-                .ok_or(Error::InvalidState)?;
-            Ok(Ordered::Cell(cell))
-        } else {
-            Ok(Ordered::Yield)
-        }
-    }
-    fn absorb(&mut self, cell: Cell) -> Result<bool, Error> {
-        if let Some(starter) = self.composed {
-            if self.last_class == 0 || self.last_class < cell.class {
-                if let Some(value) =
-                    unicode::compose(starter, cell.value).map_err(|_| Error::InvalidTable)?
-                {
-                    self.composed = Some(value);
-                    return Ok(true);
-                }
-            }
-        }
-        self.last_class = cell.class;
-        Ok(false)
+        self.engine
+            .poll(&mut Context {
+                work: self.work,
+                budget: self.budget,
+                credit: &mut self.work_credit,
+                now,
+            })
+            .map_err(Error::from)
     }
 }
 
@@ -791,6 +465,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use crate::ports::Deadline;
+    use td_nfc::Mode;
     fn work() -> Meter {
         Meter::new(
             Deadline::after(Tick(0), 1000).unwrap(),
@@ -1011,14 +686,15 @@ mod tests {
             let mut cursor = Cursor::new(&input, &mut scratch, &mut work, &mut budget);
             let mut reached = false;
             for _ in 0..10000 {
+                let state = cursor.engine.inspect().unwrap();
                 reached = match phase {
                     0 => {
-                        matches!(cursor.phase, Phase::Scan)
-                            && matches!(cursor.scan.input, Input::Utf8 { position, .. } if position > 0)
+                        matches!(state.mode, Mode::Scan)
+                            && matches!(state.scan.input, Input::Utf8 { position, .. } if position > 0)
                     }
-                    1 => matches!(cursor.phase, Phase::Insert { .. }),
-                    2 => cursor.overflow && matches!(cursor.phase, Phase::Compute),
-                    3 => cursor.overflow && matches!(cursor.phase, Phase::Emit),
+                    1 => matches!(state.mode, Mode::Insert),
+                    2 => state.overflow && matches!(state.mode, Mode::Compute),
+                    3 => state.overflow && matches!(state.mode, Mode::Emit),
                     _ => false,
                 };
                 if reached {
@@ -1322,13 +998,14 @@ mod tests {
         let mut start_restored = false;
         let mut resume_restored = false;
         for _ in 0..2_000_000 {
-            start_restored |= cursor.overflow
-                && matches!(cursor.phase, Phase::Compute | Phase::Emit)
-                && cursor.scan.at(&cursor.start)
-                && cursor.scan.pending.is_some();
-            resume_restored |= matches!(cursor.phase, Phase::Scan)
-                && cursor.scan.at(&cursor.resume)
-                && cursor.scan.pending.is_some();
+            let state = cursor.engine.inspect().unwrap();
+            start_restored |= state.overflow
+                && matches!(state.mode, Mode::Compute | Mode::Emit)
+                && state.scan.same_checkpoint(state.start)
+                && state.scan.pending.is_some();
+            resume_restored |= matches!(state.mode, Mode::Scan)
+                && state.scan.same_checkpoint(state.resume)
+                && state.scan.pending.is_some();
             match cursor.poll(Tick(1)).unwrap() {
                 Status::Yield => {}
                 Status::Scalar(value) => text.push(value),
@@ -1560,15 +1237,17 @@ mod tests {
         let right = vec![b'a'];
         let original = Source::header(&left, crate::header_text::Grammar::Text);
         let mut advanced = original;
-        assert!(original.at(&advanced));
-        assert!(!original.at(&Source::header(&right, crate::header_text::Grammar::Text)));
+        assert!(original.same_checkpoint(&advanced));
+        assert!(
+            !original.same_checkpoint(&Source::header(&right, crate::header_text::Grammar::Text))
+        );
         assert!(matches!(
             advanced
                 .read(&mut work(), &mut HeaderBudget::new(), &mut 0, Tick(1))
                 .unwrap(),
             Read::Yield
         ));
-        assert!(!original.at(&advanced));
+        assert!(!original.same_checkpoint(&advanced));
         let word = "=?utf-8?Q?=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80=CC=95=CC=80?=";
         let tail = format!("=?utf-8?Q?a?={}", format!(" {word}").repeat(30));
         let expected = format!("à{}{}", "\u{300}".repeat(149), "\u{315}".repeat(150));
@@ -1769,13 +1448,14 @@ mod tests {
             );
             let mut reached = false;
             for _ in 0..1_000_000 {
+                let state = cursor.engine.inspect().unwrap();
                 let ready = match target {
                     0 => {
-                        matches!(cursor.phase, Phase::Scan)
+                        matches!(state.mode, Mode::Scan)
                             && cursor.budget.steps_remaining() < 15_999_980
                     }
-                    1 => matches!(cursor.phase, Phase::Compute) && cursor.overflow,
-                    _ => matches!(cursor.phase, Phase::Emit) && cursor.overflow,
+                    1 => matches!(state.mode, Mode::Compute) && state.overflow,
+                    _ => matches!(state.mode, Mode::Emit) && state.overflow,
                 };
                 if ready {
                     let bytes = cursor.budget.source_bytes_remaining();

@@ -1787,6 +1787,15 @@ Initial independently landable increments:
   engine extraction, parameter checkpoints, retention and traversal remain
   open.
 
+- **M06bz — shared bounded canonical composition:** extract the existing NFC
+  engine into td-nfc and migrate mail atomically. Keep pure checkpoints/table
+  policy separate from original live admission, preserving source/cursor/scratch
+  ceilings, work counts, sticky refusal and exact unfinished-segment replay.
+  Admit the std-only local crate in manifest/lock/staging/reader closure and
+  pin its package-only graph. Preserve all mail Unicode/checkpoint/allocation
+  qualification and add standalone engine contracts. Parameter checkpoints/NFC,
+  retention, selected boundary metadata and traversal remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
