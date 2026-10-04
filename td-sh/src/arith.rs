@@ -933,30 +933,29 @@ fn plain_decimal(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
-/// `**`. The loop is busybox's own (math.c:420-438) and not `pow`, because it
-/// must WRAP at every step the same way -- `2**63` is `i64::MIN` and `2**64` is
-/// 0 -- and because halving the exponent is what stops `3**999999999999999999`
-/// running forever. A negative exponent is refused as ash refuses it, and that
-/// guard also TERMINATES this loop: halving a negative and decrementing it
-/// returns where it started, so `exp` would alternate between -1 and -2.
+/// `**`: `base` to the `exp`, wrapping in 64-bit two's complement as every
+/// other operator does -- `2**63` is `i64::MIN` and `2**64` is 0. Binary
+/// exponentiation, one squaring per exponent bit, so `3**999999999999999999`
+/// takes 60 steps rather than forever; `i64::wrapping_pow` takes only a `u32`
+/// exponent. A negative exponent is refused as ash refuses it.
 fn power(live: bool, base: i64, exp: i64) -> A<i64> {
-    if exp < 0 {
+    let Ok(mut exp) = u64::try_from(exp) else {
         return if live {
             Err("exponent less than 0".into())
         } else {
             Ok(0)
         };
-    }
-    let (mut base, mut exp, mut acc) = (base, exp, 1i64);
-    while exp != 0 {
-        if exp & 1 == 0 {
-            base = base.wrapping_mul(base);
-            exp >>= 1;
+    };
+    let mut square = base;
+    let mut result = 1i64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result.wrapping_mul(square);
         }
-        acc = acc.wrapping_mul(base);
-        exp -= 1;
+        square = square.wrapping_mul(square);
+        exp >>= 1;
     }
-    Ok(acc)
+    Ok(result)
 }
 
 /// The two that fail on a zero divisor -- `power` above is the third fallible
@@ -1000,6 +999,24 @@ mod tests {
     fn ev(src: &str) -> Result<i64, String> {
         let mut sh = Shell::new_for_test();
         eval(&mut sh, src).map_err(|_| format!("evaluation of {src:?} failed"))
+    }
+
+    /// `**` wraps like the other operators and is `wrapping_pow` wherever
+    /// that can say; a huge exponent finishes, with its value pinned.
+    #[test]
+    fn power_wraps_and_finishes() -> Result<(), String> {
+        assert_eq!(ev("2**63")?, i64::MIN);
+        assert_eq!(ev("2**64")?, 0);
+        assert_eq!(ev("(-1)**999999999999999999")?, -1);
+        assert_eq!(ev("3**999999999999999999")?, 2_657_844_495_946_263_211);
+        assert_eq!(ev("0**0")?, 1);
+        for base in [-7i64, -2, -1, 0, 1, 2, 3, 10, i64::MAX, i64::MIN] {
+            for exp in [0u32, 1, 2, 3, 31, 62, 63, 64, 65, 1000, u32::MAX] {
+                let got = power(true, base, i64::from(exp)).map_err(words)?;
+                assert_eq!(got, base.wrapping_pow(exp), "{base}**{exp}");
+            }
+        }
+        Ok(())
     }
 
     /// A failure's words. `Reported` has none of its own -- the shell wrote
