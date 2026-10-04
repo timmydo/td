@@ -20,9 +20,10 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::host::Client;
+use crate::repo::{self, Task};
 
 /// The variables `./agent` names its built td-jail and td-txt in.
 pub const JAIL_VAR: &str = "TD_AGENT_JAIL";
@@ -31,6 +32,8 @@ pub const TXT_VAR: &str = "TD_AGENT_TXT";
 const PROGRAM_DIR: &str = "/opt/workspace/bin";
 /// The most of td-jail's own diagnostics kept for a report.
 const DIAGNOSTIC_KEEP: usize = 4096;
+/// The most a maintenance instance's answer may be.
+const MAX_ANSWER: usize = 64 * 1024;
 
 /// The programs a jailed tool host needs, outside the jail.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,21 +113,32 @@ impl Programs {
 }
 
 /// What one instance binds (§8): its private home, the ready worktrees,
-/// and the shared directories, read-only or read-write.
+/// a repository workspace's checkouts and repositories with their git
+/// mount chains, the store's objects they borrow, and the shared
+/// directories, read-only or read-write.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Policy {
     pub home: PathBuf,
     pub worktrees: Vec<PathBuf>,
+    /// Linked worktrees of `repositories`, each with its `.git` bound
+    /// read-only over it.
+    pub checkouts: Vec<PathBuf>,
+    pub repositories: Vec<PathBuf>,
+    /// The store `objects/` directories the repositories' alternates
+    /// name, read-only and no root of the tool host's.
+    pub objects: Vec<PathBuf>,
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
 }
 
 impl Policy {
-    /// The directories the tool host may act in: every one bound but the
-    /// home.
+    /// The directories the tool host may act in: the worktrees, the
+    /// checkouts and the shared directories, never the home, a
+    /// repository or the store.
     pub fn roots(&self) -> Vec<PathBuf> {
         self.worktrees
             .iter()
+            .chain(&self.checkouts)
             .chain(&self.read)
             .chain(&self.write)
             .cloned()
@@ -152,7 +166,13 @@ pub fn spec_text(programs: &Programs, policy: &Policy) -> Result<String, String>
     for tree in &policy.worktrees {
         line("worktree", tree)?;
     }
-    for tree in &policy.read {
+    for tree in &policy.checkouts {
+        line("checkout", tree)?;
+    }
+    for tree in &policy.repositories {
+        line("repository", tree)?;
+    }
+    for tree in policy.objects.iter().chain(&policy.read) {
         line("read", tree)?;
     }
     for tree in &policy.write {
@@ -244,6 +264,120 @@ fn start(programs: &Programs, policy: &Policy, spec: &Path) -> Result<Client, St
     Ok(Client::over(reader, ours).owning(child, spec.to_path_buf(), tail))
 }
 
+/// Runs `task` in a maintenance instance of `policy` (DESIGN.md §9), its
+/// spec written in `spec_dir`, and returns its answer. It blocks its
+/// thread, to which td-jail ties itself, for at most `time`; past it the
+/// instance is killed, which takes every process in it.
+pub fn maintain(
+    programs: &Programs,
+    policy: &Policy,
+    spec_dir: &Path,
+    task: &Task,
+    time: Duration,
+) -> Result<String, String> {
+    let policy = Policy {
+        home: private_dir(&policy.home)?,
+        ..policy.clone()
+    };
+    let spec = write_spec(spec_dir, &spec_text(programs, &policy)?)?;
+    let answered = run_maintenance(programs, &spec, task, time);
+    let _ = fs::remove_file(&spec);
+    answered
+}
+
+fn run_maintenance(
+    programs: &Programs,
+    spec: &Path,
+    task: &Task,
+    time: Duration,
+) -> Result<String, String> {
+    let now = Instant::now();
+    let deadline = now.checked_add(time).unwrap_or(now);
+    let (mut ours, theirs) = UnixStream::pair().map_err(|e| format!("the jail's channel: {e}"))?;
+    let theirs_in = theirs
+        .try_clone()
+        .map_err(|e| format!("the jail's channel: {e}"))?;
+    let mut child = Command::new(&programs.jail)
+        .env_clear()
+        .arg("--workspace")
+        .arg(std::process::id().to_string())
+        .arg(spec)
+        .arg(repo::MAINTAIN)
+        .args(task.args())
+        .stdin(Stdio::from(OwnedFd::from(theirs_in)))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", programs.jail.display()))?;
+    let tail = Arc::new(Tail::default());
+    let reading = child.stderr.take().and_then(|mut stderr| {
+        let kept = Arc::clone(&tail);
+        std::thread::Builder::new()
+            .name("td-jail-stderr".into())
+            .spawn(move || kept.keep(&mut stderr))
+            .ok()
+    });
+    if reading.is_none() {
+        tail.end();
+    }
+    let said = |what: String| match tail.text(Duration::from_secs(2)) {
+        Some(text) if !text.trim().is_empty() => format!("{what}; td-jail said: {}", text.trim()),
+        _ => what,
+    };
+    // The answer is what the channel gives until every end of it closes,
+    // as the instance's last process exits.
+    let mut answer = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let read = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break Err(format!("maintenance took more than {time:?}"));
+        }
+        if let Err(e) = ours.set_read_timeout(Some(left)) {
+            break Err(format!("the jail's channel: {e}"));
+        }
+        match ours.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                answer.extend_from_slice(buffer.get(..n).unwrap_or_default());
+                if answer.len() > MAX_ANSWER {
+                    break Err("the maintenance instance said too much".into());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => break Err(format!("the jail's channel: {e}")),
+        }
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if read.is_ok() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    read.map_err(said)?;
+    let answered = repo::read_answer(&answer);
+    match status {
+        Some(status) if status.success() => answered,
+        Some(status) => Err(said(match answered {
+            Err(why) => why,
+            Ok(_) => format!("td-jail ended with {status}"),
+        })),
+        None => Err(said(format!("maintenance took more than {time:?}"))),
+    }
+}
+
 /// td-jail's standard error as it is read: its last `DIAGNOSTIC_KEEP`
 /// bytes, and whether it has ended.
 #[derive(Default)]
@@ -319,19 +453,25 @@ mod tests {
         let policy = Policy {
             home: "/s/jail/a/home".into(),
             worktrees: vec!["/w/a".into(), "/w/b".into()],
+            checkouts: vec!["/t/r".into()],
+            repositories: vec!["/ws/r.git".into()],
+            objects: vec!["/store/r.git/objects".into()],
             read: vec!["/d".into()],
             write: vec!["/e".into()],
         };
         assert_eq!(
             spec_text(&programs(), &policy).unwrap(),
             "format=1\nentry=/w/target/td-agent\nprogram=/w/target/td-txt\n\
-             home=/s/jail/a/home\nworktree=/w/a\nworktree=/w/b\nread=/d\nwrite=/e\n"
+             home=/s/jail/a/home\nworktree=/w/a\nworktree=/w/b\ncheckout=/t/r\n\
+             repository=/ws/r.git\nread=/store/r.git/objects\nread=/d\nwrite=/e\n"
         );
+        // Neither a repository nor the store is the tool host's to act in.
         assert_eq!(
             policy.roots(),
             [
                 PathBuf::from("/w/a"),
                 "/w/b".into(),
+                "/t/r".into(),
                 "/d".into(),
                 "/e".into()
             ]

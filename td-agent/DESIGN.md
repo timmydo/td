@@ -1855,8 +1855,11 @@ $XDG_DATA_HOME/td-agent/
   its base, with a cone-mode sparse checkout of the entry's paths. Sparse
   checkout is enabled in the repository's shared, read-only configuration,
   and each worktree's patterns live in its own `info/sparse-checkout`,
-  which the agent may widen from inside the jail with `git sparse-checkout
-  add`; `set`, `init` and `disable` write configuration and fail there.
+  which the agent may change from inside the jail with `git sparse-checkout
+  add` or a `set` naming no mode, which rewrite only those patterns; a
+  `set` naming a mode (`--cone` included) and `disable` write
+  configuration and fail there, `disable` after first checking the
+  whole tree out.
 - The workspace tree's root is `workspace_root` (default `~/td-agent`),
   admitted like any source (§8).
 - A workspace's `<name>` is made by td-agent from its template's name
@@ -2132,8 +2135,9 @@ jail-made `rr-cache/` exists), and, for the git worker's own gc,
 read-only.
 There is no `extensions.worktreeConfig`, so no `config.worktree` is ever
 read. What therefore fails in the jail, by design: `git config`, `git
-remote`, `git sparse-checkout set`, adding worktrees and submodules, and
-gc; the git worker does gc in a maintenance instance.
+remote`, a `git sparse-checkout` that names or changes the sparse mode, adding
+worktrees and submodules, and gc; the git worker does gc in a
+maintenance instance.
 
 **What the jail does not protect.** Anything outside the jail that later
 acts on a worktree or shared directory is a persistence channel, and much
@@ -2353,13 +2357,9 @@ or top it lies in, so that it is the mount seen there; of its kind and
 mode, a writable one written and a read-only one refusing a write with
 `EROFS`; and refuses any other mount below a repository. The store's
 `objects/` reaches an instance as a `read` directory at its own path.
-td-agent does not yet write either key; workspace repositories arrive
-in the next step, and with them two things this step leaves to
-td-agent: every `.git`, `gitdir` and `commondir` that was ever
-jail-writable is created afresh, since td-jail checks an entry's kind
-and names, not its content; and a fetch from the store into a
-repository whose empty `shallow` makes git call it shallow is checked
-there (commit, log and the push's export do not depend on it). The
+td-jail checks an entry's kind and names, not its content, so td-agent
+makes every `.git`, `gitdir` and `commondir` afresh, never one that
+was ever jail-writable (As built (increment 11, the layout), below). The
 kind's live test lays out a linked worktree as td-agent will and, from
 inside, finds every protected file unwritable, unremovable and
 immovable, every protected directory unwritable and immovable, the
@@ -2369,6 +2369,70 @@ through its root. Mounting no chain, a writable one, or one lacking
 `config` fails its readback; one out of order fails at its own mount,
 and the stacking check is proved apart, on mountinfo with a hidden and
 a doubled link.
+
+**As built (increment 11, the layout).** `src/repo.rs` lays a
+workspace repository out as the chain above protects it, as plain
+files td-agent writes outside any jail: `create` makes the repository
+over a store, `add_worktree` a linked worktree, and nothing calls them
+yet; the window's preparation arrives with repository templates. Each
+is built complete in a staging directory beside the repository, each
+file an exclusive create written through to the disk, and renamed into
+place whole: the repository at its path, a worktree's id directory
+into `worktrees/`, which no jail can write, so no instance finds one
+half made and a crash leaves its debris beside the repository rather
+than as an id td-jail would refuse to launch over. A repository, a
+checkout or an id that exists, or a link planted at one, is refused and
+never written through; a refused call removes only what it made; the
+paths written into git's files are the ones they resolve to, as
+td-jail binds them; and a repository holds at most 32 worktrees, as
+many as td-jail binds. td-jail reads `worktrees/` at both of its
+stages, so a worktree added while an instance over its repository is
+starting fails that launch: the caller adds them while none is. The
+repository holds `HEAD`, the configuration above (the identity from
+the git worker's copied global file, quoted; `core.hooksPath` its own
+empty, read-only `hooks/`; no `extensions.worktreeConfig`),
+`commondir` naming itself, an empty `config.worktree` and `shallow`,
+`objects/info/alternates` naming the store's `objects/`, and its
+directories. A worktree's id is letters, digits, `.`, `_` and `-`; its
+`worktrees/<id>/` holds `gitdir` naming the checkout's `.git`,
+`commondir` naming the repository, an empty `config.worktree`, `HEAD`
+naming its branch, and `info/sparse-checkout` with the entry's paths
+as cone patterns, as `git sparse-checkout set --cone` writes them (no
+`sparse` is the whole tree, an empty list the top's files alone; a
+path segment git would read as a glob or a comment is refused); the
+checkout holds only its `.git`. A maintenance instance is td-jail's
+`workspace` kind with td-agent as its entry, run as `td-agent maintain
+TASK...` by `jail::maintain`, which blocks its thread, kills the
+instance past its time, and reads the entry's one line of answer, `ok`
+or `failed` and a reason, from the channel; its policy binds the
+checkout, the repository with its chain and the store's `objects/`,
+which `jail::Policy` now names (`checkouts`, `repositories` and
+`objects`, the last no root of the tool host's). Its git is the
+host's, by the path it resolves to, which the kind's system trees
+bind, run with a cleared environment, `GIT_DIR` the linked worktree's
+directory and `GIT_WORK_TREE` its checkout, no system or global
+configuration, `HOME` naming no directory, and hooks, fsmonitor,
+attributes and excludes files, submodules, every protocol and auto gc
+off on its command line. Its one task so far, `checkout`, trusts
+nothing in the id directory, which is the jail's to write once it is
+in place: it refuses one holding an `index`, makes the branch at the
+base with `update-ref` and an empty old value, so an existing branch is
+refused rather than moved, sets `HEAD` to it, and reads the base's tree
+by its id with `read-tree --reset -u`, which the sparse patterns
+select and which overwrites what a broken run left; a
+checkout that fails after making the branch removes it while it is
+still at the base, so the task can be asked again. A workspace
+repository is never fetched into: its remote-tracking refs will be set
+with `update-ref` from the ids the git worker reads in the trusted
+store, whose objects the alternates already reach, so its empty
+`shallow` (which makes git call it shallow) matters to no command
+td-agent runs; commit, log, counts and export do not depend on it. The
+live test in `tests/jail.rs` checks a sparse worktree out in a
+maintenance instance, refuses a second run, and in a shell instance
+commits as the identity the configuration names, cannot write
+`config`, widens the cone with `add` and narrows it with a plain `set`,
+and cannot name the sparse mode, which leaves the patterns as they
+were.
 
 **As built (increment 10, the launch).** `./agent` builds td-jail and
 td-txt from the checkout beside td-agent and names them in
@@ -2437,8 +2501,8 @@ workspace's own conversation process (§2).
   refs from the store (bound read-only), gc, the ahead-and-behind counts
   `conversations` shows, the cleanliness check before archiving or
   deleting, and exporting a commit for a push. Its git reads no
-  configuration the model can write: `HOME` is an empty read-only
-  directory, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+  configuration the model can write: `HOME` names no directory,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
   hooks and fsmonitor are forced off on the command line as in the
   repository's configuration, and `GIT_DIR` and `GIT_WORK_TREE` are set,
   so a nested `.git` the model made cannot steer discovery. Everything
@@ -3935,6 +3999,26 @@ outside every repository and worktree, at a top, named twice, a
 writable file, or anything in a worktree but its read-only `.git`
 file. Its ignored live test, run where unprivileged user
 namespaces are, is As built (increment 11, the chain)'s.
+
+For the workspace repository's layout, `src/repo.rs` covers cone
+patterns as git writes them (the whole tree, the top alone, nested and
+overlapping paths, refused segments), the configuration (the identity
+quoted, the hooks path, the settings §8 names, no `[user]` without an
+identity, a control character refused), a repository and a worktree
+made whole and once (each file's content, paths named as they resolve
+through a link, no staging debris left, a second call refused and the
+first kept, a refused call removing only what it made, a planted link
+never written through, a bad id or branch refused, the 33rd worktree
+refused), a task's words round-tripping and refusing what they cannot
+name, and the one-line answer; with `git` on PATH, the checkout task
+run outside a jail removes the branch it made when the checkout fails,
+sets a `HEAD` the jail rewrote, checks the cone out on a new branch,
+refuses a second run by its index and another worktree on the branch
+without moving it, and a commit there carries the configuration's
+identity. `src/jail.rs` covers the spec's `checkout`, `repository` and
+store `read` lines in td-jail's order and that neither a repository nor
+the store is a root. The ignored live test is As built (increment 11,
+the layout)'s.
 
 For row menus and archiving, `src/menu.rs` covers the row menu's items
 for a live and an archived conversation, each activating its action,

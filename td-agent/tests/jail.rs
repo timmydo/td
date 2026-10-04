@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use td_agent::host::{Call, Client, Done, Up};
 use td_agent::jail::{self, Policy, Programs};
+use td_agent::repo::{self, Identity, Task, Worktree};
 
 const PROGRAM: &str = env!("CARGO_BIN_EXE_td-agent");
 /// Set in a child of the lifetime test, which then launches and waits.
@@ -44,7 +45,7 @@ impl Scratch {
             home: self.0.join("jail/home"),
             worktrees: vec![self.0.join("tree")],
             read: vec![self.0.join("shared")],
-            write: Vec::new(),
+            ..Policy::default()
         }
     }
 }
@@ -213,6 +214,180 @@ fn the_jailed_tool_host_works_inside_its_policy() {
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("spec-"))
         .collect();
     assert!(left.is_empty(), "the spec outlived its instance");
+}
+
+/// Plain git, the test's own, for the upstream and the store.
+fn plain(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args([
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "protocol.file.allow=always",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The host's git as an instance sees it: where `git` on PATH resolves,
+/// when that is a system tree the jail binds.
+fn bound_git() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let found = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())?;
+    let resolved = std::fs::canonicalize(found).ok()?;
+    ["/usr/", "/bin/", "/gnu/", "/nix/"]
+        .iter()
+        .any(|tree| resolved.starts_with(tree))
+        .then_some(resolved)
+}
+
+/// A workspace repository as td-agent lays it out over a store, checked
+/// out by a maintenance instance and committed to by a jailed shell
+/// (DESIGN.md §8, §9), with every protected file out of the model's
+/// reach.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
+    let Some(git) = bound_git() else {
+        panic!("no git on PATH in a tree the jail binds");
+    };
+    let scratch = Scratch::new("repo");
+    let up = scratch.0.join("up");
+    for path in ["a/x", "c/d/z", "c/w", "top"] {
+        let file = up.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, format!("{path}\n")).unwrap();
+    }
+    plain(&up, &["init", "--quiet"]);
+    plain(&up, &["add", "."]);
+    plain(&up, &["commit", "--quiet", "-m", "one"]);
+    let store = scratch.0.join("store/up.git");
+    std::fs::create_dir_all(&store).unwrap();
+    plain(&store, &["init", "--quiet", "--bare"]);
+    let from = up.display().to_string();
+    plain(
+        &store,
+        &["fetch", "--quiet", &from, "+refs/heads/*:refs/heads/*"],
+    );
+    let base = plain(&store, &["rev-parse", "main"]).trim().to_string();
+
+    let repository = scratch.0.join("ws/w/r.git");
+    let checkout = scratch.0.join("trees/w/r");
+    let identity = Identity {
+        name: Some("Human".into()),
+        email: Some("h@example.org".into()),
+    };
+    repo::create(&repository, &store, &identity).unwrap();
+    repo::add_worktree(
+        &repository,
+        &Worktree {
+            id: "r".into(),
+            checkout: checkout.clone(),
+            branch: "agent/one".into(),
+            sparse: Some(vec!["c/d".into()]),
+        },
+    )
+    .unwrap();
+    let policy = |home: &str| Policy {
+        home: scratch.0.join(home),
+        checkouts: vec![checkout.clone()],
+        repositories: vec![repository.clone()],
+        objects: vec![store.join("objects")],
+        ..Policy::default()
+    };
+    let task = Task::Checkout {
+        git: git.clone(),
+        repository: repository.clone(),
+        id: "r".into(),
+        checkout: checkout.clone(),
+        branch: "agent/one".into(),
+        base: base.clone(),
+    };
+    let specs = scratch.0.join("jail");
+    let time = Duration::from_secs(60);
+    assert_eq!(
+        jail::maintain(
+            &programs(),
+            &policy("jail/maintenance"),
+            &specs,
+            &task,
+            time
+        )
+        .unwrap(),
+        format!("agent/one checked out at {base}")
+    );
+    for (path, there) in [
+        ("top", true),
+        ("c/w", true),
+        ("c/d/z", true),
+        ("a/x", false),
+    ] {
+        assert_eq!(checkout.join(path).exists(), there, "{path}");
+    }
+    // The worktree is checked out once: a second run is refused, and says
+    // why.
+    let refused = jail::maintain(
+        &programs(),
+        &policy("jail/maintenance"),
+        &specs,
+        &task,
+        time,
+    )
+    .unwrap_err();
+    assert!(refused.contains("is not checked out again"), "{refused}");
+
+    // The model's own git, in a shell instance: it commits as the human
+    // the repository names, and cannot touch what the chain protects.
+    let mut client = jail::launch(&programs(), &policy("jail/home"), &specs).unwrap();
+    let git = git.display();
+    let said = shell(
+        &mut client,
+        &format!(
+            "cd {checkout} && echo more >> top && {git} commit -q -a -m two && \
+             {git} log --format=log=%an:%s -1; \
+             echo x >> {repository}/config 2>/dev/null || echo config=read-only; \
+             {git} sparse-checkout add a && test -e a/x && echo add=widened; \
+             {git} sparse-checkout set c/d && test ! -e a/x && echo set=narrowed; \
+             {git} sparse-checkout list | sed 's/^/list=/'; \
+             {git} sparse-checkout set --cone a 2>/dev/null || echo cone=refused; \
+             {git} sparse-checkout set --no-cone a 2>/dev/null || echo no-cone=refused; \
+             {git} sparse-checkout list | sed 's/^/kept=/'",
+            checkout = checkout.display(),
+            repository = repository.display(),
+        ),
+    );
+    for line in [
+        "log=Human:two",
+        "config=read-only",
+        "add=widened",
+        "set=narrowed",
+        "list=c/d",
+        "cone=refused",
+        "no-cone=refused",
+        "kept=c/d",
+    ] {
+        assert!(
+            said.lines().any(|got| got == line),
+            "{line} absent from {said}"
+        );
+    }
+    drop(client);
+    assert!(!said.lines().any(|got| got == "list=a"), "{said}");
+    let tip = std::fs::read_to_string(repository.join("refs/heads/agent/one")).unwrap();
+    assert_ne!(tip.trim(), base, "the commit moved the branch");
+    assert_eq!(
+        std::fs::read_to_string(repository.join("config")).unwrap(),
+        repo::config_text(&repository, &identity).unwrap()
+    );
 }
 
 /// The instance dies with the process that launched it, killed with

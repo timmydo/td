@@ -734,6 +734,32 @@ impl Worker {
         Ok(None)
     }
 
+    /// The human's identity as the global configuration copied it, for
+    /// a workspace repository's own configuration (DESIGN.md §8).
+    pub fn identity(&self) -> Result<crate::repo::Identity, String> {
+        let get = |key: &str| {
+            let mut read = self.bare();
+            read.env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["config", "--file"])
+                .arg(&self.config)
+                .args(["--get", key]);
+            match run(&mut read, 4096, LOCAL_TIME) {
+                Ok(out) => Ok(Some(
+                    String::from_utf8_lossy(&out)
+                        .trim_end_matches('\n')
+                        .to_string(),
+                )),
+                // Exit 1 is git's "not set".
+                Err(Failure::Exit(1, _)) => Ok(None),
+                Err(e) => Err(format!("reading {key}: {e}")),
+            }
+        };
+        Ok(crate::repo::Identity {
+            name: get("user.name")?,
+            email: get("user.email")?,
+        })
+    }
+
     /// The project instructions at the top of commit `id` (DESIGN.md
     /// §13): `AGENTS.md`, else `CLAUDE.md`, with the name it came from.
     pub fn instructions(
@@ -752,7 +778,7 @@ impl Worker {
 
 /// Why a git run failed.
 #[derive(Debug)]
-enum Failure {
+pub(crate) enum Failure {
     Start(std::io::Error),
     /// Its exit code, -1 when a signal ended it, and the start of what
     /// it said.
@@ -826,7 +852,7 @@ const GRACE: Duration = Duration::from_secs(1);
 /// reason. git's own exit decides: once it has exited, what its pipes
 /// gave within `GRACE` is its answer. Past `time`, or past `limit`, git
 /// is killed and the readers left to end with whatever it started.
-fn run(command: &mut Command, limit: u64, time: Duration) -> Result<Vec<u8>, Failure> {
+pub(crate) fn run(command: &mut Command, limit: u64, time: Duration) -> Result<Vec<u8>, Failure> {
     let now = Instant::now();
     let deadline = now.checked_add(time).unwrap_or(now);
     let mut child = command
@@ -911,7 +937,7 @@ fn run(command: &mut Command, limit: u64, time: Duration) -> Result<Vec<u8>, Fai
 }
 
 /// A full object id, as git names one: 40 or 64 hexadecimal digits.
-fn object_id(id: &str) -> bool {
+pub(crate) fn object_id(id: &str) -> bool {
     (id.len() == 40 || id.len() == 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -923,7 +949,7 @@ pub fn kept_env() -> Vec<(String, OsString)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use crate::store::tests::Scratch;
@@ -1102,6 +1128,13 @@ mod tests {
             "{copied}"
         );
         assert!(worker.env.iter().all(|(k, _)| k != "GIT_CONFIG_PARAMETERS"));
+        assert_eq!(
+            worker.identity().unwrap(),
+            crate::repo::Identity {
+                name: Some("Human".into()),
+                email: Some("h@example.org".into()),
+            }
+        );
         let remote = local(&up);
         let stores = root.join("store");
         let store = worker.store(&stores, &remote).unwrap();

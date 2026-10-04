@@ -739,6 +739,9 @@ pub fn policy(
     let policy = Policy {
         home: made("home")?,
         worktrees: vec![tree],
+        checkouts: Vec::new(),
+        repositories: Vec::new(),
+        objects: Vec::new(),
         read: shared
             .iter()
             .filter(|shared| !shared.write)
