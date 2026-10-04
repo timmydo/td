@@ -54,6 +54,8 @@ const STAGE2_WORKSPACE_ARG: &str = "--workspace";
 const STAGE2_PROGRAMS_ARG: &str = "--programs";
 const STAGE2_HOME_ARG: &str = "--home";
 const STAGE2_WORKTREES_ARG: &str = "--worktrees";
+const STAGE2_REPOSITORIES_ARG: &str = "--repositories";
+const STAGE2_CHAIN_ARG: &str = "--git-chain";
 const STAGE2_SHARED_ARG: &str = "--shared";
 const NO_CGROUP_MEMBERSHIP: &str = "none";
 /// Stage 2's spelling for "this launch carries no zone". A tzdb zone name
@@ -423,6 +425,8 @@ pub struct Stage2Workspace {
     programs: Vec<String>,
     home: PathBuf,
     worktrees: Vec<PathBuf>,
+    repositories: Vec<PathBuf>,
+    chain: Vec<Stage2Filesystem>,
     shared: Vec<Stage2Filesystem>,
     working_directory: PathBuf,
     arguments: Vec<OsString>,
@@ -439,6 +443,7 @@ impl Stage2Workspace {
     fn trees(&self) -> impl Iterator<Item = &Path> {
         std::iter::once(self.home.as_path())
             .chain(self.worktrees.iter().map(PathBuf::as_path))
+            .chain(self.repositories.iter().map(PathBuf::as_path))
             .chain(self.shared.iter().map(|grant| grant.target.as_path()))
     }
 }
@@ -6563,6 +6568,26 @@ fn stage2_workspace_arguments(
             .iter()
             .map(|tree| tree.target.as_os_str().to_os_string()),
     );
+    stage2.push(OsString::from(STAGE2_REPOSITORIES_ARG));
+    stage2.push(OsString::from(plan.repositories.len().to_string()));
+    stage2.extend(
+        plan.repositories
+            .iter()
+            .map(|tree| tree.target.as_os_str().to_os_string()),
+    );
+    stage2.push(OsString::from(STAGE2_CHAIN_ARG));
+    stage2.push(OsString::from(plan.chain.len().to_string()));
+    for entry in &plan.chain {
+        stage2.push(entry.target.as_os_str().to_os_string());
+        stage2.push(OsString::from(if entry.read_only { "ro" } else { "rw" }));
+        stage2.push(OsString::from(
+            if entry.source_kind == FilesystemSourceKind::File {
+                "file"
+            } else {
+                "dir"
+            },
+        ));
+    }
     stage2.push(OsString::from(STAGE2_SHARED_ARG));
     stage2.push(OsString::from(plan.shared.len().to_string()));
     for grant in &plan.shared {
@@ -6619,9 +6644,61 @@ where
     let worktrees = (0..count)
         .map(|_| tree(args.next()))
         .collect::<io::Result<Vec<_>>>()?;
+    expect(STAGE2_REPOSITORIES_ARG, args)?;
+    let count = parse_count(args.next(), "repository count")?;
+    if count.saturating_add(worktrees.len()) > workspace::MAX_TREES {
+        return Err(usage_error());
+    }
+    let repositories = (0..count)
+        .map(|_| tree(args.next()))
+        .collect::<io::Result<Vec<_>>>()?;
+    expect(STAGE2_CHAIN_ARG, args)?;
+    let count = parse_count(args.next(), "git chain count")?;
+    if count > workspace::MAX_CHAIN {
+        return Err(usage_error());
+    }
+    let mut chain = Vec::with_capacity(count);
+    for _ in 0..count {
+        let target = tree(args.next())?;
+        let read_only = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("ro") => true,
+            Some("rw") => false,
+            _ => return Err(usage_error()),
+        };
+        let source_kind = match args.next().as_deref().and_then(OsStr::to_str) {
+            Some("dir") => FilesystemSourceKind::Directory,
+            // Only a directory is ever a writable link of the chain.
+            Some("file") if read_only => FilesystemSourceKind::File,
+            _ => return Err(usage_error()),
+        };
+        // Each lies inside a repository, below its top, or is a
+        // worktree's own `.git`, read-only; and is named once.
+        let inside = repositories
+            .iter()
+            .any(|top| target != *top && path_is_same_or_child(&target, top))
+            || (read_only
+                && source_kind == FilesystemSourceKind::File
+                && worktrees.iter().any(|top| target == top.join(".git")));
+        if !inside
+            || chain
+                .iter()
+                .any(|entry: &Stage2Filesystem| entry.target == target)
+        {
+            return Err(usage_error());
+        }
+        chain.push(Stage2Filesystem {
+            target,
+            read_only,
+            source_kind,
+        });
+    }
     expect(STAGE2_SHARED_ARG, args)?;
     let count = parse_count(args.next(), "shared count")?;
-    if count.saturating_add(worktrees.len()) > workspace::MAX_TREES {
+    if count
+        .saturating_add(worktrees.len())
+        .saturating_add(repositories.len())
+        > workspace::MAX_TREES
+    {
         return Err(usage_error());
     }
     let mut shared = Vec::with_capacity(count);
@@ -6648,6 +6725,8 @@ where
         programs,
         home,
         worktrees,
+        repositories,
+        chain,
         shared,
         working_directory,
         arguments: authority::collect_arguments(args)?,
@@ -6666,8 +6745,9 @@ where
 }
 
 /// Stage 1's plan for a workspace: the base trees, the host's system
-/// trees and selective `/etc`, the programs, the home, the worktrees and
-/// the shared directories.
+/// trees and selective `/etc`, the programs, the home, the worktrees, the
+/// shared directories, the repositories, and the git chain over them in
+/// its order, each link after the one it lies on.
 fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io::Result<()> {
     let root = cstring("/")?;
     sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
@@ -6730,6 +6810,12 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
     }
     for grant in &plan.shared {
         mount_grant(grant, false)?;
+    }
+    for repository in &plan.repositories {
+        mount_grant(repository, false)?;
+    }
+    for entry in &plan.chain {
+        mount_grant(entry, false)?;
     }
     remount_read_only(&dev, sys::MS_NOSUID | sys::MS_NOEXEC)
 }
@@ -7030,8 +7116,18 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     for grant in &plan.shared {
         require_tree_mount_policy(&mountinfo, grant, false)?;
     }
+    for repository in &plan.repositories {
+        let repository = Stage2Filesystem {
+            target: repository.clone(),
+            read_only: false,
+            source_kind: FilesystemSourceKind::Directory,
+        };
+        require_tree_mount_policy(&mountinfo, &repository, false)?;
+    }
+    require_git_chain(plan, &mountinfo, token)?;
     for writable in std::iter::once(&plan.home)
         .chain(plan.worktrees.iter())
+        .chain(plan.repositories.iter())
         .chain(
             plan.shared
                 .iter()
@@ -7043,6 +7139,197 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             .to_str()
             .ok_or_else(|| io::Error::other("workspace directory is not UTF-8"))?;
         require_writable_directory(text, token)?;
+    }
+    Ok(())
+}
+
+/// Each mount's id, its parent's, and where it is.
+fn mount_parents(mountinfo: &str) -> io::Result<Vec<(u64, u64, PathBuf)>> {
+    mountinfo
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let id = fields.next().and_then(|field| field.parse().ok());
+            let parent = fields.next().and_then(|field| field.parse().ok());
+            match (id, parent, fields.nth(2)) {
+                (Some(id), Some(parent), Some(point)) => {
+                    Ok((id, parent, decode_mountinfo_path(point)?))
+                }
+                _ => Err(io::Error::other(
+                    "mountinfo row has no id, parent or mount point",
+                )),
+            }
+        })
+        .collect()
+}
+
+/// The links a repository's chain must have, derived here from its fixed
+/// names and its read-only `worktrees/`, not taken from the plan.
+/// Each with whether it is read-only: only `objects/` and each linked
+/// worktree's directory are writable.
+fn required_chain(repository: &Path) -> io::Result<BTreeMap<PathBuf, bool>> {
+    let mut required: BTreeMap<PathBuf, bool> = ["objects/info", "worktrees"]
+        .iter()
+        .chain(workspace::REPOSITORY_FILES)
+        .chain(workspace::REPOSITORY_DIRECTORIES)
+        .map(|name| (repository.join(name), true))
+        .collect();
+    required.insert(repository.join("objects"), false);
+    for entry in fs::read_dir(repository.join("worktrees"))?.take(workspace::MAX_TREES + 1) {
+        let linked = repository.join("worktrees").join(entry?.file_name());
+        for name in workspace::LINKED_FILES {
+            required.insert(linked.join(name), true);
+        }
+        required.insert(linked, false);
+    }
+    Ok(required)
+}
+
+/// Each link is the one mount at its path, mounted on the deepest link
+/// or top it lies in: mounted out of order, it would lie hidden under
+/// that one, and the mount seen at its path would be another.
+fn require_chain_stacking(plan: &Stage2Workspace, mountinfo: &str) -> io::Result<()> {
+    let parents = mount_parents(mountinfo)?;
+    let row_at = |path: &Path| -> io::Result<(u64, u64)> {
+        let mut rows = parents.iter().filter(|(_, _, point)| point == path);
+        match (rows.next(), rows.next()) {
+            (Some((id, parent, _)), None) => Ok((*id, *parent)),
+            _ => Err(io::Error::other(format!(
+                "git chain mount {} is not one mount",
+                path.display()
+            ))),
+        }
+    };
+    for entry in &plan.chain {
+        let below = plan
+            .chain
+            .iter()
+            .map(|other| &other.target)
+            .chain(plan.repositories.iter())
+            .chain(plan.worktrees.iter())
+            .filter(|other| **other != entry.target && path_is_same_or_child(&entry.target, other))
+            .max_by_key(|other| other.components().count())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "git chain link {} lies in no top",
+                    entry.target.display()
+                ))
+            })?;
+        let (_, parent) = row_at(&entry.target)?;
+        let (on, _) = row_at(below)?;
+        if parent != on {
+            return Err(io::Error::other(format!(
+                "git chain link {} is not mounted on {}",
+                entry.target.display(),
+                below.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Each link of the git chain is its own mount, the only one at its
+/// path, mounted on the link or top it lies in, so it is the one seen
+/// there; `nosuid`, `nodev` and `noexec`; read-only or writable as
+/// planned, each proved by a write; and of its kind. A repository's links
+/// are exactly those its names require, and it holds no other mount
+/// (td-agent/DESIGN.md §8).
+fn require_git_chain(
+    plan: &Stage2Workspace,
+    mountinfo: &str,
+    token: &[u8; TOKEN_LEN],
+) -> io::Result<()> {
+    for repository in &plan.repositories {
+        let required = required_chain(repository)?;
+        let planned: BTreeMap<PathBuf, bool> = plan
+            .chain
+            .iter()
+            .filter(|entry| path_is_same_or_child(&entry.target, repository))
+            .map(|entry| (entry.target.clone(), entry.read_only))
+            .collect();
+        if planned != required {
+            return Err(io::Error::other(format!(
+                "workspace repository {}'s chain is not the one its names require",
+                repository.display()
+            )));
+        }
+    }
+    require_chain_stacking(plan, mountinfo)?;
+    for entry in &plan.chain {
+        let rows = grant_mount_rows(mountinfo, &entry.target)?;
+        let row = rows
+            .iter()
+            .find(|row| row.mountpoint == entry.target)
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "git chain link {} is not a mount",
+                    entry.target.display()
+                ))
+            })?;
+        for required in ["nosuid", "nodev", "noexec"] {
+            if !row.options.contains(required) {
+                return Err(io::Error::other(format!(
+                    "git chain link {} lacks {required}",
+                    entry.target.display()
+                )));
+            }
+        }
+        if row.read_only != entry.read_only {
+            return Err(io::Error::other(format!(
+                "git chain link {} is not {} as planned",
+                entry.target.display(),
+                if entry.read_only {
+                    "read-only"
+                } else {
+                    "writable"
+                }
+            )));
+        }
+        let metadata = fs::symlink_metadata(&entry.target)?;
+        let kind = match entry.source_kind {
+            FilesystemSourceKind::Directory => metadata.file_type().is_dir(),
+            FilesystemSourceKind::File => metadata.file_type().is_file(),
+        };
+        if !kind {
+            return Err(io::Error::other(format!(
+                "git chain link {} is not of its kind",
+                entry.target.display()
+            )));
+        }
+        let text = entry
+            .target
+            .to_str()
+            .ok_or_else(|| io::Error::other("git chain link is not UTF-8"))?;
+        match (entry.read_only, entry.source_kind) {
+            (false, _) => require_writable_directory(text, token)?,
+            (true, FilesystemSourceKind::Directory) => require_read_only_mount(text, token)?,
+            (true, FilesystemSourceKind::File) => {
+                match OpenOptions::new().write(true).open(&entry.target) {
+                    Err(error) if error.kind() == io::ErrorKind::ReadOnlyFilesystem => {}
+                    _ => {
+                        return Err(io::Error::other(format!(
+                            "git chain link {} is writable",
+                            entry.target.display()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    for repository in &plan.repositories {
+        for row in grant_mount_rows(mountinfo, repository)? {
+            if row.mountpoint != *repository
+                && !plan
+                    .chain
+                    .iter()
+                    .any(|entry| entry.target == row.mountpoint)
+            {
+                return Err(io::Error::other(format!(
+                    "workspace repository mount {} is not one its chain made",
+                    row.mountpoint.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -7177,6 +7464,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_chain_link_must_be_mounted_on_the_link_it_lies_in() {
+        let link = |path: &str| Stage2Filesystem {
+            target: PathBuf::from(path),
+            read_only: true,
+            source_kind: FilesystemSourceKind::Directory,
+        };
+        let plan = Stage2Workspace {
+            programs: vec!["a".into()],
+            home: "/h".into(),
+            worktrees: Vec::new(),
+            repositories: vec!["/r".into()],
+            chain: vec![link("/r/objects"), link("/r/objects/info")],
+            shared: Vec::new(),
+            working_directory: "/h".into(),
+            arguments: Vec::new(),
+        };
+        let row = |id: u32, parent: u32, point: &str| {
+            format!("{id} {parent} 0:1 / {point} rw,nosuid - ext4 /dev/a rw\n")
+        };
+        let stacked = [
+            row(1, 0, "/"),
+            row(2, 1, "/r"),
+            row(3, 2, "/r/objects"),
+            row(4, 3, "/r/objects/info"),
+        ]
+        .concat();
+        assert!(require_chain_stacking(&plan, &stacked).is_ok());
+        // `objects/info` mounted first lies hidden under `objects`.
+        let hidden = [
+            row(1, 0, "/"),
+            row(2, 1, "/r"),
+            row(4, 2, "/r/objects/info"),
+            row(3, 2, "/r/objects"),
+        ]
+        .concat();
+        let refused = require_chain_stacking(&plan, &hidden).unwrap_err();
+        assert!(refused.to_string().contains("not mounted on"), "{refused}");
+        // A second mount at a link's path, which would be the one seen.
+        let doubled = [stacked.clone(), row(5, 4, "/r/objects/info")].concat();
+        let refused = require_chain_stacking(&plan, &doubled).unwrap_err();
+        assert!(refused.to_string().contains("not one mount"), "{refused}");
+    }
+
+    #[test]
     fn stage2_workspace_arguments_round_trip_and_refuse_overlap() {
         let grant = |path: &str, read_only: bool| FilesystemGrant {
             source: PathBuf::from(path),
@@ -7205,6 +7536,18 @@ mod tests {
             ],
             home: grant("/s/home", false),
             worktrees: vec![grant("/w/a", false)],
+            repositories: vec![grant("/g/r.git", false)],
+            chain: vec![
+                grant("/g/r.git/objects", false),
+                FilesystemGrant {
+                    source_kind: FilesystemSourceKind::File,
+                    ..grant("/g/r.git/config", true)
+                },
+                FilesystemGrant {
+                    source_kind: FilesystemSourceKind::File,
+                    ..grant("/w/a/.git", true)
+                },
+            ],
             shared: vec![grant("/d", true), grant("/e", false)],
             arguments: vec!["tool-host".into(), "--root".into()],
         };
@@ -7229,6 +7572,27 @@ mod tests {
         );
         assert_eq!(parsed.home, Path::new("/s/home"));
         assert_eq!(parsed.worktrees, [PathBuf::from("/w/a")]);
+        assert_eq!(parsed.repositories, [PathBuf::from("/g/r.git")]);
+        assert_eq!(
+            parsed
+                .chain
+                .iter()
+                .map(|entry| (entry.target.clone(), entry.read_only, entry.source_kind))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    PathBuf::from("/g/r.git/objects"),
+                    false,
+                    FilesystemSourceKind::Directory
+                ),
+                (
+                    PathBuf::from("/g/r.git/config"),
+                    true,
+                    FilesystemSourceKind::File
+                ),
+                (PathBuf::from("/w/a/.git"), true, FilesystemSourceKind::File),
+            ]
+        );
         assert_eq!(parsed.working_directory, Path::new("/w/a"));
         assert_eq!(
             parsed
@@ -7241,26 +7605,38 @@ mod tests {
         assert_eq!(parsed.arguments, ["tool-host", "--root"]);
 
         let words = |text: &str| -> Vec<OsString> { text.split(' ').map(OsString::from).collect() };
+        const NONE: &str = "--repositories 0 --git-chain 0";
         for bad in [
             // A working directory that is not the first worktree.
-            "--programs 1 a --home /h --worktrees 1 /w --shared 0 --working-directory /h --arguments",
+            format!("--programs 1 a --home /h --worktrees 1 /w {NONE} --shared 0 --working-directory /h --arguments"),
             // Overlapping trees.
-            "--programs 1 a --home /h --worktrees 1 /h/w --shared 0 --working-directory /h/w --arguments",
-            "--programs 1 a --home /h --worktrees 0 --shared 2 /d ro /d/e rw --working-directory /h --arguments",
+            format!("--programs 1 a --home /h --worktrees 1 /h/w {NONE} --shared 0 --working-directory /h/w --arguments"),
+            format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 2 /d ro /d/e rw --working-directory /h --arguments"),
+            "--programs 1 a --home /h --worktrees 0 --repositories 1 /h/r --git-chain 0 --shared 0 --working-directory /h --arguments".into(),
+            // A chain link outside every repository and worktree, at a
+            // top, twice, or a writable file; in a worktree, anything
+            // but its `.git` file, read-only.
+            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /h/x ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/x ro file --shared 0 --working-directory /w --arguments".into(),
+            "--programs 1 a --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/.git ro dir --shared 0 --working-directory /w --arguments".into(),
+            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 2 /r/x ro dir /r/x ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r/x rw file --shared 0 --working-directory /h --arguments".into(),
             // A program name that is a path.
-            "--programs 1 ../a --home /h --worktrees 0 --shared 0 --working-directory /h --arguments",
-            "--programs 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments",
-            "--programs 1 a --home /h --worktrees 0 --shared 1 /d rx --working-directory /h --arguments",
-            "--programs 1 a --home h --worktrees 0 --shared 0 --working-directory h --arguments",
-            "--programs 1 a --home /h --worktrees 0 --shared 0 --working-directory /h",
+            format!("--programs 1 ../a --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 1 /d rx --working-directory /h --arguments"),
+            format!("--programs 1 a --home h --worktrees 0 {NONE} --shared 0 --working-directory h --arguments"),
+            format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h"),
+            // The old shape, without repositories or a chain.
+            "--programs 1 a --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
         ] {
             assert!(
-                parse_stage2_workspace(&mut words(bad).into_iter()).is_err(),
+                parse_stage2_workspace(&mut words(&bad).into_iter()).is_err(),
                 "{bad}"
             );
         }
-        let good =
-            "--programs 1 a --home /h --worktrees 0 --shared 0 --working-directory /h --arguments";
+        let good = "--programs 1 a --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
         assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
     }
     use crate::authority::{

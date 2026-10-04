@@ -3526,13 +3526,15 @@ entry=/absolute/td-agent
 program=/absolute/td-txt
 home=/absolute/private/home
 worktree=/absolute/worktree
+checkout=/absolute/linked/worktree
+repository=/absolute/workspace/repository.git
 read=/absolute/shared/read-only
 write=/absolute/shared/read-write
 ```
 
 `entry` and `home` appear once; `program` (with `entry`, at most four),
-`worktree`, `read` and `write` repeat, at most 32 directories in all; keys
-appear in that order. Admission is §C's filesystem-grant source checks
+`worktree`, `checkout`, `repository`, `read` and `write` repeat, at most
+32 directories in all; keys appear in that order. Admission is §C's filesystem-grant source checks
 with the kind's own departures:
 
 - **Programs**, the entry first, are direct executable regular files,
@@ -3559,6 +3561,27 @@ with the kind's own departures:
   worktree, a `write` directory) may hold td-jail's own executable or a
   spec program, by path or by mount identity: td-jail runs outside every
   jail, and a launcher may run its entry unconfined.
+- **Git repositories** (td-agent/DESIGN.md §8, The git mount chain). A
+  `checkout` is a worktree that is a git linked worktree: its `.git`
+  must be a regular file of one name, bound read-only over it. A
+  `repository` is a workspace repository, read-write and not executable,
+  admitted as any directory, with its chain bound over it in this
+  order: `objects/` read-write, `objects/info/` read-only on that;
+  `commondir`, `config`, `config.worktree` and `shallow` (files) and
+  `branches/`, `hooks/`, `info/` and `remotes/` read-only; `worktrees/`
+  read-only, and each entry of it, all of which must be directories, at
+  most 32, read-write on that, with its `commondir`, `config.worktree`
+  and `gitdir` read-only. Every link must exist when the instance is
+  admitted, not be a link, and a file must have one name; its device
+  and inode are checked before and after its bind as a grant's are. So
+  every directory between a repository's top and a protected entry is
+  itself a mount, which the kernel will not rename or remove, and the
+  filter refuses every mount call. The chain adds at most 1024 mounts,
+  a protected file must be its owner's to write (so a write to it fails
+  for the read-only mount alone), and a plan's paths take at most 384 KiB
+  of stage 2's argv. When the spec names a
+  repository, a plain `worktree` holding a `.git` is refused: a git
+  worktree is a `checkout`, whose `.git` is protected.
 - **Mount flags.** Every directory is `nosuid,nodev`. The home and the
   shared directories are `noexec`; worktrees are not, because the
   agent's shell runs what it builds there. `read` directories are
@@ -3585,8 +3608,16 @@ no cgroupfs, and no Wayland, bus, audio, fetch, tty or runtime
 directory. Stage 2 reads all of it back before confinement: the exact
 names of the root, of every directory between it and an admitted tree,
 and of `/run`, `/etc` and `/opt/workspace`; every program's flags; every
-mount row below every directory; and that no mount exists the plan did
-not make.
+mount row below every directory; each repository's chain links, derived
+again inside from the fixed names and the read-only `worktrees/` and
+required to be exactly the plan's in path and mode, only `objects/`
+and each linked worktree's directory writable, and a worktree's only
+its `.git`;
+each link as the one mount at its path, mounted on the link or top it
+lies in, `nosuid,nodev,noexec`, of its kind, and read-only or writable
+as planned, proved by a write that fails with `EROFS` or succeeds; that
+a repository holds no mount but its chain's; and that no mount exists
+the plan did not make.
 
 The instance always isolates the network, with loopback up, and keeps
 §C's user, mount, PID and UTS namespaces, but maps the caller to itself

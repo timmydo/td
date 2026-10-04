@@ -126,6 +126,204 @@ fn a_workspace_launch_is_confined_and_speaks_on_its_channel() -> Result<(), Box<
     Ok(())
 }
 
+const CHAIN_PROBE: &str = r#"#!/bin/sh
+read -r request
+cd "$C" || exit 1
+t() { if eval "$2" 2>/dev/null; then echo "$1=yes"; else echo "$1=no"; fi; }
+t objects 'touch "$R/objects/x"'
+t alternates 'echo x >> "$R/objects/info/alternates"'
+t alternates-new 'touch "$R/objects/info/new"'
+t objects-mv 'mv "$R/objects" "$R/o2"'
+t refs 'touch "$R/refs/x"'
+for f in commondir config config.worktree shallow; do
+  t "$f" 'echo x >> "$R/$f"'
+  t "$f-rm" 'rm -f "$R/$f"'
+  t "$f-mv" 'mv "$R/$f" "$R/$f.2"'
+done
+for d in branches hooks info remotes worktrees; do
+  t "$d" 'touch "$R/$d/x"'
+  t "$d-mv" 'mv "$R/$d" "$R/$d.2"'
+done
+t linked 'touch "$R/worktrees/id/x"'
+for f in commondir config.worktree gitdir; do
+  t "linked-$f" 'echo x >> "$R/worktrees/id/$f"'
+  t "linked-$f-rm" 'rm -f "$R/worktrees/id/$f"'
+done
+t linked-new 'mkdir "$R/worktrees/new"'
+t linked-mv 'mv "$R/worktrees/id" "$R/worktrees/id2"'
+t dotgit 'echo x >> "$C/.git"'
+t dotgit-rm 'rm -f "$C/.git"'
+t tree 'touch "$C/f"'
+t store 'touch "$S/x"'
+if [ -n "$GIT" ]; then
+  "$GIT" add f && "$GIT" -c user.name=t -c user.email=t@t commit -q -m one && echo "commit=made"
+  "$GIT" --git-dir="$R" log --format=%s -1 main | sed 's/^/root-log=/'
+  "$GIT" rev-parse --is-shallow-repository | sed 's/^/is-shallow=/'
+fi
+"#;
+
+/// The git mount chain (td-agent/DESIGN.md §8) over a linked worktree
+/// laid out as td-agent lays it: what tells git what to execute or where
+/// to look is read-only, no link of the chain moves, and a jailed git
+/// still commits.
+#[test]
+#[ignore = "needs unprivileged user namespaces and a host /bin/sh"]
+fn the_git_chain_protects_a_repository_and_a_jailed_git_commits() -> Result<(), Box<dyn Error>> {
+    let (base, _) = prepare("workspace-chain")?;
+    let store = base.join("store/objects");
+    let repository = base.join("ws/r.git");
+    let checkout = base.join("tree/r");
+    for dir in [
+        "store/objects/info",
+        "store/objects/pack",
+        "ws/r.git/objects/info",
+        "ws/r.git/objects/pack",
+        "ws/r.git/refs/heads",
+        "ws/r.git/refs/tags",
+        "ws/r.git/branches",
+        "ws/r.git/hooks",
+        "ws/r.git/info",
+        "ws/r.git/remotes",
+        "ws/r.git/worktrees/id",
+        "tree/r",
+    ] {
+        fs::create_dir_all(base.join(dir))?;
+    }
+    let write = |path: PathBuf, text: String| fs::write(path, text);
+    write(repository.join("HEAD"), "ref: refs/heads/main\n".into())?;
+    write(
+        repository.join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = true\n".into(),
+    )?;
+    // The root's `commondir` names itself: git refuses an empty one.
+    write(repository.join("commondir"), ".\n".into())?;
+    for empty in ["config.worktree", "shallow"] {
+        write(repository.join(empty), String::new())?;
+    }
+    write(
+        repository.join("objects/info/alternates"),
+        format!("{}\n", store.display()),
+    )?;
+    let linked = repository.join("worktrees/id");
+    write(linked.join("HEAD"), "ref: refs/heads/main\n".into())?;
+    write(linked.join("commondir"), "../..\n".into())?;
+    write(
+        linked.join("gitdir"),
+        format!("{}\n", checkout.join(".git").display()),
+    )?;
+    write(linked.join("config.worktree"), String::new())?;
+    write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", linked.display()),
+    )?;
+    let probe = base.join("bin/chain");
+    write(
+        probe.clone(),
+        CHAIN_PROBE
+            .replace("$C", &checkout.display().to_string())
+            .replace("$R", &repository.display().to_string())
+            .replace("$S", &store.display().to_string())
+            .replace("$GIT", &bound_git().unwrap_or_default()),
+    )?;
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))?;
+    let spec = base.join("chain-spec");
+    write(
+        spec.clone(),
+        format!(
+            "format=1\nentry={}\nhome={}\ncheckout={}\nrepository={}\nread={}\n",
+            probe.display(),
+            base.join("home").display(),
+            checkout.display(),
+            repository.display(),
+            store.display()
+        ),
+    )?;
+    fs::set_permissions(&spec, fs::Permissions::from_mode(0o600))?;
+    let (mut ours, theirs) = UnixStream::pair()?;
+    let child = Command::new(env!("CARGO_BIN_EXE_td-jail"))
+        .arg("--workspace")
+        .arg(std::process::id().to_string())
+        .arg(&spec)
+        .stdin(Stdio::from(OwnedFd::from(theirs.try_clone()?)))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // A refused launch closes the channel; its reason is on stderr.
+    let _ = ours.write_all(b"go\n");
+    let mut reply = String::new();
+    let _ = ours.read_to_string(&mut reply);
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{reply}\n{stderr}");
+    let mut expected: Vec<String> = [
+        "objects=yes",
+        "alternates=no",
+        "alternates-new=no",
+        "objects-mv=no",
+        "refs=yes",
+        "linked=yes",
+        "linked-new=no",
+        "linked-mv=no",
+        "dotgit=no",
+        "dotgit-rm=no",
+        "tree=yes",
+        "store=no",
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect();
+    for name in ["commondir", "config", "config.worktree", "shallow"] {
+        for probe in ["", "-rm", "-mv"] {
+            expected.push(format!("{name}{probe}=no"));
+        }
+    }
+    for name in ["branches", "hooks", "info", "remotes", "worktrees"] {
+        expected.push(format!("{name}=no"));
+        expected.push(format!("{name}-mv=no"));
+    }
+    for name in ["commondir", "config.worktree", "gitdir"] {
+        expected.push(format!("linked-{name}=no"));
+        expected.push(format!("linked-{name}-rm=no"));
+    }
+    for line in &expected {
+        assert!(
+            reply.lines().any(|got| got == line),
+            "{line} absent from:\n{reply}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(repository.join("config"))?,
+        "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+    );
+    if bound_git().is_some() {
+        assert!(
+            // The empty protected `shallow` makes git call it shallow.
+            ["commit=made", "root-log=one", "is-shallow=true"]
+                .iter()
+                .all(|line| reply.lines().any(|got| got == *line)),
+            "{reply}\n{stderr}"
+        );
+        assert!(fs::read_to_string(repository.join("refs/heads/main")).is_ok());
+    }
+    fs::remove_dir_all(&base)?;
+    Ok(())
+}
+
+/// The host's git as the jail sees it: where the first `git` on PATH
+/// resolves, when that lies in a system tree the jail binds (a store-based
+/// host keeps it in a profile the jail lacks).
+fn bound_git() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    let found = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())?;
+    let resolved = fs::canonicalize(found).ok()?;
+    ["/usr/", "/bin/", "/gnu/", "/nix/"]
+        .iter()
+        .any(|tree| resolved.starts_with(tree))
+        .then(|| resolved.display().to_string())
+}
+
 /// A datagram pair is no channel: it could address any socket on the host,
 /// and the filter leaves `sendto` alone.
 #[test]

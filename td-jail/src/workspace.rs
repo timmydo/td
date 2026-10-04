@@ -2,10 +2,11 @@
 //! a development-host launch whose policy is a spec file its launcher
 //! writes, for an agent's tools. It runs a program the launcher names, not
 //! a package; binds the launcher's worktrees read-write and executable at
-//! their real paths, shared directories at theirs, a private home, and the
-//! host's own system trees read-only; and grants no Wayland, bus, audio,
-//! fetch, tty or network. Its entry's standard input and output are one
-//! stream socket the launcher holds the other end of.
+//! their real paths, its git repositories through the git mount chain,
+//! shared directories at theirs, a private home, and the host's own system
+//! trees read-only; and grants no Wayland, bus, audio, fetch, tty or
+//! network. Its entry's standard input and output are one stream socket
+//! the launcher holds the other end of.
 //!
 //! This module reads and admits the spec, as `authority` does a package's;
 //! `transition` performs it.
@@ -86,6 +87,24 @@ const MAX_SPEC_BYTES: u64 = 64 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 pub(crate) const MAX_PROGRAMS: usize = 4;
 pub(crate) const MAX_TREES: usize = 32;
+/// The most mounts the git chains add, past the directories: a
+/// repository takes 11 and 4 for each of at most `MAX_TREES` linked
+/// worktrees, 139 at most, so this holds 7 such repositories.
+pub(crate) const MAX_CHAIN: usize = 1024;
+/// The most bytes a plan's paths take in stage 2's argv, each counted
+/// with `ARGV_WORD` for its pointer, its terminator and the word beside
+/// it, so a plan too large is refused by name at admission rather than
+/// failing to start. The kernel allows a quarter of the stack limit,
+/// 2 MiB at the usual 8 MiB; this assumes at least 2 MiB of stack.
+const MAX_PLAN_BYTES: usize = 384 * 1024;
+const ARGV_WORD: usize = 32;
+/// A workspace repository's entries that say what git executes or where
+/// it looks, bound read-only over it (td-agent/DESIGN.md §8, The git
+/// mount chain): files, then directories.
+pub(crate) const REPOSITORY_FILES: &[&str] = &["commondir", "config", "config.worktree", "shallow"];
+pub(crate) const REPOSITORY_DIRECTORIES: &[&str] = &["branches", "hooks", "info", "remotes"];
+/// A linked worktree's entries under `worktrees/<id>/`, bound read-only.
+pub(crate) const LINKED_FILES: &[&str] = &["commondir", "config.worktree", "gitdir"];
 /// Filesystems no admitted tree may carry in below it: each reaches past
 /// the jail (procfs's `/proc/<pid>/root` and `environ` of the caller's own
 /// processes, the same uid) or the kernel.
@@ -135,8 +154,15 @@ pub(crate) struct WorkspacePlan {
     pub(crate) programs: Vec<Program>,
     /// Read-write, not executable.
     pub(crate) home: FilesystemGrant,
-    /// Read-write and executable: what the tools build and run.
+    /// Read-write and executable: what the tools build and run. A
+    /// checkout's are last.
     pub(crate) worktrees: Vec<FilesystemGrant>,
+    /// Workspace git repositories: read-write, not executable.
+    pub(crate) repositories: Vec<FilesystemGrant>,
+    /// The git mount chain, in mount order, each inside a repository or a
+    /// checkout and bound over it: read-only or read-write, not
+    /// executable.
+    pub(crate) chain: Vec<FilesystemGrant>,
     /// Read-only or read-write, not executable.
     pub(crate) shared: Vec<FilesystemGrant>,
     pub(crate) arguments: Vec<OsString>,
@@ -172,19 +198,30 @@ struct Spec {
     programs: Vec<PathBuf>,
     home: PathBuf,
     worktrees: Vec<PathBuf>,
+    checkouts: Vec<PathBuf>,
+    repositories: Vec<PathBuf>,
     read: Vec<PathBuf>,
     write: Vec<PathBuf>,
 }
 
 /// The exact, ordered keyfile: `format=1`, one `entry`, any `program`s,
-/// one `home`, then any `worktree`, `read` and `write` lines, each group
-/// in that order.
+/// one `home`, then any `worktree`, `checkout`, `repository`, `read` and
+/// `write` lines, each group in that order.
 fn parse_spec(text: &str) -> io::Result<Spec> {
     let mut lines = text.lines();
     if lines.next() != Some(FORMAT_LINE) {
         return Err(invalid("workspace spec does not begin with format=1"));
     }
-    const ORDER: &[&str] = &["entry", "program", "home", "worktree", "read", "write"];
+    const ORDER: &[&str] = &[
+        "entry",
+        "program",
+        "home",
+        "worktree",
+        "checkout",
+        "repository",
+        "read",
+        "write",
+    ];
     let mut spec = Spec::default();
     let mut last = 0usize;
     let mut home = None;
@@ -214,6 +251,8 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             "program" => return Err(invalid("workspace spec names a program before its entry")),
             "home" => home = Some(path),
             "worktree" => spec.worktrees.push(path),
+            "checkout" => spec.checkouts.push(path),
+            "repository" => spec.repositories.push(path),
             "read" => spec.read.push(path),
             _ => spec.write.push(path),
         }
@@ -227,7 +266,13 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             "workspace spec names more than {MAX_PROGRAMS} programs"
         )));
     }
-    if spec.worktrees.len() + spec.read.len() + spec.write.len() > MAX_TREES {
+    if spec.worktrees.len()
+        + spec.checkouts.len()
+        + spec.repositories.len()
+        + spec.read.len()
+        + spec.write.len()
+        > MAX_TREES
+    {
         return Err(invalid(format!(
             "workspace spec names more than {MAX_TREES} directories"
         )));
@@ -338,8 +383,56 @@ fn admit(
     let worktrees = spec
         .worktrees
         .iter()
+        .chain(spec.checkouts.iter())
         .map(|tree| admit_directory(tree, false))
         .collect::<io::Result<Vec<_>>>()?;
+    let repositories = spec
+        .repositories
+        .iter()
+        .map(|tree| admit_directory(tree, false))
+        .collect::<io::Result<Vec<_>>>()?;
+    // Beside repositories, a git worktree is a checkout, whose `.git` is
+    // protected: a plain worktree's could be pointed at a repository the
+    // jail made.
+    if !spec.repositories.is_empty() {
+        for tree in &spec.worktrees {
+            match fs::symlink_metadata(tree.join(".git")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => {
+                    return Err(invalid(format!(
+                    "workspace worktree {} holds a `.git` beside repositories; name it a checkout",
+                    tree.display()
+                )))
+                }
+            }
+        }
+    }
+    let mut chain = Vec::new();
+    for checkout in &spec.checkouts {
+        chain.push(admit_git_entry(
+            &checkout.join(".git"),
+            FilesystemSourceKind::File,
+            true,
+        )?);
+    }
+    for repository in &spec.repositories {
+        chain.extend(repository_chain(repository)?);
+    }
+    if chain.len() > MAX_CHAIN {
+        return Err(invalid(format!(
+            "workspace git chains need more than {MAX_CHAIN} mounts"
+        )));
+    }
+    check_plan_bytes(
+        std::iter::once(&spec.home)
+            .chain(&spec.worktrees)
+            .chain(&spec.checkouts)
+            .chain(&spec.repositories)
+            .chain(&spec.read)
+            .chain(&spec.write)
+            .chain(chain.iter().map(|grant| &grant.target)),
+        MAX_PLAN_BYTES,
+    )?;
     let mut shared = spec
         .read
         .iter()
@@ -350,6 +443,7 @@ fn admit(
     }
     let all: Vec<&FilesystemGrant> = std::iter::once(&home)
         .chain(worktrees.iter())
+        .chain(repositories.iter())
         .chain(shared.iter())
         .collect();
     let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
@@ -449,8 +543,108 @@ fn admit(
         programs,
         home,
         worktrees,
+        repositories,
+        chain,
         shared,
         arguments,
+    })
+}
+
+/// Refuses paths that would take more than `most` bytes of argv.
+fn check_plan_bytes<'a>(paths: impl Iterator<Item = &'a PathBuf>, most: usize) -> io::Result<()> {
+    let bytes = paths.fold(0usize, |sum, path| {
+        sum.saturating_add(path.as_os_str().len())
+            .saturating_add(ARGV_WORD)
+    });
+    if bytes > most {
+        return Err(invalid(format!(
+            "workspace plan's paths take more than {most} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// A workspace repository's chain, in mount order: its `objects/`
+/// read-write with `objects/info/` (which holds `alternates`) read-only
+/// on it; its protected files and directories read-only; `worktrees/`
+/// read-only; and each `worktrees/<id>/` read-write on that, with its
+/// protected files read-only. Every protected entry must exist: its
+/// launcher creates them before any instance binds the repository, and an
+/// absent one cannot be protected.
+fn repository_chain(repository: &Path) -> io::Result<Vec<FilesystemGrant>> {
+    use FilesystemSourceKind::{Directory, File};
+    let mut chain = vec![
+        admit_git_entry(&repository.join("objects"), Directory, false)?,
+        admit_git_entry(&repository.join("objects/info"), Directory, true)?,
+    ];
+    for name in REPOSITORY_FILES {
+        chain.push(admit_git_entry(&repository.join(name), File, true)?);
+    }
+    for name in REPOSITORY_DIRECTORIES {
+        chain.push(admit_git_entry(&repository.join(name), Directory, true)?);
+    }
+    let linked = repository.join("worktrees");
+    chain.push(admit_git_entry(&linked, Directory, true)?);
+    let mut ids = fs::read_dir(&linked)?
+        .take(MAX_TREES + 1)
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<io::Result<Vec<_>>>()?;
+    if ids.len() > MAX_TREES {
+        return Err(invalid(format!(
+            "workspace repository {} has more than {MAX_TREES} linked worktrees",
+            repository.display()
+        )));
+    }
+    ids.sort();
+    for id in ids {
+        let entry = linked.join(id);
+        chain.push(admit_git_entry(&entry, Directory, false)?);
+        for name in LINKED_FILES {
+            chain.push(admit_git_entry(&entry.join(name), File, true)?);
+        }
+    }
+    Ok(chain)
+}
+
+/// One entry of a git chain: present, of its kind, not a link, and a
+/// file with no other name.
+fn admit_git_entry(
+    path: &Path,
+    kind: FilesystemSourceKind,
+    read_only: bool,
+) -> io::Result<FilesystemGrant> {
+    authority::validate_filesystem_target(path)
+        .map_err(|_| invalid(format!("workspace git entry {path:?} is not canonical")))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| invalid(format!("workspace git entry {}: {error}", path.display())))?;
+    // A protected file is its owner's to write, so that stage 2's write
+    // to it fails for the mount alone (EROFS) and not for its mode.
+    let fits = match kind {
+        FilesystemSourceKind::Directory => metadata.file_type().is_dir(),
+        FilesystemSourceKind::File => {
+            metadata.file_type().is_file()
+                && metadata.nlink() == 1
+                && metadata.permissions().mode() & 0o200 != 0
+        }
+    };
+    if !fits {
+        return Err(invalid(format!(
+            "workspace git entry {} is not a direct {}",
+            path.display(),
+            if kind == FilesystemSourceKind::File {
+                "file with one name, its owner's to write"
+            } else {
+                "directory"
+            }
+        )));
+    }
+    Ok(FilesystemGrant {
+        source: path.to_path_buf(),
+        target: path.to_path_buf(),
+        read_only,
+        source_kind: kind,
+        source_device: metadata.dev(),
+        source_inode: metadata.ino(),
     })
 }
 
@@ -644,7 +838,17 @@ mod tests {
         assert_eq!(spec.home, PathBuf::from("/s/home"));
         assert_eq!(spec.worktrees.len(), 2);
         assert_eq!((spec.read.len(), spec.write.len()), (1, 1));
+        let spec = parse_spec(
+            "format=1\nentry=/w/bin/td-agent\nhome=/s/home\nworktree=/w/a\n\
+             checkout=/w/b\nrepository=/g/b.git\nread=/g/store/objects\n",
+        )
+        .unwrap();
+        assert_eq!(spec.checkouts, [PathBuf::from("/w/b")]);
+        assert_eq!(spec.repositories, [PathBuf::from("/g/b.git")]);
         for bad in [
+            "format=1\nentry=/a\nhome=/h\nrepository=/r\ncheckout=/c\n",
+            "format=1\nentry=/a\nhome=/h\nread=/d\nrepository=/r\n",
+            "format=1\nentry=/a\nhome=/h\ncheckout=/c\nworktree=/w\n",
             "",
             "format=2\nentry=/a\nhome=/h\n",
             "format=1\nhome=/h\n",
@@ -730,6 +934,8 @@ mod tests {
             programs: programs.iter().map(|path| path.to_path_buf()).collect(),
             home: home.to_path_buf(),
             worktrees: worktrees.iter().map(|path| path.to_path_buf()).collect(),
+            checkouts: Vec::new(),
+            repositories: Vec::new(),
             read: read.iter().map(|path| path.to_path_buf()).collect(),
             write: Vec::new(),
         };
@@ -826,6 +1032,174 @@ mod tests {
             &[base.to_str().unwrap()],
         )
         .is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A workspace repository as td-agent lays it out, with one linked
+    /// worktree `id` checked out at `checkout`.
+    fn lay_out_repository(repository: &Path, checkout: &Path) {
+        for dir in ["objects/info", "refs", "worktrees/id"]
+            .iter()
+            .chain(REPOSITORY_DIRECTORIES)
+        {
+            fs::create_dir_all(repository.join(dir)).unwrap();
+        }
+        for file in REPOSITORY_FILES {
+            fs::write(repository.join(file), b"").unwrap();
+        }
+        fs::write(repository.join("commondir"), b".\n").unwrap();
+        for file in LINKED_FILES {
+            fs::write(repository.join("worktrees/id").join(file), b"").unwrap();
+        }
+        fs::create_dir_all(checkout).unwrap();
+        fs::write(checkout.join(".git"), b"gitdir: x\n").unwrap();
+    }
+
+    #[test]
+    fn a_repository_is_admitted_with_its_whole_chain() {
+        let base = std::env::temp_dir().join(format!("td-jail-chain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        let uid = fs::metadata(&base).unwrap().uid();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        let entry = base.join("td-agent");
+        fs::write(&entry, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&entry, fs::Permissions::from_mode(0o755)).unwrap();
+        let repository = base.join("ws/r.git");
+        let checkout = base.join("tree/r");
+        lay_out_repository(&repository, &checkout);
+        let spec = || Spec {
+            programs: vec![entry.clone()],
+            home: home.clone(),
+            checkouts: vec![checkout.clone()],
+            repositories: vec![repository.clone()],
+            ..Spec::default()
+        };
+        let admit_spec = || {
+            admit(
+                spec(),
+                &base.join("spec"),
+                uid,
+                uid,
+                &[PathBuf::from("/nonexistent-td-jail-home")],
+                Vec::new(),
+                &["/proc"],
+            )
+        };
+        let plan = admit_spec().unwrap();
+        assert_eq!(plan.working_directory(), checkout);
+        let chain: Vec<(String, bool)> = plan
+            .chain
+            .iter()
+            .map(|grant| {
+                let name = grant
+                    .target
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .display()
+                    .to_string();
+                (name, grant.read_only)
+            })
+            .collect();
+        let expected: Vec<(String, bool)> = [
+            ("tree/r/.git", true),
+            ("ws/r.git/objects", false),
+            ("ws/r.git/objects/info", true),
+            ("ws/r.git/commondir", true),
+            ("ws/r.git/config", true),
+            ("ws/r.git/config.worktree", true),
+            ("ws/r.git/shallow", true),
+            ("ws/r.git/branches", true),
+            ("ws/r.git/hooks", true),
+            ("ws/r.git/info", true),
+            ("ws/r.git/remotes", true),
+            ("ws/r.git/worktrees", true),
+            ("ws/r.git/worktrees/id", false),
+            ("ws/r.git/worktrees/id/commondir", true),
+            ("ws/r.git/worktrees/id/config.worktree", true),
+            ("ws/r.git/worktrees/id/gitdir", true),
+        ]
+        .iter()
+        .map(|(name, read_only)| (name.to_string(), *read_only))
+        .collect();
+        assert_eq!(chain, expected);
+        // Each protected entry must be present, direct and, for a file,
+        // of one name: one missing, a link, or a second name is refused.
+        let config = repository.join("config");
+        fs::remove_file(&config).unwrap();
+        assert!(admit_spec().unwrap_err().to_string().contains("config"));
+        std::os::unix::fs::symlink(base.join("elsewhere"), &config).unwrap();
+        assert!(admit_spec().is_err());
+        fs::remove_file(&config).unwrap();
+        fs::write(&config, b"").unwrap();
+        fs::hard_link(&config, base.join("second")).unwrap();
+        assert!(admit_spec().unwrap_err().to_string().contains("one name"));
+        fs::remove_file(base.join("second")).unwrap();
+        fs::remove_dir(repository.join("hooks")).unwrap();
+        fs::write(repository.join("hooks"), b"").unwrap();
+        assert!(admit_spec().is_err());
+        fs::remove_file(repository.join("hooks")).unwrap();
+        fs::create_dir(repository.join("hooks")).unwrap();
+        fs::write(repository.join("worktrees/id/gitdir.lock"), b"").unwrap();
+        assert!(admit_spec().is_ok(), "an extra file is the repository's");
+        fs::write(repository.join("worktrees/stray"), b"").unwrap();
+        let refused = admit_spec().unwrap_err().to_string();
+        assert!(refused.contains("not a direct directory"), "{refused}");
+        fs::remove_file(repository.join("worktrees/stray")).unwrap();
+        // A checkout's `.git` is a file, not a directory or a link.
+        fs::remove_file(checkout.join(".git")).unwrap();
+        fs::create_dir(checkout.join(".git")).unwrap();
+        assert!(admit_spec().is_err());
+        fs::remove_dir(checkout.join(".git")).unwrap();
+        assert!(admit_spec().is_err());
+        fs::write(checkout.join(".git"), b"gitdir: x\n").unwrap();
+        // A repository is a writable tree like any: it may not overlap
+        // another directory, nor hold the program.
+        let admit_with = |spec: Spec| {
+            admit(
+                spec,
+                &base.join("spec"),
+                uid,
+                uid,
+                &[PathBuf::from("/nonexistent-td-jail-home")],
+                Vec::new(),
+                &["/proc"],
+            )
+        };
+        let mut overlapping = spec();
+        overlapping.worktrees.push(repository.join("objects"));
+        let refused = admit_with(overlapping).unwrap_err().to_string();
+        assert!(refused.contains("overlap"), "{refused}");
+        // Beside a repository, a plain worktree holding `.git` is refused.
+        let plain = base.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(plain.join(".git"), b"gitdir: x\n").unwrap();
+        let mut beside = spec();
+        beside.worktrees.push(plain.clone());
+        let refused = admit_with(beside).unwrap_err().to_string();
+        assert!(refused.contains("name it a checkout"), "{refused}");
+        // A plan too large for stage 2's argv is refused by name.
+        let paths: Vec<PathBuf> = (0..4).map(|n| PathBuf::from(format!("/p/{n}"))).collect();
+        assert!(check_plan_bytes(paths.iter(), 4 * (4 + ARGV_WORD)).is_ok());
+        let refused = check_plan_bytes(paths.iter(), 4 * (4 + ARGV_WORD) - 1).unwrap_err();
+        assert!(refused.to_string().contains("take more than"), "{refused}");
+        // A protected file its owner cannot write is refused.
+        fs::set_permissions(
+            repository.join("shallow"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let refused = admit_spec().unwrap_err().to_string();
+        assert!(refused.contains("its owner's to write"), "{refused}");
+        fs::set_permissions(
+            repository.join("shallow"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(admit_spec().is_ok());
         fs::remove_dir_all(&base).unwrap();
     }
 

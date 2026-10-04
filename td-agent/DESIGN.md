@@ -2060,13 +2060,16 @@ mount surface, old and new API. The chain:
   read-only on top of it.
 
 td-agent creates every protected entry itself, outside any jail, before
-any instance binds it: the repository's files, empty where git expects
-none, and for each new worktree its directory, its `.git` file and its
-`worktrees/<id>/` with `gitdir`, `commondir` and an empty
-`config.worktree` (the protected entries) and `HEAD` (written once,
-writable afterwards), each with a fresh `mkdir` or an exclusive,
-no-follow create, so nothing the jail planted is reused. These are plain
-files td-agent writes, not git run on the repository. `worktrees/` is
+any instance binds it: the repository's files, `commondir` naming the
+repository itself (`.`), since git refuses an empty one, and the others
+empty where git expects none, and for each new worktree its directory,
+its `.git` file and its `worktrees/<id>/` with `gitdir`, `commondir`
+and an empty `config.worktree` (the protected entries) and `HEAD`
+(written once, writable afterwards), each with a fresh `mkdir` or an
+exclusive, no-follow create, so nothing the jail planted is reused. A
+protected file is its owner's to write (td-jail refuses one that is
+not, so that its read-only probe fails for the mount alone). These are
+plain files td-agent writes, not git run on the repository. `worktrees/` is
 read-only in every instance, maintenance included, so no jailed process
 creates, moves or prunes a linked worktree; a maintenance instance then
 only checks the new worktree out.
@@ -2077,9 +2080,14 @@ git needs and nothing it could misuse: the human's `user.name` and
 `branch.autoSetupMerge=false` (so `git switch -c` does not try to write
 it), `submodule.recurse=false`, `core.fsmonitor=false`, `core.hooksPath`
 naming an empty read-only directory, `gc.auto=0`, `maintenance.auto=false`,
-and, for the git worker's own gc, `gc.writeCommitGraph=false`,
-`repack.updateServerInfo=false` and `gc.worktreePruneExpire=never`, since
-`objects/info/` and `info/` are read-only.
+`diff.ignoreSubmodules=all` and `status.submoduleSummary=false` (so the
+human's read-only `git status` in a worktree never starts a git in a
+jail-made submodule, which would read that one's configuration),
+`rerere.enabled=false` (rerere otherwise switches itself on when a
+jail-made `rr-cache/` exists), and, for the git worker's own gc,
+`gc.writeCommitGraph=false`, `repack.updateServerInfo=false` and
+`gc.worktreePruneExpire=never`, since `objects/info/` and `info/` are
+read-only.
 There is no `extensions.worktreeConfig`, so no `config.worktree` is ever
 read. What therefore fails in the jail, by design: `git config`, `git
 remote`, `git sparse-checkout set`, adding worktrees and submodules, and
@@ -2268,15 +2276,57 @@ signal, checked against its parent as stage 1's is, ends the instance
 with its launcher, so td-agent starts td-jail from the conversation
 process's main thread. `/tmp` and `/var/tmp` are fresh, private and
 executable, since worktrees are executable anyway and test suites run
-scripts they write to `TMPDIR`; the home is `noexec`. Until increment 11
-brings the git chain, the kind refuses every overlap between its
-directories rather than admitting the chain's nesting. td-agent's own
+scripts they write to `TMPDIR`; the home is `noexec`. The kind refuses
+every overlap between its directories; the git chain's nesting is not
+an overlap of directories but mounts td-jail derives from a repository's
+fixed names (As built (increment 11, the chain), below). td-agent's own
 refusals above (its state, credential locations, `workspace_root`) are
 td-agent's, applied before it writes a spec; td-jail's are the reserved
 trees, the caller's real home, overlap and links. The killed-launcher
 tests named above run with td-agent's launch in the next commit; the
 kind's own live test launches it on a socket, reads its plan back from
 inside, and is ignored where unprivileged user namespaces are absent.
+
+**As built (increment 11, the chain).** td-jail binds the chain above
+from two spec keys (APPLICATIONS.md §C, The `workspace` kind): a
+`checkout`, a worktree whose `.git` file is bound read-only over it,
+and a `repository`, a workspace repository read-write with every
+protected entry of the list above bound over it from fixed names, the
+read-only `worktrees/` enumerated for each linked worktree's directory
+and files. Nothing of the chain is named by path in the spec, so a
+launcher cannot misplace a link, and an entry that is missing, a link,
+or a file with a second name refuses the launch, since an absent entry
+cannot be protected and td-agent creates every one first. Beside a
+repository, a plain `worktree` holding a `.git` is refused, since its
+`.git` could be pointed at a repository the jail made; a git worktree
+is a `checkout`. The plan's paths take at most 384 KiB of stage 2's
+argv, counting each word's overhead, which assumes a stack limit of at
+least 2 MiB. Stage 2 derives each repository's required links itself,
+from the fixed names and its read-only `worktrees/`, with their modes
+(only `objects/` and each linked worktree's directory writable), and
+requires the plan's to be exactly those; a link inside a worktree may
+only be its `.git`. A protected file must be its owner's to write. It
+reads each link back as the one mount at its path, mounted on the link
+or top it lies in, so that it is the mount seen there; of its kind and
+mode, a writable one written and a read-only one refusing a write with
+`EROFS`; and refuses any other mount below a repository. The store's
+`objects/` reaches an instance as a `read` directory at its own path.
+td-agent does not yet write either key; workspace repositories arrive
+in the next step, and with them two things this step leaves to
+td-agent: every `.git`, `gitdir` and `commondir` that was ever
+jail-writable is created afresh, since td-jail checks an entry's kind
+and names, not its content; and a fetch from the store into a
+repository whose empty `shallow` makes git call it shallow is checked
+there (commit, log and the push's export do not depend on it). The
+kind's live test lays out a linked worktree as td-agent will and, from
+inside, finds every protected file unwritable, unremovable and
+immovable, every protected directory unwritable and immovable, the
+writable links writable, the store read-only, and a jailed git
+committing through the linked worktree and reading the repository
+through its root. Mounting no chain, a writable one, or one lacking
+`config` fails its readback; one out of order fails at its own mount,
+and the stacking check is proved apart, on mountinfo with a hidden and
+a doubled link.
 
 **As built (increment 10, the launch).** `./agent` builds td-jail and
 td-txt from the checkout beside td-agent and names them in
@@ -3829,6 +3879,19 @@ whose standard error is long draining it, and one past its time
 killed. These run where a
 `git` is on PATH, as in the host preflight; the in-sandbox gate's
 toolchain has none, and there the test says it is skipped.
+
+For the git mount chain, td-jail's `workspace.rs` covers the spec's
+`checkout` and `repository` keys in order and a repository admitted
+with its whole chain in mount order, and refuses a protected entry
+missing, a link, a file with a second name, a file where a directory
+belongs, a linked entry that is no directory, a checkout whose `.git`
+is a directory or absent, a directory overlapping a repository, a plain
+worktree holding `.git` beside a repository, and a plan past its bytes;
+`transition.rs` round-trips the chain to stage 2 and refuses a link
+outside every repository and worktree, at a top, named twice, a
+writable file, or anything in a worktree but its read-only `.git`
+file. Its ignored live test, run where unprivileged user
+namespaces are, is As built (increment 11, the chain)'s.
 
 For row menus and archiving, `src/menu.rs` covers the row menu's items
 for a live and an archived conversation, each activating its action,
