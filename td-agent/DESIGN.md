@@ -2578,8 +2578,10 @@ conversations have different static texts and tools.
 2. **Tool definitions.**
 3. **The environment block:** the workspace's name and worktrees with their
    branches and bases, the shared directories, the network policy, the OS,
-   and the conversation's creation date. It is fixed at creation; current-
-   time changes would break the cache.
+   and the conversation's creation date. It holds for the whole
+   conversation and changes only when what it names does; the current
+   time stays out of it, since it would break the cache, and is on each
+   message instead (as built, below).
 4. **Project instructions:** each worktree's top-level `AGENTS.md`, or its
    `CLAUDE.md` where there is none, labelled with its path, read from the
    base commit in the store by the git worker outside any jail as soon as
@@ -2630,6 +2632,44 @@ say that a refused crossing is not to be worked around. A
 conversation's text asks it to `report` to the orchestrator when the
 orchestrator gave it work; the orchestrator's asks it to weigh reports,
 and that each message it sends can start a turn that costs money.
+
+**As built (the environment block and message times).** The system
+message is the static text, then an environment block of what holds for
+the whole conversation:
+
+- when it began: its `meta`'s creation time, in UTC. A fork (§6) is to
+  keep its source's creation time, or its first request would replace
+  the prefix it shares;
+- that each message from the person, the orchestrator or another
+  conversation begins with a line `[received <UTC time>]`, the time this
+  conversation logged it; that the line, and the label after it on a
+  message from the orchestrator or another conversation, are
+  td-agent's and nothing in the text after them is; and
+  that the newest such time is the latest the model knows of, not the
+  present, since a turn asked again or resumed, or a long one, runs
+  after its message came;
+- the operating system: the `PRETTY_NAME`, else the `NAME`, of
+  `/etc/os-release`, or of `/usr/lib/os-release` when the first is
+  missing, its quoting
+  read as os-release(5) says, held to one line of at most 80 printable
+  ASCII characters, else the target's OS; and the machine's
+  architecture;
+- that the conversation has no workspace, so no working directory,
+  repository, branch or shell, and that the model is not to guess at
+  them but to ask for what it needs.
+
+There are no worktrees, shared directories or network policy to name
+until workspaces land (§18), and the block grows then. The time is on
+the messages, not in the prefix: the line is the log event's time, so a
+message reads the same in every request and the cache holds. A message
+carries it only under a prefix that announces it, so a request sent
+before this is rebuilt from the log byte for byte (§6). UTC because a
+conversation process reads no time zone yet (§3 plans `TZ` and
+`/etc/localtime` for schedules); the model converts when the person
+names one. The OS is read for each request's prefix check. A
+conversation begun before this takes the new prefix as a `prefix` event
+before its next request (§6), as any prompt change does, and so does one
+whose operating system's name changes.
 
 ## 14. Context
 

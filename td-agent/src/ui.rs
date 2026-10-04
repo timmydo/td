@@ -3301,7 +3301,7 @@ pub mod tests {
                 prefix,
             })
         };
-        let prefix = crate::prompt::prefix(Role::Orchestrator);
+        let prefix = crate::prompt::prefix(Role::Orchestrator, 0);
         app.update(hello(Some(prefix.clone())), 0);
         assert_eq!(app.transcript().len(), 1);
         let system = app.transcript().message(0).unwrap();

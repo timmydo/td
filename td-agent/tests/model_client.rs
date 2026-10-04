@@ -34,6 +34,14 @@ use td_agent::models::Models;
 use td_agent::protocol::{Down, Up};
 use td_agent::store::{Basis, Conversation, Event, Id, Kind, Purpose, Role, StateDir};
 
+/// Whether `content` is `text` after its `[received <UTC time>]` line.
+fn is_sent(content: &str, text: &str) -> bool {
+    content
+        .strip_prefix("[received ")
+        .and_then(|rest| rest.split_once("Z]\n"))
+        .is_some_and(|(time, rest)| time.len() == 19 && rest == text)
+}
+
 const PROGRAM: &str = env!("CARGO_BIN_EXE_td-agent");
 const KEY: &str = "sk-or-v1-feedface0123456789abcdef";
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -487,7 +495,12 @@ fn a_turn_is_sent_as_the_design_says_logged_whole_and_titled() {
     assert_eq!(body["provider.data_collection"], "deny");
     assert_eq!(body["cache_control.type"], "ephemeral");
     assert_eq!(body["messages.0.role"], "system");
-    assert_eq!(body["messages.1.content"], "What is a sparse checkout?");
+    // A message the model is given begins with when it was sent.
+    assert!(
+        is_sent(&body["messages.1.content"], "What is a sparse checkout?"),
+        "{}",
+        body["messages.1.content"]
+    );
     // Every request carries the conversation's tools.
     assert!(!body.contains_key("tool_choice"));
     assert!(!body.contains_key("parallel_tool_calls"));
@@ -1657,7 +1670,11 @@ fn a_call_started_and_not_finished_is_answered_as_interrupted_after_a_restart() 
     );
     assert_eq!(body["messages.4.tool_call_id"], "toolu_b");
     assert_eq!(body["messages.4.content"], td_agent::store::CALL_NOT_RUN);
-    assert_eq!(body["messages.5.content"], "Go on.");
+    assert!(
+        is_sent(&body["messages.5.content"], "Go on."),
+        "{}",
+        body["messages.5.content"]
+    );
     let (conversation, _) = h.close();
     assert!(
         !conversation

@@ -198,21 +198,45 @@ pub fn label(from: &crate::store::Id, role: Role, status: Option<&str>) -> Strin
     }
 }
 
+/// The line a message the model is given begins with: when this
+/// conversation logged it, in UTC (DESIGN.md §13). It is the event's, so
+/// a message reads the same in every request and the cache holds.
+pub fn received(time: u64) -> String {
+    format!("[received {}]", crate::history::utc(time))
+}
+
+/// Whether messages carry `received` under `prefix`: only under a prefix
+/// that says they do, so a request sent before it is rebuilt as it was.
+pub fn timed(prefix: &str) -> bool {
+    prefix.contains(crate::prompt::RECEIVED_FORM)
+}
+
 /// The messages of the log before a request, as the request carries
 /// them: each user message, and each message from another conversation
-/// under its label; each whole turn reply that has text, reasoning or
-/// tool calls to give back; and each tool result, as a `tool` message
+/// under its label, each after the time it was received when `timed`;
+/// each whole turn reply that has text, reasoning or tool calls to give
+/// back; and each tool result, as a `tool` message
 /// after the reply that asked for it. A reply a broken or interrupted
 /// stream left incomplete is the log's and the window's, never the
 /// model's: its reasoning details may lack the signature that closes
 /// them, and its tool calls never ran.
-pub fn messages(events: &[Event]) -> Vec<String> {
+pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
+    let at = |time: u64| {
+        if timed {
+            format!("{}\n", received(time))
+        } else {
+            String::new()
+        }
+    };
     let mut purposes: Vec<(u64, Purpose)> = Vec::new();
     let mut out = Vec::new();
     for event in events {
         match &event.kind {
             Kind::Request { purpose, .. } => purposes.push((event.seq, *purpose)),
-            Kind::User { text, .. } => out.push(crate::prompt::message("user", text)),
+            Kind::User { text, .. } => out.push(crate::prompt::message(
+                "user",
+                &format!("{}{text}", at(event.time)),
+            )),
             Kind::Message {
                 from,
                 role,
@@ -221,7 +245,11 @@ pub fn messages(events: &[Event]) -> Vec<String> {
                 ..
             } => out.push(crate::prompt::message(
                 "user",
-                &format!("{}\n{text}", label(from, *role, status.as_deref())),
+                &format!(
+                    "{}{}\n{text}",
+                    at(event.time),
+                    label(from, *role, status.as_deref())
+                ),
             )),
             Kind::Assistant {
                 request,
@@ -379,7 +407,7 @@ pub fn body(events: &[Event], index: usize, prefix_file: &str) -> Result<String,
             let before = events.get(..index).unwrap_or_default();
             let prefix = prefix_text(before, prefix_file, *prefix)
                 .ok_or_else(|| format!("request {} names no prefix {prefix}", event.seq))?;
-            turn_body(head, prefix, &messages(before))
+            turn_body(head, prefix, &messages(before, timed(prefix)))
         }
     }
 }
@@ -855,7 +883,7 @@ mod tests {
 
     #[test]
     fn a_body_is_the_head_the_prefix_and_the_logs_messages() {
-        let prefix = crate::prompt::prefix(crate::store::Role::Conversation);
+        let prefix = crate::prompt::prefix(crate::store::Role::Conversation, 0);
         let details = r#"[ {"type":"reasoning.encrypted","data":"q\/w=="} ]"#;
         let events = vec![
             event(
@@ -942,8 +970,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             first,
-            format!("{{\"model\":\"m\",{members},{{\"role\":\"user\",\"content\":\"hi \\\"you\\\"\"}}]}}")
+            format!("{{\"model\":\"m\",{members},{{\"role\":\"user\",\"content\":\"[received 1970-01-01T00:00:00Z]\\nhi \\\"you\\\"\"}}]}}")
         );
+        // Under a prefix that does not announce the line, as one from
+        // before it, messages are rebuilt without it.
         let second = body(&events, 8, &prefix).unwrap();
         assert_eq!(
             second,
@@ -1026,7 +1056,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            messages(&events),
+            messages(&events, true),
             ["{\"role\":\"assistant\",\"content\":\"\",\"reasoning_details\":[]}"]
         );
     }
@@ -1069,7 +1099,7 @@ mod tests {
                 reserved: 0,
             },
         );
-        let sent = messages(&[request, back]);
+        let sent = messages(&[request, back], true);
         assert_eq!(
             sent,
             [format!(
@@ -1360,13 +1390,23 @@ mod tests {
             ),
         ];
         assert_eq!(
-            messages(&events),
+            messages(&events, true),
             [
-                format!("{{\"role\":\"user\",\"content\":\"[a report from conversation {from}, status done, not from the person]\\nit is done\"}}"),
+                format!("{{\"role\":\"user\",\"content\":\"[received 1970-01-01T00:00:00Z]\\n[a report from conversation {from}, status done, not from the person]\\nit is done\"}}"),
                 "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"history_read\",\"arguments\":\"{\\\"from\\\":1}\"}}]}".to_string(),
                 "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"#1 report\"}".to_string(),
             ]
         );
+        // The line is the event's own time, and only under a prefix
+        // that announces it: an older request is rebuilt as it was sent.
+        let mut later = events.clone();
+        if let Some(first) = later.first_mut() {
+            first.time = 1_791_000_000;
+        }
+        assert!(messages(&later, true)[0].contains("[received 2026-10-03T"));
+        assert!(!messages(&later, false)[0].contains("[received"));
+        assert!(timed(&crate::prompt::prefix(Role::Conversation, 0)));
+        assert!(!timed("{\"tools\":[],\"messages\":[]}"));
         assert_eq!(
             label(&from, Role::Orchestrator, None),
             "[a message from the orchestrator, not from the person]"

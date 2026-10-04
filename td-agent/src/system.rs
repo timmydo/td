@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn a_prefix_shows_its_system_prompt_and_tools_folded() {
         for role in [Role::Orchestrator, Role::Conversation] {
-            let prefix = crate::prompt::prefix(role);
+            let prefix = crate::prompt::prefix(role, 0);
             let message = message(&prefix, false).unwrap().unwrap();
             assert_eq!(message.label(), HEADER);
             assert!(message.is_collapsed());

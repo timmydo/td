@@ -1244,7 +1244,10 @@ impl Conversation {
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
-                create_file(&dir.join("prefix"), crate::prompt::prefix(role).as_bytes())?;
+                create_file(
+                    &dir.join("prefix"),
+                    crate::prompt::prefix(role, meta.created).as_bytes(),
+                )?;
                 create_file(&dir.join("log"), b"")?;
                 replace(&dir, "meta", meta.to_json().to_string().as_bytes())?;
                 meta
@@ -1801,7 +1804,7 @@ pub mod tests {
         let dir = state.conversation(&id);
         assert_eq!(
             std::fs::read_to_string(dir.join("prefix")).unwrap(),
-            crate::prompt::prefix(Role::Conversation)
+            crate::prompt::prefix(Role::Conversation, read_meta(&dir).unwrap().created)
         );
 
         let log = std::fs::read_to_string(dir.join("log")).unwrap();

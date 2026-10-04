@@ -814,7 +814,7 @@ impl Session {
         // The prefix this program writes; a conversation begun by another
         // (one from before the conversation tools, say) takes it as an
         // event, at the cost of one cache miss.
-        let expected = crate::prompt::prefix(role);
+        let expected = crate::prompt::prefix(role, self.conversation.meta().created);
         if client::current_prefix(self.conversation.events(), self.conversation.prefix_file()).1
             != expected
         {
@@ -825,7 +825,7 @@ impl Session {
             let events = self.conversation.events();
             let (prefix, prefix_text) =
                 client::current_prefix(events, self.conversation.prefix_file());
-            let messages = client::messages(events);
+            let messages = client::messages(events, client::timed(prefix_text));
             let mut max_tokens = model
                 .as_ref()
                 .and_then(|m| m.max_completion_tokens)
@@ -1934,7 +1934,11 @@ mod tests {
         else {
             panic!("no hello")
         };
-        assert_eq!(prefix, Some(crate::prompt::prefix(Role::Conversation)));
+        let created = state.list().0.first().unwrap().created;
+        assert_eq!(
+            prefix,
+            Some(crate::prompt::prefix(Role::Conversation, created))
+        );
         keyless(&mut window);
         say(&mut window, D1, "first words\nand more");
         let Up::Event(user) = next(&mut window) else {
