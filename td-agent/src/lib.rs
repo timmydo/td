@@ -15,7 +15,10 @@
 //! from its File menu (`menu`) through the key dialog (`keydialog`). The
 //! conversation tools (DESIGN.md §3, §12) are `tools`, their reads of a
 //! log `history` and their wake budget `wake`; the window routes the
-//! messages they send between conversations through `post`.
+//! messages they send between conversations through `post`. The tool
+//! host (DESIGN.md §2, §12) is a third personality, `toolhost`, which
+//! serves `host`'s protocol and performs the file tools (`files`) and
+//! the process tools (`shell`).
 //!
 //! `unsafe` is forbidden for the whole crate (DESIGN.md §2).
 
@@ -30,8 +33,10 @@ pub mod control;
 pub mod conversation;
 pub mod cost;
 pub mod diagnostics;
+pub mod files;
 pub mod frame;
 pub mod history;
+pub mod host;
 pub mod key;
 pub mod keydialog;
 pub mod menu;
@@ -40,11 +45,16 @@ pub mod picker;
 pub mod post;
 pub mod prompt;
 pub mod protocol;
+#[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
+#[path = "../../engine/src/sha256.rs"]
+mod sha256;
+pub mod shell;
 pub mod span;
 pub mod sse;
 pub mod store;
 pub mod supervisor;
 pub mod system;
+pub mod toolhost;
 pub mod tools;
 pub mod ui;
 pub mod wake;

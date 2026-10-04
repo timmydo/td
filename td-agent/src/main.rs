@@ -1,5 +1,6 @@
-//! td-agent's program: the window process by default, and a conversation
-//! process when the window starts one (DESIGN.md §2).
+//! td-agent's program: the window process by default, a conversation
+//! process when the window starts one, and the tool host a conversation
+//! starts for its tools (DESIGN.md §2).
 
 #![forbid(unsafe_code)]
 
@@ -101,6 +102,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((first, rest)) if first == "conversation" => conversation(rest),
+        Some((first, rest)) if first == "tool-host" => td_agent::toolhost::Config::parse(rest)
+            .and_then(|config| {
+                td_agent::toolhost::serve(std::io::stdin(), std::io::stdout(), config)
+            }),
         Some((first, [])) if first == "--help" || first == "-h" => {
             let _ = std::io::stdout().lock().write_all(USAGE.as_bytes());
             return ExitCode::SUCCESS;

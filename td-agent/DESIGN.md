@@ -2553,6 +2553,85 @@ caller's own log, as when left out; `send_message`'s `to` is trimmed
 and refused when empty, never a default receiver. A conversation id
 that does not parse is refused quoting the value, cut to 64 characters.
 
+**As built (increment 9).** The tool host is `td-agent tool-host [--txt
+PATH] [--root DIR]...`, every path absolute, serving over its standard
+input and output; until increment 10 launches it in a jail, only the
+tests start it, and no tool of this section is exposed to a model. Its
+frames are `frame`'s, at most 1 MiB. Down, `{call: ID, tool, args}`
+names a tool by the model's name for it, and `{cancel: ID}` kills that
+call's process; up, `{output: ID, text}` carries a process's output as
+it comes, at most 32 KiB a frame, and `{done: ID, text, kept, digest}`
+or `{done: ID, error}` ends the call once. Each call runs on a thread of
+its own, at most 16 at once: one more is refused as that call's error,
+and a frame naming an id already running is not answered, since an
+answer would end that call for its caller. One writer sends every frame,
+a call's output before its end. Live output is best-effort: past 256
+frames waiting for the writer it is dropped, so a conversation slow to
+read never holds a call past its timeout, while a call's end is always
+sent, by a guard that sends it even if the call's thread panics. A call
+whose arguments are wrong is refused as its own error, and a result too
+large for a frame is sent as one saying so; a frame that names no call
+ends the host. The host ends when its input does, cancelling what still
+runs and waiting for it. Live output is cut between characters.
+`host::Client`, the conversation's end, reads at most 64 replies ahead
+and passes on only replies to calls it has in flight, dropping any other
+as the jail-controlled data it is.
+
+The digest is SHA-256 in hex, the engine's implementation shared by
+`#[path]`. A call that replaces or edits a file carries `expected`, the
+digest of the conversation's last read or write of that path; with none
+the file is refused as unread, and with another as changed since. Within
+the host, a replacement's check and write are one step, so two calls
+that read the same file cannot both replace it, and a new file is made
+exclusively. A file tool takes only a regular file, opened without
+waiting on a FIFO and checked again once open: a device, FIFO or socket
+is refused, since it may never end. A read can be cancelled between
+pieces. `read_file` reads in 64 KiB pieces and keeps at most 8 KiB of a
+line, so no line is held whole; it numbers lines as `cat -n` does,
+strips a line's `\r\n` to its text, and cuts a line past 2,000
+characters naming how many more it had. Bytes that are not UTF-8 are
+shown replaced and said; a NUL in the first 8 KiB makes the file binary,
+shown as no lines with its size and digest. An empty file and an offset
+past the end are said. A write creates missing parent directories and
+writes the file in place, so its mode and links stay; it is not atomic.
+`edit_file` takes UTF-8 files of at most 8 MiB, counted as read, naming
+`sed` for others, and refuses an empty `old_string` and one equal to
+`new_string`. `glob` matches its relative pattern, at most 1 KiB with at
+most 16 `{` groups, under `path`, or the first worktree: `*` and `?`
+within a segment, `[...]` with `!` or `^` negating and ranges, `**` for
+any number of segments, hidden ones included, and `{a,b}`, at most 64
+expansions; a leading dot is matched only by a dot. Matching backtracks
+to the last star alone, so it takes at most the product of pattern and
+name lengths. `{a}` is expanded to `a`, and a `{` inside `[...]` is
+still a group. It enters no `.git` and follows no link to a directory,
+and returns the matching entries that are not directories, a link to one
+included, as absolute paths: it looks at no more than 200,000 entries,
+sorts what matched and returns the first 1,000, saying when either bound
+cut it short.
+
+`shell` runs `sh -c` with its environment cleared to `PATH`, `HOME`,
+`TMPDIR` and `LANG` as the host has them and `TERM=dumb`, standard input
+empty and standard error on standard output's pipe, read through a queue
+of 16 pieces so unread output waits in the pipe. `timeout_ms` is from 1
+to 600,000, and a `workdir` that is not a directory is refused naming
+it. The process, the cancel and the clock are looked at on every pass,
+so a process that writes without pause still ends. A timeout or a cancel
+kills `sh` alone; what it started is the jail instance's teardown's to
+end (§8), and once `sh` has ended its output is read for 300 ms more,
+then the call returns whatever a descendant still holds. The log keeps
+the output's first and last 64 KiB as `kept`, not the whole of it, with
+the bytes between counted, a character the cut splits among them; the
+model is shown its first and last 15 KiB and that count, after the exit
+status, a signal or the timeout asked for. td-txt runs under the
+applet's name as its argv[0]. `grep` runs `-r -n -H`, naming the file
+even when `path` is one, then `-E`, `-i`, `-C N` (at most 20),
+`--include=` and `--exclude=` as asked, then `-e PATTERN -- PATH`, the
+path defaulting to the first worktree; an exit status of 1 with no
+output is "no matches", and at most 1,000 lines are shown, the rest
+counted. `sed` runs `--sandbox -i`, `-E` as asked, then `-e SCRIPT --`
+and its absolute paths, saying only how many files it ran over when it
+prints nothing. Both have `shell`'s default timeout.
+
 ## 13. Prompting
 
 The prefix of §6 is ordered from stable to volatile, so it caches, and is
@@ -3114,6 +3193,45 @@ started and not finished; and, through a `Supervisor` and the window's
 woken and answers; and an interrupt that comes while a call waits on
 the window, which lets that call finish, answers the next as not run
 and offers `C-r`, whose request carries both results.
+
+**As built (increment 9).** `src/files.rs` covers a relative path
+refused naming the worktrees; a read's numbering, its 2,000 lines and
+100 KiB, the next offset, an offset past the end, a cut line, and the
+whole file's digest on every partial read; binary, empty, non-UTF-8 and
+missing files and a directory naming `glob`; a write creating its
+directories, refusing an unread file and one changed since, and
+replacing one read or written; an edit's empty, identical, missing and
+repeated `old_string`, `replace_all`, a stale digest and a non-UTF-8
+file; and `glob`'s segments, `**`, classes, braces, dot files, `.git`,
+order and cap. `src/shell.rs` covers the exit status and interleaved
+output, empty input and the cleared environment, a timeout and a cancel
+killing the process with the output streamed before it, a descendant
+holding the pipe not holding the call, a process that closes its output
+still waited for, a process writing without pause timed out and
+cancelled and a descendant writing after its parent held no longer than
+the drain, a character split between head and tail, the head and tail
+kept and shown with the omitted count, the timeout's bounds, grep's and
+sed's argv with a pattern and a path that look like options, td-txt run
+under the applet's name through a stand-in script, and grep's rendering
+of no matches, its line cap and its errors. `src/files.rs` also covers
+lines split across pieces, a CRLF among them, a line of a million
+two-byte characters, and patterns that would be exponential to a naive
+matcher; a device and a FIFO refused by each file tool, a read
+cancelled, eight replacements of one read of which one lands and four
+creations of which one does, and nested, chained and over-long brace
+groups and patterns. `src/host.rs` covers every call and reply
+round-tripping, an unknown tool, a malformed reply, and replies to calls
+not in flight dropped; `src/toolhost.rs` the read-before-write rule
+across the protocol, two shell calls side by side with one streaming and
+cancelled, calls past 16 refused, a call with a missing argument refused
+and the host serving on, a result past the frame sent as an error, live
+output cut between characters, a host without worktrees or td-txt, and
+its arguments. `tests/tool_host.rs` runs the built program as a tool
+host over a pipe, and its input closing, which interrupts the call it
+was running and ends it. Its `grep_and_sed_run_td_txt` runs td-txt's
+grep and sed, `--sandbox` refusing a `w` command, against a td-txt named
+by `TD_AGENT_TXT`; it is ignored by default, since the gate builds no
+td-txt for td-agent's tests.
 
 **As built (the File menu).** `src/menu.rs` covers each item's action
 in order, File's shortcuts being chords the window binds and Help's
