@@ -956,6 +956,31 @@ pub fn qemu_install_system_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::install::run_system(&runner)
 }
 
+/// Install the production system device-bound from an ISO under the pinned
+/// swtpm (td-install/ENCRYPTION.md increment 5). Outside the integration
+/// tier, like `qemu-secret-system`; without `--tpm` it is a host gap.
+pub fn qemu_install_encrypted_cli(args: &[String]) -> Result<(), String> {
+    let tpm = crate::checks::qemu_boot::encrypted::options(args)?.ok_or_else(|| {
+        format!(
+            "{HOST_GAP}qemu-install-encrypted needs the pinned swtpm: \
+             --tpm /absolute/path/to/swtpm"
+        )
+    })?;
+    oracle_host(true)?;
+    let targets = crate::checks::qemu_boot::encrypted::TARGETS;
+    ensure_targets_provenance(targets)?;
+    let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
+    let name = scratch_name("qemu-install-encrypted", &["system-x86-64"]);
+    let runner = RecipeCheckRunner::new(root, &name)?
+        .with_streamed_progress()
+        .with_allowed_builds(oracle_reach(targets)?);
+    if let Err(error) = crate::warm::preflight(&runner, targets, crate::warm::WarmMode::Automatic) {
+        eprintln!("   [warm] {error} — continuing; the build reports what it cannot resolve");
+    }
+    let _lock = lock_ladder_for_run(&runner)?;
+    crate::checks::qemu_boot::encrypted::run(&runner, &tpm)
+}
+
 fn qemu_kernel_cli(
     args: &[String],
     command: &str,
@@ -12092,6 +12117,7 @@ chmod 755 '{}'
             "qemu_boot_system_cli",
             "qemu_boot_uefi_cli",
             "qemu_install_cli",
+            "qemu_install_encrypted_cli",
             "qemu_install_system_cli",
             "qemu_secret_cli",
             "qemu_secret_system_cli",

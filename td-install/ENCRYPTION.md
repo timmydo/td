@@ -465,20 +465,43 @@ consented plan. Record ciphertext/header checks and the absence of the
 volume key, protector secrets and recovery key from the ESP, logs, scratch
 artifacts and command lines.
 
-Increment 5's encrypted-installation oracle is separate from the
-always-run integration tier and provisioned like `qemu-secret-system`,
-with an explicit swtpm path; without one it is an unprovisioned skip. Its
-guest drives the service with the device-bound operand onto a disposable
-disk, as both of its peers, typing the displayed recovery key back. It
-then opens the volume with that recovery key and checks the ciphertext
-(no Btrfs superblock or staged plaintext in the data segment, on a disk
-that starts zeroed, so it claims no erasure), the token
-read back through td's reader, and the published deployment. It checks
-that no recovery key or protector secret appears on the ESP, in the
-workspace or in any `/proc/*/cmdline` sampled while cryptsetup runs. It
-derives the destination's partition devices from the kernel's block
-inventory, never from `/dev/vda` literals. A no-TPM leg requires the
-operand's refusal with the disk unchanged.
+Increment 5's encrypted-installation oracle, `td-recipe-eval
+qemu-install-encrypted --tpm /absolute/path/to/swtpm`, is separate from
+the integration tier. Like `qemu-secret-system` it needs an explicit
+swtpm path (td-secret/DESIGN.md "TPM validation" says which builds
+serve); without one it is an unprovisioned host gap, not a usage error.
+Its guest drives the service with the device-bound operand onto a
+disposable disk whose two table ranges hold a valid GPT the host seeded,
+as both of its peers: it fetches the recovery key once, requires a
+second ask refused as sent and a mistyped type-back refused as a
+mismatch with the phase continuing, and types the key back. Reaching the
+phase is the evidence of verifying boot's checks, the token read back
+from the header cryptsetup wrote through td's reader and the TPM's
+verification of the sealed object among them; in the phase both of the
+disk's table ranges, which held the seeded table when the service
+started, must read zero. After completion it opens the volume with the
+recovery key, where a mistyped key fails, and requires the published
+deployment and the settings inside; the host independently parses both
+LUKS2 header copies and, through td-engine's GPT reader, the table,
+whose volume partition must be whole 4 KiB encryption sectors, and
+checks the ciphertext (no Btrfs superblock or staged plaintext in the
+data segment, which starts zeroed, so it claims no erasure). The
+recovery key must appear nowhere on the whole disk (ESP, header and
+ciphertext alike, read after the clean page cache is dropped), nowhere
+in the opened volume's plaintext, on the console or in any
+`/proc/*/cmdline` sampled while the service ran, and the service leaves
+no workspace. The protector secret never leaves td-install, so the
+oracle cannot look for it; it requires instead that every sampled
+cryptsetup command line is exactly one of td-install's documented
+argument lists, that its environment is empty, and that `luksFormat`
+and `luksAddKey` were among those sampled, the two invocations the host
+requires to have been seen. Sampling may still miss a short-lived process, so it is not
+proof that no other process carried a secret. It derives the
+destination's partition devices from the kernel's block inventory,
+never from `/dev/vda` literals. A no-TPM leg requires the operand's
+refusal with the disk unchanged, and a leg cut off in the recovery-key
+phase leaves both table ranges zero. The installed system is not booted:
+its release is increment 6.
 
 For the protected tier, require a real encrypted read/write roundtrip and
 reboot persistence; wrong PIN, missing token and changed boot measurements

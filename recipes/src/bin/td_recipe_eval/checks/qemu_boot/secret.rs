@@ -432,7 +432,7 @@ pub(crate) fn options(args: &[String]) -> Result<Option<PathBuf>, String> {
     }
 }
 
-fn verify_swtpm(executable: &Path) -> Result<(), String> {
+pub(super) fn verify_swtpm(executable: &Path) -> Result<(), String> {
     let version = Command::new(executable)
         .arg("--version")
         .output()
@@ -443,14 +443,14 @@ fn verify_swtpm(executable: &Path) -> Result<(), String> {
     Ok(())
 }
 
-struct Emulator {
+pub(super) struct Emulator {
     child: std::process::Child,
-    socket: PathBuf,
+    pub(super) socket: PathBuf,
     log: PathBuf,
 }
 
 impl Emulator {
-    fn start(executable: &Path, root: &Path, case: &str) -> Result<Self, String> {
+    pub(super) fn start(executable: &Path, root: &Path, case: &str) -> Result<Self, String> {
         let state = if case == "tpm-other" {
             "other"
         } else {
@@ -518,7 +518,7 @@ impl Emulator {
         }
     }
 
-    fn diagnostic(&self, message: &str) -> String {
+    pub(super) fn diagnostic(&self, message: &str) -> String {
         let mut bytes = Vec::new();
         match File::open(&self.log).and_then(|file| file.take(65_536).read_to_end(&mut bytes)) {
             Ok(_) => format!(
@@ -529,7 +529,7 @@ impl Emulator {
         }
     }
 
-    fn finish(mut self) -> Result<(), String> {
+    pub(super) fn finish(mut self) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = self

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+mod encrypted;
 #[allow(dead_code, reason = "shared codec; this fixture is its consent end")]
 #[path = "../../td-install/src/installation_consent.rs"]
 mod installation_consent;
@@ -854,36 +855,11 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
         check_source_plan_observation(device, deployment, &id)?;
     }
     if system_autotest {
-        if !Path::new("/dev/loop0").exists() {
-            applet(&["mknod", "/dev/loop0", "b", "7", "0"])?;
-        }
-        command("/bin/losetup", &["-r", "/dev/loop0", "/source/root.erofs"])?;
-        applet(&[
-            "mount",
-            "-t",
-            "erofs",
-            "-o",
-            "ro,nodev,nosuid,noexec",
-            "/dev/loop0",
-            "/root-image",
-        ])?;
-        command(
-            "/bin/td-firstboot",
-            &["check-primary-name", "/root-image", USERNAME],
-        )?;
+        mount_system_root()?;
     }
     let loops = bound_loops()?;
     let uuid = if system_autotest {
-        // The root image's links name its store, as they do on a live root.
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create("/td/store")
-            .map_err(|error| format!("create /td/store: {error}"))?;
-        applet(&["mount", "-o", "bind", "/root-image/td/store", "/td/store"])?;
-        // The image view is noexec and the bind inherits it; a live root's
-        // store executes, mkfs.btrfs among it.
-        applet(&["mount", "-o", "remount,bind,ro,nodev,nosuid", "/td/store"])?;
+        bind_root_store()?;
         let uuid = served_install(device, media, deployment, &id)?;
         command("/bin/umount", &["/td/store"])?;
         uuid
@@ -918,6 +894,42 @@ fn install(device: &str, interrupt: bool, system_autotest: bool) -> Result<(), S
     applet(&["sync"])?;
     report(std::io::stdout(), format_args!("{DIRECT_MARKER}"))?;
     report(std::io::stdout(), format_args!("{INSTALL_MARKER}"))
+}
+
+/// The signed EROFS, read-only on a loop, as the service's verified root,
+/// once the primary account name is admitted against it.
+fn mount_system_root() -> Result<(), String> {
+    if !Path::new("/dev/loop0").exists() {
+        applet(&["mknod", "/dev/loop0", "b", "7", "0"])?;
+    }
+    command("/bin/losetup", &["-r", "/dev/loop0", "/source/root.erofs"])?;
+    applet(&[
+        "mount",
+        "-t",
+        "erofs",
+        "-o",
+        "ro,nodev,nosuid,noexec",
+        "/dev/loop0",
+        "/root-image",
+    ])?;
+    command(
+        "/bin/td-firstboot",
+        &["check-primary-name", "/root-image", USERNAME],
+    )
+}
+
+/// The root image's store at `/td/store`, so its absolute links resolve as
+/// they do on a live root.
+fn bind_root_store() -> Result<(), String> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create("/td/store")
+        .map_err(|error| format!("create /td/store: {error}"))?;
+    applet(&["mount", "-o", "bind", "/root-image/td/store", "/td/store"])?;
+    // The image view is noexec and the bind inherits it; a live root's
+    // store executes, mkfs.btrfs and cryptsetup among it.
+    applet(&["mount", "-o", "remount,bind,ro,nodev,nosuid", "/td/store"])
 }
 
 /// The raw formatter's path, as the small oracle and the interrupted and
@@ -1012,49 +1024,104 @@ fn served_install(
     deployment: [u8; 32],
     id: &str,
 ) -> Result<String, String> {
-    use std::os::fd::OwnedFd;
-    use std::os::unix::net::UnixStream;
-    // A live boot's init records the deployment the root was
-    // authenticated as; the fixture's validation of the source stands in.
+    record_deployment(id)?;
+    let mut service = Service::start(installation_plan::Storage::Unencrypted, Stdio::inherit())?;
+    let served = drive_service(&mut service, device, media, deployment);
+    let uuid = service.finish(served)?;
+    report(
+        std::io::stdout(),
+        format_args!("{SERVED_MARKER} {uuid} {device}"),
+    )?;
+    Ok(uuid)
+}
+
+/// A live boot's init records the deployment the root was authenticated
+/// as; the fixture's validation of the source stands in.
+fn record_deployment(id: &str) -> Result<(), String> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open("/run/td-deployment")
         .and_then(|mut record| record.write_all(format!("{id}\n").as_bytes()))
-        .map_err(|error| format!("record the booted deployment: {error}"))?;
-    let (installer, theirs) =
-        UnixStream::pair().map_err(|error| format!("installer channel: {error}"))?;
-    let (authority, channel) =
-        UnixStream::pair().map_err(|error| format!("consent channel: {error}"))?;
-    let mut child = Command::new("/bin/td-install")
-        .args([
-            "serve",
+        .map_err(|error| format!("record the booted deployment: {error}"))
+}
+
+/// `td-install serve` with its operands; this fixture holds the far end of
+/// both of its channels.
+struct Service {
+    child: std::process::Child,
+    installer: std::os::unix::net::UnixStream,
+    authority: std::os::unix::net::UnixStream,
+}
+
+impl Service {
+    /// Started as td-authd starts it: root, an empty environment and `/` as
+    /// its directory. Device-bound storage adds the control-plane operand
+    /// td-authd never passes.
+    fn start(storage: installation_plan::Storage, stderr: Stdio) -> Result<Self, String> {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let (installer, theirs) =
+            UnixStream::pair().map_err(|error| format!("installer channel: {error}"))?;
+        let (authority, channel) =
+            UnixStream::pair().map_err(|error| format!("consent channel: {error}"))?;
+        let mut args = vec!["serve"];
+        if storage == installation_plan::Storage::DeviceBound {
+            args.extend(["--storage", "device-bound"]);
+        }
+        args.extend([
             "/bin/td-boot",
             "/media",
             "/trusted.pub",
             "/root-image",
             "/bin/td-firstboot",
-        ])
-        .env_clear()
-        .current_dir("/")
-        .stdin(Stdio::from(OwnedFd::from(theirs)))
-        .stdout(Stdio::from(OwnedFd::from(channel)))
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("start the installation service: {error}"))?;
-    let served = drive_service(installer, authority, device, media, deployment);
-    // Closing the installer's channel ends a finished service.
-    if served.is_err() {
-        // The service may already have exited; it is reaped either way.
-        let _ = child.kill();
+        ]);
+        let child = Command::new("/bin/td-install")
+            .args(args)
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::from(OwnedFd::from(theirs)))
+            .stdout(Stdio::from(OwnedFd::from(channel)))
+            .stderr(stderr)
+            .spawn()
+            .map_err(|error| format!("start the installation service: {error}"))?;
+        Ok(Self {
+            child,
+            installer,
+            authority,
+        })
     }
-    let status = child.wait();
-    let uuid = served?;
-    let status = status.map_err(|error| format!("wait for the installation service: {error}"))?;
-    if !status.success() {
-        return Err(format!("the installation service exited {status}"));
+
+    /// Closes both channels, which ends a finished service, and requires it
+    /// to exit successfully with its workspace gone. A drive that failed
+    /// kills it first; it is reaped either way.
+    fn finish<T>(self, driven: Result<T, String>) -> Result<T, String> {
+        let Self {
+            mut child,
+            installer,
+            authority,
+        } = self;
+        drop(installer);
+        drop(authority);
+        if driven.is_err() {
+            // The service may already have exited; it is reaped either way.
+            let _ = child.kill();
+        }
+        let status = child.wait();
+        let value = driven?;
+        let status =
+            status.map_err(|error| format!("wait for the installation service: {error}"))?;
+        if !status.success() {
+            return Err(format!("the installation service exited {status}"));
+        }
+        require_no_workspace()?;
+        Ok(value)
     }
+}
+
+/// The service left no `td-install-` workspace in `/run`.
+fn require_no_workspace() -> Result<(), String> {
     for entry in fs::read_dir("/run").map_err(|error| format!("list /run: {error}"))? {
         let entry = entry.map_err(|error| format!("read /run: {error}"))?;
         if entry
@@ -1068,24 +1135,47 @@ fn served_install(
             ));
         }
     }
-    report(
-        std::io::stdout(),
-        format_args!("{SERVED_MARKER} {uuid} {device}"),
-    )?;
-    Ok(uuid)
+    Ok(())
 }
 
-/// One installation through the service's protocols, to its finished
-/// report; both channels close when it returns.
+/// One unencrypted installation through the service's protocols, to its
+/// finished report.
 fn drive_service(
-    mut installer: std::os::unix::net::UnixStream,
-    mut authority: std::os::unix::net::UnixStream,
+    service: &mut Service,
     device: &str,
     media: &str,
     deployment: [u8; 32],
 ) -> Result<String, String> {
+    let plan = start_installation(
+        service,
+        device,
+        media,
+        deployment,
+        installation_plan::Storage::Unencrypted,
+    )?;
+    let nonce = *plan.nonce();
+    let mut phases = Vec::new();
+    poll_installation(&mut service.installer, nonce, &mut phases, None)?;
+    require_phase_order(&phases, installation_plan::Storage::Unencrypted)?;
+    require_finished(&mut service.authority, nonce)?;
+    plan_uuid(&plan)
+}
+
+/// Greets both channels, proposes the target with the fixed settings,
+/// executes the review and consents to it on the consent channel, through
+/// the started report. Returns the plan the service reviewed, which must be
+/// of the validated source, the proposed disk and `storage`.
+fn start_installation(
+    service: &mut Service,
+    device: &str,
+    media: &str,
+    deployment: [u8; 32],
+    storage: installation_plan::Storage,
+) -> Result<installation_plan::Plan, String> {
     use installation_consent as consent;
     use installation_protocol::{self as wire, Reply, Request, State};
+    let installer = &mut service.installer;
+    let authority = &mut service.authority;
     let name = device
         .strip_prefix("/dev/")
         .ok_or("invalid target device")?;
@@ -1106,7 +1196,7 @@ fn drive_service(
         .write_all(consent::GREETING)
         .map_err(|error| format!("greet the consent channel: {error}"))?;
 
-    let Reply::Destinations(candidates) = exchange(&mut installer, &Request::Destinations)? else {
+    let Reply::Destinations(candidates) = exchange(installer, &Request::Destinations)? else {
         return Err("the service refused discovery".into());
     };
     if candidates
@@ -1124,7 +1214,7 @@ fn drive_service(
         .clone();
     let settings = installation_plan::Settings::new(USERNAME, HOSTNAME, "us", TIMEZONE_ID)?;
     let plan = match exchange(
-        &mut installer,
+        installer,
         &Request::Propose {
             destination: destination.clone(),
             settings,
@@ -1135,16 +1225,20 @@ fn drive_service(
     };
     if *plan.deployment() != deployment
         || *plan.destination() != destination
-        || plan.storage() != installation_plan::Storage::Unencrypted
+        || plan.storage() != storage
     {
-        return Err("the review is not of the source and disk proposed".into());
+        return Err("the review is not of the source, disk and storage proposed".into());
     }
+    let reviewed_storage = match storage {
+        installation_plan::Storage::Unencrypted => consent::Storage::Unencrypted,
+        installation_plan::Storage::DeviceBound => consent::Storage::DeviceBound,
+    };
     let nonce = *plan.nonce();
-    match exchange(&mut installer, &Request::Execute(plan.clone()))? {
+    match exchange(installer, &Request::Execute(plan.clone()))? {
         Reply::Status(State::AwaitingConsent(review)) if *review.as_bytes() == nonce => {}
         other => return Err(format!("execute did not await consent: {other:?}")),
     }
-    let review = match consent_report(&mut authority)? {
+    let review = match consent_report(authority)? {
         consent::Report::Review(review) => review,
         other => return Err(format!("consent was not asked: {other:?}")),
     };
@@ -1154,7 +1248,7 @@ fn drive_service(
         || review.hostname() != HOSTNAME
         || review.username() != USERNAME
         || *review.deployment() != deployment
-        || review.storage() != consent::Storage::Unencrypted
+        || review.storage() != reviewed_storage
     {
         return Err("the consent review is not the review held".into());
     }
@@ -1162,35 +1256,82 @@ fn drive_service(
     authority
         .write_all(&answer)
         .map_err(|error| format!("consent: {error}"))?;
-    match consent_report(&mut authority)? {
+    match consent_report(authority)? {
         consent::Report::Started(started) if started == nonce => {}
         other => return Err(format!("the installation did not start: {other:?}")),
     }
-    let mut phases: Vec<wire::Phase> = Vec::new();
+    Ok(plan)
+}
+
+/// Polls status every half second, recording each phase seen, until the
+/// installation `nonce` names completes or, with `until`, first reports
+/// that phase.
+fn poll_installation(
+    installer: &mut std::os::unix::net::UnixStream,
+    nonce: [u8; 32],
+    phases: &mut Vec<installation_protocol::Phase>,
+    until: Option<installation_protocol::Phase>,
+) -> Result<(), String> {
+    use installation_protocol::{Reply, Request, State};
     loop {
-        match exchange(&mut installer, &Request::Status)? {
+        match exchange(installer, &Request::Status)? {
             Reply::Status(State::Running(running, phase)) if *running.as_bytes() == nonce => {
                 if phases.last() != Some(&phase) {
                     phases.push(phase);
                 }
+                if until == Some(phase) {
+                    return Ok(());
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            Reply::Status(State::Complete(done)) if *done.as_bytes() == nonce => break,
+            Reply::Status(State::Complete(done))
+                if until.is_none() && *done.as_bytes() == nonce =>
+            {
+                return Ok(())
+            }
             other => return Err(format!("the installation did not complete: {other:?}")),
         }
     }
-    // The phases run in order, so each one seen is later than the last.
-    let order = |phase: &wire::Phase| wire::Phase::ALL.iter().position(|each| each == phase);
-    if !phases.windows(2).all(|pair| match pair {
+}
+
+/// The phases run in order, so each one seen is later than the last; the
+/// recovery-key phase is a device-bound installation's last, and only its.
+fn require_phase_order(
+    phases: &[installation_protocol::Phase],
+    storage: installation_plan::Storage,
+) -> Result<(), String> {
+    use installation_protocol::Phase;
+    let order = |phase: &Phase| Phase::ALL.iter().position(|each| each == phase);
+    let ordered = phases.windows(2).all(|pair| match pair {
         [one, other] => order(one) < order(other),
         _ => false,
-    }) {
+    });
+    let recovery = match storage {
+        installation_plan::Storage::Unencrypted => !phases.contains(&Phase::RecoveryKey),
+        installation_plan::Storage::DeviceBound => phases.last() == Some(&Phase::RecoveryKey),
+    };
+    if !ordered || !recovery {
         return Err(format!("installation phases out of order: {phases:?}"));
     }
-    match consent_report(&mut authority)? {
-        consent::Report::Finished(finished, consent::Outcome::Complete) if finished == nonce => {}
-        other => return Err(format!("the installation did not finish: {other:?}")),
+    Ok(())
+}
+
+/// td-authd's finished report says the installation completed.
+fn require_finished(
+    authority: &mut std::os::unix::net::UnixStream,
+    nonce: [u8; 32],
+) -> Result<(), String> {
+    use installation_consent as consent;
+    match consent_report(authority)? {
+        consent::Report::Finished(finished, consent::Outcome::Complete) if finished == nonce => {
+            Ok(())
+        }
+        other => Err(format!("the installation did not finish: {other:?}")),
     }
+}
+
+/// The plan's volume UUID in its canonical text.
+fn plan_uuid(plan: &installation_plan::Plan) -> Result<String, String> {
     let uuid = plan
         .volume_uuid()
         .iter()
@@ -1851,6 +1992,9 @@ fn run() -> Result<(), String> {
     match read(Path::new("/fixture-phase"), 32)?.as_slice() {
         b"install\n" => install(&target()?, false, false),
         b"install-system\n" => install(&target()?, false, true),
+        b"install-encrypted\n" => encrypted::install(&target()?, false),
+        b"install-encrypted-cut\n" => encrypted::install(&target()?, true),
+        b"install-no-tpm\n" => encrypted::refuse_without_tpm(&target()?),
         b"interrupt\n" => install(&target()?, true, false),
         b"install-scratch\n" => scratch_limited_install(&target()?),
         b"protect-media\n" => protect_writable_media(&target()?),
@@ -2007,6 +2151,30 @@ mod tests {
             std::os::unix::fs::symlink(&target, &path).unwrap();
             assert!(check(&scratch.0).is_err());
         }
+    }
+
+    #[test]
+    fn phases_run_in_order_and_only_device_bound_storage_ends_in_the_key() {
+        use installation_plan::Storage;
+        use installation_protocol::Phase;
+        let unencrypted = [
+            Phase::PreparingDisk,
+            Phase::WritingFilesystems,
+            Phase::VerifyingBoot,
+        ];
+        require_phase_order(&unencrypted, Storage::Unencrypted).unwrap();
+        assert!(require_phase_order(&unencrypted, Storage::DeviceBound).is_err());
+        assert!(require_phase_order(&[], Storage::DeviceBound).is_err());
+        require_phase_order(&[], Storage::Unencrypted).unwrap();
+        let bound = [Phase::PublishingDeployment, Phase::RecoveryKey];
+        require_phase_order(&bound, Storage::DeviceBound).unwrap();
+        assert!(require_phase_order(&bound, Storage::Unencrypted).is_err());
+        let backwards = [
+            Phase::VerifyingBoot,
+            Phase::WritingFilesystems,
+            Phase::RecoveryKey,
+        ];
+        assert!(require_phase_order(&backwards, Storage::DeviceBound).is_err());
     }
 
     #[test]

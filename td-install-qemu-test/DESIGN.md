@@ -1,7 +1,8 @@
 # Native QEMU installation fixture
 
 This crate is a diagnostic PID-1 program for `td-recipe-eval qemu-install`
-and the live installation phase of `qemu-install-system`.
+and the live installation phases of `qemu-install-system` and
+`qemu-install-encrypted`.
 It is built from source through the ordinary Rust ladder and is never packed
 in the system or graphical installer profile. It adds no user-facing device
 admission, account configuration or signing identity. In
@@ -591,3 +592,83 @@ the real service must retain source mounts and bind backing-device
 identity in its plan. No hotplug admission, protection from privileged
 raw I/O or physical thumbdrive compatibility is claimed. The full-system
 matrix remains unchanged.
+
+## Device-bound installation
+
+`qemu-install-encrypted` (td-install/DESIGN.md, ENCRYPTION.md "Acceptance
+evidence") boots three phases of this fixture from the full-system ISO
+through optical firmware media onto a fresh virtio target. Each mounts
+the source, validates it, loop-mounts the signed EROFS as the verified
+root with its store bound at `/td/store`, and records the deployment, as
+the full-system installation does, and starts `td-install serve
+--storage device-bound` with the same operands and channels.
+
+`install-no-tpm` runs with no TPM attached: it first requires neither
+`/dev/tpm0` nor `/dev/tpmrm0`, then that the service exits unsuccessfully
+with td-install's no-usable-TPM diagnostic on its captured stderr, that
+neither channel receives a byte before end of file, and that the disk's
+canaries are unchanged; then `TD-INSTALL-NO-TPM-REFUSED`.
+
+`install-encrypted` drives the service as in "Installation through the
+service", except that the review, the consent report and the plan must
+name device-bound storage and the polled phases must end in the
+recovery-key phase. Before the service starts, the fixture requires both
+of the disk's GPT ranges to hold the table the host seeded, so the
+service is what clears them. A thread samples every process's command
+line in `/proc` every two milliseconds from before the service starts
+until it exits, and the environment of each whose program is named
+cryptsetup; a line or environment over 4 KiB refuses rather than escape
+the check. In the phase the fixture reads, without a claim, both GPT
+ranges (the protective MBR, primary header and entry array; the backup
+array and header) and requires them zero, then reports
+`TD-INSTALL-ENCRYPTED-NO-TABLE` with the plan's UUID. It asks for the
+recovery key once, requires a second ask refused as sent (16), types
+back the key with its last digit changed and requires the mismatch
+refusal (17) and status still in the phase, then types the key back and
+requires status still in the phase (`TD-INSTALL-RECOVERY-KEY-TYPED-BACK`)
+and, polling, completion and the finished-complete report. The service
+must exit successfully and leave no workspace or bound loop. No sampled
+line may hold the key's 48 digits or its hyphenated display form; every
+sampled cryptsetup line must be exactly one of td-install's argument
+lists (`luksFormat`, `luksAddKey`, `token import`, `open`,
+`--test-passphrase`, `close`, `status`), word for word, its variable
+words only the plan's UUID, a `/dev/loopN`, the `td-install-` mapping
+name, a keyslot 0 or 1 and the new key's `/proc/PID/fd/N`; and none may
+have an environment. The record `TD-INSTALL-ENCRYPTED-CMDLINES` carries
+the distinct lines, the cryptsetup lines and the invocations seen, and
+the host requires `luksFormat` and `luksAddKey` among them, the two
+invocations it requires to have been sampled.
+
+The fixture then syncs and drops the clean page cache, reads every byte
+of the disk with an overlap no form of the key fits in and requires
+neither form anywhere (`TD-INSTALL-ENCRYPTED-KEY-ABSENT` with the byte
+count, which the host requires to be the disk's capacity). It rereads
+the disk's partitions and takes exactly partitions 1 and 2 from the
+kernel's block inventory under the disk. The verified root's
+cryptsetup, run with an empty environment and the key on standard
+input, must accept the key for keyslot 0 with `--test-passphrase` and
+refuse the mistyped key with exit 2; it opens partition 2 itself as
+`td-oracle`, which stock cryptsetup can only when the partition is whole
+4 KiB encryption sectors, reads every byte of the mapping for either
+form of the key, and then `td-boot verify` on the mounted volume must
+name the validated deployment as current and `@var` hold the reviewed
+settings; it closes the mapping, `status` answering inactive (exit 4)
+(`TD-INSTALL-ENCRYPTED-VOLUME` with the UUID, partition, deployment and
+the mapping's bytes read, which the host requires to be the data
+segment's length). Last it syncs and reports
+`TD-INSTALL-ENCRYPTED-WRITTEN`, then the bare
+`TD-INSTALL-ENCRYPTED-END` on which the host stops. No record carries
+the key or anything derived from it; every copy the fixture holds is
+zeroed on drop.
+
+`install-encrypted-cut` stops after the second ask is refused: it
+reports `TD-INSTALL-ENCRYPTED-CUT` and `TD-INSTALL-ENCRYPTED-END`, both
+channels still open and the key unconfirmed, and parks for the host's
+power cut. The host then requires the seeded table's ranges zero and the
+LUKS2 header with both keyslots.
+
+The protector secret never leaves td-install, so the fixture cannot
+search for it; the argument and environment checks are its evidence.
+Sampling may miss a short-lived process, which is why it is not proof
+that no other process carried the key, and the installed system is not
+booted, since selector release is ENCRYPTION.md increment 6.

@@ -30,6 +30,7 @@
 //! always means a real boot happened.
 pub(crate) mod build_iso;
 pub(crate) mod efi;
+pub(crate) mod encrypted;
 pub(crate) mod install;
 pub(crate) mod live;
 pub(crate) mod media;

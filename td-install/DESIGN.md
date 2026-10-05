@@ -2014,6 +2014,39 @@ throwaway signing key on the host, and does not enter the shipped closure.
 It retains the stock system's account defaults: username/PIN selection,
 production consent and hardware support remain separate milestones.
 
+`td-recipe-eval qemu-install-encrypted --tpm /absolute/path/to/swtpm` is
+"Device-bound formatting"'s oracle, outside the integration tier
+(ENCRYPTION.md "Acceptance evidence"); without `--tpm` it is an
+unprovisioned host gap (exit 69). It builds what `qemu-install-system`
+builds and boots the same live fixture through optical firmware media
+onto a fresh 512-byte virtio target, each
+leg from its own ISO and firmware variables, the emulated TPM a tpm-tis
+device on a fresh swtpm state behind a private socket. A no-TPM leg
+requires `serve --storage device-bound` to refuse with its diagnostic and
+no byte on either channel, and the whole target unchanged. The installed
+leg's and the cut leg's targets start with a valid GPT the host wrote
+into the two table ranges alone. The installed leg drives the
+device-bound service through the recovery-key phase as both of its
+peers, then opens the volume with the key typed back; the guest ends
+each encrypted leg with a bare `TD-INSTALL-ENCRYPTED-END` line, on which
+the host stops, so the records before it are whole. The host then reads
+the image: the table through td-engine's GPT reader (both copies, CRCs
+and bounds), the ESP of the fixed layout and the volume after it on
+whole 4 KiB encryption sectors, both LUKS2 header copies by
+their own parse (magic, version, 16 KiB size, offsets, SHA-256
+checksums, UUID, label, keyslots 0 and 1 at PBKDF2-SHA256/1000 over a
+512-bit key, one first-boot td-protector token on keyslot 1, the
+AES-XTS segment at 16 MiB in 4 KiB sectors, the layout sizes), and the
+data segment: written where Btrfs keeps its first two superblocks, with
+no Btrfs magic, hostname, time zone or manifest header at any offset.
+The data segment starts zeroed, so this shows the filesystem only inside
+the mapping and claims no erasure. A cut leg powers the guest off in the
+phase after the key was sent: the host finds the seeded table's ranges
+zero and the header with both keyslots. Every console the host saves or
+prints has key-shaped text redacted, after the check that refuses it. The installed system is not booted:
+selector release is increment 6. td-install-qemu-test/DESIGN.md
+"Device-bound installation" owns the guest's side.
+
 The oracle signs with a **per-run throwaway key**: generate a keypair, sign
 the staged bundle, build `td-boot` pinned to that run's public key, boot, and
 require the machine to reach its target. This exercises the entire

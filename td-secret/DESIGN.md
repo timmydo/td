@@ -837,7 +837,12 @@ Build them using their upstream autotools instructions into a host scratch
 prefix (libtpms with TPM2; swtpm can disable tests, CUSE, seccomp, SELinux
 and GnuTLS for this socket-only oracle). Host compiler and development
 libraries are prerequisites for that scratch build, never inputs to td's
-target graph. Then run:
+target graph. A host distribution's build of the same releases (swtpm
+0.10.1 against libtpms 0.10.2) serves equally: it is host tooling in the
+same way, outside every td artifact. The oracles check only swtpm's
+`--version` line; swtpm reports no libtpms release (its `--print-info`
+names the TPM specification and firmware date, not the library), so the
+libtpms version is the operator's to match and is unchecked. Then run:
 
 ```
 TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-secret/Cargo.toml emulator_ -- --ignored
@@ -868,6 +873,10 @@ and the eleven HID guests below to the authority checks. The host starts a
 private software TPM control socket and attaches QEMU's emulated TIS device; there is no host TPM
 passthrough. The source-built test executable calls the unchanged
 `Device::open` and `Client` implementations through `/dev/tpmrm0`.
+`td-recipe-eval qemu-install-encrypted --tpm` (td-install/ENCRYPTION.md
+"Acceptance evidence") requires the same pinned emulator and starts it
+the same way, from fresh state for each leg, attached to a UEFI firmware
+boot whose measurements reach it.
 
 The sealing guest extends SHA-256 PCR 7 with a fixed fixture measurement,
 seals a known fixture key with a metadata binding, verifies immediate

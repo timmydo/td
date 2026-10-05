@@ -912,7 +912,9 @@ installation") and opens the consent channel, so an execute td-authd answers
 with consent installs. Tests drive the core's two ends with fakes and the
 execution on a regular-file disk; `qemu-install-system` drives the service
 itself as root in a guest, as both of its peers, onto a disposable disk it
-then boots (td-install-qemu-test/DESIGN.md). The service holds the source
+then boots (td-install-qemu-test/DESIGN.md), and `qemu-install-encrypted`
+drives it with the storage operand under an emulated TPM, typing the
+recovery key back (ENCRYPTION.md "Acceptance evidence"). The service holds the source
 directory open for its life, so the medium's filesystem, and the kernel's
 exclusive claim on the disk under it, outlive even a lazy unmount, and that
 disk is never claimable as a destination; the live root, a loop over the

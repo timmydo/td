@@ -13,7 +13,7 @@ const INSTALLED_SYSTEM_MEMORY_MIB: &str = "4096";
 
 /// Only this module can create a writable installation target, in owned scratch.
 pub(super) struct TargetDisk {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     read_only: bool,
     sector_size: SectorSize,
     bus: DiskBus,
@@ -35,11 +35,11 @@ impl TargetDisk {
         )
     }
 
-    fn fingerprint(&self) -> Result<(u64, String), String> {
+    pub(super) fn fingerprint(&self) -> Result<(u64, String), String> {
         image_fingerprint(&self.path)
     }
 
-    fn seed_preservation_canaries(&self) -> Result<(), String> {
+    pub(super) fn seed_preservation_canaries(&self) -> Result<(), String> {
         let mut file = OpenOptions::new()
             .write(true)
             .open(&self.path)
@@ -160,7 +160,7 @@ const OUTPUTS: &[&str] = &[
     "tzdata",
 ];
 
-fn read(path: &Path) -> Result<Vec<u8>, String> {
+pub(super) fn read(path: &Path) -> Result<Vec<u8>, String> {
     let (file, len) = efi::input(path)?;
     let mut bytes = Vec::new();
     file.take(len + 1)
@@ -172,7 +172,7 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -184,9 +184,9 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-type PackedFile = (String, u32, Vec<u8>);
+pub(super) type PackedFile = (String, u32, Vec<u8>);
 
-fn initramfs(
+pub(super) fn initramfs(
     base: &[u8],
     common: &[PackedFile],
     phase: &str,
@@ -230,15 +230,15 @@ fn initramfs(
     Ok(image)
 }
 
-struct LiveInstaller {
-    kernel: PathBuf,
-    base: Vec<u8>,
-    common: Vec<PackedFile>,
-    extra: Vec<PackedFile>,
+pub(super) struct LiveInstaller {
+    pub(super) kernel: PathBuf,
+    pub(super) base: Vec<u8>,
+    pub(super) common: Vec<PackedFile>,
+    pub(super) extra: Vec<PackedFile>,
 }
 
 impl LiveInstaller {
-    fn load(runner: &RecipeCheckRunner, trust: &RunTrust) -> Result<Self, String> {
+    pub(super) fn load(runner: &RecipeCheckRunner, trust: &RunTrust) -> Result<Self, String> {
         let outputs = runner.build_and_stage("td-install-qemu-test", OUTPUTS)?;
         let [probe, linux, installer, firstboot, init, boot, kexec, btrfs, tzdata] =
             outputs.as_slice()
@@ -2551,7 +2551,7 @@ fn target_plan<'a>(target: &'a TargetDisk, marker: &'a str) -> BootPlan<'a> {
     result
 }
 
-fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
+pub(super) fn plan<'a>(path: &'a Path, read_only: bool, marker: &'a str) -> BootPlan<'a> {
     BootPlan {
         disk: Some(BootDisk::new(path, read_only)),
         mem: "2048",
@@ -2628,7 +2628,7 @@ fn selector_binding_diagnostic(console: &str, identity: &str, id: &str) -> Strin
     report
 }
 
-fn require(result: &BootResult, marker: &str, phase: &str) -> Result<(), String> {
+pub(super) fn require(result: &BootResult, marker: &str, phase: &str) -> Result<(), String> {
     if result.evidence.target && result.console.lines().any(|line| line.trim_end() == marker) {
         Ok(())
     } else {

@@ -274,7 +274,10 @@ toward the four-token bound, a malformed orphan, and a read error. No
 test reads a header cryptsetup wrote: that needs the source-built
 cryptsetup and its kernel crypto interfaces, which the host
 gate does not provide, so increment 5's encrypted-installation oracle
-reads one in the guest. An ignored oracle runs the protector lifecycle against
+(`qemu-install-encrypted`) reads one in the guest: the installer's
+verifying-boot check runs this reader and `verify_first_boot_object` on
+the header cryptsetup wrote, under the pinned swtpm, and the oracle
+requires the recovery-key phase that check gates. An ignored oracle runs the protector lifecycle against
 the pinned swtpm under td-secret's convention (`td-secret/DESIGN.md`, "TPM
 validation"):
 
