@@ -2144,6 +2144,38 @@ mod tests {
             .any(|(recipe, file)| *recipe == stem && staged_body(recipe, file) == path)
     }
 
+    /// The bodies that IMPLEMENT a retired tool rather than run one, each
+    /// freed for the tools it names and no other.
+    ///
+    /// td-util serves `find` and `xargs` as applets, so its crate root names
+    /// them in the applet table and each applet's diagnostics carry its own
+    /// name. Those are the words the scan looks for and none of them starts
+    /// the tool. Unlike `RUST_NOT_A_COMMAND_SURFACE` these bodies DO spawn —
+    /// `-exec` and `xargs` run what they are handed — so the reviewed claim
+    /// is narrower: they start only argv computed from their input, never a
+    /// program they name. `the_tool_providers_spawn_only_what_they_are_given`
+    /// is that claim's tripwire, in the same approximate, deciding-nothing
+    /// sense as its sibling's.
+    ///
+    /// Per file AND per tool, so `find.rs` growing an `xargs` literal is
+    /// scanned as before; a path that moves fails closed as the other
+    /// roster's does.
+    const TOOL_PROVIDER_BODIES: &[(&str, &str, &[&str])] = &[
+        ("td-util", "find.rs", &["find"]),
+        ("td-util", "main.rs", &["find", "xargs"]),
+        ("td-util", "xargs.rs", &["xargs"]),
+    ];
+
+    /// Whether this step writes a body `stem` provides `cmd` from.
+    fn provides(stem: &str, step: &Step, cmd: &str) -> bool {
+        let Some(path) = rust_module_path(step) else {
+            return false;
+        };
+        TOOL_PROVIDER_BODIES.iter().any(|(recipe, file, tools)| {
+            *recipe == stem && staged_body(recipe, file) == path && tools.contains(&cmd)
+        })
+    }
+
     /// The retired tools, named once: the farm branch and the text branch each
     /// scan for them, and a third added to one alone would be invisible on the
     /// other with every test still green.
@@ -2210,7 +2242,7 @@ mod tests {
             }
             for text in command_texts(step) {
                 for cmd in HOST_TOOLS {
-                    if !step_invokes(step, text, cmd) {
+                    if provides(stem, step, cmd) || !step_invokes(step, text, cmd) {
                         continue;
                     }
                     // The one exemption lives in `farm_invocation` above, which
@@ -3012,7 +3044,10 @@ mod tests {
     /// that is not the reviewed one.
     #[test]
     fn every_rostered_entry_names_a_body_the_recipe_writes() {
-        for &(stem, file) in RUST_NOT_A_COMMAND_SURFACE {
+        let providers = TOOL_PROVIDER_BODIES
+            .iter()
+            .map(|&(stem, file, _)| (stem, file));
+        for (stem, file) in RUST_NOT_A_COMMAND_SURFACE.iter().copied().chain(providers) {
             let body = staged_body(stem, file);
             let recipe = catalog::all()
                 .into_iter()
@@ -3194,6 +3229,105 @@ mod tests {
             "#![forbid(unsafe_code, dead_code)]\nfn main() {}\n",
         )]);
         assert_eq!(spawn_tripwire(&many), None);
+    }
+
+    /// Why a provider recipe looks able to start a program it names, or
+    /// `None`: a rostered provider body handing `Command::new` a literal, or
+    /// any other body of the recipe spawning at all. Approximate both ways —
+    /// a `concat!` or a `const` name passes, an aliased import reads as a
+    /// spawn — and, like `spawn_tripwire`, decides nothing.
+    fn provider_tripwire(stem: &str, recipe: &Recipe) -> Option<String> {
+        const SPAWN: &str = "Command::new(";
+        for step in recipe.steps.as_ref()? {
+            let Step::WriteFile { path, content, .. } = step else {
+                continue;
+            };
+            let provider = TOOL_PROVIDER_BODIES
+                .iter()
+                .any(|(name, file, _)| *name == stem && staged_body(name, file) == *path);
+            if !provider && (content.contains(SPAWN) || content.contains("process::Command")) {
+                return Some(format!("`{path}' spawns but provides no retired tool"));
+            }
+            for (at, _) in content.match_indices(SPAWN) {
+                let arg = content
+                    .get(at + SPAWN.len()..)
+                    .unwrap_or_default()
+                    .trim_start();
+                if arg.starts_with('"') || arg.starts_with("r\"") || arg.starts_with("r#") {
+                    return Some(format!("`{path}' spawns a program it names"));
+                }
+            }
+        }
+        None
+    }
+
+    /// A TRIPWIRE for `TOOL_PROVIDER_BODIES`: a provider spawns only the argv
+    /// it was given, so freeing its own tool's name cannot free a call.
+    #[test]
+    fn the_tool_providers_spawn_only_what_they_are_given() {
+        let mut seen = 0usize;
+        for (stem, recipe) in catalog::all() {
+            if !TOOL_PROVIDER_BODIES
+                .iter()
+                .any(|(name, _, _)| *name == stem)
+            {
+                continue;
+            }
+            seen += 1;
+            if let Some(why) = provider_tripwire(stem, &recipe) {
+                panic!(
+                    "provider recipe `{stem}': {why} — its rostered bodies are \
+                     exempt from the find/xargs scan for the tools they serve"
+                );
+            }
+        }
+        assert!(seen > 0, "no provider recipe was checked");
+
+        // ...and it FIRES.
+        let rs = |path: &str, content: &str| Step::WriteFile {
+            path: path.into(),
+            content: content.into(),
+            exec: false,
+        };
+        let find = staged_body("td-util", "find.rs");
+        for (body, want) in [
+            (
+                rs(&find, r#"Command::new("find")"#),
+                "spawns a program it names",
+            ),
+            (
+                rs(&find, r#"Command::new( r"sh")"#),
+                "spawns a program it names",
+            ),
+            (
+                rs(
+                    &staged_body("td-util", "less.rs"),
+                    "std::process::Command::new(p)",
+                ),
+                "spawns but provides no retired tool",
+            ),
+        ] {
+            let recipe = Recipe::gnu("td-util", "1").steps(vec![body]);
+            let why = provider_tripwire("td-util", &recipe).unwrap_or_default();
+            assert!(why.contains(want), "expected `{want}', got `{why}'");
+        }
+        let quiet = Recipe::gnu("td-util", "1").steps(vec![rs(&find, "Command::new(prog)")]);
+        assert_eq!(provider_tripwire("td-util", &quiet), None);
+
+        // The exemption is per tool: a provider body naming the OTHER tool,
+        // or a provider's name written anywhere else, is scanned as before.
+        let named =
+            |path: &str, text: &str| Recipe::gnu("td-util", "1").steps(vec![rs(path, text)]);
+        assert_eq!(
+            host_tool_invocation("td-util", &named(&find, r#"let a = "find";"#)),
+            None
+        );
+        assert!(host_tool_invocation("td-util", &named(&find, r#"let a = "xargs";"#)).is_some());
+        assert!(
+            host_tool_invocation("td-util", &named("{src}/find.rs", r#"let a = "find";"#))
+                .is_some()
+        );
+        assert!(host_tool_invocation("td-txt", &named(&find, r#"let a = "find";"#)).is_some());
     }
 
     /// The `.rs` rule above is narrow in the direction that matters: a staged

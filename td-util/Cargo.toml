@@ -2,7 +2,7 @@
 name = "td-util"
 version = "0.1.0"
 edition = "2021"
-description = "Static dependency-free multicall for td's diagnostics userland (clear, which, free, ps, dmesg)"
+description = "Static dependency-free multicall for td's diagnostics, pre-pivot and build-tool userland"
 license = "MIT"
 
 [[bin]]

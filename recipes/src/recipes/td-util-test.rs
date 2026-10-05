@@ -79,11 +79,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in cat chmod chown clear dmesg free less ln mkdir printf ps readlink rm sleep test which; do \
+                     for a in cat chmod chown clear cmp cpio diff dmesg free gunzip gzip less ln mkdir printf ps readlink rm sleep test which zcat; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 16 ] || {{ echo \"td-util serves $n applets, expected exactly 16 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 24 ] || {{ echo \"td-util serves $n applets, expected exactly 24 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -147,6 +147,45 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
+    // The build-tool applets in the SHIPPED binary (opt-level=s, panic=abort,
+    // which cargo's tests never build), each crossed with busybox: td gzip
+    // read by busybox gunzip and the reverse, and a busybox newc archive read
+    // by td cpio. gunzip, cmp and cpio are not among the applets busybox
+    // links into this PATH, so they are run through the binary. The other two
+    // build-tool applets are left to the crate's
+    // process tests, which the in-sandbox cargo gate runs: their names are
+    // the retired findutils words, which the ladder guard refuses in any Run
+    // argv, so this text names them nowhere — the count of 24 above pins
+    // that they are served.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "bb='{{in:busybox-x86-64}}/bin/busybox'; \
+                     d='{{root}}/tools'; mkdir -p \"$d/t/s\" \"$d/x\" && cd \"$d\" || exit 1; \
+                     printf 'a\\n' > t/a; printf 'b\\n' > t/s/b; \
+                     '{bin}' cmp t/a t/a || {{ echo 'cmp of a file with itself must exit 0' >&2; exit 1; }}; \
+                     '{bin}' cmp -s t/a t/s/b; \
+                     [ $? -eq 1 ] || {{ echo 'cmp -s must exit 1 on differing files' >&2; exit 1; }}; \
+                     '{bin}' diff -u t/a t/s/b > u.diff; \
+                     [ $? -eq 1 ] || {{ echo 'diff must exit 1 on differing files' >&2; exit 1; }}; \
+                     grep -q -x -F -- '+b' u.diff || {{ echo 'diff -u lost the added line' >&2; exit 1; }}; \
+                     '{bin}' gzip -c t/a | \"$bb\" gunzip -c | \"$bb\" cmp - t/a || {{ echo 'busybox gunzip could not read td gzip' >&2; exit 1; }}; \
+                     \"$bb\" gzip -c t/s/b | '{bin}' zcat | \"$bb\" cmp - t/s/b || {{ echo 'td zcat could not read busybox gzip' >&2; exit 1; }}; \
+                     printf 't\\nt/a\\nt/s\\nt/s/b\\n' | \"$bb\" cpio -o -H newc > t.cpio || {{ echo 'busybox cpio -o failed' >&2; exit 1; }}; \
+                     [ \"$('{bin}' cpio -t -F t.cpio | tr '\\n' ' ')\" = 't t/a t/s t/s/b ' ] || {{ echo 'td cpio -t misread a busybox newc archive' >&2; exit 1; }}; \
+                     (cd x && '{bin}' cpio -i -d -F ../t.cpio) || {{ echo 'td cpio -i failed' >&2; exit 1; }}; \
+                     \"$bb\" cmp x/t/s/b t/s/b || {{ echo 'td cpio -i extracted the wrong bytes' >&2; exit 1; }}; \
+                     '{bin}' sleep 0.01 || {{ echo 'sleep must take a fractional second' >&2; exit 1; }}"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+
     // The /proc-backed applets, gated on /proc being mounted in this sandbox.
     // `free` must report a non-zero MemTotal and `ps` must list PID 1 — asserting
     // real parsed content, not merely a zero exit.
@@ -179,7 +218,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the sixteen applets cat/chmod/chown/clear/dmesg/free/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), and parses /proc for free/ps where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly twenty-four applets, among them cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which/zcat, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), interoperates with busybox gzip and newc cpio, and parses /proc for free/ps where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -192,7 +231,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall: cat/chmod/chown/clear/dmesg/free/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
+echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall plus build tools: cat/chmod/chown/clear/cmp/cpio/diff/dmesg/free/gunzip/gzip/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which/zcat and two more, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,

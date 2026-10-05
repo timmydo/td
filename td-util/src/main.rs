@@ -21,8 +21,16 @@
 //! `/bin/<applet> -> td-util` symlink runs that applet. An explicit
 //! `td-util <applet> [args]` form covers the un-symlinked case.
 //!
+//! A third kind replaces busybox in the build graph: `find`, `xargs`, `cmp`,
+//! `diff`, `gzip`/`gunzip`/`zcat` and `cpio`, the tools recipes and the
+//! initramfs build drive. Each takes the subset those callers use and refuses
+//! the rest rather than guessing at it. `gzip` decodes with the engine's
+//! inflater and CRC, included below, so one decoder serves source preparation
+//! and this.
+//!
 //! Almost everything here is safe `std`: `/proc` and `/dev/kmsg` are ordinary
-//! files. `less` is the exception, and the reason this crate root `deny`s the
+//! files, and the build tools walk, read and spawn through `std`. `less` is
+//! the exception, and the reason this crate root `deny`s the
 //! unsafe lint rather than `forbid`ding it — a pager that cannot take a keystroke
 //! without waiting for Enter, or ask how many rows the screen has, is not a pager,
 //! and both are `ioctl(2)`. That surface is ONE syscall with THREE pinned requests,
@@ -34,10 +42,46 @@
 //! a drive-by.
 
 mod cat;
+mod cmp;
+mod cpio;
+// The engine's CRC and inflater, the ones source preparation trusts, rather
+// than a second copy. Std-only; the confinement tests below pin these two
+// attributes and scan both files.
+#[path = "../../engine/src/crc32.rs"]
+#[allow(dead_code)]
+// The engine file's own tests, held to the engine's lints rather than these.
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )
+)]
+mod crc32;
+mod deflate;
+mod diff;
 mod dmesg;
 mod fileattr;
 mod fileops;
+mod find;
 mod free;
+mod glob;
+mod gz;
+#[path = "../../engine/src/gzip.rs"]
+#[allow(dead_code)]
+// The engine file's own tests, held to the engine's lints rather than these.
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )
+)]
+mod gzip;
 mod less;
 mod printf;
 mod procfs;
@@ -47,6 +91,7 @@ mod sys;
 mod term;
 mod test;
 mod which;
+mod xargs;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -61,8 +106,14 @@ const APPLETS: &[(&str, Applet)] = &[
     ("chmod", fileattr::chmod),
     ("chown", fileattr::chown),
     ("clear", clear),
+    ("cmp", cmp::run),
+    ("cpio", cpio::run),
+    ("diff", diff::run),
     ("dmesg", dmesg::run),
+    ("find", find::run),
     ("free", free::run),
+    ("gunzip", gz::gunzip),
+    ("gzip", gz::gzip),
     ("less", less::run),
     ("ln", fileops::ln),
     ("mkdir", fileops::mkdir),
@@ -73,6 +124,8 @@ const APPLETS: &[(&str, Applet)] = &[
     ("sleep", sleep::run),
     ("test", test::run),
     ("which", which::run),
+    ("xargs", xargs::run),
+    ("zcat", gz::zcat),
 ];
 
 /// A plain loop rather than an iterator search: this file is embedded verbatim
@@ -102,8 +155,13 @@ fn basename(path: &str) -> &str {
 /// PANIC when the write fails, and Rust leaves SIGPIPE ignored, so `ps | head`
 /// would abort the process — which the no-panic rule forbids.
 pub fn emit(text: &str) -> Result<(), String> {
+    emit_bytes(text.as_bytes())
+}
+
+/// `emit` for bytes that need not be UTF-8: file contents, paths.
+pub fn emit_bytes(bytes: &[u8]) -> Result<(), String> {
     let mut out = std::io::stdout().lock();
-    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+    match out.write_all(bytes).and_then(|()| out.flush()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -114,7 +172,7 @@ pub fn emit(text: &str) -> Result<(), String> {
 /// reason `println!` does (and `panic = "abort"` turns that into a SIGABRT on
 /// `2>/dev/full`), and there is nowhere left to report a failure to report a
 /// failure — so drop it and let the exit code carry the outcome.
-fn emit_err(text: &str) {
+pub fn emit_err(text: &str) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(text.as_bytes()).and_then(|()| err.flush());
 }
@@ -286,6 +344,35 @@ mod confinement {
     /// the three call sites below are pinned whole and all three live there.
     const REFUSED: &[&str] = &["TCSETSW", "TCSETSF", "TIOCSWINSZ", "TIOCSTI", "TIOCSCTTY"];
 
+    /// The engine files this crate compiles by `#[path]`, and the squeezed
+    /// attribute that reaches each. Nothing else may leave `src/`.
+    const ENGINE: &[(&str, &str)] = &[
+        (
+            "crc32.rs",
+            concat!("#[", "path=\"../../engine/src/crc32.rs\"]"),
+        ),
+        (
+            "gzip.rs",
+            concat!("#[", "path=\"../../engine/src/gzip.rs\"]"),
+        ),
+    ];
+
+    /// The engine files are compiled under this crate's `deny`, so an `allow`
+    /// or an `unsafe` token in one would escape the `src/` scans: refuse both.
+    #[test]
+    fn the_engine_includes_are_pinned_and_hold_no_unsafe() {
+        let main = squeeze(&source("main.rs"));
+        for (file, attr) in ENGINE {
+            assert_eq!(main.matches(attr).count(), 1, "{file}'s #[path] attribute");
+            let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../engine/src")).join(file);
+            let text = scan::strip_comments(&std::fs::read_to_string(&path).unwrap());
+            assert!(!text.contains(concat!("un", "safe")), "{file} names unsafe");
+            for construct in scan::DECOUPLING {
+                assert!(!squeeze(&text).contains(construct), "{file}: `{construct}`");
+            }
+        }
+    }
+
     /// Reading the directory only equals reading `main.rs` if the two agree, so
     /// assert it: a `mod` whose file the scan missed — an `#[path]` attribute
     /// pointing outside `src/`, say — would make every assertion below vacuous
@@ -293,7 +380,10 @@ mod confinement {
     #[test]
     fn the_scan_covers_every_module_the_crate_declares() {
         let files = sources();
-        let declared = scan::declared_modules(&files);
+        let declared: Vec<String> = scan::declared_modules(&files)
+            .into_iter()
+            .filter(|d| !ENGINE.iter().any(|(f, _)| f == d))
+            .collect();
         for target in &declared {
             assert!(
                 files.iter().any(|(f, _)| f == target),
@@ -302,8 +392,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            14,
-            "expected fourteen modules beside the crate root"
+            22,
+            "expected twenty-two modules in src/ beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -315,7 +405,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these fifteen files and nothing else.
+    /// `src/` holds these files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -326,17 +416,24 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_fifteen_scanned_modules() {
+    fn src_holds_exactly_the_scanned_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
                 "cat.rs",
+                "cmp.rs",
+                "cpio.rs",
+                "deflate.rs",
+                "diff.rs",
                 "dmesg.rs",
                 "fileattr.rs",
                 "fileops.rs",
+                "find.rs",
                 "free.rs",
+                "glob.rs",
+                "gz.rs",
                 "less.rs",
                 "main.rs",
                 "printf.rs",
@@ -347,6 +444,7 @@ mod confinement {
                 "term.rs",
                 "test.rs",
                 "which.rs",
+                "xargs.rs",
             ],
             "the crate's file set changed"
         );
@@ -388,8 +486,12 @@ mod confinement {
             );
         }
         // These would make the scanned text stop describing the compiled crate,
-        // and every assertion here reads text.
-        let squeezed = squeezed();
+        // and every assertion here reads text. The pinned engine includes are
+        // the exceptions, each removed once.
+        let mut squeezed = squeezed();
+        for (_, attr) in ENGINE {
+            squeezed = squeezed.replacen(attr, "", 1);
+        }
         for construct in scan::DECOUPLING {
             assert_eq!(
                 squeezed.matches(construct).count(),

@@ -10,7 +10,7 @@ use std::path::Path;
 
 const MAX_BITS: usize = 15;
 const MAX_GZIP_INPUT_BYTES: u64 = 257 * 1024 * 1024;
-const MAX_GZIP_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_GZIP_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 // Normal source archives are one member; concatenation stays finite too.
 const MAX_GZIP_MEMBERS: usize = 4_096;
 // Leaves more than 9x headroom over 256 MiB of gzip --rsyncable output.

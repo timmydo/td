@@ -20,6 +20,13 @@ use crate::types::{Recipe, Step};
 // runtime closure is its job. Those ten carry no `/bin` name here (uutils owns them
 // and the farms are disjoint) and are reached as `td-util <applet>`.
 //
+// A third kind replaces busybox in the build graph: find, xargs, cmp, diff,
+// gzip/gunzip/zcat and cpio. They are served by `td-util <applet>` like the
+// ten above and get no `/bin` name. `find` and `xargs` are the retired
+// findutils words, so the ladder guard's TOOL_PROVIDER_BODIES names the three
+// bodies that serve them. main.rs's two `#[path]` includes reach the engine's
+// CRC and inflater, staged at the checkout's layout below.
+//
 // `free`/`ps` read /proc and `dmesg` reads /dev/kmsg O_NONBLOCK, all ordinary file
 // I/O. `less` is the one that is not: taking a keystroke without waiting for Enter,
 // and asking how many rows a screen has, are `ioctl(2)`, and nothing in safe `std`
@@ -71,10 +78,17 @@ const MAIN_RS: &str = include_str!("../../../td-util/src/main.rs");
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
     ("cat", include_str!("../../../td-util/src/cat.rs")),
+    ("cmp", include_str!("../../../td-util/src/cmp.rs")),
+    ("cpio", include_str!("../../../td-util/src/cpio.rs")),
+    ("deflate", include_str!("../../../td-util/src/deflate.rs")),
+    ("diff", include_str!("../../../td-util/src/diff.rs")),
     ("dmesg", include_str!("../../../td-util/src/dmesg.rs")),
     ("fileattr", include_str!("../../../td-util/src/fileattr.rs")),
     ("fileops", include_str!("../../../td-util/src/fileops.rs")),
+    ("find", include_str!("../../../td-util/src/find.rs")),
     ("free", include_str!("../../../td-util/src/free.rs")),
+    ("glob", include_str!("../../../td-util/src/glob.rs")),
+    ("gz", include_str!("../../../td-util/src/gz.rs")),
     ("less", include_str!("../../../td-util/src/less.rs")),
     ("printf", include_str!("../../../td-util/src/printf.rs")),
     ("procfs", include_str!("../../../td-util/src/procfs.rs")),
@@ -84,6 +98,25 @@ const MODULES: &[(&str, &str)] = &[
     ("term", include_str!("../../../td-util/src/term.rs")),
     ("test", include_str!("../../../td-util/src/test.rs")),
     ("which", include_str!("../../../td-util/src/which.rs")),
+    ("xargs", include_str!("../../../td-util/src/xargs.rs")),
+];
+
+// The engine files main.rs reaches by `#[path = "../../engine/src/NAME.rs"]`:
+// its CRC and inflater, the ones source preparation trusts. Staged at the
+// checkout's own layout so the relative path resolves.
+// Each with its staged path spelled out: builder/src/affected.rs reads this
+// text for the destination of every `#[path]` include it routes here.
+const ENGINE: &[(&str, &str, &str)] = &[
+    (
+        "crc32",
+        "{src}/engine/src/crc32.rs",
+        include_str!("../../../engine/src/crc32.rs"),
+    ),
+    (
+        "gzip",
+        "{src}/engine/src/gzip.rs",
+        include_str!("../../../engine/src/gzip.rs"),
+    ),
 ];
 
 pub fn recipe() -> Recipe {
@@ -115,8 +148,11 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
+    // The checkout's layout under {src}: main.rs's `#[path]` includes reach
+    // `../../engine/src`, and the ladder's tool-provider roster names these
+    // bodies by where they are written.
     steps.push(Step::WriteFile {
-        path: "{src}/main.rs".into(),
+        path: "{src}/td-util/src/main.rs".into(),
         content: MAIN_RS.into(),
         exec: false,
     });
@@ -124,7 +160,14 @@ pub fn recipe() -> Recipe {
     // can resolve `mod NAME;` from the filesystem.
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
-            path: format!("{{src}}/{name}.rs"),
+            path: format!("{{src}}/td-util/src/{name}.rs"),
+            content: (*source).into(),
+            exec: false,
+        });
+    }
+    for (_, path, source) in ENGINE {
+        steps.push(Step::WriteFile {
+            path: (*path).into(),
             content: (*source).into(),
             exec: false,
         });
@@ -168,7 +211,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-util",
-                "{src}/main.rs",
+                "{src}/td-util/src/main.rs",
             ],
         )
         .env("PATH", &path)
@@ -195,7 +238,7 @@ pub fn recipe() -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAIN_RS, MODULES};
+    use super::{ENGINE, MAIN_RS, MODULES};
 
     /// Every `mod NAME;` in main.rs must have its source embedded here.
     ///
@@ -220,7 +263,11 @@ mod tests {
                 "the inline `{inline}` module is not a file and must not be embedded"
             );
         }
-        let mut embedded: Vec<&str> = MODULES.iter().map(|(n, _)| *n).collect();
+        let mut embedded: Vec<&str> = MODULES
+            .iter()
+            .map(|(n, _)| *n)
+            .chain(ENGINE.iter().map(|(n, _, _)| *n))
+            .collect();
         embedded.sort_unstable();
         assert_eq!(
             declared, embedded,
@@ -283,6 +330,23 @@ mod tests {
                 *source, on_disk,
                 "the embedded '{name}' is not td-util/src/{name}.rs; the confinement \
                  tests read the file, the build ships these bytes"
+            );
+        }
+        let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/src");
+        for (name, path, source) in ENGINE {
+            assert_eq!(*path, format!("{{src}}/engine/src/{name}.rs"));
+            let on_disk =
+                std::fs::read_to_string(engine.join(format!("{name}.rs"))).unwrap_or_default();
+            assert!(!on_disk.is_empty(), "engine/src/{name}.rs must be readable");
+            assert_eq!(
+                *source, on_disk,
+                "the embedded engine '{name}' is not engine/src/{name}.rs"
+            );
+            let attr = format!("#[path = \"../../engine/src/{name}.rs\"]");
+            assert_eq!(
+                MAIN_RS.matches(&attr).count(),
+                1,
+                "main.rs must reach engine/src/{name}.rs by exactly one #[path]"
             );
         }
     }

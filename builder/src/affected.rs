@@ -312,7 +312,11 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/crc32.rs",
-        "td-builder's xz decoder, the shared gzip decoder, and target-static td-install (through gpt.rs)",
+        "td-builder's xz decoder, the shared gzip decoder, target-static td-install (through gpt.rs), and target-static td-util's gzip applets",
+    ),
+    (
+        "engine/src/gzip.rs",
+        "td-builder source extraction, the bounded OSTree importer, and target-static td-util's gunzip and zcat",
     ),
     (
         "engine/src/gpt.rs",
@@ -753,9 +757,13 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         // change (recipes/*) would.
         sel.add_target("check-engine");
         sel.add_target("check");
-        sel.add_note(
-            "engine/src/gzip.rs is shared by td-builder source extraction and the bounded OSTree importer: check-engine is the fast signal and the full check exercises the from-source consumer.",
-        );
+        // td-util `#[path]`-includes it, so the gate that builds that target
+        // crate is selected as for any other target-included source.
+        sel.add_target("recipe-checks");
+        sel.add_note(&format!(
+            "engine/src/gzip.rs is shared by {}: check-engine is the fast signal, recipe-checks builds the target crate, and the full check exercises the from-source consumer.",
+            target_included_consumers(p).unwrap_or("td-builder source extraction")
+        ));
         return;
     }
 
@@ -2384,6 +2392,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("engine/src/gzip.rs", "check");
     assert_preflight!("engine/src/gzip.rs", "net-test");
     assert_contains!("engine/src/gzip.rs", "source extraction");
+    assert_target!("engine/src/gzip.rs", "recipe-checks");
+    assert_contains!("engine/src/gzip.rs", "target-static td-util");
     assert_preflight!("engine/src/ostree.rs", "net-test");
     assert_preflight!("engine/src/lib.rs", "net-test");
     // The three trees staged into td-net's seed are re-derived LIVE from the
@@ -2432,6 +2442,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/sha256.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-crypto's test-only ES256 oracle");
     assert_contains!("engine/src/crc32.rs", "target-static td-install");
+    assert_contains!("engine/src/crc32.rs", "target-static td-util");
     assert_contains!("engine/src/gpt.rs", "target-static td-install");
     assert_contains!("engine/src/fat.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-install");
@@ -2452,6 +2463,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "engine/src/principals.rs",
         "engine/src/sha256.rs",
         "engine/src/crc32.rs",
+        "engine/src/gzip.rs",
         "engine/src/gpt.rs",
         "engine/src/cpio.rs",
         "engine/src/fat.rs",

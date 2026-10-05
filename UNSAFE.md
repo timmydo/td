@@ -941,8 +941,19 @@ out-of-bounds kernel write from code the compiler reads as safe; and
 check that would catch a constructed termios can only fire against a real
 terminal, which the gate has none of.
 
-Every other applet td-util serves reads `/proc` or `/dev/kmsg` as an
-ordinary file, which is what keeps that surface at one syscall.
+Every other applet td-util serves is safe `std`: `/proc` and `/dev/kmsg`
+read as ordinary files, and the build-tool applets (`find`, `xargs`,
+`cmp`, `diff`, `gzip`, `cpio`) walk, read, write and spawn through
+`std::fs` and `std::process`. That is what keeps the surface at one
+syscall.
+
+Two modules are not td-util's own: `main.rs` reaches the engine's CRC
+and inflater by `#[path = "../../engine/src/crc32.rs"]` and
+`#[path = "../../engine/src/gzip.rs"]`. Those two attributes are the
+only decoupling constructs the confinement scan admits, each pinned
+verbatim and removed exactly once before the scan refuses the rest,
+and the engine files themselves are scanned: no `unsafe` and no
+decoupling construct of their own.
 
 ## 8. `td-sh` — the shell
 
