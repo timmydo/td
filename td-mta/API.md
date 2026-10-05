@@ -4957,6 +4957,39 @@ source publication. Constructors do not parse or freshly admit; active
 polls, explicit checks and consuming finishes retain that
 responsibility.
 
+### 1.116 Source-bound compact part classification
+
+M06dk adds PartCursor::finish_classified(now). Consume the same complete
+metadata with fresh original admission and body-boundary correlation
+before classifying its retained headers through Class::from_headers.
+Return ClassifiedView with the complete original Part (including
+ordinal), retained metadata and its passive Node, plus pointer-identical
+original Meter/HeaderBudget/Scratch reborrows. No caller classification,
+source, parent/depth or replacement budget enters this handoff.
+Successful consumption alone restores the binding; metadata,
+classification or retained-node work refusal leaves it retired.
+
+Fixed classification charges 64 source visits and 64 interpretation
+steps under the original HeaderBudget, including original job I/O/work
+funding. Class retention charges its size; charge the compile-time
+remaining Node size under the same original output allowance before
+exposing the whole node. There is no new positive cost for owner handoff
+or boundary correlation. No growing state, metadata arena or additional
+descriptor region is added. Caller nodes fit beside traversal parts and
+membership in the existing 64-byte slot reservation. Their backing must
+already be admitted.
+
+After serial short-borrow part consumption, fresh Structure::finish can
+release the original job/header owners to the existing body-list cursor.
+Caller node slots must still correspond to every original descriptor in
+complete preorder. The body-list cursor checks supplied depth/parent
+shape, but cannot detect swapped sibling slots or omitted trailing
+parts. This method does not automatically visit all parts, enforce visit
+order or uniqueness, serialize a response, derive locators or authorize
+publication. Earlier copied passive metadata/nodes remain provisional
+through whole response success and must be discarded after later
+refusal.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

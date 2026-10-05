@@ -1,9 +1,12 @@
 //! Bind completed structure and part metadata to one authorized resident source.
 use super::{Part, Status};
+const NODE_EXTRA_OUTPUT: u64 = (std::mem::size_of::<Node>() - std::mem::size_of::<Class>()) as u64;
+const _: () = assert!(std::mem::size_of::<Node>() >= std::mem::size_of::<Class>());
 use crate::{
     admission::work::Meter,
     header_select::SourceEnd,
     limits::Limits,
+    mime_body_lists::{self, Class, Node},
     mime_part_headers::{self, label_json},
     nfc::{self, HeaderBudget, Scratch},
     ports::Tick,
@@ -12,6 +15,7 @@ use crate::{
 pub enum Error {
     Traversal(super::Error),
     Metadata(label_json::Error),
+    Classification(mime_body_lists::Error),
     Admission(nfc::Error),
     PartOrdinal,
     InvalidRange,
@@ -23,6 +27,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Traversal(error) => write!(f, "bound MIME traversal: {error}"),
             Self::Metadata(error) => write!(f, "bound MIME part metadata: {error}"),
+            Self::Classification(error) => write!(f, "bound MIME classification: {error}"),
             Self::Admission(error) => write!(f, "bound MIME structure admission: {error}"),
             Self::PartOrdinal => f.write_str("invalid bound MIME part ordinal"),
             Self::InvalidRange => f.write_str("invalid bound MIME part range"),
@@ -36,6 +41,7 @@ impl std::error::Error for Error {
         match self {
             Self::Traversal(error) => Some(error),
             Self::Metadata(error) => Some(error),
+            Self::Classification(error) => Some(error),
             Self::Admission(error) => Some(error),
             _ => None,
         }
@@ -198,6 +204,12 @@ pub struct PartView<'w> {
     pub part: Part,
     pub metadata: label_json::View<'w>,
 }
+/// Complete original retained metadata and its descriptor's passive body node.
+pub struct ClassifiedView<'w> {
+    pub part: Part,
+    pub metadata: label_json::View<'w>,
+    pub node: Node,
+}
 /// Metadata child uses only the completed structure's immutable source binding.
 /// Failure or abandonment retires the binding; finish freshly admits before release.
 /// ```compile_fail,E0277
@@ -273,12 +285,12 @@ impl<'w> PartCursor<'_, 'w> {
             .and_then(|child| child.check_deadline(now).map_err(Error::Metadata));
         self.outcome(result)
     }
-    pub fn finish(
-        mut self,
+    fn finish_metadata(
+        &mut self,
         now: Tick,
     ) -> Result<
         (
-            PartView<'w>,
+            label_json::View<'w>,
             &'w mut Meter,
             &'w mut HeaderBudget,
             &'w mut Scratch,
@@ -308,11 +320,71 @@ impl<'w> PartCursor<'_, 'w> {
             *self.parent_failure = Some(error);
             return Err(error);
         }
+        Ok((metadata, work, budget, scratch))
+    }
+    pub fn finish(
+        mut self,
+        now: Tick,
+    ) -> Result<
+        (
+            PartView<'w>,
+            &'w mut Meter,
+            &'w mut HeaderBudget,
+            &'w mut Scratch,
+        ),
+        Error,
+    > {
+        let (metadata, work, budget, scratch) = self.finish_metadata(now)?;
         *self.parent_failure = None;
         Ok((
             PartView {
                 part: self.part,
                 metadata,
+            },
+            work,
+            budget,
+            scratch,
+        ))
+    }
+    /// Consume original metadata into its descriptor's compact body-list node.
+    /// Fixed comparisons and retained node bytes spend the original allowances.
+    pub fn finish_classified(
+        mut self,
+        now: Tick,
+    ) -> Result<
+        (
+            ClassifiedView<'w>,
+            &'w mut Meter,
+            &'w mut HeaderBudget,
+            &'w mut Scratch,
+        ),
+        Error,
+    > {
+        let (metadata, work, budget, scratch) = self.finish_metadata(now)?;
+        let result = (|| {
+            let class = Class::from_headers(metadata.headers, now, work, budget)
+                .map_err(Error::Classification)?;
+            work.charge(
+                now,
+                crate::admission::work::Charge {
+                    output_bytes: NODE_EXTRA_OUTPUT,
+                    ..crate::admission::work::Charge::default()
+                },
+            )
+            .map_err(|error| Error::Classification(mime_body_lists::Error::Work(error)))?;
+            Ok(Node {
+                parent: self.part.parent,
+                depth: self.part.depth,
+                class,
+            })
+        })();
+        let node = self.outcome(result)?;
+        *self.parent_failure = None;
+        Ok((
+            ClassifiedView {
+                part: self.part,
+                metadata,
+                node,
             },
             work,
             budget,

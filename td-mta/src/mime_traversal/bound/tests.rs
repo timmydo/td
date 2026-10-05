@@ -549,3 +549,349 @@ fn cached_completion_is_inert_but_explicit_traversal_admission_is_fresh() {
         assert_eq!(work.stopped(), Some(Stop::Deadline));
     }
 }
+const TREE: &[u8] = concat!(
+    "Content-Type: multipart/mixed;boundary=a\r\n\r\n--a\r\n",
+    "Content-Type: text/plain\r\n\r\nplain\r\n--a\r\n",
+    "Content-Type: multipart/alternative;boundary=b\r\n\r\n--b\r\n",
+    "Content-Type: text/plain\r\n\r\nplain2\r\n--b\r\n",
+    "Content-Type: text/html\r\n\r\nhtml\r\n--b--\r\n--a\r\n",
+    "Content-Type: image/png\r\nContent-Disposition: inline;filename=x.png\r\n\r\nimage\r\n--a\r\n",
+    "Content-Type: application/pdf\r\nContent-Disposition: attachment;filename=x.pdf\r\n\r\npdf\r\n--a--\r\n"
+).as_bytes();
+#[test]
+fn classified_nodes_match_independent_headers_and_exact_original_costs() {
+    use mime_body_lists::{Disposition, Media};
+    let expected = [
+        (0, 1, Media::Multipart, Disposition::Other, false),
+        (1, 2, Media::Plain, Disposition::Other, false),
+        (1, 2, Media::Alternative, Disposition::Other, false),
+        (3, 3, Media::Plain, Disposition::Other, false),
+        (3, 3, Media::Html, Disposition::Other, false),
+        (1, 2, Media::InlineMedia, Disposition::Inline, true),
+        (1, 2, Media::Other, Disposition::Attachment, true),
+    ];
+    for base in [0, 17, u64::MAX - TREE.len() as u64] {
+        let mut totals = [[0; 5]; 2];
+        for classified in [false, true] {
+            let mut parts = [Part::default(); 8];
+            let mut work = meter();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let mut storage = Storage::new();
+            let pointers = (
+                std::ptr::from_mut(&mut work),
+                std::ptr::from_mut(&mut budget),
+                std::ptr::from_mut(&mut scratch),
+            );
+            let mut bound = structure(TREE, base, &mut parts, &mut work, &mut budget);
+            assert_eq!(bound.parts().unwrap().len(), expected.len());
+            for (index, &(parent, depth, media, disposition, named)) in expected.iter().enumerate()
+            {
+                let mut cursor = bound
+                    .metadata(
+                        u16::try_from(index + 1).unwrap(),
+                        storage.backing(256),
+                        &mut scratch,
+                    )
+                    .unwrap();
+                drain_part(&mut cursor).unwrap();
+                let (node, work, budget, scratch) = if classified {
+                    let (view, work, budget, scratch) = cursor.finish_classified(Tick(1)).unwrap();
+                    assert_eq!(view.part.ordinal, u16::try_from(index + 1).unwrap());
+                    assert_eq!(view.part.parent, view.node.parent);
+                    assert_eq!(view.part.depth, view.node.depth);
+                    assert_eq!(view.metadata.headers.body_start, view.part.body_start);
+                    (view.node, work, budget, scratch)
+                } else {
+                    let (view, work, budget, scratch) = cursor.finish(Tick(1)).unwrap();
+                    let class =
+                        Class::from_headers(view.metadata.headers, Tick(1), work, budget).unwrap();
+                    work.charge(
+                        Tick(1),
+                        Charge {
+                            output_bytes: 3,
+                            ..Charge::default()
+                        },
+                    )
+                    .unwrap();
+                    (
+                        Node {
+                            parent: view.part.parent,
+                            depth: view.part.depth,
+                            class,
+                        },
+                        work,
+                        budget,
+                        scratch,
+                    )
+                };
+                assert_eq!(
+                    node,
+                    Node {
+                        parent,
+                        depth,
+                        class: Class {
+                            media,
+                            disposition,
+                            named
+                        }
+                    }
+                );
+                assert_eq!(
+                    (
+                        std::ptr::from_mut(work),
+                        std::ptr::from_mut(budget),
+                        std::ptr::from_mut(scratch)
+                    ),
+                    pointers
+                );
+            }
+            let (_, work, budget) = bound.finish(Tick(1)).unwrap();
+            totals[usize::from(classified)] = costs(work, budget);
+        }
+        assert_eq!(totals[0], totals[1]);
+        assert!(totals[0].iter().all(|value| *value > 0));
+    }
+}
+#[test]
+fn bound_tree_classification_hands_original_owners_to_body_lists() {
+    let mut parts = [Part::default(); 8];
+    let mut nodes = [Node::default(); 7];
+    let mut work = meter();
+    let mut budget = HeaderBudget::new();
+    let mut scratch = Scratch::new();
+    let mut storage = Storage::new();
+    let pointers = (
+        std::ptr::from_mut(&mut work),
+        std::ptr::from_mut(&mut budget),
+    );
+    let mut bound = structure(TREE, 17, &mut parts, &mut work, &mut budget);
+    for (index, node) in nodes.iter_mut().enumerate() {
+        let mut cursor = bound
+            .metadata(
+                u16::try_from(index + 1).unwrap(),
+                storage.backing(256),
+                &mut scratch,
+            )
+            .unwrap();
+        drain_part(&mut cursor).unwrap();
+        let (classified, work, budget, _) = cursor.finish_classified(Tick(1)).unwrap();
+        assert_eq!(
+            (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+            pointers
+        );
+        *node = classified.node;
+    }
+    let (parts, work, budget) = bound.finish(Tick(1)).unwrap();
+    assert_eq!(parts.len(), nodes.len());
+    let mut text = [0; 8];
+    let mut html = [0; 8];
+    let mut attachments = [0; 8];
+    let mut membership = [0; 8];
+    let mut cursor = mime_body_lists::Cursor::new(
+        &nodes,
+        &Limits::default(),
+        mime_body_lists::Backing {
+            text: &mut text,
+            html: &mut html,
+            attachments: &mut attachments,
+            membership: &mut membership,
+        },
+        work,
+        budget,
+    )
+    .unwrap();
+    let mut complete = false;
+    for _ in 0..10000 {
+        if cursor.poll(Tick(1)).unwrap() == mime_body_lists::Status::Complete {
+            complete = true;
+            break;
+        }
+        assert!(cursor.value().is_none());
+    }
+    assert!(complete);
+    let (view, work, budget) = cursor.finish(Tick(1)).unwrap();
+    assert_eq!(view.text, &[2, 4, 6]);
+    assert_eq!(view.html, &[2, 5, 6]);
+    assert_eq!(view.attachments, &[7]);
+    assert!(view.has_attachment);
+    assert_eq!(
+        (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+        pointers
+    );
+}
+#[test]
+fn classified_finish_is_fresh_before_every_part_progress_decision() {
+    for ordinal in [1, 2] {
+        let mut parts = [Part::default(); 8];
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut storage = Storage::new();
+        let mut bound = structure(SOURCE, 17, &mut parts, &mut work, &mut budget);
+        let mut cursor = bound
+            .metadata(ordinal, storage.backing(256), &mut scratch)
+            .unwrap();
+        let turns = drain_part(&mut cursor).unwrap();
+        cursor.finish_classified(Tick(1)).unwrap();
+        bound.finish(Tick(1)).unwrap();
+        for cut in 0..=turns {
+            for late in [false, true] {
+                let mut parts = [Part::default(); 8];
+                let mut work = meter();
+                let mut budget = HeaderBudget::new();
+                let mut scratch = Scratch::new();
+                let mut storage = Storage::new();
+                let mut bound = structure(SOURCE, 17, &mut parts, &mut work, &mut budget);
+                let mut cursor = bound
+                    .metadata(ordinal, storage.backing(256), &mut scratch)
+                    .unwrap();
+                for _ in 0..cut {
+                    cursor.poll(Tick(1)).unwrap();
+                }
+                if late {
+                    let error = cursor.finish_classified(Tick(100)).err().unwrap();
+                    assert!(matches!(error, Error::Metadata(_)));
+                    assert_eq!(bound.finish(Tick(1)).err(), Some(error));
+                    assert_eq!(work.stopped(), Some(Stop::Deadline));
+                } else if cut == turns {
+                    cursor.finish_classified(Tick(1)).unwrap();
+                    bound.finish(Tick(1)).unwrap();
+                    assert_eq!(work.stopped(), None);
+                } else {
+                    let error = Error::Metadata(label_json::Error::InvalidState);
+                    assert_eq!(cursor.finish_classified(Tick(1)).err(), Some(error));
+                    assert_eq!(bound.finish(Tick(1)).err(), Some(error));
+                    assert_eq!(work.stopped(), None);
+                }
+            }
+        }
+    }
+}
+#[test]
+fn classification_spends_all_five_original_resources_and_exact_node_bytes() {
+    const SIMPLE: &[u8] = b"Content-Type: text/plain\r\n\r\nbody";
+    let mut parts = [Part::default(); 8];
+    let mut work = meter();
+    let mut budget = HeaderBudget::new();
+    let mut scratch = Scratch::new();
+    let mut storage = Storage::new();
+    let mut bound = structure(SIMPLE, 17, &mut parts, &mut work, &mut budget);
+    let mut cursor = bound
+        .metadata(1, storage.backing(256), &mut scratch)
+        .unwrap();
+    drain_part(&mut cursor).unwrap();
+    let (view, work, budget, _) = cursor.finish(Tick(1)).unwrap();
+    Class::from_headers(view.metadata.headers, Tick(1), work, budget).unwrap();
+    work.charge(
+        Tick(1),
+        Charge {
+            output_bytes: 3,
+            ..Charge::default()
+        },
+    )
+    .unwrap();
+    let (_, work, budget) = bound.finish(Tick(1)).unwrap();
+    let total = costs(work, budget);
+    for (resource, &cost) in total.iter().enumerate() {
+        let cuts: &[u64] = if resource == 4 { &[0, 1, 4] } else { &[0, 1] };
+        for &cut in cuts {
+            let exact = cut == 0;
+            let grant = cost - cut;
+            let mut parts = [Part::default(); 8];
+            let mut allowance = Charge {
+                io_bytes: 100_000_000,
+                records: 10_000_000,
+                output_bytes: 10_000_000,
+                ..Charge::default()
+            };
+            match resource {
+                2 => allowance.io_bytes = grant,
+                3 => allowance.records = grant,
+                4 => allowance.output_bytes = grant,
+                _ => {}
+            }
+            let mut work = Meter::new(Deadline::after(Tick(0), 100).unwrap(), allowance);
+            let mut budget = HeaderBudget::new();
+            if resource < 2 {
+                let (bytes, steps) = if resource == 0 {
+                    (16 * 1024 * 1024 - grant, 0)
+                } else {
+                    (0, 16_000_000 - grant)
+                };
+                budget
+                    .charge(&mut work, Tick(1), bytes, steps, &mut 0)
+                    .unwrap();
+            }
+            let mut scratch = Scratch::new();
+            let mut storage = Storage::new();
+            let mut bound = structure(SIMPLE, 17, &mut parts, &mut work, &mut budget);
+            let mut cursor = bound
+                .metadata(1, storage.backing(256), &mut scratch)
+                .unwrap();
+            drain_part(&mut cursor).unwrap();
+            assert!(cursor.value().is_some());
+            if exact {
+                let (node, _, _, _) = cursor.finish_classified(Tick(1)).unwrap();
+                assert_eq!(node.node.class.media, mime_body_lists::Media::Plain);
+                bound.finish(Tick(1)).unwrap();
+                assert_eq!(work.stopped(), None);
+                if resource == 4 {
+                    assert_eq!(work.remaining().output_bytes, 0);
+                }
+            } else {
+                let expected = Error::Classification(match resource {
+                    0 | 1 => mime_body_lists::Error::InterpretationLimit,
+                    2 => mime_body_lists::Error::Work(Stop::IoBytes),
+                    3 => mime_body_lists::Error::Work(Stop::Records),
+                    4 => mime_body_lists::Error::Work(Stop::OutputBytes),
+                    _ => panic!("invalid resource"),
+                });
+                assert_eq!(cursor.finish_classified(Tick(1)).err(), Some(expected));
+                assert_eq!(bound.parts(), Err(expected));
+                assert_eq!(bound.check_deadline(Tick(1)), Err(expected));
+                assert_eq!(
+                    bound.metadata(1, storage.backing(256), &mut scratch).err(),
+                    Some(expected)
+                );
+                assert_eq!(bound.finish(Tick(1)).err(), Some(expected));
+                if resource == 4 {
+                    assert_eq!(work.remaining().output_bytes, 2);
+                }
+                assert_eq!(
+                    work.stopped(),
+                    match resource {
+                        2 => Some(Stop::IoBytes),
+                        3 => Some(Stop::Records),
+                        4 => Some(Stop::OutputBytes),
+                        _ => None,
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn classified_view_preserves_original_retained_metadata_and_ordinals() {
+    let mut parts = [Part::default(); 8];
+    let mut work = meter();
+    let mut budget = HeaderBudget::new();
+    let mut scratch = Scratch::new();
+    let mut storage = Storage::new();
+    let mut bound = structure(SOURCE, 17, &mut parts, &mut work, &mut budget);
+    for (index, ordinal) in (1..=3).enumerate() {
+        let expected = bound.parts().unwrap()[index];
+        let mut cursor = bound
+            .metadata(ordinal, storage.backing(256), &mut scratch)
+            .unwrap();
+        drain_part(&mut cursor).unwrap();
+        let (view, _, _, _) = cursor.finish_classified(Tick(1)).unwrap();
+        assert_eq!(view.part, expected);
+        assert_eq!(view.part.ordinal, ordinal);
+        assert_eq!(view.node.parent, expected.parent);
+        assert_eq!(view.node.depth, expected.depth);
+        assert_view(view.part, &view.metadata, index);
+    }
+    bound.finish(Tick(1)).unwrap();
+}

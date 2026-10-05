@@ -5254,6 +5254,182 @@ fn bound_mime_part_metadata() {
     assert_eq!(before, after, "bound MIME metadata allocated");
 }
 
+fn bound_mime_classification() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        limits::Limits,
+        mime_body_lists::{self, Node},
+        mime_part_headers::{self, label_json},
+        mime_traversal::{
+            bound::{Cursor, Error},
+            Part, Status,
+        },
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    const SOURCE: &[u8] = concat!(
+        "Content-Type: multipart/mixed;boundary=a\r\n\r\n--a\r\n",
+        "Content-Type: text/plain\r\n\r\nplain\r\n--a\r\n",
+        "Content-Type: multipart/alternative;boundary=b\r\n\r\n--b\r\n",
+        "Content-Type: text/plain\r\n\r\nplain2\r\n--b\r\n",
+        "Content-Type: text/html\r\n\r\nhtml\r\n--b--\r\n--a\r\n",
+        "Content-Type: image/png\r\nContent-Disposition: inline;filename=x.png\r\n\r\nimage\r\n--a\r\n",
+        "Content-Type: application/pdf\r\nContent-Disposition: attachment;filename*=utf-8''caf%C3%A9.pdf\r\n\r\npdf\r\n--a--\r\n"
+    ).as_bytes();
+    let mut heads = [0; 256];
+    let mut charset = [0; 256];
+    let mut filename = [0; 256];
+    let mut id = [0; 256];
+    let mut language = [0; 256];
+    let mut location = [0; 256];
+    let mut parts = [Part::default(); 8];
+    let mut nodes = [Node::default(); 7];
+    let mut text = [0; 8];
+    let mut html = [0; 8];
+    let mut attachments = [0; 8];
+    let mut membership = [0; 8];
+    let mut scratch = Scratch::new();
+    let before = COUNTERS.snapshot();
+    for late in [false, true] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 10_000_000,
+                output_bytes: 10_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let pointers = (
+            std::ptr::from_mut(&mut work),
+            std::ptr::from_mut(&mut budget),
+            std::ptr::from_mut(&mut scratch),
+        );
+        let mut cursor = Cursor::new(
+            black_box(SOURCE),
+            17,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut parts,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut complete = false;
+        for _ in 0..100000 {
+            if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        let mut bound = cursor.finish(Tick(1)).unwrap();
+        assert_eq!(bound.parts().unwrap().len(), nodes.len());
+        let mut failure = None;
+        for (index, node) in nodes.iter_mut().enumerate() {
+            let mut cursor = bound
+                .metadata(
+                    u16::try_from(index + 1).unwrap(),
+                    label_json::Backing {
+                        headers: mime_part_headers::Backing {
+                            heads: &mut heads,
+                            charset: &mut charset,
+                            filename: &mut filename,
+                        },
+                        labels: td_mta::mime_label_fields::json::Backing {
+                            content_id: &mut id,
+                            content_language: &mut language,
+                        },
+                        content_location: &mut location,
+                    },
+                    &mut scratch,
+                )
+                .unwrap();
+            let mut complete = false;
+            for _ in 0..100000 {
+                if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+                assert!(cursor.value().is_none());
+            }
+            assert!(complete);
+            let result = cursor.finish_classified(if late && index == 6 {
+                Tick(100)
+            } else {
+                Tick(1)
+            });
+            if let Err(error) = result {
+                assert!(matches!(error, Error::Metadata(_)));
+                assert_eq!(bound.parts(), Err(error));
+                failure = Some(error);
+                break;
+            }
+            let (value, work, budget, scratch) = result.unwrap();
+            assert_eq!(
+                (
+                    std::ptr::from_mut(work),
+                    std::ptr::from_mut(budget),
+                    std::ptr::from_mut(scratch)
+                ),
+                pointers
+            );
+            assert_eq!(value.part.ordinal, u16::try_from(index + 1).unwrap());
+            assert_eq!(value.metadata.headers.body_start, value.part.body_start);
+            if index == 6 {
+                assert_eq!(
+                    value.metadata.headers.filename,
+                    Some(b"caf\xc3\xa9.pdf".as_slice())
+                );
+            }
+            *node = value.node;
+        }
+        if let Some(error) = failure {
+            assert_eq!(bound.finish(Tick(1)).err(), Some(error));
+            assert_eq!(work.stopped(), Some(Stop::Deadline));
+            continue;
+        }
+        let (_, work, budget) = bound.finish(Tick(1)).unwrap();
+        let mut cursor = mime_body_lists::Cursor::new(
+            &nodes,
+            &Limits::default(),
+            mime_body_lists::Backing {
+                text: &mut text,
+                html: &mut html,
+                attachments: &mut attachments,
+                membership: &mut membership,
+            },
+            work,
+            budget,
+        )
+        .unwrap();
+        let mut complete = false;
+        for _ in 0..100000 {
+            if cursor.poll(Tick(1)).unwrap() == mime_body_lists::Status::Complete {
+                complete = true;
+                break;
+            }
+            assert!(cursor.value().is_none());
+        }
+        assert!(complete);
+        let (view, work, budget) = cursor.finish(Tick(1)).unwrap();
+        assert_eq!(view.text, &[2, 4, 6]);
+        assert_eq!(view.html, &[2, 5, 6]);
+        assert_eq!(view.attachments, &[7]);
+        assert!(view.has_attachment);
+        assert_eq!(
+            (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+            (pointers.0, pointers.1)
+        );
+        black_box(view);
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "bound MIME classification allocated");
+}
+
 fn resident_mime_delimiters() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -11610,6 +11786,7 @@ fn main() {
         resident_mime_delimiters();
         resident_mime_traversal();
         bound_mime_part_metadata();
+        bound_mime_classification();
         resident_part_headers();
         mime_body_list_selection();
         mime_label_fields();
@@ -11787,6 +11964,7 @@ fn main() {
     resident_mime_delimiters();
     resident_mime_traversal();
     bound_mime_part_metadata();
+    bound_mime_classification();
     resident_part_headers();
     mime_body_list_selection();
     mime_label_fields();

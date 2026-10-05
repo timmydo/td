@@ -2100,6 +2100,32 @@ folded/malformed metadata, original-owner reuse, late capacity and fresh
 whole-binding retirement. Inputs and backing allocate before counting;
 worker, native and RSS qualifications remain separate.
 
+M06dk adds no retained cursor state or parser arena. Bound
+classification consumes complete original metadata, then spends 64
+source visits and 64 steps through the same HeaderBudget and its
+original job I/O/work funding. Class::from_headers charges Class
+retention; finish_classified additionally charges the compile-time
+difference between Node and Class sizes before exposing a whole node.
+The existing Part + Node + membership compiled ceiling stays 64 bytes
+per admitted body slot. Caller node/list backing stays separately
+admitted; no second descriptor or metadata table is introduced.
+
+Five units qualify compact classification. One compares literal original
+parent/depth/classification and exact five costs against independently
+consumed public headers plus Class at zero, nonzero and maximum-fitting
+bases. Three others hand a nested mixed/alternative tree to existing
+body-list selection under original owner pointers, check fresh
+classified finish at every root/digest-child metadata prefix and require
+typed refusal at all five resource cuts against independent whole
+traversal, metadata and classification costs. Output cuts reach both
+Class and extra Node admission and pin remaining bytes. The fifth
+preserves original retained metadata and ordinal beside its node.
+Warm/measured intervals cover serial nested plain/HTML classification,
+named inline media, an attachment with an asserted decoded UTF-8
+extended filename, original owner reuse into body lists and late fresh
+part refusal. Inputs and caller backing precede counting; native, worker
+and RSS reservations remain separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

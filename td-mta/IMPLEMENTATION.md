@@ -2104,6 +2104,16 @@ Initial independently landable increments:
   correlation and measured zero Rust allocation. Automatic whole-tree
   body-list/response composition and authenticated locators remain next.
 
+- **M06dk — bound compact classification:** freshly consume original
+  part metadata and original ordinal beside its passive body-list Node,
+  spending fixed comparisons and complete node output under original
+  allowances. Preserve retirement on classification refusal; hand serial
+  complete caller nodes and original owners to existing body-list
+  selection. Qualify exact costs, all five resource cuts, both
+  normal/digest progress prefixes and nested preorder/list output with
+  zero measured Rust allocation. Whole-part visit enforcement, response
+  serialization and authenticated locators remain next boundaries.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

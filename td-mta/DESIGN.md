@@ -620,6 +620,18 @@ Passive earlier copies remain provisional; source/blob authority,
 body-list/response serialization and publication stay external. No
 simultaneous traversal frame set or metadata table is added.
 
+M06dk consumes bound retained headers into compact body-list nodes with
+original descriptor parent/depth and original job/header/scratch owners.
+Fresh metadata consumption precedes fixed classification comparisons and
+whole-node output admission. Classification refusal keeps the binding
+retired; success alone restores it. Return original metadata and Part
+ordinal beside the node for one-pass response consumption. Caller nodes
+share the existing body slot reservation, without another metadata
+table. Complete preorder, whole-part visitation, source authority and
+response publication remain external. Existing body-list traversal
+checks supplied depth/parent shape but cannot certify sibling order or
+completeness against the source.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or
