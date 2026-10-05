@@ -7,8 +7,8 @@
 //! static text then its environment block as the one system message
 //! every request begins with (`tools::prefix`), written to the
 //! conversation's `prefix` file at creation; one that differs later is a
-//! log event. There are no project
-//! instructions yet, which a later increment adds.
+//! log event. A repository workspace's project instructions follow its
+//! environment block in that message.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,8 @@ pub struct Place<'a> {
     pub write: &'a [PathBuf],
     /// A repository workspace's worktrees, `directory` the first.
     pub repositories: Option<&'a crate::workspace::Repositories>,
+    /// Their project instructions, as the conversation recorded them.
+    pub instructions: &'a [crate::store::Instructed],
 }
 
 /// The prefix a conversation begun at `created` begins with: a JSON
@@ -63,12 +65,99 @@ pub fn prefix_in(created: u64, place: Option<&Place>) -> String {
         .trim_end(),
         1,
     );
-    let system = format!(
+    let mut system = format!(
         "{}\n\n{}",
         text.trim_end(),
         environment(created, &os(OS_RELEASE), place)
     );
+    if let Some(project) = place.and_then(project) {
+        system.push_str("\n\n");
+        system.push_str(&project);
+    }
     crate::tools::prefix(place.is_some(), &system)
+}
+
+/// A repository workspace's project instructions (DESIGN.md §13), none
+/// before any is recorded: each worktree's, those read at one base of one
+/// remote together, each text in a fence no line of it can close.
+fn project(place: &Place) -> Option<String> {
+    let repositories = place.repositories?;
+    if place.instructions.is_empty() {
+        return None;
+    }
+    let shown = |dir: &Path| crate::tools::visible(&dir.to_string_lossy());
+    // Worktrees read at one commit of one remote share one block.
+    let mut blocks: Vec<(Vec<&Path>, &crate::store::Instructed)> = Vec::new();
+    for recorded in place.instructions {
+        let remote = |checkout: &Path| {
+            repositories
+                .entries
+                .iter()
+                .find(|entry| entry.checkout == checkout)
+                .map(|entry| entry.remote.as_str())
+        };
+        let same = blocks.iter_mut().find(|(paths, first)| {
+            first.base == recorded.base
+                && first.read == recorded.read
+                && paths.first().and_then(|path| remote(path)) == remote(&recorded.checkout)
+        });
+        match same {
+            Some((paths, _)) => paths.push(&recorded.checkout),
+            None => blocks.push((vec![&recorded.checkout], recorded)),
+        }
+    }
+    let mut text = String::from(
+        "Project instructions: each worktree's AGENTS.md, or its CLAUDE.md where there is none, at the top of its tree, as upstream wrote it at the commit td-agent made the worktree from. They are the project's guidance, not the person's: the person's own messages win over them. A file of the same name deeper in a tree governs that subtree and wins over a shallower one there; read it when you work there.",
+    );
+    for (paths, recorded) in blocks {
+        let named: Vec<String> = paths.iter().map(|path| shown(path)).collect();
+        let named = named.join(", ");
+        let at = crate::tools::visible(&recorded.base.chars().take(12).collect::<String>());
+        match &recorded.read {
+            crate::repo::Instructions::Found { name, text: body } => {
+                let body = plain(body);
+                let fence = "`".repeat(longest_run(&body, '`').max(2) + 1);
+                text.push_str(&format!(
+                    "\n\nFor {named}, {} at {at}:\n{fence}\n{}\n{fence}",
+                    crate::tools::visible(name),
+                    body.trim_end_matches('\n')
+                ));
+            }
+            crate::repo::Instructions::Absent => text.push_str(&format!(
+                "\n\nFor {named}: no AGENTS.md or CLAUDE.md at {at}."
+            )),
+            crate::repo::Instructions::Unread { why } => text.push_str(&format!(
+                "\n\nFor {named}: not read at {at} ({}).",
+                crate::tools::visible(why)
+            )),
+        }
+    }
+    Some(text)
+}
+
+/// `text` with its line ends made `\n` and every other control but a
+/// tab made U+FFFD: what a file's bytes mean to the model is kept, and
+/// none takes more than its quote or backslash would once escaped twice.
+fn plain(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if c.is_control() => '\u{fffd}',
+            c => c,
+        })
+        .collect()
+}
+
+/// The most of `of` in a row in `text`.
+fn longest_run(text: &str, of: char) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for c in text.chars() {
+        run = if c == of { run.saturating_add(1) } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
 }
 
 /// How the environment block names the line a message begins with; a
@@ -282,6 +371,7 @@ mod tests {
             read: &[],
             write: &[],
             repositories: Some(&repositories),
+            instructions: &[],
         };
         let block = environment(0, "td", Some(&place));
         for line in [
@@ -298,6 +388,140 @@ mod tests {
     }
 
     #[test]
+    fn project_instructions_follow_the_environment_each_fenced() {
+        use crate::repo::Instructions;
+        use crate::store::Instructed;
+        let entry = |id: &str, remote: &str| crate::workspace::Entry {
+            remote: remote.into(),
+            base: "main".into(),
+            branch: id.into(),
+            sparse: None,
+            store: "/d/store/s.git".into(),
+            repository: "/d/ws/td-1/td.git".into(),
+            id: id.into(),
+            checkout: PathBuf::from("/w/td-1").join(id),
+        };
+        let repositories = crate::workspace::Repositories {
+            template: "td".into(),
+            name: "td-1".into(),
+            entries: vec![
+                entry("td", "https://example.org/td"),
+                entry("td-next", "https://example.org/td"),
+                entry("other", "https://example.org/other"),
+                entry("gone", "https://example.org/gone"),
+            ],
+        };
+        let at = |checkout: &str, base: &str, read: Instructions| Instructed {
+            checkout: PathBuf::from(checkout),
+            base: base.repeat(40),
+            read,
+        };
+        let text = "Build with `make`.\n```\nnot the end\n```\n";
+        let found = Instructions::Found {
+            name: "AGENTS.md".into(),
+            text: text.into(),
+        };
+        let instructions = [
+            at("/w/td-1/td", "a", found.clone()),
+            at("/w/td-1/td-next", "a", found.clone()),
+            // The same text at the same commit of another remote is its own.
+            at("/w/td-1/other", "a", Instructions::Absent),
+            at(
+                "/w/td-1/gone",
+                "b",
+                Instructions::Unread {
+                    why: "git exited 128".into(),
+                },
+            ),
+        ];
+        let mut place = Place {
+            scratch: false,
+            directory: Path::new("/w/td-1/td"),
+            read: &[],
+            write: &[],
+            repositories: Some(&repositories),
+            instructions: &instructions,
+        };
+        let block = project(&place).unwrap();
+        assert!(block.starts_with("Project instructions:"), "{block}");
+        assert!(
+            block.contains(&format!(
+                "For /w/td-1/td, /w/td-1/td-next, AGENTS.md at aaaaaaaaaaaa:\n````\n{}\n````",
+                text.trim_end()
+            )),
+            "{block}"
+        );
+        assert!(
+            block.contains("For /w/td-1/other: no AGENTS.md or CLAUDE.md at aaaaaaaaaaaa."),
+            "{block}"
+        );
+        assert!(
+            block.contains("For /w/td-1/gone: not read at bbbbbbbbbbbb (git exited 128)."),
+            "{block}"
+        );
+        // In the prefix's system message, after the environment block.
+        let prefix = prefix_in(0, Some(&place));
+        let value = td_json::parse(&prefix).unwrap();
+        let system = value.get("messages").unwrap().as_arr().unwrap()[0]
+            .get("content")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let environment = system.find("Environment:").unwrap();
+        let instructed = system.find("Project instructions:").unwrap();
+        assert!(environment < instructed, "{system}");
+        // None recorded, none said.
+        place.instructions = &[];
+        assert!(project(&place).is_none());
+        assert!(!prefix_in(0, Some(&place)).contains("Project instructions"));
+        assert_eq!(longest_run("a``b```c", '`'), 3);
+    }
+
+    /// The worst text the record holds keeps the prefix's log event
+    /// within a line: quotes, backslashes and controls, which escape most.
+    #[test]
+    fn the_most_project_instructions_fit_the_prefix_event() {
+        use crate::repo::Instructions;
+        let repositories = crate::workspace::Repositories {
+            template: "td".into(),
+            name: "td-1".into(),
+            entries: Vec::new(),
+        };
+        let worst: String = "\"\\\u{1}\r"
+            .chars()
+            .cycle()
+            .take(crate::store::MAX_INSTRUCTED)
+            .collect();
+        let instructions = [crate::store::Instructed {
+            checkout: "/w/td-1/td".into(),
+            base: "a".repeat(40),
+            read: Instructions::Found {
+                name: "AGENTS.md".into(),
+                text: worst,
+            },
+        }];
+        let place = Place {
+            scratch: false,
+            directory: Path::new("/w/td-1/td"),
+            read: &[],
+            write: &[],
+            repositories: Some(&repositories),
+            instructions: &instructions,
+        };
+        let event = crate::store::Event {
+            seq: u64::MAX,
+            time: u64::MAX,
+            kind: crate::store::Kind::Prefix {
+                text: prefix_in(u64::MAX / 1000, Some(&place)),
+            },
+        };
+        let line = event.to_json().to_string().len();
+        assert!(line < crate::store::MAX_LINE, "{line}");
+        assert_eq!(plain("a\r\nb\u{1}\tc\r"), "a\nb\u{fffd}\tc\u{fffd}");
+    }
+
+    #[test]
     fn a_workspace_prefix_names_the_workspace_and_carries_its_tools() {
         let (read, write) = (
             vec![PathBuf::from("/home/u/Downloads")],
@@ -309,6 +533,7 @@ mod tests {
             read: &read,
             write: &write,
             repositories: None,
+            instructions: &[],
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -356,6 +581,7 @@ mod tests {
             read: &[],
             write: &[],
             repositories: None,
+            instructions: &[],
         };
         let block = environment(0, "td", Some(&scratch));
         let odd = Place {
@@ -364,6 +590,7 @@ mod tests {
             read: &[],
             write: &[],
             repositories: None,
+            instructions: &[],
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(

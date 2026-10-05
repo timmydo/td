@@ -70,11 +70,13 @@ pub enum Down {
 
 /// A fetched store, for a repository workspace's preparation (DESIGN.md
 /// §7): the human's identity its commits carry, and each base asked for
-/// resolved to its commit, in the order asked.
+/// resolved to its commit and its project instructions there (§13), in
+/// the order asked.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Fetched {
     pub identity: crate::repo::Identity,
     pub ids: Vec<String>,
+    pub instructions: Vec<crate::repo::Instructions>,
 }
 
 /// From a conversation to the window.
@@ -218,6 +220,68 @@ fn strings(value: &Json, name: &str) -> Result<Vec<String>, String> {
     Ok(strings)
 }
 
+/// A `Fetched`'s project instructions as they cross: a base at a commit
+/// an earlier base names says so (`{"same": <index>}`), so a commit's
+/// read crosses once however many worktrees start there.
+fn carried(fetched: &Fetched) -> Json {
+    let items = fetched
+        .instructions
+        .iter()
+        .enumerate()
+        .map(|(at, read)| {
+            let id = fetched.ids.get(at);
+            let earlier = fetched
+                .ids
+                .iter()
+                .zip(&fetched.instructions)
+                .take(at)
+                .position(|(other, same)| Some(other) == id && same == read);
+            match earlier {
+                Some(index) => Json::Obj(vec![("same".into(), Json::from(index as u64))]),
+                None => read.to_json(),
+            }
+        })
+        .collect();
+    Json::Arr(items)
+}
+
+/// A `Fetched`'s project instructions, one a base of `ids`, each as it
+/// crossed (`carried`), within the bound of the store's answer counted
+/// once a commit.
+fn instructions(value: &Json, ids: &[String]) -> Result<Vec<crate::repo::Instructions>, String> {
+    let items = value
+        .get("instructions")
+        .and_then(Json::as_arr)
+        .ok_or("no instructions")?;
+    if items.len() != ids.len() {
+        return Err("instructions for another number of bases".into());
+    }
+    let mut read: Vec<crate::repo::Instructions> = Vec::new();
+    let mut carried = 0usize;
+    for (at, item) in items.iter().enumerate() {
+        match item.get("same") {
+            Some(same) => {
+                let index = same
+                    .as_u64()
+                    .and_then(|index| usize::try_from(index).ok())
+                    .filter(|index| *index < at && ids.get(*index) == ids.get(at))
+                    .ok_or("instructions name no earlier base at the same commit")?;
+                let earlier = read.get(index).cloned().ok_or("no such instructions")?;
+                read.push(earlier);
+            }
+            None => {
+                let one = crate::repo::Instructions::from_json(item)?;
+                carried = carried.saturating_add(one.carried());
+                read.push(one);
+            }
+        }
+    }
+    if carried > crate::git::MAX_INSTRUCTIONS {
+        return Err("instructions past their bound".into());
+    }
+    Ok(read)
+}
+
 /// The most bases a `Fetch` asks and commits a `Fetched` answers, as
 /// many as a repository workspace has worktrees.
 const MAX_STRINGS: usize = crate::workspace::MAX_ENTRIES;
@@ -328,6 +392,7 @@ impl Down {
                             "ids".into(),
                             Json::Arr(fetched.ids.iter().cloned().map(Json::Str).collect()),
                         ),
+                        ("instructions".into(), carried(fetched)),
                     ]),
                     Err(why) => pairs.push(("error".into(), Json::Str(why.clone()))),
                 }
@@ -441,6 +506,7 @@ impl Down {
                             email: maybe(&value, "email")?,
                         },
                         ids: strings(&value, "ids")?,
+                        instructions: instructions(&value, &strings(&value, "ids")?)?,
                     }),
                 },
             }),
@@ -655,6 +721,50 @@ mod tests {
     }
 
     #[test]
+    fn a_fetched_answer_carries_instructions_within_their_bound() {
+        // Each text at its own commit, or all at one.
+        let at = |n: usize, one: bool| -> Vec<String> {
+            (0..n)
+                .map(|i| format!("{:040x}", if one { 0 } else { i }))
+                .collect()
+        };
+        let fetched = |texts: Vec<String>, one: bool| Down::Fetched {
+            remote: "https://github.com/timmydo/td".into(),
+            result: Ok(Fetched {
+                identity: crate::repo::Identity::default(),
+                ids: at(texts.len(), one),
+                instructions: texts
+                    .into_iter()
+                    .map(|text| crate::repo::Instructions::Found {
+                        name: "AGENTS.md".into(),
+                        text,
+                    })
+                    .collect(),
+            }),
+        };
+        // At its bound, the worst escaping still fits a frame.
+        let most = fetched(vec!["\u{1}".repeat(crate::git::MAX_INSTRUCTIONS)], false);
+        let bytes = most.encode();
+        assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
+        assert_eq!(Down::decode(&bytes).unwrap(), most);
+        let half = "x".repeat(crate::git::MAX_INSTRUCTIONS / 2 + 1);
+        let past = fetched(vec![half.clone(), half.clone()], false);
+        assert!(Down::decode(&past.encode()).is_err());
+        // A commit's text crosses once, however many worktrees start
+        // there: as many as a workspace has, at the bound, fit a frame.
+        let shared = fetched(
+            vec!["\u{1}".repeat(crate::git::MAX_INSTRUCTIONS); MAX_STRINGS],
+            true,
+        );
+        let bytes = shared.encode();
+        assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
+        assert_eq!(Down::decode(&bytes).unwrap(), shared);
+        // A back-reference names an earlier base at the same commit.
+        let forged = br#"{"type":"fetched","remote":"https://github.com/timmydo/td","error":null,"name":null,"email":null,"ids":["0000000000000000000000000000000000000000","0000000000000000000000000000000000000001"],"instructions":[{"kind":"absent"},{"same":0}]}"#;
+        assert!(Down::decode(forged).is_err());
+    }
+
+    #[test]
     fn a_fetch_asks_at_most_as_many_bases_as_a_workspace_has_worktrees() {
         let fetch = |n: usize| Up::Fetch {
             remote: "https://github.com/timmydo/td".into(),
@@ -836,7 +946,17 @@ mod tests {
                         name: Some("Human".into()),
                         email: None,
                     },
-                    ids: vec!["a".repeat(40)],
+                    ids: vec!["a".repeat(40), "b".repeat(40), "c".repeat(40)],
+                    instructions: vec![
+                        crate::repo::Instructions::Found {
+                            name: "AGENTS.md".into(),
+                            text: "Run `make`.\n\u{1}".into(),
+                        },
+                        crate::repo::Instructions::Absent,
+                        crate::repo::Instructions::Unread {
+                            why: "AGENTS.md is not UTF-8".into(),
+                        },
+                    ],
                 }),
             },
             Down::Fetched {

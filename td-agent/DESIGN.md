@@ -1987,9 +1987,12 @@ is refused (the tool host is told its working directory,
 `--directory`, rather than taking its first root), never run in
 another root. The prefix names every worktree with its remote, branch,
 base and paths whether or not it is ready, so it holds while they
-prepare. In this step the checkout runs on the conversation process's
-main thread, so a turn waits behind it, and the model is told nothing
-of it; the workspace card, project instructions and rules from the base, background fetches
+prepare. The first turn waits for each store's answer, which carries
+the project instructions (§13, As built (increment 11, project
+instructions)); in this step the checkout then runs on the
+conversation process's main thread, so that turn, and any during a
+later preparation, waits behind it too, and the model is told nothing
+of it; the workspace card, rules from the base, background fetches
 and the model's notification are later steps, as is the cleanup:
 deleting the conversation leaves its repository workspace in place,
 which the deletion question says.
@@ -3481,6 +3484,47 @@ conversation begun before this takes the new prefix as a `prefix` event
 before its next request (§6), as any prompt change does, and so does one
 whose operating system's name changes.
 
+**As built (increment 11, project instructions).** The window's store
+thread reads, at each base it resolves, `AGENTS.md`, else `CLAUDE.md`,
+at the commit's top through the git worker outside any jail (§9), each
+commit once, and answers with them beside the commits: absent, found
+(its name and text) or unread with why (past 64 KiB, not UTF-8, git
+failing, or past 128 KiB with the answer's other commits). A base at a
+commit an earlier base names crosses as a reference to it, so a
+commit's text crosses once however many worktrees start there, and the
+answer stays within its frame however JSON escapes it; the decoder
+holds the same bound and takes a reference only to an earlier base at
+the same commit. The conversation process records them, before the
+checkout, in the `instructions` file of its directory: one entry a
+worktree, its checkout, the commit and what was read there, at most
+128 KiB of text in all with a commit's counted once (a later
+worktree's past that is recorded unread), replaced whole, and refused
+whole when it is not what td-agent writes (a relative checkout, a
+commit that is no object id, a file other than the two). A worktree's
+entry is replaced when its repository is read again, which happens
+only while it is not yet prepared, so the record is the commit the
+worktree was checked out at, and holds once it is. A turn's first
+request waits for the window's answer to every store the process
+asked for, preparing each as it comes, so the instructions are in the
+prefix from the first request; it waits only with a key, since without
+one the turn ends at once saying so. Other messages wait their turn
+meanwhile, and an interrupt, come with the message or after, ends the
+turn, which may be asked again. They follow the environment block in
+the system message, under a heading that says they are the project's
+guidance, not the person's, that the person's messages win, and that a
+file of the same name deeper in a tree governs its subtree and is read
+when the model works there: one block for the worktrees read at one
+commit of one remote, naming them, the file and the commit, its text
+with line ends made `\n` and every other control but a tab made
+U+FFFD, in a backtick fence longer than any run of backticks in it, so
+no line of the text closes it; an absent or unread one is said in a
+line. So a byte of them takes at most four in the prefix's log event,
+escaped there twice, and the most the record holds keeps that event
+within a line; one that still could not be logged ends the turn, saying
+why, not the process. A conversation whose preparation failed has none
+for that remote; one recorded later changes the prefix, a `prefix`
+event as any change is.
+
 ## 14. Context
 
 The model's context is the prefix (§13) plus a view of the log; the log
@@ -4161,6 +4205,27 @@ admits only on its action; and `src/ui.rs` that it is shown with
 refusal in a note, takes no key as it is shown, is set aside with the
 keyboard and asked again when it comes back, and is not asked over
 another question.
+
+For project instructions, `src/git.rs` covers that each commit's are
+read once and held to the answer's bound, unread with why when past it,
+not UTF-8 or when git fails; `src/protocol.rs` that an answer at that
+bound fits a frame however its text escapes, that one past it is
+refused, that a workspace's every worktree at one commit at the bound
+still fits, the text crossing once, and that a reference to a base at
+another commit is refused; `src/store.rs` that a worktree's record is
+replaced in its place, that a commit's text counts once against the
+conversation's bound and a later worktree's past it is unread, that
+they survive reopening, and that a file td-agent would not write
+refuses the conversation; and `src/prompt.rs` that they follow the
+environment block, grouped by commit and remote, fenced past any run
+of backticks, controls made plain, an absent and an unread one said,
+none said before any is recorded, and that the most the record holds,
+of the text that escapes most, keeps the prefix's event within a line.
+`tests/processes.rs` has a first turn wait for the store's answer,
+ending only after it, with its instructions recorded though the
+checkout then fails, and an interrupt end a waiting turn, sent with
+its message or after; the live test finds them recorded for the
+prepared worktree.
 
 For row menus and archiving, `src/menu.rs` covers the row menu's items
 for a live and an archived conversation, each activating its action,

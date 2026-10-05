@@ -302,6 +302,124 @@ fn a_repository_conversation_asks_for_its_store_and_says_a_refusal() {
     assert!(conversation.meta().prepared.is_empty());
 }
 
+/// A turn's first request waits for the window's answer to each store
+/// the process asked for: a message sent before it is held, its turn
+/// ending only once the answer comes. The project instructions the
+/// answer carries are recorded before the checkout, which fails here,
+/// having no jail (DESIGN.md §7, §13).
+#[test]
+fn a_repository_conversations_first_turn_waits_for_its_stores() {
+    let scratch = Scratch::new("instructions");
+    let state = scratch.state();
+    let id = Id::random().unwrap();
+    // A key, so the turn waits; no td-fetch socket, so its request then
+    // fails here and reaches nothing.
+    let keyed = Down::Setup {
+        key: Ok(td_agent::key::Secret::new("sk-or-v1-test".into())),
+        client: Client::default(),
+    };
+    let nowhere = scratch.0.join("run");
+    std::fs::create_dir(&nowhere).unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyed)
+        .env("XDG_RUNTIME_DIR", &nowhere);
+    supervisor
+        .create(
+            id.clone(),
+            Role::Conversation,
+            repositories(&id, &scratch.0),
+        )
+        .unwrap();
+    let mut heard = Vec::new();
+    until(&mut supervisor, &mut heard, |heard| {
+        heard
+            .iter()
+            .any(|u| matches!(u, Update::Up(Up::Fetch { .. })))
+    });
+    supervisor.send("hello".into()).unwrap();
+    let finished = |heard: &[Update]| {
+        heard.iter().any(
+            |u| matches!(u, Update::Up(Up::Event(e)) if matches!(e.kind, Kind::Finished { .. })),
+        )
+    };
+    until(&mut supervisor, &mut heard, |heard| delivered(heard) == 1);
+    let held = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < held {
+        heard.extend(supervisor.poll().into_iter().map(|(_, update)| update));
+        assert!(!finished(&heard), "the turn did not wait");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    supervisor.answer(
+        &id,
+        &Down::Fetched {
+            remote: "https://example.org/a/td".into(),
+            result: Ok(td_agent::protocol::Fetched {
+                identity: td_agent::repo::Identity::default(),
+                ids: vec!["a".repeat(40)],
+                instructions: vec![td_agent::repo::Instructions::Found {
+                    name: "AGENTS.md".into(),
+                    text: "Run make.\n".into(),
+                }],
+            }),
+        },
+    );
+    until(&mut supervisor, &mut heard, finished);
+    drop(supervisor);
+    let (conversation, _) = Conversation::open(&state, &id, None, Duration::from_secs(5)).unwrap();
+    let recorded = conversation.instructions();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert!(conversation.meta().prepared.is_empty());
+}
+
+/// An interrupt ends a turn waiting for its stores, as one to be asked
+/// again, whether it came with the message or after.
+#[test]
+fn an_interrupt_ends_a_turn_waiting_for_its_stores() {
+    let scratch = Scratch::new("await-interrupt");
+    let state = scratch.state();
+    let id = Id::random().unwrap();
+    let keyed = Down::Setup {
+        key: Ok(td_agent::key::Secret::new("sk-or-v1-test".into())),
+        client: Client::default(),
+    };
+    let nowhere = scratch.0.join("run");
+    std::fs::create_dir(&nowhere).unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyed)
+        .env("XDG_RUNTIME_DIR", &nowhere);
+    supervisor
+        .create(
+            id.clone(),
+            Role::Conversation,
+            repositories(&id, &scratch.0),
+        )
+        .unwrap();
+    let mut heard = Vec::new();
+    until(&mut supervisor, &mut heard, |heard| {
+        heard
+            .iter()
+            .any(|u| matches!(u, Update::Up(Up::Fetch { .. })))
+    });
+    let ended = |heard: &[Update]| {
+        heard
+            .iter()
+            .filter(|u| {
+                matches!(u, Update::Up(Up::Event(e)) if matches!(&e.kind,
+                    Kind::Finished { outcome, retry: true, .. }
+                        if outcome.contains("waiting for the workspace's project instructions")))
+            })
+            .count()
+    };
+    // Sent with the message, the interrupt is queued behind it.
+    supervisor.send("hello".into()).unwrap();
+    supervisor.interrupt().unwrap();
+    until(&mut supervisor, &mut heard, |heard| ended(heard) == 1);
+    // Sent while it waits.
+    supervisor.send("again".into()).unwrap();
+    until(&mut supervisor, &mut heard, |heard| delivered(heard) == 2);
+    std::thread::sleep(Duration::from_millis(200));
+    supervisor.interrupt().unwrap();
+    until(&mut supervisor, &mut heard, |heard| ended(heard) == 2);
+}
+
 #[test]
 fn a_conversation_that_keeps_failing_is_left_failed() {
     let scratch = Scratch::new("failing");

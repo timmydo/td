@@ -264,6 +264,7 @@ pub fn serve_in(
             .map_err(|e| format!("a reservation id: {e}"))?,
         gone: false,
         bench: Bench::default(),
+        awaiting: Vec::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -432,6 +433,9 @@ struct Session {
     gone: bool,
     /// The workspace's jail instances, for a conversation in one.
     bench: Bench,
+    /// The remotes this process asked the window for and has no answer
+    /// for yet: a turn's first request waits for them (`await_stores`).
+    awaiting: Vec<String>,
 }
 
 impl Session {
@@ -644,6 +648,9 @@ impl Session {
     /// that ends after a whole reply, however it ends, is titled as the
     /// first that replied (`first_reply`) and none later is left untitled.
     fn steps(&mut self, turn: u64) -> Result<Outcome, String> {
+        if let Some(outcome) = self.await_stores()? {
+            return Ok(outcome);
+        }
         let mut replied = false;
         for _ in 0..MAX_STEPS {
             let outcome = self.exchange(turn)?;
@@ -879,7 +886,12 @@ impl Session {
         if client::current_prefix(self.conversation.events(), self.conversation.prefix_file()).1
             != expected
         {
-            self.log(Kind::Prefix { text: expected })?;
+            // One past the log's line ends the turn, not the process.
+            if let Err(why) = self.log(Kind::Prefix { text: expected }) {
+                return Ok(Outcome::stop(format!(
+                    "the conversation's prefix could not be logged: {why}"
+                )));
+            }
         }
         let mut attempt = 0u32;
         loop {
@@ -1208,6 +1220,7 @@ impl Session {
             }
         }
         for (remote, bases) in asks {
+            self.awaiting.push(remote.clone());
             self.send(&Up::Fetch { remote, bases });
         }
     }
@@ -1215,6 +1228,7 @@ impl Session {
     /// The window's answer for `remote`'s store (`prepare`), then the
     /// window told this process is done with it, so it may retire it.
     fn stored(&mut self, remote: String, result: Result<Stored, String>) -> Result<(), String> {
+        self.awaiting.retain(|asked| *asked != remote);
         let prepared = self.prepare(&remote, result);
         self.send(&Up::Prepared { remote });
         prepared
@@ -1242,7 +1256,13 @@ impl Session {
         if meta.prepared.contains(&repository) {
             return Ok(());
         }
-        let text = match result.and_then(|fetched| self.check_out(&meta.id, &entries, &fetched)) {
+        // The instructions first: the turn waiting for them goes on
+        // whether or not the checkout does.
+        let checked = result.and_then(|fetched| {
+            self.instructed(&entries, &fetched)?;
+            self.check_out(&meta.id, &entries, &fetched)
+        });
+        let text = match checked {
             Ok(()) => {
                 self.conversation.set_prepared(&repository)?;
                 let ready: Vec<String> = entries
@@ -1257,6 +1277,85 @@ impl Session {
         self.sync()
     }
 
+    /// Records the project instructions `fetched` read at each of
+    /// `entries`' bases, one remote's (DESIGN.md §13).
+    fn instructed(&mut self, entries: &[&Entry], fetched: &Stored) -> Result<(), String> {
+        if fetched.ids.len() != entries.len() || fetched.instructions.len() != entries.len() {
+            return Err("the window answered for another number of bases".into());
+        }
+        if !fetched.ids.iter().all(|id| crate::git::object_id(id)) {
+            return Err("the window answered with a base that is no commit".into());
+        }
+        let recorded = entries
+            .iter()
+            .zip(&fetched.ids)
+            .zip(&fetched.instructions)
+            .map(|((entry, base), read)| store::Instructed {
+                checkout: entry.checkout.clone(),
+                base: base.clone(),
+                read: read.clone(),
+            })
+            .collect();
+        self.conversation.instructed(recorded)
+    }
+
+    /// Waits, before a turn's first request, for the window's answer to
+    /// each store this process asked for, preparing each as it comes, so
+    /// the prefix holds the project instructions from the first request
+    /// on (DESIGN.md §7, §13). What else comes meanwhile waits its turn;
+    /// an interrupt ends the turn.
+    fn await_stores(&mut self) -> Result<Option<Outcome>, String> {
+        // With no key the turn ends at its first step, saying so, and
+        // waits for nothing.
+        if !self.setup.as_ref().is_some_and(|(key, _)| key.is_ok()) {
+            return Ok(None);
+        }
+        let interrupted = || {
+            Ok(Some(Outcome::again(
+                "interrupted while waiting for the workspace's project instructions",
+            )))
+        };
+        while !self.awaiting.is_empty() {
+            // Said with the turn's message, before it began.
+            if let Some(at) = self
+                .queue
+                .iter()
+                .position(|down| matches!(down, Down::Interrupt))
+            {
+                self.queue.remove(at);
+                return interrupted();
+            }
+            // One that came before the turn began, behind its message.
+            if let Some(at) = self
+                .queue
+                .iter()
+                .position(|down| matches!(down, Down::Fetched { .. }))
+            {
+                if let Some(Down::Fetched { remote, result }) = self.queue.remove(at) {
+                    self.stored(remote, result)?;
+                }
+                continue;
+            }
+            if self.gone {
+                return Err("the window has closed".into());
+            }
+            match self.inbox.recv() {
+                Ok(Inbound::Down(Down::Fetched { remote, result })) => {
+                    self.stored(remote, result)?
+                }
+                Ok(Inbound::Down(Down::Interrupt)) => return interrupted(),
+                Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
+                Ok(Inbound::Down(down)) => self.queue.push_back(down),
+                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Closed | Inbound::Broken(_)) | Err(_) => {
+                    self.gone = true;
+                    return Err("the window has closed".into());
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Lays out `entries`' repository, one remote's, and checks each
     /// worktree out in a maintenance instance, at the bases `fetched`
     /// resolved. Until it is recorded prepared no instance but these binds
@@ -1265,9 +1364,6 @@ impl Session {
     /// its id removed and made again, and an index is a checkout that
     /// ended before it was recorded.
     fn check_out(&self, id: &Id, entries: &[&Entry], fetched: &Stored) -> Result<(), String> {
-        if fetched.ids.len() != entries.len() {
-            return Err("the window resolved another number of bases".into());
-        }
         let first = entries.first().ok_or("no worktree to check out")?;
         let repository = &first.repository;
         let programs = crate::jail::Programs::from_env()?;
@@ -1362,12 +1458,14 @@ impl Session {
             None => policy.worktrees.first(),
         }
         .ok_or("the workspace has no directory")?;
+        let instructions = self.conversation.instructions().to_vec();
         let place = crate::prompt::Place {
             scratch: workspace.scratch(),
             directory,
             read: &policy.read,
             write: &policy.write,
             repositories,
+            instructions: &instructions,
         };
         Ok(crate::prompt::prefix_in(meta.created, Some(&place)))
     }

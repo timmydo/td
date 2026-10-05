@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use td_json::Json;
+
 use crate::git::{self, Failure};
 
 /// The longest worktree id.
@@ -607,6 +609,72 @@ pub fn host_git() -> Result<PathBuf, String> {
         .find(|candidate| candidate.is_file())
         .ok_or("there is no git on PATH")?;
     fs::canonicalize(&found).map_err(|e| format!("{}: {e}", found.display()))
+}
+
+/// The project instructions' files, in the order looked for (DESIGN.md
+/// §13).
+pub const INSTRUCTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+/// A worktree's project instructions as the git worker read them at its
+/// base in the store (DESIGN.md §13): upstream's text, never a jail's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Instructions {
+    /// Neither `AGENTS.md` nor `CLAUDE.md` is at the base's top.
+    Absent,
+    /// The file `name`, whole.
+    Found { name: String, text: String },
+    /// Not read, and why: past a bound, not UTF-8, git failed.
+    Unread { why: String },
+}
+
+impl Instructions {
+    pub fn to_json(&self) -> Json {
+        let kind = |kind: &str| ("kind".to_string(), Json::Str(kind.into()));
+        match self {
+            Self::Absent => Json::Obj(vec![kind("absent")]),
+            Self::Found { name, text } => Json::Obj(vec![
+                kind("found"),
+                ("name".into(), Json::Str(name.clone())),
+                ("text".into(), Json::Str(text.clone())),
+            ]),
+            Self::Unread { why } => {
+                Json::Obj(vec![kind("unread"), ("why".into(), Json::Str(why.clone()))])
+            }
+        }
+    }
+
+    pub fn from_json(value: &Json) -> Result<Self, String> {
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(Json::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| format!("project instructions without `{key}`"))
+        };
+        match value.get("kind").and_then(Json::as_str) {
+            Some("absent") => Ok(Self::Absent),
+            Some("found") => {
+                let name = text("name")?;
+                if !INSTRUCTION_FILES.contains(&name.as_str()) {
+                    return Err(format!("project instructions from {name:?}"));
+                }
+                Ok(Self::Found {
+                    name,
+                    text: text("text")?,
+                })
+            }
+            Some("unread") => Ok(Self::Unread { why: text("why")? }),
+            _ => Err("project instructions of no known kind".into()),
+        }
+    }
+
+    /// The bytes of text it carries.
+    pub fn carried(&self) -> usize {
+        match self {
+            Self::Found { text, .. } => text.len(),
+            Self::Absent | Self::Unread { .. } => 0,
+        }
+    }
 }
 
 /// A maintenance entry's answer, its standard output's one line.

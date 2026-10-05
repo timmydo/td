@@ -544,6 +544,125 @@ const ADMITTED: &str = "remotes";
 const MAX_ADMITTED: usize = 256;
 const MAX_ADMITTED_BYTES: u64 = (MAX_ADMITTED * (crate::git::MAX_TEXT + 1)) as u64;
 
+/// One worktree's project instructions, as a conversation records them:
+/// the checkout they are for, the commit they were read at, and what was
+/// read there (DESIGN.md §13).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Instructed {
+    pub checkout: PathBuf,
+    pub base: String,
+    pub read: crate::repo::Instructions,
+}
+
+impl Instructed {
+    /// Its JSON, its read given whole or as the index of an earlier
+    /// entry with the same (`instructions_json`).
+    fn to_json(&self, same: Option<usize>) -> Json {
+        let read = match same {
+            Some(index) => ("same".into(), Json::from(index as u64)),
+            None => ("read".into(), self.read.to_json()),
+        };
+        Json::Obj(vec![
+            (
+                "checkout".into(),
+                Json::Str(self.checkout.to_string_lossy().into_owned()),
+            ),
+            ("base".into(), Json::Str(self.base.clone())),
+            read,
+        ])
+    }
+
+    /// The entry at `at` of a file whose entries before it are
+    /// `earlier`, which one naming its read takes it from.
+    fn from_json(value: &Json, earlier: &[Instructed], at: usize) -> Result<Self, String> {
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(Json::as_str)
+                .ok_or_else(|| format!("recorded instructions without `{key}`"))
+        };
+        let checkout = PathBuf::from(text("checkout")?);
+        if !checkout.is_absolute() {
+            return Err("recorded instructions for a relative checkout".into());
+        }
+        let base = text("base")?;
+        if !crate::git::object_id(base) {
+            return Err("recorded instructions at no commit".into());
+        }
+        let read = match value.get("same") {
+            Some(same) => same
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index < at)
+                .and_then(|index| earlier.get(index))
+                .filter(|other| other.base == base)
+                .map(|other| other.read.clone())
+                .ok_or("recorded instructions naming no earlier entry at their commit")?,
+            None => crate::repo::Instructions::from_json(
+                value
+                    .get("read")
+                    .ok_or("recorded instructions without `read`")?,
+            )?,
+        };
+        Ok(Self {
+            checkout,
+            base: base.to_string(),
+            read,
+        })
+    }
+}
+
+/// The conversation's recorded project instructions, its file and the
+/// most text they hold in all, and the file's bound, that text escaped.
+/// The prefix holds them, its JSON escaped again in its log event, so a
+/// byte of them takes at most four there (`prompt::project` makes
+/// controls plain): 128 KiB leaves the line room for the rest.
+const INSTRUCTIONS: &str = "instructions";
+pub const MAX_INSTRUCTED: usize = 128 * 1024;
+const MAX_INSTRUCTIONS_FILE: u64 = 8 * MAX_INSTRUCTED as u64;
+
+/// `dir`'s recorded project instructions, none when there is no file.
+fn read_instructions(dir: &Path) -> Result<Vec<Instructed>, String> {
+    let path = dir.join(INSTRUCTIONS);
+    let bytes = match read_bounded(&path, MAX_INSTRUCTIONS_FILE) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        read => read.map_err(|e| format!("{}: {e}", path.display()))?,
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|_| format!("{}: not UTF-8", path.display()))?;
+    let value = td_json::parse(text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut read: Vec<Instructed> = Vec::new();
+    for (at, item) in value
+        .as_arr()
+        .ok_or_else(|| format!("{}: not a list", path.display()))?
+        .iter()
+        .enumerate()
+    {
+        let one = Instructed::from_json(item, &read, at)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        read.push(one);
+    }
+    Ok(read)
+}
+
+/// The record as its file holds it: a worktree read at the commit an
+/// earlier one was, the same read, names that one (`"same": <index>`)
+/// rather than holding the text again, so the file's bound holds
+/// however many worktrees start there.
+fn instructions_json(all: &[Instructed]) -> Json {
+    Json::Arr(
+        all.iter()
+            .enumerate()
+            .map(|(at, one)| {
+                let earlier = all
+                    .iter()
+                    .take(at)
+                    .position(|other| other.base == one.base && other.read == one.read);
+                one.to_json(earlier)
+            })
+            .collect(),
+    )
+}
+
 /// A lock file, created when missing, never through a final link.
 fn open_lock(path: &Path) -> Result<File, String> {
     OpenOptions::new()
@@ -1456,6 +1575,8 @@ pub struct Load {
 pub struct Conversation {
     dir: PathBuf,
     meta: Meta,
+    /// Its worktrees' project instructions, as recorded (`instructed`).
+    instructions: Vec<Instructed>,
     log: File,
     /// The log's length, held within `MAX_LOG`.
     length: u64,
@@ -1536,6 +1657,7 @@ impl Conversation {
         }
         let prefix = String::from_utf8(read_named(&dir.join("prefix"), MAX_PREFIX)?)
             .map_err(|_| format!("{}: not UTF-8", dir.join("prefix").display()))?;
+        let instructions = read_instructions(&dir)?;
         let path = dir.join("log");
         let mut log = OpenOptions::new()
             .read(true)
@@ -1560,6 +1682,7 @@ impl Conversation {
         let mut conversation = Self {
             dir,
             meta,
+            instructions,
             log,
             length: bytes.len() as u64,
             events,
@@ -1727,6 +1850,69 @@ impl Conversation {
             }
         }
         open
+    }
+
+    /// Its worktrees' project instructions as recorded, in the order
+    /// they came (DESIGN.md §13).
+    pub fn instructions(&self) -> &[Instructed] {
+        &self.instructions
+    }
+
+    /// Records `more`, a worktree's replacing what it had: only a
+    /// repository not yet prepared is read again (DESIGN.md §7), so the
+    /// record is the commit its worktree was checked out at, and holds
+    /// once it is. Past `MAX_INSTRUCTED` bytes in all, a commit's text
+    /// counted once, a later worktree's is recorded unread, saying so.
+    pub fn instructed(&mut self, more: Vec<Instructed>) -> Result<(), String> {
+        // What stays is held as it was: only the new reads are bounded,
+        // against the rest, so no other worktree's record changes.
+        let kept: Vec<&Instructed> = self
+            .instructions
+            .iter()
+            .filter(|done| more.iter().all(|one| one.checkout != done.checkout))
+            .collect();
+        let mut counted: Vec<(&str, &crate::repo::Instructions)> = Vec::new();
+        let mut carried = 0usize;
+        for done in &kept {
+            if !counted.contains(&(done.base.as_str(), &done.read)) {
+                carried = carried.saturating_add(done.read.carried());
+                counted.push((done.base.as_str(), &done.read));
+            }
+        }
+        let mut bounded: Vec<Instructed> = Vec::new();
+        for mut one in more {
+            let seen = counted
+                .iter()
+                .any(|(base, read)| *base == one.base && **read == one.read)
+                || bounded
+                    .iter()
+                    .any(|done| done.base == one.base && done.read == one.read);
+            if !seen {
+                if carried.saturating_add(one.read.carried()) > MAX_INSTRUCTED {
+                    one.read = crate::repo::Instructions::Unread {
+                        why: format!(
+                            "past {MAX_INSTRUCTED} bytes with the other worktrees' instructions"
+                        ),
+                    };
+                }
+                carried = carried.saturating_add(one.read.carried());
+            }
+            bounded.push(one);
+        }
+        let mut all = self.instructions.clone();
+        for one in bounded {
+            match all.iter_mut().find(|done| done.checkout == one.checkout) {
+                Some(done) => *done = one,
+                None => all.push(one),
+            }
+        }
+        if all == self.instructions {
+            return Ok(());
+        }
+        let text = instructions_json(&all).to_string();
+        replace(&self.dir, INSTRUCTIONS, text.as_bytes())?;
+        self.instructions = all;
+        Ok(())
     }
 
     /// Records repository `repository` checked out in `meta`, once.
@@ -2418,6 +2604,135 @@ pub mod tests {
         let other = Id::random().unwrap();
         assert!(state.set_archived(&other, true, LOCK_WAIT).is_err());
         assert!(!state.conversation(&other).exists());
+    }
+
+    #[test]
+    fn project_instructions_are_recorded_once_a_worktree_within_their_bound() {
+        use crate::repo::Instructions;
+        let scratch = Scratch::new("instructed");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let instructed = |checkout: &str, read: Instructions| Instructed {
+            checkout: checkout.into(),
+            base: "a".repeat(40),
+            read,
+        };
+        let found = |text: &str| Instructions::Found {
+            name: "AGENTS.md".into(),
+            text: text.into(),
+        };
+        let (mut conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        assert!(conversation.instructions().is_empty());
+        conversation
+            .instructed(vec![
+                instructed("/w/a", found("first")),
+                instructed("/w/b", Instructions::Absent),
+            ])
+            .unwrap();
+        // Read again, as for a repository not yet prepared, a worktree's
+        // record is replaced, in its place; a commit's text counts once.
+        let big = found(&"x".repeat(MAX_INSTRUCTED - "second".len()));
+        conversation
+            .instructed(vec![
+                instructed("/w/a", found("second")),
+                instructed("/w/d", big.clone()),
+                instructed("/w/e", big.clone()),
+                instructed("/w/c", found("past the bound")),
+            ])
+            .unwrap();
+        let kept = conversation.instructions().to_vec();
+        assert_eq!(kept.len(), 5);
+        assert_eq!(kept.first().map(|i| &i.read), Some(&found("second")));
+        assert_eq!(kept.get(2).map(|i| &i.read), Some(&big));
+        assert_eq!(kept.get(3).map(|i| &i.read), Some(&big));
+        assert!(
+            matches!(kept.get(4).map(|i| &i.read), Some(Instructions::Unread { why }) if why.contains("past")),
+            "not said past the bound"
+        );
+        // Read again larger, one worktree's record is bounded against the
+        // others, which stay as they were.
+        conversation
+            .instructed(vec![instructed("/w/a", found(&"y".repeat(MAX_INSTRUCTED)))])
+            .unwrap();
+        let again = conversation.instructions().to_vec();
+        assert!(matches!(
+            again.first().map(|i| &i.read),
+            Some(Instructions::Unread { .. })
+        ));
+        assert_eq!(again.get(1..), kept.get(1..));
+        let kept = again;
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.instructions(), kept.as_slice());
+        drop(conversation);
+        // What td-agent would not have written refuses the conversation:
+        // a relative checkout, a base that is no commit, another file.
+        let file = state.conversation(&id).join(INSTRUCTIONS);
+        let commit = "a".repeat(40);
+        for (checkout, base, read) in [
+            ("rel", commit.as_str(), r#"{"kind": "absent"}"#),
+            ("/w/a", "main", r#"{"kind": "absent"}"#),
+            (
+                "/w/a",
+                commit.as_str(),
+                r#"{"kind": "found", "name": "README.md", "text": "x"}"#,
+            ),
+        ] {
+            std::fs::write(
+                &file,
+                format!(r#"[{{"checkout": "{checkout}", "base": "{base}", "read": {read}}}]"#),
+            )
+            .unwrap();
+            assert!(
+                Conversation::open(&state, &id, None, LOCK_WAIT).is_err(),
+                "{checkout} {base} {read}"
+            );
+        }
+    }
+
+    /// A workspace's every worktree at one commit, its text the most the
+    /// record holds and escaping most, is written within the file's bound
+    /// and read back.
+    #[test]
+    fn worktrees_at_one_commit_keep_their_instructions_file_within_its_bound() {
+        let scratch = Scratch::new("instructed-shared");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let (mut conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        let read = crate::repo::Instructions::Found {
+            name: "AGENTS.md".into(),
+            text: "\u{1}".repeat(MAX_INSTRUCTED),
+        };
+        let all: Vec<Instructed> = (0..crate::workspace::MAX_ENTRIES)
+            .map(|n| Instructed {
+                checkout: PathBuf::from(format!("/w/{n}")),
+                base: "a".repeat(40),
+                read: read.clone(),
+            })
+            .collect();
+        conversation.instructed(all.clone()).unwrap();
+        assert_eq!(conversation.instructions(), all.as_slice());
+        drop(conversation);
+        let bytes = std::fs::metadata(state.conversation(&id).join(INSTRUCTIONS))
+            .unwrap()
+            .len();
+        assert!(bytes <= MAX_INSTRUCTIONS_FILE, "{bytes}");
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.instructions(), all.as_slice());
+        drop(conversation);
+        // A reference to no earlier entry at its commit refuses the file.
+        std::fs::write(
+            state.conversation(&id).join(INSTRUCTIONS),
+            format!(
+                r#"[{{"checkout": "/w/0", "base": "{a}", "read": {{"kind": "absent"}}}}, {{"checkout": "/w/1", "base": "{b}", "same": 0}}]"#,
+                a = "a".repeat(40),
+                b = "b".repeat(40)
+            ),
+        )
+        .unwrap();
+        assert!(Conversation::open(&state, &id, None, LOCK_WAIT).is_err());
     }
 
     #[test]

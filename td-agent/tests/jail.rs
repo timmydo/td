@@ -483,6 +483,10 @@ fn a_repository_conversation_prepares_its_workspace() {
                                     email: Some("h@example.org".into()),
                                 },
                                 ids: vec![base.clone()],
+                                instructions: vec![td_agent::repo::Instructions::Found {
+                                    name: "AGENTS.md".into(),
+                                    text: "Read the docs.\n".into(),
+                                }],
                             }),
                         },
                     );
@@ -505,6 +509,13 @@ fn a_repository_conversation_prepares_its_workspace() {
     assert_eq!(
         conversation.meta().prepared,
         std::slice::from_ref(&entry.repository)
+    );
+    // The instructions the answer carried are recorded for the worktree.
+    let recorded = conversation.instructions();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded.first().map(|r| (&r.checkout, &r.base)),
+        Some((&entry.checkout, &base))
     );
 }
 

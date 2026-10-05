@@ -767,7 +767,7 @@ impl Worker {
         store: &Path,
         id: &str,
     ) -> Result<Option<(&'static str, Vec<u8>)>, String> {
-        for name in ["AGENTS.md", "CLAUDE.md"] {
+        for name in crate::repo::INSTRUCTION_FILES.iter().copied() {
             if let Some(text) = self.read(store, id, name)? {
                 return Ok(Some((name, text)));
             }
@@ -785,6 +785,59 @@ pub(crate) enum Failure {
     Exit(i32, String),
     TooLong,
     TimedOut(Duration),
+}
+
+/// The most bytes of project instructions one store's answer carries, in
+/// all: escaped as JSON escapes the worst text, within a frame.
+pub const MAX_INSTRUCTIONS: usize = 128 * 1024;
+
+/// The project instructions at each of `ids`, as `read` finds them there:
+/// each commit's read once, within one bound for the answer, so it fits
+/// its frame however JSON escapes it.
+fn instructions_at(
+    ids: &[String],
+    mut read: impl FnMut(&str) -> Result<Option<(&'static str, Vec<u8>)>, String>,
+) -> Vec<crate::repo::Instructions> {
+    let mut done: Vec<(&String, crate::repo::Instructions)> = Vec::new();
+    let mut carried = 0usize;
+    for id in ids {
+        if done.iter().any(|(at, _)| *at == id) {
+            continue;
+        }
+        let found = match read(id) {
+            Ok(None) => crate::repo::Instructions::Absent,
+            Ok(Some((name, bytes))) => match String::from_utf8(bytes) {
+                Ok(text) if carried.saturating_add(text.len()) > MAX_INSTRUCTIONS => {
+                    crate::repo::Instructions::Unread {
+                        why: format!(
+                            "{name} is past {MAX_INSTRUCTIONS} bytes with the other bases' instructions"
+                        ),
+                    }
+                }
+                Ok(text) => {
+                    carried = carried.saturating_add(text.len());
+                    crate::repo::Instructions::Found {
+                        name: name.to_string(),
+                        text,
+                    }
+                }
+                Err(_) => crate::repo::Instructions::Unread {
+                    why: format!("{name} is not UTF-8"),
+                },
+            },
+            Err(why) => crate::repo::Instructions::Unread { why },
+        };
+        done.push((id, found));
+    }
+    ids.iter()
+        .map(|id| {
+            done.iter()
+                .find(|(at, _)| *at == id)
+                .map_or(crate::repo::Instructions::Absent, |(_, found)| {
+                    found.clone()
+                })
+        })
+        .collect()
 }
 
 /// The window's store fetches (DESIGN.md §7, §9): one thread, which runs
@@ -879,9 +932,11 @@ impl Worker {
             .iter()
             .map(|base| self.resolve(&store, base))
             .collect::<Result<Vec<_>, _>>()?;
+        let instructions = instructions_at(&ids, |id| self.instructions(&store, id));
         Ok(crate::protocol::Fetched {
             identity: self.identity()?,
             ids,
+            instructions,
         })
     }
 }
@@ -1315,6 +1370,55 @@ pub(crate) mod tests {
             .store(&stores, &remote)
             .unwrap_err()
             .contains("another remote"));
+    }
+
+    #[test]
+    fn each_bases_instructions_are_read_once_within_the_answers_bound() {
+        use crate::repo::Instructions;
+        let ids: Vec<String> = ["a", "b", "a", "c", "d", "e"]
+            .iter()
+            .map(|id| id.repeat(40))
+            .collect();
+        let mut asked: Vec<String> = Vec::new();
+        let big = MAX_INSTRUCTIONS - 5;
+        let read = instructions_at(&ids, |id| {
+            asked.push(id.to_string());
+            match id.get(..1) {
+                Some("a") => Ok(Some(("AGENTS.md", b"Run make.\n".to_vec()))),
+                Some("b") => Ok(None),
+                Some("c") => Ok(Some(("CLAUDE.md", vec![b'x'; big]))),
+                Some("d") => Ok(Some(("AGENTS.md", vec![0xff, 0xfe]))),
+                _ => Err("git exited 128".into()),
+            }
+        });
+        // A commit asked twice is read once.
+        assert_eq!(asked.len(), 5);
+        let found = Instructions::Found {
+            name: "AGENTS.md".into(),
+            text: "Run make.\n".into(),
+        };
+        assert_eq!(read.first(), Some(&found));
+        assert_eq!(read.get(1), Some(&Instructions::Absent));
+        assert_eq!(read.get(2), Some(&found));
+        // Past the answer's bound with the others: said, not carried.
+        assert!(
+            matches!(read.get(3), Some(Instructions::Unread { why }) if why.contains("past")),
+            "not said past the bound"
+        );
+        assert_eq!(
+            read.get(4),
+            Some(&Instructions::Unread {
+                why: "AGENTS.md is not UTF-8".into()
+            })
+        );
+        assert_eq!(
+            read.get(5),
+            Some(&Instructions::Unread {
+                why: "git exited 128".into()
+            })
+        );
+        let carried: usize = read.iter().map(Instructions::carried).sum();
+        assert!(carried <= MAX_INSTRUCTIONS);
     }
 
     #[test]
