@@ -264,3 +264,9 @@ pub const UMOUNT_APPLET: &str = "umount";
 pub const LOSETUP_APPLET: &str = "losetup";
 #[allow(dead_code)]
 pub const REQUIRED_TD_INIT_APPLETS: &[&str] = &[MOUNT_APPLET, UMOUNT_APPLET, LOSETUP_APPLET];
+// The td-init applet the installed selector's recovery flow reads the
+// recovery key and the reseal's confirmation through, by its /bin name
+// (td-install/ENCRYPTION.md "Device-bound default"). Not in the roster
+// above: no root farm serves it. The image's shape check binds it into the
+// selector initramfs, and only there.
+pub const SECRET_LINE_APPLET: &str = "secret-line";

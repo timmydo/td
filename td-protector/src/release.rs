@@ -8,6 +8,7 @@
 
 use crate::cryptsetup::{Cryptsetup, KeyFile};
 use crate::luks2::{Header, MAX_TD_TOKENS};
+use crate::recovery::RecoveryKey;
 use crate::token::{Role, Token};
 use crate::transition::{self, Input, Refusal, Released as Classified, Step, Transition};
 use crate::{
@@ -18,7 +19,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::Path;
-use td_tpm::{Client, Device, SealedObject, Transport};
+use td_tpm::{Client, Device, PcrPolicy, SealedObject, Transport};
 
 /// The most td tokens one release tries: the reader's bound on td tokens,
 /// so every one a header can carry.
@@ -249,10 +250,15 @@ pub fn release<T: Tpm, C: Runner>(
         Ok(header) => header,
         Err(error) => return recovery(Recovery::Header(error.clone()), false),
     };
+    // The cap closed PCR 12 and td read the header: the reseal is offered
+    // wherever the planner admits one over it.
+    let offerable = reseal_plannable(header);
     let new = match new {
         Some(Err(reason)) => {
             console(&reason.to_string());
-            return recovery(reason, true);
+            // An unmeasured PCR 4 or 9 refuses the reseal's seal too.
+            let offer = offerable && !matches!(reason, Recovery::Unmeasured { .. });
+            return recovery(reason, offer);
         }
         Some(Ok(new)) => Some(new),
         None => None,
@@ -260,10 +266,12 @@ pub fn release<T: Tpm, C: Runner>(
     if released.is_empty() {
         let reason = Recovery::NothingReleased;
         console(&reason.to_string());
-        return recovery(reason, true);
+        return recovery(reason, offerable);
     }
     // Step 5: after the cap.
-    let outcome = execute(header, device, released, new, cryptsetup, console);
+    let outcome = execute(
+        header, device, released, new, offerable, cryptsetup, console,
+    );
     if let Outcome::Recovery { reason, .. } = &outcome {
         console(&reason.to_string());
     }
@@ -285,6 +293,18 @@ pub fn candidates(header: &Header) -> Vec<(u8, &Token)> {
     tokens
 }
 
+/// Whether the planner admits a reseal over `header`: keyslot 0 present
+/// and named by no td token, no keyslot shared, and a free keyslot and
+/// token number. The sealed object only fills the new token's format, so
+/// a placeholder stands in for the one a reseal would seal.
+fn reseal_plannable(header: &Header) -> bool {
+    let sealed = SealedObject {
+        public: vec![0],
+        private: vec![0],
+    };
+    transition::plan(header, &Transition::Reseal { sealed }).is_ok()
+}
+
 fn role_of(header: &Header, number: u8) -> Option<Role> {
     header
         .tokens
@@ -301,22 +321,40 @@ fn keyslot_of(header: &Header, number: u8) -> Option<u8> {
         .map(|(_, token)| token.keyslot())
 }
 
-/// Seal a device-bound protector to the observed PCR 4 and PCR 9 values
-/// and a literal-zero PCR 12, then unseal it once to verify it.
-fn new_protector<T: Tpm>(tpm: &mut T) -> Result<NewProtector, Recovery> {
+/// Why a device-bound protector was not sealed.
+enum SealError {
+    Unmeasured { pcr: u8 },
+    Failed(String),
+}
+
+/// Seal a fresh device-bound protector to the observed PCR 4 and PCR 9
+/// values and a literal-zero PCR 12. Seal only: the release's step 3
+/// verifies it before the cap, and after the cap no unseal can.
+fn seal_device_bound<T: Tpm>(tpm: &mut T) -> Result<(PcrPolicy, NewProtector), SealError> {
     let policy = tpm
         .open()
         .map_err(ObserveError::Tpm)
         .and_then(|mut client| observe(&mut client))
         .map_err(|error| match error {
-            ObserveError::Unmeasured { pcr } => Recovery::Unmeasured { pcr },
-            ObserveError::Tpm(error) => Recovery::Transition(format!("read PCRs 4 and 9: {error}")),
+            ObserveError::Unmeasured { pcr } => SealError::Unmeasured { pcr },
+            ObserveError::Tpm(error) => SealError::Failed(format!("read PCRs 4 and 9: {error}")),
         })?;
-    let secret = Secret::generate().map_err(Recovery::Transition)?;
+    let secret = Secret::generate().map_err(SealError::Failed)?;
     let sealed = tpm
         .open()
         .and_then(|client| seal(client, &policy, &secret))
-        .map_err(|error| Recovery::Transition(format!("seal: {error}")))?;
+        .map_err(|error| SealError::Failed(format!("seal: {error}")))?;
+    Ok((policy, NewProtector { sealed, secret }))
+}
+
+/// Seal a device-bound protector to the observed PCR 4 and PCR 9 values
+/// and a literal-zero PCR 12, then unseal it once to verify it.
+fn new_protector<T: Tpm>(tpm: &mut T) -> Result<NewProtector, Recovery> {
+    let (policy, NewProtector { sealed, secret }) =
+        seal_device_bound(tpm).map_err(|error| match error {
+            SealError::Unmeasured { pcr } => Recovery::Unmeasured { pcr },
+            SealError::Failed(error) => Recovery::Transition(error),
+        })?;
     let verified = tpm
         .open()
         .map_err(UnsealError::Other)
@@ -342,17 +380,20 @@ enum Opens {
 enum Run {
     /// The released keyslot failed its test: fall back.
     OpenerFailed,
-    Opens(Opens),
+    /// Every step ran (`complete`), or a later one failed and stopped it.
+    Opens { opens: Opens, complete: bool },
 }
 
 /// Step 5: classify, plan, confirm against cryptsetup's metadata and run,
 /// falling back to the next released token when the released keyslot fails
-/// its test, and to recovery when none is left; never halting.
+/// its test, and to recovery when none is left; never halting. `offerable`
+/// is whether a recovery it reaches offers the reseal.
 fn execute<C: Runner>(
     header: &Header,
     device: &Path,
     mut released: Vec<(u8, Secret)>,
     mut new: Option<NewProtector>,
+    offerable: bool,
     cryptsetup: &mut C,
     console: &mut dyn FnMut(&str),
 ) -> Outcome {
@@ -360,10 +401,10 @@ fn execute<C: Runner>(
         let numbers: Vec<u8> = released.iter().map(|(number, _)| *number).collect();
         let classified = match transition::classify(header, &numbers) {
             Ok(classified) => classified,
-            Err(refusal) => return recovery(Recovery::Refused(refusal), true),
+            Err(refusal) => return recovery(Recovery::Refused(refusal), offerable),
         };
         let (opener, transition) = match classified {
-            Classified::Nothing => return recovery(Recovery::NoKeyslotOpens, true),
+            Classified::Nothing => return recovery(Recovery::NoKeyslotOpens, offerable),
             Classified::DeviceBound { token } => (token, Some(Transition::Keep { token })),
             Classified::FirstBoot { token } => match new.as_ref() {
                 Some(new) => (
@@ -377,7 +418,7 @@ fn execute<C: Runner>(
                 // that failed its test, so nothing was sealed this boot:
                 // opening with the first-boot protector would release to
                 // PCR 12 alone on every later boot too.
-                None => return recovery(Recovery::FirstBootFallback, true),
+                None => return recovery(Recovery::FirstBootFallback, offerable),
             },
         };
         let (Some(slot), Some(opener_secret)) = (
@@ -389,7 +430,7 @@ fn execute<C: Runner>(
         ) else {
             return recovery(
                 Recovery::Refused(Refusal::UnknownToken { token: opener }),
-                true,
+                offerable,
             );
         };
         let steps = transition
@@ -399,7 +440,7 @@ fn execute<C: Runner>(
             .unwrap_or_default();
         let key = Keys {
             opener: slot,
-            released: opener_secret,
+            released: opener_secret.expose(),
             new: new.as_ref(),
             new_slot: steps.iter().find_map(|step| match step {
                 Step::AddKeyslot { slot, .. } => Some(*slot),
@@ -421,26 +462,107 @@ fn execute<C: Runner>(
                 // Dropping it zeroes it.
                 released.retain(|(number, _)| *number != opener);
             }
-            Run::Opens(Opens::New(keyslot)) => {
+            Run::Opens {
+                opens: Opens::New(keyslot),
+                ..
+            } => {
                 return match new.take() {
                     Some(new) => Outcome::Released {
                         keyslot,
                         secret: new.secret,
                     },
-                    None => recovery(Recovery::NoKeyslotOpens, true),
+                    None => recovery(Recovery::NoKeyslotOpens, offerable),
                 };
             }
-            Run::Opens(Opens::Released) => {
+            Run::Opens {
+                opens: Opens::Released,
+                ..
+            } => {
                 // Every other released secret is dropped, and zeroed, here.
                 return match released.into_iter().find(|(number, _)| *number == opener) {
                     Some((_, secret)) => Outcome::Released {
                         keyslot: slot,
                         secret,
                     },
-                    None => recovery(Recovery::NoKeyslotOpens, true),
+                    None => recovery(Recovery::NoKeyslotOpens, offerable),
                 };
             }
         }
+    }
+}
+
+/// How a confirmed recovery reseal ended. Keyslot 0 is never touched, so
+/// the recovery key opens the volume whatever it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resealed {
+    /// Every step ran: the new device-bound protector's keyslot passed its
+    /// test and every other td keyslot and token is gone.
+    Complete { keyslot: u8 },
+    /// A step failed and stopped the plan. `tested` is the new keyslot if
+    /// its test had passed; the next boot's plan removes what is left over,
+    /// or that boot reaches recovery again.
+    Stopped { tested: Option<u8> },
+    /// No step ran, and the header is unchanged.
+    NotRun(String),
+}
+
+/// The confirmed recovery reseal (ENCRYPTION.md "Device-bound default"),
+/// after this boot's own cap and after `recovery` opened keyslot 0: seal a
+/// fresh device-bound protector to the observed PCR 4 and PCR 9 values and
+/// a literal-zero PCR 12, then run the planner's `Reseal` plan over
+/// `header` once cryptsetup's metadata confirms it, reporting each commit.
+/// The seal is not verified by an unseal, which the closed cap refuses:
+/// the plan's test of the new keyslot with its secret is this boot's
+/// evidence, and its TPM release is first proven on the next boot. The new
+/// secret is zeroed before this returns.
+pub fn reseal<T: Tpm, C: Runner>(
+    header: &Header,
+    device: &Path,
+    recovery: &RecoveryKey,
+    tpm: &mut T,
+    cryptsetup: &mut C,
+    console: &mut dyn FnMut(&str),
+) -> Resealed {
+    let new = match seal_device_bound(tpm) {
+        Ok((_, new)) => new,
+        Err(SealError::Unmeasured { pcr }) => {
+            return Resealed::NotRun(format!(
+                "PCR {pcr} is unmeasured: no device-bound protector is sealed"
+            ))
+        }
+        Err(SealError::Failed(error)) => return Resealed::NotRun(error),
+    };
+    let transition = Transition::Reseal {
+        sealed: new.sealed.clone(),
+    };
+    let Some(steps) = confirmed_steps(header, device, &transition, cryptsetup, console) else {
+        return Resealed::NotRun("the reseal plan did not run".into());
+    };
+    let Some(new_slot) = steps.iter().find_map(|step| match step {
+        Step::AddKeyslot { slot, .. } => Some(*slot),
+        _ => None,
+    }) else {
+        return Resealed::NotRun("the reseal plan adds no keyslot".into());
+    };
+    let passphrase = recovery.passphrase();
+    let keys = Keys {
+        opener: transition::RECOVERY_SLOT,
+        released: passphrase.expose(),
+        new: Some(&new),
+        new_slot: Some(new_slot),
+    };
+    match run_steps(&steps, device, &keys, cryptsetup, console) {
+        Run::Opens {
+            opens: Opens::New(keyslot),
+            complete: true,
+        } => Resealed::Complete { keyslot },
+        Run::Opens {
+            opens: Opens::New(keyslot),
+            complete: false,
+        } => Resealed::Stopped {
+            tested: Some(keyslot),
+        },
+        _ => Resealed::Stopped { tested: None },
     }
 }
 
@@ -479,32 +601,31 @@ fn confirmed_steps<C: Runner>(
     }
 }
 
-/// The keys a plan's steps may name: the released secret's keyslot and the
-/// new protector's. Keyslot 0's recovery key is never among them here.
+/// The keys a plan's steps may name: the opener's, a released secret's
+/// keyslot or, for a confirmed reseal, keyslot 0's recovery passphrase;
+/// and the new protector's.
 struct Keys<'a> {
     opener: u8,
-    released: &'a Secret,
+    released: &'a [u8],
     new: Option<&'a NewProtector>,
     new_slot: Option<u8>,
 }
 
 impl Keys<'_> {
     fn of(&self, slot: u8) -> io::Result<&[u8]> {
-        let secret = if slot == self.opener {
+        let key = if slot == self.opener {
             Some(self.released)
         } else if Some(slot) == self.new_slot {
-            self.new.map(|new| &new.secret)
+            self.new.map(|new| new.secret.expose().as_slice())
         } else {
             None
         };
-        secret
-            .map(|secret| secret.expose().as_slice())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("no key for keyslot {slot}"),
-                )
-            })
+        key.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no key for keyslot {slot}"),
+            )
+        })
     }
 }
 
@@ -557,11 +678,17 @@ fn run_steps<C: Runner>(
                 if index == 0 && *step == (Step::Test { slot: keys.opener }) {
                     return Run::OpenerFailed;
                 }
-                return Run::Opens(opens);
+                return Run::Opens {
+                    opens,
+                    complete: false,
+                };
             }
         }
     }
-    Run::Opens(opens)
+    Run::Opens {
+        opens,
+        complete: true,
+    }
 }
 
 /// One step through the runner: a key on standard input by the keyslot it
@@ -614,7 +741,7 @@ mod tests {
 
     const DEVICE: &str = "/proc/1/fd/7";
     /// Keyslot 0's passphrase: 48 recovery-key digits.
-    const RECOVERY_KEY: &[u8] = b"123450123450123450123450123450123450123450123450";
+    const RECOVERY_KEY: &[u8] = b"123459123459123459123459123459123459123459123459";
 
     /// PCR 12 once the cap closed it.
     fn capped() -> [u8; 32] {
@@ -638,6 +765,8 @@ mod tests {
         dead: Vec<u8>,
         tokens: BTreeMap<u8, Entry>,
         calls: Vec<String>,
+        /// The calls that succeeded with the recovery key on standard input.
+        recovery_calls: Vec<String>,
         /// Another header's metadata, as from a copy td did not read.
         metadata: Option<Vec<u8>>,
         /// Verbs that fail as cryptsetup would.
@@ -659,6 +788,7 @@ mod tests {
                 dead: Vec::new(),
                 tokens: BTreeMap::new(),
                 calls: Vec::new(),
+                recovery_calls: Vec::new(),
                 metadata: None,
                 fail: Vec::new(),
                 pcr12: Box::new(move || read.pcr(usize::from(CAP_PCR))),
@@ -847,6 +977,10 @@ mod tests {
                 }
                 verb => panic!("unscripted cryptsetup {verb}"),
             }
+            if input == RECOVERY_KEY {
+                let call = self.calls.last().cloned().unwrap_or_default();
+                self.recovery_calls.push(call);
+            }
             Ok(())
         }
 
@@ -1018,6 +1152,41 @@ mod tests {
         assert_eq!(count(&tpm.codes(), CREATE), 0);
     }
 
+    /// Recovery offers the reseal only where the planner admits one: not
+    /// over a header whose td token names keyslot 0, nor one with no free
+    /// keyslot; the same header without them offers it.
+    #[test]
+    fn recovery_offers_no_reseal_the_planner_would_refuse() {
+        for case in ["keyslot 0 named", "no free keyslot", "admitted"] {
+            let mut tpm = Scripted::new();
+            let mut disk = Disk::new(&tpm);
+            let _bound = disk.enroll(&mut tpm, 0, 1, Role::DeviceBound);
+            match case {
+                "keyslot 0 named" => {
+                    drop(disk.enroll(&mut tpm, 1, 0, Role::DeviceBound));
+                    disk.keyslots.insert(0, RECOVERY_KEY.to_vec());
+                }
+                "no free keyslot" => {
+                    for slot in 2..=31u8 {
+                        disk.keyslots.insert(slot, vec![slot; 32]);
+                    }
+                }
+                _ => {}
+            }
+            tpm.0.borrow_mut().pcrs[4] = [0x45; 32];
+            let mut header = disk.header();
+            if case == "no free keyslot" {
+                // Foreign tokens name keyslots 2 to 31, so none is an
+                // orphan the plan would free.
+                header.foreign = (2..=31u8).map(|slot| (slot, vec![slot])).collect();
+            }
+            let (outcome, lines) = boot_over(&Ok(header), &mut disk, Some(&mut tpm));
+            let (reason, offerable) = recovered(outcome, &lines);
+            assert_eq!(reason, Recovery::NothingReleased, "{case}");
+            assert_eq!(offerable, case == "admitted", "{case}");
+        }
+    }
+
     #[test]
     fn nothing_released_reaches_recovery_without_cryptsetup() {
         let mut tpm = Scripted::new();
@@ -1137,7 +1306,7 @@ mod tests {
             let (outcome, lines) = boot(&mut disk, &mut tpm);
             assert_eq!(
                 recovered(outcome, &lines),
-                (Recovery::Unmeasured { pcr }, true)
+                (Recovery::Unmeasured { pcr }, false)
             );
             assert!(disk.calls.is_empty());
             let codes = tpm.codes();
@@ -1238,41 +1407,191 @@ mod tests {
         assert_eq!(disk.calls, ["test 1"]);
     }
 
-    /// A confirmed recovery reseal, as the recovery flow will run it after
-    /// this boot's cap: the planner's steps with the recovery key on
-    /// keyslot 0 and the new protector's on its own.
-    fn reseal(disk: &mut Disk, tpm: &mut Scripted) -> (u8, Secret) {
-        let policy = observed_policy(&mut tpm.client()).unwrap();
-        let secret = Secret::generate().unwrap();
-        let sealed = seal(tpm.client(), &policy, &secret).unwrap();
-        let steps = transition::plan(&disk.header(), &Transition::Reseal { sealed })
-            .unwrap()
-            .confirm(&disk.dump_with(&[]))
-            .unwrap();
-        let slot = steps
-            .iter()
-            .find_map(|step| match step {
-                Step::AddKeyslot { slot, .. } => Some(*slot),
-                _ => None,
-            })
-            .unwrap();
-        for step in &steps {
-            let file = KeyFile::new(secret.expose()).unwrap();
-            let json;
-            let input: &[u8] = match step.input() {
-                Input::KeyOf(0) => RECOVERY_KEY,
-                Input::KeyOf(key) if key == slot => secret.expose(),
-                Input::KeyOf(key) => panic!("no key for keyslot {key}"),
-                Input::Token(token) => {
-                    json = token.encode();
-                    json.as_bytes()
-                }
-                Input::Nothing => &[],
-            };
-            disk.run(&step.args(Path::new(DEVICE), file.path()), input)
-                .unwrap();
+    fn recovery_key() -> RecoveryKey {
+        match RecoveryKey::parse(RECOVERY_KEY) {
+            Ok(key) => key,
+            Err(error) => panic!("{error}"),
         }
-        (slot, secret)
+    }
+
+    /// A confirmed recovery reseal after this boot's cap, as the selector's
+    /// recovery flow runs it once the recovery key opened keyslot 0. No
+    /// secret outlives it, and it sends the TPM no unseal: the closed cap
+    /// would refuse one.
+    fn run_reseal(disk: &mut Disk, tpm: &mut Scripted) -> (Resealed, Vec<String>) {
+        disk.calls.clear();
+        disk.recovery_calls.clear();
+        tpm.codes();
+        let mut lines = Vec::new();
+        let before = live_secrets();
+        let header = disk.header();
+        let outcome = reseal(
+            &header,
+            Path::new(DEVICE),
+            &recovery_key(),
+            tpm,
+            disk,
+            &mut |line| lines.push(line.to_owned()),
+        );
+        assert_eq!(live_secrets(), before, "secrets left alive: {lines:?}");
+        let codes = tpm.codes();
+        assert_eq!(count(&codes, UNSEAL), 0);
+        assert_eq!(count(&codes, PCR_EXTEND), 0);
+        (outcome, lines)
+    }
+
+    /// The first boot's transition done, then a changed selector image:
+    /// the device-bound protector in keyslot 2, token 1, is refused, so the
+    /// boot reaches recovery with the reseal offered.
+    fn changed_chain() -> (Disk, Scripted) {
+        let mut tpm = Scripted::new();
+        let (mut disk, _first) = installed(&mut tpm);
+        let (outcome, lines) = boot(&mut disk, &mut tpm);
+        assert_eq!(released(outcome, &lines).0, 2);
+        assert_eq!(
+            disk.shape(),
+            (vec![0, 2], vec![(1, Some(2), Role::DeviceBound)])
+        );
+        tpm.0.borrow_mut().pcrs[4] = [0x45; 32];
+        reboot(&tpm);
+        let (outcome, lines) = boot(&mut disk, &mut tpm);
+        assert_eq!(
+            recovered(outcome, &lines),
+            (Recovery::NothingReleased, true)
+        );
+        (disk, tpm)
+    }
+
+    /// The reseal seals to the changed chain without verifying by unseal,
+    /// kills an orphan with keyslot 0's key, adds and tests the new
+    /// protector, then retires every other td keyslot and token, reporting
+    /// each commit; keyslot 0 stays, and the recovery key authorizes only
+    /// the steps keyslot 0 authorizes. The next boot releases the new
+    /// protector with no plan.
+    #[test]
+    fn a_confirmed_reseal_replaces_every_td_protector_and_keeps_keyslot_0() {
+        let (mut disk, mut tpm) = changed_chain();
+        disk.keyslots.insert(4, vec![4; 32]);
+        let (outcome, lines) = run_reseal(&mut disk, &mut tpm);
+        assert_eq!(outcome, Resealed::Complete { keyslot: 1 }, "{lines:?}");
+        assert_eq!(
+            disk.calls,
+            [
+                "dump",
+                "kill 4",
+                "add 1 by 0",
+                "import 1",
+                "test 1",
+                "kill 2",
+                "remove 1"
+            ]
+        );
+        assert_eq!(disk.recovery_calls, ["kill 4", "add 1 by 0"]);
+        assert_eq!(
+            disk.shape(),
+            (vec![0, 1], vec![(0, Some(1), Role::DeviceBound)])
+        );
+        assert_eq!(disk.keyslots[&0], RECOVERY_KEY);
+        for step in 1..=6 {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("transition step {step}/6: "))),
+                "{lines:?}"
+            );
+        }
+        let new = disk.keyslots[&1].clone();
+        reboot(&tpm);
+        let (outcome, lines) = boot(&mut disk, &mut tpm);
+        let (keyslot, secret) = released(outcome, &lines);
+        assert_eq!((keyslot, secret.expose().as_slice()), (1, new.as_slice()));
+        assert_eq!(disk.calls, ["test 1"]);
+    }
+
+    /// A step that fails stops the reseal; keyslot 0 always remains. Before
+    /// the new keyslot's test passed, the next boot reaches recovery again
+    /// (an added keyslot without its token is an orphan the next reseal
+    /// kills first); after it, or once its token is in, the next boot
+    /// releases the new protector and its plan retires what is left.
+    #[test]
+    fn a_failed_reseal_step_stops_the_plan_and_the_next_boot_proves_or_recovers() {
+        for (verb, expected, next) in [
+            (
+                "dump",
+                Resealed::NotRun("the reseal plan did not run".into()),
+                None,
+            ),
+            ("add", Resealed::Stopped { tested: None }, None),
+            ("import", Resealed::Stopped { tested: None }, None),
+            ("test", Resealed::Stopped { tested: None }, Some(1)),
+            ("kill", Resealed::Stopped { tested: Some(1) }, Some(1)),
+            ("remove", Resealed::Stopped { tested: Some(1) }, Some(1)),
+        ] {
+            let (mut disk, mut tpm) = changed_chain();
+            let before = disk.shape();
+            disk.fail.push(verb);
+            let (outcome, lines) = run_reseal(&mut disk, &mut tpm);
+            assert_eq!(outcome, expected, "{verb}: {lines:?}");
+            assert_eq!(disk.keyslots[&0], RECOVERY_KEY, "{verb}");
+            if verb == "dump" {
+                assert_eq!(disk.shape(), before);
+            }
+            assert!(
+                lines.iter().any(|l| l.contains("failed") || verb == "dump"),
+                "{verb}: {lines:?}"
+            );
+            disk.fail.clear();
+            reboot(&tpm);
+            let (outcome, lines) = boot(&mut disk, &mut tpm);
+            match next {
+                Some(slot) => {
+                    let (keyslot, secret) = released(outcome, &lines);
+                    assert_eq!(keyslot, slot, "{verb}");
+                    assert_eq!(disk.keyslots[&slot], secret.expose(), "{verb}");
+                    assert_eq!(
+                        disk.shape(),
+                        (vec![0, 1], vec![(0, Some(1), Role::DeviceBound)]),
+                        "{verb}: {lines:?}"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        recovered(outcome, &lines),
+                        (Recovery::NothingReleased, true),
+                        "{verb}"
+                    );
+                    let (outcome, lines) = run_reseal(&mut disk, &mut tpm);
+                    assert_eq!(
+                        outcome,
+                        Resealed::Complete { keyslot: 1 },
+                        "{verb}: {lines:?}"
+                    );
+                    if verb == "import" {
+                        assert_eq!(disk.calls[..3], ["dump", "kill 1", "add 1 by 0"]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// An unmeasured PCR 4 or 9 seals nothing and runs no cryptsetup: the
+    /// header is unchanged and the boot goes on with the recovery key.
+    #[test]
+    fn an_unmeasured_pcr_runs_no_reseal() {
+        for pcr in [4usize, 9] {
+            let (mut disk, mut tpm) = changed_chain();
+            let before = disk.shape();
+            tpm.0.borrow_mut().pcrs[pcr] = [0; 32];
+            let (outcome, _) = run_reseal(&mut disk, &mut tpm);
+            assert_eq!(
+                outcome,
+                Resealed::NotRun(format!(
+                    "PCR {pcr} is unmeasured: no device-bound protector is sealed"
+                ))
+            );
+            assert!(disk.calls.is_empty());
+            assert_eq!(disk.shape(), before);
+        }
     }
 
     /// A device-bound protector whose keyslot is dead beside a live
@@ -1299,15 +1618,23 @@ mod tests {
             // No protector is sealed: a device-bound one released.
             assert_eq!(count(&tpm.codes(), CREATE), 0);
         }
-        let (slot, secret) = reseal(&mut disk, &mut tpm);
+        // The reseal retires both, the surviving first-boot one included.
+        let (outcome, lines) = run_reseal(&mut disk, &mut tpm);
+        let Resealed::Complete { keyslot: slot } = outcome else {
+            panic!("{outcome:?}: {lines:?}");
+        };
         assert_eq!(
             disk.shape(),
             (vec![0, slot], vec![(2, Some(slot), Role::DeviceBound)])
         );
+        let secret = disk.keyslots[&slot].clone();
         reboot(&tpm);
         let (outcome, lines) = boot(&mut disk, &mut tpm);
         let (keyslot, released_secret) = released(outcome, &lines);
-        assert_eq!((keyslot, released_secret.expose()), (slot, secret.expose()));
+        assert_eq!(
+            (keyslot, released_secret.expose().as_slice()),
+            (slot, secret.as_slice())
+        );
         assert_eq!(disk.calls, [format!("test {slot}")]);
     }
 

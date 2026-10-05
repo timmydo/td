@@ -208,7 +208,11 @@ volume consumers"). So the image build refuses either initramfs without
 `/bin/cryptsetup` or its store payload, the static binary, or with a
 `/bin/cryptsetup` that does not link that payload; the debug companion
 ships in the root with the package. The live selector, the same stock
-initramfs, carries it and never runs it.
+initramfs, carries it and never runs it. The installed selector's
+recovery flow reads the recovery key through td-init's `secret-line`
+(td-boot's `SECRET_LINE_APPLET`), a td-init applet like the rest, and the
+image build refuses a selector initramfs whose `/bin/secret-line` does
+not link td-init, and a deployment initramfs or root that carries it.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create
@@ -1291,8 +1295,9 @@ whose descriptor is held for the consumer. The installed selector's
 `on-volume boot` of an encrypted volume runs the release order on the
 pinned partition, before any mount
 (ENCRYPTION.md "Selector release"); a mapping already active then
-refuses boot. The released secret opens the mapping `td-selector`,
-cryptsetup naming the partition by its held descriptor,
+refuses boot. The released secret, or the recovery key on keyslot 0
+when the release ends in the recovery flow, opens the mapping
+`td-selector`, cryptsetup naming the partition by its held descriptor,
 `/proc/<pid>/fd/N`; the mapping is then admitted by this walk, under
 that name only, held with the partition, and the boot's mounts name it
 as `/proc/<pid>/fd/M`. It does not survive `kexec`.

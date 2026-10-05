@@ -89,7 +89,9 @@ forbidding unsafe code, the TPM being td-tpm's safe file I/O on
 `/dev/tpmrm0`; a refused cap or release halts by parking the thread
 through std. The release's cryptsetup children, and the pipe that hands
 the volume key to td-kexec, are std's, through td-protector's runner and
-its `KeyFile`. The deployment initramfs's unlock adds none: its post-cap
+its `KeyFile`; its recovery flow's secret-line child and the pipe it
+reads the entry from are std's too, the termios requests being td-init's
+own (§3). The deployment initramfs's unlock adds none: its post-cap
 unseal is td-protector's over the same client, its key member is read
 with std file I/O, and its one cryptsetup child, with the key on a pipe,
 is td-protector's runner's std process and pipe. `td-install` was the
@@ -364,8 +366,12 @@ neither kept nor joined to the entry. `sys::termios_set_flush` passes the same
 beside the value, the roster entry and the wrapper. Every restore, and
 getty, stays on plain `TCSETS`. `TCSETSW` remains refused.
 
-The applet is dormant: no initramfs or root farm links it until the
-selector's recovery flow does. Its one operand is the prompt, 1 to 128
+The selector initramfs links it, and nothing else does: the installed
+selector's recovery flow runs it once per entry as td-boot's child and
+reads its line from the pipe (`td-install/ENCRYPTION.md` "Selector
+release"); the live selector, the same stock initramfs, never runs it,
+and the image's shape check refuses it in the deployment initramfs or
+the root. Its one operand is the prompt, 1 to 128
 printable ASCII bytes. It refuses a stdout that is not a pipe (a named FIFO
 is one; a socket, terminal or file is not), then opens `/dev/console`, the
 kernel's console, `O_NOCTTY`. `term::echo_off` patches the kernel's own

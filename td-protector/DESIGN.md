@@ -339,7 +339,10 @@ before a child starts. `metadata` runs `luksDump --dump-json-metadata` and
 returns its output instead, the header's public JSON.
 
 `run` succeeds only on exit 0 and otherwise names the program, the verb
-and the exit status, never an argument. `mapping` asks `status NAME` of
+and the exit status, never an argument; `exit_code` reads that status
+back from the error, so a caller can tell `EXIT_BAD_PASSPHRASE`, 2
+(cryptsetup 2.8.8's `translate_errno` of a wrong passphrase's
+`-EPERM`), from every other failure. `mapping` asks `status NAME` of
 device-mapper and classifies its exit alone: 0 active, 4 inactive
 (cryptsetup 2.8.8's `action_status` returns `-ENODEV` for an inactive
 name, which `translate_errno` makes 4), and any other exit an error
@@ -356,7 +359,9 @@ remains; `luksDump --dump-json-metadata`; `luksDump --dump-volume-key
 handoff, which cryptsetup 2.8.8 writes to a new FILE it creates
 `O_CREAT|O_EXCL` at mode 0400 and names on standard output without the
 key (ENCRYPTION.md "Selector release" says what was verified); `open`,
-`close`, `status`; `open --test-passphrase` on one keyslot; and the
+`close`, `status`; `open --key-slot N`, the passphrase tried on that
+keyslot alone, with which the selector's recovery flow opens keyslot 0;
+`open --test-passphrase` on one keyslot; and the
 deployment initramfs's `open --volume-key-file KEY-FILE`, the handed-off
 volume key a `KeyFile` with nothing on standard input, which cryptsetup
 2.8.8 reads at the header's volume-key size and activates only when it
@@ -455,8 +460,8 @@ it.
 
 `release::release` runs ENCRYPTION.md's release order, steps 2 to 5,
 for the installed selector, td-boot, which then opens the volume with a
-`Released` secret and refuses boot and halts on any other outcome until
-the recovery flow lands (ENCRYPTION.md "Selector release"). It takes the result of `luks2::read` on the volume (step 1,
+`Released` secret, runs its recovery flow on `Recovery` and refuses
+boot and halts on `Halt` (ENCRYPTION.md "Selector release"). It takes the result of `luks2::read` on the volume (step 1,
 which td-boot runs first, since a header carrying a td token decides
 its TPM wait), the name cryptsetup opens the partition by, the TPM as a
 `release::Tpm` (`DeviceTpm` opens `/dev/tpmrm0`; `None` when no device
@@ -512,8 +517,34 @@ passed, and the next boot's plan removes what is left over. `Released {
 keyslot, secret }` is the only outcome holding a secret; the selector
 opens with it and drops it. `Recovery`'s `reseal_offerable` is
 ENCRYPTION.md's condition for offering the confirmed reseal: this
-boot's own cap closed PCR 12 and td read the header. It is false
-without a TPM, for `AlreadyClosed` and for a refused header.
+boot's own cap closed PCR 12, td read the header, and the reseal can
+run. It is false without a TPM, for `AlreadyClosed` and for a refused
+header; for `Unmeasured`, whose PCR refuses the reseal's seal too; and
+wherever the planner refuses a `Reseal` plan over the header (a td
+token naming keyslot 0, a shared keyslot, no free keyslot or token
+number), which a placeholder sealed object tries before the outcome
+returns.
+
+`release::reseal` is the confirmed recovery reseal, which td-boot's
+recovery flow runs after the cap, once the recovery key opened keyslot
+0 and its owner confirmed. It takes the header `release` was given, the
+partition's name, the parsed `RecoveryKey`, the TPM and the runner. It
+seals a fresh secret to `observe`'s PCR 4 and PCR 9 and a literal-zero
+PCR 12, the seal step 3 also makes, but sends no verifying unseal, which
+the closed cap would refuse. It then plans `Transition::Reseal`,
+confirms the plan against `luksDump --dump-json-metadata` and runs its
+steps through the same executor, reporting each commit: the recovery
+passphrase is keyslot 0's key, authorizing the add and any orphan's
+kill, and the new secret is the added keyslot's. `Resealed::Complete`
+names the new keyslot when every step ran; `Stopped` says whether the
+new keyslot's test passed before a failed step stopped the plan, which
+the next boot's plan completes or that boot's recovery repeats; and
+`NotRun` (an unmeasured PCR, a failed seal or read, a plan refused,
+metadata that fails or disagrees) leaves the header unchanged. Keyslot
+0 is never touched, the new secret is zeroed before it returns, and the
+caller opens the volume with the recovery key whatever it says. The
+plan's test of the new keyslot is the only verification this boot can
+make; its TPM release is first proven on the next boot.
 
 Two choices go beyond ENCRYPTION.md's text. A step 3 seal or
 verification that fails for a reason other than an unmeasured PCR also
@@ -545,7 +576,8 @@ steps: two tests, a kill per keyslot from 1 to 31, a removal per td
 token, an add and an import. The runner's inputs are at most one page.
 A release tries at most four tokens, seals at most one protector, caps
 once, and runs at most one plan per released token, each of whose
-fall-backs follows a failed first step.
+fall-backs follows a failed first step. A reseal seals one protector
+and runs at most one plan.
 
 ## Evidence
 
@@ -597,7 +629,8 @@ holding exactly the secret, the one-page input bound, a stand-in
 cryptsetup's cleared environment and inputs with no key in its argv, a
 relative program refused, every other luksDump shape (a key dump without
 a file, the master-key aliases, `--unbound`) refused
-before any child starts, and `status` exits 0, 4 and others. Planner
+before any child starts, `status` exits 0, 4 and others, and a failed
+run's exit code read back, none for a child that never ran. Planner
 tests model cryptsetup's header commits, a kill stripping its keyslot
 from the tokens naming it, and pin the plans of the first-boot
 transition, each of its interrupted states, a device-bound release with
@@ -635,7 +668,17 @@ or without a new protector, an unmeasured PCR 4 or 9, a cleared TPM,
 metadata that disagrees or fails, a dead released keyslot falling back
 to the next token and to recovery, a dead device-bound keyslot beside a
 live first-boot one reaching recovery on every boot until a confirmed
-reseal converges, a td token naming keyslot 0 never
+reseal (`release::reseal`) converges, the reseal after a changed
+selector image (no unseal and no extension, an orphan killed with
+keyslot 0's key, every other td keyslot and token retired, keyslot 0
+kept, the recovery key on no step keyslot 0 does not authorize, each
+commit reported, and the next boot releasing the new protector), a
+reseal failing at each of its steps (the metadata dump, the add, the
+import, the test, a kill and a removal) followed by the boot that
+releases the new protector or reaches recovery and reseals again, an
+unmeasured PCR 4 or 9 running no reseal and offering none, recovery
+offering no reseal over a header with a td token naming keyslot 0 or
+no free keyslot, a td token naming keyslot 0 never
 tried and suppressing the plan, a failed import or kill and the boot
 that completes it, no TPM device, a refused header still capped, and
 the order tokens are tried in. No test reads a header cryptsetup wrote: that needs the source-built

@@ -4237,6 +4237,15 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             s.push_str("dir {in:td-kexec}/bin 0755 0 0\n");
             s.push_str("file {in:td-kexec}/bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0\n");
             s.push_str("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0\n");
+            // The installed selector's recovery flow reads the recovery key
+            // and the reseal's confirmation through td-init's secret-line
+            // (td-install/ENCRYPTION.md "Device-bound default"), and only
+            // the selector has that flow; the live selector, the same
+            // stock initramfs, carries the name and never runs it.
+            s.push_str(&format!(
+                "slink /bin/{} {{in:td-init}}/bin/td-init 0777 0 0\n",
+                td_boot_protocol::SECRET_LINE_APPLET
+            ));
         }
         // The pivot applet and the loop applet, and ONLY here. /init execs
         // `/bin/switch_root`, and the selector has no branch that enters a root.
@@ -4998,6 +5007,9 @@ fn shape_check() -> String {
      for a in \"$selector\" \"$init\"; do \"$bb\" cpio -tv < \"$a\" 2>/dev/null | grep -q -F ' bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup td-boot opens volumes with\" >&2; exit 1; }; done; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
+     \"$bb\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -F ' bin/secret-line -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/secret-line must link td-init - the recovery flow could not read the recovery key and an encrypted boot that reaches recovery would halt' >&2; exit 1; }; \
+     if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then echo 'deployment initramfs: secret-line must be selector-only - only the selector has a recovery flow' >&2; exit 1; fi; \
+     if [ -e \"$root/bin/secret-line\" ] || [ -L \"$root/bin/secret-line\" ]; then echo 'root tree: secret-line must be selector-only - no root farm links it' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$selector_manifest\")\" = td-deployment-v1 ] || { echo 'selector manifest: unsupported header' >&2; exit 1; }; \
      grep -q -E '^[0-9a-f]{64}  selector-initramfs\\.cpio$' \"$selector_manifest\" || { echo 'selector manifest: missing strict SHA-256 entry' >&2; exit 1; }; \
@@ -12892,6 +12904,58 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
             "the loop bind is a deployment capability: `td-boot root-loop` runs only there, \
              and the selector must not carry the name that would let it bind one"
         );
+        // The recovery flow's console reader: td-boot runs /bin/secret-line in
+        // the installed selector, so td-init must serve it and the selector
+        // link it; no other phase and no root farm has a recovery flow.
+        let secret_line = td_boot_protocol::SECRET_LINE_APPLET;
+        assert_eq!(secret_line, "secret-line");
+        assert!(
+            applet_table(include_str!("../../../td-init/src/main.rs"))
+                .iter()
+                .any(|applet| applet == secret_line),
+            "td-boot runs /bin/{secret_line}, which td-init does not serve"
+        );
+        assert!(
+            selector.contains(&format!(
+                "slink /bin/{secret_line} {{in:td-init}}/bin/td-init 0777 0 0\n"
+            )) && !deployment.contains(secret_line),
+            "only the selector initramfs may link /bin/{secret_line}"
+        );
+        assert!(
+            !td_init_applets().contains(&secret_line),
+            "no root farm links /bin/{secret_line}"
+        );
+        // td-boot reads the applet's statuses and line bound as td-init
+        // states them.
+        let applet = include_str!("../../../td-init/src/secretline.rs");
+        let reader = include_str!("../../../td-boot/src/selector_release.rs");
+        for (theirs, ours) in [
+            (
+                "pub const LINE_MAX: usize = 256;",
+                "pub(crate) const ENTRY_MAX: usize = 256;",
+            ),
+            ("pub const EXIT_EOF: u8 = 3;", "const EXIT_EOF: i32 = 3;"),
+            (
+                "pub const EXIT_REFUSED: u8 = 4;",
+                "const EXIT_REFUSED: i32 = 4;",
+            ),
+        ] {
+            assert!(
+                applet.contains(theirs) && reader.contains(ours),
+                "secret-line and td-boot disagree: {theirs} / {ours}"
+            );
+        }
+        let shape = shape_check();
+        for leg in [
+            "grep -q -F ' bin/secret-line -> {in:td-init}/bin/td-init'",
+            "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then",
+            "[ -e \"$root/bin/secret-line\" ] || [ -L \"$root/bin/secret-line\" ]",
+        ] {
+            assert!(
+                shape.contains(leg),
+                "shape_check lost its secret-line leg: {leg}"
+            );
+        }
     }
 
     /// td-txt is packed, serves both /bin names, and each is exercised by the greeter — the

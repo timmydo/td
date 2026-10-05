@@ -149,8 +149,7 @@ td tokens by someone who can write the disk must not shorten the wait
 and so widen the late-TPM residual below. If the device appears, the
 release order runs. If it does not, the selector skips the cap, its
 console says that PCR 12 stays open to a TPM exposed later, and it
-enters the recovery flow, which offers no reseal; until that flow lands
-it refuses boot and halts ("Selector release"). These are the paths the
+enters the recovery flow, which offers no reseal. These are the paths the
 cap does not close, and their residuals are disclosed. A TPM that the kernel
 exposes only after that wait, by a late driver probe, sees PCR 12 still
 zero, so on that boot root can release the disk's first-boot and
@@ -199,9 +198,11 @@ an entry is bounded at 256 bytes, and a longer record, or one holding a
 newline before its end, is refused whole, consuming nothing after it; a
 record ended by `^D` rather than a newline ends input and is refused.
 Each entry is tried on keyslot 0 alone, and a wrong one prompts again,
-without a limit: a 128-bit key needs no retry bound. After the
+without a limit: a 128-bit key needs no retry bound. End of input
+refuses boot and halts instead ("Selector release"). After the
 cap, a correct recovery key opens the volume; when this boot's own cap
-closed PCR 12, the selector then offers, with an explicit console
+closed PCR 12 and a reseal can run ("Selector release"), the selector
+then offers, with an explicit console
 confirmation, to seal a device-bound protector to the observed PCR 4 and
 PCR 9 values and a literal-zero PCR 12, commit its keyslot and token, and
 only then destroy every other td keyslot and token, a surviving first-boot
@@ -367,17 +368,16 @@ orchestration"), opens the volume and hands its key to td-kexec's
 `--fds-key` mode, and the live selector caps (MEDIA.md "Live boot"). So
 is the deployment initramfs's unlock ("Boot and authority boundaries"),
 which takes that key and opens the volume again; both initramfs carry
-cryptsetup (DESIGN.md D6). The recovery flow is not: until it lands, a
-release that ends in recovery refuses boot on the console, naming its
-reason, and halts as a failed cap does, so no recovery path half-works.
-So is the running system's half: its `install`, `update`, `rollback`
-and `success`, so boot acknowledgement, updates and rollback, bind the
-`td-system` mapping the deployment initramfs opened by its held
-descriptor, as they bind an unencrypted volume's partition, and refuse
-a volume without it (DESIGN.md "Full-system volume consumers"): the
-running system never opens or unlocks the volume, runs no cryptsetup
-and reaches no TPM for it. td-init's secret-line applet exists but no
-initramfs links it until the recovery flow does (UNSAFE.md §3).
+cryptsetup (DESIGN.md D6). So is the recovery flow with its confirmed
+reseal (below), through td-init's secret-line applet, which the
+selector initramfs alone links (UNSAFE.md §3). So is the running
+system's half: its `install`, `update`, `rollback` and `success`, so
+boot acknowledgement, updates and rollback, bind the `td-system`
+mapping the deployment initramfs opened by its held descriptor, as they
+bind an unencrypted volume's partition, and refuse a volume without it
+(DESIGN.md "Full-system volume consumers"): the running system never
+opens or unlocks the volume, runs no cryptsetup and reaches no TPM for
+it.
 
 The installed selector acts on what discovery finds under its configured
 UUID (DESIGN.md "Full-system volume consumers"): a Btrfs volume boots as
@@ -426,6 +426,65 @@ builds, refusing an unfiled dump, its `--dump-master-key` and
 writes no file; and the file's 64 bytes equal the hex dump. Unlinking
 retires the key from that filesystem only; its freed pages are a
 residual like the memfd's.
+
+A release that ends in recovery prints its reason and runs the recovery
+flow ("Device-bound default"), still before any mount. Each entry is one
+run of `/bin/secret-line` with td-boot's prompt as its operand; td-boot
+reads the line from the applet's standard output, a std pipe, into a
+buffer zeroed on drop, and never prints a prompt itself. td-protector's
+recovery-key codec parses the line, admitting the 48 digits with spaces
+or hyphens between groups. An entry the codec refuses (a wrong digit
+count, a group above 65535 or with a wrong check digit, any other byte)
+prompts again, naming the group or byte and never the digits, without
+reaching cryptsetup, as does a record the applet refuses as over-long or
+holding a newline (its status 4). An admitted key is tried with `open
+--test-passphrase --key-slot 0`, its 48 digits on standard input; a
+wrong one prompts again, without a limit. Only cryptsetup's
+wrong-passphrase status is a wrong key: 2, which cryptsetup 2.8.8's
+`translate_errno` makes of the keyslot code's `-EPERM`. Any other
+failure of that test (a missing keyslot 0 or bad arguments, exit 1; a
+wrong device, 4; a cryptsetup that cannot start or a signal) fails the
+boot as a failed open does (below), since prompting again could never
+succeed. End of input (status 3: `^D`,
+or a hung-up console) and any other failure of the applet refuse boot
+and halt as a failed cap does: a console that answers end of input at
+once would make a repeating prompt spin, and the selector never boots
+without a key that opened keyslot 0, nor exits init. A platform reset
+returns to the same recovery.
+
+Once keyslot 0 opened, the reseal is offered where it can run: this
+boot's own cap closed PCR 12, td read the header, the release did not
+find PCR 4 or PCR 9 unmeasured, and td-protector's planner admits a
+reseal over the header (keyslot 0 present and named by no td token, no
+keyslot shared, a free keyslot and token number). The console first
+says that confirming binds release to this boot chain and retires every
+other td protector, then asks through a second run of secret-line,
+whose flush discards anything typed before the question:
+exactly `reseal` confirms, and every other answer, an empty one, end of
+input and a failed run included, declines. Confirmed, td-protector's
+`release::reseal` seals a fresh `/dev/random` secret to the observed PCR
+4 and PCR 9 values and a literal-zero PCR 12 and runs the planner's
+reseal plan once cryptsetup's metadata confirms the header, the recovery
+key authorizing the add and any orphan's kill, printing each commit as
+the release does. The seal is not verified by an unseal, which the
+closed cap refuses: the plan's test of the new keyslot with its secret
+is this boot's evidence, and the TPM release is first proven on the
+next boot. An unmeasured PCR, a failed seal or a plan that does not run
+leaves the header unchanged. A failed step stops the plan; keyslot 0 is
+never touched, the boot goes on with the recovery key, and the next
+boot either releases the new protector, whose plan removes what is left
+over, or reaches recovery again. Whatever the reseal did, and when it is
+declined or not offered, the mapping then opens on keyslot 0 alone
+(`open --key-slot 0`) and the volume key is taken as above, both with
+the recovery key; `luksDump`'s `--key-slot` cannot restrict which
+keyslot opens, so the dump tries the key as cryptsetup chooses. A failed
+open or volume-key dump after keyslot 0 opened fails the boot as on the
+released path: td-boot exits, init's exit panics the kernel, `panic=-1`
+reboots, and the next boot prompts again. A completed reseal persists
+across that reboot, since it ran before the open, so the next boot may
+release its protector instead. The recovery key, its passphrase text,
+each entry and the new protector's secret are zeroed when dropped, on
+every path.
 
 Before activation the default unencrypted boot is behaviour-identical,
 not byte-identical: cryptsetup enters both initramfs and the boot

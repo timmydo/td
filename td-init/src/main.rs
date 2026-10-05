@@ -11,7 +11,8 @@
 //! `secret-line` reads one line from `/dev/console` with echo off for the
 //! selector's recovery-key entry, through the `TCGETS`/`TCSETS` pair `getty`
 //! already uses and `TCSETSF`, which discards what was typed before its
-//! prompt; no initramfs links it yet.
+//! prompt; the selector initramfs alone links it, for the installed
+//! selector's recovery flow.
 //!
 //! `devpts` is the one applet here that needs no syscall of its own: it mounts
 //! through the `mount` applet's own argv, and lives here rather than in td-util

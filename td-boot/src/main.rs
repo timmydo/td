@@ -3939,11 +3939,13 @@ fn boot_encrypted(
     }
     let mut tpm = present.then_some(DeviceTpm);
     let mut cryptsetup = Cryptsetup::new(Path::new("/bin").join(protocol::CRYPTSETUP));
+    let mut line = selector_release::Applet(Path::new("/bin").join(protocol::SECRET_LINE_APPLET));
     let (keyslot, key) = match selector_release::unlock(
         &header,
         &partition.path(),
         tpm.as_mut(),
         &mut cryptsetup,
+        &mut line,
         Path::new(selector_release::KEY_DIRECTORY),
         &mut console,
     ) {
@@ -8587,7 +8589,14 @@ mod tests {
         let program = position(
             "let mut cryptsetup = Cryptsetup::new(Path::new(\"/bin\").join(protocol::CRYPTSETUP));",
         );
+        // The recovery flow's console reader, td-init's applet by its /bin
+        // name; the release ending in recovery runs it, and only then.
+        let applet = position(
+            "let mut line = selector_release::Applet(Path::new(\"/bin\").join(protocol::SECRET_LINE_APPLET));",
+        );
         let released = position("let (keyslot, key) = match selector_release::unlock(");
+        assert!(position("&mut line,") > released);
+        assert_eq!(protocol::SECRET_LINE_APPLET, "secret-line");
         let halted = position("selector_release::Unlock::Halt(reason) => halt(&reason),");
         let failed = position("selector_release::Unlock::Failed(error) => return Err(error),");
         let admitted = position(
@@ -8595,7 +8604,7 @@ mod tests {
         );
         let booted = position("run_boot(&mapping.path(), mountpoint, cmdline, Some(&key))");
         assert!(pre_active < header && header < waited);
-        assert!(waited < device && device < program && program < released);
+        assert!(waited < device && device < program && program < applet && applet < released);
         assert!(released < halted && halted < failed && failed < admitted);
         assert!(admitted < booted);
         assert!(body
@@ -8646,9 +8655,18 @@ mod tests {
             "td_protector",
             "td_tpm",
             "luks2",
+            "SECRET_LINE",
+            "secret-line",
+            "Applet",
         ] {
             assert!(!body.contains(absent), "run_boot names {absent}");
         }
+        // Only the encrypted selector boot reaches the recovery flow's
+        // console reader.
+        let source = include_str!("main.rs");
+        let (production, _) = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
+        assert_eq!(production.matches("SECRET_LINE_APPLET").count(), 1);
+        assert!(production_body("boot_encrypted").contains("SECRET_LINE_APPLET"));
         assert!(production_body("dispatch")
             .contains("} => run_boot(&device, &mountpoint, &cmdline, None),"));
         let decision = production_body("kexec_boot_decision");

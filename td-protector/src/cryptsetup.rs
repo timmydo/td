@@ -201,6 +201,18 @@ pub fn open_args(device: &Path, name: &str) -> Vec<OsString> {
     args
 }
 
+/// The mapping `name`, opened with the passphrase on standard input tried
+/// on keyslot `slot` alone: the selector's recovery flow opens with the
+/// recovery key on keyslot 0 this way.
+pub fn open_slot_args(device: &Path, name: &str, slot: u8) -> Vec<OsString> {
+    let mut args = os(&["open", "--type", "luks2", "--key-slot"]);
+    args.push(slot.to_string().into());
+    args.push("--key-file=-".into());
+    args.push(device.into());
+    args.push(name.into());
+    args
+}
+
 /// The mapping `name`, opened with the raw volume key cryptsetup reads from
 /// `key`, a `KeyFile`'s descriptor name. cryptsetup 2.8.8's `open` with
 /// `--volume-key-file` reads the header's volume-key size from it
@@ -281,6 +293,56 @@ impl KeyFile {
     }
 }
 
+/// cryptsetup's exit status when the passphrase opens no keyslot it was
+/// let try: 2.8.8's `translate_errno` maps `-EPERM`, the keyslot code's
+/// answer to a wrong passphrase, to 2. Every other failure exits otherwise
+/// (1 for a missing keyslot or bad arguments, 4 for a wrong device).
+pub const EXIT_BAD_PASSPHRASE: i32 = 2;
+
+/// A command that ran and exited unsuccessfully: the program, the verb and
+/// the exit status, never an argument.
+#[derive(Debug)]
+pub struct Failed {
+    program: PathBuf,
+    verb: String,
+    status: ExitStatus,
+}
+
+impl Failed {
+    pub fn new(program: &Path, verb: &str, status: ExitStatus) -> Self {
+        Self {
+            program: program.to_path_buf(),
+            verb: verb.to_owned(),
+            status,
+        }
+    }
+
+    pub fn into_error(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} failed ({})",
+            self.program.display(),
+            self.verb,
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for Failed {}
+
+/// The exit code of a command `error` reports as having run and failed;
+/// `None` for any other error, such as one that kept the child from
+/// starting, and for a child killed by a signal.
+pub fn exit_code(error: &io::Error) -> Option<i32> {
+    error.get_ref()?.downcast_ref::<Failed>()?.status.code()
+}
+
 /// A static cryptsetup at an absolute path.
 pub struct Cryptsetup {
     program: PathBuf,
@@ -340,10 +402,7 @@ impl Cryptsetup {
             .first()
             .map(|verb| verb.to_string_lossy().into_owned())
             .unwrap_or_default();
-        invalid(format!(
-            "{} {verb} failed ({status})",
-            self.program.display()
-        ))
+        Failed::new(&self.program, &verb, status).into_error()
     }
 
     /// One child: its exit and at most `MAX_OUTPUT` bytes of its standard
@@ -523,6 +582,19 @@ mod tests {
                 "--key-file=-",
                 "/dev/loop7",
                 "td-install-07"
+            ]
+        );
+        assert_eq!(
+            words(&open_slot_args(Path::new("/proc/1/fd/5"), "td-selector", 0)),
+            [
+                "open",
+                "--type",
+                "luks2",
+                "--key-slot",
+                "0",
+                "--key-file=-",
+                "/proc/1/fd/5",
+                "td-selector"
             ]
         );
         assert_eq!(
@@ -893,6 +965,28 @@ mod tests {
             error.to_string().contains("not an absolute path"),
             "{error}"
         );
+        assert_eq!(exit_code(&error), None);
+    }
+
+    /// A failed run carries its exit code, so a caller can tell a wrong
+    /// passphrase (2) from every other failure; the message names the
+    /// program, the verb and the status alone.
+    #[test]
+    fn a_failed_run_carries_its_exit_code() {
+        let recorder = Recorder::new();
+        let device = Path::new("/dev/loop7");
+        for (call, code) in [(1, EXIT_BAD_PASSPHRASE), (2, 1), (3, 4)] {
+            recorder.exit_with(call, code);
+            let error = recorder
+                .cryptsetup
+                .run(&test_args(device, 0), b"secret")
+                .unwrap_err();
+            assert_eq!(exit_code(&error), Some(code), "{error}");
+            assert!(error.to_string().contains(" open failed ("), "{error}");
+            assert!(!error.to_string().contains("secret"), "{error}");
+        }
+        assert_eq!(EXIT_BAD_PASSPHRASE, 2);
+        assert_eq!(exit_code(&io::Error::other("other")), None);
     }
 
     /// `status` is read by its exit alone: 0 active, 4 inactive, and any
