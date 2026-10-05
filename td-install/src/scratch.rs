@@ -14,7 +14,11 @@
 //!
 //! So the fixtures go under `/dev/shm` when the host mounts one that will do,
 //! and under the temp dir otherwise — or whenever `TMPDIR` is set, since an
-//! explicit choice is an answer, not a default to improve on. "Will do" is
+//! explicit choice is an answer, not a default to improve on. td-builder's
+//! check host sets one for each request it runs, a private directory to
+//! keep pid-named paths apart; when it made that under /tmp because the
+//! user set no TMPDIR, it names it in `TD_CHECK_HOST_TMPDIR`, and that one
+//! is no one's choice of filesystem, and does not count. "Will do" is
 //! probed, not assumed. The mkfs and td-boot stand-ins are scripts and live
 //! here too, and a hardened host mounts its tmpfs `noexec`. And a tmpfs
 //! bounded at the 64 MiB a container runtime gives by default cannot hold a
@@ -93,10 +97,19 @@ pub fn executable(path: &Path, body: &str) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
 }
 
+/// Whether `tmpdir` is someone's choice: set, and not the one td-builder's
+/// check host set for its request.
+fn explicit_tmpdir(tmpdir: Option<std::ffi::OsString>, host: Option<std::ffi::OsString>) -> bool {
+    tmpdir.is_some_and(|tmpdir| !tmpdir.is_empty() && Some(&tmpdir) != host.as_ref())
+}
+
 fn root() -> &'static Path {
     static ROOT: OnceLock<ScratchRoot> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let explicit = std::env::var_os("TMPDIR").is_some_and(|v| !v.is_empty());
+        let explicit = explicit_tmpdir(
+            std::env::var_os("TMPDIR"),
+            std::env::var_os("TD_CHECK_HOST_TMPDIR"),
+        );
         let shm = PathBuf::from("/dev/shm");
         let base = if !explicit && suits(&shm) {
             shm
@@ -271,6 +284,17 @@ fn reclaim_root(root: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_check_hosts_tmpdir_is_no_ones_choice() {
+        use std::ffi::OsString;
+        let host = || Some(OsString::from("/tmp/td.3"));
+        assert!(!explicit_tmpdir(None, None));
+        assert!(!explicit_tmpdir(Some(OsString::new()), None));
+        assert!(explicit_tmpdir(Some(OsString::from("/var/tmp")), None));
+        assert!(!explicit_tmpdir(Some(OsString::from("/tmp/td.3")), host()));
+        assert!(explicit_tmpdir(Some(OsString::from("/var/tmp")), host()));
+    }
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]

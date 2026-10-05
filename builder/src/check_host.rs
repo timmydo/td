@@ -1762,6 +1762,7 @@ fn run_request(
     stream
         .set_read_timeout(Some(Duration::from_millis(20)))
         .map_err(|e| format!("reset check-host client poll timeout: {e}"))?;
+    let scratch = RequestTmp::new(&request.env)?;
     // Each request supplies a procfs descriptor to its pinned executable.
     // Use it for the supervisor, then have that exact process re-exec itself
     // after installing the PID namespace. A client that disconnects closes
@@ -1777,6 +1778,10 @@ fn run_request(
         if !reserved_policy_key(&key) {
             command.env(key, value);
         }
+    }
+    command.env("TMPDIR", &scratch.path);
+    if !scratch.chosen {
+        command.env(REQUEST_TMPDIR_ENV, &scratch.path);
     }
     let base_jobs = check_memory::jobs_for_budget(
         permit.bytes(),
@@ -2092,6 +2097,70 @@ fn descendant_pids(root: u32) -> Vec<u32> {
         }
     }
     out
+}
+
+/// One hosted request's own TMPDIR. Its PID namespace numbers its processes
+/// from 1, as every concurrent request's does, over the one host /tmp, so a
+/// temporary path named from the pid alone would otherwise be another
+/// request's. (A sandboxed gate already has a private /tmp of its own.)
+///
+/// It is made 0700 under the client's TMPDIR, else /tmp, and named as short
+/// as it can be, `td.` and a serial: every byte added is one fewer for a
+/// Unix socket path a test makes under it (`sun_path` holds 107). One host
+/// serves a user, so its serial is unique among its requests; a name taken
+/// (another user's, or one a host killed outright left) is stepped past.
+/// The host removes it once the request's child is reaped or its namespace
+/// torn down, a cancelled request's included. A descendant still dying
+/// after a cancel can recreate a file the removal missed, and a host killed
+/// outright leaves the directory: such a leftover is what that process would
+/// have left in /tmp before.
+struct RequestTmp {
+    path: PathBuf,
+    /// Whether it lies under the client's own TMPDIR, the client's choice of
+    /// filesystem, rather than under /tmp for want of one.
+    chosen: bool,
+}
+
+/// Names the TMPDIR the host set under /tmp for a client that set none, so a
+/// reader that takes a set TMPDIR as the user's choice (td-install's test
+/// scratch) can tell this one is not; under a client's own TMPDIR it is
+/// left unset, the choice standing. A client cannot forge it:
+/// `TD_CHECK_HOST_` keys are the host's own.
+const REQUEST_TMPDIR_ENV: &str = "TD_CHECK_HOST_TMPDIR";
+
+impl RequestTmp {
+    fn new(env: &[(OsString, OsString)]) -> Result<Self, String> {
+        static SERIAL: AtomicUsize = AtomicUsize::new(0);
+        let client = env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "TMPDIR")
+            .map(|(_, value)| PathBuf::from(value))
+            .filter(|base| base.is_absolute());
+        let chosen = client.is_some();
+        let base = client.unwrap_or_else(|| PathBuf::from("/tmp"));
+        for _ in 0..1024 {
+            let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("td.{serial}"));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self { path, chosen }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("create {}: {e}", path.display())),
+            }
+        }
+        Err(format!(
+            "no free request temporary directory name in {}",
+            base.display()
+        ))
+    }
+}
+
+impl Drop for RequestTmp {
+    fn drop(&mut self) {
+        if let Err(e) = crate::sandbox::remove_scratch_tree(&self.path) {
+            eprintln!("td-builder: check host left {}: {e}", self.path.display());
+        }
+    }
 }
 
 fn reserved_policy_key(key: &OsStr) -> bool {
@@ -2430,6 +2499,69 @@ fn read_frame(stream: &mut UnixStream) -> Result<(u8, Vec<u8>), FrameError> {
         .read_exact(&mut bytes)
         .map_err(|e| FrameError::Other(format!("read check-host frame body: {e}")))?;
     Ok((kind[0], bytes))
+}
+
+#[cfg(test)]
+mod request_tmp_tests {
+    use super::*;
+
+    fn base(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "td-request-tmp-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_request_tmp_lies_under_the_clients_tmpdir_and_is_its_own() {
+        let dir = base("under");
+        let env = vec![
+            (OsString::from("TMPDIR"), OsString::from("relative")),
+            (OsString::from("TMPDIR"), dir.clone().into_os_string()),
+        ];
+        let one = RequestTmp::new(&env).unwrap();
+        let two = RequestTmp::new(&env).unwrap();
+        assert_eq!(one.path.parent(), Some(dir.as_path()));
+        assert!(one.chosen, "under the client's TMPDIR");
+        assert_ne!(one.path, two.path);
+        let mode = std::fs::metadata(&one.path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let none =
+            RequestTmp::new(&[(OsString::from("TMPDIR"), OsString::from("relative"))]).unwrap();
+        assert_eq!(none.path.parent(), Some(Path::new("/tmp")));
+        assert!(!none.chosen, "under /tmp for want of one");
+        drop((one, two, none));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sealed directory inside is removed, and a hardlink to a read-only
+    /// file outside (as store outputs are linked into scratch trees) does not
+    /// make that file writable.
+    #[test]
+    fn a_request_tmp_goes_with_sealed_contents_and_leaves_linked_files_alone() {
+        let dir = base("removed");
+        let outside = dir.join("store-file");
+        std::fs::write(&outside, b"store").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let env = vec![(OsString::from("TMPDIR"), dir.clone().into_os_string())];
+        let scratch = RequestTmp::new(&env).unwrap();
+        let path = scratch.path.clone();
+        let sealed = path.join("sealed");
+        std::fs::create_dir_all(sealed.join("inner")).unwrap();
+        std::fs::write(sealed.join("inner/file"), b"x").unwrap();
+        std::fs::hard_link(&outside, path.join("link")).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        drop(scratch);
+        assert!(!path.exists(), "{} was left behind", path.display());
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444, "the linked file was made writable");
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(test)]
