@@ -61,6 +61,7 @@ pub const HOST_ONLY: &[&str] = &[
     "install_apps.rs",
     "install_fonts.rs",
     "integration.rs",
+    "main_integration.rs",
     "ready.rs",
     "verdict_journal.rs",
 ];
@@ -80,6 +81,7 @@ pub const HOST_ONLY_VERBS: &[&str] = &[
     "host-run",
     "install-apps",
     "install-fonts",
+    "main-integration",
     "ready",
     // argv0 applets the isolated crypto build binds into its own sandbox.
     "td-crypto-decoy",

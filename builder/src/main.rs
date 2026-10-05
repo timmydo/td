@@ -59,6 +59,7 @@ mod install_fonts;
 mod integration;
 mod kernel_headers;
 mod lock;
+mod main_integration;
 mod mes_boot;
 mod nar;
 mod oci;
@@ -9637,6 +9638,10 @@ fn main() -> ExitCode {
         Some("stop") => run_record::stop_cli(args.get(2..).unwrap_or(&[])),
         Some("check-host-serve") => check_host::serve_cli(args.get(2..).unwrap_or(&[])),
         Some("check-host-stop") if args.len() == 2 => check_host::stop_cli(),
+        // main-integration run|status — the qemu oracles on main after
+        // landings, which no branch's ready runs. See
+        // builder/src/main_integration.rs.
+        Some("main-integration") => main_integration::main(args.get(2..).unwrap_or(&[])),
         // Internal process-lifetime boundary. It is intentionally absent from
         // user-facing help; check-host and gate-run construct it themselves.
         Some("check-pidns-run") => sandbox::pid_namespace_cli(args.get(2..).unwrap_or(&[])),

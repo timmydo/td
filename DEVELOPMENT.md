@@ -405,18 +405,35 @@ boots without forgetting or recording. The memo does not see the host's
 qemu or firmware, nor whether a `KVM, TCG fallback` boot fell back; the
 key is read when asked and again when a pass is recorded, not between.
 
-It belongs to main: after a landing, an agent on a provisioned host runs
-`td-builder check integration` on main, and a red one is healed as any
-red gate on main is (`ci/revert-suspect.sh`). No branch's `ready` runs
-it, so an hour of qemu never holds a landing: the selection prints that
-the tier is deferred to main, and names in its notes a change to the
-boot path — the code, manifest, lock or build script of td-boot,
-td-firstboot, td-init, td-install, td-install-qemu-test, td-kexec,
-td-login, td-sh or td-svc, or the recipe of the same name; the
-linux-x86-64 or system-x86-64 recipe; the oracles' code; or the tier's
-runner. The cost is that a boot-breaking change is found on main, after
-it lands. A branch that expects to touch the boot can run the tier by
-hand with `td-builder check integration` before pushing.
+It belongs to main. On a provisioned host (qemu, OVMF, and `/dev/kvm`
+for the user), `td-builder main-integration run`, started from any
+checkout of the repository, fetches `origin/main` five minutes after
+each pass and runs that head's own `td-builder check integration` in a
+detached worktree of its own, under `~/.local/state/td/main-integration`
+(or `TD_MAIN_INTEGRATION_DIR`). Heads that land during a run are not
+queued: the next run takes the newest, so a burst of landings costs one
+run. Each head's verdict and log are kept there; a red run prints the
+commits since the last green one as suspects. A run killed by a signal
+records nothing and runs again; any other failure, the check host's
+included, is red, since an exit of 1 cannot say whose. `td-builder
+main-integration status` says what the newest fetched main has (pass,
+fail, host-gap, running or none yet) and exits 0, 1 or 69 as `run
+--once` does, or 3 while it has no verdict. A red one is healed as any
+red gate on main is (`ci/revert-suspect.sh`), and `run --once --again`
+re-runs the newest head once a red's cause is understood. One runner
+holds the state at a time; its hour of qemu takes the check host's
+memory like any check, so a host of its own keeps it out of the agents'
+way. No branch's
+`ready` runs it, so an hour of qemu never holds a landing: the
+selection prints that the tier is deferred to main, and names in its
+notes a change to the boot path — the code, manifest, lock or build
+script of td-boot, td-firstboot, td-init, td-install,
+td-install-qemu-test, td-kexec, td-login, td-sh or td-svc, or the recipe
+of the same name; the linux-x86-64 or system-x86-64 recipe; the
+oracles' code; or `builder/src/integration.rs`. The cost is that a
+boot-breaking change is found on main, after it lands. A branch that
+expects to touch the boot can run the tier by hand with `td-builder
+check integration` before pushing.
 
 When `ready` passes, push the branch:
 

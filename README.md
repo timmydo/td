@@ -212,8 +212,8 @@ td-recipe-eval qemu-boot-live        # live wizard installs a disk, which then b
 
 `td-builder check integration` runs the system-level oracles —
 `qemu-boot-system`, `qemu-boot-live` and `qemu-install-system` — on the
-host; main runs it after a landing, and a branch's `ready` never does
-(`DEVELOPMENT.md`).
+host; `td-builder main-integration run` runs it on main after landings,
+and a branch's `ready` never does (`DEVELOPMENT.md`).
 
 To build a bootable live ISO of the system, signed with a key made for that
 ISO alone:
