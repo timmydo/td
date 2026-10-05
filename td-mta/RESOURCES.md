@@ -2064,6 +2064,42 @@ capacity refusal, original triple-owner reuse and fresh complete-view
 retirement. Sources and all independent backings allocate before counting;
 native, RSS, worker and response reservations remain separate.
 
+M06dj's source-bound traversal wrapper plus HeaderBudget has a compiled
+16 KiB ceiling in the existing parser/boundary reservation. After fresh
+traversal consumption, only the small binding and one retained metadata
+child remain. Structure plus PartCursor plus HeaderBudget has a compiled
+8 KiB ceiling inside that same region. The observed 64-bit host snapshot
+is 11928 traversal bytes plus 24 HeaderBudget bytes (11952 total), then
+72 binding bytes plus 6072 PartCursor bytes plus 24 HeaderBudget bytes
+(6168 total). These are host layout observations, not native stack/RSS
+or exact target ABI claims. Source, caller descriptors and all
+independent response windows stay separately reserved; no table or
+growing state is added.
+
+Every bound traversal/part poll calls at most one original child poll;
+constructor, checked extent mapping, body correlation and owner handoff
+add no positive charge or renewed credit. Child source visits, repeated
+header scans, work records and scalar/wire output spend the same
+original Meter/HeaderBudget throughout. Fresh binding admission consumes
+no positive allowance. Scratch remains the caller's admitted owner, used
+only during serial metadata projection. A later failure hides all child
+views without wiping backing. Part construction marks the binding
+Abandoned; only successful consuming finish restores it, so dropping or
+safely forgetting also leaves it retired.
+
+Seven units qualify the binding. One compares same-source clipped
+metadata, context, exact original pointers, costs and poll counts
+against independent public children at zero, nonzero and maximum-fitting
+bases. The other six use base 17 to cover every traversal prefix and
+both root and digest-child metadata prefixes, fresh-before-premature and
+whole-binding admission, ordinal/capacity/drop/forget refusal, defensive
+body/range/identity checks, inert cached completion and explicit
+traversal admission. Three exclusive owner types have active Copy/Clone
+compile-fail guards. Warm/measured Rust intervals qualify nested/long/
+folded/malformed metadata, original-owner reuse, late capacity and fresh
+whole-binding retirement. Inputs and backing allocate before counting;
+worker, native and RSS qualifications remain separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

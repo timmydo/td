@@ -2094,6 +2094,16 @@ Initial independently landable increments:
   parse-problem flags separately from context evidence.
   Automatic traversal/metadata response composition remains next.
 
+- **M06dj — bound traversal/part metadata:** keep one original resident
+  source and original job/header owners across complete traversal and
+  serial retained part projections. Map only checked completed descriptor
+  extents/context, correlate raw body starts, and retire the whole binding
+  on child refusal. Keep it Abandoned until healthy consumption, including
+  after safe forgetting. Qualify public-child costs and owner reuse,
+  every traversal/part prefix, late whole-binding admission, descriptor
+  correlation and measured zero Rust allocation. Automatic whole-tree
+  body-list/response composition and authenticated locators remain next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

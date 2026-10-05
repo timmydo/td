@@ -4912,6 +4912,51 @@ it does not count recognized raw headers again. Automatic whole
 traversal/metadata response
 composition and source/publication authority remain external.
 
+### 1.115 Original source binding for traversal and part metadata
+
+M06dj adds mime_traversal::bound::Cursor, a fixed wrapper over the
+existing complete resident walker. Its fresh consuming finish creates
+Structure with the same immutable source/base, admitted header bound,
+completed caller descriptors and original Meter/HeaderBudget. The
+binding owns those original budgets until its own fresh finish; copied
+passive parts cannot construct a binding or substitute a source. Source
+authorization, blob/part IDs and publication authority remain external.
+
+Structure::metadata(ordinal, backing, scratch) reborrows only its
+original job/header owners, selects a checked original descriptor and
+clips only that binding's source. Original part.context() determines the
+MIME default. Construct M06dh with EOF, original header bound and
+independent reserved windows; no caller replacement source or new budget
+enters this handoff. Scratch remains caller-owned and must be the
+admitted conversion owner. Only one part cursor can borrow a binding at
+a time. No second traversal frame set, retained row arena or additional
+descriptor storage is added.
+
+PartCursor freshly checks/polls at most one metadata child per turn and
+correlates completed raw body_start with the traversal descriptor before
+exposing PartView. Cached healthy completion is inert. Explicit
+admission and consuming finish freshly admit before complete/premature
+decisions. Any metadata, mapping, capacity, work, ordinal or correlation
+refusal retires the binding as well as the child. The binding starts
+retired with Abandoned while a part cursor exists; only successful
+consuming finish restores it. Dropping or safely forgetting an
+unfinished or completed but unconsumed cursor therefore leaves it
+retired. Earlier copied passive evidence cannot be revoked and must be
+discarded by the enclosing response owner. Structure::parts hides its
+cells after refusal, and no healthy Structure finish can follow it.
+Backing remains provisional rather than wiped.
+
+Successful part finish returns passive PartView and pointer-identical
+reborrowed job/header/scratch owners. After the view/reborrows expire,
+the binding can project another part with separately admitted windows.
+Structure::finish(now) freshly checks its original budgets and returns
+passive completed descriptors with those same reusable owners. This
+boundary coordinates component metadata but does not automatically visit
+every part, derive body lists, serialize the response or authorize
+source publication. Constructors do not parse or freshly admit; active
+polls, explicit checks and consuming finishes retain that
+responsibility.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

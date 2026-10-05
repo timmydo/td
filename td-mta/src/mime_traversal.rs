@@ -1,4 +1,5 @@
 //! Complete resident MIME structure; source authorization is external.
+pub mod bound;
 use crate::{
     admission::work::{Charge, Meter, Stop},
     decode_work,

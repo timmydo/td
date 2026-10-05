@@ -608,6 +608,18 @@ use that context with the same original source extents; passive descriptors
 cannot authorize or bind a source. Digest defaulting is not inferred from
 a child's final media classification.
 
+M06dj binds complete traversal to its original immutable source and
+keeps its original job/header owners through per-part metadata. The
+binding alone maps descriptors to clipped entities/context and
+constructs the retained child; callers cannot replace source or budgets
+between phases. Healthy metadata correlates raw body starts before
+exposure. A child refusal retires the binding. Part construction marks
+it Abandoned until successful consumption, including after safe
+forgetting. Fresh binding finish precedes original-owner release.
+Passive earlier copies remain provisional; source/blob authority,
+body-list/response serialization and publication stay external. No
+simultaneous traversal frame set or metadata table is added.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

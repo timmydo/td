@@ -4984,6 +4984,276 @@ fn resident_mime_traversal() {
     assert_eq!(before, after, "resident MIME traversal allocated");
 }
 
+fn bound_mime_part_metadata() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        limits::Limits,
+        mime_part_headers::{self, label_json},
+        mime_traversal::{
+            bound::{Cursor, Error},
+            Part, Status,
+        },
+        nfc::{HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    fn meter() -> Meter {
+        Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 10_000_000,
+                output_bytes: 10_000_000,
+                ..Charge::default()
+            },
+        )
+    }
+    fn drain(cursor: &mut Cursor<'_, '_>) {
+        for _ in 0..1_000_000 {
+            if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                return;
+            }
+        }
+        panic!("bound allocation traversal did not finish")
+    }
+    struct Storage {
+        heads: Vec<u8>,
+        charset: Vec<u8>,
+        name: Vec<u8>,
+        id: Vec<u8>,
+        language: Vec<u8>,
+        location: Vec<u8>,
+    }
+    impl Storage {
+        fn new(cap: usize) -> Self {
+            Self {
+                heads: vec![0; cap],
+                charset: vec![0; cap],
+                name: vec![0; cap],
+                id: vec![0; cap],
+                language: vec![0; cap],
+                location: vec![0; cap],
+            }
+        }
+        fn backing(&mut self, cap: usize) -> label_json::Backing<'_> {
+            label_json::Backing {
+                headers: mime_part_headers::Backing {
+                    heads: &mut self.heads,
+                    charset: &mut self.charset,
+                    filename: &mut self.name,
+                },
+                labels: td_mta::mime_label_fields::json::Backing {
+                    content_id: &mut self.id,
+                    content_language: &mut self.language,
+                },
+                content_location: self.location.get_mut(..cap).unwrap(),
+            }
+        }
+    }
+    let long = format!(
+        concat!(
+            "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+            "Content-Location: /{}\r\n\r\nbody"
+        ),
+        "a".repeat(40963)
+    );
+    let folded = format!(
+        concat!(
+            "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+            "Content-Location: {}\r\n\r\nbody"
+        ),
+        "=?ascii?Q?a?=\r\n ".repeat(1024)
+    );
+    let malformed = format!(
+        concat!(
+            "{}Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+            "Content-Location: ../ok\r\n\r\nbody"
+        ),
+        "Content-Location: a%\r\n".repeat(1024)
+    );
+    let nested = concat!(
+        "Content-Type: multipart/digest;boundary=a\r\n",
+        "Content-Location: ../root\r\n\r\n--a\r\n",
+        "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+        "Content-Location: \r\n\r\nbody\r\n--a\r\n",
+        "Content-Type: text/plain\r\nContent-Location: ../leaf\r\n",
+        "\r\nbody\r\n--a--\r\n"
+    );
+    let reserve = long.len().max(folded.len()).max(malformed.len()) * 6 + 32;
+    let mut storage = Storage::new(reserve);
+    let mut next_storage = Storage::new(256);
+    let mut parts = [Part::default(); 64];
+    let mut next_parts = [Part::default(); 8];
+    let mut scratch = Scratch::new();
+    let cases = [
+        (long.as_bytes(), reserve),
+        (folded.as_bytes(), reserve),
+        (malformed.as_bytes(), reserve),
+        (nested.as_bytes(), reserve),
+        (
+            b"Content-Location: =?utf-8?Q?=FF?=\r\n\r\n".as_slice(),
+            reserve,
+        ),
+        (
+            b"Content-Location: a%\r\n\r\nContent-Location: ../body".as_slice(),
+            0,
+        ),
+    ];
+    let before = COUNTERS.snapshot();
+    for (source, cap) in cases {
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let pointers = (
+            std::ptr::from_mut(&mut work),
+            std::ptr::from_mut(&mut budget),
+            std::ptr::from_mut(&mut scratch),
+        );
+        let mut cursor = Cursor::new(
+            black_box(source),
+            17,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut parts,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        drain(&mut cursor);
+        let mut bound = cursor.finish(Tick(1)).unwrap();
+        let count = bound.parts().unwrap().len();
+        for index in 0..count {
+            let ordinal = u16::try_from(index + 1).unwrap();
+            let mut cursor = bound
+                .metadata(ordinal, storage.backing(cap), &mut scratch)
+                .unwrap();
+            let mut complete = false;
+            for _ in 0..1_000_000 {
+                if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+                assert!(cursor.value().is_none());
+            }
+            assert!(complete, "bound source {} part {ordinal}", source.len());
+            let (view, work, budget, scratch) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (
+                    std::ptr::from_mut(work),
+                    std::ptr::from_mut(budget),
+                    std::ptr::from_mut(scratch)
+                ),
+                pointers
+            );
+            assert_eq!(view.part.ordinal, ordinal);
+            assert_eq!(view.metadata.headers.body_start, view.part.body_start);
+            if source == nested.as_bytes() && index == 1 {
+                assert_eq!(view.metadata.headers.content_type, b"message/rfc822");
+                assert_eq!(
+                    view.metadata.labels.content_id,
+                    Some(b"\"id@a\"".as_slice())
+                );
+                assert_eq!(view.metadata.location.value, Some(b"\"\"".as_slice()));
+            }
+            if cap == 0 {
+                assert!(view.metadata.location.value.is_none());
+            }
+            black_box(view);
+        }
+        let (_, work, budget) = bound.finish(Tick(1)).unwrap();
+        assert_eq!(
+            (std::ptr::from_mut(work), std::ptr::from_mut(budget)),
+            (pointers.0, pointers.1)
+        );
+        let mut cursor = Cursor::new(
+            b"\r\n",
+            0,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut next_parts,
+            work,
+            budget,
+        )
+        .unwrap();
+        drain(&mut cursor);
+        let mut next = cursor.finish(Tick(1)).unwrap();
+        let mut cursor = next
+            .metadata(1, next_storage.backing(256), &mut scratch)
+            .unwrap();
+        let mut complete = false;
+        for _ in 0..1_000_000 {
+            if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+        let (view, _, _, _) = cursor.finish(Tick(1)).unwrap();
+        assert!(view.metadata.location.value.is_none());
+        next.finish(Tick(1)).unwrap();
+    }
+    for kind in 0..3 {
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(
+            nested.as_bytes(),
+            17,
+            SourceEnd::Eof,
+            &Limits::default(),
+            &mut parts,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        drain(&mut cursor);
+        let mut bound = cursor.finish(Tick(1)).unwrap();
+        let mut cursor = bound
+            .metadata(
+                1,
+                storage.backing(if kind == 0 { 0 } else { reserve }),
+                &mut scratch,
+            )
+            .unwrap();
+        if kind == 0 {
+            let mut error = None;
+            for _ in 0..1_000_000 {
+                match cursor.poll(Tick(1)) {
+                    Err(value) => {
+                        error = Some(value);
+                        break;
+                    }
+                    Ok(_) => assert!(cursor.value().is_none()),
+                }
+            }
+            let error = error.unwrap();
+            assert!(matches!(error, Error::Metadata(_)));
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+            assert_eq!(bound.finish(Tick(1)).err(), Some(error));
+            assert_eq!(work.stopped(), None);
+        } else if kind == 1 {
+            assert_eq!(bound.parts(), Err(Error::Abandoned));
+            assert_eq!(bound.finish(Tick(1)).err(), Some(Error::Abandoned));
+        } else {
+            let mut complete = false;
+            for _ in 0..1_000_000 {
+                if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            cursor.finish(Tick(1)).unwrap();
+            let error = bound.check_deadline(Tick(100)).unwrap_err();
+            assert!(matches!(error, Error::Admission(_)));
+            assert_eq!(bound.parts(), Err(error));
+            assert_eq!(bound.finish(Tick(1)).err(), Some(error));
+            assert_eq!(work.stopped(), Some(Stop::Deadline));
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "bound MIME metadata allocated");
+}
+
 fn resident_mime_delimiters() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -11339,6 +11609,7 @@ fn main() {
         mime_protocol_parameters();
         resident_mime_delimiters();
         resident_mime_traversal();
+        bound_mime_part_metadata();
         resident_part_headers();
         mime_body_list_selection();
         mime_label_fields();
@@ -11515,6 +11786,7 @@ fn main() {
     mime_protocol_parameters();
     resident_mime_delimiters();
     resident_mime_traversal();
+    bound_mime_part_metadata();
     resident_part_headers();
     mime_body_list_selection();
     mime_label_fields();
