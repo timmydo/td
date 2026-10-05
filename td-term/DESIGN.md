@@ -971,8 +971,9 @@ Firefox's bounded native filter list and admits its selected `All Files` glob
 and matching current filter, renders that bounded label, and returns the
 selected filter. Non-current filters are validated compatibility metadata
 rather than selectable UI; selecting richer filter semantics remains a typed
-refusal. The portal reports its first frame only after the private manager
-acknowledgement, keyboard enter, shm release and frame callback. At that
+refusal. The portal reports its presented frame only after the private
+manager acknowledgement, keyboard enter, the compositor's sizing configure
+drawn, and that frame's shm release and frame callback. At that
 boundary the host captures the virtio display through QMP, requires the
 centred portal client geometry and chooser background, panel and
 selected-row palette, and reconstructs the client XRGB bytes from that

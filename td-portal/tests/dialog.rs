@@ -215,9 +215,16 @@ impl Peer {
 }
 
 /// Drive one full FileChooser dialog to a physical acceptance, from the mock
-/// compositor's side. Returns the checksum of the first (640x432) frame, which
-/// must equal the checksum the dialog reported to the caller.
-fn serve(listener: UnixListener, runtime: PathBuf, keymap_dir: PathBuf) -> u64 {
+/// compositor's side. Returns the checksum of the frame the dialog must report
+/// to the caller: the one drawn at the compositor's size, whether that
+/// configure comes before the first frame's callback (`resize_before_done`,
+/// td-compositor's usual order) or after it.
+fn serve(
+    listener: UnixListener,
+    runtime: PathBuf,
+    keymap_dir: PathBuf,
+    resize_before_done: bool,
+) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(10);
     let (stream, _) = listener.accept().unwrap();
     let mut peer = Peer::new(stream);
@@ -322,14 +329,21 @@ fn serve(listener: UnixListener, runtime: PathBuf, keymap_dir: PathBuf) -> u64 {
     let ack = peer.expect(deadline, XDG_SURFACE, 4);
     assert_eq!(Cursor::new(&ack.payload).u32().unwrap(), 23);
     let (first_buffer, first_callback, first) = peer.expect_frame(deadline, 640, 432, &runtime);
-    release(&mut peer, first_buffer, first_callback, 1000);
+    if !resize_before_done {
+        release(&mut peer, first_buffer, first_callback, 1000);
+    }
 
-    // A resize renders a different frame; the caller's first-frame notice does
-    // not move to it. The client reuses the freed slot for the new extent, so
-    // it destroys the first, differently sized buffer before making the next.
+    // The compositor's sizing configure renders a different frame, and the
+    // notice waits for it whether it comes before or after the first frame's
+    // callback: the default-size frame is never the one on screen. The
+    // client reuses the freed slot for the new extent, so it destroys the
+    // first, differently sized buffer before making the next.
     configure(&mut peer, 600, 402, 24);
     let ack = peer.expect(deadline, XDG_SURFACE, 4);
     assert_eq!(Cursor::new(&ack.payload).u32().unwrap(), 24);
+    if resize_before_done {
+        release(&mut peer, first_buffer, first_callback, 1000);
+    }
     peer.expect(deadline, first_buffer, 0);
     let (second_buffer, second_callback, second) = peer.expect_frame(deadline, 600, 402, &runtime);
     assert_ne!(second, first);
@@ -354,7 +368,7 @@ fn serve(listener: UnixListener, runtime: PathBuf, keymap_dir: PathBuf) -> u64 {
     dismissed.u32(SURFACE);
     dismissed.u32(DISMISSED);
     peer.send(manager, 0, dismissed);
-    first
+    second
 }
 
 fn configure(peer: &mut Peer, width: i32, height: i32, serial: u32) {
@@ -377,7 +391,22 @@ fn release(peer: &mut Peer, buffer: u32, callback: u32, serial: u32) {
 
 #[test]
 fn dialog_presents_pixels_and_accepts_a_physical_return() {
-    let temp = Temp::new("round-trip");
+    round_trip("round-trip", false, (600, 402));
+}
+
+/// td-compositor sizes the dialog after its first frame maps and usually
+/// sends that configure before the frame's callback: the first frame is
+/// stale by then, so the report waits for the frame drawn at the configured
+/// size. The callback-first order above reports that same frame.
+#[test]
+fn a_resize_before_the_first_callback_moves_the_report_to_the_resized_frame() {
+    round_trip("resize-first", true, (600, 402));
+}
+
+/// One dialog through the mock compositor; the report must name the frame
+/// the mock says is current, at `expected` size.
+fn round_trip(name: &str, resize_before_done: bool, expected: (usize, usize)) {
+    let temp = Temp::new(name);
     let display = temp.0.join("display");
     let runtime = temp.0.join("runtime");
     let root = temp.0.join("Downloads");
@@ -390,7 +419,8 @@ fn dialog_presents_pixels_and_accepts_a_physical_return() {
 
     let server_runtime = runtime.clone();
     let server_keymap = temp.0.clone();
-    let server = thread::spawn(move || serve(listener, server_runtime, server_keymap));
+    let server =
+        thread::spawn(move || serve(listener, server_runtime, server_keymap, resize_before_done));
 
     let (sender, receiver) = mpsc::channel();
     let config = DialogConfig {
@@ -425,7 +455,7 @@ fn dialog_presents_pixels_and_accepts_a_physical_return() {
             height,
             checksum,
         } => {
-            assert_eq!((width, height), (640, 432));
+            assert_eq!((width, height), expected);
             checksum
         }
         other => panic!("expected a first-frame notice, got {other:?}"),

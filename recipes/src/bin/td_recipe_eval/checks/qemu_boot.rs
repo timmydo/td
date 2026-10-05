@@ -380,10 +380,23 @@ const FIREFOX_AUDIO_CAPTURE_MARGIN_SECS: u64 = 2;
 /// so the disk ceiling covers that whole bound while verification streams it.
 const MAX_AUDIO_CAPTURE_BYTES: u64 = 640 * 1024 * 1024;
 const QMP_OUTPUT_HEIGHT: u32 = 800;
-const PORTAL_CLIENT_X: usize = 160;
-const PORTAL_CLIENT_Y: usize = 141;
-const PORTAL_CLIENT_WIDTH: usize = 640;
-const PORTAL_CLIENT_HEIGHT: usize = 432;
+// The file chooser's client rectangle, by td-compositor's
+// `portal_dialog_placement`: a frame three quarters of the output wide and of
+// the height below the 24-row bar, centred there, less its 20-row title band.
+// The portal reports its size; the origin it cannot report, so it is derived.
+const PORTAL_BAR_HEIGHT: usize = 24;
+const PORTAL_TITLE_HEIGHT: usize = 20;
+const PORTAL_USABLE_HEIGHT: usize = QMP_OUTPUT_HEIGHT as usize - PORTAL_BAR_HEIGHT;
+const PORTAL_FRAME_WIDTH: usize = QMP_OUTPUT_WIDTH as usize * 3 / 4;
+const PORTAL_FRAME_HEIGHT: usize = PORTAL_USABLE_HEIGHT * 3 / 4;
+const PORTAL_CLIENT_X: usize = (QMP_OUTPUT_WIDTH as usize - PORTAL_FRAME_WIDTH) / 2;
+const PORTAL_CLIENT_Y: usize =
+    PORTAL_BAR_HEIGHT + (PORTAL_USABLE_HEIGHT - PORTAL_FRAME_HEIGHT) / 2 + PORTAL_TITLE_HEIGHT;
+const PORTAL_CLIENT_WIDTH: usize = PORTAL_FRAME_WIDTH;
+const PORTAL_CLIENT_HEIGHT: usize = PORTAL_FRAME_HEIGHT - PORTAL_TITLE_HEIGHT;
+/// Where the pointer waits while the chooser is captured: the 24-pixel gap
+/// below the tiles, between the two, outside the chooser and any window.
+const PORTAL_POINTER_PARK: (u32, u32) = (640, 790);
 // The file chooser renders on td-ui's light palette (increment 7c): a chrome
 // ground, the filter field on paper, and the selected list row highlighted.
 // These are `td_ui::raster::{CHROME, PAPER}` and `td_ui::chrome::SELECTED_ROW`
@@ -7950,7 +7963,15 @@ impl Qmp {
 
     fn file_chooser_open_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.move_absolute_until(24_576, 16_384, deadline)?;
-        self.button_until("left", deadline)
+        self.button_until("left", deadline)?;
+        // The click lands inside the chooser's rectangle, and the compositor
+        // paints its cursor into the screenshot the portal's checksum cannot
+        // include. Park it in the gap below the tiles, where focus stays put.
+        self.move_absolute_until(
+            qmp_absolute_pixel(PORTAL_POINTER_PARK.0, QMP_OUTPUT_WIDTH)?,
+            qmp_absolute_pixel(PORTAL_POINTER_PARK.1, QMP_OUTPUT_HEIGHT)?,
+            deadline,
+        )
     }
 
     fn file_chooser_command_until(&mut self, deadline: Instant) -> Result<(), String> {
@@ -9442,7 +9463,7 @@ mod tests {
             stream.write_all(b"{\"QMP\":{\"version\":{}}}\r\n").unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut commands = Vec::new();
-            for _ in 0..38 {
+            for _ in 0..39 {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 commands.push(line.trim_end().to_string());
@@ -9665,8 +9686,17 @@ mod tests {
             .unwrap()
             .contains("\"axis\":\"y\",\"value\":16384"));
         assert!(commands.get(34).unwrap().contains("\"button\":\"left\""));
+        // The pointer leaves the chooser's rectangle before the command.
+        assert!(commands
+            .get(35)
+            .unwrap()
+            .contains("\"axis\":\"x\",\"value\":16384"));
+        assert!(commands
+            .get(35)
+            .unwrap()
+            .contains("\"axis\":\"y\",\"value\":32359"));
         assert_eq!(
-            commands.get(35).map(String::as_str),
+            commands.get(36).map(String::as_str),
             Some(concat!(
                 r#"{"execute":"input-send-event","arguments":{"events":["#,
                 r#"{"type":"key","data":{"down":true,"key":{"type":"qcode","data":"ctrl"}}},"#,
@@ -9677,14 +9707,14 @@ mod tests {
             ))
         );
         assert!(commands
-            .get(36)
+            .get(37)
             .unwrap()
             .contains("\"execute\":\"screendump\""));
         assert!(commands
-            .get(36)
+            .get(37)
             .unwrap()
             .contains("portal-file-chooser.ppm"));
-        assert!(commands.get(37).unwrap().contains("\"data\":\"ret\""));
+        assert!(commands.get(38).unwrap().contains("\"data\":\"ret\""));
         let source = include_str!("qemu_boot.rs");
         assert!(
             source.contains("qmp.capture_portal_frame_until(&self.path, presentation, deadline)?;")
@@ -9722,7 +9752,9 @@ mod tests {
         );
         let scene = include_str!("../../../../../td-compositor/src/scene.rs");
         assert!(scene.contains("pub(crate) const GAP: usize = 24;"));
-        assert!(scene.contains("pub(crate) const TITLE_HEIGHT: usize = 20;"));
+        assert!(scene.contains(&format!(
+            "pub(crate) const TITLE_HEIGHT: usize = {PORTAL_TITLE_HEIGHT};"
+        )));
         assert!(scene.contains("let frame_width = width.saturating_mul(3) / 4;"));
         assert!(scene.contains("let frame_height = usable_height.saturating_mul(3) / 4;"));
         assert!(scene.contains("let frame_x = width.saturating_sub(frame_width) / 2;"));
@@ -9733,12 +9765,22 @@ mod tests {
             "y: frame_y.saturating_add(band_height),\n                width: frame_width,\n                height: frame_height.saturating_sub(band_height),"
         ));
         let bar = include_str!("../../../../../td-compositor/src/bar.rs");
-        assert!(bar.contains("pub const BAR_HEIGHT: usize = 24;"));
-        let chooser = include_str!("../../../../../td-portal/src/file_chooser.rs");
-        assert!(chooser.contains(&format!("pub const WIDTH: usize = {PORTAL_CLIENT_WIDTH};")));
-        assert!(chooser.contains(&format!(
-            "pub const HEIGHT: usize = {PORTAL_CLIENT_HEIGHT};"
+        assert!(bar.contains(&format!(
+            "pub const BAR_HEIGHT: usize = {PORTAL_BAR_HEIGHT};"
         )));
+        assert_eq!(
+            (PORTAL_CLIENT_X, PORTAL_CLIENT_Y),
+            (160, 141),
+            "the chooser's origin at 1280x800"
+        );
+        assert_eq!((PORTAL_CLIENT_WIDTH, PORTAL_CLIENT_HEIGHT), (960, 562));
+        // The chooser's own default size is not this rectangle: the
+        // compositor configures it after the first frame maps, and the portal
+        // reports only a frame drawn at the size it last acknowledged.
+        let dialog = include_str!("../../../../../td-portal/src/dialog.rs");
+        assert!(dialog.contains(
+            "if self.presented_once\n            || !self.placed\n            || self.dirty\n"
+        ));
         // The chooser no longer owns a palette; it renders on td-ui's shared
         // constants. Pin those source-of-truth values and prove the scanner's
         // sample colours are their exact RGB, so a palette change in td-ui
@@ -10792,7 +10834,13 @@ mod tests {
             valid.replace("gtk_7", "gtk-7"),
             valid.replace(
                 &format!("{PORTAL_CLIENT_WIDTH}x{PORTAL_CLIENT_HEIGHT}"),
-                "641x432",
+                &format!("{}x{PORTAL_CLIENT_HEIGHT}", PORTAL_CLIENT_WIDTH + 1),
+            ),
+            // The chooser's default size, reported before the compositor's
+            // configure was drawn.
+            valid.replace(
+                &format!("{PORTAL_CLIENT_WIDTH}x{PORTAL_CLIENT_HEIGHT}"),
+                "640x432",
             ),
             valid.replace("0123456789abcdef", "0123456789abcdeF"),
             valid.replace("0123456789abcdef", "0000000000000000"),

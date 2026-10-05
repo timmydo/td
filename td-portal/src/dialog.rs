@@ -72,8 +72,8 @@ const PROGRESS_DEADLINE_MS: u64 = 20_000;
 
 /// What the worker hands back to the portal service thread. Preserved across
 /// the td-ui migration so the service's `consume_dialog_notice` is unchanged:
-/// the caller receives a cancellation handle, one first-frame report, and the
-/// final outcome.
+/// the caller receives a cancellation handle, one presented-frame report (the
+/// frame at the size the compositor configured), and the final outcome.
 #[derive(Debug)]
 pub enum Notice {
     Connected(UnixStream),
@@ -140,6 +140,10 @@ struct Dialog<'a, F: Fn(Notice) -> Result<()>> {
     /// configures one.
     size: (usize, usize),
     dirty: bool,
+    /// The compositor has sized the dialog: a configure with both axes set
+    /// arrived. td-compositor places every portal dialog after its first
+    /// frame maps, so no earlier frame is the one the user sees.
+    placed: bool,
     /// The manager's last reported dialog state: `Some(0 | 1)` admits the
     /// first-frame notice, `Some(2)` ends the dismiss handshake.
     portal_state: Option<u32>,
@@ -194,6 +198,7 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
             manager: None,
             size: (file_chooser::WIDTH, file_chooser::HEIGHT),
             dirty: true,
+            placed: false,
             portal_state: None,
             frame_done: false,
             presented: None,
@@ -255,6 +260,7 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
     /// it is treated the same rather than cast to a huge extent.
     fn configure(&mut self, size: Option<(i32, i32)>, serial: u32) -> Result<()> {
         if let Some((width, height)) = size {
+            self.placed |= width > 0 && height > 0;
             let (current_w, current_h) = self.size;
             let width = if width <= 0 {
                 current_w
@@ -368,14 +374,21 @@ impl<'a, F: Fn(Notice) -> Result<()>> Dialog<'a, F> {
         Ok(())
     }
 
-    /// Report the first presented frame to the caller once the dialog is truly
+    /// Report the presented frame to the caller once the dialog is truly
     /// interactive: the compositor admitted it (`portal_state` 0 or 1), the
-    /// keyboard is focused on it, its frame callback fired, and it released the
+    /// keyboard is focused on it, its frame callback fired, it released the
     /// frame's buffer (so the pixels are the compositor's, not still in
-    /// flight). Only this signal waits; the buffer is committed as soon as it
-    /// is drawn.
+    /// flight), the compositor has sized the dialog, and no acknowledged
+    /// configure is still waiting to be drawn. The compositor sizes the
+    /// dialog only after the first frame maps it, so that frame, at the
+    /// default size, is never the one on screen; reporting it named pixels
+    /// the next draw replaces, and whether its callback beat the sizing
+    /// configure is the compositor's scheduling, not an order. Only this
+    /// signal waits; the buffer is committed as soon as it is drawn.
     fn report_presented(&mut self) -> Result<()> {
         if self.presented_once
+            || !self.placed
+            || self.dirty
             || !self.frame_done
             || self.client.buffers().iter().any(|buffer| buffer.busy())
             || !self.client.input().focused
