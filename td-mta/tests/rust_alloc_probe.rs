@@ -2294,6 +2294,249 @@ fn content_id_json() {
     assert_eq!(before, after, "Content-ID JSON projection allocated");
 }
 
+fn content_language_json() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_language::{
+            self,
+            json::{Cursor, Error, Status},
+        },
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("({})x{}", "🐈".repeat(1024), "-abcdefgh".repeat(1024));
+    let many = "EN-us, fr, ".repeat(1024) + "EN-us";
+    let deep = format!("en {}x{}", "(".repeat(33), ")".repeat(33));
+    let mut baseline_work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 100_000_000,
+            output_bytes: 100_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut baseline_budget = HeaderBudget::new();
+    {
+        let mut baseline =
+            mime_language::Cursor::new(b"en-US", &mut baseline_work, &mut baseline_budget);
+        loop {
+            if matches!(
+                baseline.poll(Tick(1)).unwrap(),
+                mime_language::Status::Tag(_)
+            ) {
+                break;
+            }
+        }
+    }
+    let replay_io_cap = 100_000_000 - baseline_work.remaining().io_bytes + 2;
+    let replay_header_cap =
+        HeaderBudget::new().steps_remaining() - baseline_budget.steps_remaining() + 2;
+    let preload = "x".to_owned() + &"-abcdefgh".repeat(900_000);
+    let mut preload_work = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100_000_000,
+            records: 100_000_000,
+            ..Charge::default()
+        },
+    );
+    let mut preload_budget = HeaderBudget::new();
+    let initial_steps = preload_budget.steps_remaining();
+    {
+        let mut preload_cursor =
+            mime_language::Cursor::new(preload.as_bytes(), &mut preload_work, &mut preload_budget);
+        // The leading CFWS poll charges one visit/step pair; each tag byte
+        // then charges two steps. Leave two or three replay steps available.
+        let polls = (initial_steps - replay_header_cap) / 2;
+        for _ in 0..polls {
+            preload_cursor.poll(Tick(1)).unwrap();
+        }
+    }
+    assert!((replay_header_cap..=replay_header_cap + 1).contains(&preload_budget.steps_remaining()));
+    let mut prepared_budget = Some(preload_budget);
+    let before = COUNTERS.snapshot();
+    for (source, fault, records, output_bytes, io_bytes, limited_header) in [
+        (
+            b"(x) EN-us, en-US, x-Ab12 (tail)".as_slice(),
+            None,
+            100_000_000,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (
+            long.as_bytes(),
+            None,
+            100_000_000,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (
+            many.as_bytes(),
+            None,
+            100_000_000,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (
+            b"en,",
+            Some(Error::Source(mime_language::Error::Malformed)),
+            100_000_000,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (
+            deep.as_bytes(),
+            Some(Error::Source(mime_language::Error::NestingLimit)),
+            100_000_000,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (
+            b"en",
+            Some(Error::Source(mime_language::Error::Work(Stop::Records))),
+            0,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (
+            b"en",
+            Some(Error::Source(mime_language::Error::Work(Stop::OutputBytes))),
+            100_000_000,
+            0,
+            100_000_000,
+            false,
+        ),
+        (
+            b"en-US",
+            Some(Error::Source(mime_language::Error::Work(Stop::IoBytes))),
+            100_000_000,
+            100_000_000,
+            replay_io_cap,
+            false,
+        ),
+        (
+            b"en-US",
+            Some(Error::Source(mime_language::Error::InterpretationLimit)),
+            100_000_000,
+            100_000_000,
+            100_000_000,
+            true,
+        ),
+        (
+            b"en-US",
+            Some(Error::Source(mime_language::Error::Work(Stop::OutputBytes))),
+            100_000_000,
+            4,
+            100_000_000,
+            false,
+        ),
+    ] {
+        for trial in 0..if fault.is_some() { 1 } else { 2 } {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes,
+                    records,
+                    output_bytes,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = if limited_header {
+                prepared_budget.take().unwrap()
+            } else {
+                HeaderBudget::new()
+            };
+            let identity = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+            let mut cursor = Cursor::new(black_box(source), &mut work, &mut budget);
+            assert!(!cursor.is_complete());
+            let mut emitted = 0;
+            let mut complete = false;
+            let mut failed = None;
+            let mut byte = [0];
+            for turn in 0..200_000 {
+                if turn % 7 == 0 {
+                    if let Err(error) = cursor.poll(Tick(1), &mut []) {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+                match cursor.poll(Tick(1), &mut byte) {
+                    Ok(progress) => {
+                        emitted += progress.written;
+                        black_box(byte.get(..progress.written).unwrap());
+                        if progress.status == Status::Complete {
+                            complete = true;
+                            break;
+                        }
+                        assert!(!cursor.is_complete());
+                    }
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(failed, fault);
+            if let Some(error) = fault {
+                if source == b"en-US" {
+                    assert!(emitted >= 4);
+                }
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.poll(Tick(1), &mut byte), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            assert!(complete);
+            assert_eq!(
+                cursor.poll(Tick(100), &mut []).unwrap().status,
+                Status::Complete
+            );
+            if trial == 1 {
+                let error = Error::Source(mime_language::Error::Work(Stop::Deadline));
+                assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            let (work, budget) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                identity
+            );
+            let mut next = mime_language::Cursor::new(b"x-next", work, budget);
+            let mut complete = false;
+            for _ in 0..1000 {
+                match next.poll(Tick(1)).unwrap() {
+                    mime_language::Status::Tag(c) => {
+                        black_box(c);
+                    }
+                    mime_language::Status::Complete => {
+                        complete = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(complete);
+            let (work, budget) = next.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                identity
+            );
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Content-Language JSON projection allocated");
+}
+
 fn content_id_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -9207,6 +9450,7 @@ fn main() {
         uri_reference_values();
         content_id_values();
         content_id_json();
+        content_language_json();
         content_language_values();
         body_value();
         mime_text();
@@ -9373,6 +9617,7 @@ fn main() {
     uri_reference_values();
     content_id_values();
     content_id_json();
+    content_language_json();
     content_language_values();
     body_value();
     mime_text();

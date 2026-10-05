@@ -504,6 +504,15 @@ admission owners and contextual errors. Shared punctuation and string
 escaping retain fixed paid progress without retaining values or granting
 source/publication authority. Content-Language binding remains separate.
 
+M06cy binds selected Content-Language grammar to the shared string-array
+frame under original job/header owners. Ordered, original-case tag extents
+replay one charged ASCII byte at a time without a retained list. Grammar and
+replay share prepaid credit; exact JSON bytes consume original output work.
+Earlier serialized tags retire on malformed tails or any later refusal.
+Fresh whole-list/framing completion precedes consuming original-owner
+handoff. Null/presence mapping and retained MIME/response composition remain
+separate; the binding grants no locale, source or publication authority.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

@@ -1,4 +1,5 @@
 //! Provisional Content-Language tag extents under original email admission.
+pub mod json;
 use crate::{
     admission::work::{Meter, Stop},
     decode_work::{self, Admission, Lexical, Parsing},

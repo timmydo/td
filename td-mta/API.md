@@ -4539,6 +4539,43 @@ resource ceilings remain unchanged. This primitive introduces no field,
 source, locator or publication authority; Content-Language JSON remains a
 separate binding.
 
+### 1.104 Selected Content-Language JSON array
+
+M06cy adds mime_language::json::Cursor over one caller-selected complete
+Content-Language field value and the original Meter/HeaderBudget. Constructor
+admission is inert. Shared std-only string-array framing serializes literal
+tag spelling, preserving order, case and duplicates. No locale lookup,
+normalization, encoded-word decoding or retained tag list is introduced.
+Caller source/field authorization, absence/null mapping and publication
+remain separate obligations.
+
+Each grammar Tag extent begins one JSON string. Its ASCII spelling replays
+from the same immutable authorized source with one original source visit and
+interpretation step per byte, sharing the grammar's prepaid record credit.
+Quotes, commas, brackets and tag bytes spend exact serialized output charges.
+The cursor retains one current extent/position and one shared array frame;
+no source-sized buffer, fresh allowance or tag-count-sized collection follows.
+Each poll runs one grammar turn, one replay byte or one bounded framing turn.
+
+poll(now, output) returns Progress with Yield/NeedOutput/Complete. Empty output
+freshly admits without advancing source; short drains preserve paid bytes.
+Individual tags and all array bytes remain provisional until whole-list
+syntax and array framing both complete. A malformed tail can therefore retire
+already serialized tags. Syntax/nesting/resource/admission refusals latch
+the original cause and hide completion; all partial bytes retire. Missing or
+malformed fields do not become null automatically in this selected binding.
+
+is_complete requires both the healthy shared frame and complete grammar.
+Cached Complete is inert; check_deadline and consuming finish(now) freshly
+admit even after Complete. Finish admits before premature-state refusal,
+requires the complete drained array and returns the exact original owners.
+Premature finish uses shared Error::InvalidState(Role::Array); Role is
+reexported alongside Progress/Status. Source causes remain typed language
+errors, including child state, grammar and admission refusal.
+The caller may reuse them for another projection without renewed grants.
+Cursor is neither Copy nor Clone. No source, locator, retained-part or
+whole-response publication authority follows.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

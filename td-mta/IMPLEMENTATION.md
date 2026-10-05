@@ -1991,6 +1991,15 @@ Initial independently landable increments:
   consuming handoff and existing allocation/resource ceilings. Language JSON
   and MIME metadata/response publication remain subsequent work.
 
+- **M06cy — selected Content-Language JSON:** bind original-owner language
+  parsing to shared bounded string-array framing. Serialize charged literal
+  tag replay with original order/case/duplicates and shared prepaid credit.
+  Retire provisional tags on malformed tails and fresh refusal; consume only
+  complete drained framing with the original owners. Qualify tiny/empty
+  windows, exact costs, every resource/deadline cut, original handoff and
+  measured long-list/comment/refusal allocation paths. Selection/null mapping,
+  retained metadata/response publication and worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

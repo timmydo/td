@@ -1813,6 +1813,22 @@ comments, decomposed Unicode, escapes, noncharacter repair, syntax/nesting/job
 and output refusal, fresh retirement and original consuming handoff. They
 remain separate from native, worker-stack and RSS qualification.
 
+M06cy's selected language JSON cursor plus HeaderBudget fits 512 bytes in
+the existing parser region. It retains one language child, the same source
+slice, one current tag extent/position and one fixed shared array frame.
+There is no retained tag list, NFC scratch or input-sized buffer. Each turn
+invokes one language poll, replays one ASCII byte or performs one framing
+turn; bounds remain 160 visits, 192 steps, 12 job records and at most one
+serialized output byte. Grammar/replay share original prepaid credit.
+Replay adds exactly one original source visit and step per tag byte; exact
+serialized-length charges pay quotes, punctuation and tag bytes once.
+Unit fixtures measure turn and complete cost bounds. Warm/measured Rust
+allocation intervals cover long tags/four-byte comments, many duplicated
+tags, tiny/empty drains, malformed/nesting and mid-replay job/header/output
+refusal, fresh final
+retirement and original-owner reuse. Native, worker-stack and RSS
+qualification remain separate; no new parser reservation or grant follows.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no
