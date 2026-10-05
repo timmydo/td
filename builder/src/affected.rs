@@ -868,7 +868,10 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // seed/local-source-roster.txt below) — every row here is a fetched or
     // host-generated pin, which needs a warm-cache `seed-digests` run to
     // check directly.
-    if p == "seed/seed-digests.txt" {
+    // seed/bootstrap-root.txt — the pinned bootstrap root, compiled into both
+    // planners like the digest table: a row change moves what every post-cut
+    // build admits as its toolchain, so it routes the same way.
+    if p == "seed/seed-digests.txt" || p == "seed/bootstrap-root.txt" {
         sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
         add_build_gate_targets(root, sel);
@@ -2355,6 +2358,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // like a seed/seed-digests.txt row change — the build gates must run too
     // (found in review: this arm omitted them while its sibling arms did not).
     assert_target!("seed/local-source-roster.txt", "build-recipes");
+    // The bootstrap-root manifest moves what every post-cut build stages.
+    assert_preflight!("seed/bootstrap-root.txt", "cargo-test");
+    assert_target!("seed/bootstrap-root.txt", "recipe-rs");
+    assert_target!("seed/bootstrap-root.txt", "build-recipes");
     assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
     // The td-builder build engine (its own src) rides the check-engine smoke.
     assert_target!("builder/src/main.rs", "check-engine");

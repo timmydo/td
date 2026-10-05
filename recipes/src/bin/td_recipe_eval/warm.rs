@@ -27,7 +27,8 @@ use td_recipe::types::{OstreePin, Recipe, SourcePin};
 
 use crate::check_runner::{
     classify_graph_inputs, is_executable, linux_version_from_file, ostree_cache_is_warm,
-    recipe_closure, source_pin_for_key, RecipeCheckRunner, RecipeNode, SeedInput,
+    recipe_closure, recipe_closure_full, source_pin_for_key, RecipeCheckRunner, RecipeNode,
+    SeedInput,
 };
 
 /// One `td-feed warm crate`/`warm crate-local` job: the argv that populates
@@ -229,7 +230,17 @@ fn survey(
     let mut sources: Vec<SourcePin> = Vec::new();
     let mut ostree: Vec<OstreePin> = Vec::new();
     let mut headers: Vec<&'static str> = Vec::new();
-    for input in classify_graph_inputs(&graph)? {
+    let mut inputs = classify_graph_inputs(&graph)?;
+    if inputs
+        .iter()
+        .any(|i| matches!(i, SeedInput::BootstrapRoot { .. }))
+    {
+        // A machine without the pinned root materializes it by building the
+        // ladder from stage0, so that ladder's sources are this graph's too.
+        let ladder = recipe_closure_full(crate::bootstrap_root::CUT)?;
+        inputs.extend(classify_graph_inputs(&ladder)?);
+    }
+    for input in inputs {
         match input {
             // Stage0's tarball is pinned under its own key, like any other source.
             SeedInput::Stage0 { key } => {
@@ -243,11 +254,13 @@ fn survey(
                 }
             }
             SeedInput::LinuxHeaders { arch, .. } => {
-                if !header_seed_is_warm(sources_dir, arch)? {
+                if !headers.contains(&arch) && !header_seed_is_warm(sources_dir, arch)? {
                     headers.push(arch);
                 }
             }
-            SeedInput::Patch { .. } | SeedInput::LocalSource { .. } => {}
+            SeedInput::Patch { .. }
+            | SeedInput::LocalSource { .. }
+            | SeedInput::BootstrapRoot { .. } => {}
         }
     }
     Ok(Cold {

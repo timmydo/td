@@ -267,7 +267,14 @@ pub fn input_addressed_path(key_hex: &str, name: &str) -> String {
 /// burden of dropping the content hash: forgetting to bump on an output-affecting change
 /// yields stale reuse. The `tree_fingerprint` builder-source drift record and the
 /// rebuild-the-world are the backstops.
-pub const BUILDER_ABI: u64 = 4;
+///
+/// 5 separates the graphs above the pinned bootstrap root from the ones
+/// below it: the root's paths were built under 4, and a graph stopped at the
+/// root types those inputs AuditedSeed where a full climb types them
+/// RecipeOutput. The reuse key binds that origin, so the two must never
+/// share an output path. A pin therefore records its own ABI token
+/// (`bootstrap_root`), which is never the compiled one.
+pub const BUILDER_ABI: u64 = 5;
 
 /// The ABI token string, `td-builder-abi-<rev>`. `TD_BUILDER_ABI` (set + non-empty)
 /// OVERRIDES the compiled revision — an escape hatch to force a distinct builder

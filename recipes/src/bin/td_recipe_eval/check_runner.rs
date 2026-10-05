@@ -19,8 +19,11 @@ const MAX_OSTREE_OWNER_BYTES: u64 = 4 * 1024;
 const MAX_OSTREE_ADMISSION_BYTES: u64 = 4 * 1024;
 
 fn forward_inherited_check_policy(command: &mut Command) {
-    if let Some(value) = env::var_os(JOB_BUDGET_ENV) {
-        command.env(JOB_BUDGET_ENV, value);
+    // The stage0 opt-out decides every nested evaluator's graph too.
+    for key in [JOB_BUDGET_ENV, crate::bootstrap_root::FULL_ENV] {
+        if let Some(value) = env::var_os(key) {
+            command.env(key, value);
+        }
     }
 }
 
@@ -1543,6 +1546,184 @@ pub fn seed_digests_cli() -> Result<(), String> {
     Ok(())
 }
 
+/// `bootstrap-root status|pin|check` (AGENTS.md, "Target artifact graph").
+///
+/// - `status` says whether the root is pinned, still describes the ladder,
+///   and is admitted on this machine.
+/// - `pin` builds the ladder below the cut from stage0 under the current
+///   builder ABI (warm rungs reuse the shared build cache), measures the
+///   exports' reference closure and rewrites `seed/bootstrap-root.txt`.
+/// - `check` is the on-demand stage0 proof: it rebuilds the ladder from
+///   stage0 into a private, empty build cache under the pinned ABI and
+///   reports every item whose bytes or references differ from the pin.
+pub(crate) fn bootstrap_root_cli(verb: &str) -> Result<(), String> {
+    let root_dir = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let root = crate::bootstrap_root::root()?;
+    if verb == "status" {
+        let runner = RecipeCheckRunner::new(root_dir, "bootstrap-root-status")?;
+        if !root.is_pinned() {
+            println!("bootstrap root: unpinned; every graph builds from stage0");
+            return Ok(());
+        }
+        println!(
+            "bootstrap root: {} exports, {} items, builder ABI {}",
+            root.exports.len(),
+            root.items.len(),
+            root.builder_abi
+        );
+        match crate::bootstrap_root::require_current() {
+            Ok(_) => println!("ladder: matches the pin"),
+            Err(e) => println!("ladder: STALE — {e}"),
+        }
+        println!(
+            "admitted here: {}",
+            if runner.bootstrap_root_present(root) {
+                "yes"
+            } else {
+                "no (the first cut build materializes it)"
+            }
+        );
+        return Ok(());
+    }
+    let (scratch, check) = match verb {
+        "pin" => ("bootstrap-root-pin", false),
+        "check" => ("bootstrap-root-check", true),
+        _ => return Err("usage: bootstrap-root status|pin|check".to_string()),
+    };
+    if check && !root.is_pinned() {
+        return Err("seed/bootstrap-root.txt is unpinned; nothing to check".to_string());
+    }
+    let runner = RecipeCheckRunner::new(root_dir.clone(), scratch)?.with_streamed_progress();
+    let _lock = lock_ladder_for_run(&runner)?;
+    let opts = if check {
+        crate::bootstrap_root::require_current()?;
+        let private = runner.scratch.join("check-cache");
+        PlanOpts {
+            builder_abi: Some(root.builder_abi.clone()),
+            cache: Some((private.join("store"), private.join("db"))),
+        }
+    } else {
+        // The ladder for a pin builds under its own ABI token, never the
+        // compiled one (`store::BUILDER_ABI`), and the measurement below runs
+        // under the same token.
+        let mut abi = runner.builder_command();
+        abi.arg("bootstrap-root").arg("abi");
+        let effective = command_output(&mut abi, "td-builder bootstrap-root abi")?;
+        PlanOpts {
+            builder_abi: Some(crate::bootstrap_root::pin_abi(effective.trim())),
+            cache: None,
+        }
+    };
+    let mut exports: Vec<(String, String)> = Vec::new();
+    for stem in crate::bootstrap_root::CUT {
+        let out = runner.build_ladder_target(stem, &opts)?;
+        let steps = parse_step_map(
+            &fs::read_to_string(&out).map_err(|e| format!("read {}: {e}", out.display()))?,
+        );
+        let base = steps
+            .get(*stem)
+            .ok_or_else(|| format!("bootstrap root: no STEP output for {stem}"))?;
+        exports.push((stem.to_string(), base.clone()));
+    }
+    let (cache_store, _) = opts
+        .cache
+        .clone()
+        .unwrap_or_else(|| runner.build_cache_paths());
+    let mut cmd = runner.builder_command();
+    match &opts.builder_abi {
+        Some(abi) => cmd.env("TD_BUILDER_ABI", abi),
+        None => cmd.env_remove("TD_BUILDER_ABI"),
+    };
+    // Items come from the build cache alone, for pin and check alike: a root
+    // is only ladder outputs, so a reference into the seed store fails as
+    // absent, and `check` cannot be answered by the admitted pin.
+    cmd.arg("bootstrap-root")
+        .arg("measure")
+        .arg("--seeds")
+        .arg(path_str(&runner.store)?)
+        .arg(path_str(&cache_store)?)
+        .arg("--");
+    for (_, base) in &exports {
+        cmd.arg(format!("{TD_STORE_DIR}/{base}"));
+    }
+    let measured = command_output(&mut cmd, "td-builder bootstrap-root measure")?;
+    let mut text = format!(
+        "format 1\nladder {}\n",
+        crate::bootstrap_root::current_ladder_digest(crate::bootstrap_root::CUT)?
+    );
+    for (stem, base) in &exports {
+        text.push_str(&format!("export {stem} {base}\n"));
+    }
+    text.push_str(&measured);
+    let built = td_engine::bootstrap_root::Root::parse(&text)?;
+    if check {
+        let report = bootstrap_root_diff(root, &built);
+        if report.is_empty() {
+            println!(
+                "bootstrap root: stage0 reproduces all {} pinned items",
+                root.items.len()
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "bootstrap root: stage0 does NOT reproduce the pin:\n  {}",
+            report.join("\n  ")
+        ));
+    }
+    let path = root_dir.join("seed/bootstrap-root.txt");
+    fs::write(&path, built.render()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    println!(
+        "bootstrap root: pinned {} exports and {} items under builder ABI {} into {}",
+        built.exports.len(),
+        built.items.len(),
+        built.builder_abi,
+        path.display()
+    );
+    Ok(())
+}
+
+/// Every difference between the pinned root and one rebuilt from stage0.
+fn bootstrap_root_diff(
+    pinned: &td_engine::bootstrap_root::Root,
+    built: &td_engine::bootstrap_root::Root,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if pinned.builder_abi != built.builder_abi {
+        out.push(format!(
+            "builder ABI: pinned {}, rebuilt {}",
+            pinned.builder_abi, built.builder_abi
+        ));
+    }
+    for (stem, base) in &pinned.exports {
+        if built.export(stem) != Some(base.as_str()) {
+            out.push(format!(
+                "export {stem}: pinned {base}, rebuilt {}",
+                built.export(stem).unwrap_or("nothing")
+            ));
+        }
+    }
+    for item in &pinned.items {
+        match built.item(&item.base) {
+            None => out.push(format!("{}: not in the rebuilt closure", item.base)),
+            Some(got) if got.nar != item.nar => out.push(format!(
+                "{}: pinned {}, rebuilt {}",
+                item.base, item.nar, got.nar
+            )),
+            Some(got) if got.refs != item.refs => out.push(format!(
+                "{}: references pinned {:?}, rebuilt {:?}",
+                item.base, item.refs, got.refs
+            )),
+            Some(_) => {}
+        }
+    }
+    for item in &built.items {
+        if pinned.item(&item.base).is_none() {
+            out.push(format!("{}: rebuilt but not pinned", item.base));
+        }
+    }
+    out
+}
+
 /// local-source-roster: print (or, with `check`, verify) the catalog's
 /// DECLARATION-ONLY local-source roster — key, main path, and sibling
 /// `local_source_trees`, one line per `SeedInput::LocalSource` — matching
@@ -2020,6 +2201,17 @@ fn ladder_lock_path(lw: &Path) -> PathBuf {
 /// keeps the closure of what builds used within a window and drops the rest, and an opt-in
 /// `TD_CHECK_LADDER_CACHE_CAP_BYTES` enables a coarse high-watermark eviction of the whole
 /// `build-cache/` (store + db + `db.receipts` sidecars — the coherent unit the builder writes).
+/// How one `build_plan_with` differs from an ordinary build.
+#[derive(Default)]
+struct PlanOpts {
+    /// `TD_BUILDER_ABI` for the builder: the ABI the bootstrap root's paths
+    /// were pinned under.
+    builder_abi: Option<String>,
+    /// A build-output cache other than the shared one: `bootstrap-root
+    /// check`'s private, initially empty cache.
+    cache: Option<(PathBuf, PathBuf)>,
+}
+
 fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
     let base = lw.join("build-cache");
     (base.join("store"), base.join("db"))
@@ -2977,6 +3169,11 @@ pub(crate) struct RecipeCheckRunner {
     /// Store paths this pin table's seed db vouches: `None` until first asked, then
     /// kept current as this run registers — see `db_vouches`.
     vouched: std::sync::Mutex<Option<HashSet<String>>>,
+    /// Targets whose prepared graph stages the bootstrap root: their plan
+    /// names the root db (`build_plan`).
+    rooted: std::sync::Mutex<HashSet<String>>,
+    /// Whether this run has verified (or admitted) the bootstrap root.
+    root_verified: std::sync::Mutex<bool>,
     /// The exclusive claim on `scratch`, held for this runner's whole life: it is what
     /// tells a peer's reaper that this tree is live (see `claim_scratch`). `None` only
     /// in tests, which construct the struct directly and share no ladder.
@@ -3082,17 +3279,24 @@ pub(crate) enum SeedInput {
         path: String,
         trees: Vec<String>,
     },
+    /// A pinned bootstrap-root export (`seed/bootstrap-root.txt`): a ladder
+    /// rung a cut graph stages at its pinned path instead of building. Its
+    /// key is the rung's stem.
+    BootstrapRoot {
+        key: String,
+    },
 }
 
 impl SeedInput {
-    fn key(&self) -> &str {
+    pub(crate) fn key(&self) -> &str {
         match self {
             SeedInput::Stage0 { key }
             | SeedInput::Source { key, .. }
             | SeedInput::Ostree { key, .. }
             | SeedInput::LinuxHeaders { key, .. }
             | SeedInput::Patch { key, .. }
-            | SeedInput::LocalSource { key, .. } => key,
+            | SeedInput::LocalSource { key, .. }
+            | SeedInput::BootstrapRoot { key } => key,
         }
     }
 }
@@ -3153,6 +3357,8 @@ impl RecipeCheckRunner {
             daemon_dir,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
+            rooted: std::sync::Mutex::new(HashSet::new()),
+            root_verified: std::sync::Mutex::new(false),
             _scratch_lock: Some(scratch_lock),
             // A runner a confined check's build spawned (a nested
             // `build-run`, `check-run`) holds to the same builds.
@@ -3338,8 +3544,8 @@ impl RecipeCheckRunner {
         Ok(())
     }
 
-    /// Every pin table's seed db on this ladder, sorted so a failure names the same one
-    /// run to run. Dotfiles are skipped: the table generator and cold-seed candidate
+    /// Every pin table's seed db on this ladder, and the bootstrap root's, sorted so a
+    /// failure names the same one run to run. Dotfiles are skipped: the table generator and cold-seed candidate
     /// paths keep their disposable dbs here too, and neither is authority.
     fn seed_dbs(&self) -> Result<Vec<PathBuf>, String> {
         let Some(dir) = self.db.parent() else {
@@ -4015,6 +4221,14 @@ impl RecipeCheckRunner {
     fn emit_recipe_graph(&self, nodes: &[RecipeNode]) -> Result<(), String> {
         fs::create_dir_all(&self.recipes)
             .map_err(|e| format!("mkdir {}: {e}", self.recipes.display()))?;
+        // `build-plan --auto` builds an input whose JSON is present. A cut
+        // graph stages the root's exports instead, so a JSON an earlier
+        // full-ladder plan in this run left behind must not outlive it.
+        for stem in crate::bootstrap_root::CUT {
+            if !nodes.iter().any(|n| n.stem == *stem) {
+                remove_path_if_exists(&self.recipes.join(format!("{stem}.json")))?;
+            }
+        }
         for node in nodes {
             fs::write(
                 self.recipes.join(format!("{}.json", node.stem)),
@@ -4049,9 +4263,18 @@ impl RecipeCheckRunner {
         let tdstore = self.scratch.join("tdstore");
         fs::create_dir_all(&tdstore).map_err(|e| format!("mkdir {}: {e}", tdstore.display()))?;
         let mut entries: Vec<(String, String)> = Vec::new();
+        let mut rooted = false;
         for input in classify_graph_inputs(nodes)? {
+            rooted |= matches!(input, SeedInput::BootstrapRoot { .. });
             let derived = self.ensure_seed_input(&input)?;
             entries.push((input.key().to_string(), derived));
+        }
+        if let Ok(mut set) = self.rooted.lock() {
+            if rooted {
+                set.insert(target.to_string());
+            } else {
+                set.remove(target);
+            }
         }
         self.write_auto_map(target, &entries)
     }
@@ -4094,6 +4317,9 @@ impl RecipeCheckRunner {
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<String, String> {
         if let SeedInput::LocalSource { key, path, trees } = input {
             return self.ensure_local_source(key, path, trees);
+        }
+        if let SeedInput::BootstrapRoot { key } = input {
+            return self.ensure_root_export(key);
         }
         if let SeedInput::Ostree { pin, .. } = input {
             validate_ostree_pin(pin)?;
@@ -4215,15 +4441,146 @@ impl RecipeCheckRunner {
             SeedInput::LocalSource { key, path, trees } => {
                 self.intern_local_source(key, path, trees, db)
             }
+            SeedInput::BootstrapRoot { key } => Err(format!(
+                "bootstrap-root export `{key}' is built by the ladder, not derived from a pin"
+            )),
         }
     }
 
-    pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
-        self.build_clock.time(|| self.build_plan_timed(target))
+    /// The local db admitting this checkout's pinned root, keyed by the
+    /// manifest so worktrees pinning different roots never share one.
+    /// Beside the keyed seed dbs, so admission commits into the seed store
+    /// under the seed store's own commit lock (`lock_store_commit`).
+    fn bootstrap_root_db(&self) -> PathBuf {
+        let key = crate::bootstrap_root::manifest_key();
+        self.lw.join("seed-db").join(format!(
+            "bootstrap-root-{}.db",
+            key.get(..16).unwrap_or(&key)
+        ))
     }
 
-    fn build_plan_timed(&self, target: &str) -> Result<PathBuf, String> {
-        self.ensure_build_allowed(target)?;
+    /// The root db TARGET's prepared graph stages, if it stages the root:
+    /// what its plan, and any build that consumes its outputs, must name.
+    pub(crate) fn bootstrap_root_db_for(&self, target: &str) -> Result<Option<PathBuf>, String> {
+        Ok(self
+            .rooted
+            .lock()
+            .map_err(|_| "bootstrap root: poisoned target set".to_string())?
+            .contains(target)
+            .then(|| self.bootstrap_root_db()))
+    }
+
+    fn bootstrap_root_present(&self, root: &td_engine::bootstrap_root::Root) -> bool {
+        self.bootstrap_root_db().is_file()
+            && root
+                .items
+                .iter()
+                .all(|item| self.store.join(&item.base).symlink_metadata().is_ok())
+    }
+
+    /// The pinned root, admitted into this machine's seed store: built once
+    /// from stage0 here when it is not, then admitted against the pin. The
+    /// builder re-authenticates the db and every item's bytes per plan.
+    fn ensure_bootstrap_root(&self) -> Result<&'static td_engine::bootstrap_root::Root, String> {
+        let root = crate::bootstrap_root::require_current()?;
+        let mut verified = self
+            .root_verified
+            .lock()
+            .map_err(|_| "bootstrap root: poisoned verification".to_string())?;
+        if *verified {
+            return Ok(root);
+        }
+        if self.bootstrap_root_present(root) {
+            // Re-hashed once per run: a rotted or replaced item would
+            // otherwise fail every plan's authentication with nothing to
+            // repair it.
+            match self.verify_bootstrap_root() {
+                Ok(()) => {
+                    *verified = true;
+                    return Ok(root);
+                }
+                // Admission re-checks under the lock and repairs in place.
+                Err(e) => {
+                    eprintln!("bootstrap root: re-admitting after a failed verification: {e}")
+                }
+            }
+        }
+        eprintln!(
+            "bootstrap root: not admitted on this machine; building the ladder below the \
+             gcc-14 cut from stage0 under builder ABI {} (once per machine)",
+            root.builder_abi
+        );
+        let opts = PlanOpts {
+            builder_abi: Some(root.builder_abi.clone()),
+            cache: None,
+        };
+        for stem in crate::bootstrap_root::CUT {
+            self.build_ladder_target(stem, &opts)?;
+        }
+        let (cache_store, _) = self.build_cache_paths();
+        self.admit_bootstrap_root(&[cache_store, self.store.clone()])?;
+        *verified = true;
+        Ok(root)
+    }
+
+    fn verify_bootstrap_root(&self) -> Result<(), String> {
+        let mut cmd = self.builder_command();
+        cmd.arg("bootstrap-root")
+            .arg("verify")
+            .arg(path_str(&self.store)?)
+            .arg(path_str(&self.bootstrap_root_db())?);
+        command_output(&mut cmd, "td-builder bootstrap-root verify").map(|_| ())
+    }
+
+    fn admit_bootstrap_root(&self, src_dirs: &[PathBuf]) -> Result<(), String> {
+        let db = self.bootstrap_root_db();
+        if let Some(parent) = db.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+        let mut cmd = self.builder_command();
+        cmd.arg("bootstrap-root")
+            .arg("admit")
+            .arg(path_str(&self.store)?)
+            .arg(path_str(&db)?);
+        for dir in src_dirs {
+            cmd.arg(path_str(dir)?);
+        }
+        command_output(&mut cmd, "td-builder bootstrap-root admit").map(|_| ())
+    }
+
+    /// One ladder rung, planned from stage0 whatever the cut, outside any
+    /// check's build confinement: the root is shared machine state, not part
+    /// of the requesting check's verdict.
+    fn build_ladder_target(&self, stem: &str, opts: &PlanOpts) -> Result<PathBuf, String> {
+        let graph = recipe_closure_full(&[stem])?;
+        self.ensure_graph_inputs(stem, &graph)?;
+        self.emit_recipe_graph(&graph)?;
+        self.build_plan_with(stem, opts)
+    }
+
+    /// A cut graph's export: the root, admitted and staged into this run's
+    /// td-store beside the outputs a plan stages there.
+    fn ensure_root_export(&self, key: &str) -> Result<String, String> {
+        let root = self.ensure_bootstrap_root()?;
+        let base = root
+            .export(key)
+            .ok_or_else(|| format!("seed/bootstrap-root.txt exports no `{key}'"))?;
+        // Staged like every seed: an independent copy, so an edit to the
+        // operator-visible td-store can never reach the admitted bytes.
+        for item in &root.items {
+            self.stage_store_path(&format!("{TD_STORE_DIR}/{}", item.base))?;
+        }
+        Ok(format!("{TD_STORE_DIR}/{base}"))
+    }
+
+    pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
+        self.build_clock.time(|| {
+            self.ensure_build_allowed(target)?;
+            self.build_plan_with(target, &PlanOpts::default())
+        })
+    }
+
+    fn build_plan_with(&self, target: &str, opts: &PlanOpts) -> Result<PathBuf, String> {
         // The auto map is the FRESH per-run map prepare_recipe_target wrote from this
         // graph's re-derived, pin-verified seeds (every non-owned input is an interned
         // seed source). There is no tools map — a host executable is not an admissible
@@ -4255,6 +4612,7 @@ impl RecipeCheckRunner {
         // safe — every db in that list is read per step.
         let local_seed_db = local_seed_db_path(&self.lw, &self.scratch_id());
         let local_seed_db_s = path_str(&local_seed_db)?;
+        let root_db = self.bootstrap_root_db_for(target)?;
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
             .env_clear()
@@ -4289,6 +4647,14 @@ impl RecipeCheckRunner {
             .arg(path_str(&self.db)?)
             .arg(scratch)
             .arg(local_seed_db_s);
+        if let Some(db) = &root_db {
+            cmd.arg(path_str(db)?);
+        }
+        // The ladder rebuilt for the root keeps the ABI its paths were pinned
+        // under, so its outputs land at the pinned basenames.
+        if let Some(abi) = &opts.builder_abi {
+            cmd.env("TD_BUILDER_ABI", abi);
+        }
         // Cross-run reuse is ALWAYS on (re #469 build speed): point the chain at the
         // DEDICATED build-output cache (build_cache_paths, under the ladder work dir), kept
         // SEPARATE from the seed store/db (self.store/self.db). Each UNCHANGED rung is reused
@@ -4315,7 +4681,10 @@ impl RecipeCheckRunner {
         // OUTPUT committed there would be rejected as an unpinned seed. Keeping the cache a
         // distinct store/db pair keeps the seed authority clean and makes reuse compatible
         // with #468 (which then reuses through the same persistent_realization).
-        let (cache_store, cache_db) = self.build_cache_paths();
+        let (cache_store, cache_db) = opts
+            .cache
+            .clone()
+            .unwrap_or_else(|| self.build_cache_paths());
         cmd.env("TD_PERSIST_STORE", path_str(&cache_store)?)
             .env("TD_PERSIST_DB", path_str(&cache_db)?);
         // Host-side human commands stream the build's stdout AND stderr live so a cold
@@ -4646,14 +5015,22 @@ impl RecipeCheckRunner {
         let eval = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let closure = recipe_closure(&[target])?;
         let (locks, local_sources) = closure_repo_inputs(&closure);
-        plan_fingerprint(
+        let fingerprint = plan_fingerprint(
             &eval,
             &self.builder_engine_fingerprint()?,
             &self.root.join("seed/patches"),
             &self.root,
             &locks,
             &local_sources,
-        )
+        )?;
+        // Whether the graph stops at the pinned root is decided at run time
+        // (`TD_BOOTSTRAP_FROM_STAGE0`), so it keys the memo too: a stage0
+        // run must not reuse what a cut run recorded.
+        Ok(if crate::bootstrap_root::cut_for(&[target])?.is_some() {
+            fingerprint
+        } else {
+            td_engine::sha256::hex_digest(format!("{fingerprint} from-stage0").as_bytes())
+        })
     }
 
     /// The verdict memo key for check `index` of `stem`: sha256 over every
@@ -5209,7 +5586,33 @@ impl RecipeCheckRunner {
     }
 }
 
+/// TARGETS' recipe graph as it builds: stopped at the pinned bootstrap root
+/// when one applies (`bootstrap_root::cut_for`), whose exports then stage
+/// as `SeedInput::BootstrapRoot` seeds instead of recipe nodes.
 pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
+    let Some(cut) = crate::bootstrap_root::cut_for(targets)? else {
+        return recipe_closure_full(targets);
+    };
+    let nodes = recipe_closure_cut(targets, &cut)?;
+    // A cut graph builds nothing below the cut: a rung here would build on
+    // root items typed AuditedSeed at the paths a full climb types otherwise.
+    let ladder = crate::bootstrap_root::ladder()?;
+    if let Some(node) = nodes.iter().find(|n| ladder.contains(&n.stem)) {
+        return Err(format!(
+            "bootstrap root: {} reaches ladder rung `{}' past the cut",
+            targets.join(" "),
+            node.stem
+        ));
+    }
+    Ok(nodes)
+}
+
+/// TARGETS' whole graph down to stage0, whatever the root says.
+pub(crate) fn recipe_closure_full(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
+    recipe_closure_cut(targets, &BTreeSet::new())
+}
+
+fn recipe_closure_cut(targets: &[&str], cut: &BTreeSet<&str>) -> Result<Vec<RecipeNode>, String> {
     // The catalog is CONSTRUCTED once and then indexed. `catalog::lookup` builds
     // all 98 recipes and searches linearly, and this walk asked it once per node
     // and once more per EDGE, which is most of what a pure graph question costs.
@@ -5217,10 +5620,26 @@ pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String
     let mut visiting = HashSet::new();
     let mut emitted = HashSet::new();
     let mut out = Vec::new();
+    let mut walk = Walk {
+        catalog: &catalog,
+        cut,
+        visiting: &mut visiting,
+        emitted: &mut emitted,
+        out: &mut out,
+    };
     for target in targets {
-        visit_recipe(target, &catalog, &mut visiting, &mut emitted, &mut out)?;
+        visit_recipe(target, &mut walk)?;
     }
     Ok(out)
+}
+
+struct Walk<'a> {
+    catalog: &'a BTreeMap<&'a str, Recipe>,
+    /// Stems the walk does not enter: the bootstrap root's exports.
+    cut: &'a BTreeSet<&'a str>,
+    visiting: &'a mut HashSet<String>,
+    emitted: &'a mut HashSet<String>,
+    out: &'a mut Vec<RecipeNode>,
 }
 
 /// The check-owning recipes a change under `scope` can reach: each whose
@@ -5333,8 +5752,20 @@ pub(crate) fn checks_reaching(scope: &[&str]) -> Result<BTreeMap<String, String>
         }
         let mut closure = Vec::new();
         let (mut visiting, mut emitted) = (HashSet::new(), HashSet::new());
-        for root in owner_roots(stem, recipe) {
-            visit_recipe(&root, &catalog, &mut visiting, &mut emitted, &mut closure)?;
+        let roots = owner_roots(stem, recipe);
+        let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+        // The graph the check builds: a ladder edit reaches a post-cut check
+        // only through the pin, whose staleness `cargo-test` reports.
+        let cut = crate::bootstrap_root::cut_for(&root_refs)?.unwrap_or_default();
+        let mut walk = Walk {
+            catalog: &catalog,
+            cut: &cut,
+            visiting: &mut visiting,
+            emitted: &mut emitted,
+            out: &mut closure,
+        };
+        for root in &roots {
+            visit_recipe(root, &mut walk)?;
         }
         if let Some(why) = closure.iter().find_map(|n| reached.get(n.stem.as_str())) {
             out.insert((*stem).to_string(), why.clone());
@@ -5417,34 +5848,30 @@ fn recipe_entry_readers(
     }
 }
 
-fn visit_recipe(
-    stem: &str,
-    catalog: &BTreeMap<&str, Recipe>,
-    visiting: &mut HashSet<String>,
-    emitted: &mut HashSet<String>,
-    out: &mut Vec<RecipeNode>,
-) -> Result<(), String> {
-    if emitted.contains(stem) {
+fn visit_recipe(stem: &str, walk: &mut Walk) -> Result<(), String> {
+    if walk.emitted.contains(stem) {
         return Ok(());
     }
-    if !visiting.insert(stem.to_string()) {
+    if !walk.visiting.insert(stem.to_string()) {
         return Err(format!("ladder: cycle in recipe nativeInputs at `{stem}'"));
     }
-    let recipe = catalog
+    let recipe = walk
+        .catalog
         .get(stem)
         .ok_or_else(|| format!("ladder: no td recipe for `{stem}'"))?
         .clone();
+    let enters = |walk: &Walk, dep: &str| walk.catalog.contains_key(dep) && !walk.cut.contains(dep);
     if let Some(native_inputs) = &recipe.native_inputs {
         for dep in native_inputs {
-            if catalog.contains_key(dep.as_str()) {
-                visit_recipe(dep, catalog, visiting, emitted, out)?;
+            if enters(walk, dep) {
+                visit_recipe(dep, walk)?;
             }
         }
     }
     if let Some(inputs) = &recipe.inputs {
         for dep in inputs {
-            if catalog.contains_key(dep.as_str()) {
-                visit_recipe(dep, catalog, visiting, emitted, out)?;
+            if enters(walk, dep) {
+                visit_recipe(dep, walk)?;
             }
         }
     }
@@ -5454,14 +5881,14 @@ fn visit_recipe(
     // `build-plan --auto` failing to resolve a name the catalog plainly has.
     if let Some(payload_inputs) = &recipe.payload_inputs {
         for dep in payload_inputs {
-            if catalog.contains_key(dep.as_str()) {
-                visit_recipe(dep, catalog, visiting, emitted, out)?;
+            if enters(walk, dep) {
+                visit_recipe(dep, walk)?;
             }
         }
     }
-    visiting.remove(stem);
-    emitted.insert(stem.to_string());
-    out.push(RecipeNode {
+    walk.visiting.remove(stem);
+    walk.emitted.insert(stem.to_string());
+    walk.out.push(RecipeNode {
         stem: stem.to_string(),
         recipe,
     });
@@ -5826,6 +6253,7 @@ fn classify_graph_inputs_with(
     // linearly, and this asks it once per INPUT across the whole graph. It only
     // ever tests existence, so a stem set answers the same question.
     let catalog_stems: HashSet<&str> = catalog::all().into_iter().map(|(stem, _)| stem).collect();
+    let node_stems: HashSet<&str> = nodes.iter().map(|n| n.stem.as_str()).collect();
     let mut seen = HashSet::new();
     let mut seed_inputs = Vec::new();
     for node in nodes {
@@ -5844,6 +6272,17 @@ fn classify_graph_inputs_with(
             .flatten()
         {
             if catalog_stems.contains(input.as_str()) {
+                // A cut walk stops at the root's exports: an export the
+                // graph does not build is staged from the pinned root.
+                if !node_stems.contains(input.as_str())
+                    && crate::bootstrap_root::CUT.contains(&input.as_str())
+                {
+                    push_seed_input(
+                        &mut seed_inputs,
+                        &mut seen,
+                        SeedInput::BootstrapRoot { key: input.clone() },
+                    );
+                }
                 continue;
             }
             match seed_input_for_recipe_input(input)? {
@@ -9825,6 +10264,8 @@ chmod 755 '{}'
             daemon_dir: None,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
+            rooted: std::sync::Mutex::new(HashSet::new()),
+            root_verified: std::sync::Mutex::new(false),
             // Not claimed: this runner shares no ladder with anything.
             _scratch_lock: None,
             allowed_builds: None,
@@ -10664,7 +11105,7 @@ chmod 755 '{}'
 
     #[test]
     fn recipe_closure_is_derived_from_catalog_edges() {
-        let graph = recipe_closure(&["busybox-test"]).unwrap();
+        let graph = recipe_closure_full(&["busybox-test"]).unwrap();
         let stems: Vec<&str> = graph.iter().map(|node| node.stem.as_str()).collect();
 
         for expected in [
@@ -10695,6 +11136,16 @@ chmod 755 '{}'
             busybox_pos < test_pos,
             "dependency should be emitted before dependent: {stems:?}"
         );
+
+        // With a pinned root the same target's build graph stops at the cut.
+        if crate::bootstrap_root::root().unwrap().is_pinned() {
+            let cut = recipe_closure(&["busybox-test"]).unwrap();
+            let cut: Vec<&str> = cut.iter().map(|node| node.stem.as_str()).collect();
+            assert!(cut.contains(&"busybox-x86-64"), "{cut:?}");
+            for below in ["stage0", "mes", "gcc-14", "glibc-mesboot"] {
+                assert!(!cut.contains(&below), "{below} in the cut graph: {cut:?}");
+            }
+        }
     }
 
     /// The real bootstrap graph is host-free: planning provenance ACCEPTS every
@@ -10807,6 +11258,8 @@ chmod 755 '{}'
             daemon_dir: None,
             stream_progress: false,
             vouched: std::sync::Mutex::new(None),
+            rooted: std::sync::Mutex::new(HashSet::new()),
+            root_verified: std::sync::Mutex::new(false),
             _scratch_lock: None,
             allowed_builds: None,
         };
@@ -10924,9 +11377,29 @@ chmod 755 '{}'
         let why = &firefox["openssh-x86-64-test"];
         assert!(why.contains("system-x86-64's module"), "{why}");
         assert!(!firefox.contains_key("busybox-test"), "{firefox:?}");
-        // A data file reaches what builds on the recipe embedding it.
+        // A data file reaches what builds on the recipe embedding it: with a
+        // pinned root, only the checks that still build the ladder.
         let mk = checks_reaching(&["recipes/src/recipes/bash-mesboot.mk"]).unwrap();
-        assert!(mk["busybox-test"].contains("bash-mesboot reads"), "{mk:?}");
+        assert!(!mk.is_empty());
+        assert!(
+            mk.values().all(|why| why.contains("bash-mesboot reads")),
+            "{mk:?}"
+        );
+        if crate::bootstrap_root::root().unwrap().is_pinned() {
+            assert!(!mk.contains_key("busybox-test"), "{mk:?}");
+            for stem in mk.keys() {
+                let roots = owner_roots(stem, &catalog::lookup(stem).unwrap());
+                let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+                assert!(
+                    crate::bootstrap_root::cut_for_with(&refs, false)
+                        .unwrap()
+                        .is_none(),
+                    "{stem} is reached but builds above the cut"
+                );
+            }
+        } else {
+            assert!(mk.contains_key("busybox-test"), "{mk:?}");
+        }
         for scope in [
             "recipes/src/types.rs",
             "recipes/build.rs",
@@ -11992,6 +12465,81 @@ chmod 755 '{}'
         append_check_history(&path, "2\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "1\n2\n");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cut_walk_stages_the_root_instead_of_climbing_the_ladder() {
+        let cut: BTreeSet<&str> = crate::bootstrap_root::CUT.iter().copied().collect();
+        let ladder = crate::bootstrap_root::ladder().unwrap();
+        let nodes = recipe_closure_cut(&["rust-toolchain"], &cut).unwrap();
+        assert!(nodes.iter().all(|n| !ladder.contains(&n.stem)));
+        let seeds = classify_graph_inputs(&nodes).unwrap();
+        let staged: BTreeSet<&str> = seeds
+            .iter()
+            .filter_map(|s| match s {
+                SeedInput::BootstrapRoot { key } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(staged.contains("gcc-14") && staged.contains("glibc-mesboot"));
+        assert!(staged.iter().all(|k| cut.contains(k)));
+        assert!(!seeds.iter().any(|s| matches!(s, SeedInput::Stage0 { .. })));
+        // The same target walked whole climbs from stage0.
+        let full = recipe_closure_full(&["rust-toolchain"]).unwrap();
+        assert!(full.iter().any(|n| n.stem == "gcc-mesboot"));
+        let full_seeds = classify_graph_inputs(&full).unwrap();
+        assert!(full_seeds
+            .iter()
+            .any(|s| matches!(s, SeedInput::Stage0 { .. })));
+        assert!(!full_seeds
+            .iter()
+            .any(|s| matches!(s, SeedInput::BootstrapRoot { .. })));
+    }
+
+    #[test]
+    fn a_ladder_side_recipe_climbs_from_stage0() {
+        assert!(crate::bootstrap_root::ladder_side("gcc-14").unwrap());
+        assert!(crate::bootstrap_root::ladder_side("gcc-10-bridge-test").unwrap());
+        assert!(!crate::bootstrap_root::ladder_side("gcc-x86-64-stage1").unwrap());
+        assert!(!crate::bootstrap_root::ladder_side("rust-toolchain").unwrap());
+    }
+
+    #[test]
+    fn the_stage0_check_names_every_drifted_item() {
+        use td_engine::bootstrap_root::{Item, Root};
+        let a = "0123456789abcdfghijklmnpqrsvwxyz-a-1".to_string();
+        let b = "0123456789abcdfghijklmnpqrsvwxyy-b-1".to_string();
+        let nar = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        let pinned = Root {
+            builder_abi: "4".to_string(),
+            ladder: "1".repeat(64),
+            exports: vec![("a".to_string(), a.clone())],
+            items: vec![
+                Item {
+                    base: a.clone(),
+                    nar: nar('0'),
+                    refs: vec![b.clone()],
+                },
+                Item {
+                    base: b.clone(),
+                    nar: nar('0'),
+                    refs: Vec::new(),
+                },
+            ],
+        };
+        assert!(bootstrap_root_diff(&pinned, &pinned).is_empty());
+        let mut built = pinned.clone();
+        built.items[1].nar = nar('1');
+        let report = bootstrap_root_diff(&pinned, &built);
+        assert_eq!(report.len(), 1);
+        assert!(report[0].starts_with(&b), "{report:?}");
+        built.items.pop();
+        built.items[0].refs.clear();
+        let report = bootstrap_root_diff(&pinned, &built);
+        assert!(report
+            .iter()
+            .any(|r| r.contains("not in the rebuilt closure")));
+        assert!(report.iter().any(|r| r.contains("references pinned")));
     }
 
     // The STEP map takes the LAST line for a stem (matching ladder_out_from) and

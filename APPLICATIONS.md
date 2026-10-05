@@ -2285,6 +2285,14 @@ the wire says `unmarked`, the design sentence stays what it is, and
 `audited-seeds` — the distinct seed inputs the planning pass classified —
 is printed beside it so the seeds are visible rather than absent.
 
+With a pinned bootstrap root (AGENTS.md, "Target artifact graph") the
+query walks the graph that builds: the ladder below the gcc-14 cut is not a
+member, and the cut's exports are counted among `audited-seeds`. Their
+descent from stage0 rests on the pin, which this machine built from stage0
+and admits only when the bytes equal it; `td-recipe-eval bootstrap-root
+check` re-proves it on demand, and `TD_BOOTSTRAP_FROM_STAGE0=1` makes the
+query walk the whole chain.
+
 A marked pin is reported BESIDE the output built from it rather than
 instead of it: the archive's bytes are a store path of their own, so the
 two are two paths the claim does not cover. Neither is a closure MEMBER

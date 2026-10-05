@@ -81,6 +81,8 @@ use std::process::exit;
 
 use td_recipe::catalog;
 
+#[path = "td_recipe_eval/bootstrap_root.rs"]
+mod bootstrap_root;
 #[path = "td_recipe_eval/check_runner.rs"]
 mod check_runner;
 #[path = "td_recipe_eval/checks/mod.rs"]
@@ -584,6 +586,15 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("bootstrap-root") => {
+            let verb = match (args.get(2), args.get(3)) {
+                (Some(verb), None) => verb.as_str(),
+                _ => die("usage: bootstrap-root status|pin|check"),
+            };
+            if let Err(e) = check_runner::bootstrap_root_cli(verb) {
+                die_runner(&e);
+            }
+        }
         Some("local-source-roster") => {
             let check = match (args.get(2).map(String::as_str), args.get(3)) {
                 (None, _) => false,
@@ -598,7 +609,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|check-history|clear-store|gc-store|qemu-secret|qemu-secret-system|qemu-boot|qemu-boot-uefi|qemu-boot-media|qemu-install|qemu-install-system|qemu-boot-live|compose-iso|build-iso|test-iso|qemu-boot-erofs|qemu-boot-system|qemu-update|qemu-boot-net|qemu-boot-kexec|run|bundle|warm|verify-store|payload-closure|application-closure|vendor-warm-args|source-pins|source-pin|ostree-pins|ostree-pin|seed-digests|local-source-roster|bootstrap-root ..."),
     }
 }
 

@@ -972,8 +972,9 @@ fn embedded_include_paths(files: &[PathBuf]) -> Result<Vec<String>, String> {
 /// The evaluator's compile inputs — the mirror of the stage0 roots below, with
 /// `recipes/` in place of `builder/`, PLUS everything the crate embeds (above)
 /// and the helper implementation/entry script a memo hit skips.
-/// The seed-digest table is `include_str!`d into td-recipe-eval too, so a new
-/// seed pin must not leave a stale compiled table in force.
+/// The seed-digest table and the bootstrap-root manifest are `include_str!`d
+/// into td-recipe-eval too, so a new pin must not leave a stale compiled
+/// table in force.
 fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
     let mut roots: Vec<String> = [
         "recipes/src",
@@ -985,6 +986,7 @@ fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
         "Cargo.lock",
         "seed/seed-digests.txt",
         "seed/local-source-roster.txt",
+        "seed/bootstrap-root.txt",
         "tests/recipe-eval-tool.sh",
         "builder/src/stage0.rs",
     ]
@@ -1253,6 +1255,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
         "Cargo.lock",
         "seed/seed-digests.txt",
         "seed/local-source-roster.txt",
+        "seed/bootstrap-root.txt",
     ]
     .iter()
     .map(|p| root.join(p).to_string_lossy().into_owned())

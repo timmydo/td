@@ -361,6 +361,11 @@ fn prove_td_shell_userland(
         .env("TD_SHELL_NATIVE_LOCK", lock_s)
         .env("TD_PERSIST_STORE", tdstore_s)
         .env("TD_PERSIST_DB", persist_db_s);
+    // A toolchain built above the pinned root references root items, which
+    // only the root db vouches; td-builder authenticates it at intake.
+    if let Some(db) = runner.bootstrap_root_db_for("rust-toolchain")? {
+        cmd.env("TD_SHELL_NATIVE_ROOT_DB", path_str(&db)?);
+    }
     // The shell asks this evaluator for each recipe it builds; the command
     // carries the check's confinement, so it refuses any not declared.
     cmd.arg("shell")

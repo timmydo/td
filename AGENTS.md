@@ -89,13 +89,20 @@ stage0-posix -> Mes/MesCC -> TinyCC -> early GNU tools
   -> target-built td control plane, tools, and Rust userland -> image
 ```
 
-The stage0/Mes ladder is the provenance boundary: every later target
-executable descends from declared seeds and source, which keeps undeclared host
-binaries out and makes the from-scratch chain reproducible and checkable. The
-compiler/libc path is iterative. Recipe steps may execute only audited seed
-executables, unmarked outputs of earlier recipes, and executables created by
-the current build. Host `/bin`, `/usr`, ambient `PATH`, and arbitrary host store
-paths are never target inputs.
+The stage0/Mes ladder is the provenance boundary: every later target executable
+descends from declared seeds and source, which keeps undeclared host binaries
+out and makes the from-scratch chain reproducible and checkable. Default builds
+start at the gcc-14 cut instead: `seed/bootstrap-root.txt` pins the ladder's
+outputs there by path, NAR hash and references, each machine builds them once
+from stage0 and admits only bytes equal to the pin, and graphs above the cut
+stage them as audited seeds.
+The pin is never downloaded or published; `td-recipe-eval bootstrap-root check`
+rebuilds the ladder from stage0 on demand and reports any item that does not
+reproduce. `DEVELOPMENT.md` says when to re-pin. The compiler/libc path is
+iterative. Recipe steps may execute only audited seed executables, unmarked
+outputs of earlier recipes, and executables created by the current build. Host
+`/bin`, `/usr`, ambient `PATH`, and arbitrary host store paths are never target
+inputs.
 
 `td-builder build` stages declared inputs and sets compatibility `NIX_STORE`
 to the active td store. A `TD_STORE_DIR=/td/store` build is hashed for and

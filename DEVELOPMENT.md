@@ -226,6 +226,49 @@ seed patch, or stage0 source change and commit it with the change:
 td-recipe-eval seed-digests > seed/seed-digests.txt
 ```
 
+The ladder below the gcc-14 cut is pinned the same way, by
+`seed/bootstrap-root.txt`: the cut's sixteen exports
+(`bootstrap_root::CUT`), every store item in their reference closure by
+basename, NAR hash and references, the builder ABI they were built under,
+and a digest over the ladder's recipes and the seeds it stages. A graph
+whose targets are not ladder rungs stops at the exports and stages them
+from the pinned root, so a builder ABI bump rebuilds only what lies above
+the cut. The first such build on a machine materializes the root: it
+builds the ladder from stage0 under the pinned ABI, which on a warm
+machine is a cache hit, and admits the result only if every item
+reproduces the pin. Nothing is downloaded or published (principle 5).
+
+A pin builds the ladder under its own ABI token, `<abi>-root`, never the
+compiled `store::BUILDER_ABI`: a graph cut at the root types its exports
+AuditedSeed where a full climb types them RecipeOutput, the reuse key
+binds that origin, and the two must therefore never share an output
+path. The root keeps its token across later ABI bumps; the first pin
+records plain `4`, which the bump to 5 retired. A ladder-side check (a
+rung's own test, such as gcc-10-bridge-test) still climbs from stage0 at
+the compiled ABI, so each bump re-climbs the ladder for it once. A bump
+that changes what the ladder's rungs produce makes a cold machine's
+admission fail with the differing items named; re-pin then, and use
+`bootstrap-root check` to see the drift. An admitted root is re-verified
+once per run and re-admitted if it no longer matches. Re-pinning leaves
+the old root's items in the seed store; only `clear-store` reclaims
+them.
+
+Changing a ladder recipe, or a seed it stages, makes the pin stale; the
+`cargo-test` preflight reds until it is re-pinned, and a cut build refuses
+to start. Re-pin, review the diff, and commit it with the change:
+
+```text
+td-recipe-eval bootstrap-root pin
+```
+
+`td-recipe-eval bootstrap-root check` is the on-demand stage0 proof and
+not part of `check`: it rebuilds the ladder from stage0 into a private,
+empty build cache under the pinned ABI and reports every item that does
+not reproduce. `bootstrap-root status` says whether the root is pinned,
+current and admitted here; `TD_BOOTSTRAP_FROM_STAGE0=1` makes one
+invocation build every graph from stage0. Building a ladder rung, or a
+recipe that builds from one below the cut, always climbs from stage0.
+
 A recipe built from the checkout's own trees (a `local_source`, with any
 sibling `local_source_trees`) is pinned differently: DECLARATION-only, by
 `seed/local-source-roster.txt`, which the evaluator and td-builder both

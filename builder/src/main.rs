@@ -19,6 +19,7 @@
 mod affected;
 mod application;
 mod bootstrap;
+mod bootstrap_root;
 mod build;
 mod build_daemon;
 mod bzip2;
@@ -7049,6 +7050,7 @@ fn build_plan(
     builder_store: Option<(&str, &str, &str)>,
     persist: Option<(&str, &str)>,
     local_seed_db: Option<&str>,
+    root_db: Option<&str>,
 ) -> Result<(), String> {
     use std::collections::BTreeMap;
     let plan =
@@ -7090,10 +7092,19 @@ fn build_plan(
     if let Some(db) = local_seed_db {
         authenticate_local_seed_db(db, Path::new(seed_store), scratch)?;
     }
+    // The bootstrap-root db: the pinned ladder outputs a cut plan stages as
+    // AuditedSeed, authenticated against the compiled manifest. Unlike the
+    // other two it is never named speculatively, so a named one must exist.
+    if let Some(db) = root_db {
+        bootstrap_root::authenticate_db(db, Path::new(seed_store))?;
+    }
     let mut built: BTreeMap<String, String> = BTreeMap::new();
     let mut td_dbs: Vec<(String, sandbox::InputOrigin)> =
         vec![(seed_db.to_string(), sandbox::InputOrigin::AuditedSeed)];
     if let Some(db) = local_seed_db {
+        td_dbs.push((db.to_string(), sandbox::InputOrigin::AuditedSeed));
+    }
+    if let Some(db) = root_db {
         td_dbs.push((db.to_string(), sandbox::InputOrigin::AuditedSeed));
     }
     let store_prefix = store::store_dir();
@@ -7672,6 +7683,9 @@ fn local_source_roster_expected(
 enum SeedOrigin {
     Digest(&'static str),
     LocalSource,
+    /// A pinned bootstrap-root export (`seed/bootstrap-root.txt`): the
+    /// ladder output a post-cut recipe names, at its pinned basename.
+    BootstrapRoot(&'static str),
 }
 
 /// Refuse a seed key pinned by BOTH tables (re #469 local-source-roster
@@ -7701,6 +7715,17 @@ fn classify_seed_key(key: &str) -> Result<Option<SeedOrigin>, String> {
     let digest = seed_digests_expected(key)?;
     let roster = local_source_roster_expected(key)?;
     reject_if_pinned_both_ways(key, digest.is_some(), roster.is_some())?;
+    if let Some(exp) = bootstrap_root::export(key)? {
+        // An export names a recipe stem; a seed table names a pinned
+        // source. One key cannot be both a built rung and a fetched input.
+        if digest.is_some() || roster.is_some() {
+            return Err(format!(
+                "provenance rejected: seed key `{key}' is both a seed/bootstrap-root.txt \
+                 export and a seed-table key"
+            ));
+        }
+        return Ok(Some(SeedOrigin::BootstrapRoot(exp)));
+    }
     // `reject_if_pinned_both_ways` already refused `(Some, Some)`, so the only
     // question left is which single table (if either) admits the key.
     if let Some(exp) = digest {
@@ -8102,6 +8127,13 @@ fn auto_seed_provenance(
             verify_local_source_roster_basename(key, base, scratch)
                 .map_err(|e| format!("--auto: recipe `{name}' input `{key}': {e}"))?;
         }
+        Some(SeedOrigin::BootstrapRoot(exp)) if exp != base => {
+            return Err(format!(
+                "--auto: provenance rejected: recipe `{name}' input `{key}' resolves to \
+                 `{base}' but seed/bootstrap-root.txt exports `{exp}'"
+            ))
+        }
+        Some(SeedOrigin::BootstrapRoot(_)) => {}
     }
     let on_disk = seed_store.join(base);
     if !on_disk.exists() {
@@ -8192,7 +8224,7 @@ fn auto_synthesize_lock(
 /// operator invoking this arm directly with a forged map is outside the
 /// boundary, the same trust class as pointing TD_RECIPE_EVAL at old code.
 ///
-/// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH [LOCAL-SEED-DB]
+/// Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH [LOCAL-SEED-DB [ROOT-DB]]
 ///
 /// `LOCAL-SEED-DB` is OPTIONAL (re #469 local-source-roster blocker fix): the
 /// runner's per-run db of local-source registrations, kept separate from the
@@ -8202,6 +8234,9 @@ fn auto_synthesize_lock(
 /// for anything that names no local-source-roster key; a plan that DOES need
 /// one then reds at per-entry provenance (`auto_seed_provenance`) or
 /// manifest assembly, naming the key, never silently succeeding.
+///
+/// `ROOT-DB` is the bootstrap-root db (`bootstrap_root`), named only for a
+/// plan cut at the pinned root; its items live in SEED-STORE.
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -8222,6 +8257,7 @@ fn build_plan_auto(
     builder_store: Option<(&str, &str, &str)>,
     persist: Option<(&str, &str)>,
     local_seed_db: Option<&str>,
+    root_db: Option<&str>,
 ) -> Result<(), String> {
     if !auto_is_owned(recipe_dir, target) {
         return Err(format!(
@@ -8280,7 +8316,62 @@ fn build_plan_auto(
         builder_store,
         persist,
         local_seed_db,
+        root_db,
     )
+}
+
+/// The `bootstrap-root` verbs (see the dispatch arm).
+fn run_bootstrap_root(args: &[String]) -> Result<(), String> {
+    let usage = || {
+        "usage: bootstrap-root admit SEED-STORE ROOT-DB SRC-DIR... | \
+         bootstrap-root verify SEED-STORE ROOT-DB | bootstrap-root abi | \
+         bootstrap-root measure [--seeds SEED-STORE] SRC-DIR... -- EXPORT-PATH..."
+            .to_string()
+    };
+    match args {
+        [verb, seed_store, root_db, dirs @ ..] if verb == "admit" && !dirs.is_empty() => {
+            let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+            bootstrap_root::admit(&dirs, Path::new(seed_store), Path::new(root_db))
+        }
+        [verb, seed_store, root_db] if verb == "verify" => {
+            bootstrap_root::verify(root_db, Path::new(seed_store))
+        }
+        [verb] if verb == "abi" => {
+            let abi = store::builder_abi_token();
+            println!("{}", abi.strip_prefix("td-builder-abi-").unwrap_or(&abi));
+            Ok(())
+        }
+        [verb, rest @ ..] if verb == "measure" => {
+            let (seeds, rest) = match rest {
+                [flag, seed, rest @ ..] if flag == "--seeds" => (vec![PathBuf::from(seed)], rest),
+                _ => (Vec::new(), rest),
+            };
+            let mut halves = rest.splitn(2, |a| a == "--");
+            let (Some(dirs), Some(exports)) = (halves.next(), halves.next()) else {
+                return Err(usage());
+            };
+            if dirs.is_empty() || exports.is_empty() {
+                return Err(usage());
+            }
+            let dirs: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+            let items = bootstrap_root::measure(&dirs, &seeds, exports)?;
+            let abi = store::builder_abi_token();
+            println!(
+                "builder-abi {}",
+                abi.strip_prefix("td-builder-abi-").unwrap_or(&abi)
+            );
+            for item in items {
+                let refs = if item.refs.is_empty() {
+                    "-".to_string()
+                } else {
+                    item.refs.join(",")
+                };
+                println!("item {} {} {refs}", item.base, item.nar);
+            }
+            Ok(())
+        }
+        _ => Err(usage()),
+    }
 }
 
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
@@ -8335,6 +8426,9 @@ struct NativeToolchain {
     /// The native toolchain's own td store db(s) (its `/td/store` outputs + refs), colon-
     /// separated → passed to build-recipe as `--recipe-output-db` argv (typed, re #469).
     extra_dbs: String,
+    /// The bootstrap-root db, when the toolchain was built above the pinned
+    /// root (`TD_SHELL_NATIVE_ROOT_DB`) → `--bootstrap-root-db`.
+    root_db: Option<String>,
     /// Native link mode: the `/td/store` glibc loader, RUNPATH, and `-B` dir baked by run_rust.
     interp: String,
     rpath: String,
@@ -8373,9 +8467,13 @@ impl NativeToolchain {
         let lock_file = get("TD_SHELL_NATIVE_LOCK")?;
         let lock_lines = std::fs::read_to_string(&lock_file)
             .map_err(|e| format!("read TD_SHELL_NATIVE_LOCK {lock_file}: {e}"))?;
+        let root_db = std::env::var("TD_SHELL_NATIVE_ROOT_DB")
+            .ok()
+            .filter(|s| !s.is_empty());
         Ok(Some(NativeToolchain {
             store,
             extra_dbs,
+            root_db,
             interp,
             rpath,
             bdir,
@@ -8495,6 +8593,10 @@ fn run_shell(rest: &[String]) -> Result<std::process::ExitStatus, String> {
                 for db in nt.extra_dbs.split(':').filter(|s| !s.is_empty()) {
                     bargs.push("--recipe-output-db".into());
                     bargs.push(db.to_string());
+                }
+                if let Some(db) = &nt.root_db {
+                    bargs.push("--bootstrap-root-db".into());
+                    bargs.push(db.clone());
                 }
                 nt
             }
@@ -9410,6 +9512,16 @@ fn parse_recipe_output_options(args: &[String]) -> Result<RecipeOutputOptions, S
                     .get(positional_len.saturating_sub(1))
                     .ok_or("--recipe-output-db has no value")?;
                 dbs.push((db.clone(), sandbox::InputOrigin::RecipeOutput));
+                positional_len = positional_len.saturating_sub(2);
+            }
+            // The pinned bootstrap root's db: its rows are ladder outputs a
+            // cut graph staged, admitted against the compiled manifest at
+            // intake, never engine receipts.
+            Some("--bootstrap-root-db") => {
+                let db = args
+                    .get(positional_len.saturating_sub(1))
+                    .ok_or("--bootstrap-root-db has no value")?;
+                dbs.push((db.clone(), sandbox::InputOrigin::AuditedSeed));
                 positional_len = positional_len.saturating_sub(2);
             }
             Some("--recipe-output-store") => {
@@ -12011,7 +12123,8 @@ fn main() -> ExitCode {
                 eprintln!(
                     "td-builder: build-recipe: usage: build-recipe RECIPE-JSON-FILE LOCK \
                      SCRATCH STORE-DIR [SRC-STORE-DIR SRC-DB [VENDOR-CANONICAL VENDOR-STORE \
-                     VENDOR-DB]] [--recipe-output-store STORE] [--recipe-output-db DB]..."
+                     VENDOR-DB]] [--recipe-output-store STORE] [--recipe-output-db DB]... \
+                     [--bootstrap-root-db DB]"
                 );
                 return ExitCode::FAILURE;
             }
@@ -12069,8 +12182,14 @@ fn main() -> ExitCode {
                 // come from the db they wrote; the FILES stage from td_store/<base>).
                 // AUTHENTICATED at intake (round-8): recipe-output rows must be
                 // engine-receipt-backed — a raw path/env value cannot mint a typed origin.
-                for (dbp, _) in &recipe_output_dbs {
-                    authenticate_recipe_output_db(dbp)?;
+                for (dbp, origin) in &recipe_output_dbs {
+                    match origin {
+                        sandbox::InputOrigin::AuditedSeed => bootstrap_root::authenticate_db(
+                            dbp,
+                            Path::new(recipe_output_store.as_deref().unwrap_or(store_dir)),
+                        )?,
+                        _ => authenticate_recipe_output_db(dbp)?,
+                    }
                 }
                 let extra_dbs: Vec<(String, sandbox::InputOrigin)> = recipe_output_dbs.clone();
                 let recipe_json =
@@ -12125,10 +12244,11 @@ fn main() -> ExitCode {
         // poisons a db every worktree on the same digest table shares. A
         // direct invocation naming no LOCAL-SEED-DB works exactly as before
         // the split for any plan that needs no local source.
-        Some("build-plan") if (args.len() == 9 || args.len() == 10) && args[2] == "--auto" => {
+        Some("build-plan") if (9..=11).contains(&args.len()) && args[2] == "--auto" => {
             let (target, recipe_dir, map_file, seed_store, seed_db, scratch) =
                 (&args[3], &args[4], &args[5], &args[6], &args[7], &args[8]);
             let local_seed_db = args.get(9).map(String::as_str);
+            let root_db = args.get(10).map(String::as_str);
             let bov = match builder_store_env() {
                 Ok(b) => b,
                 Err(e) => {
@@ -12157,6 +12277,7 @@ fn main() -> ExitCode {
                 builder_store,
                 persist,
                 local_seed_db,
+                root_db,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -12170,6 +12291,20 @@ fn main() -> ExitCode {
         // caller-writable TD_EXTRA_DBS env, and nothing invoked it — the live
         // reproducibility oracle is the daemon's CHECK verb (`daemon_check_one`),
         // whose two independent builds run the typed realize_drv path.
+        // bootstrap-root admit SEED-STORE ROOT-DB SRC-DIR... — admit the pinned
+        // bootstrap root from the dirs a ladder build left its outputs in.
+        // bootstrap-root measure SRC-DIR... -- EXPORT-PATH... — print the
+        // `item` rows of the exports' reference closure, plus the ABI they
+        // were built under. bootstrap-root verify SEED-STORE ROOT-DB —
+        // authenticate an admitted root. bootstrap-root abi — the effective
+        // ABI revision. See bootstrap_root.rs.
+        Some("bootstrap-root") => match run_bootstrap_root(args.get(2..).unwrap_or_default()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("td-builder: bootstrap-root: {e}");
+                ExitCode::FAILURE
+            }
+        },
         // td-builder shell — td's own package shell (NOT a container): resolve
         // the named recipes, build them with td, compose the command's PATH from
         // their outputs, and run it. The durable assertion is behavioral — the
@@ -13107,6 +13242,34 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
         assert_eq!(parsed.store.as_deref(), Some("physical-store"));
         let dbs: Vec<&str> = parsed.dbs.iter().map(|(db, _)| db.as_str()).collect();
         assert_eq!(dbs, ["one.db", "two.db"]);
+    }
+
+    #[test]
+    fn a_bootstrap_root_db_is_typed_as_an_audited_seed() {
+        let args: Vec<String> = [
+            "td-builder",
+            "build-recipe",
+            "recipe.json",
+            "lock",
+            "scratch",
+            "store",
+            "--recipe-output-db",
+            "one.db",
+            "--bootstrap-root-db",
+            "root.db",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse_recipe_output_options(&args).unwrap();
+        assert_eq!(parsed.positional_len, 6);
+        assert_eq!(
+            parsed.dbs,
+            [
+                ("one.db".to_string(), sandbox::InputOrigin::RecipeOutput),
+                ("root.db".to_string(), sandbox::InputOrigin::AuditedSeed),
+            ]
+        );
     }
 
     #[test]
@@ -16127,6 +16290,7 @@ daemon build START (2/2 active)
                 &seeds.to_string_lossy(),
                 &d.join("seed.db").to_string_lossy(),
                 &d.join("scratch"),
+                None,
                 None,
                 None,
                 None,
