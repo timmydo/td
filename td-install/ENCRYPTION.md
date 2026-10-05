@@ -370,10 +370,14 @@ which takes that key and opens the volume again; both initramfs carry
 cryptsetup (DESIGN.md D6). The recovery flow is not: until it lands, a
 release that ends in recovery refuses boot on the console, naming its
 reason, and halts as a failed cap does, so no recovery path half-works.
-The running system's consumers of an encrypted volume (DESIGN.md
-"Full-system volume consumers") still refuse it as not yet supported,
-and td-init's secret-line applet exists but no initramfs links it until
-the recovery flow does (UNSAFE.md §3).
+So is the running system's half: its `install`, `update`, `rollback`
+and `success`, so boot acknowledgement, updates and rollback, bind the
+`td-system` mapping the deployment initramfs opened by its held
+descriptor, as they bind an unencrypted volume's partition, and refuse
+a volume without it (DESIGN.md "Full-system volume consumers"): the
+running system never opens or unlocks the volume, runs no cryptsetup
+and reaches no TPM for it. td-init's secret-line applet exists but no
+initramfs links it until the recovery flow does (UNSAFE.md §3).
 
 The installed selector acts on what discovery finds under its configured
 UUID (DESIGN.md "Full-system volume consumers"): a Btrfs volume boots as

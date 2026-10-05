@@ -33,7 +33,6 @@ const MAX_DM_UUID_BYTES: usize = 129;
 const MAPPING_WAIT: Duration = Duration::from_secs(5);
 // Distinct notes one resolve reports; the rest are dropped.
 const MAX_NOTES: usize = 64;
-pub(crate) const ENCRYPTED_UNSUPPORTED: &str = "encrypted volume: not yet supported";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Uuid([u8; 16]);
@@ -420,6 +419,11 @@ impl Mapping {
         &self.entry.name
     }
 
+    /// The node discovery opened it through, `/dev/dm-N`.
+    pub(crate) fn node(&self) -> PathBuf {
+        Path::new("/dev").join(&self.entry.node)
+    }
+
     /// The held mapping as the operation's device, reported as `device`,
     /// the partition it maps.
     pub(crate) fn into_pinned(self, device: PathBuf) -> Pinned {
@@ -467,7 +471,12 @@ pub(crate) enum Opened {
 
 impl Opened {
     pub(crate) fn open(uuid: &Uuid) -> io::Result<Self> {
-        let found = resolve(Some(uuid))?;
+        Self::pin(resolve(Some(uuid))?)
+    }
+
+    /// Reopens what a scan found under the same identity checks and holds
+    /// it, with a LUKS2 partition's active mapping.
+    pub(crate) fn pin(found: Found) -> io::Result<Self> {
         let name = found
             .path
             .file_name()
@@ -478,16 +487,16 @@ impl Opened {
         let (id, kind, file) = probe_open(
             &Path::new(CLASS_BLOCK).join(name),
             &found.path,
-            Some(uuid),
+            Some(&found.uuid),
             &mut notes,
         )?
         .ok_or_else(|| invalid("resolved volume disappeared"))?;
-        if &id != uuid || kind != found.kind {
+        if id != found.uuid || kind != found.kind {
             return Err(invalid("resolved volume identity changed"));
         }
         let mapping = match kind {
             Kind::Btrfs => None,
-            Kind::Luks2 => open_mapping(name, uuid)?,
+            Kind::Luks2 => open_mapping(name, &file, &found.uuid)?,
         };
         let partition = Pinned {
             file,
@@ -500,30 +509,26 @@ impl Opened {
     }
 }
 
-pub(crate) fn encrypted_unsupported(device: &Path, mapping: Option<&Mapping>) -> io::Error {
-    let mapping = match mapping {
-        Some(mapping) => {
-            let number = match mapping.file.metadata() {
-                Ok(meta) => {
-                    let (major, minor) = rdev_numbers(&meta);
-                    format!("{major}:{minor}")
-                }
-                Err(error) => format!("device number unreadable: {error}"),
-            };
-            format!(
-                "its mapping {} ({}, {number}) is active",
-                mapping.entry.node, mapping.entry.name
-            )
-        }
-        None => "no mapping of it is active".to_owned(),
-    };
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!(
-            "{ENCRYPTED_UNSUPPORTED}: {} holds a td LUKS2 volume; {mapping}",
-            device.display()
-        ),
-    )
+/// The active mapping the deployment initramfs's mount-root opened, which
+/// mount-var and the running system's operations bind: discovery admitted
+/// it, and it must carry the fixed name `td-system`. Nothing after
+/// mount-root opens or unlocks the volume, so a partition with no active
+/// mapping, or with another, refuses.
+pub(crate) fn system_mapping(partition: &Pinned, mapping: Option<Mapping>) -> io::Result<Mapping> {
+    match mapping {
+        Some(mapping) if mapping.name() == protocol::VOLUME_MAPPING_NAME => Ok(mapping),
+        Some(mapping) => Err(invalid(format!(
+            "{}'s active mapping is {:?}, not the {:?} the deployment initramfs's mount-root opens",
+            partition.device.display(),
+            mapping.name(),
+            protocol::VOLUME_MAPPING_NAME
+        ))),
+        None => Err(invalid(format!(
+            "{} holds a td LUKS2 volume with no active mapping; only the deployment \
+             initramfs's mount-root opens it",
+            partition.device.display()
+        ))),
+    }
 }
 
 /// A device-mapper node name, `dm-N`.
@@ -643,23 +648,55 @@ fn find_mapping(sys_block: &Path, partition: &str, uuid: &Uuid) -> io::Result<Ma
     Ok(MappingScan::Complete(found))
 }
 
-/// The admitted mapping, opened through `/dev/dm-N` and held. The node is
+/// The held node if it carries the volume's Btrfs: a mapping whose
+/// filesystem names another UUID, or that holds no td Btrfs, refuses.
+fn carried(node: &str, uuid: &Uuid, probed: Option<(Uuid, Kind, File)>) -> io::Result<File> {
+    match probed {
+        Some((found, Kind::Btrfs, file)) if &found == uuid => Ok(file),
+        _ => Err(invalid(format!(
+            "mapping {node} of td volume {uuid} does not carry its Btrfs volume"
+        ))),
+    }
+}
+
+/// The mapping's slave named `partition` must have the held partition's
+/// device number, so a name the kernel gave another device since the
+/// partition was pinned is not taken for it.
+fn require_over(directory: &Path, node: &str, partition: &str, held: (u64, u64)) -> io::Result<()> {
+    let slave = device_number(&text(
+        &directory.join("slaves").join(partition).join("dev"),
+    )?)?;
+    if slave != held {
+        return Err(invalid(format!(
+            "mapping {node} is over {}:{}, not the held partition {partition} ({}:{})",
+            slave.0, slave.1, held.0, held.1
+        )));
+    }
+    Ok(())
+}
+
+/// The admitted mapping, opened through `/dev/dm-N` and held. Its slave
+/// must first be the held partition by device number; the node is then
 /// opened under probe_open's device-number and inode checks and must carry
-/// the volume's Btrfs; its sysfs claim and `dev` are then read again and
-/// must still describe the held node.
-fn hold_mapping(entry: MappingEntry, partition: &str, uuid: &Uuid) -> io::Result<Mapping> {
-    let directory = Path::new(SYS_BLOCK).join(&entry.node);
+/// the volume's Btrfs; its sysfs claim, slaves included, and `dev` are
+/// then read again and must still describe the held node, and its slave
+/// must again be the held partition.
+fn hold_mapping(
+    sys_block: &Path,
+    entry: MappingEntry,
+    partition: &str,
+    held: (u64, u64),
+    uuid: &Uuid,
+) -> io::Result<Mapping> {
+    let directory = sys_block.join(&entry.node);
+    require_over(&directory, &entry.node, partition, held)?;
     let path = Path::new("/dev").join(&entry.node);
     let mut notes = Vec::new();
-    let file = match probe_open(&directory, &path, Some(uuid), &mut notes)? {
-        Some((found, Kind::Btrfs, file)) if &found == uuid => file,
-        _ => {
-            return Err(invalid(format!(
-                "mapping {} of td volume {uuid} does not carry its Btrfs volume",
-                entry.node
-            )))
-        }
-    };
+    let file = carried(
+        &entry.node,
+        uuid,
+        probe_open(&directory, &path, Some(uuid), &mut notes)?,
+    )?;
     let again = mapping_entry(&directory, &entry.node, uuid, partition)?;
     let number = device_number(&text(&directory.join("dev"))?)?;
     if again.as_ref() != Some(&entry) || !matches_device(&file.metadata()?, number) {
@@ -668,6 +705,9 @@ fn hold_mapping(entry: MappingEntry, partition: &str, uuid: &Uuid) -> io::Result
             entry.node
         )));
     }
+    // Again for the opened node: a dm-N recreated under the same number
+    // since the first check must still sit over the held partition.
+    require_over(&directory, &entry.node, partition, held)?;
     Ok(Mapping { entry, file })
 }
 
@@ -684,7 +724,7 @@ pub(crate) fn admit_mapping(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("missing volume name"))?;
-    let mapping = open_mapping(name, uuid)?.ok_or_else(|| {
+    let mapping = open_mapping(name, partition.file(), uuid)?.ok_or_else(|| {
         invalid(format!(
             "td volume {uuid} has no active mapping after cryptsetup opened it"
         ))
@@ -703,14 +743,26 @@ fn admitted_name(mapping: Mapping, expected: &str) -> io::Result<Mapping> {
     Ok(mapping)
 }
 
-/// The partition's active mapping, held; `None` when none is active.
-pub(crate) fn open_mapping(partition: &str, uuid: &Uuid) -> io::Result<Option<Mapping>> {
+/// The active mapping of `partition`, whose held descriptor is `held`,
+/// itself held; `None` when none is active.
+pub(crate) fn open_mapping(
+    partition: &str,
+    held: &File,
+    uuid: &Uuid,
+) -> io::Result<Option<Mapping>> {
+    let held = held.metadata()?;
+    if !held.file_type().is_block_device() {
+        return Err(invalid(format!(
+            "{partition} is not held as a block device"
+        )));
+    }
+    let held = rdev_numbers(&held);
     let started = Instant::now();
     loop {
         match find_mapping(Path::new(SYS_BLOCK), partition, uuid)? {
             MappingScan::Complete(None) => return Ok(None),
             MappingScan::Complete(Some(entry)) => {
-                return hold_mapping(entry, partition, uuid).map(Some)
+                return hold_mapping(Path::new(SYS_BLOCK), entry, partition, held, uuid).map(Some)
             }
             MappingScan::Incomplete => {}
         }
@@ -767,27 +819,28 @@ pub(crate) struct Found {
 }
 
 impl Found {
-    /// `td-boot volume`'s line. It refuses an encrypted volume as every
-    /// other consumer does, naming the mapping discovery finds.
+    /// `td-boot volume`'s line: the UUID and the device, and for a td
+    /// LUKS2 partition the mapping node the running system's operations
+    /// bind, which must be active as `system_mapping` requires.
     pub(crate) fn describe(&self) -> io::Result<String> {
-        self.describe_with(open_mapping)
+        self.describe_with(|found| Opened::pin(found.clone()))
     }
 
-    fn describe_with(
-        &self,
-        mapping: impl FnOnce(&str, &Uuid) -> io::Result<Option<Mapping>>,
-    ) -> io::Result<String> {
+    fn describe_with(&self, pin: impl FnOnce(&Self) -> io::Result<Opened>) -> io::Result<String> {
         match self.kind {
             Kind::Btrfs => Ok(format!("{} {}", self.uuid, self.path.display())),
-            Kind::Luks2 => {
-                let name = self
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| invalid("missing volume name"))?;
-                let mapping = mapping(name, &self.uuid)?;
-                Err(encrypted_unsupported(&self.path, mapping.as_ref()))
-            }
+            Kind::Luks2 => match pin(self)? {
+                Opened::Luks2 { partition, mapping } => {
+                    let mapping = system_mapping(&partition, mapping)?;
+                    Ok(format!(
+                        "{} {} {}",
+                        self.uuid,
+                        self.path.display(),
+                        mapping.node().display()
+                    ))
+                }
+                Opened::Btrfs(_) => Err(invalid("resolved volume identity changed")),
+            },
         }
     }
 }
@@ -1962,65 +2015,142 @@ mod tests {
         assert!(error.to_string().contains("is named"), "{error}");
     }
 
+    /// A slave that is not the held partition's device number refuses, as
+    /// does one whose `dev` is missing.
     #[test]
-    fn every_consumer_refuses_an_encrypted_volume() {
-        let found = encrypted(Uuid::parse(LUKS_UUID).unwrap(), "/dev/vda2");
-        // `td-boot volume` asks mapping discovery for the partition.
-        let mut asked = None;
-        let error = found
-            .describe_with(|partition, uuid| {
-                asked = Some((partition.to_owned(), uuid.clone()));
-                Ok(None)
-            })
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(
-            error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
-            "{error}"
-        );
-        assert!(error.to_string().contains("no mapping"), "{error}");
+    fn the_mapping_must_be_over_the_held_partition() {
+        let sysfs = FakeSysfs::new("held");
+        let directory = sysfs.0.join("dm-0");
+        fs::create_dir_all(directory.join("slaves/vda2")).unwrap();
         assert_eq!(
-            asked,
-            Some(("vda2".into(), Uuid::parse(LUKS_UUID).unwrap()))
+            require_over(&directory, "dm-0", "vda2", (252, 2))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
         );
-        let error = found
-            .describe_with(|_, _| {
-                Ok(Some(Mapping::for_test(
-                    "dm-0",
-                    "td-root",
-                    File::open("/dev/null").unwrap(),
-                )))
-            })
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("dm-0 (td-root, 1:3) is active"),
-            "{error}"
-        );
-        let error = found
-            .describe_with(|_, _| Err(invalid("two active mappings")))
-            .unwrap_err();
-        assert!(error.to_string().contains("two active mappings"), "{error}");
-        assert_eq!(
-            btrfs(Uuid::parse(LUKS_UUID).unwrap(), "/dev/vda2")
-                .describe_with(|_, _| panic!("a Btrfs volume has no mapping"))
-                .unwrap(),
-            format!("{LUKS_UUID} /dev/vda2")
-        );
-        for mapping in [
-            None,
-            Some(Mapping::for_test(
-                "dm-0",
-                "td-root",
-                File::open("/dev/null").unwrap(),
-            )),
-        ] {
-            let error = encrypted_unsupported(Path::new("/dev/vda2"), mapping.as_ref());
-            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        fs::write(directory.join("slaves/vda2/dev"), b"252:2\n").unwrap();
+        require_over(&directory, "dm-0", "vda2", (252, 2)).unwrap();
+        for held in [(252, 3), (8, 2)] {
+            let error = require_over(&directory, "dm-0", "vda2", held).unwrap_err();
             assert!(
-                error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
+                error
+                    .to_string()
+                    .contains("dm-0 is over 252:2, not the held partition vda2"),
                 "{error}"
             );
         }
+        // hold_mapping checks the slave before it opens the node: over
+        // another device number it refuses so; over the held partition it
+        // goes on to the open, which this fake sysfs cannot satisfy.
+        let hold = |held| {
+            hold_mapping(
+                &sysfs.0,
+                MappingEntry {
+                    node: "dm-0".into(),
+                    name: "td-system".into(),
+                },
+                "vda2",
+                held,
+                &Uuid::parse(LUKS_UUID).unwrap(),
+            )
+            .err()
+            .unwrap()
+            .to_string()
+        };
+        let error = hold((252, 3));
+        assert!(error.contains("dm-0 is over 252:2"), "{error}");
+        let error = hold((252, 2));
+        assert!(!error.contains("held partition"), "{error}");
+        // Only a block device is a held partition.
+        let error = open_mapping(
+            "vda2",
+            &File::open("/dev/null").unwrap(),
+            &Uuid::parse(LUKS_UUID).unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("not held as a block device"));
+    }
+
+    /// The post-open check needs a real block node, which no fake sysfs
+    /// gives, so its place is pinned: the slave is checked before the open
+    /// and again after the node's claim and number are re-read, binding it
+    /// to the opened node.
+    #[test]
+    fn hold_mapping_checks_the_slave_before_and_after_the_open() {
+        let source = include_str!("volume.rs");
+        let body = source
+            .split_once("\nfn hold_mapping(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let check = "require_over(&directory, &entry.node, partition, held)?;";
+        let checks: Vec<usize> = body.match_indices(check).map(|(at, _)| at).collect();
+        assert_eq!(checks.len(), 2, "{body}");
+        let opened = body.find("probe_open(").unwrap();
+        let reread = body.find("changed while it was opened").unwrap();
+        let held = body.find("Ok(Mapping { entry, file })").unwrap();
+        assert!(checks[0] < opened, "{body}");
+        assert!(reread < checks[1] && checks[1] < held, "{body}");
+    }
+
+    /// The mapping node must carry the volume's own Btrfs.
+    #[test]
+    fn a_mapping_carrying_another_filesystem_refuses() {
+        let uuid = Uuid::parse(LUKS_UUID).unwrap();
+        let other = Uuid::parse("00112233-4455-4677-8899-aabbccddeeff").unwrap();
+        let file = || File::open("/dev/null").unwrap();
+        assert!(carried("dm-0", &uuid, Some((uuid.clone(), Kind::Btrfs, file()))).is_ok());
+        for probed in [
+            Some((other, Kind::Btrfs, file())),
+            Some((uuid.clone(), Kind::Luks2, file())),
+            None,
+        ] {
+            let error = carried("dm-0", &uuid, probed).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not carry its Btrfs volume"),
+                "{error}"
+            );
+        }
+    }
+
+    /// `td-boot volume` pins an encrypted volume as `on-volume` does and
+    /// reports its `td-system` mapping node; without it, or with another,
+    /// it refuses as the running system's operations do. A Btrfs volume is
+    /// reported as before, unpinned.
+    #[test]
+    fn td_boot_volume_reports_the_mapping_the_running_system_binds() {
+        let uuid = Uuid::parse(LUKS_UUID).unwrap();
+        let found = encrypted(uuid.clone(), "/dev/vda2");
+        let mut asked = None;
+        let line = found
+            .describe_with(|found| {
+                asked = Some(found.clone());
+                Ok(luks2(Some(protocol::VOLUME_MAPPING_NAME)))
+            })
+            .unwrap();
+        assert_eq!(line, format!("{LUKS_UUID} /dev/vda2 /dev/dm-0"));
+        assert_eq!(asked, Some(found.clone()));
+        for (mapping, message) in [
+            (None, "no active mapping"),
+            (Some("td-other"), "\"td-other\""),
+        ] {
+            let error = found.describe_with(|_| Ok(luks2(mapping))).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        let error = found
+            .describe_with(|_| Err(invalid("two active mappings")))
+            .unwrap_err();
+        assert!(error.to_string().contains("two active mappings"), "{error}");
+        assert!(found.describe_with(|_| Ok(btrfs_opened())).is_err());
+        assert_eq!(
+            btrfs(uuid, "/dev/vda2")
+                .describe_with(|_| panic!("a Btrfs volume is not pinned"))
+                .unwrap(),
+            format!("{LUKS_UUID} /dev/vda2")
+        );
     }
 
     fn mode_device(mode: &crate::Mode) -> Option<PathBuf> {
@@ -2045,12 +2175,18 @@ mod tests {
         *operation
     }
 
+    /// The partition is held as `/dev/null` and its mapping as `/dev/zero`,
+    /// so a binding shows which descriptor it took.
     fn luks2(mapping: Option<&str>) -> Opened {
         Opened::Luks2 {
             partition: Pinned::for_test(File::open("/dev/null").unwrap(), "/dev/vda2".into()),
             mapping: mapping
-                .map(|name| Mapping::for_test("dm-0", name, File::open("/dev/null").unwrap())),
+                .map(|name| Mapping::for_test("dm-0", name, File::open("/dev/zero").unwrap())),
         }
+    }
+
+    fn rdev(path: impl AsRef<Path>) -> u64 {
+        fs::metadata(path).unwrap().rdev()
     }
 
     fn btrfs_opened() -> Opened {
@@ -2087,37 +2223,87 @@ mod tests {
         }
     }
 
-    /// The selector's `boot` and the running system's transactions bind
-    /// their device through `bind_volume`: an encrypted volume refuses each,
-    /// with or without a mapping, and a Btrfs one binds each to its held
-    /// descriptor as before.
+    /// The selector boots an encrypted volume through `boot_encrypted`
+    /// alone: `bind_volume` refuses its `boot`, with or without a mapping.
     #[test]
-    fn each_on_volume_operation_but_the_mounts_refuses_an_encrypted_volume() {
-        let id = "a".repeat(64);
-        let operations: &[&[&str]] = &[
-            &["boot", "/volume", "quiet"],
-            &["install", "/update", "/source", "/key"],
-            &["update", "/update", "/volume", "/volume/channel", "/key"],
-            &["rollback", "/update"],
-            &["success", "/update", &id],
-        ];
-        for words in operations {
-            for mapping in [None, Some(crate::protocol::VOLUME_MAPPING_NAME)] {
+    fn bind_volume_refuses_the_selectors_boot_of_an_encrypted_volume() {
+        for mapping in [None, Some(crate::protocol::VOLUME_MAPPING_NAME)] {
+            let mut operation = on_volume_operation(&["boot", "/volume", "quiet"]);
+            let error = crate::bind_volume(&mut operation, luks2(mapping), None, no_unlock)
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("boots only through its release"),
+                "{error}"
+            );
+            assert_eq!(
+                mode_device(&operation).unwrap(),
+                Path::new("/volume-device")
+            );
+        }
+    }
+
+    const RUNNING: &[&[&str]] = &[
+        &["install", "/update", "/source", "/key"],
+        &["update", "/update", "/volume", "/volume/channel", "/key"],
+        &["rollback", "/update"],
+        &[
+            "success",
+            "/update",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ],
+    ];
+
+    /// Each of the running system's operations binds an encrypted volume's
+    /// active `td-system` mapping by its held descriptor, reported as the
+    /// partition, exactly as it binds a Btrfs partition.
+    #[test]
+    fn the_running_system_binds_the_deployment_initramfs_mapping() {
+        for words in RUNNING {
+            let mut operation = on_volume_operation(words);
+            let pinned = bound(crate::bind_volume(
+                &mut operation,
+                luks2(Some(crate::protocol::VOLUME_MAPPING_NAME)),
+                None,
+                no_unlock,
+            ));
+            assert_eq!(pinned.device, Path::new("/dev/vda2"), "{words:?}");
+            assert_eq!(mode_device(&operation).unwrap(), pinned.path(), "{words:?}");
+            // The operand names the mapping's descriptor, not the partition's.
+            assert_eq!(rdev(pinned.path()), rdev("/dev/zero"), "{words:?}");
+            assert_ne!(rdev(pinned.path()), rdev("/dev/null"), "{words:?}");
+        }
+    }
+
+    /// The running system never opens or unlocks the volume: with no
+    /// active mapping, or only another, each operation refuses and keeps
+    /// its operand.
+    #[test]
+    fn the_running_system_refuses_an_encrypted_volume_without_its_mapping() {
+        for words in RUNNING {
+            for (mapping, message) in [
+                (None, "no active mapping"),
+                (Some("td-other"), "\"td-other\""),
+            ] {
                 let mut operation = on_volume_operation(words);
                 let error = crate::bind_volume(&mut operation, luks2(mapping), None, no_unlock)
                     .err()
                     .unwrap();
-                assert!(
-                    error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
-                    "{words:?}: {error}"
-                );
+                assert!(error.to_string().contains(message), "{words:?}: {error}");
                 assert_eq!(
                     mode_device(&operation).unwrap(),
                     Path::new("/volume-device")
                 );
             }
         }
-        for words in operations.iter().copied().chain([
+    }
+
+    /// Every operation binds a Btrfs volume to its held partition as
+    /// before.
+    #[test]
+    fn each_on_volume_operation_binds_a_btrfs_volume_as_before() {
+        let operations: &[&[&str]] = &[&["boot", "/volume", "quiet"]];
+        for words in operations.iter().chain(RUNNING).copied().chain([
             ["mount-root", "/volume"].as_slice(),
             &["mount-var", "/sysroot/var"],
         ]) {
@@ -2129,6 +2315,8 @@ mod tests {
                 no_unlock,
             ));
             assert_eq!(mode_device(&operation).unwrap(), pinned.path(), "{words:?}");
+            assert_eq!(pinned.device, Path::new("/dev/vda2"), "{words:?}");
+            assert_eq!(rdev(pinned.path()), rdev("/dev/null"), "{words:?}");
         }
     }
 

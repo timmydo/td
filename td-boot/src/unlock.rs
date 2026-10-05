@@ -317,7 +317,7 @@ impl Unlocker for System<'_> {
     }
 
     fn admit(&mut self) -> io::Result<Option<volume::Mapping>> {
-        volume::open_mapping(&self.name, self.uuid)
+        volume::open_mapping(&self.name, self.partition.file(), self.uuid)
     }
 }
 

@@ -3967,26 +3967,37 @@ enum Binding {
     Halt(String),
 }
 
+/// Who consumes the volume `bind_volume` binds.
+enum Consumer {
+    /// The selector's `boot`.
+    Selector,
+    /// The deployment initramfs's `mount-root` (false) or `mount-var` (true).
+    Mount { var: bool },
+    /// The running system's `install`, `update`, `rollback` and `success`.
+    Running,
+}
+
 /// Gives the operation the pinned volume as its device operand. A Btrfs
 /// volume binds as before, and refuses a handed-off key. A td LUKS2
-/// volume binds only for the deployment initramfs: `mount-root` requires
-/// the key and no active mapping, and binds the mapping `unlock` opens;
-/// `mount-var` binds the mapping `mount-root` opened. Every other
-/// operation refuses it; the installed selector's boot of one never
-/// reaches here (`boot_encrypted`).
+/// volume binds through its mapping: `mount-root` requires the key and no
+/// active mapping, and binds the mapping `unlock` opens; `mount-var` and
+/// the running system's operations bind the `td-system` mapping
+/// `mount-root` opened, by its held descriptor, and refuse without it.
+/// The installed selector's boot of one never reaches here
+/// (`boot_encrypted`), and is refused if it does.
 fn bind_volume(
     operation: &mut Mode,
     opened: volume::Opened,
     key: Option<unlock::VolumeKey>,
     unlock: impl FnOnce(&volume::Pinned, unlock::VolumeKey) -> io::Result<unlock::Unlocked>,
 ) -> io::Result<Binding> {
-    let (device, mount) = match operation {
-        Mode::MountVolume { device, var, .. } => (device, Some(*var)),
-        Mode::Boot { device, .. }
-        | Mode::Install { device, .. }
+    let (device, consumer) = match operation {
+        Mode::MountVolume { device, var, .. } => (device, Consumer::Mount { var: *var }),
+        Mode::Boot { device, .. } => (device, Consumer::Selector),
+        Mode::Install { device, .. }
         | Mode::Update { device, .. }
         | Mode::Rollback { device, .. }
-        | Mode::Success { device, .. } => (device, None),
+        | Mode::Success { device, .. } => (device, Consumer::Running),
         _ => return Err(usage_error()),
     };
     let pinned = match opened {
@@ -3999,8 +4010,8 @@ fn bind_volume(
             }
             pinned
         }
-        volume::Opened::Luks2 { partition, mapping } => match mount {
-            Some(false) => {
+        volume::Opened::Luks2 { partition, mapping } => match consumer {
+            Consumer::Mount { var: false } => {
                 let Some(key) = key else {
                     return Err(invalid(format!(
                         "{} holds a td LUKS2 volume and no volume key was handed off",
@@ -4022,30 +4033,15 @@ fn bind_volume(
                     unlock::Unlocked::Halt(reason) => return Ok(Binding::Halt(reason)),
                 }
             }
-            Some(true) => match mapping {
-                Some(mapping) if mapping.name() == protocol::VOLUME_MAPPING_NAME => {
-                    mapping.into_pinned(partition.device.clone())
-                }
-                Some(mapping) => {
-                    return Err(invalid(format!(
-                        "{}'s active mapping is {:?}, not the {:?} mount-root opens",
-                        partition.device.display(),
-                        mapping.name(),
-                        protocol::VOLUME_MAPPING_NAME
-                    )))
-                }
-                None => {
-                    return Err(invalid(format!(
-                        "{} holds a td LUKS2 volume with no active mapping; mount-root opens it",
-                        partition.device.display()
-                    )))
-                }
-            },
-            None => {
-                return Err(volume::encrypted_unsupported(
-                    &partition.device,
-                    mapping.as_ref(),
-                ))
+            Consumer::Mount { var: true } | Consumer::Running => {
+                volume::system_mapping(&partition, mapping)?.into_pinned(partition.device.clone())
+            }
+            Consumer::Selector => {
+                return Err(invalid(format!(
+                    "{} holds a td LUKS2 volume, which the selector boots only through \
+                     its release",
+                    partition.device.display()
+                )))
             }
         },
     };
@@ -8563,10 +8559,10 @@ mod tests {
         let (production, _) = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
         assert_eq!(production.matches("boot_encrypted(").count(), 2);
         assert_eq!(production.matches("selector_release::unlock(").count(), 1);
-        // Every operation but the two deployment mounts still refuses an
-        // encrypted volume in bind_volume.
+        // bind_volume refuses a selector boot of an encrypted volume that
+        // reached it some other way.
         assert!(production_body("bind_volume").contains(
-            "            None => {\n                return Err(volume::encrypted_unsupported("
+            "            Consumer::Selector => {\n                return Err(invalid(format!("
         ));
     }
 

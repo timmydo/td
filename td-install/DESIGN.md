@@ -521,16 +521,19 @@ The Btrfs partition takes the remainder and carries `@var` plus
 ### Read-only volume discovery primitive
 
 `td-boot volume [UUID]` prints one canonical lowercase filesystem UUID and
-one `/dev` path, separated by a space and terminated by a newline. Without
-an argument it requires exactly one visible td volume, a `td-system` Btrfs
-filesystem or a `td-system` LUKS2 header (below). With a UUID it requires
+one `/dev` path, or two for an encrypted volume (below), separated by
+spaces and terminated by a newline. Without an argument it requires
+exactly one visible td volume, a `td-system` Btrfs filesystem or a
+`td-system` LUKS2 header (below). With a UUID it requires
 exactly one matching volume. The two kinds are counted together: multiple
 eligible volumes, including two devices carrying a cloned UUID and a
 LUKS2 partition beside a Btrfs one with its UUID, refuse rather than
-selecting by enumeration order. It refuses an encrypted volume, as every
-consumer but the installed selector's boot does ("Full-system volume
-consumers"). UUIDs and labels identify bytes; they do not authenticate a
-deployment or authorize a write.
+selecting by enumeration order. For an encrypted volume it reopens and
+pins the partition as `on-volume` does and adds a third field, the
+`/dev/dm-N` node of its active `td-system` mapping, admitted as the
+running system's operations admit it; with no such mapping it refuses
+as they do ("Full-system volume consumers"). UUIDs and labels identify
+bytes; they do not authenticate a deployment or authorize a write.
 
 The resolver refuses more than 4096 `/sys/class/block` entries and probes only
 direct virtio, SCSI/SATA and NVMe disk/partition names (`vd*`, `sd*`, and
@@ -1277,13 +1280,16 @@ whose name disagrees or whose `slaves/` names anything else, and a
 second such mapping, refuse. `dm/uuid` is read up to 129 bytes, the
 kernel's 128 characters and a newline. A `dm-N` or attribute that
 vanishes during the walk makes it incomplete, and the walk is repeated
-for up to five seconds. An admitted mapping is opened through
-`/dev/dm-N` under the same device-number and inode checks and must
-carry the td Btrfs superblock with the volume's UUID; its `dm/uuid`,
-`dm/name`, `slaves/` and `dev` are then read again and must still
-describe the opened node, whose descriptor is held for the consumer.
-The installed selector's `on-volume boot` of an encrypted volume runs
-the release order on the pinned partition, before any mount
+for up to five seconds. An admitted mapping's one slave must have, in
+its sysfs `dev`, the device number of the held partition descriptor, so
+a partition name the kernel gave another device since the pin is not
+taken for it. The mapping is then opened through `/dev/dm-N` under the
+same device-number and inode checks and must carry the td Btrfs
+superblock with the volume's UUID; its `dm/uuid`, `dm/name`, `slaves/`
+and `dev` are then read again and must still describe the opened node,
+whose descriptor is held for the consumer. The installed selector's
+`on-volume boot` of an encrypted volume runs the release order on the
+pinned partition, before any mount
 (ENCRYPTION.md "Selector release"); a mapping already active then
 refuses boot. The released secret opens the mapping `td-selector`,
 cryptsetup naming the partition by its held descriptor,
@@ -1303,13 +1309,36 @@ partition as the volume. It refuses a mapping already active before it
 opens one. `on-volume mount-var` requires the active `td-system`
 mapping `mount-root` opened, admitted the same way, and mounts it;
 neither reads the key again. A failure after the open leaves the
-mapping until the reboot that refusal causes. Every other consumer, the
-running system's `install`, `update`, `rollback` and `success`, and
-`td-boot volume`, still refuses an encrypted volume with `encrypted
-volume: not yet supported`, naming the partition and any active
-mapping, until a later commit binds the running system's transactions
-to the mapping its deployment initramfs opened. An unencrypted volume's
-boot takes the same steps as before.
+mapping until the reboot that refusal causes.
+
+The running system's `install`, `update`, `rollback` and `success` bind
+the same mapping. When discovery finds the handed-off UUID's td LUKS2
+partition with its admitted `td-system` mapping active, `on-volume`
+holds the mapping's descriptor as the operation's device,
+`/proc/<pid>/fd/M`, exactly as it holds an unencrypted volume's Btrfs
+partition, reports the partition as the volume, and runs the
+operation unchanged: its mounts, transaction lock, stale-mount probe and
+publication reach the Btrfs inside through that descriptor. Admission
+is the walk above, so a mapping over another device, or whose Btrfs
+carries another UUID or none, refuses. The running system never opens
+or unlocks the volume: it runs no cryptsetup, reaches no TPM and reads
+no key, so a LUKS2 partition with no active mapping, or with an active
+mapping under another name, refuses. Device-mapper refuses, or defers
+until the last close, removing a mapping that is open, so the held
+descriptor keeps the mapping for the operation; root reloading its
+table is a privileged device administrator's change, outside this
+boundary as above. `td-boot volume` pins an encrypted volume the same
+way and prints the mapping node after the partition, refusing as these
+operations do ("Read-only volume discovery primitive").
+
+No consumer refuses an encrypted volume as such; each requires its own
+mapping state. The selector's `boot` requires no active mapping before
+its release (one halts it) and admits only the `td-selector` mapping it
+opens; `mount-root` requires no active mapping and admits only the
+`td-system` mapping it opens; `mount-var`, the running system's
+operations and `td-boot volume` require the active admitted `td-system`
+mapping and refuse without it. An unencrypted volume's boot and
+operations take the same steps as before.
 
 The native installation oracle provisions its chosen UUID into both the
 formatter and the selector before writing the disk. Its tiny selector
