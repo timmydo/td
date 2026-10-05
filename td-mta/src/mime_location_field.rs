@@ -58,6 +58,7 @@ enum Owner<'a, 'w> {
     Words(word::Cursor<'a, 'w>),
     Literal(literal::Cursor<'a, 'w>),
     Complete(&'w mut Meter, &'w mut HeaderBudget),
+    Rejected(&'w mut Meter, &'w mut HeaderBudget),
     Retired,
 }
 /// Caller authorizes surrounding CFWS and whole-spelling encoded-word placement.
@@ -103,9 +104,39 @@ impl<'a, 'w> Cursor<'a, 'w> {
             self.failure = Some(error);
             self.end = None;
             self.spelling = None;
-            self.owner = Owner::Retired;
+            let owner = std::mem::replace(&mut self.owner, Owner::Retired);
+            let budgets = match (error, owner) {
+                (Error::Selection(selection::Error::Malformed), Owner::Selection(cursor)) => {
+                    Some(cursor.discard())
+                }
+                (Error::Words(word::Error::MalformedFold), Owner::Words(cursor)) => {
+                    Some(cursor.discard())
+                }
+                (Error::Literal(literal::Error::MalformedUri), Owner::Literal(cursor)) => {
+                    Some(cursor.discard())
+                }
+                _ => None,
+            };
+            if let Some((work, budget)) = budgets {
+                self.owner = Owner::Rejected(work, budget);
+            }
         }
         result
+    }
+    /// Consume only a malformed source refusal; no value or validity survives.
+    /// Nesting, interpretation, work and internal refusals cannot be discarded.
+    /// Fresh original admission precedes returning allowances for another field.
+    pub(crate) fn discard_malformed(
+        self,
+        now: Tick,
+    ) -> Result<(&'w mut Meter, &'w mut HeaderBudget), Error> {
+        let Owner::Rejected(work, budget) = self.owner else {
+            return Err(self.failure.unwrap_or(Error::InvalidState));
+        };
+        budget
+            .charge(work, now, 0, 0, &mut 0)
+            .map_err(Error::Admission)?;
+        Ok((work, budget))
     }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
         if let Some(error) = self.failure {
@@ -118,22 +149,33 @@ impl<'a, 'w> Cursor<'a, 'w> {
             Owner::Complete(work, budget) => budget
                 .charge(work, now, 0, 0, &mut 0)
                 .map_err(Error::Admission),
-            Owner::Retired => Err(Error::InvalidState),
+            Owner::Rejected(..) | Owner::Retired => Err(Error::InvalidState),
         };
         self.outcome(result)
     }
     #[cfg(test)]
-    fn remaining(&self) -> Option<(Charge, u64, u64)> {
+    pub(crate) fn remaining(&self) -> Option<(Charge, u64, u64)> {
         match &self.owner {
             Owner::Selection(cursor) => Some(cursor.remaining()),
             Owner::Words(cursor) => Some(cursor.remaining()),
             Owner::Literal(cursor) => Some(cursor.remaining()),
-            Owner::Complete(work, budget) => Some((
+            Owner::Complete(work, budget) | Owner::Rejected(work, budget) => Some((
                 work.remaining(),
                 budget.source_bytes_remaining(),
                 budget.steps_remaining(),
             )),
             Owner::Retired => None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn deadline_error(&self) -> Error {
+        use crate::admission::work::Stop;
+        match self.owner {
+            Owner::Selection(_) => Error::Selection(selection::Error::Work(Stop::Deadline)),
+            Owner::Words(_) => Error::Words(word::Error::Work(Stop::Deadline)),
+            Owner::Literal(_) => Error::Literal(literal::Error::Work(Stop::Deadline)),
+            Owner::Complete(..) => Error::Admission(nfc::Error::Work(Stop::Deadline)),
+            Owner::Rejected(..) | Owner::Retired => Error::InvalidState,
         }
     }
     fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
@@ -157,7 +199,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
                     )
                     .map_err(|error| Error::Admission(nfc::Error::Work(error)))
                 }),
-            Owner::Retired => Err(Error::InvalidState),
+            Owner::Rejected(..) | Owner::Retired => Err(Error::InvalidState),
         };
         self.outcome(result)
     }
@@ -236,7 +278,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
                     Ok(Status::Complete)
                 }
             },
-            Owner::Complete(..) | Owner::Retired => Err(Error::InvalidState),
+            Owner::Complete(..) | Owner::Rejected(..) | Owner::Retired => Err(Error::InvalidState),
         }
     }
     pub fn finish(

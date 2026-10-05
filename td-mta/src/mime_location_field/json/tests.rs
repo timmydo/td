@@ -300,7 +300,7 @@ fn every_prefix_deadline_and_premature_finish_including_escape_drains() {
                     Owner::Complete(..) => {
                         FieldError::Admission(crate::nfc::Error::Work(Stop::Deadline))
                     }
-                    Owner::Retired => panic!("unexpected retirement"),
+                    Owner::Rejected(..) | Owner::Retired => panic!("unexpected retirement"),
                 });
                 if trial == 0 {
                     if cut == turns {

@@ -2168,6 +2168,272 @@ fn uri_word_runs() {
     assert_eq!(before, after, "URI encoded-word run allocated");
 }
 
+fn uri_location_discovery() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        mime_headers,
+        mime_location_field::{self as field, retained},
+        mime_location_fields::{Cursor, Error, Input, Status},
+        mime_location_literal as literal, mime_location_selection as selection,
+        nfc::{self, HeaderBudget},
+        ports::{Deadline, Tick},
+    };
+    let literal_source = format!("Content-Location: ../{}\r\n\r\nbody", "a%2F/".repeat(8192));
+    let word_source = format!(
+        "Content-Location: {}\r\n\r\nbody",
+        "=?utf-8?Q?e=CC=81?= \r\n ".repeat(1024)
+    );
+    let malformed_duplicates = format!(
+        "{}Content-Location: ../ok\r\n\r\n",
+        "Content-Location: a%\r\n".repeat(1024)
+    );
+    let ignored_duplicates = format!(
+        "Content-Location: ../ok\r\n{}\r\n",
+        "Content-Location: (bad\r\n".repeat(1024)
+    );
+    let nested_source = format!(
+        "Content-Location: {}x{}\r\nContent-Location: ../ok\r\n\r\n",
+        "(".repeat(33),
+        ")".repeat(33)
+    );
+    let mut backing =
+        vec![0; retained::capacity_bound(literal_source.len().max(word_source.len())).unwrap()];
+    let before = COUNTERS.snapshot();
+    for (source, source_end, limit, output, records, wanted, fault) in [
+        (
+            literal_source.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            true,
+            None,
+        ),
+        (
+            word_source.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            true,
+            None,
+        ),
+        (
+            malformed_duplicates.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            true,
+            None,
+        ),
+        (
+            ignored_duplicates.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            true,
+            None,
+        ),
+        (
+            b"Content-Location: \r\nContent-Location: ../later\r\n\r\n".as_slice(),
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            true,
+            None,
+        ),
+        (
+            b"Content-Location: =?utf-8?Q?=FF?=\r\n\r\n",
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            true,
+            None,
+        ),
+        (
+            b"Content-Location: a%\r\n\r\n",
+            SourceEnd::Eof,
+            1_000_000,
+            0,
+            2_000_000,
+            false,
+            None,
+        ),
+        (
+            b"Other: x\r\n\r\n",
+            SourceEnd::Eof,
+            1_000_000,
+            0,
+            2_000_000,
+            false,
+            None,
+        ),
+        (
+            b"Content-Location: ../ok\r\n",
+            SourceEnd::Prefix,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            false,
+            Some(Error::Truncated),
+        ),
+        (
+            b"Content-Location: ../ok\r\nOther: x\r\n\r\n",
+            SourceEnd::Eof,
+            27,
+            1_000_000,
+            2_000_000,
+            false,
+            Some(Error::Headers(mime_headers::Error::HeaderLimit)),
+        ),
+        (
+            b"Content-Location: ../ok\r\n\r\n",
+            SourceEnd::Eof,
+            0,
+            1_000_000,
+            2_000_000,
+            false,
+            Some(Error::Headers(mime_headers::Error::HeaderLimit)),
+        ),
+        (
+            nested_source.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            2_000_000,
+            false,
+            Some(Error::Location(field::Error::Selection(
+                selection::Error::NestingLimit,
+            ))),
+        ),
+        (
+            b"Content-Location: ../ok\r\nContent-Location: ../later\r\n\r\n",
+            SourceEnd::Eof,
+            1_000_000,
+            1_000_000,
+            0,
+            false,
+            Some(Error::Headers(mime_headers::Error::Work(Stop::Records))),
+        ),
+        (
+            b"Content-Location: ../ok\r\nContent-Location: ../later\r\n\r\n",
+            SourceEnd::Eof,
+            1_000_000,
+            0,
+            2_000_000,
+            false,
+            Some(Error::Location(field::Error::Literal(
+                literal::Error::Work(Stop::OutputBytes),
+            ))),
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records,
+                output_bytes: output,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let pointers = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+        let input = Input {
+            source,
+            base: 100,
+            header_limit: limit,
+            source_end,
+        };
+        let mut cursor = Cursor::new(input, &mut work, &mut budget).unwrap();
+        let mut result = None;
+        for _ in 0..2_000_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(cursor.selection().is_none()),
+                Ok(Status::Complete) => {
+                    result = Some(Ok(()));
+                    break;
+                }
+                Err(error) => {
+                    result = Some(Err(error));
+                    break;
+                }
+            }
+        }
+        assert_eq!(result, Some(fault.map_or(Ok(()), Err)));
+        if let Some(error) = fault {
+            assert!(cursor.selection().is_none());
+            assert_eq!(cursor.poll(Tick(100)), Err(error));
+            assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+        } else {
+            let selected = cursor.selection().unwrap();
+            assert_eq!(selected.content_location.is_some(), wanted);
+            assert_eq!(selected.location_end.is_some(), wanted);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            let (work, budget, selected) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                pointers
+            );
+            let value = selected.content_location.map(|field| {
+                td_header::resident::slice(source, 100, field.value_start..field.value_end).unwrap()
+            });
+            let mut projection = retained::Cursor::new(value, &mut backing, work, budget);
+            let mut complete = false;
+            for _ in 0..2_000_000 {
+                if projection.poll(Tick(1)).unwrap() == retained::Status::Complete {
+                    complete = true;
+                    break;
+                }
+                assert!(projection.view().is_none());
+            }
+            assert!(complete);
+            let (retained, work, budget) = projection.finish(Tick(1)).unwrap();
+            assert_eq!(retained.value.is_some(), wanted);
+            assert_eq!(retained.end, selected.location_end);
+            black_box(retained.value);
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                pointers
+            );
+            let mut next = Cursor::new(
+                Input {
+                    source: b"Other: x\r\n\r\n",
+                    base: 0,
+                    header_limit: 100,
+                    source_end: SourceEnd::Eof,
+                },
+                work,
+                budget,
+            )
+            .unwrap();
+            let mut complete = false;
+            for _ in 0..1000 {
+                if next.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            assert_eq!(next.poll(Tick(100)), Ok(Status::Complete));
+            let deadline = Error::Admission(nfc::Error::Work(Stop::Deadline));
+            assert_eq!(next.check_deadline(Tick(100)), Err(deadline));
+            assert!(next.selection().is_none());
+            assert_eq!(next.finish(Tick(1)).err(), Some(deadline));
+        }
+    }
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "Rust allocation in resident location discovery"
+    );
+}
+
 fn uri_location_retention() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -10725,6 +10991,7 @@ fn main() {
         uri_word_runs();
         uri_location_fields();
         uri_location_json();
+        uri_location_discovery();
         uri_location_retention();
         uri_unfold_values();
         uri_reference_values();
@@ -10898,6 +11165,7 @@ fn main() {
     uri_word_runs();
     uri_location_fields();
     uri_location_json();
+    uri_location_discovery();
     uri_location_retention();
     uri_unfold_values();
     uri_reference_values();

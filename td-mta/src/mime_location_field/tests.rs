@@ -36,7 +36,16 @@ fn drain(mut cursor: Cursor<'_, '_>) -> (String, Result<End, Error>, usize) {
             Err(error) => {
                 assert_eq!(cursor.end(), None);
                 assert!(!cursor.is_complete());
-                assert!(matches!(cursor.owner, Owner::Retired));
+                if matches!(
+                    error,
+                    Error::Selection(selection::Error::Malformed)
+                        | Error::Words(word::Error::MalformedFold)
+                        | Error::Literal(literal::Error::MalformedUri)
+                ) {
+                    assert!(matches!(cursor.owner, Owner::Rejected(..)));
+                } else {
+                    assert!(matches!(cursor.owner, Owner::Retired));
+                }
                 assert_eq!(cursor.poll(Tick(100)), Err(error));
                 assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
                 assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
@@ -302,7 +311,7 @@ fn every_prefix_fresh_admission_and_original_owner_handoff() {
                     Owner::Words(_) => Error::Words(word::Error::Work(Stop::Deadline)),
                     Owner::Literal(_) => Error::Literal(literal::Error::Work(Stop::Deadline)),
                     Owner::Complete(..) => Error::Admission(nfc::Error::Work(Stop::Deadline)),
-                    Owner::Retired => panic!("unexpected retirement"),
+                    Owner::Rejected(..) | Owner::Retired => panic!("unexpected retirement"),
                 };
                 if trial == 0 {
                     if cut == turns {

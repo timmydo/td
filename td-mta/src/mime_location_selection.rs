@@ -79,6 +79,11 @@ impl<'a, 'w> Cursor<'a, 'w> {
             ))
             .map_err(Error::from)
     }
+    /// Consuming discard only; the enclosing owner proves a syntax refusal and
+    /// freshly admits these original budgets before returning or reusing them.
+    pub(crate) fn discard(self) -> (&'w mut Meter, &'w mut HeaderBudget) {
+        (self.work, self.budget)
+    }
     #[cfg(test)]
     pub(crate) fn remaining(&self) -> (Charge, u64, u64) {
         (

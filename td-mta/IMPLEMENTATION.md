@@ -2054,6 +2054,17 @@ Initial independently landable increments:
   allocation. First-valid Content-Location discovery/source-bound retention
   and existing traversal/response metadata integration remain next.
 
+- **M06df — resident first-valid location discovery:** bind the existing raw
+  header scanner and authorized complete location field to original owners.
+  Skip only malformed needed occurrences, retain first empty references,
+  ignore later duplicate values and require the complete raw boundary before
+  passive extents/diagnostics become visible. Consuming malformed discard
+  freshly admits unchanged owners; nesting, job, interpretation and internal
+  refusals stay fatal. Independent scanner/field cost cuts, progress deadlines,
+  original source/owner reuse and long duplicate allocation qualify the
+  fixed collector. Source-bound retained composition and MIME integration
+  remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

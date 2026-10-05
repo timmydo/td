@@ -52,6 +52,7 @@ pub mod mime_input;
 pub mod mime_label_fields;
 pub mod mime_language;
 pub mod mime_location_field;
+pub mod mime_location_fields;
 pub mod mime_location_literal;
 pub mod mime_location_literal_field;
 pub mod mime_location_selection;

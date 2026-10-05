@@ -4716,7 +4716,9 @@ No End escapes before whole healthy completion. Selection, Words and Literal
 errors retain child context; fresh admission after completion uses Admission.
 Context identifies the phase that failed, not the eventual field form: fold
 errors come from Words even for a plain literal spelling.
-Any refusal retires the active owner and hides every metadata extent/End.
+Any refusal retires its parser and hides every metadata extent/End. Only
+malformed source syntax retains the original owner references for private,
+freshly admitted consuming discard; all other refusals retire those owners.
 Provisional caller output is not wiped. Cached Complete is inert, while
 check_deadline and consuming finish(now) freshly admit even Complete before
 premature-state refusal.
@@ -4794,6 +4796,43 @@ primitive, retaining its public Backing/Values/Retained APIs, error contexts,
 first-valid selected sources, exclusive children and original cost contracts.
 The shared window tracks only fixed backing and checked reported prefixes;
 it grants no source identity, JSON validity, completion or publication.
+
+### 1.111 First-valid resident Content-Location fields
+
+M06df adds mime_location_fields::Cursor using the existing caller-authorized
+resident Input contract, raw Scanner, shared field matching/range helpers and
+complete location projection. Select the first completely valid field,
+including an empty reference; skip only malformed needed occurrences. Later
+duplicates are scanned without interpreting their values. A raw scanner
+boundary (including its existing non-header body rule) must complete before
+selection() exposes any passive field extent, form or repair diagnostic.
+Raw field values and absolute offsets preserve the original resident source;
+no JSON retention, URL matching, normalization or publication grant follows.
+
+One inline field child exclusively owns the original Meter/HeaderBudget.
+Its provisional scalars are discarded, but their original output charges
+remain funded. Healthy child finish returns original owners; a malformed
+source discards the dead parser and retains only those same owner references.
+An internal consuming discard freshly admits original allowances before
+another occurrence can be tried. No credit, budget or source is renewed.
+Errors preserve their phase: Headers carries scanner refusals, Location
+carries the active field child's refusal, and Admission carries the outer
+original-budget check. These contexts are fatal except for the explicitly
+consumed malformed field syntax; no resource refusal becomes absence.
+
+Nesting, work, interpretation, invalid-state and raw-header refusals never
+return this malformed-discard path and retire the whole selection. All
+cached public field failures remain sticky; no failed field becomes valid.
+
+Every live turn freshly admits and polls at most one scanner or field child.
+The complete selection remains provisional through fresh consuming finish,
+which returns the same pointer-identical reusable Meter/HeaderBudget and
+passive Selection { content_location, location_end, end }. Later refusals
+hide the whole selection. Cached Complete is inert; check_deadline and
+finish freshly admit completed owners before premature-state refusal.
+The cursor is neither Copy nor Clone and uses fixed inline storage. Retained
+location projection must still use the original selected source and original
+allowances; a source-bound retained composition remains separate work.
 
 ## 2. Read views and change history
 

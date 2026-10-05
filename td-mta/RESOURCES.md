@@ -1792,6 +1792,35 @@ malformed tails, zero records/output and late scalar/closing refusal. Inputs
 are allocated before counting; worker/native/RSS and retained response
 buffers remain separate qualifications.
 
+M06df's resident location collector plus HeaderBudget fits a compiled
+1024-byte ceiling within the existing parser reservation. One scanner and
+one exclusive inline field child use fixed state; selected raw extents and
+diagnostics allocate no retained output. Live turns freshly admit original
+owners and perform at most one scanner/field poll. Healthy fixtures check
+256 job visits, 452 interpretation steps, 29 job records and four scalar
+output bytes per turn, with identical job/header source visits. Failed-turn
+bounds remain those of the independently qualified scanner/field children.
+Discarding provisional scalars adds no copying, but preserves their original
+output charges. Discovery followed by retention must fund the selected
+field's scalar output twice, plus the retained JSON wire output; malformed
+needed occurrences also spend their original interpretation/output costs.
+Malformed handoff adds no charge or renewed allowance;
+remaining funded child credit is discarded, never reset to a positive grant.
+
+Five units qualify first-valid/empty/repair selection, original raw-source
+retention and reusable owners, every progress-prefix admission/premature
+finish, typed malformed-only discard and resource/nesting/structural refusal.
+An independent raw scanner plus public field projection derives child costs;
+the reference separately funds the specified name comparison and final
+bookkeeping charges. Malformed-owner snapshots pin zero-cost handoff, and
+every positive original resource cut and exact grant checks whole visibility.
+Warm/measured Rust intervals cover long literal/word fields, 1024 malformed
+needed and ignored later duplicates, repair/empty/absence, complete body
+isolation, prefix/header bounds and zero-record/output/nesting refusal.
+Inputs and optional retained backing allocate before counting; completed
+original-owner reuse and fresh whole-view retirement are measured. Worker,
+native, RSS and response-backing reservations remain separate qualifications.
+
 M06de's selected location retention cursor plus HeaderBudget fits a compiled
 1024-byte ceiling in the existing parser region. The shared window owns one
 fixed reserved backing and checked prefix/failure state within four machine

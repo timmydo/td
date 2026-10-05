@@ -350,6 +350,19 @@ normalization. Job/interpretation refusal never permits fallback. Empty
 references remain a separate field-presence decision. Field discovery,
 retained location JSON, label matching and publication remain separate work.
 
+Resident Content-Location metadata selects the first completely valid field
+under the complete authorized location policy, including an empty reference.
+Skip malformed needed occurrences; later duplicates remain raw and are scanned
+without interpreting their values. Malformed leading CFWS, folds or literal
+URI syntax are source rejections only. Nesting, raw-header limits, incomplete
+resident prefixes, job/interpretation and internal refusals retire the whole
+selection and cannot be rescued by a later occurrence. Consuming malformed
+syntax returns only original live allowances after fresh admission, never
+field validity or metadata. A complete raw scanner boundary is required
+before any selected extent or diagnostic becomes visible. Its existing
+non-header body boundary rule remains authoritative. Retained JSON, matching,
+null mapping and whole response publication remain separately admitted.
+
 RFC 2231 MIME parameters support percent decoding, charset/language prefixes,
 and numbered continuations beginning at zero without gaps or leading zeros.
 A malformed extended name (including leading zeros, numeric overflow or extra

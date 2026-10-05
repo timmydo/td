@@ -448,9 +448,10 @@ recognized runs decode; other spellings retain all word-looking markers in
 literal replay after URI validation. Decoded labels receive no URI check or
 normalization. Child phases remain exclusive under the original owners;
 fresh handoff never adds charge or renews credit. No metadata escapes before
-whole healthy completion, and every refusal hides the End and retires the
-owner. Empty-reference presence, discovery, label matching and retained
-response publication remain external.
+whole healthy completion, and every refusal hides the End and retires its
+parser. Only M06df's consuming malformed-syntax path retains original owner
+references for freshly admitted discard. Empty-reference presence, discovery,
+label matching and retained response publication remain external.
 
 M06dd binds complete authorized location scalars to shared td-json framing.
 One bound source and original owner set funds both scalar output and exact
@@ -469,8 +470,20 @@ The shared primitive supplies no source or completion authority. Enclosing
 cursors keep original exclusive admission owners, freshly consume completing
 children without added charge and hide all fragment metadata on any refusal.
 Whole retained views remain provisional through fresh final admission and
-whole-job publication; first-valid location discovery and traversal response
-integration remain later composition.
+whole-job publication. M06df owns first-valid location discovery;
+source-bound retention and traversal response integration remain separate
+composition.
+
+M06df selects first-valid resident Content-Location fields with the existing
+raw scanner and complete authorized field child. Only malformed needed
+occurrences can be skipped; first empty references remain present. A syntax
+refusal retires its parser/value and retains only original owner references
+for a freshly admitted internal consuming discard. Work, interpretation,
+nesting and internal refusals never enter that path. Later duplicates are
+scanned without value interpretation; no selection/diagnostic escapes before
+the complete raw boundary. Original scalar output costs remain funded even
+when selection discards provisional scalars. Selected extents preserve the
+original resident source, with retained composition and publication separate.
 
 M06cq composes shared URI unfolding and reference validation into a selected
 literal spelling reader. It validates the complete spelling before replaying
