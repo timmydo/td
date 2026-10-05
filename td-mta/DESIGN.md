@@ -471,8 +471,8 @@ cursors keep original exclusive admission owners, freshly consume completing
 children without added charge and hide all fragment metadata on any refusal.
 Whole retained views remain provisional through fresh final admission and
 whole-job publication. M06df owns first-valid location discovery;
-source-bound retention and traversal response integration remain separate
-composition.
+M06dg owns source-bound retention; traversal response integration remains
+separate composition.
 
 M06df selects first-valid resident Content-Location fields with the existing
 raw scanner and complete authorized field child. Only malformed needed
@@ -483,7 +483,18 @@ nesting and internal refusals never enter that path. Later duplicates are
 scanned without value interpretation; no selection/diagnostic escapes before
 the complete raw boundary. Original scalar output costs remain funded even
 when selection discards provisional scalars. Selected extents preserve the
-original resident source, with retained composition and publication separate.
+original resident source; M06dg binds retained composition while publication
+remains external.
+
+M06dg binds the completed resident first-valid location selector and optional
+JSON retention to one immutable authorized Input and original allowances.
+Only that Input's selected raw extent is replayed into distinct reserved
+backing. No replacement source can enter between phases. Whole-view
+visibility includes both completed header selection and retained JSON;
+capacity or later admission refusal hides both. Fresh consuming finish
+returns original reusable allowances, with publication and label resolution
+still owned by the enclosing response job. This composition introduces no
+new parser arena or retained-storage grant.
 
 M06cq composes shared URI unfolding and reference validation into a selected
 literal spelling reader. It validates the complete spelling before replaying

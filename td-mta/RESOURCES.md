@@ -1853,6 +1853,30 @@ empty/full capacity, original public reuse and fresh completed retirement.
 Input/backing allocation precedes counting; native, worker/RSS and enclosing
 response retention reservations remain separate qualifications.
 
+M06dg's source-bound location collector/retainer plus HeaderBudget fits a
+compiled 1536-byte ceiling in the existing parser reservation. One inline
+selector or retained child owns the original mutable allowances. One
+immutable resident Input and one reserved backing remain bound throughout;
+no source-sized scratch, growing collection or second header arena exists.
+Handoff grants no allowance, performs no extra copying and polls no second
+child. Child charges remain unchanged: discovery funds discarded scalars,
+retention funds replayed scalars and JSON wire output separately. A turn is
+bounded by the larger child ceiling: 256 job/header visits, 452 interpretation
+steps, 29 job records and ten scalar-plus-JSON output bytes. Reconstructed
+original-owner snapshots pin those limits at every turn without a new
+counter-access surface.
+
+Five units compare public selector-plus-retainer output, diagnostics, exact
+original costs and pointer-identical reusable owners; sweep all five
+positive original resource costs and every output capacity; pin combined
+poll counts against separately run public children; and qualify
+fresh checks/finish at every progress prefix and late scanner refusal before
+retention. Warm/measured Rust intervals cover long literal and folded-word
+fields, 1024 malformed needed occurrences, empty/repair/absence and capacity
+refusal, original-owner reuse and fresh whole-view retirement. Source and
+backing allocate before counting; native, RSS, worker and response storage
+remain separate qualifications.
+
 M06cq's selected literal URI reader plus HeaderBudget fits 320 bytes in the
 existing parser region. It retains shared fixed validator/unfolder state
 and source borrows, with no source-sized scratch or second header arena.

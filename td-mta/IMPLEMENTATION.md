@@ -2062,8 +2062,16 @@ Initial independently landable increments:
   freshly admits unchanged owners; nesting, job, interpretation and internal
   refusals stay fatal. Independent scanner/field cost cuts, progress deadlines,
   original source/owner reuse and long duplicate allocation qualify the
-  fixed collector. Source-bound retained composition and MIME integration
-  remain open.
+  fixed collector. M06dg supplies source-bound retained composition; MIME
+  integration remains open.
+
+- **M06dg — source-bound selected location JSON:** bind first-valid resident
+  discovery and optional retained JSON to one immutable Input and original
+  Meter/HeaderBudget. Replay only that Input's selected extent; expose whole
+  selection and borrowed JSON with correlated diagnostics. Qualify public
+  child costs, every original resource/capacity cut, progress-prefix
+  admission, original-owner reuse and measured zero Rust allocation.
+  Retained MIME part metadata and traversal response integration remain next.
 
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement

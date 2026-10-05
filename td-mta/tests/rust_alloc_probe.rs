@@ -2168,6 +2168,141 @@ fn uri_word_runs() {
     assert_eq!(before, after, "URI encoded-word run allocated");
 }
 
+fn uri_location_source_bound() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        mime_location_field::retained,
+        mime_location_fields::{
+            json::{Cursor, Error, Status},
+            Input,
+        },
+        nfc::{self, HeaderBudget},
+        ports::{Deadline, Tick},
+    };
+    let literal = format!("Content-Location: ../{}\r\n\r\nbody", "a%2F/".repeat(8192));
+    let words = format!(
+        "Content-Location: {}\r\n\r\nbody",
+        "=?utf-8?Q?e=CC=81?= \r\n ".repeat(1024)
+    );
+    let duplicates = format!(
+        "{}Content-Location: ../ok\r\n\r\n",
+        "Content-Location: a%\r\n".repeat(1024)
+    );
+    let mut backing = vec![0; retained::capacity_bound(literal.len().max(words.len())).unwrap()];
+    let before = COUNTERS.snapshot();
+    for (source, present, capacity, fault) in [
+        (literal.as_bytes(), true, backing.len(), None),
+        (words.as_bytes(), true, backing.len(), None),
+        (duplicates.as_bytes(), true, backing.len(), None),
+        (
+            b"Content-Location: \r\nContent-Location: ../later\r\n\r\n".as_slice(),
+            true,
+            backing.len(),
+            None,
+        ),
+        (
+            b"Content-Location: =?utf-8?Q?=FF?=\r\n\r\n",
+            true,
+            backing.len(),
+            None,
+        ),
+        (b"Content-Location: a%\r\n\r\n", false, 0, None),
+        (b"Other: x\r\n\r\n", false, 0, None),
+        (
+            b"Content-Location: ../ok\r\n\r\n",
+            true,
+            3,
+            Some(Error::Retention(retained::Error::OutputCapacity)),
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 2_000_000,
+                output_bytes: 1_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let pointers = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+        let mut cursor = Cursor::new(
+            Input {
+                source,
+                base: 100,
+                header_limit: 1_000_000,
+                source_end: SourceEnd::Eof,
+            },
+            backing.get_mut(..capacity).unwrap(),
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        let mut result = None;
+        for _ in 0..2_000_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(cursor.view().is_none()),
+                Ok(Status::Complete) => {
+                    result = Some(Ok(()));
+                    break;
+                }
+                Err(error) => {
+                    assert!(cursor.view().is_none());
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    result = Some(Err(error));
+                    break;
+                }
+            }
+        }
+        assert_eq!(result, Some(fault.map_or(Ok(()), Err)));
+        if let Some(error) = fault {
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+        } else {
+            let view = cursor.view().unwrap();
+            assert_eq!(view.value.is_some(), present);
+            assert_eq!(view.selection.content_location.is_some(), present);
+            black_box(view.value);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            let (retained, work, budget) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(retained.value.is_some(), present);
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                pointers
+            );
+            let mut next = Cursor::new(
+                Input {
+                    source: b"Other: x\r\n\r\n",
+                    base: 0,
+                    header_limit: 100,
+                    source_end: SourceEnd::Eof,
+                },
+                &mut [],
+                work,
+                budget,
+            )
+            .unwrap();
+            let mut complete = false;
+            for _ in 0..1000 {
+                if next.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            let deadline = Error::Admission(nfc::Error::Work(Stop::Deadline));
+            assert_eq!(next.check_deadline(Tick(100)), Err(deadline));
+            assert!(next.view().is_none());
+            assert_eq!(next.finish(Tick(1)).err(), Some(deadline));
+        }
+    }
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "Rust allocation in source-bound location JSON"
+    );
+}
+
 fn uri_location_discovery() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -10992,6 +11127,7 @@ fn main() {
         uri_location_fields();
         uri_location_json();
         uri_location_discovery();
+        uri_location_source_bound();
         uri_location_retention();
         uri_unfold_values();
         uri_reference_values();
@@ -11166,6 +11302,7 @@ fn main() {
     uri_location_fields();
     uri_location_json();
     uri_location_discovery();
+    uri_location_source_bound();
     uri_location_retention();
     uri_unfold_values();
     uri_reference_values();

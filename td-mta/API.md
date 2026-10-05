@@ -4832,7 +4832,31 @@ hide the whole selection. Cached Complete is inert; check_deadline and
 finish freshly admit completed owners before premature-state refusal.
 The cursor is neither Copy nor Clone and uses fixed inline storage. Retained
 location projection must still use the original selected source and original
-allowances; a source-bound retained composition remains separate work.
+allowances; M06dg provides that bound composition.
+
+### 1.112 Source-bound retained Content-Location
+
+M06dg adds mime_location_fields::json::Cursor binding one immutable
+caller-authorized resident Input, original Meter/HeaderBudget and distinct
+reserved JSON backing. Complete first-valid discovery precedes optional
+retention. Slice only the selected extent from that same original Input;
+no caller can substitute another source between those phases. The handoff
+freshly consumes the selector and polls no second child in that turn.
+Retention freshly consumes its child and checks that presence and field
+form/repair diagnostics agree with discovery before exposing a whole view.
+
+Retained { selection, value } preserves raw header End and selected extent,
+and absent versus present-empty JSON. Scalars fund discovery and replay
+separately; JSON wire output is charged additionally. Every live turn
+freshly admits original owners and polls at most one exclusive child.
+Capacity, scanner, syntax, work and deadline refusals hide the whole view,
+including selection metadata, and stay sticky. Cached Complete is inert;
+explicit check and consuming finish freshly admit before completed or
+premature-state decisions. Finish returns the same reusable original
+owners and a borrowed fragment in caller-reserved backing. The cursor is
+neither Copy nor Clone. The view remains provisional through enclosing
+publication; URI resolution, label matching and response/null policy stay
+external.
 
 ## 2. Read views and change history
 
