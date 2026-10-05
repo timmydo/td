@@ -11,6 +11,7 @@ mod frames;
 mod mode;
 mod plain;
 mod protocol;
+mod store;
 mod window;
 
 use std::io::Write;

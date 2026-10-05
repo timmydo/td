@@ -20,6 +20,21 @@ pub fn start_folder() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// The folder a finder for a password store opens on: `pass`'s own,
+/// `$PASSWORD_STORE_DIR` when it is an absolute folder, else
+/// `~/.password-store`, else the finder's usual start. The finder lists
+/// no hidden name, so the store's folder is where it starts.
+pub fn store_folder() -> PathBuf {
+    let folder = |path: PathBuf| (path.is_absolute() && path.is_dir()).then_some(path);
+    std::env::var_os("PASSWORD_STORE_DIR")
+        .and_then(|store| folder(PathBuf::from(store)))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .and_then(|home| folder(PathBuf::from(home).join(".password-store")))
+        })
+        .unwrap_or_else(start_folder)
+}
+
 /// The most directory entries one listing examines, so a folder of very
 /// many is read to a bound, not whole.
 const EXAMINED: usize = 16 * finder::ENTRIES;

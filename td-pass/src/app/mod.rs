@@ -1,7 +1,8 @@
 //! The notebook window's state: locked or unlocked, the open entry in
 //! td-ui's editor pane under the vault-document policy, the search field
-//! and title list, the keys view, the finder for an encrypted copy, the
-//! key prompt and the confirmation dialog. It reaches the vault only
+//! and title list, the keys view, the finder for an encrypted copy or a
+//! password store, the questions a store's import asks, the key prompt
+//! and the confirmation dialog. It reaches the vault only
 //! through `Out` commands and `Reply` answers, and folders only through
 //! `Out::List`, so it holds no key and runs in tests without a token.
 
@@ -63,14 +64,15 @@ pub enum Out {
     Answer(Op, Answer),
     /// Abandon the operation in flight.
     Cancel,
-    /// List `folder`, or the starting folder, for the finder `chooser`,
-    /// with files that may be chosen when `files`; answered with
-    /// `App::listed`.
+    /// List `folder`, or the starting folder, the password store's when
+    /// `store`, for the finder `chooser`, with files that may be chosen
+    /// when `files`; answered with `App::listed`.
     List {
         chooser: u64,
         folder: Option<PathBuf>,
         select: Option<String>,
         files: bool,
+        store: bool,
     },
 }
 
@@ -93,6 +95,13 @@ enum Act {
     AcceptSwap,
     CreateWithBackup,
     CreateOneKey,
+    /// Import a store's entries though some cannot be.
+    ImportRest,
+    /// Of a title the notebook holds: keep the notebook's entry (No),
+    /// replace it (Yes), or replace it and every later one (Yes to all).
+    Keep,
+    ReplaceOne,
+    ReplaceAll,
 }
 
 /// What a decision about unsaved changes was asked for.
@@ -100,6 +109,8 @@ enum Act {
 enum Then {
     Select(usize),
     New,
+    /// Import a password store.
+    Import,
     Lock,
     Quit,
 }
@@ -224,6 +235,24 @@ enum Busy {
     Export(Op),
     ReadCopy(Op),
     Import(Op),
+    ReadStore(Op),
+    ImportStore(Op),
+}
+
+/// A password store read for import: its titles the notebook already
+/// holds, asked about in order, the answers so far, and the entries that
+/// cannot be imported, asked about first.
+struct StoreImport {
+    /// The read that brought it, which the vault's thread keeps it by.
+    read: Op,
+    found: usize,
+    held: Vec<Text>,
+    replace: Vec<bool>,
+    skipped: Vec<(Text, &'static str)>,
+    /// The skipped entries were shown and the rest is to be imported.
+    rest: bool,
+    /// Every later title is replaced.
+    all: bool,
 }
 
 /// What the finder chooses for.
@@ -231,8 +260,21 @@ enum Busy {
 enum Purpose {
     /// A folder to write the encrypted copy into.
     Export,
-    /// A copy to import.
+    /// A copy to restore.
     Import,
+    /// A password store's folder to import from.
+    Store,
+}
+
+impl Purpose {
+    /// The strip the finder was opened from, which it lies under.
+    fn strip(self) -> &'static [&'static str] {
+        match self {
+            Self::Export => layout::KEYS,
+            Self::Import => layout::LOCKED,
+            Self::Store => layout::NOTEBOOK,
+        }
+    }
 }
 
 /// The finder over the folder `folder`; `finder` is `None` until its
@@ -257,7 +299,9 @@ impl Busy {
             | Self::Create(op)
             | Self::Export(op)
             | Self::ReadCopy(op)
-            | Self::Import(op) => *op,
+            | Self::Import(op)
+            | Self::ReadStore(op)
+            | Self::ImportStore(op) => *op,
             Self::Save { op, .. } | Self::Delete { op, .. } | Self::Keys { op, .. } => *op,
         }
     }
@@ -298,6 +342,8 @@ pub struct App {
     dialog_revision: u64,
     chooser: Option<Chooser>,
     next_chooser: u64,
+    /// A password store read and being asked about.
+    store: Option<StoreImport>,
     /// What an export that finished during a lock wrote, shown with the
     /// locked view that follows.
     exported: Option<String>,
@@ -349,6 +395,7 @@ impl App {
             dialog_revision: 0,
             chooser: None,
             next_chooser: 0,
+            store: None,
             exported: None,
             host_locked: None,
             host_ready: false,
@@ -593,7 +640,30 @@ impl App {
                 }
                 self.phase = Phase::Importing { keys, list };
                 self.focus = Focus::Keys;
-                self.say("Choose the key to import the copy with, then Import");
+                self.say("Choose the key to restore the copy with, then Restore");
+            }
+            Reply::Reading { op, done, total } => {
+                if matches!(self.busy, Some(Busy::ReadStore(o)) if o == op) {
+                    self.say(format!(
+                        "Reading the password store: {done} of {total}; Escape cancels"
+                    ));
+                }
+            }
+            Reply::Store {
+                op,
+                found,
+                held,
+                skipped,
+            } => self.store_read(op, found, held, skipped),
+            Reply::Imported {
+                op,
+                entries,
+                created,
+                replaced,
+                kept,
+            } => {
+                self.imported(op, entries, (created, replaced, kept));
+                self.reask();
             }
         }
     }
@@ -771,6 +841,7 @@ impl App {
                     | Busy::Keys { .. }
                     | Busy::Create(_)
                     | Busy::Import(_)
+                    | Busy::ImportStore(_)
             )
         );
         if self.busy.is_some() {
@@ -1148,7 +1219,7 @@ impl App {
         self.relayout();
         // A finder the window can no longer hold closes.
         if let Some(chooser) = self.chooser.as_mut() {
-            let rect = layout::finder(surface, chooser.purpose == Purpose::Import);
+            let rect = layout::finder(surface, chooser.purpose.strip());
             if let Some(finder) = chooser.finder.as_mut() {
                 if let finder::Outcome::Closed(_) =
                     finder.event(finder::Event::Resize { surface, rect })
@@ -1265,7 +1336,7 @@ impl App {
     fn request(&mut self, then: Then, opener: Option<(i64, i64)>) {
         // Only Lock and Quit may give up an entry while its save is in
         // flight; another entry waits for the save's answer.
-        if self.busy.is_some() && matches!(then, Then::Select(_) | Then::New) {
+        if self.busy.is_some() && matches!(then, Then::Select(_) | Then::New | Then::Import) {
             return self.say("Wait for the current operation to finish");
         }
         if !self.dirty() {
@@ -1298,6 +1369,9 @@ impl App {
     /// phase only the swap question can be, and with no notebook only the
     /// create question.
     fn dialog_rows(&self) -> i64 {
+        if self.store.is_some() {
+            return layout::STORE_ROWS;
+        }
         match self.phase {
             Phase::Swap(_) => layout::SWAP_ROWS,
             Phase::Locked { keys: None, .. } => layout::CREATE_ROWS,
@@ -1323,6 +1397,7 @@ impl App {
                 [
                     confirmations::Focus::Confirm,
                     confirmations::Focus::Alternate,
+                    confirmations::Focus::Further,
                 ]
                 .into_iter()
                 .filter_map(|focus| dialog.action_rect(focus))
@@ -1348,6 +1423,7 @@ impl App {
         match then {
             Then::Select(index) => self.read(index),
             Then::New => self.new_entry(),
+            Then::Import => self.start_store(),
             Then::Lock => self.lock_now(),
             Then::Quit => {
                 self.lock_now();
@@ -1788,7 +1864,7 @@ impl App {
         self.say("Choose a folder: Return opens one, Ctrl+Return exports into it, Escape cancels");
     }
 
-    /// Opens the finder on a copy to import, when the account holds no
+    /// Opens the finder on a copy to restore, when the account holds no
     /// notebook.
     fn start_import(&mut self) {
         if self.busy.is_some() || !matches!(self.phase, Phase::Locked { keys: None, .. }) {
@@ -1796,6 +1872,22 @@ impl App {
         }
         self.open_chooser(Purpose::Import);
         self.say("Choose an encrypted copy: Return opens a folder or reads the copy");
+    }
+
+    /// Opens the finder on the password store's folder, to import its
+    /// entries into the open notebook.
+    fn start_store(&mut self) {
+        if self.busy.is_some() {
+            return self.say("Wait for the current operation to finish");
+        }
+        if !matches!(&self.phase, Phase::Unlocked(notebook) if !notebook.keys.showing) {
+            return;
+        }
+        self.open_chooser(Purpose::Store);
+        self.say(
+            "Choose the password store: Return opens a folder, Ctrl+Return imports from \
+             the listed one, Escape cancels",
+        );
     }
 
     fn open_chooser(&mut self, purpose: Purpose) {
@@ -1812,6 +1904,7 @@ impl App {
             folder: None,
             select: None,
             files: purpose == Purpose::Import,
+            store: purpose == Purpose::Store,
         });
         self.sync_focus();
         self.redraw = true;
@@ -1840,7 +1933,7 @@ impl App {
             return;
         };
         let choose = match chooser.purpose {
-            Purpose::Export => finder::Choose::Folder,
+            Purpose::Export | Purpose::Store => finder::Choose::Folder,
             Purpose::Import => finder::Choose::File,
         };
         self.redraw = true;
@@ -1853,7 +1946,7 @@ impl App {
                 Err(error) => error.to_string(),
             },
             (Ok(listing), None) => {
-                let rect = layout::finder(surface, chooser.purpose == Purpose::Import);
+                let rect = layout::finder(surface, chooser.purpose.strip());
                 match finder::Controller::new(listing, choose, surface, rect, select) {
                     Ok(finder) => {
                         chooser.finder = Some(finder);
@@ -1907,6 +2000,7 @@ impl App {
                         folder: Some(folder),
                         select: None,
                         files,
+                        store: false,
                     });
                 }
             }
@@ -1922,6 +2016,7 @@ impl App {
                         folder: Some(parent.to_path_buf()),
                         select,
                         files,
+                        store: false,
                     });
                 }
             }
@@ -1941,6 +2036,7 @@ impl App {
                 self.redraw = true;
                 match (choice, chooser.purpose, name) {
                     (finder::Choice::Here, Purpose::Export, _) => self.export(chooser.folder),
+                    (finder::Choice::Here, Purpose::Store, _) => self.read_store(chooser.folder),
                     (finder::Choice::Entry(_), Purpose::Import, Some(name)) => {
                         self.read_copy(chooser.folder.join(name));
                     }
@@ -1974,7 +2070,7 @@ impl App {
             return;
         };
         let Some(key) = list.selected().filter(|&key| key < keys.len()) else {
-            return self.say("Choose a key to import the copy with");
+            return self.say("Choose a key to restore the copy with");
         };
         if self.awaiting_host() {
             return;
@@ -1982,7 +2078,7 @@ impl App {
         let op = self.op();
         self.out.push(Out::Send(Command::Import { op, key }));
         self.busy = Some(Busy::Import(op));
-        self.say("Importing");
+        self.say("Restoring");
     }
 
     /// Gives the copy up: the thread drops it and lists the account's
@@ -1996,6 +2092,272 @@ impl App {
         self.out.push(Out::Send(Command::Lock));
         self.phase = Phase::Locking;
         self.say("");
+    }
+
+    // A password store's import.
+
+    fn read_store(&mut self, folder: PathBuf) {
+        let op = self.op();
+        self.out.push(Out::Send(Command::ReadStore { op, folder }));
+        self.busy = Some(Busy::ReadStore(op));
+        self.say("Reading the password store; gpg may ask for its key. Escape cancels");
+    }
+
+    /// Stops reading the store: gpg is ended and nothing is imported.
+    pub(super) fn cancel_store_read(&mut self) {
+        if matches!(self.busy, Some(Busy::ReadStore(_))) {
+            self.out.push(Out::Cancel);
+            self.busy = None;
+            self.say("Import cancelled; nothing was imported");
+        }
+    }
+
+    /// The store is read: what cannot be imported is shown first, then
+    /// each title the notebook holds is asked about. One read for an
+    /// abandoned operation is given up.
+    fn store_read(
+        &mut self,
+        op: Op,
+        found: usize,
+        held: Vec<Text>,
+        skipped: Vec<(Text, &'static str)>,
+    ) {
+        if !matches!(self.busy, Some(Busy::ReadStore(o)) if o == op)
+            || !matches!(self.phase, Phase::Unlocked(_))
+        {
+            self.out.push(Out::Send(Command::DropStore { op }));
+            return;
+        }
+        self.busy = None;
+        // A question asked meanwhile, to lock or quit over unsaved edits,
+        // is not replaced: the store is given up for it, and it is asked
+        // again now that Save is possible.
+        if self.dialog.is_some() || self.deferred.is_some() {
+            self.out.push(Out::Send(Command::DropStore { op }));
+            // Said first, so a question that finds no place says so.
+            self.say("Import cancelled for the question; nothing was imported");
+            return self.reask();
+        }
+        if found == 0 && skipped.is_empty() {
+            self.out.push(Out::Send(Command::DropStore { op }));
+            return self.say("The password store holds no entries");
+        }
+        self.store = Some(StoreImport {
+            read: op,
+            found,
+            replace: Vec::with_capacity(held.len()),
+            held,
+            rest: skipped.is_empty(),
+            skipped,
+            all: false,
+        });
+        self.ask_store();
+    }
+
+    /// Asks the store's next question, or, with every answer given,
+    /// imports.
+    fn ask_store(&mut self) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        if !store.rest {
+            let count = store.skipped.len();
+            let mut details = Vec::with_capacity(count.min(STORE_SKIPPED) + 3);
+            details.push(match (count, store.found) {
+                (1, _) => "This entry of the password store cannot be imported:".to_owned(),
+                _ => format!("These {count} entries of the password store cannot be imported:"),
+            });
+            details.extend(
+                store
+                    .skipped
+                    .iter()
+                    .take(STORE_SKIPPED)
+                    .map(|(title, reason)| format!("{}: {reason}", shown(title.as_str()))),
+            );
+            if let Some(more) = count.checked_sub(STORE_SKIPPED).filter(|n| *n > 0) {
+                details.push(format!("and {more} more"));
+            }
+            // The title stays short so a narrow window holds it.
+            let (title, confirm) = match store.found {
+                0 => ("Nothing to import", "OK"),
+                1 => {
+                    details.push("The other entry can be imported.".to_owned());
+                    ("Import the rest?", "Import")
+                }
+                found => {
+                    details.push(format!("The other {found} entries can be imported."));
+                    ("Import the rest?", "Import")
+                }
+            };
+            return self.ask_store_question(title, confirm, details, None);
+        }
+        while store.all && store.replace.len() < store.held.len() {
+            store.replace.push(true);
+        }
+        let asked = store.replace.len();
+        let Some(title) = store.held.get(asked) else {
+            return self.import_store();
+        };
+        let mut details = vec![
+            shown(title.as_str()),
+            "The notebook already has an entry with this title. Yes replaces its text with \
+             the password store's; No keeps it as it is; Yes to all replaces it and every \
+             later one; Cancel imports nothing."
+                .to_owned(),
+        ];
+        match store.held.len() - asked - 1 {
+            0 => {}
+            1 => details.push("1 more title is asked about after this one.".to_owned()),
+            more => details.push(format!(
+                "{more} more titles are asked about after this one."
+            )),
+        }
+        self.ask_store_question(
+            "Replace this entry?",
+            "Yes to all",
+            details,
+            Some(("No", "Yes")),
+        );
+    }
+
+    /// One of the store's questions: `rows`, when given, the alternate and
+    /// further labels of a title the notebook holds. A window without room
+    /// for it gives the store up.
+    fn ask_store_question(
+        &mut self,
+        title: &str,
+        confirm: &str,
+        details: Vec<String>,
+        rows: Option<(&str, &str)>,
+    ) {
+        self.dialog_revision += 1;
+        let revision = self.dialog_revision;
+        let model = || {
+            let details: Vec<&str> = details.iter().map(String::as_str).collect();
+            let act = if rows.is_some() {
+                Act::ReplaceAll
+            } else {
+                Act::ImportRest
+            };
+            let model = Model::new(title, confirm, &details, act, revision)?;
+            match rows {
+                Some((alternate, further)) => model
+                    .with_alternate(alternate, Act::Keep)?
+                    .with_further(further, Act::ReplaceOne),
+                None => Ok(model),
+            }
+        };
+        // Each question opens away from the pointer where the window has
+        // room: the second click of a double-click on Yes would otherwise
+        // answer the next one.
+        if self.open_dialog(&model, None, self.pointer) || self.open_dialog(&model, None, None) {
+            self.say(match rows {
+                Some(_) => "Replace the notebook's entry with the password store's?",
+                None => "Some entries cannot be imported",
+            });
+        } else {
+            let status = self.status.clone();
+            self.abandon_store(&format!("{status}; nothing was imported"));
+        }
+    }
+
+    /// The answer to one of the store's questions.
+    fn store_answer(&mut self, act: Act) {
+        let Some(store) = self.store.as_mut() else {
+            return;
+        };
+        match act {
+            Act::ImportRest => store.rest = true,
+            Act::Keep => store.replace.push(false),
+            Act::ReplaceOne => store.replace.push(true),
+            Act::ReplaceAll => {
+                store.all = true;
+                store.replace.push(true);
+            }
+            _ => return,
+        }
+        self.ask_store();
+    }
+
+    /// Sends the answers: one save of every new title and each one the
+    /// person said to replace.
+    fn import_store(&mut self) {
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let count = store.found - store.replace.iter().filter(|replace| !**replace).count();
+        if count == 0 {
+            self.out
+                .push(Out::Send(Command::DropStore { op: store.read }));
+            return self.say(if store.found == 0 {
+                "Nothing was imported"
+            } else {
+                "Nothing was imported: every title was kept"
+            });
+        }
+        let op = self.op();
+        self.out.push(Out::Send(Command::ImportStore {
+            op,
+            read: store.read,
+            replace: store.replace,
+        }));
+        self.busy = Some(Busy::ImportStore(op));
+        self.say(match count {
+            1 => "Importing 1 entry".to_owned(),
+            count => format!("Importing {count} entries"),
+        });
+    }
+
+    /// Gives the store read up: the thread drops it, and nothing is
+    /// imported.
+    pub(super) fn abandon_store(&mut self, status: &str) {
+        if let Some(store) = self.store.take() {
+            self.out
+                .push(Out::Send(Command::DropStore { op: store.read }));
+            self.say(status);
+        }
+    }
+
+    /// The import is saved: the list shows the notebook's entries now,
+    /// and the open entry, when it was replaced and has no unsaved edits,
+    /// is read again.
+    fn imported(
+        &mut self,
+        op: Op,
+        entries: Vec<Item>,
+        (created, replaced, kept): (usize, usize, usize),
+    ) {
+        if !matches!(self.busy, Some(Busy::ImportStore(o)) if o == op) {
+            return;
+        }
+        self.busy = None;
+        let dirty = self.dirty();
+        let Some(notebook) = self.notebook() else {
+            return;
+        };
+        notebook.entries = entries;
+        let reread = notebook.open.as_ref().and_then(|open| {
+            let id = open.id?;
+            let now = notebook.entries.iter().find(|item| item.id == id)?;
+            (now.revision != open.revision).then_some(id)
+        });
+        if let Some(id) = reread.filter(|_| !dirty) {
+            notebook.reading = Some(id);
+            self.out.push(Out::Send(Command::Read { id }));
+        }
+        self.refilter(None);
+        let mut parts = vec![format!("Imported: {created} new")];
+        if replaced > 0 {
+            parts.push(format!("{replaced} replaced"));
+        }
+        if kept > 0 {
+            parts.push(format!("{kept} kept as they were"));
+        }
+        let mut status = parts.join(", ");
+        if reread.is_some() && dirty {
+            status.push_str("; the open entry was replaced under its unsaved edits");
+        }
+        self.say(status);
     }
 
     /// Gives up the open entry's unsaved changes: its document closes and
@@ -2035,6 +2397,7 @@ impl App {
         self.prompt = None;
         self.dialog = None;
         self.chooser = None;
+        self.store = None;
         self.paste = None;
         self.drag = None;
         self.deferred = None;
@@ -2105,6 +2468,10 @@ const SWAP_RISK: &str = "Turning swap off does not erase what was written. Anyon
 /// The most devices the swap question lists one by one; the kernel
 /// allows fewer.
 const SWAP_DEVICES: usize = 64;
+
+/// The most entries that cannot be imported the store's question lists
+/// one by one.
+const STORE_SKIPPED: usize = 200;
 
 /// The most characters of a device's name the question shows.
 const SWAP_NAME: usize = 512;

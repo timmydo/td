@@ -35,6 +35,7 @@ const FILES: &[&str] = &[
     "mode.rs",
     "plain.rs",
     "protocol.rs",
+    "store.rs",
     "window.rs",
 ];
 
@@ -200,7 +201,7 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     for &name in FILES {
         if !matches!(
             name,
-            "main.rs" | "window.rs" | "files.rs" | "backend/fixture.rs"
+            "main.rs" | "window.rs" | "files.rs" | "store.rs" | "backend/fixture.rs"
         ) {
             assert!(!source(name).contains("std::fs"), "{name}");
         }
@@ -266,8 +267,9 @@ fn only_the_backend_holds_the_vault_and_only_the_window_the_compositor() {
     assert!(backend.contains("crate::files::write_copy(&folder, &name, &bytes)"));
     assert!(backend.contains("crate::files::read_copy(&path, pass::MAX_COPY)"));
     let window = source("window.rs");
-    assert_eq!(window.matches("files::").count(), 2);
+    assert_eq!(window.matches("files::").count(), 3);
     assert!(window.contains("crate::files::start_folder"));
+    assert!(window.contains("crate::files::store_folder()"));
     assert!(window.contains("crate::files::list_folder(&folder, ceiling)"));
     for &name in FILES {
         if !matches!(name, "backend.rs" | "window.rs" | "main.rs" | "files.rs") {
@@ -331,6 +333,85 @@ fn every_entry_document_is_held_to_the_vault_policy() {
         "self.paste = None",
     ] {
         assert!(body.contains(step), "lock skips {step}");
+    }
+}
+
+/// A password store is read only by `src/store.rs`, for the vault's
+/// thread, and only it starts a process: the account's `gpg`, with fixed
+/// arguments, the entry's file on its input, read here without following
+/// a link, its output read to a bound and its errors discarded. It
+/// writes nothing, and puts nothing in argv or the environment.
+#[test]
+fn only_the_store_reader_runs_gpg_and_it_writes_nothing() {
+    for &name in FILES {
+        let text = production(name);
+        if name != "store.rs" {
+            assert!(!text.contains("Command::new"), "{name}");
+            assert!(!text.contains(".spawn()"), "{name}");
+            if name != "backend.rs" {
+                assert!(!text.contains("store::"), "{name}");
+            }
+        }
+        if !matches!(name, "store.rs" | "main.rs") {
+            assert!(!text.contains("std::process"), "{name}");
+        }
+    }
+    // The binary names std::process only for its exit code.
+    let main = production("main.rs");
+    assert_eq!(main.matches("std::process").count(), 1);
+    assert!(main.contains("use std::process::ExitCode;"));
+    let store = production("store.rs");
+    assert_eq!(store.matches("Command::new(").count(), 1);
+    assert_eq!(store.matches(".args(").count(), 1);
+    assert!(store.contains("let mut command = Command::new(\"gpg\");\n        command.args(GPG);"));
+    assert!(store.contains("const GPG: &[&str] = &[\"--quiet\", \"--batch\", \"--decrypt\"];"));
+    assert_eq!(store.matches(".spawn()").count(), 1);
+    assert!(store.contains(".stdin(Stdio::from(file))"));
+    assert!(store.contains(".stderr(Stdio::null())"));
+    assert!(store.contains(".take(MAX_BODY as u64 + 1)"));
+    assert!(store.contains("Vec::with_capacity(MAX_BODY + 1)"));
+    assert_eq!(store.matches("OpenOptions::new()").count(), 1);
+    assert!(store.contains(".read(true)\n        .custom_flags(NOFOLLOW_NONBLOCK)"));
+    for denied in [
+        ".arg(",
+        ".env(",
+        ".envs(",
+        ".current_dir(",
+        ".write(",
+        "fs::write",
+        "File::create",
+        "fs::copy",
+        "remove_file",
+        "remove_dir",
+        "rename(",
+        "set_permissions",
+        "create_dir",
+        "hard_link",
+        "unix::fs::symlink",
+        "Command::new(\"sh\")",
+        "td_secret",
+        "std::fs as",
+        "as OpenOptions",
+    ] {
+        assert!(!store.contains(denied), "store.rs names {denied}");
+    }
+    // The vault's thread reads a store through it once, under the job's
+    // cancel, and names it for the store's types alone.
+    let backend = production("backend.rs");
+    assert_eq!(backend.matches("store::read(").count(), 1);
+    assert!(backend.contains("let stop = || cancel.cancelled();"));
+    assert!(backend.contains("crate::store::read(&folder, &admit, &stop, &mut progress)"));
+    for (at, _) in backend.match_indices("store::") {
+        let rest = &backend[at + "store::".len()..];
+        assert!(
+            ["read(", "Found", "Store", "Stop::"]
+                .iter()
+                .any(|name| rest.starts_with(name)),
+            "backend.rs names store::{}",
+            &rest[..rest
+                .find(|c: char| !c.is_alphanumeric() && c != ':')
+                .unwrap_or(0)]
+        );
     }
 }
 

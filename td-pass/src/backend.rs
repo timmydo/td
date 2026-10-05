@@ -15,14 +15,19 @@ use td_secret::pass;
 
 use crate::plain::{Bytes, Text};
 use crate::protocol::{
-    Answer, Ask, Change, Command, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse, Reply, Role,
+    Answer, Ask, Change, Command, EntryId, Failure, HostEvent, Item, KeyLabel, Keys, Op, PinUse,
+    Reply, Role,
 };
 
 #[cfg(feature = "test-vault")]
 mod fixture;
 
-// The window offers no copy larger than td-secret reads.
+// The window offers no copy larger than td-secret reads, and a store
+// is read to td-secret's bounds.
 const _: () = assert!(crate::protocol::MAX_COPY == pass::MAX_COPY);
+const _: () = assert!(crate::protocol::MAX_ENTRIES == pass::MAX_ENTRIES);
+const _: () = assert!(crate::protocol::MAX_TITLE == pass::MAX_TITLE);
+const _: () = assert!(crate::protocol::MAX_BODY == pass::MAX_BODY);
 
 struct Job {
     command: Command,
@@ -75,7 +80,9 @@ impl Client {
         | Command::ReplaceKeys { op, .. }
         | Command::Export { op, .. }
         | Command::ReadCopy { op, .. }
-        | Command::Import { op, .. } = command
+        | Command::Import { op, .. }
+        | Command::ReadStore { op, .. }
+        | Command::ImportStore { op, .. } = command
         {
             self.current = Some((op, cancel.clone()));
         }
@@ -231,6 +238,9 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
     let mut copy: Option<(Vec<u8>, Vec<pass::Key>)> = None;
     // The swap the window last asked about, accepted only by `AcceptSwap`.
     let mut risk: Option<pass::SwapRisk> = None;
+    // A password store read for import, by its read's number, until
+    // imported or given up.
+    let mut staged: Option<(Op, Staged)> = None;
     while let Ok(Job { command, cancel }) = jobs.recv() {
         let reply = match command {
             Command::Open => open(None, &mut host, &mut keys, &mut risk),
@@ -393,10 +403,73 @@ fn serve(jobs: &Receiver<Job>, answers: &Receiver<(Op, Answer)>, replies: &Sende
                     (None, _) => closed(op),
                 }
             }
+            Command::ReadStore { op, folder } => {
+                staged = None;
+                match vault.as_ref() {
+                    Some(vault) => {
+                        let mut progress = |done, total| {
+                            let _ = replies.send(Reply::Reading { op, done, total });
+                        };
+                        let admit = |titles: &[&str]| room(vault, titles);
+                        let stop = || cancel.cancelled();
+                        let read = crate::store::read(&folder, &admit, &stop, &mut progress);
+                        match read {
+                            Ok(store) => {
+                                let read = stage(vault, store);
+                                let reply = Reply::Store {
+                                    op,
+                                    found: read.0.found.len(),
+                                    held: read.1,
+                                    skipped: read.2,
+                                };
+                                staged = Some((op, read.0));
+                                reply
+                            }
+                            Err(crate::store::Stop::Cancelled) => cancelled(op),
+                            Err(crate::store::Stop::Failed(text)) => refused(op, &text),
+                        }
+                    }
+                    None => closed(op),
+                }
+            }
+            Command::ImportStore { op, read, replace } => match (host.as_mut(), vault.as_mut()) {
+                (Some(host), Some(vault)) => match staged.take() {
+                    Some((staged_by, store))
+                        if staged_by == read && store.held.len() == replace.len() =>
+                    {
+                        let (changes, counts) = changes(store, &replace);
+                        match host.apply_all(vault, changes, &cancel) {
+                            Ok(_) => Reply::Imported {
+                                op,
+                                entries: items(vault),
+                                created: counts.0,
+                                replaced: counts.1,
+                                kept: counts.2,
+                            },
+                            Err(failure) => failed(op, &failure),
+                        }
+                    }
+                    Some(_) => refused(op, "the answers do not match the store read"),
+                    None => refused(op, "no password store is read for import"),
+                },
+                _ => closed(op),
+            },
+            // Nothing answers: the window has moved on. A later read's
+            // store is not the one given up.
+            Command::DropStore { op } => {
+                if staged
+                    .as_ref()
+                    .is_some_and(|(staged_by, _)| *staged_by == op)
+                {
+                    staged = None;
+                }
+                continue;
+            }
             Command::Lock => {
                 vault = None;
                 enrolled.clear();
                 copy = None;
+                staged = None;
                 match host.as_ref().map(pass::Host::keys) {
                     Some(Ok(listed)) => Reply::Locked {
                         keys: labels(&mut keys, listed),
@@ -482,6 +555,92 @@ fn role(role: pass::KeyRole) -> Role {
     }
 }
 
+/// A password store read for import: its entries, and of them those
+/// whose title the notebook holds, each with that entry's identity and
+/// the revision read.
+struct Staged {
+    found: Vec<crate::store::Found>,
+    held: Vec<(usize, EntryId, u64)>,
+}
+
+/// Whether `vault` has room for the titles of a store not already its
+/// own, asked before any entry is decrypted.
+fn room(vault: &pass::Vault, titles: &[&str]) -> Result<(), String> {
+    let have = vault.entries().len();
+    let new = titles
+        .iter()
+        .filter(|title| !vault.entries().any(|entry| entry.title == **title))
+        .count();
+    if have + new > pass::MAX_ENTRIES {
+        return Err(format!(
+            "the notebook holds {have} entries and the store brings {new} new ones, more \
+             than its {}",
+            pass::MAX_ENTRIES
+        ));
+    }
+    Ok(())
+}
+
+/// Keeps `store` for import, naming to the window the titles `vault`
+/// already holds and the entries skipped.
+fn stage(
+    vault: &pass::Vault,
+    store: crate::store::Store,
+) -> (Staged, Vec<Text>, Vec<(Text, &'static str)>) {
+    let mut held = Vec::new();
+    let mut titles = Vec::new();
+    for (index, found) in store.found.iter().enumerate() {
+        let title = found.title.as_str();
+        if let Some(entry) = vault.entries().find(|entry| entry.title == title) {
+            held.push((index, entry.id, entry.revision));
+            titles.push(found.title.clone());
+        }
+    }
+    let skipped = store
+        .skipped
+        .into_iter()
+        .map(|skipped| (skipped.title, skipped.reason))
+        .collect();
+    let staged = Staged {
+        found: store.found,
+        held,
+    };
+    (staged, titles, skipped)
+}
+
+/// The changes importing `store` makes: a creation for each new title,
+/// and for each held one an edit `replace` asks for, else nothing; with
+/// how many are created, replaced and kept.
+fn changes(store: Staged, replace: &[bool]) -> (Vec<pass::Change>, (usize, usize, usize)) {
+    let mut changes = Vec::with_capacity(store.found.len());
+    let mut counts = (0, 0, 0);
+    let mut held = store.held.iter().zip(replace).peekable();
+    for (index, found) in store.found.into_iter().enumerate() {
+        let decided = held.next_if(|((at, ..), _)| *at == index);
+        match decided {
+            Some(((_, id, base), true)) => {
+                counts.1 += 1;
+                changes.push(pass::Change::Edit {
+                    id: *id,
+                    base: *base,
+                    title: found.title.take(),
+                    body: found.body.take(),
+                });
+            }
+            // Kept: its text is cleared as it drops.
+            Some((_, false)) => counts.2 += 1,
+            None => {
+                counts.0 += 1;
+                changes.push(pass::Change::Create {
+                    title: found.title.take(),
+                    body: found.body.take(),
+                });
+            }
+        }
+    }
+    (changes, counts)
+}
+
 fn items(vault: &pass::Vault) -> Vec<Item> {
     vault
         .entries()
@@ -527,6 +686,19 @@ fn failed(op: Op, failure: &pass::Failure) -> Reply {
             stale: failure.stale(),
             uncertain: failure.uncertain(),
             cancelled: failure.cancelled(),
+        },
+    }
+}
+
+/// An operation the window cancelled before td-secret was asked.
+fn cancelled(op: Op) -> Reply {
+    Reply::Failed {
+        op,
+        failure: Failure {
+            text: "cancelled".to_owned(),
+            stale: false,
+            uncertain: false,
+            cancelled: true,
         },
     }
 }
@@ -747,6 +919,87 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn store_commands_without_an_open_notebook_are_refused_and_drop_answers_nothing() {
+        let (jobs, job_rx) = mpsc::channel();
+        let (_answers, answer_rx) = mpsc::channel();
+        let (reply_tx, replies) = mpsc::channel();
+        for command in [
+            Command::ReadStore {
+                op: 1,
+                folder: std::env::temp_dir(),
+            },
+            Command::DropStore { op: 1 },
+            Command::ImportStore {
+                op: 2,
+                read: 1,
+                replace: Vec::new(),
+            },
+        ] {
+            jobs.send(Job {
+                command,
+                cancel: pass::Cancel::new(),
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        serve(&job_rx, &answer_rx, &reply_tx);
+        for expected in 1..=2 {
+            match replies.try_recv() {
+                Ok(Reply::Failed { op, failure }) => {
+                    assert_eq!(op, expected);
+                    assert_eq!(failure.text, "the notebook is not open");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(replies.try_recv().is_err());
+    }
+
+    fn found(title: &str) -> crate::store::Found {
+        crate::store::Found {
+            title: Text::new(title.to_owned()),
+            body: Text::new(format!("{title} text")),
+        }
+    }
+
+    #[test]
+    fn an_import_creates_new_titles_and_replaces_only_those_answered_yes() {
+        let staged = || Staged {
+            found: vec![found("a"), found("b"), found("c"), found("d")],
+            held: vec![(1, [1; 16], 3), (3, [3; 16], 1)],
+        };
+        let shape = |changes: &[pass::Change]| {
+            changes
+                .iter()
+                .map(|change| match change {
+                    pass::Change::Create { title, body } => {
+                        format!("create {title} {body}")
+                    }
+                    pass::Change::Edit {
+                        id,
+                        base,
+                        title,
+                        body,
+                    } => format!("edit {} {base} {title} {body}", id[0]),
+                    _ => panic!("only creations and edits"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let (made, counts) = changes(staged(), &[false, true]);
+        assert_eq!(
+            shape(&made),
+            ["create a a text", "create c c text", "edit 3 1 d d text"]
+        );
+        assert_eq!(counts, (2, 1, 1));
+        let (made, counts) = changes(staged(), &[true, false]);
+        assert_eq!(
+            shape(&made),
+            ["create a a text", "edit 1 3 b b text", "create c c text"]
+        );
+        assert_eq!(counts, (2, 1, 1));
     }
 
     #[test]

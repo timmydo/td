@@ -20,6 +20,7 @@ pub const NOTEBOOK: &[&str] = &[
     "Save",
     "Find",
     "Keys",
+    "Import",
     "Lock",
     td_ui::keys::BUTTON,
     QUIT,
@@ -33,8 +34,8 @@ pub const KEYS: &[&str] = &[
     td_ui::keys::BUTTON,
     QUIT,
 ];
-pub const LOCKED: &[&str] = &["Unlock", "Create", "Import", td_ui::keys::BUTTON, QUIT];
-pub const IMPORT: &[&str] = &["Import", "Cancel", td_ui::keys::BUTTON, QUIT];
+pub const LOCKED: &[&str] = &["Unlock", "Create", "Restore", td_ui::keys::BUTTON, QUIT];
+pub const IMPORT: &[&str] = &["Restore", "Cancel", td_ui::keys::BUTTON, QUIT];
 pub const PRESENT: [&str; 2] = ["Continue", "Cancel"];
 pub const PIN: [&str; 2] = ["OK", "Cancel"];
 
@@ -132,16 +133,17 @@ pub fn enrolled(surface: Surface) -> Option<List> {
     listing(surface, KEYS)
 }
 
-/// The keys an encrypted copy opens with, laid out as the locked view.
+/// The keys an encrypted copy to restore opens with, laid out as the
+/// locked view.
 pub fn copy_keys(surface: Surface) -> Option<List> {
     listing(surface, IMPORT)
 }
 
-/// The finder: the body under the strip it was opened from, the locked
-/// view's for an import and the keys view's for an export, a cell in
-/// from each side.
-pub fn finder(surface: Surface, import: bool) -> Rect {
-    let body = body(surface, if import { LOCKED } else { KEYS });
+/// The finder: the body under the strip `labels` it was opened from,
+/// the locked view's to restore, the keys view's to export and the
+/// notebook's to import a password store, a cell in from each side.
+pub fn finder(surface: Surface, labels: &'static [&'static str]) -> Rect {
+    let body = body(surface, labels);
     let cell = cell(surface);
     rect(
         cell,
@@ -242,6 +244,9 @@ pub const CREATE_ROWS: i64 = 13;
 /// The swap question's rows: at 800x600 the body's height, so all it says
 /// shows without scrolling.
 pub const SWAP_ROWS: i64 = 22;
+/// A password store's questions' rows: the title, a title the notebook
+/// holds with what each answer does, and four actions.
+pub const STORE_ROWS: i64 = 14;
 
 /// Where the confirmation dialog may go, in the order to try it: centred,
 /// then at the top and the bottom of the body, so its actions can be kept

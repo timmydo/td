@@ -12,8 +12,9 @@ backup YubiKeys, authentication, migration and recovery.
 
 The left pane contains a search field and a scrollable list of entry titles.
 The right pane contains the selected title and a multiline text editor.
-New, Rename, Delete, Save and Lock are visible operations; key management
-and encrypted import/export are available without occupying the text area.
+New, Rename, Delete, Save and Lock are visible operations; key management,
+an encrypted copy's export and restore, and a password store's import are
+available without occupying the text area.
 The status row distinguishes locked, unlocked, saving, saved, unsaved and
 failed operations. Failure text contains no password, PIN or token output.
 
@@ -28,9 +29,10 @@ editor navigation, undo/redo, selection, find and keyboard profiles remain
 available. Only titles participate in sidebar search initially.
 
 Unlock explicitly authorizes a bounded notebook session for browsing and
-saving, until it locks. Entry selection, copy and Save do not request
-repeated token touches. Protector changes and import follow td-secret's
-fresh-operation authorization contract. Switching away from a dirty
+saving, until it locks. Entry selection, copy, Save and a password
+store's import do not request repeated token touches. Protector changes
+and restoring an encrypted copy follow td-secret's fresh-operation
+authorization contract. Switching away from a dirty
 entry, closing the window or explicitly locking asks Save / Discard /
 Cancel; failed Save keeps the document dirty. Save captures an immutable
 entry revision and reports success only after durable publication. A
@@ -65,7 +67,11 @@ its history. Complete the planned text-entry and list widgets in td-ui;
 do not fork the editor or add another Wayland transport or renderer. No
 plaintext file-save adapter, arbitrary Open/Save As path, spelling worker,
 external editor, editor control socket, plugin or shell command reaches
-vault contents.
+vault contents. The one program td-pass starts besides its own token
+worker is the account's `gpg`, to import a password store: it reads an
+entry's ciphertext and writes the entry's text back to td-pass, and sees
+no vault content, key or PIN. No password store or `gpg` is needed to
+use the notebook.
 
 The notebook speaks only td-secret's entry and lifecycle API. On td it
 uses the admitted service and holds no vault key. Standalone mode runs
@@ -115,7 +121,8 @@ mode.
   it carried. Lock cancels the operation's `pass::Cancel` and declines
   the prompt it may wait on, then drops the vault.
 - **Window state.** `src/app/` is the notebook as td-ui widgets: the
-  action strip (New, Rename, Delete, Save, Find, Keys, Lock, Help, Quit),
+  action strip (New, Rename, Delete, Save, Find, Keys, Import, Lock, Help,
+  Quit),
   the search field over the title list, the title field over the editor
   pane, and the status row. Every strip, locked or unlocked, ends with
   Help (td-ui's `keys::BUTTON`), then Quit, and both answer over an open
@@ -172,7 +179,7 @@ mode.
   (td-ui/DESIGN.md, "Key list"): a section each for the prompt, a
   question, the finder, the swap screen, the window while nothing is
   open (opening, locking or refused), the locked view, a copy being
-  imported, the keys view, the notebook's shortcuts and each focus,
+  restored, the keys view, the notebook's shortcuts and each focus,
   listed beside the input code in `src/app/input.rs` and spelled as
   td-ui's keymap spells chords, which `keys::check` holds in every phase
   and focus. The sections for what has the keyboard now come first;
@@ -186,16 +193,69 @@ mode.
   new file, mode 0600, never written over an existing file, synced, and
   its folder synced where the folder allows it. A failed write empties
   the partial copy and removes its name only while that name is still
-  the file made. On an account holding no notebook, Import (Ctrl+O)
+  the file made. On an account holding no notebook, Restore (Ctrl+O)
   opens the finder on files, offering only those no larger than a copy
   can be. The vault thread checks that the chosen path is a file, opens
   it without waiting on a FIFO, reads it to that bound and lists the
-  keys it opens with; the copy is imported with the one chosen, through
+  keys it opens with; the copy is restored with the one chosen, through
   the prompt, and td-secret authenticates it whole before placing it.
   Folders are listed on a thread of their own, to the finder's bounds,
   so a slow folder never holds the window; Ctrl+L, or a press outside
   the finder, closes it and acts. Only ciphertext and listings cross
   `src/files.rs`.
+- **Password store.** In the open notebook Import (Ctrl+O), after the
+  unsaved-changes question, opens td-ui's finder on folders, starting at
+  `pass`'s store: `$PASSWORD_STORE_DIR` when it is an absolute folder,
+  else `~/.password-store` when that is one, since the finder lists no
+  hidden name; Ctrl+Return reads the listed folder. `src/store.rs`, on
+  the vault thread, walks it, the chosen folder itself followed when it
+  is a link, as a store kept in a synchronized folder often is, and no
+  link below it; past `.git` and `.extensions` as `pass` does, at most
+  32 folders deep and 65,536 names examined. It takes each `*.gpg` file
+  as an entry titled by its path under the store less `.gpg`. A title
+  the notebook cannot take, a name not UTF-8, a link, another kind of
+  file and a folder that cannot be read are skipped with why. Before
+  anything is decrypted the vault thread refuses a store whose new
+  titles would take the notebook past its 1024 entries; the 4 MiB
+  plaintext bound is td-secret's to refuse at the save. Each entry, in
+  title order, is opened here without following a link or waiting on a
+  FIFO, bounded at four times a body, and given as standard input to the
+  account's `gpg --quiet --batch --decrypt`, found on `PATH`, whose
+  agent asks for the key's passphrase or card itself; its errors are
+  discarded, its output read on a thread of its own into a buffer
+  allocated whole to one byte past a body and handed back in a clearing
+  owner, so text a cancel overtakes is cleared too. It is kept, copied
+  to its own size and the buffer cleared, only when gpg succeeds and it
+  is UTF-8 within the bound; else the entry is skipped and its bytes
+  cleared. A gpg that cannot start, that fails on two entries before
+  decrypting any, since the key is then what is wrong, or that leaves
+  its output open after it exits stops the import. The status counts the
+  entries read; Escape in the notebook, Lock, a host lock or quitting
+  cancels, the walk between names and a decryption by killing its gpg;
+  whether a pinentry gpg-agent opened closes with it is GnuPG's. The
+  thread keeps what it read, by the read's number, in clearing owners,
+  and names to the window the skipped entries and, in order, the titles
+  the notebook already holds. A read that finishes under the question to
+  lock or quit is given up for it, and the question asked again now that
+  Save is possible. Otherwise the window asks first whether to import
+  the rest when any are skipped, listing each with why, a name's control
+  characters escaped, then about each held title in turn, each question
+  opening away from the pointer where the window has room, so a
+  double-click answers only one: Yes replaces the entry's text with the
+  store's, No keeps the notebook's, Yes to all replaces it and every
+  later one, and Cancel, or the question closing any other way, imports
+  nothing and drops what that read brought, and no later read's. With
+  every answer given the import is one td-secret batch save under the
+  session's unlock: a creation for each new title and an edit, against
+  the revision read, for each one to replace; all of it commits or none
+  of it does. The list then shows the notebook's entries, an open entry
+  that was replaced is read again unless it has unsaved edits, which the
+  status then says, and the status counts what was created, replaced and
+  kept. Nothing is written outside the vault, and the store is left as
+  it was. The store is the account's own: the reader does not pin its
+  folders against a writer renaming them while it reads, who could as
+  well put entries in it; what such a writer redirects is decrypted into
+  the vault, not shown to it.
 - **Prompt.** A presentation asks for the named key to be connected; a
   PIN request shows a masked field that refuses copy. The title names
   the operation and the instruction the key and what to do with it; a
@@ -216,7 +276,7 @@ mode.
 - - - **Host lock.** The window watches the host's screen lock and sleep
   through td-secret's `pass::HostEvents` (`td-secret/PORTABLE.md`), on a
   thread of its own so a slow system bus never holds it; unlock, create
-  and import wait until the watch has started or its failure has been
+  and restore wait until the watch has started or its failure has been
   told. A screen lock, sleep, or the events being lost locks at once
   without the unsaved-changes question: the operation in flight is
   cancelled, every edit is given up, and the vault thread is told to
@@ -227,9 +287,10 @@ mode.
   than logind's default maximum. The locked status says why it locked,
   and the next unlock says, once and without keeping either, that
   unsaved edits were given up (during a save, only edits made since it
-  was sent) or that a save, delete, key change, creation or import under
-  way may have been stopped. Before the first editing session the locked
-  view says that a screen lock or sleep locks the notebook too; while
+  was sent) or that a save, delete, key change, creation, restore or a
+  password store's import under way may have been stopped. Before the
+  first editing session the locked view says that a screen lock or
+  sleep locks the notebook too; while
   the watch starts, that unlocking waits for it; on a host whose events
   cannot be watched, or are lost, to lock the notebook before leaving
   it, with the reason in the status, where a narrow row may cut it.
@@ -259,11 +320,26 @@ seams with the list and the search field with and without an entry and
 finding, a pane too short for a row keeping its lower bezel under the
 placeholder and an open entry, and painting the notebook, its keys view,
 its prompt and dialogs and each locked view, export into the folder the
-finder accepts, import of a chosen copy with one of its keys, a copy
+finder accepts, restoring a chosen copy with one of its keys, a copy
 given up or unread, the finder painted, filtered and closed by Ctrl+L or
-the strip's Lock, a listing for a closed finder dropped, a host lock or
+the strip's Lock, a listing for a closed finder dropped, a password
+store read from the folder the finder starts on and accepts, by Ctrl+O
+and the strip's Import, its progress, a question for each title the
+notebook holds whose No, Yes and Yes to all send exactly those answers,
+a store all of whose titles are new imported without asking, an empty
+store and one whose every title is kept importing nothing, the skipped
+entries shown first with a name's control character escaped, Cancel,
+closing or a host lock over a question dropping what was read, Escape
+or Lock cancelling the read and a read that answers late dropped by its
+number, a read finishing under the question to lock given up for it
+and the question asked again with Save, the next question opening away
+from the pointer that answered, and in a window too short for that
+still opening with the answer kept, unsaved
+edits asked about first, a replaced open entry read again and one with
+unsaved edits kept and said so, a refused import's reason, and the
+questions painted and held at 320 pixels, a host lock or
 sleep that asks nothing and is reported at the next unlock, closes a
-question and gives up a copy being imported, sleep during a save and an
+question and gives up a copy being restored, sleep during a save and an
 edit made after it was sent, a host lock during an unlock or a key
 change, no second lock while locking, nothing locked while nothing is
 held, unlocking waiting for the watch, a warning waiting behind a prompt
@@ -271,18 +347,38 @@ and keeping why it locked, and the warnings for a host not watched, not
 delaying sleep, or lost. The vault thread's tests pin that a prompt
 takes only its operation's answer, that cancel declines once and that a
 key command without an open notebook is refused, as are a copy that
-cannot be read and an export or import without a notebook; the files'
-tests that a copy is written new and private, never over another, and
-read to its bound, and how folders are listed; the frame directory's,
-the mount table's rules. Confinement tests pin the source inventory,
+cannot be read, an export or restore and a store's read or import
+without a notebook, that dropping a store answers nothing, and that an
+import creates each new title and edits, against the revision read,
+only the held titles answered Yes; the files' tests that a copy is
+written new and private, never over another, and read to its bound,
+and how folders are listed; the store reader's, that titles are paths
+under the store in order with `pass`'s folders pruned and links not
+followed, that a linked store is read, that a folder that cannot be
+read, where the test's account cannot, and names not UTF-8 are
+skipped, that a name the notebook cannot take is skipped and a store
+past its entries refused, that a cancel ends the walk, that a store
+the notebook has no room for decrypts nothing, that each entry is
+decrypted from its file to its body by a stand-in gpg run through `sh`
+where the host has one, that a link put in an entry's place is not
+followed, that text too large or not UTF-8 is skipped, that failures
+before any success stop the import, that a gpg leaving its output open
+stops it, and that a missing gpg stops it and a cancel ends a
+decryption in flight; the frame directory's, the mount table's
+rules. Confinement tests pin the source inventory,
 that pure files reach no system, vault or compositor and only the
 toolkit's drawing, widget and editor modules, that td-secret is named
 only by the vault thread's file, for the vault and the host's events,
 and the worker dispatch, the two reads the window makes itself, that it
 lists folders only through `src/files.rs`, that pure files call no path
 method that reaches the file system, that copies are written and read
-only through `src/files.rs` in those ways, the vault-document policy,
-and that the test vault below is built only by its feature.
+only through `src/files.rs` in those ways, that only `src/store.rs`
+starts a process, the one `gpg` with its one set of fixed arguments,
+the entry's file on its input, its output bounded and its errors
+discarded, that it writes nothing and sets no argument or environment
+beside them, and that the vault thread reads a store through it once
+under the job's cancel, the vault-document policy, and that the test
+vault below is built only by its feature.
 
 Native compositor cases run the binary under a real headless
 td-compositor and type through its seat

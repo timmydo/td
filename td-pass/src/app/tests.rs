@@ -1434,7 +1434,7 @@ fn the_strips_buttons_reach_the_keys_view_and_its_actions() {
     click_button(&mut app, &mut board, layout::KEYS, 0);
     assert!(!notebook(&app).keys.showing);
     assert_eq!(notebook(&app).keys.marked, vec![false, false]);
-    click_button(&mut app, &mut board, layout::NOTEBOOK, 6);
+    click_button(&mut app, &mut board, layout::NOTEBOOK, 7);
     assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
 }
 
@@ -1917,7 +1917,7 @@ fn the_strips_lock_is_not_held_back_by_the_finder() {
         None,
     );
     // A press inside the finder is the finder's.
-    let inside = layout::finder(app.surface, false);
+    let inside = layout::finder(app.surface, layout::KEYS);
     press(
         &mut app,
         &mut board,
@@ -2836,4 +2836,543 @@ fn the_key_list_passes_the_check_in_every_phase_and_focus() {
         key(&mut app, &mut board, chord);
     }
     checked(&app);
+}
+
+// A password store's import.
+
+const STORE: &str = "/home/u/.password-store";
+
+/// Opens the finder on the password store from the notebook, by `how`,
+/// and reads the listed folder: the read's operation.
+fn read_store(app: &mut App, board: &mut Board, how: &str) -> Op {
+    match how {
+        "strip" => click_button(app, board, layout::NOTEBOOK, 6),
+        chord => key(app, board, chord),
+    }
+    match app.take_out().into_iter().next() {
+        Some(Out::List {
+            folder: None,
+            files: false,
+            store: true,
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    app.listed(
+        chooser_id(app),
+        PathBuf::from(STORE),
+        Ok(listing(STORE, &["bank"], &[])),
+        None,
+    );
+    key(app, board, "C-Return");
+    assert!(app.chooser.is_none());
+    match &app.take_out()[..] {
+        [Out::Send(Command::ReadStore { op, folder })] => {
+            assert_eq!(folder, &PathBuf::from(STORE));
+            assert!(matches!(app.busy, Some(Busy::ReadStore(o)) if o == *op));
+            *op
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+fn texts(titles: &[&str]) -> Vec<Text> {
+    titles
+        .iter()
+        .map(|title| Text::new((*title).to_owned()))
+        .collect()
+}
+
+/// The open question's details, its wrapped rows joined.
+fn details(app: &App) -> String {
+    let (dialog, _) = app.dialog.as_ref().expect("a question");
+    (0..dialog.detail_rows())
+        .filter_map(|row| dialog.detail_text(row))
+        .collect()
+}
+
+/// Answers the open question with the action `tabs` Tabs from Cancel:
+/// for a title the notebook holds, 1 is No, 2 Yes and 3 Yes to all.
+fn answer(app: &mut App, board: &mut Board, tabs: usize) {
+    for _ in 0..tabs {
+        key(app, board, "Tab");
+    }
+    key(app, board, "Return");
+}
+
+/// The answers the import sent, and its operation.
+fn import_sent(app: &mut App) -> (Op, Vec<bool>) {
+    match app.take_out().into_iter().next() {
+        Some(Out::Send(Command::ImportStore { op, replace, .. })) => (op, replace),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn import_reads_the_store_and_asks_before_replacing_each_title_it_holds() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank"), item(2, "Mail")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Reading {
+        op,
+        done: 1,
+        total: 4,
+    });
+    assert_eq!(
+        app.status,
+        "Reading the password store: 1 of 4; Escape cancels"
+    );
+    app.reply(Reply::Store {
+        op,
+        found: 4,
+        held: texts(&["Bank", "Mail"]),
+        skipped: Vec::new(),
+    });
+    assert!(app.busy.is_none());
+    let asked = details(&app);
+    assert!(asked.starts_with("Bank"), "{asked}");
+    assert!(asked.contains("1 more title"), "{asked}");
+    // No keeps Bank; the next title is asked.
+    answer(&mut app, &mut board, 1);
+    assert!(app.take_out().is_empty());
+    assert!(details(&app).starts_with("Mail"));
+    assert!(!details(&app).contains("more title"));
+    // Yes replaces Mail, and with every answer given the import is sent.
+    answer(&mut app, &mut board, 2);
+    assert!(app.dialog.is_none());
+    let (op, replace) = import_sent(&mut app);
+    assert_eq!(replace, [false, true]);
+    assert_eq!(app.status, "Importing 3 entries");
+    let mut mail = item(2, "Mail");
+    mail.revision = 2;
+    app.reply(Reply::Imported {
+        op,
+        entries: vec![item(1, "Bank"), mail, item(3, "Shop"), item(4, "Web")],
+        created: 2,
+        replaced: 1,
+        kept: 1,
+    });
+    assert!(app.busy.is_none());
+    assert!(app.store.is_none());
+    let titles: Vec<_> = notebook(&app)
+        .entries
+        .iter()
+        .map(|item| item.title.as_str())
+        .collect();
+    assert_eq!(titles, ["Bank", "Mail", "Shop", "Web"]);
+    assert_eq!(notebook(&app).shown.len(), 4);
+    assert_eq!(
+        app.status,
+        "Imported: 2 new, 1 replaced, 1 kept as they were"
+    );
+}
+
+#[test]
+fn yes_to_all_replaces_every_later_title_and_the_strip_starts_an_import() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "a"), item(2, "b"), item(3, "c")]);
+    let op = read_store(&mut app, &mut board, "strip");
+    app.reply(Reply::Store {
+        op,
+        found: 3,
+        held: texts(&["a", "b", "c"]),
+        skipped: Vec::new(),
+    });
+    // Yes to all is Confirm, the last row; its rows stand in order.
+    let (dialog, _) = app.dialog.as_ref().unwrap();
+    let rows = [
+        confirmations::Focus::Cancel,
+        confirmations::Focus::Alternate,
+        confirmations::Focus::Further,
+        confirmations::Focus::Confirm,
+    ]
+    .map(|focus| dialog.action_rect(focus).unwrap().y);
+    assert!(rows.windows(2).all(|pair| pair[0] < pair[1]), "{rows:?}");
+    answer(&mut app, &mut board, 1);
+    answer(&mut app, &mut board, 3);
+    assert!(app.dialog.is_none());
+    assert_eq!(import_sent(&mut app).1, [false, true, true]);
+}
+
+#[test]
+fn a_store_whose_titles_are_all_new_imports_without_asking() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 2,
+        held: Vec::new(),
+        skipped: Vec::new(),
+    });
+    assert!(app.dialog.is_none());
+    assert_eq!(import_sent(&mut app).1, Vec::<bool>::new());
+    assert_eq!(app.status, "Importing 2 entries");
+    // A store with nothing in it imports nothing and keeps nothing.
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 0,
+        held: Vec::new(),
+        skipped: Vec::new(),
+    });
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::DropStore { .. })]
+    ));
+    assert_eq!(app.status, "The password store holds no entries");
+    // Keeping every title the notebook holds sends nothing to save.
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 1,
+        held: texts(&["Bank"]),
+        skipped: Vec::new(),
+    });
+    answer(&mut app, &mut board, 1);
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::DropStore { .. })]
+    ));
+    assert_eq!(app.status, "Nothing was imported: every title was kept");
+}
+
+#[test]
+fn entries_that_cannot_be_imported_are_shown_first_and_cancel_imports_nothing() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 2,
+        held: texts(&["Bank"]),
+        skipped: vec![
+            (Text::new("bin\nary".to_owned()), "its text is not UTF-8"),
+            (
+                Text::new("huge".to_owned()),
+                "its text is larger than an entry can be",
+            ),
+        ],
+    });
+    let shown = details(&app);
+    assert!(shown.starts_with("These 2 entries"), "{shown}");
+    // A control character in a name is shown escaped.
+    assert!(
+        shown.contains("bin\\nary: its text is not UTF-8"),
+        "{shown}"
+    );
+    assert!(shown.contains("The other 2 entries can be imported."));
+    // Import goes on to the title the notebook holds.
+    answer(&mut app, &mut board, 1);
+    assert!(details(&app).starts_with("Bank"));
+    // Cancel gives the store up.
+    key(&mut app, &mut board, "Escape");
+    assert!(app.dialog.is_none());
+    assert!(app.store.is_none());
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::DropStore { .. })]
+    ));
+    assert_eq!(app.status, "Import cancelled; nothing was imported");
+    // A store none of whose entries can be imported says so and drops.
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 0,
+        held: Vec::new(),
+        skipped: vec![(Text::new("x".to_owned()), "gpg could not decrypt it")],
+    });
+    assert!(details(&app).starts_with("This entry"));
+    answer(&mut app, &mut board, 1);
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::DropStore { .. })]
+    ));
+    assert_eq!(app.status, "Nothing was imported");
+}
+
+#[test]
+fn escape_or_lock_while_reading_cancels_and_a_late_read_is_dropped() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    key(&mut app, &mut board, "Escape");
+    assert!(matches!(app.take_out()[..], [Out::Cancel]));
+    assert!(app.busy.is_none());
+    assert_eq!(app.status, "Import cancelled; nothing was imported");
+    // A read that finished as it was cancelled is given up.
+    app.reply(Reply::Store {
+        op,
+        found: 1,
+        held: Vec::new(),
+        skipped: Vec::new(),
+    });
+    assert!(app.dialog.is_none());
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::DropStore { .. })]
+    ));
+    // Another import waits for an operation in flight.
+    read_store(&mut app, &mut board, "C-o");
+    key(&mut app, &mut board, "C-o");
+    assert!(app.take_out().is_empty());
+    assert_eq!(app.status, "Wait for the current operation to finish");
+    // Lock cancels the read and locks.
+    key(&mut app, &mut board, "C-l");
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Cancel, Out::Send(Command::Lock)]
+    ));
+}
+
+#[test]
+fn closing_or_a_host_lock_over_a_question_gives_the_store_up() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    let held = || Reply::Store {
+        op,
+        found: 1,
+        held: texts(&["Bank"]),
+        skipped: Vec::new(),
+    };
+    app.reply(held());
+    // The question takes the keyboard; the strip's Quit answers over it.
+    let labels = layout::NOTEBOOK;
+    click_button(&mut app, &mut board, labels, quit(labels));
+    assert!(app.store.is_none());
+    let out = app.take_out();
+    assert!(
+        matches!(
+            out[..],
+            [
+                Out::Send(Command::DropStore { .. }),
+                Out::Send(Command::Lock)
+            ]
+        ),
+        "{out:?}"
+    );
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 1,
+        held: texts(&["Bank"]),
+        skipped: Vec::new(),
+    });
+    app.host(HostEvent::Lock);
+    assert!(app.store.is_none());
+    assert!(app.dialog.is_none());
+    assert!(matches!(app.take_out()[..], [Out::Send(Command::Lock)]));
+}
+
+#[test]
+fn unsaved_edits_are_asked_about_and_a_replaced_open_entry_is_read_again() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "old");
+    key(&mut app, &mut board, "Return");
+    typed(&mut app, &mut board, "x");
+    key(&mut app, &mut board, "C-o");
+    assert!(matches!(app.dialog, Some((_, Some(Then::Import)))));
+    assert!(app.chooser.is_none());
+    // Discard, the alternate, gives the edits up and opens the finder.
+    answer(&mut app, &mut board, 1);
+    assert!(app.chooser.is_some());
+    key(&mut app, &mut board, "Escape");
+    app.take_out();
+    // With the entry open and clean, replacing it reads it again.
+    app.set_focus(Focus::List);
+    open(&mut app, &mut board, "Home", "old");
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 1,
+        held: texts(&["Bank"]),
+        skipped: Vec::new(),
+    });
+    answer(&mut app, &mut board, 2);
+    let (op, replace) = import_sent(&mut app);
+    assert_eq!(replace, [true]);
+    let mut bank = item(1, "Bank");
+    bank.revision = 2;
+    app.reply(Reply::Imported {
+        op,
+        entries: vec![bank],
+        created: 0,
+        replaced: 1,
+        kept: 0,
+    });
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::Read { id })] if id == [1; 16]
+    ));
+    assert_eq!(app.status, "Imported: 0 new, 1 replaced");
+}
+
+#[test]
+fn the_stores_questions_paint_and_fit_a_narrow_window() {
+    let font = td_ui::font::pinned().unwrap();
+    for (width, height) in [(800, 600), (320, 480)] {
+        let surface = Surface::new(width, height, td_ui::raster::Scale::default()).unwrap();
+        let mut pixels = vec![0u8; width * height * 4];
+        let mut board = Board::default();
+        let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+        app.input(Input::Resize(surface), &mut board);
+        let op = read_store(&mut app, &mut board, "C-o");
+        app.reply(Reply::Store {
+            op,
+            found: 2,
+            held: texts(&["Bank"]),
+            skipped: vec![(Text::new("x".to_owned()), "gpg could not decrypt it")],
+        });
+        for tabs in [1, 1] {
+            assert!(app.dialog.is_some(), "{width}x{height}: {}", app.status);
+            let mut raster = Raster::new(&mut pixels, &font, surface, width * 4).unwrap();
+            app.paint(&mut raster, surface).unwrap();
+            answer(&mut app, &mut board, tabs);
+        }
+        assert_eq!(import_sent(&mut app).1, [false]);
+    }
+}
+
+#[test]
+fn a_store_read_under_a_lock_question_is_given_up_for_it() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "old");
+    let op = read_store(&mut app, &mut board, "C-o");
+    // Edits made while the store is read, then Lock asks about them.
+    app.set_focus(Focus::Editor);
+    typed(&mut app, &mut board, "x");
+    key(&mut app, &mut board, "C-l");
+    assert!(matches!(app.dialog, Some((_, Some(Then::Lock)))));
+    app.reply(Reply::Store {
+        op,
+        found: 1,
+        held: texts(&["Bank"]),
+        skipped: Vec::new(),
+    });
+    // The question to lock stays, asked again now that Save is possible,
+    // and the store is dropped by its read.
+    let (dialog, then) = app.dialog.as_ref().unwrap();
+    assert_eq!(*then, Some(Then::Lock));
+    assert!(dialog
+        .action_rect(confirmations::Focus::Alternate)
+        .is_some());
+    assert!(app.store.is_none());
+    assert!(matches!(
+        app.take_out()[..],
+        [Out::Send(Command::DropStore { op: o })] if o == op
+    ));
+}
+
+#[test]
+fn the_next_question_opens_away_from_the_pointer_that_answered() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "a"), item(2, "b")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 2,
+        held: texts(&["a", "b"]),
+        skipped: Vec::new(),
+    });
+    let (dialog, _) = app.dialog.as_ref().unwrap();
+    let yes = dialog.action_rect(confirmations::Focus::Further).unwrap();
+    press(&mut app, &mut board, (yes.x + 1, yes.y + 1), false);
+    // The second click of a double-click lands on no action of the next.
+    let (dialog, _) = app.dialog.as_ref().expect("the next question");
+    for focus in [
+        confirmations::Focus::Alternate,
+        confirmations::Focus::Further,
+        confirmations::Focus::Confirm,
+    ] {
+        assert!(!dialog
+            .action_rect(focus)
+            .unwrap()
+            .contains(yes.x + 1, yes.y + 1));
+    }
+}
+
+#[test]
+fn a_replaced_entry_with_unsaved_edits_stays_and_a_failed_import_says_why() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    key(&mut app, &mut board, "Return");
+    open(&mut app, &mut board, "Down", "old");
+    let op = read_store(&mut app, &mut board, "C-o");
+    // Edited while the store is read.
+    app.set_focus(Focus::Editor);
+    typed(&mut app, &mut board, "x");
+    app.reply(Reply::Store {
+        op,
+        found: 1,
+        held: texts(&["Bank"]),
+        skipped: Vec::new(),
+    });
+    answer(&mut app, &mut board, 2);
+    let (op, _) = import_sent(&mut app);
+    let mut bank = item(1, "Bank");
+    bank.revision = 2;
+    app.reply(Reply::Imported {
+        op,
+        entries: vec![bank],
+        created: 0,
+        replaced: 1,
+        kept: 0,
+    });
+    assert!(app.take_out().is_empty());
+    assert!(app.dirty());
+    assert_eq!(
+        app.status,
+        "Imported: 0 new, 1 replaced; the open entry was replaced under its unsaved edits"
+    );
+    // A refused import says why and leaves the list as it was.
+    let mut app = unlocked(&mut board, vec![item(1, "Bank")]);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 1,
+        held: Vec::new(),
+        skipped: Vec::new(),
+    });
+    let (op, _) = import_sent(&mut app);
+    app.reply(Reply::Failed {
+        op,
+        failure: Failure {
+            text: "the notebook is full".to_owned(),
+            stale: false,
+            uncertain: false,
+            cancelled: false,
+        },
+    });
+    assert!(app.busy.is_none());
+    assert_eq!(app.status, "the notebook is full");
+    assert_eq!(notebook(&app).entries.len(), 1);
+}
+
+#[test]
+fn a_window_too_short_to_avoid_the_pointer_still_asks_the_next_question() {
+    let mut board = Board::default();
+    let mut app = unlocked(&mut board, vec![item(1, "a"), item(2, "b")]);
+    let surface = Surface::new(800, 400, td_ui::raster::Scale::default()).unwrap();
+    app.input(Input::Resize(surface), &mut board);
+    let op = read_store(&mut app, &mut board, "C-o");
+    app.reply(Reply::Store {
+        op,
+        found: 2,
+        held: texts(&["a", "b"]),
+        skipped: Vec::new(),
+    });
+    let (dialog, _) = app.dialog.as_ref().unwrap();
+    let yes = dialog.action_rect(confirmations::Focus::Further).unwrap();
+    press(&mut app, &mut board, (yes.x + 1, yes.y + 1), false);
+    // The answer given is kept and the next title is asked about.
+    assert!(app.dialog.is_some());
+    assert_eq!(app.store.as_ref().unwrap().replace, [true]);
 }

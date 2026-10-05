@@ -140,7 +140,11 @@ pub(super) fn serve(
             | Command::ReplaceKeys { op, .. }
             | Command::Export { op, .. }
             | Command::ReadCopy { op, .. }
-            | Command::Import { op, .. } => refused(op, "the test vault does not do this"),
+            | Command::Import { op, .. }
+            | Command::ReadStore { op, .. }
+            | Command::ImportStore { op, .. } => refused(op, "the test vault does not do this"),
+            // Nothing is read to drop, and nothing answers.
+            Command::DropStore { .. } => continue,
         };
         while answers.try_recv().is_ok() {}
         if replies.send(reply).is_err() {

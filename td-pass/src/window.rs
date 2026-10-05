@@ -30,6 +30,7 @@ struct Ask {
     folder: Option<PathBuf>,
     select: Option<String>,
     files: bool,
+    store: bool,
 }
 
 /// The answer: the folder listed, its listing or why not, and the entry
@@ -52,7 +53,13 @@ fn start_lister() -> Result<(Sender<Ask>, Receiver<Listed>), String> {
         .name("lister".to_owned())
         .spawn(move || {
             while let Ok(ask) = ask_rx.recv() {
-                let folder = ask.folder.unwrap_or_else(crate::files::start_folder);
+                let folder = ask.folder.unwrap_or_else(|| {
+                    if ask.store {
+                        crate::files::store_folder()
+                    } else {
+                        crate::files::start_folder()
+                    }
+                });
                 let ceiling = ask.files.then_some(crate::protocol::MAX_COPY as u64);
                 let listing = crate::files::list_folder(&folder, ceiling);
                 let answer = Listed {
@@ -82,6 +89,7 @@ impl Session {
                     folder,
                     select,
                     files,
+                    store,
                 } => {
                     // A lister that is gone answers nothing; the finder
                     // shows what it has.
@@ -90,6 +98,7 @@ impl Session {
                         folder,
                         select,
                         files,
+                        store,
                     });
                 }
             }

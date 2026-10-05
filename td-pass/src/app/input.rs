@@ -57,15 +57,15 @@ pub(super) const SECTIONS: &[(&str, Rows)] = &[
                 "Return",
                 "unlock with the selected key, or create a notebook",
             ),
-            ("C-o", "import an encrypted copy, with no notebook"),
+            ("C-o", "restore an encrypted copy, with no notebook"),
             ("C-q", "quit"),
         ],
     ),
     (
-        "Importing a copy",
+        "Restoring a copy",
         &[
-            ("Up/Down", "select the key to import with"),
-            ("Return", "import the copy with the selected key"),
+            ("Up/Down", "select the key to restore with"),
+            ("Return", "restore the copy with the selected key"),
             ("Escape/C-l", "give the copy up"),
             ("C-q", "quit"),
         ],
@@ -92,6 +92,11 @@ pub(super) const SECTIONS: &[(&str, Rows)] = &[
             ("F2", "rename the entry"),
             ("C-f", "find in the entry"),
             ("C-k", "show the keys view"),
+            ("C-o", "import a password store, asking before replacing"),
+            (
+                "Escape",
+                "while a password store is read, cancel its import",
+            ),
             ("F6/S-F6", "move the focus forward or back"),
             ("C-l", "lock"),
             ("C-q", "quit"),
@@ -164,7 +169,7 @@ impl App {
             Phase::Opening | Phase::Locking | Phase::Refused(_) => current.push("Not open"),
             Phase::Swap(_) => current.push("Swap on storage"),
             Phase::Locked { .. } => current.push("Locked"),
-            Phase::Importing { .. } => current.push("Importing a copy"),
+            Phase::Importing { .. } => current.push("Restoring a copy"),
             Phase::Unlocked(notebook) if notebook.keys.showing => {
                 current.push("Keys view");
                 idle = &["Notebook", "Search", "Titles", "Title", "Text", "Find"];
@@ -242,6 +247,7 @@ impl App {
         if self.prompt.is_some() {
             self.answer_prompt(false);
         }
+        self.abandon_store("Import cancelled; nothing was imported");
         if self.dialog.take().is_some() || self.chooser.take().is_some() {
             self.sync_focus();
         }
@@ -383,8 +389,12 @@ impl App {
         {
             return self.keys_key(chord, repeat);
         }
+        if chord == "Escape" && matches!(self.busy, Some(Busy::ReadStore(_))) {
+            return self.cancel_store_read();
+        }
         match chord {
             "C-k" => return self.show_keys(true),
+            "C-o" => return self.request(Then::Import, None),
             "C-s" => return self.save(None),
             "C-n" => return self.request(Then::New, None),
             "C-l" => return self.request(Then::Lock, None),
@@ -838,6 +848,16 @@ impl App {
                 let then = self.dialog.take().and_then(|(_, then)| then);
                 self.sync_focus();
                 self.redraw = true;
+                // While a store is read, every question is the store's.
+                if self.store.is_some() {
+                    return match choice {
+                        Choice::Confirmed(act) => self.store_answer(act),
+                        Choice::Unavailable(error) => {
+                            self.abandon_store(&format!("{error}; nothing was imported"))
+                        }
+                        _ => self.abandon_store("Import cancelled; nothing was imported"),
+                    };
+                }
                 match (choice, then) {
                     (Choice::Confirmed(Act::AcceptSwap), _) => {
                         self.phase = Phase::Opening;
@@ -952,8 +972,7 @@ impl App {
         if let Some(chooser) = &self.chooser {
             // A press outside the finder closes it and acts there, so the
             // strip's Lock is never held back by it.
-            let inside =
-                layout::finder(self.surface, chooser.purpose == Purpose::Import).contains(x, y);
+            let inside = layout::finder(self.surface, chooser.purpose.strip()).contains(x, y);
             if phase != PointerPhase::Press || inside {
                 return self.chooser_event(match phase {
                     PointerPhase::Press => finder::Event::Press { x, y },
@@ -1066,7 +1085,8 @@ impl App {
                     Some(3) => return self.save(None),
                     Some(4) => return self.open_find(),
                     Some(5) => return self.show_keys(true),
-                    Some(6) => return self.request(Then::Lock, opener),
+                    Some(6) => return self.request(Then::Import, opener),
+                    Some(7) => return self.request(Then::Lock, opener),
                     _ => {}
                 }
                 let panes = layout::panes(surface, notebook.finding);

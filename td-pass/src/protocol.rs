@@ -9,8 +9,15 @@ use crate::plain::{Bytes, Text};
 pub type EntryId = [u8; 16];
 
 /// The largest encrypted copy, td-secret's `pass::MAX_COPY`; a file
-/// larger is not offered for import.
+/// larger is not offered for restoring.
 pub const MAX_COPY: usize = 4 * 1024 * 1024 + 16 + 65 + 8 * 1196;
+
+/// The notebook's bounds, td-secret's: the most entries, the longest
+/// title and the largest body, in bytes. A password store's entry past
+/// them is not imported.
+pub const MAX_ENTRIES: usize = 1024;
+pub const MAX_TITLE: usize = 512;
+pub const MAX_BODY: usize = 64 * 1024;
 
 /// One operation the window may abandon: its prompts and its answer carry
 /// the same number, so a late answer is told from the current one.
@@ -135,7 +142,7 @@ pub enum Command {
         op: Op,
         folder: PathBuf,
     },
-    /// Read an encrypted copy for import and list the keys it opens with.
+    /// Read an encrypted copy to restore and list the keys it opens with.
     ReadCopy {
         op: Op,
         path: PathBuf,
@@ -146,7 +153,28 @@ pub enum Command {
         op: Op,
         key: usize,
     },
-    /// Drop the unlocked vault, and any copy read for import.
+    /// Read the password store in `folder` for import into the unlocked
+    /// notebook, decrypting each entry with gpg; the thread keeps what
+    /// it read and names the titles the notebook already holds.
+    ReadStore {
+        op: Op,
+        folder: PathBuf,
+    },
+    /// Import the store the read `read` brought: every entry whose title
+    /// is new, and of those whose title the notebook holds, in the order
+    /// they were named, each one `replace` says to replace. One save.
+    ImportStore {
+        op: Op,
+        read: Op,
+        replace: Vec<bool>,
+    },
+    /// Give up the store the read `op` brought, importing nothing; a
+    /// later read's is kept.
+    DropStore {
+        op: Op,
+    },
+    /// Drop the unlocked vault, any copy read to restore and any store
+    /// read to import.
     Lock,
 }
 
@@ -224,6 +252,30 @@ pub enum Reply {
     Copy {
         op: Op,
         keys: Vec<KeyLabel>,
+    },
+    /// Reading a password store: `done` of its `total` entries are read.
+    Reading {
+        op: Op,
+        done: usize,
+        total: usize,
+    },
+    /// The store is read: `found` entries can be imported, of which
+    /// `held` name, in order, the titles the notebook already holds;
+    /// `skipped` cannot be, each with why.
+    Store {
+        op: Op,
+        found: usize,
+        held: Vec<Text>,
+        skipped: Vec<(Text, &'static str)>,
+    },
+    /// The store's entries are saved: the notebook's entries now, and
+    /// how many were created, replaced and kept as they were.
+    Imported {
+        op: Op,
+        entries: Vec<Item>,
+        created: usize,
+        replaced: usize,
+        kept: usize,
     },
     /// The vault is dropped; the keys are listed again for the next unlock.
     Locked {
