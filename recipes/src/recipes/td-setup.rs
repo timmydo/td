@@ -1,12 +1,12 @@
 use crate::types::Recipe;
 
 /// Build the native installer front end with the target Rust toolchain. The
-/// pure installer plan and toolkit are Cargo siblings. The toolkit's font,
-/// notices and Wayland codec reach the compositor tree by relative source
-/// paths. td-install's own Cargo dependencies, the disk protector, the TPM
-/// client and td-json, are in its lock, and the TPM client includes the
-/// engine's SHA-256 by relative path, so those trees are staged too; the
-/// library td-setup uses names none of them.
+/// pure installer plan, the disk protector, whose recovery-key codec checks
+/// the completion page's key, and the toolkit are Cargo siblings. The
+/// toolkit's font, notices and Wayland codec reach the compositor tree by
+/// relative source paths. The protector's own dependencies, the TPM client
+/// and td-json, are in its lock, and the TPM client includes the engine's
+/// SHA-256 by relative path, so those trees are staged too.
 /// The system image carries it, and a live boot's session starts it
 /// (td-install/INSTALLER.md "Live startup").
 pub fn recipe() -> Recipe {
@@ -70,6 +70,7 @@ mod tests {
             siblings,
             [
                 "td-install = { path = \"../td-install\" }",
+                "td-protector = { path = \"../td-protector\" }",
                 "td-ui = { path = \"../td-ui\" }",
             ]
         );

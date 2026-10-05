@@ -88,14 +88,15 @@ operations are specified in "Installation service protocol".
 The `td-setup` front end has a source-built static target recipe and
 `td-setup-test` realized-output check. The recipe stages its own tree with
 `td-install`, `td-ui` and the compositor sources that the toolkit mounts,
-and td-install's own Cargo dependencies (td-protector, td-tpm, td-json and
-the engine SHA-256 td-tpm includes), which the library td-setup uses does
-not name, then builds with the target Rust toolchain. The check runs `--help`,
+`td-protector`, whose recovery-key codec alone td-setup names, and its
+dependencies (td-tpm, td-json and the engine SHA-256 td-tpm includes),
+then builds with the target Rust toolchain. The check runs `--help`,
 `--font-license` and a headless render of every page type at the reference
 800x600 size and the compositor's 752x508 tile, including all destination
-and review detail pages and every progress outcome, without emitting image
-bytes. The connected and pure views share a 752x480 minimum extent, while
-welcome keeps its own content-dependent layout. The render data is synthetic
+and review detail pages of both storages, every progress outcome and the
+recovery key's pages, without emitting image bytes. The connected and
+pure views share a 752x480 minimum extent, while welcome keeps its own
+content-dependent layout. The render data is synthetic
 and grants no authority. This establishes an image-eligible executable whose
 window presents welcome and, on Return, connects to td-authd's setup intake
 (td-authd/DESIGN.md "Whole-disk installation intake") and asks the service
@@ -347,7 +348,13 @@ drops a proposal not yet sent and releases one that arrives later.
 The pure review page renders one immutable `Plan` proposal. It shows the
 complete escaped disk identity and all four selected settings across bounded
 detail pages. The destructive-loss and unencrypted automatic-login notices
-remain visible on every page. It cannot authenticate the source, establish a
+remain visible on every page. A device-bound review, which only a service
+started with the storage operand makes ("Device-bound records"), shows in
+place of the unencrypted notice that storage is encrypted to this
+computer's TPM, which does not protect a lost computer, that the account
+signs in automatically, and that a recovery key follows; the tier's full
+review disclosures (ENCRYPTION.md "Device-bound default") are increment
+7's, with its activation. It cannot authenticate the source, establish a
 disk claim or authorize execution; the service and compositor-owned trusted
 consent remain mandatory. In the live window it shows the service's review,
 never the drafts: PageUp and PageDown move between its detail pages, Return
@@ -410,18 +417,52 @@ completion asks only for the chosen ending. A reported completion or failure
 stands when the connection ends.
 
 A device-bound installation reaches completion through its recovery-key
-phase ("Device-bound records"). The window asks for the key once and shows
-its eight groups, saying that it is shown only now, that no copy is kept,
-and that it is the only way back if the TPM, firmware measurements or boot
-chain change. Return then asks for it back on a field that admits digits,
-spaces and hyphens; a group whose value or check digit fails is named
-before anything is sent, and a key the service refuses as a mismatch is
-shown and asked again. The window holds the key, in memory only, until the
-service reports complete, and may show it again until then; the restart
-is offered only after completion. A connection lost during the phase
-before the key is confirmed shows that the installation was withdrawn,
-since the service withdraws it; one lost after shows the outcome as
-unknown, as any lost connection does.
+phase ("Device-bound records"). When status first reports the phase for
+the review it executed, the window asks for the key, once per execution,
+and shows its eight groups in td-protector's display form, saying that
+it is shown only now, that no copy is kept, and that it is the only way
+to open the disk if the TPM, firmware measurements or boot chain change.
+The phase has no deadline and changes only with what the window sends, so
+its state is not asked for while the key is shown or typed. Return asks
+for it back on a field that takes digits, spaces and hyphens and the
+caret keys; as each key is pressed the page says how many digits are
+typed or names the first group whose value or check digit fails
+(td-protector's `check_partial`), and Return names it, or a short count,
+before anything is sent. A key whose every group checks is sent as its 48
+digits and the field emptied; the service alone compares it. A mismatch
+is said and the key may be typed again, and Escape shows the key again;
+only an edit, not a caret move, clears what was said. A field whose
+buffer cannot be reserved says the key cannot be typed back there. The
+key's pages say that closing the window now withdraws the installation
+and the disk will not start. The window holds the key, in memory only
+and zeroed on drop, until the service confirms the type-back, and may
+show it again until then; no copy or paste reaches the key or the field,
+and no diagnostic names a digit. The field's buffer is td-ui's entry,
+reserved once and zeroed on every edit's leftover, when Return takes a
+key and on drop; the toolkit's chord for each key typed, the entry's own
+four-byte stack buffer that encodes each typed character (td-ui
+`entry_model`'s insert), and the frame's pixels are outside it and not
+zeroed. Once the type-back is confirmed the window shows the
+installation finishing, polling as for progress, while the service
+writes the table and the phase still reports; the completion page and
+its restart follow only the service's complete. The evidence line says
+the step (`page=recovery step=asking`, `shown`, `typeback`, then
+`page=finishing`), never a digit. Only the service's own report of
+failure 6 is shown as withdrawn. A connection lost during the phase
+before a key typed back is sent, the key's own request answered as
+refusal 16 or otherwise than with this review's key included, shows the
+installation not finished (`page=unconfirmed`): a service still running
+withdraws it, but one that stopped, a crash included, withdrew nothing,
+and the window cannot tell which. Either way the disk carries no
+partition table, so it does not start, and it may still hold the new
+ESP files and the volume's header, which the unconfirmed recovery key
+opens (ENCRYPTION.md "Device-bound formatting"). A connection lost once
+a key typed back was sent, or after the confirmation, shows the outcome
+as unknown, as any lost connection does, and so does a confirmation
+answered otherwise than with this review's match or mismatch, which
+ends the connection. A connection lost on a device-bound execution
+before the phase is reported is unknown too: an earlier write or
+verification failure may still be its outcome.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are
@@ -576,11 +617,14 @@ still needs the person's physical consent.
 unprivileged installer and the root installation service. It is data and
 codec only, and decoding a message grants no authority. The service core
 below implements it; td-authd's setup intake starts it for td-setup, which
-asks for destinations, time zones and status, proposes, executes, withdraws
-and asks for an ending, and checks that a review carries exactly what it
-proposed and that a withdraw answers abandoned (withdrawn), and an ending
-complete, for its nonce; any other answer ends its connection, and with it,
-until an installation starts, the review and claim.
+asks for destinations, time zones and status, proposes, executes, withdraws,
+asks for a device-bound installation's recovery key and confirms it typed
+back, and asks for an ending, and checks that a review carries exactly what
+it proposed and that a withdraw answers abandoned (withdrawn), the key
+request the key, a confirmation running in the recovery-key phase or a
+mismatch, and an ending complete, for its nonce; any other answer ends its
+connection, and with it, until an installation starts, the review and
+claim.
 
 Both ends first send and require the eight bytes `TDINS05\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
@@ -765,12 +809,16 @@ recovery unconfirmed. One lost after it changes nothing: the execution
 finishes as it would have.
 
 A service started without the storage operand reviews unencrypted plans;
-with it, its plans are device-bound. td-setup ends a connection whose
-review is device-bound or whose status reports the phase or failure 6
-until the completion page's display and type-back land (ENCRYPTION.md
-increment 5's sixth commit), and td-authd declines a device-bound review
-as unavailable, so no window or prompt shows storage until increment 7
-activates the tier.
+with it, its plans are device-bound. td-setup shows a review of either
+storage as the service made it, and follows the phase and failure 6
+only for a review it executed as device-bound: the worker remembers the
+storage of the review execute last named, and the phase, failure 6, the
+key or a confirmation reported of any other review ends the connection.
+td-authd declines a device-bound review as unavailable and never passes
+the operand, so the live wizard never shows device-bound storage until
+increment 7 activates the tier; the completion page's display and
+type-back are reached by td-setup's own tests and a caller that starts
+the service with the operand.
 
 ## Installation service core
 

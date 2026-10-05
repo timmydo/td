@@ -10,13 +10,15 @@
 //! and lists them, or shows why it cannot; a selected disk leads to the
 //! settings form, whose time zones the service supplies, and the completed
 //! form to the service's review of it; from the review it asks for trusted
-//! consent and follows the installation to its outcome. The privileged disk
-//! writer stays in td-install; this front end holds no disk-writing
-//! authority (INSTALLER.md). Later navigation follows.
+//! consent and follows the installation to its outcome, through a
+//! device-bound installation's recovery key (`recovery`), shown once and
+//! typed back. The privileged disk writer stays in td-install; this front
+//! end holds no disk-writing authority (INSTALLER.md).
 
 pub mod destination;
 pub mod evidence;
 pub mod outcome;
+pub mod recovery;
 pub mod review;
 pub mod service;
 pub mod settings;
@@ -153,14 +155,24 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
     let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC")?;
     let uuid = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
     let plan = Plan::new([1; 32], disk, [2; 32], uuid, Storage::Unencrypted, settings)?;
-    let review = review::ReviewPage::new(surface, &plan, 0).ok_or("review page did not fit")?;
-    paint(&review)?;
-    let (_, review_pages) = review.position();
-    for index in 1..review_pages {
-        paint(
-            &review::ReviewPage::new(surface, &plan, index)
-                .ok_or("review detail page did not fit")?,
-        )?;
+    let bound = Plan::new(
+        [1; 32],
+        plan.destination().clone(),
+        [2; 32],
+        uuid,
+        Storage::DeviceBound,
+        plan.settings().clone(),
+    )?;
+    for plan in [&plan, &bound] {
+        let review = review::ReviewPage::new(surface, plan, 0).ok_or("review page did not fit")?;
+        paint(&review)?;
+        let (_, review_pages) = review.position();
+        for index in 1..review_pages {
+            paint(
+                &review::ReviewPage::new(surface, plan, index)
+                    .ok_or("review detail page did not fit")?,
+            )?;
+        }
     }
     for phase in [
         outcome::Phase::PreparingDisk,
@@ -180,6 +192,7 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
         outcome::Failure::WriteFailed,
         outcome::Failure::VerificationFailed,
         outcome::Failure::SettingsFailed,
+        outcome::Failure::RecoveryUnconfirmed,
     ] {
         paint(
             &outcome::ProgressPage::new(surface, outcome::Progress::Failed(failure))
@@ -190,6 +203,34 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
         &outcome::ProgressPage::new(surface, outcome::Progress::Consent)
             .ok_or("consent page did not fit")?,
     )?;
+    paint(
+        &outcome::ProgressPage::new(surface, outcome::Progress::Finishing)
+            .ok_or("finishing page did not fit")?,
+    )?;
+    paint(
+        &outcome::ProgressPage::new(surface, outcome::Progress::Unconfirmed)
+            .ok_or("unconfirmed page did not fit")?,
+    )?;
+    // The pinned counting key, td-protector's own example; no service
+    // supplied it and it opens nothing.
+    let key = recovery::Key::from_digits(b"000013005150010290015439020571025716030859035998")?;
+    let shown = key.display();
+    let mut entry = recovery::Entry::default();
+    for chord in ["0", "0", "0", "0", "1", "3", "-", "0", "0", "5"] {
+        entry.key(chord);
+    }
+    let feedback = entry.feedback();
+    for step in [
+        recovery::Step::Asking,
+        recovery::Step::Shown(shown.as_str()),
+        recovery::Step::TypeBack {
+            entry: &entry,
+            feedback: &feedback,
+            notice: Some("That is not the recovery key shown. Check it and type it again."),
+        },
+    ] {
+        paint(&recovery::RecoveryPage::new(surface, step).ok_or("recovery-key page did not fit")?)?;
+    }
     paint(
         &outcome::ProgressPage::new(surface, outcome::Progress::Unknown)
             .ok_or("unknown outcome page did not fit")?,

@@ -13,6 +13,7 @@ const CONSENT_FOOTER: &str = "Consent \u{b7} step 5 of 6 \u{b7} Escape withdraws
 const PROGRESS_FOOTER: &str = "Installation progress \u{b7} step 5 of 6";
 const FAILED_FOOTER: &str = "Installation stopped \u{b7} step 5 of 6";
 const UNKNOWN_FOOTER: &str = "Outcome unknown \u{b7} step 5 of 6";
+const UNCONFIRMED_FOOTER: &str = "Installation not finished \u{b7} step 6 of 6";
 const COMPLETE_FOOTER: &str = "Complete \u{b7} step 6 of 6";
 
 /// A bounded operation label supplied by the installation service.
@@ -45,6 +46,8 @@ pub enum Failure {
     WriteFailed,
     VerificationFailed,
     SettingsFailed,
+    /// The installer was lost before the recovery key was typed back.
+    RecoveryUnconfirmed,
 }
 
 impl Failure {
@@ -55,6 +58,7 @@ impl Failure {
             Self::WriteFailed => "Writing the destination disk",
             Self::VerificationFailed => "Verifying installed boot artifacts",
             Self::SettingsFailed => "Publishing account and regional settings",
+            Self::RecoveryUnconfirmed => "Confirming the recovery key",
         }
     }
 
@@ -65,6 +69,9 @@ impl Failure {
             Self::WriteFailed => "The installer could not finish a disk write.",
             Self::VerificationFailed => "The installed boot artifacts failed verification.",
             Self::SettingsFailed => "The account or regional settings could not be published.",
+            Self::RecoveryUnconfirmed => {
+                "The recovery key was not typed back, so the installation was withdrawn."
+            }
         }
     }
 }
@@ -77,8 +84,15 @@ pub enum Progress {
     /// The service seeks compositor-owned consent; nothing is written.
     Consent,
     Running(Phase),
+    /// A device-bound installation's recovery key was typed back and
+    /// confirmed; the service is making the disk bootable.
+    Finishing,
     Failed(Failure),
     Unknown,
+    /// The connection ended in a device-bound installation's recovery-key
+    /// phase before a key typed back was sent: the service withdraws the
+    /// installation if it still runs, which the installer cannot confirm.
+    Unconfirmed,
 }
 
 /// One view of consent, an installation in progress or failed, or an
@@ -163,6 +177,38 @@ impl Composition for ProgressPage {
                 );
                 PROGRESS_FOOTER
             }
+            Progress::Finishing => {
+                row(self.surface, 1, "Installing td", damage, sink);
+                row(
+                    self.surface,
+                    4,
+                    "Recovery key confirmed. Finishing the installation\u{2026}",
+                    damage,
+                    sink,
+                );
+                row(
+                    self.surface,
+                    6,
+                    "The installation service is making the selected disk bootable.",
+                    damage,
+                    sink,
+                );
+                row(
+                    self.surface,
+                    8,
+                    "Keep the destination disk and installation media connected.",
+                    damage,
+                    sink,
+                );
+                row(
+                    self.surface,
+                    9,
+                    "Closing this window cannot restore previous disk contents.",
+                    damage,
+                    sink,
+                );
+                PROGRESS_FOOTER
+            }
             Progress::Failed(reason) => {
                 row(self.surface, 1, "Installation stopped", damage, sink);
                 row(self.surface, 3, "Stopped while:", damage, sink);
@@ -214,6 +260,31 @@ impl Composition for ProgressPage {
                     sink,
                 );
                 UNKNOWN_FOOTER
+            }
+            Progress::Unconfirmed => {
+                for (index, text) in [
+                    (1, "Installation not finished"),
+                    (
+                        4,
+                        "The connection to the installer service ended before the recovery key was confirmed.",
+                    ),
+                    (
+                        5,
+                        "The service withdraws the installation if it still can; whether it did is unknown.",
+                    ),
+                    (
+                        7,
+                        "The disk has no partition table, so it will not start as an installed system.",
+                    ),
+                    (
+                        8,
+                        "It may still hold the new boot files and the encrypted volume's header.",
+                    ),
+                    (10, "Restart the live system and install again to use this disk."),
+                ] {
+                    row(self.surface, index, text, damage, sink);
+                }
+                UNCONFIRMED_FOOTER
             }
         };
         self.footer.emit(footer.chars(), damage, sink);
@@ -388,6 +459,7 @@ mod tests {
             Failure::WriteFailed,
             Failure::VerificationFailed,
             Failure::SettingsFailed,
+            Failure::RecoveryUnconfirmed,
         ] {
             let failed = ProgressPage::new(screen, Progress::Failed(reason)).unwrap();
             let painted = glyphs(&failed, screen);
@@ -399,6 +471,32 @@ mod tests {
             assert!(painted.contains(FAILED_FOOTER));
             assert!(!painted.contains("service is working"));
         }
+        let unconfirmed = glyphs(
+            &ProgressPage::new(screen, Progress::Failed(Failure::RecoveryUnconfirmed)).unwrap(),
+            screen,
+        );
+        assert!(unconfirmed.contains("Confirming the recovery key"));
+        assert!(unconfirmed.contains("the installation was withdrawn"));
+        // Confirmed is not complete: the disk is still being made bootable.
+        let finishing = ProgressPage::new(screen, Progress::Finishing).unwrap();
+        let painted = glyphs(&finishing, screen);
+        assert!(painted.contains("Recovery key confirmed. Finishing the installation\u{2026}"));
+        assert!(painted.contains("making the selected disk bootable"));
+        assert!(painted.contains(PROGRESS_FOOTER));
+        assert!(!painted.contains("Installation complete"));
+        // A connection lost before a key typed back was sent claims no
+        // withdrawal: the service may have stopped before making one.
+        let unconfirmed = ProgressPage::new(screen, Progress::Unconfirmed).unwrap();
+        let painted = glyphs(&unconfirmed, screen);
+        assert!(painted.contains("Installation not finished"));
+        assert!(painted.contains("The connection to the installer service ended before"));
+        assert!(painted.contains("The service withdraws the installation if it still can"));
+        assert!(painted.contains("whether it did is unknown"));
+        assert!(painted.contains("Restart the live system and install again"));
+        assert!(painted.contains("no partition table, so it will not start"));
+        assert!(painted.contains("encrypted volume's header"));
+        assert!(painted.contains(UNCONFIRMED_FOOTER));
+        assert!(!painted.contains("was withdrawn"));
         let consent = ProgressPage::new(screen, Progress::Consent).unwrap();
         let painted = glyphs(&consent, screen);
         assert!(painted.contains("secure prompt") && painted.contains(CONSENT_FOOTER));

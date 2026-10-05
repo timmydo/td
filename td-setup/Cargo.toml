@@ -12,8 +12,11 @@ license = "MIT"
 # The pure td-install plan library and the shared UI toolkit use the one
 # sibling-dependency spelling the lock guard admits (AGENTS.md 'Rust code').
 # The raster, chrome bands and client reach this crate only through `td_ui::`.
+# The disk protector's recovery-key codec checks the key the completion page
+# shows and the one typed back; only its `recovery` module is named.
 [dependencies]
 td-install = { path = "../td-install" }
+td-protector = { path = "../td-protector" }
 td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]

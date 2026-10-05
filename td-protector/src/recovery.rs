@@ -56,6 +56,57 @@ fn group(value: u16) -> Option<[u8; GROUP_DIGITS]> {
     Some(digits)
 }
 
+/// Scans an entry into digit values, keeping the first 48, and counts
+/// them; a byte other than a digit, space or hyphen, or a separator ending
+/// a run that is not whole groups, is refused.
+fn scan(entry: &[u8], digits: &mut [u8; PASSPHRASE_LEN]) -> Result<usize, EntryError> {
+    let mut count = 0usize;
+    // The digits before the current run: always whole groups.
+    let mut run_start = 0usize;
+    for (index, byte) in entry.iter().enumerate() {
+        match byte {
+            b'0'..=b'9' => {
+                if let Some(slot) = digits.get_mut(count) {
+                    *slot = byte - b'0';
+                }
+                count = count.saturating_add(1);
+            }
+            b' ' | b'-' => {
+                let run = count.saturating_sub(run_start);
+                if !run.is_multiple_of(GROUP_DIGITS) {
+                    return Err(EntryError::GroupLength {
+                        group: run_start / GROUP_DIGITS + 1,
+                        digits: run,
+                    });
+                }
+                run_start = count;
+            }
+            _ => {
+                return Err(EntryError::Character {
+                    position: index + 1,
+                })
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Checks one written group, numbered from one: its value, then its check
+/// digit.
+fn check_group(group: usize, written: &[u8; GROUP_DIGITS]) -> Result<(), EntryError> {
+    let value = written
+        .iter()
+        .take(GROUP_DIGITS - 1)
+        .fold(0u32, |value, digit| value * 10 + u32::from(*digit));
+    if value > u32::from(u16::MAX) {
+        return Err(EntryError::Value { group });
+    }
+    if damm(written) != Some(0) {
+        return Err(EntryError::Check { group });
+    }
+    Ok(())
+}
+
 /// ASCII text derived from a recovery key: its passphrase or display form.
 /// Allocated once at its exact final length and zeroed on drop;
 /// deliberately neither `Debug`, `Display` nor `Clone`.
@@ -186,35 +237,37 @@ impl RecoveryKey {
         result
     }
 
-    fn parse_into(entry: &[u8], digits: &mut [u8; PASSPHRASE_LEN]) -> Result<Self, EntryError> {
-        let mut count = 0usize;
-        // The digits before the current run: always whole groups.
-        let mut run_start = 0usize;
-        for (index, byte) in entry.iter().enumerate() {
-            match byte {
-                b'0'..=b'9' => {
-                    if let Some(slot) = digits.get_mut(count) {
-                        *slot = byte - b'0';
-                    }
-                    count = count.saturating_add(1);
-                }
-                b' ' | b'-' => {
-                    let run = count.saturating_sub(run_start);
-                    if !run.is_multiple_of(GROUP_DIGITS) {
-                        return Err(EntryError::GroupLength {
-                            group: run_start / GROUP_DIGITS + 1,
-                            digits: run,
-                        });
-                    }
-                    run_start = count;
-                }
-                _ => {
-                    return Err(EntryError::Character {
-                        position: index + 1,
-                    })
-                }
-            }
+    /// What `parse` says of an entry still being typed, for feedback as
+    /// each key is pressed: the first refusal among its bytes, its
+    /// separators and its complete groups, as `parse` names it, or else
+    /// how many digits it holds. Fewer than 48 digits are incomplete, not
+    /// refused; more are `Length`. It returns no digits.
+    pub fn check_partial(entry: &[u8]) -> Result<usize, EntryError> {
+        if entry.len() > MAX_ENTRY_LEN {
+            return Err(EntryError::TooLong);
         }
+        let mut digits = [0u8; PASSPHRASE_LEN];
+        let result = scan(entry, &mut digits).and_then(|count| {
+            if count > PASSPHRASE_LEN {
+                return Err(EntryError::Length { digits: count });
+            }
+            for (index, written) in digits
+                .as_chunks::<GROUP_DIGITS>()
+                .0
+                .iter()
+                .take(count / GROUP_DIGITS)
+                .enumerate()
+            {
+                check_group(index + 1, written)?;
+            }
+            Ok(count)
+        });
+        td_tpm::zero(&mut digits);
+        result
+    }
+
+    fn parse_into(entry: &[u8], digits: &mut [u8; PASSPHRASE_LEN]) -> Result<Self, EntryError> {
+        let count = scan(entry, digits)?;
         if count != PASSPHRASE_LEN {
             return Err(EntryError::Length { digits: count });
         }
@@ -226,17 +279,7 @@ impl RecoveryKey {
             .zip(key.0.as_chunks_mut::<GROUP_DIGITS>().0.iter_mut())
             .enumerate()
         {
-            let group = index + 1;
-            let value = written
-                .iter()
-                .take(GROUP_DIGITS - 1)
-                .fold(0u32, |value, digit| value * 10 + u32::from(*digit));
-            if value > u32::from(u16::MAX) {
-                return Err(EntryError::Value { group });
-            }
-            if damm(written) != Some(0) {
-                return Err(EntryError::Check { group });
-            }
+            check_group(index + 1, written)?;
             for (slot, digit) in out.iter_mut().zip(written.iter()) {
                 *slot = b'0' + digit;
             }
@@ -528,6 +571,142 @@ mod tests {
             EntryError::Length { digits: 47 }.to_string(),
             "recovery key entry has 47 digits, not 48"
         );
+    }
+
+    /// An entry being typed: short is incomplete, and each refusal is the
+    /// one `parse` names, as soon as its group is whole.
+    #[test]
+    fn a_partial_entry_is_checked_group_by_group_as_parse_checks_it() {
+        let canonical = "000013-005150-010290-015439-020571-025716-030859-035998";
+        for typed in 0..=canonical.len() {
+            let entry = canonical.get(..typed).unwrap();
+            let digits = entry.bytes().filter(u8::is_ascii_digit).count();
+            // A hyphen after a whole group is admitted, as `parse` admits it.
+            assert_eq!(RecoveryKey::check_partial(entry.as_bytes()), Ok(digits));
+        }
+        assert_eq!(RecoveryKey::check_partial(b""), Ok(0));
+        // Group 2's check digit is wrong once it is typed, not before.
+        assert_eq!(RecoveryKey::check_partial(b"000013 00515"), Ok(11));
+        assert_eq!(
+            RecoveryKey::check_partial(b"000013 005151"),
+            Err(EntryError::Check { group: 2 })
+        );
+        assert_eq!(
+            RecoveryKey::check_partial(b"000013 999999"),
+            Err(EntryError::Value { group: 2 })
+        );
+        assert_eq!(
+            RecoveryKey::check_partial(b"000013 00515 "),
+            Err(EntryError::GroupLength {
+                group: 2,
+                digits: 5
+            })
+        );
+        assert_eq!(
+            RecoveryKey::check_partial(b"000013x"),
+            Err(EntryError::Character { position: 7 })
+        );
+        let long = format!("{canonical}0");
+        assert_eq!(
+            RecoveryKey::check_partial(long.as_bytes()),
+            Err(EntryError::Length { digits: 49 })
+        );
+        assert_eq!(
+            RecoveryKey::check_partial(&[b'0'; MAX_ENTRY_LEN + 1]),
+            Err(EntryError::TooLong)
+        );
+        // Whatever `parse` refuses of a whole entry, this refuses alike.
+        for entry in [
+            "000013-005150-010290-015438-020571-025716-030859-035998",
+            "000013-005150-010290-015439-020571-052716-030859-035998",
+            "000000-000000-000000-000000-000000-000000-000000-999999",
+            "000013-00515 0-010290-015439-020571-025716-030859-035998",
+        ] {
+            assert_eq!(
+                RecoveryKey::check_partial(entry.as_bytes()),
+                Err(refused(entry)),
+                "{entry}"
+            );
+        }
+    }
+
+    /// Over every prefix of several keys, in each written form, and every
+    /// single-digit corruption in each group: a partial entry is fine
+    /// exactly until the corrupted group is whole, and from then on is
+    /// refused as `parse` refuses the whole entry.
+    #[test]
+    fn check_partial_agrees_with_parse_on_every_prefix_and_corruption() {
+        for bytes in [
+            [0; KEY_BYTES],
+            [0xff; KEY_BYTES],
+            std::array::from_fn(|index| index as u8),
+            std::array::from_fn(|index| (index as u8).wrapping_mul(37)),
+        ] {
+            let original = key(bytes);
+            let display = original.display();
+            let passphrase = original.passphrase();
+            let spaced = display.as_str().replace('-', " ");
+            for written in [display.as_str(), passphrase.as_str(), spaced.as_str()] {
+                for end in 0..=written.len() {
+                    let prefix = written.get(..end).unwrap();
+                    let digits = prefix.bytes().filter(u8::is_ascii_digit).count();
+                    assert_eq!(
+                        RecoveryKey::check_partial(prefix.as_bytes()),
+                        Ok(digits),
+                        "{prefix}"
+                    );
+                    match RecoveryKey::parse(prefix.as_bytes()) {
+                        Ok(parsed) => {
+                            assert_eq!(digits, PASSPHRASE_LEN);
+                            assert!(parsed.matches(&original));
+                        }
+                        Err(error) => assert_eq!(error, EntryError::Length { digits }),
+                    }
+                }
+                for position in 0..written.len() {
+                    let Some(&byte) = written.as_bytes().get(position) else {
+                        continue;
+                    };
+                    if !byte.is_ascii_digit() {
+                        continue;
+                    }
+                    let index = written
+                        .get(..position)
+                        .unwrap()
+                        .bytes()
+                        .filter(u8::is_ascii_digit)
+                        .count();
+                    let group_end = (index / GROUP_DIGITS + 1) * GROUP_DIGITS;
+                    for digit in b'0'..=b'9' {
+                        if digit == byte {
+                            continue;
+                        }
+                        let mut corrupt = written.as_bytes().to_vec();
+                        corrupt[position] = digit;
+                        let whole = refused(std::str::from_utf8(&corrupt).unwrap());
+                        assert!(
+                            matches!(
+                                whole,
+                                EntryError::Value { group } | EntryError::Check { group }
+                                    if group == index / GROUP_DIGITS + 1
+                            ),
+                            "{whole:?}"
+                        );
+                        assert_eq!(RecoveryKey::check_partial(&corrupt), Err(whole.clone()));
+                        for end in 0..=corrupt.len() {
+                            let prefix = &corrupt[..end];
+                            let digits = prefix.iter().filter(|b| b.is_ascii_digit()).count();
+                            let expected = if digits < group_end {
+                                Ok(digits)
+                            } else {
+                                Err(whole.clone())
+                            };
+                            assert_eq!(RecoveryKey::check_partial(prefix), expected);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

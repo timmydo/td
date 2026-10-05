@@ -4,8 +4,11 @@
 //! leads to the settings form, whose time zones the service supplies, and
 //! the completed form to the service's review of it; from the review it asks
 //! the service to seek trusted consent and follows the installation's
-//! progress to its outcome. It owns no Wayland objects of its own, so its
-//! `Tag` is the empty `Object`; the seat and its devices are the client's.
+//! progress to its outcome. A device-bound installation's outcome waits
+//! on its recovery key: the window shows it once and has it typed back
+//! before the service makes the disk bootable. It owns no Wayland objects
+//! of its own, so its `Tag` is the empty `Object`; the seat and its devices
+//! are the client's.
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -24,6 +27,7 @@ use td_ui::wire::Message;
 use crate::destination::DestinationPage;
 use crate::evidence::{self, field, Proof};
 use crate::outcome::{CompletionPage, Progress, ProgressPage};
+use crate::recovery::{self, Entry, Key, RecoveryPage};
 use crate::review::ReviewPage;
 use crate::service::{Answer, Ending, Service, Stage, Standing, SOCKET};
 use crate::settings::{Draft, TIME_ZONE};
@@ -80,8 +84,20 @@ enum Page {
     Review,
     /// Consent, the installation's progress, or an outcome not known.
     Progress(Progress),
+    /// A device-bound installation's recovery key, asked for, shown or
+    /// typed back.
+    Recovery(KeyStep),
     /// The service reported the installation complete.
     Complete,
+}
+
+/// Where the recovery key's showing stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyStep {
+    /// Asked for; not yet here.
+    Asking,
+    Shown,
+    TypeBack,
 }
 
 /// A request sent to the service whose answer is awaited.
@@ -94,6 +110,8 @@ enum Asked {
     Execute,
     Status,
     End,
+    RecoveryKey,
+    Confirm,
 }
 
 /// Where the completion page's restart or power-off stands; each asked
@@ -165,6 +183,15 @@ const REVIEW_KEYS: &[(&str, &str)] = &[
 ];
 const CONSENT_KEYS: &[(&str, &str)] =
     &[("Escape", "withdraw the review and go back to the settings")];
+const RECOVERY_KEYS: &[(&str, &str)] = &[("Return", "type the key back once it is written down")];
+/// The type-back's own keys; the field's are `recovery`'s.
+const TYPE_BACK_KEYS: &[(&str, &str)] = &[
+    (
+        "Return",
+        "ask the installer service to confirm the key typed back",
+    ),
+    ("Escape", "show the recovery key again"),
+];
 const COMPLETE_KEYS: &[(&str, &str)] = &[
     ("Left/Up", "choose restart"),
     ("Right/Down", "choose power off"),
@@ -213,6 +240,10 @@ const POWER_UNAVAILABLE: &str =
 const REVIEWING: &str = "Asking the installer service for a review\u{2026}";
 /// Shown on review while execute is with the service.
 const SEEKING: &str = "Asking the installer service to seek consent\u{2026}";
+/// Shown on the type-back while the key typed is with the service.
+const CONFIRMING: &str = "Asking the installer service to confirm the key\u{2026}";
+/// Shown on the type-back once the service found the key typed different.
+const MISMATCH: &str = "That is not the recovery key shown. Check it and type it again.";
 /// How often the service's state is asked for while consent is sought or
 /// the installation runs, in milliseconds.
 const POLL: u64 = 500;
@@ -261,6 +292,23 @@ struct Wizard {
     /// The completion page's selected button.
     choice: Ending,
     power: Power,
+    /// The device-bound installation's recovery key, in memory only and
+    /// zeroed on drop, from its arrival until the service confirms it
+    /// typed back or the connection ends; it may be shown again until then.
+    recovery: Option<Key>,
+    /// Whether the key was asked for: the service sends it once.
+    key_asked: bool,
+    /// The field the key is typed back in.
+    entry: Entry,
+    /// What is wrong with the key typed, or what became of it.
+    typed_notice: Option<String>,
+    /// A key typed back, not yet sent.
+    confirm: Option<Key>,
+    /// Whether a key typed back is with the service, unanswered.
+    confirming: bool,
+    /// Whether the service confirmed the key typed back: the installation
+    /// is finishing, and the key is never asked for again.
+    confirmed: bool,
 }
 
 impl Wizard {
@@ -288,6 +336,13 @@ impl Wizard {
             completed: None,
             choice: Ending::Restart,
             power: Power::Offered,
+            recovery: None,
+            key_asked: false,
+            entry: Entry::default(),
+            typed_notice: None,
+            confirm: None,
+            confirming: false,
+            confirmed: false,
         }
     }
 
@@ -345,6 +400,21 @@ impl Wizard {
                 self.review_page = 0;
                 self.page = Page::Settings;
             }
+            // The key, once written down, is typed back; Escape shows it
+            // again. Nothing here leaves the installation.
+            (Page::Recovery(KeyStep::Shown), "Return") => {
+                self.page = Page::Recovery(KeyStep::TypeBack);
+            }
+            (Page::Recovery(KeyStep::TypeBack), "Escape") => {
+                self.page = Page::Recovery(KeyStep::Shown);
+            }
+            (Page::Recovery(KeyStep::TypeBack), "Return") => self.type_back(),
+            (Page::Recovery(KeyStep::TypeBack), _) => {
+                if self.entry.key(chord) && !self.typed_out() {
+                    self.typed_notice = None;
+                }
+            }
+            (Page::Recovery(_), _) => {}
             // Only a complete installation's own review ends the session,
             // once asked, or again after a refusal.
             // The buttons sit Restart then Power off: arrows choose one,
@@ -399,6 +469,9 @@ impl Wizard {
         let mut zone = Section::new("Time zone", TIME_ZONE_KEYS);
         let zones = crate::settings::ZONE_KEYS.iter().copied().map(keys::row);
         zone.rows.extend(zones);
+        let mut type_back = Section::new("Type back", TYPE_BACK_KEYS);
+        let field = recovery::TYPE_BACK_KEYS.iter().copied().map(keys::row);
+        type_back.rows.extend(field);
         let mut sections = vec![
             Some(Section::new("Welcome", WELCOME_KEYS)),
             Some(Section::new("Disks", DISK_KEYS)),
@@ -407,6 +480,8 @@ impl Wizard {
             Some(Section::new("Review", REVIEW_KEYS)),
             Some(Section::new("Consent", CONSENT_KEYS)),
             Some(Section::new("Complete", COMPLETE_KEYS)),
+            Some(Section::new("Recovery key", RECOVERY_KEYS)),
+            Some(type_back),
         ];
         let leads: &[usize] = match &self.page {
             Page::Welcome => &[0],
@@ -417,8 +492,10 @@ impl Wizard {
             Page::Progress(Progress::Consent) => &[5],
             Page::Complete if self.endable() => &[6],
             Page::Complete => &[],
+            Page::Recovery(KeyStep::Shown) => &[7],
+            Page::Recovery(KeyStep::TypeBack) => &[8],
             // These take no key.
-            Page::Progress(_) => &[],
+            Page::Progress(_) | Page::Recovery(KeyStep::Asking) => &[],
         };
         let mut ordered = Vec::with_capacity(sections.len());
         ordered.extend(
@@ -440,6 +517,41 @@ impl Wizard {
     /// Whether a proposal is queued or its review still wanted.
     fn reviewing(&self) -> bool {
         self.proposal.is_some() || self.awaited
+    }
+
+    /// Whether a key typed back is queued or with the service.
+    fn typed_out(&self) -> bool {
+        self.confirm.is_some() || self.confirming
+    }
+
+    /// Return on the type-back: a key whose every group checks is sent,
+    /// once, and the field is emptied; otherwise the page names what is
+    /// wrong. The service alone compares it with the key it sent.
+    fn type_back(&mut self) {
+        if self.typed_out() {
+            return;
+        }
+        match self.entry.parse() {
+            Ok(typed) => {
+                self.entry.clear();
+                self.confirm = Some(typed);
+                self.typed_notice = Some(CONFIRMING.into());
+            }
+            Err(why) => self.typed_notice = Some(why),
+        }
+    }
+
+    /// Forgets the recovery key, the key typed and what became of it,
+    /// zeroing each: the installation has moved past its phase, or the
+    /// connection that carried it ended.
+    fn end_recovery(&mut self) {
+        self.recovery = None;
+        self.key_asked = false;
+        self.entry.clear();
+        self.typed_notice = None;
+        self.confirm = None;
+        self.confirming = false;
+        self.confirmed = false;
     }
 
     /// Proposes the selected disk with the drafts, once they are complete
@@ -481,6 +593,8 @@ impl Wizard {
             (Page::Settings, _) if self.proposal.is_some() => Some(Asked::Review),
             (Page::Review, _) if self.execute.is_some() => Some(Asked::Execute),
             (Page::Complete, _) if matches!(self.power, Power::Wanted(_)) => Some(Asked::End),
+            (Page::Recovery(KeyStep::Asking), _) if !self.key_asked => Some(Asked::RecoveryKey),
+            (Page::Recovery(_), _) if self.confirm.is_some() => Some(Asked::Confirm),
             _ if self.poll_due && self.executing.is_some() && self.following() => {
                 Some(Asked::Status)
             }
@@ -585,8 +699,29 @@ impl Wizard {
                         }
                         self.follow(Standing::Review { nonce, stage });
                     }
-                    Stage::Reviewed | Stage::AwaitingConsent | Stage::Running(_) => {}
+                    Stage::Reviewed
+                    | Stage::AwaitingConsent
+                    | Stage::Running(_)
+                    | Stage::Recovery => {}
                 }
+            }
+            (Some(Asked::RecoveryKey), Ok(Answer::RecoveryKey(key))) => {
+                self.recovery = Some(key);
+                if self.page == Page::Recovery(KeyStep::Asking) {
+                    self.page = Page::Recovery(KeyStep::Shown);
+                }
+            }
+            // The phase goes on: the key may be shown again and retyped.
+            (Some(Asked::Confirm), Ok(Answer::Mismatched)) => {
+                self.confirming = false;
+                self.typed_notice = Some(MISMATCH.into());
+            }
+            // Confirmed: the key is no longer needed here, and the service
+            // goes on to make the disk bootable; status says how that ends.
+            (Some(Asked::Confirm), Ok(Answer::Confirmed)) => {
+                self.end_recovery();
+                self.confirmed = true;
+                self.page = Page::Progress(Progress::Finishing);
             }
             (Some(Asked::End), Ok(Answer::Ending(ending))) => self.power = Power::Accepted(ending),
             (Some(Asked::End), Ok(Answer::Refused(reason))) => {
@@ -620,11 +755,13 @@ impl Wizard {
         self.completed.is_some() && matches!(self.power, Power::Offered | Power::Refused(_))
     }
 
-    /// Whether the shown page follows an installation's state.
+    /// Whether the shown page follows an installation's state. The
+    /// recovery key's pages do not: its phase has no deadline and changes
+    /// only with what this window sends.
     fn following(&self) -> bool {
         matches!(
             self.page,
-            Page::Progress(Progress::Consent | Progress::Running(_))
+            Page::Progress(Progress::Consent | Progress::Running(_) | Progress::Finishing)
         )
     }
 
@@ -655,11 +792,23 @@ impl Wizard {
                 Page::Settings
             }
             Stage::Reviewed => Page::Progress(Progress::Unknown),
+            // The service stays in the phase after the key typed back is
+            // confirmed, until the disk is made bootable.
+            Stage::Recovery if self.confirmed => Page::Progress(Progress::Finishing),
+            Stage::Recovery => match self.page {
+                Page::Recovery(step) => Page::Recovery(step),
+                _ if self.recovery.is_some() => Page::Recovery(KeyStep::Shown),
+                _ => Page::Recovery(KeyStep::Asking),
+            },
         };
-        if !matches!(stage, Stage::AwaitingConsent | Stage::Running(_)) {
+        if !matches!(
+            stage,
+            Stage::AwaitingConsent | Stage::Running(_) | Stage::Recovery
+        ) {
             self.executing = None;
             self.plan = None;
             self.review_page = 0;
+            self.end_recovery();
         }
         self.page = page;
     }
@@ -686,12 +835,20 @@ impl Wizard {
             self.catalog = Catalog::Unasked;
         }
         self.withdrawing = None;
+        // Lost before a key typed back reached the service, the recovery
+        // key's phase ends with the installer: a service still running
+        // withdraws the installation, but one that stopped made no
+        // withdrawal, and only its own report of failure 6 says which.
+        // Lost once a key typed back was sent, or confirmed, the outcome
+        // is unknown.
+        let unconfirmed = matches!(self.page, Page::Recovery(_)) && !self.confirming;
+        self.end_recovery();
         // After execute, or once progress is shown, the service may still
         // be installing: the outcome is unknown, never merely unavailable.
         // A reported completion or failure stands.
         let reported = matches!(
             self.page,
-            Page::Complete | Page::Progress(Progress::Failed(_))
+            Page::Complete | Page::Progress(Progress::Failed(_) | Progress::Unconfirmed)
         );
         // Completion can no longer ask for an ending; one asked for may
         // still be under way.
@@ -706,6 +863,9 @@ impl Wizard {
         }
         if reported {
             self.executing = None;
+        } else if unconfirmed {
+            self.executing = None;
+            self.page = Page::Progress(Progress::Unconfirmed);
         } else if self.executing.take().is_some() || matches!(self.page, Page::Progress(_)) {
             self.page = Page::Progress(Progress::Unknown);
         } else if self.page != Page::Welcome {
@@ -719,6 +879,8 @@ impl Wizard {
         match asked {
             Asked::Review => self.awaited = true,
             Asked::Status => self.poll_due = false,
+            Asked::RecoveryKey => self.key_asked = true,
+            Asked::Confirm => self.confirming = true,
             _ => {}
         }
     }
@@ -769,8 +931,20 @@ impl Wizard {
             }
             Page::Progress(Progress::Consent) => state.push_str("consent"),
             Page::Progress(Progress::Running(_)) => state.push_str("running"),
+            Page::Progress(Progress::Finishing) => state.push_str("finishing"),
+            // Never a digit of the key, shown or typed.
+            Page::Recovery(step) => {
+                state.push_str("recovery");
+                let step = match step {
+                    KeyStep::Asking => "asking",
+                    KeyStep::Shown => "shown",
+                    KeyStep::TypeBack => "typeback",
+                };
+                field(&mut state, "step", step);
+            }
             Page::Progress(Progress::Failed(_)) => state.push_str("failed"),
             Page::Progress(Progress::Unknown) => state.push_str("unknown"),
+            Page::Progress(Progress::Unconfirmed) => state.push_str("unconfirmed"),
             Page::Complete => {
                 state.push_str("complete");
                 field(&mut state, "choice", ending_name(self.choice));
@@ -884,6 +1058,15 @@ impl Front {
             Asked::Status => service.status(),
             Asked::End => match (self.wizard.completed, self.wizard.power) {
                 (Some(nonce), Power::Wanted(ending)) => service.end(nonce, ending),
+                _ => return,
+            },
+            Asked::RecoveryKey => match self.wizard.executing {
+                Some(nonce) => service.recovery_key(nonce),
+                None => return,
+            },
+            // The key typed is dropped, and so zeroed, once handed over.
+            Asked::Confirm => match (self.wizard.executing, self.wizard.confirm.take()) {
+                (Some(nonce), Some(typed)) => service.confirm_recovery(nonce, &typed),
                 _ => return,
             },
         };
@@ -1127,9 +1310,12 @@ impl Window {
         // The destination step's page, built first so the list position
         // it settles on is kept for the next turn.
         let destination = match &wizard.page {
-            Page::Welcome | Page::Settings | Page::Review | Page::Progress(_) | Page::Complete => {
-                None
-            }
+            Page::Welcome
+            | Page::Settings
+            | Page::Review
+            | Page::Progress(_)
+            | Page::Recovery(_)
+            | Page::Complete => None,
             Page::Waiting => Some(DestinationPage::waiting(surface)),
             Page::Unavailable => Some(DestinationPage::unavailable(surface)),
             Page::Refused(reason) => Some(DestinationPage::refused(surface, reason)),
@@ -1145,6 +1331,31 @@ impl Window {
             wizard.first = view.first_visible();
             wizard.detail = view.detail_position().0;
         }
+        // The key's display form and the type-back's feedback, which the
+        // recovery page borrows; the display is zeroed when dropped.
+        let shown = match (&wizard.page, &wizard.recovery) {
+            (Page::Recovery(KeyStep::Shown), Some(key)) => Some(key.display()),
+            _ => None,
+        };
+        let feedback = match wizard.page {
+            Page::Recovery(KeyStep::TypeBack) => wizard.entry.feedback(),
+            _ => String::new(),
+        };
+        let key_page = match wizard.page {
+            Page::Recovery(step) => {
+                let step = match (step, &shown) {
+                    (KeyStep::Shown, Some(shown)) => recovery::Step::Shown(shown.as_str()),
+                    (KeyStep::TypeBack, _) => recovery::Step::TypeBack {
+                        entry: &wizard.entry,
+                        feedback: &feedback,
+                        notice: wizard.typed_notice.as_deref(),
+                    },
+                    (KeyStep::Asking | KeyStep::Shown, _) => recovery::Step::Asking,
+                };
+                Some(RecoveryPage::new(surface, step))
+            }
+            _ => None,
+        };
         let outcome: Option<Option<Box<dyn Composition>>> = match wizard.page {
             Page::Progress(progress) => Some(
                 ProgressPage::new(surface, progress)
@@ -1182,6 +1393,10 @@ impl Window {
                 .with_typeface(typeface.as_mut())
                 .with_theme(theme.theme());
             let painted = match (&outcome, &settings, &review, &destination) {
+                _ if key_page.is_some() => key_page
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .map(|view| raster.paint(view, surface.bounds()).map_err(error)),
                 (Some(view), _, _, _) => view
                     .as_ref()
                     .map(|view| raster.paint(view.as_ref(), surface.bounds()).map_err(error)),
@@ -1307,7 +1522,11 @@ pub fn run_window() -> std::io::Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::service::tests::{holding, installing, intake, listing, silent, slow_catalog};
+    use crate::outcome::Failure;
+    use crate::service::tests::{
+        holding, installing, intake, key, listing, recovering, silent, slow_catalog, KEY,
+        OTHER_KEY, SHOWN,
+    };
     use std::time::{Duration, Instant};
     use td_install::installation_plan::DestinationObservation;
 
@@ -2430,6 +2649,8 @@ mod tests {
             "Review",
             "Consent",
             "Complete",
+            "Recovery key",
+            "Type back",
         ];
         assert_eq!(titles(&wizard), order);
         let sections = wizard.key_sections();
@@ -2480,7 +2701,9 @@ mod tests {
                 "Disks",
                 "Review",
                 "Consent",
-                "Complete"
+                "Complete",
+                "Recovery key",
+                "Type back"
             ]
         );
         let mut wizard = on_review();
@@ -2499,6 +2722,26 @@ mod tests {
         assert_eq!(titles(&wizard)[0], "Complete");
         wizard.page = Page::Progress(Progress::Unknown);
         assert_eq!(titles(&wizard), order);
+        // The recovery key's pages lead with their own; asking and
+        // finishing take no key.
+        wizard.page = Page::Recovery(KeyStep::Shown);
+        assert_eq!(titles(&wizard)[0], "Recovery key");
+        wizard.page = Page::Recovery(KeyStep::TypeBack);
+        assert_eq!(titles(&wizard)[0], "Type back");
+        let sections = wizard.key_sections();
+        let fields: Vec<_> = recovery::TYPE_BACK_KEYS
+            .iter()
+            .copied()
+            .map(keys::row)
+            .collect();
+        assert_eq!(sections[0].rows[2..], fields[..]);
+        for page in [
+            Page::Recovery(KeyStep::Asking),
+            Page::Progress(Progress::Finishing),
+        ] {
+            wizard.page = page;
+            assert_eq!(titles(&wizard), order);
+        }
     }
 
     #[test]
@@ -2532,6 +2775,355 @@ mod tests {
         checked(&wizard);
         wizard.page = Page::Complete;
         checked(&wizard);
+        for step in [KeyStep::Asking, KeyStep::Shown, KeyStep::TypeBack] {
+            wizard.page = Page::Recovery(step);
+            checked(&wizard);
+        }
+    }
+
+    /// A wizard following `on_review`'s executed review into its recovery
+    /// key's phase, where the key is to be asked for.
+    fn at_key_phase() -> (Wizard, [u8; 32]) {
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        let verifying = Stage::Running(crate::outcome::Phase::VerifyingBoot);
+        polled(&mut wizard, state(nonce, verifying));
+        polled(&mut wizard, state(nonce, Stage::Recovery));
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::Asking));
+        (wizard, nonce)
+    }
+
+    /// As `at_key_phase`, with the key shown.
+    fn key_shown() -> (Wizard, [u8; 32]) {
+        let (mut wizard, nonce) = at_key_phase();
+        assert_eq!(wizard.wanted(), Some(Asked::RecoveryKey));
+        wizard.sent(Asked::RecoveryKey);
+        wizard.answered(Ok(Answer::RecoveryKey(key(KEY))));
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::Shown));
+        (wizard, nonce)
+    }
+
+    fn typed(wizard: &mut Wizard, text: &str) {
+        for typed in text.chars() {
+            wizard.key(&typed.to_string());
+        }
+    }
+
+    /// Sends the queued key typed back, as the front end does.
+    fn send_confirm(wizard: &mut Wizard) -> Key {
+        let typed = wizard.confirm.take().unwrap();
+        wizard.sent(Asked::Confirm);
+        typed
+    }
+
+    #[test]
+    fn the_recovery_key_is_asked_for_once_shown_and_typed_back() {
+        let (mut wizard, nonce) = at_key_phase();
+        assert_eq!(wizard.state(), "page=recovery step=asking");
+        // Nothing leaves the phase, and its state is not asked for.
+        for chord in ["Escape", "Return", "0"] {
+            wizard.key(chord);
+        }
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::Asking));
+        assert!(!wizard.following());
+        assert_eq!(wizard.wanted(), Some(Asked::RecoveryKey));
+        wizard.sent(Asked::RecoveryKey);
+        wizard.poll_due = true;
+        assert_eq!(wizard.wanted(), None);
+        wizard.answered(Ok(Answer::RecoveryKey(key(KEY))));
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::Shown));
+        let shown = wizard.recovery.as_ref().unwrap().display();
+        assert_eq!(shown.as_str(), SHOWN);
+        // No digit of it reaches the evidence.
+        assert_eq!(wizard.state(), "page=recovery step=shown");
+        // It was asked for once: the phase reported again asks nothing.
+        wizard.follow(Standing::Review {
+            nonce,
+            stage: Stage::Recovery,
+        });
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::Shown));
+        assert_eq!(wizard.wanted(), None);
+        // Return asks for it back, Escape shows it again; neither sends.
+        wizard.key("Return");
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::TypeBack));
+        assert_eq!(wizard.state(), "page=recovery step=typeback");
+        wizard.key("Escape");
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::Shown));
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), None);
+        // A key whose groups all check but is not the one shown is sent,
+        // and the field emptied; the service alone compares.
+        typed(
+            &mut wizard,
+            "000000 000000 000000 000000 000000 000000 000000 000000",
+        );
+        assert!(wizard.entry.feedback().starts_with("All 48 digits"));
+        wizard.key("Return");
+        assert_eq!(wizard.typed_notice.as_deref(), Some(CONFIRMING));
+        assert!(wizard.entry.feedback().starts_with("Type the 48 digits"));
+        assert_eq!(wizard.wanted(), Some(Asked::Confirm));
+        assert_eq!(send_confirm(&mut wizard), key(OTHER_KEY));
+        // Typing meanwhile still says it is with the service, and Return
+        // sends nothing more.
+        wizard.key("1");
+        wizard.key("Return");
+        assert_eq!(wizard.typed_notice.as_deref(), Some(CONFIRMING));
+        assert_eq!((wizard.wanted(), wizard.confirm.is_none()), (None, true));
+        wizard.answered(Ok(Answer::Mismatched));
+        assert_eq!(wizard.typed_notice.as_deref(), Some(MISMATCH));
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::TypeBack));
+        assert!(wizard.recovery.is_some());
+        // It may be shown again and typed again; moving the caret keeps
+        // the notice, and only an edit clears it.
+        wizard.key("Escape");
+        assert_eq!(wizard.page, Page::Recovery(KeyStep::Shown));
+        wizard.key("Return");
+        for chord in ["Left", "Home", "End", "Right"] {
+            wizard.key(chord);
+            assert_eq!(wizard.typed_notice.as_deref(), Some(MISMATCH), "{chord}");
+        }
+        wizard.key("Backspace");
+        assert_eq!(wizard.typed_notice, None);
+        typed(&mut wizard, SHOWN);
+        wizard.key("Return");
+        assert_eq!(send_confirm(&mut wizard), key(KEY));
+        wizard.answered(Ok(Answer::Confirmed));
+        // Confirmed: the key is forgotten, and the installation finishes,
+        // followed again; the phase reported still is finishing.
+        assert_eq!(wizard.page, Page::Progress(Progress::Finishing));
+        assert_eq!(wizard.state(), "page=finishing");
+        assert!(wizard.recovery.is_none() && wizard.confirm.is_none());
+        assert!(wizard.following());
+        polled(&mut wizard, state(nonce, Stage::Recovery));
+        assert_eq!(wizard.page, Page::Progress(Progress::Finishing));
+        assert!(wizard.recovery.is_none());
+        polled(&mut wizard, state(nonce, Stage::Complete));
+        assert_eq!(wizard.page, Page::Complete);
+        assert_eq!(wizard.completed, Some(nonce));
+        assert!(!wizard.confirmed);
+    }
+
+    #[test]
+    fn a_group_that_fails_is_named_as_it_is_typed_and_nothing_is_sent() {
+        let (mut wizard, _) = key_shown();
+        wizard.key("Return");
+        assert!(wizard.entry.feedback().starts_with("Type the 48 digits"));
+        // The field takes digits, spaces and hyphens only.
+        for chord in ["a", "Tab", "S-0", "C-a", ".", "+"] {
+            assert!(!wizard.entry.key(chord), "{chord}");
+        }
+        typed(&mut wizard, "000013-00515");
+        assert_eq!(wizard.entry.feedback(), "11 of 48 digits typed.");
+        // Group 2's check digit is wrong as soon as it is typed.
+        wizard.key("1");
+        let feedback = wizard.entry.feedback();
+        assert!(
+            feedback.starts_with("Group 2 is wrong: its check digit"),
+            "{feedback}"
+        );
+        wizard.key("Return");
+        assert_eq!(wizard.wanted(), None);
+        assert_eq!(wizard.typed_notice, Some(feedback));
+        // Right, but short: said so, and still nothing sent.
+        wizard.key("Backspace");
+        wizard.key("0");
+        assert_eq!(wizard.typed_notice, None);
+        assert_eq!(wizard.entry.feedback(), "12 of 48 digits typed.");
+        wizard.key("Return");
+        assert_eq!(
+            wizard.typed_notice.as_deref(),
+            Some("12 digits are typed; the key has 48.")
+        );
+        assert_eq!(wizard.wanted(), None);
+        // A separator inside a group, and a group above 65535.
+        typed(&mut wizard, " 0102 ");
+        assert_eq!(
+            wizard.entry.feedback(),
+            "Group 3 has 4 digits before a space or hyphen; groups have 6."
+        );
+        for _ in 0..6 {
+            wizard.key("Backspace");
+        }
+        typed(&mut wizard, " 999999");
+        assert_eq!(
+            wizard.entry.feedback(),
+            "Group 3 is wrong: its first five digits are above 65535."
+        );
+    }
+
+    #[test]
+    fn a_connection_lost_before_the_key_is_confirmed_claims_no_withdrawal() {
+        let lose = |wizard: &mut Wizard| {
+            wizard.answered(Err("the installer service connection ended".into()));
+        };
+        let withdrawn = Page::Progress(Progress::Failed(Failure::RecoveryUnconfirmed));
+        let unconfirmed = Page::Progress(Progress::Unconfirmed);
+        // While asking for the key, showing it, or typing it back with a
+        // key queued but not sent: a running service withdraws the
+        // installation, a stopped one did not, and nothing says which.
+        let (mut asking, _) = at_key_phase();
+        asking.sent(Asked::RecoveryKey);
+        let (shown, _) = key_shown();
+        let (mut queued, _) = key_shown();
+        queued.key("Return");
+        typed(&mut queued, SHOWN);
+        queued.key("Return");
+        assert!(queued.confirm.is_some());
+        let (mut mismatched, _) = key_shown();
+        mismatched.key("Return");
+        typed(&mut mismatched, SHOWN);
+        mismatched.key("Return");
+        send_confirm(&mut mismatched);
+        mismatched.answered(Ok(Answer::Mismatched));
+        for mut wizard in [asking, shown, queued, mismatched] {
+            lose(&mut wizard);
+            assert_eq!(wizard.page, unconfirmed);
+            assert_eq!(wizard.state(), "page=unconfirmed");
+            assert!(wizard.recovery.is_none() && wizard.confirm.is_none());
+            assert_eq!(wizard.executing, None);
+            // It stands, and no key moves it.
+            for chord in ["Return", "Escape"] {
+                wizard.key(chord);
+            }
+            assert_eq!((&wizard.page, wizard.wanted()), (&unconfirmed, None));
+            lose(&mut wizard);
+            assert_eq!(wizard.page, unconfirmed);
+        }
+        // Once the key typed back is with the service, or confirmed, the
+        // service may finish: the outcome is unknown.
+        let (mut confirming, _) = key_shown();
+        confirming.key("Return");
+        typed(&mut confirming, SHOWN);
+        confirming.key("Return");
+        send_confirm(&mut confirming);
+        // Shown again while it is with the service: still unknown.
+        confirming.key("Escape");
+        let (mut confirmed, _) = key_shown();
+        confirmed.key("Return");
+        typed(&mut confirmed, SHOWN);
+        confirmed.key("Return");
+        send_confirm(&mut confirmed);
+        confirmed.answered(Ok(Answer::Confirmed));
+        for mut wizard in [confirming, confirmed] {
+            lose(&mut wizard);
+            assert_eq!(wizard.page, Page::Progress(Progress::Unknown));
+            assert!(wizard.recovery.is_none());
+        }
+        // Only the service's own report of failure 6 says withdrawn, and
+        // it stands when the service goes.
+        let (mut wizard, nonce) = at_key_phase();
+        wizard.follow(Standing::Review {
+            nonce,
+            stage: Stage::Failed(Failure::RecoveryUnconfirmed),
+        });
+        assert_eq!(wizard.page, withdrawn);
+        assert_eq!(wizard.state(), "page=failed");
+        lose(&mut wizard);
+        assert_eq!(wizard.page, withdrawn);
+        // Lost on a device-bound execution before the phase: an earlier
+        // write or verification failure may still be its outcome.
+        let mut wizard = on_review();
+        wizard.key("Return");
+        let nonce = send_execute(&mut wizard);
+        wizard.answered(Ok(state(nonce, Stage::AwaitingConsent)));
+        let verifying = Stage::Running(crate::outcome::Phase::VerifyingBoot);
+        polled(&mut wizard, state(nonce, verifying));
+        lose(&mut wizard);
+        assert_eq!(wizard.page, Page::Progress(Progress::Unknown));
+    }
+
+    /// Drives the turn loop's clock until `page`, polling as it does.
+    fn drive(front: &mut Front, page: Page, now: &mut u64) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.page != page {
+            assert!(Instant::now() < deadline, "{:?}", front.wizard.page);
+            front.receive();
+            if front.wizard.page == page {
+                break;
+            }
+            if front.wizard.executing.is_some() {
+                front.poll(*now);
+            }
+            *now += POLL;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A front end showing the recovery key of a `recovering` service that
+    /// closes after `replies` answers, the key its seventh.
+    fn at_recovery_key(name: &str, replies: usize) -> (Front, PathBuf, u64) {
+        let intake = intake(name, replies, recovering());
+        let mut front = Front::new();
+        front.key("Return", &intake);
+        settle(&mut front, Page::Destinations);
+        front.key("Down", &intake);
+        front.key("Return", &intake);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.catalog != Catalog::Listed {
+            assert!(Instant::now() < deadline);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for chord in ["a", "l", "Tab", "h", "Tab", "Tab", "Return"] {
+            front.key(chord, &intake);
+        }
+        settle(&mut front, Page::Review);
+        let storage = front.wizard.plan.as_ref().map(|plan| plan.storage());
+        assert_eq!(
+            storage,
+            Some(td_install::installation_plan::Storage::DeviceBound)
+        );
+        front.key("Return", &intake);
+        let mut now = 0;
+        drive(&mut front, Page::Recovery(KeyStep::Shown), &mut now);
+        (front, intake, now)
+    }
+
+    #[test]
+    fn the_window_has_the_key_typed_back_over_its_connection_to_completion() {
+        let (mut front, intake, mut now) = at_recovery_key("front-recovery", usize::MAX);
+        assert_eq!(front.wizard.recovery, Some(key(KEY)));
+        front.key("Return", &intake);
+        for typed in "000000-000000-000000-000000-000000-000000-000000-000000".chars() {
+            front.key(&typed.to_string(), &intake);
+        }
+        front.key("Return", &intake);
+        assert_eq!(front.wizard.asked, Some(Asked::Confirm));
+        answer_taken(&mut front);
+        assert_eq!(front.wizard.typed_notice.as_deref(), Some(MISMATCH));
+        for typed in SHOWN.chars() {
+            front.key(&typed.to_string(), &intake);
+        }
+        front.key("Return", &intake);
+        drive(&mut front, Page::Progress(Progress::Finishing), &mut now);
+        assert!(front.wizard.recovery.is_none());
+        drive(&mut front, Page::Complete, &mut now);
+        front.key("Return", &intake);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while front.wizard.power != Power::Accepted(Ending::Restart) {
+            assert!(Instant::now() < deadline, "{:?}", front.wizard.power);
+            front.receive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn the_window_says_what_a_lost_connection_leaves_of_the_installation() {
+        // Gone once the key is shown: not finished, withdrawal unknown.
+        let (mut front, _intake, mut now) = at_recovery_key("front-recovery-shown", 7);
+        drive(&mut front, Page::Progress(Progress::Unconfirmed), &mut now);
+        assert!(front.service.is_none() && front.wizard.recovery.is_none());
+        // Gone once the key typed back is confirmed: unknown.
+        let (mut front, intake, mut now) = at_recovery_key("front-recovery-confirmed", 8);
+        front.key("Return", &intake);
+        for typed in SHOWN.chars() {
+            front.key(&typed.to_string(), &intake);
+        }
+        front.key("Return", &intake);
+        drive(&mut front, Page::Progress(Progress::Unknown), &mut now);
+        assert!(front.service.is_none());
     }
 
     /// A window over one end of a socket pair: no compositor reads it.

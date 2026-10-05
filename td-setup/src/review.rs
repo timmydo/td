@@ -1,7 +1,7 @@
 //! Pure review of one immutable installation proposal. The service must
 //! authenticate the source, hold the disk claim and obtain trusted consent.
 
-use td_install::installation_plan::Plan;
+use td_install::installation_plan::{Plan, Storage};
 use td_ui::chrome::{Block, Status, BLOCK_SCALARS, ROW};
 use td_ui::raster::{
     text_run, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, CHROME, INK,
@@ -14,12 +14,34 @@ const INSET: usize = CELL_WIDTH;
 const BODY_TOP: usize = 4 * ROW;
 const BODY_ROWS: usize = 15;
 const WARNING_TOP: usize = BODY_TOP + BODY_ROWS * CELL_HEIGHT + ROW;
-/// The row under the warnings that says what became of an install request.
-const NOTICE_TOP: usize = WARNING_TOP + WARNINGS.len() * ROW;
-const WARNINGS: [&str; 2] = [
+/// The warnings for each storage the service's own operand chooses; no
+/// request chooses it, so the page says what the review carries.
+const UNENCRYPTED: &[&str] = &[
     "All data on the selected disk will be lost after trusted consent.",
     "Storage is not encrypted. The account signs in automatically without a password or PIN.",
 ];
+/// Device-bound storage protects a disk read away from this computer, not
+/// a lost one (td-install/ENCRYPTION.md "Device-bound default").
+const DEVICE_BOUND: &[&str] = &[
+    "All data on the selected disk will be lost after trusted consent.",
+    "Storage is encrypted to this computer's TPM; this does not protect a lost computer.",
+    "The account signs in automatically. Write down the recovery key shown at the end.",
+];
+/// The most warning rows any storage shows.
+const WARNING_ROWS: usize = 3;
+
+/// The row under `rows` warnings that says what became of an install
+/// request.
+const fn notice_top(rows: usize) -> usize {
+    WARNING_TOP + rows * ROW
+}
+
+fn warnings(storage: Storage) -> &'static [&'static str] {
+    match storage {
+        Storage::Unencrypted => UNENCRYPTED,
+        Storage::DeviceBound => DEVICE_BOUND,
+    }
+}
 
 /// One bounded page of the proposed disk and settings. The page does not
 /// authorize installation; every page must be available before consent.
@@ -32,6 +54,7 @@ pub struct ReviewPage {
     status: String,
     footer: Status,
     notice: Option<&'static str>,
+    warnings: &'static [&'static str],
 }
 
 impl ReviewPage {
@@ -41,7 +64,7 @@ impl ReviewPage {
         let body = Block::new(surface, (BODY_TOP * scale) as i64, BODY_ROWS)?;
         let footer = Status::new(surface);
         // The notice row is the lowest, under the warnings.
-        if ((NOTICE_TOP + CELL_HEIGHT) * scale) as i64 > footer.rect().y {
+        if ((notice_top(WARNING_ROWS) + CELL_HEIGHT) * scale) as i64 > footer.rect().y {
             return None;
         }
         let columns = body
@@ -91,6 +114,7 @@ impl ReviewPage {
             status,
             footer,
             notice: None,
+            warnings: warnings(plan.storage()),
         })
     }
 
@@ -153,7 +177,7 @@ impl Composition for ReviewPage {
             );
         }
         self.body.emit(&self.detail, damage, sink);
-        for (index, warning) in WARNINGS.iter().enumerate() {
+        for (index, warning) in self.warnings.iter().enumerate() {
             let rect = Rect {
                 y: ((WARNING_TOP + index * ROW) * scale.value()) as i64,
                 ..heading
@@ -170,7 +194,7 @@ impl Composition for ReviewPage {
         }
         if let Some(notice) = self.notice {
             let rect = Rect {
-                y: (NOTICE_TOP * scale.value()) as i64,
+                y: (notice_top(self.warnings.len()) * scale.value()) as i64,
                 ..heading
             };
             let columns = (heading.width as usize) / (CELL_WIDTH * scale.value());
@@ -211,7 +235,7 @@ mod tests {
         let mut row = String::new();
         page.emit(surface.bounds(), &mut |draw| {
             if let Primitive::Glyph { y, scalar, .. } = draw.primitive {
-                if y == NOTICE_TOP as i64 {
+                if y == notice_top(UNENCRYPTED.len()) as i64 {
                     row.push(scalar);
                 }
             }
@@ -221,6 +245,10 @@ mod tests {
     }
 
     fn plan(serial: &str) -> Plan {
+        stored(serial, Storage::Unencrypted)
+    }
+
+    fn stored(serial: &str, storage: Storage) -> Plan {
         let disk = Destination::new(DestinationObservation {
             name: "nvme0n1",
             major: 259,
@@ -238,15 +266,7 @@ mod tests {
         let mut uuid = [0u8; 16];
         *uuid.get_mut(6).unwrap() = 0x40;
         *uuid.get_mut(8).unwrap() = 0x80;
-        Plan::new(
-            [1; 32],
-            disk,
-            [2; 32],
-            uuid,
-            td_install::installation_plan::Storage::Unencrypted,
-            settings,
-        )
-        .unwrap()
+        Plan::new([1; 32], disk, [2; 32], uuid, storage, settings).unwrap()
     }
 
     fn surface(width: usize, height: usize) -> Surface {
@@ -273,7 +293,7 @@ mod tests {
                     glyphs.push(scalar);
                 }
             });
-            for warning in WARNINGS {
+            for warning in UNENCRYPTED {
                 assert!(glyphs.contains(warning));
             }
             for line in view.detail.lines() {
@@ -319,5 +339,38 @@ mod tests {
         assert!(ReviewPage::new(scaled, &plan, 0).is_some());
         let too_narrow = Surface::new(1503, 960, Scale::new(2).unwrap()).unwrap();
         assert!(ReviewPage::new(too_narrow, &plan, 0).is_none());
+    }
+
+    /// A device-bound review never says storage is unencrypted, never
+    /// claims to protect a lost computer, and fits as the other does.
+    #[test]
+    fn a_device_bound_review_says_what_its_storage_is() {
+        let screen = surface(crate::MIN_PAGE_WIDTH, crate::MIN_PAGE_HEIGHT);
+        let columns = (crate::MIN_PAGE_WIDTH - 2 * INSET) / CELL_WIDTH;
+        for warning in UNENCRYPTED.iter().chain(DEVICE_BOUND) {
+            assert!(warning.chars().count() <= columns, "{warning}");
+        }
+        assert!(UNENCRYPTED.len().max(DEVICE_BOUND.len()) <= WARNING_ROWS);
+        let plan = stored("SERIAL", Storage::DeviceBound);
+        let view = ReviewPage::new(screen, &plan, 0)
+            .unwrap()
+            .with_notice(Some("trusted consent is unavailable"));
+        let mut glyphs = String::new();
+        let mut notice = String::new();
+        view.emit(screen.bounds(), &mut |draw| {
+            if let Primitive::Glyph { y, scalar, .. } = draw.primitive {
+                glyphs.push(scalar);
+                if y == notice_top(DEVICE_BOUND.len()) as i64 {
+                    notice.push(scalar);
+                }
+            }
+        });
+        for warning in DEVICE_BOUND {
+            assert!(glyphs.contains(warning), "{warning}");
+        }
+        assert!(!glyphs.contains("not encrypted"));
+        assert!(glyphs.contains("does not protect a lost computer"));
+        assert_eq!(notice, "trusted consent is unavailable");
+        assert!(ReviewPage::new(surface(752, 479), &plan, 0).is_none());
     }
 }

@@ -14,6 +14,7 @@
 //! over the raster and the chrome bands and cannot quietly reach the
 //! transport or the turn loop. `service` is the crate's only installer
 //! client: it alone names the protocol, the setup intake and threads.
+//! `recovery` alone names the disk protector, only its recovery-key codec.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -35,6 +36,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "lib.rs",
         "main.rs",
         "outcome.rs",
+        "recovery.rs",
         "review.rs",
         "service.rs",
         "settings.rs",
@@ -90,6 +92,7 @@ fn source_inventory_and_toolkit_access_are_closed() {
         "lib.rs",
         "main.rs",
         "outcome.rs",
+        "recovery.rs",
         "review.rs",
         "service.rs",
         "settings.rs",
@@ -115,6 +118,18 @@ fn source_inventory_and_toolkit_access_are_closed() {
             !allowed.contains("td_install"),
             "{name} reaches another installer API"
         );
+        // Only `recovery` names the disk protector, and only its
+        // recovery-key codec: no TPM client, token, header reader or key
+        // generation reaches the window.
+        let protector = if name == "recovery.rs" {
+            text.replace("td_protector::recovery::", "")
+        } else {
+            text.clone()
+        };
+        assert!(
+            !protector.contains("td_protector"),
+            "{name} reaches the disk protector"
+        );
         let found = client_violations(name, &text);
         assert!(found.is_empty(), "{name}: {found:?}");
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -123,6 +138,9 @@ fn source_inventory_and_toolkit_access_are_closed() {
             "{name} mounts outside source"
         );
     }
+    let recovery = std::fs::read_to_string(root.join("src/recovery.rs")).unwrap();
+    assert!(recovery.contains("use td_protector::recovery::{"));
+    assert!(!recovery.contains("generate"), "td-setup draws no key");
     // The client boundary is real: `window` names both the transport and the
     // client, so removing either from it would be caught here, not silently.
     let window = std::fs::read_to_string(root.join("src/window.rs")).unwrap();

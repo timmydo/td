@@ -27,6 +27,7 @@ name = "td-setup"
 version = "0.1.0"
 dependencies = [
  "td-install",
+ "td-protector",
  "td-ui",
 ]
 
