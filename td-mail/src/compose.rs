@@ -612,42 +612,18 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Replaces the draft at `path` with `bytes`, whole or not at all: they
-/// are written to a private sibling, synced, and renamed over the path,
-/// so a write that fails leaves the draft as it was and a symlink put at
-/// the path is replaced, not followed. A sibling left by a failure is
-/// removed; the draft never is.
+/// Replaces the draft at `path` with `bytes`, whole or not at all, private
+/// to the owner (`td_fs::replace`): a write that fails leaves the draft as
+/// it was, and a symlink put at the path is replaced, not followed. A path
+/// that names no directory is refused rather than taken as the current one.
 pub(crate) fn replace_draft(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "draft path has no directory")
-        })?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "draft path has no name"))?;
-    let mut sibling = std::ffi::OsString::from(".");
-    sibling.push(name);
-    sibling.push(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let sibling = dir.join(sibling);
-    let written = create_secure_file(&sibling).and_then(|mut file| {
-        use std::io::Write;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&sibling, path)
-    });
-    if written.is_err() {
-        let _ = fs::remove_file(&sibling);
+    if path.parent().is_none_or(|dir| dir.as_os_str().is_empty()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "draft path has no directory",
+        ));
     }
-    written
+    td_fs::replace(path, bytes, 0o600)
 }
 
 /// Where the record of a send of the draft at `path` is kept from before

@@ -511,28 +511,11 @@ fn read_named(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     read_bounded(path, limit).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Replaces `dir/name` whole: a fresh temporary written and synced, then
-/// renamed over it and the directory synced, so a reader sees the old
-/// bytes or the new, never part of either.
+/// Replaces `dir/name` whole and durably, private to the owner
+/// (`td_fs::replace`): a reader sees the old bytes or the new, never part
+/// of either.
 pub(crate) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
-    let temporary = dir.join(format!(".{name}.{}", std::process::id()));
-    let _ = std::fs::remove_file(&temporary);
-    let write = || -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, dir.join(name))?;
-        File::open(dir)?.sync_all()
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&temporary);
-        format!("{}: {e}", dir.join(name).display())
-    })
+    td_fs::replace(&dir.join(name), bytes, 0o600).map_err(|e| e.to_string())
 }
 
 /// A conversation's `meta` (DESIGN.md §6). The mode and parent are null

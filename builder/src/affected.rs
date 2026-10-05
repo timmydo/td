@@ -5044,7 +5044,7 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads td-crypto, td-header,
 /// td-json and td-nfc, its direct dependencies. td-agent reads td-civil,
-/// td-fetch-client, td-json, td-toml and td-ui, its dependencies, and
+/// td-fetch-client, td-fs, td-json, td-toml and td-ui, its dependencies, and
 /// td-compositor, the test tool its `native-compositor-tests` opt-in builds
 /// (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[
@@ -5054,6 +5054,7 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[
             "td-civil",
             "td-compositor",
             "td-fetch-client",
+            "td-fs",
             "td-json",
             "td-toml",
             "td-ui",
@@ -9813,12 +9814,20 @@ mod tests {
             }
             manifest
         };
-        let all_deps = ["td-civil", "td-fetch-client", "td-json", "td-toml", "td-ui"];
+        let all_deps = [
+            "td-civil",
+            "td-fetch-client",
+            "td-fs",
+            "td-json",
+            "td-toml",
+            "td-ui",
+        ];
         for name in [
             "td-agent",
             "td-civil",
             "td-compositor",
             "td-fetch-client",
+            "td-fs",
             "td-json",
             "td-news",
             "td-toml",
@@ -9851,7 +9860,7 @@ mod tests {
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
         // An edge lost is a changed set too.
         std::fs::write(root.join("td-agent/src/lib.rs"), "").unwrap();
-        std::fs::write(root.join("td-agent/Cargo.toml"), deps(&all_deps[..4])).unwrap();
+        std::fs::write(root.join("td-agent/Cargo.toml"), deps(&all_deps[..5])).unwrap();
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);
     }
 

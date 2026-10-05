@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "td-civil",
  "td-fetch-client",
+ "td-fs",
  "td-json",
  "td-toml",
  "td-ui",
@@ -19,6 +20,10 @@ version = "0.1.0"
 
 [[package]]
 name = "td-fetch-client"
+version = "0.1.0"
+
+[[package]]
+name = "td-fs"
 version = "0.1.0"
 
 [[package]]

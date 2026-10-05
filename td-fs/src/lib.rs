@@ -7,5 +7,7 @@
 //! td-install, td-net and the recipe library include `real_file.rs` alone.
 
 mod real_file;
+mod replace;
 
 pub use real_file::{open_real_file, read_bounded_real_file};
+pub use replace::replace;

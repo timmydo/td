@@ -64,6 +64,7 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 td-civil = { path = "../td-civil" }
 td-encoding = { path = "../td-encoding" }
 td-fetch-client = { path = "../td-fetch-client" }
+td-fs = { path = "../td-fs" }
 td-html = { path = "../td-html" }
 td-json = { path = "../td-json" }
 td-kv = { path = "../td-kv" }

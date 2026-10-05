@@ -28,6 +28,7 @@ path = "src/bin/td-vm.rs"
 # workspace ids, staging nonces and the origin reply.
 [dependencies]
 td-encoding = { path = "../td-encoding" }
+td-fs = { path = "../td-fs" }
 
 [lints.rust]
 unsafe_code = "deny"

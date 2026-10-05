@@ -1,7 +1,6 @@
 use crate::vm_wire as wire;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File};
+use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -129,20 +128,7 @@ fn enabled(dir: &Path) -> Result<bool> {
 }
 
 pub(crate) fn publish(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let temp = dir.join(format!("{name}-{:x}.tmp", request_id()?));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)
-        .map_err(|e| format!("stage VM setting: {e}"))?;
-    let result = (|| {
-        file.write_all(bytes).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        fs::rename(&temp, dir.join(name)).map_err(|e| format!("publish VM setting: {e}"))
-    })();
-    let _ = fs::remove_file(temp);
-    result
+    td_fs::replace(&dir.join(name), bytes, 0o600).map_err(|e| format!("publish VM setting: {e}"))
 }
 
 pub fn sharing(dir: &Path, mode: &str) -> Result<()> {

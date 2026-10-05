@@ -84,10 +84,10 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's source-built stage2 toolchain. Its manifest declares five
+td's source-built stage2 toolchain. Its manifest declares six
 dependencies, all td crates by path: `td-civil`, `td-fetch-client`,
-`td-json`, `td-toml` and `td-ui`, and its lock lists exactly those and
-td-agent. It
+`td-fs`, `td-json`, `td-toml` and `td-ui`, and its lock lists exactly
+those and td-agent. It
 carries no TLS, resolves no names and opens no network
 connection itself: every request to a model provider goes through the td
 fetch service (APPLICATIONS.md §W.8) by td-fetch-client, as td-news and
@@ -3658,9 +3658,10 @@ follows:
   change to a crate it reads selects td-agent as well, as it should;
 - no recipe, recipe test or seed roster names it until packaging;
 - its outgoing edges are pinned: exactly `td-civil`, `td-compositor`,
-  `td-fetch-client`, `td-json`, `td-toml` and `td-ui` (its
+  `td-fetch-client`, `td-fs`, `td-json`, `td-toml` and `td-ui` (its
   dependencies). `td-civil` joined when the history's UTC stamps left a
-  copied calendar; `td-compositor` joined with the window increment, which
+  copied calendar; `td-fs` when the store's atomic replace became
+  td-fs's; `td-compositor` joined with the window increment, which
   declared `native-compositor-tests`, since that opt-in adds the edge;
   `td-json` and `td-toml` joined when JSON and TOML left the copied
   modules for crates of their own, and `td-fetch-client` replaced

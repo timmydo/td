@@ -16,7 +16,8 @@ an ordinary running desktop.
 ### Implemented lifecycle increment
 
 `td-vm` is a standalone, dependency-free host crate: `std` and, by path,
-td's own `td-encoding` for its hex and base64. It owns the VM manager,
+td's own `td-encoding` for its hex and base64 and `td-fs` for the atomic
+replace its bridge publishes settings through. It owns the VM manager,
 Git dispatcher and account-authenticated registrar binaries. `td-review` is
 a separate review tool; their integration is ordinary Git branches. The VM
 TUI owns its terminal helpers in `src/term.rs`, with no source or Cargo

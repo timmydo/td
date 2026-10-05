@@ -55,6 +55,7 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 [dependencies]
 td-civil = { path = "../td-civil" }
 td-fetch-client = { path = "../td-fetch-client" }
+td-fs = { path = "../td-fs" }
 td-json = { path = "../td-json" }
 td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }

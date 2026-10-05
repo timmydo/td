@@ -7,8 +7,13 @@ name = "td-encoding"
 version = "0.1.0"
 
 [[package]]
+name = "td-fs"
+version = "0.1.0"
+
+[[package]]
 name = "td-vm"
 version = "0.1.0"
 dependencies = [
  "td-encoding",
+ "td-fs",
 ]
