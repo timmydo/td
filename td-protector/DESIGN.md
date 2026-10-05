@@ -11,16 +11,18 @@ shared TPM 2.0 client [td-tpm](../td-tpm/DESIGN.md) and owns only what
 ENCRYPTION.md makes disk-specific: which PCRs a protector names, the
 release cap, and the protector secret. It is pure `std`, depends only on
 td-tpm and the std-only td-json, forbids `unsafe` and adds no syscall
-surface to `UNSAFE.md`.
+surface to `UNSAFE.md`: its cryptsetup runner's pipes and children are
+std's.
 
 Increment 5 adds the two persisted formats the installer writes and the
 selector reads: the recovery key's encoding and the td LUKS2 token, with
 the bounded reader that finds tokens in a LUKS2 header before the cap.
-Increment 6 (target, not yet implemented) adds what the installer and
-the selector share for keyslot changes: the cryptsetup runner, moved
-from td-install with DESIGN.md "Device-bound formatting"'s descriptor
-rules unchanged; the pure transition planner ("Transitions"); and the
-release orchestration that runs ENCRYPTION.md's release order.
+Increment 6 adds what the installer and the selector share for keyslot
+changes: the cryptsetup runner ("Cryptsetup runner"), moved from
+td-install with DESIGN.md "Device-bound formatting"'s descriptor rules
+unchanged, and the pure transition planner ("Transitions"); the release
+orchestration that runs ENCRYPTION.md's release order is its target,
+not yet implemented.
 
 ## Policies
 
@@ -211,7 +213,8 @@ different copy than cryptsetup would.
 td parses only a used copy of the 16 KiB it formats (ENCRYPTION.md
 "Device-bound formatting"): any other `hdr_size` refuses the header
 before its JSON reaches td-json, which therefore never sees more than the
-12 KiB JSON area. That area must hold one JSON object followed only by NUL
+12 KiB JSON area from a header (cryptsetup's metadata dump, below, is
+bounded apart). That area must hold one JSON object followed only by NUL
 bytes, parsing without a duplicate key. Its `tokens` and `keyslots`
 objects are keyed by numbers 0 to 31, each token names keyslots that
 exist (cryptsetup's own token rule), and at most four td tokens, orphans
@@ -226,7 +229,9 @@ and that validation is wider than td's. So td reads the copy cryptsetup
 will use or refuses, with one gap: a copy that passes td's checks and
 fails only cryptsetup's is one td reads and cryptsetup does not use. The
 secret td releases from it opens the volume only if its keyslot is also in
-cryptsetup's copy; otherwise the boot reaches recovery.
+cryptsetup's copy; otherwise the boot reaches recovery. No header change
+rests on that copy alone: a transition runs only once cryptsetup's own
+metadata agrees with it ("Transitions").
 
 `token::Token` carries one td token: `encode` writes the compact JSON
 `cryptsetup token import` takes, keys in the order above, `decode` and
@@ -235,15 +240,89 @@ cryptsetup's copy; otherwise the boot reaches recovery.
 first byte, such as a window onto the installer's claim or the selector's
 opened partition, and returns the used copy's sequence number, size,
 UUID, label, keyslot numbers, td tokens and orphans with their token
-numbers. It runs no cryptsetup and needs no privilege.
+numbers, and each token of another type with its number and the
+keyslots it names. It runs no cryptsetup and needs no privilege.
+`luks2::metadata` reads the same keyslots and tokens, under the same
+token rules, from the JSON `luksDump --dump-json-metadata` prints for
+the copy cryptsetup uses: at most `MAX_METADATA_JSON`, 128 KiB, which
+holds cryptsetup's indented rendering of a 12 KiB area, parsed by
+td-json.
+
+## Cryptsetup runner
+
+`cryptsetup::Cryptsetup` runs one cryptsetup command per child, for the
+installer's formatting and the selector's transitions alike. Its
+program is an absolute path, checked at each run rather than looked up,
+and its environment is cleared. Standard input is a std pipe filled
+whole before the child starts, so it is held to one page
+(`MAX_PIPE_INPUT`, 4096 bytes, the least any pipe holds) and more is
+refused rather than risk a write that blocks: a passphrase or secret of
+at most 48 bytes, or a token's JSON under `token::MAX_TOKEN_JSON`. A
+second secret, the new key `luksAddKey` reads as its key file, is a
+`KeyFile`: a std pipe filled the same way whose write end is closed and
+whose read end this process keeps, close-on-exec, naming it to the child
+as `/proc/<own pid>/fd/N`, so cryptsetup opens the pipe anew and reads
+exactly the secret and end of file. That name opens only for a process
+the kernel lets trace the caller, which must therefore stay dumpable and
+run cryptsetup under its own uid. No argv element or environment
+variable carries key material, and a descriptor path names no secret.
+The runner keeps no copy of a secret: it writes from the caller's borrow
+into the pipe. A child's standard output is read up to `MAX_OUTPUT`, 128
+KiB, beyond which the run fails; `run` copies it to standard error,
+which the child inherits, and zeroes it, so no verb that prints key
+material to standard output (`luksDump --dump-volume-key`, say) may run
+through `run`. `metadata` runs `luksDump --dump-json-metadata` and
+returns its output instead, the header's public JSON.
+
+`run` succeeds only on exit 0 and otherwise names the program, the verb
+and the exit status, never an argument. `mapping` asks `status NAME` of
+device-mapper and classifies its exit alone: 0 active, 4 inactive
+(cryptsetup 2.8.8's `action_status` returns `-ENODEV` for an inactive
+name, which `translate_errno` makes 4), and any other exit an error
+meaning neither; no node under `/dev/mapper` is consulted.
+
+The module spells every command's arguments: `luksFormat` with
+ENCRYPTION.md's parameters, the UUID and the label; `luksAddKey` of a
+new keyslot, another keyslot's key on standard input authorizing it,
+with the format's PBKDF2 parameters; `token import`, at a given number
+or the lowest free one; `token remove`; `luksKillSlot --batch-mode
+--key-file=-`, whose standard input carries the key of a keyslot that
+remains; `luksDump --dump-json-metadata`; `open`, `close`, `status`;
+and `open --test-passphrase` on one keyslot. Given a key, cryptsetup
+2.8.8's `luksKillSlot` destroys a keyslot only once that key opens
+another; given an empty standard input, or one it fails to read, it
+ignores the failed read (`-EPIPE`) and destroys the keyslot unasked. So
+`run` refuses a `luksKillSlot` whose input is shorter than
+`MIN_KILL_KEY`, 32 bytes, td's shortest secret, before any child
+starts.
 
 ## Transitions
 
-This is increment 6's target; none of it is implemented yet. The
-planner is pure: from the header the reader returned and the td tokens
-whose secrets released, it computes one transition's ordered cryptsetup
-steps, running no cryptsetup and reaching no TPM. The release
-orchestration executes the plan through the runner after the cap.
+The planner is pure: from the header the reader returned and the td
+tokens whose secrets released, it computes one transition's ordered
+cryptsetup steps, running no cryptsetup and reaching no TPM. The release
+orchestration, increment 6's target, executes the plan through the
+runner after the cap. `transition::classify` names the transition the
+released tokens call for, and `transition::plan` its steps, each a
+runner command with the key of a named keyslot, the new token's JSON or
+nothing on standard input. A plan adds the new protector at the lowest
+free keyslot from 1 and imports its token at the lowest free token
+number, which cryptsetup chooses; every kill carries the key of a
+keyslot that remains: the released or recovery keyslot's before the
+add, the new one's after its test. A plan whose import would find every
+token number of any type taken, after the orphans and any early
+retirements are removed, refuses before its first step, as one with no
+free keyslot does.
+
+`plan` returns a `Plan`, which carries the reader's view of the
+keyslots and tokens of every type it was computed from. Before the
+plan's first step the executor runs `luksDump --dump-json-metadata`
+through the runner and hands its output to `Plan::confirm`, which
+returns the steps only when `luks2::metadata` reads from it exactly
+that view; the executor runs no other steps. Otherwise no plan runs that
+boot and the volume still opens: a copy td read and cryptsetup rejects
+("LUKS2 tokens") could otherwise make td kill a keyslot that is an
+orphan in td's copy and a foreign token's in cryptsetup's.
 
 - Keyslot 0 is always the recovery keyslot. No plan adds or kills it or
   names it in a token. A td token naming it is never released and
@@ -275,6 +354,18 @@ orchestration executes the plan through the runner after the cap.
   opened the volume, or the new one once its token is committed; what it
   leaves over is an orphan, a superseded token or a leftover first-boot
   one, which the next boot's plan removes.
+- A power cut inside `luksKillSlot` can leave a dead keyslot: its area
+  wiped, its JSON and any token naming it intact, so the reader sees it
+  as before. Kills retire only keyslots no protector that stays needs,
+  and each later kill of it is authorized by another keyslot's key, so a
+  dead keyslot is retired again by the next plan. A dead keyslot the
+  released token names fails the plan's first test, or the volume's open
+  when the plan is empty: the executor then classifies again without
+  that token, falling back to the next released one and, when none is
+  left, to recovery. It never halts on it.
+- A LUKS2 reencryption keyslot names no token and is an orphan by this
+  rule; the protected-tier upgrade, which re-encrypts online, must run
+  no plan while one exists.
 
 What is old depends on the transition. The first-boot transition retires
 the first-boot keyslot and token. When a device-bound protector released
@@ -299,11 +390,14 @@ together: under 12 MiB in all, hashed twice at most (the checksum, then
 the JSON area's own digest). It holds at most one area, up to 4 MiB, at
 a time, and keeps of
 each verified copy only its binary header, its JSON area's SHA-256 and,
-at 16 KiB, its 12 KiB JSON area. td-json parses at most 12 KiB and bounds
+at 16 KiB, its 12 KiB JSON area. td-json parses at most 12 KiB of a
+header, 128 KiB of a metadata dump, and bounds
 nesting. `decode` admits a token text of at most 4096 bytes; a token from
 either path has only bounded fields and encodes in under 1700 bytes. Its
 sealed areas are at most 256 and 512 bytes, and a header carries at most
-four td tokens, orphans included, among 32.
+four td tokens, orphans included, among 32. A plan has at most 39
+steps: two tests, a kill per keyslot from 1 to 31, a removal per td
+token, an add and an import. The runner's inputs are at most one page.
 
 ## Evidence
 
@@ -342,8 +436,29 @@ refused by its size without parsing, malformed and padded JSON areas, a
 duplicate key, non-canonical slot numbers, tokens naming absent
 keyslots, a malformed td token, a td token naming two keyslots, other
 token types ignored, orphans reported beside a valid token and counted
-toward the four-token bound, a malformed orphan, and a read error. No
-test reads a header cryptsetup wrote: that needs the source-built
+toward the four-token bound, a malformed orphan, the keyslots other
+token types name, and a read error. Runner tests pin every command's
+arguments word for word, that a key file is a close-on-exec descriptor
+holding exactly the secret, the one-page input bound, a stand-in
+cryptsetup's cleared environment and inputs with no key in its argv, a
+relative program refused, and `status` exits 0, 4 and others. Planner
+tests model cryptsetup's header commits, a kill stripping its keyslot
+from the tokens naming it, and pin the plans of the first-boot
+transition, each of its interrupted states, a device-bound release with
+superseded, leftover and orphaned tokens and a foreign token's keyslot,
+the reseal, the four-token bound and a header whose 31 other token
+numbers are foreign; drive the first-boot transition and the reseal to
+every cut, between steps or inside a kill, of one boot and of the boot
+that resumes it and require the same final header; fall back from a
+dead released keyslot; refuse each `Refusal`, metadata that disagrees
+in a keyslot or a token of any type among them; and, over 400 generated
+headers of keyslots 0 to 5, some dead, with up to four tokens of every
+kind, on three machines, cut the first boot everywhere and require of
+every later boot no refusal but the header's own, no command
+cryptsetup would refuse (each test with the key that opens its keyslot),
+the four-token bound after every step, and an empty plan within three
+boots. The runner tests also refuse a `luksKillSlot` with an empty or
+31-byte key before any child starts. No test reads a header cryptsetup wrote: that needs the source-built
 cryptsetup and its kernel crypto interfaces, which the host
 gate does not provide, so increment 5's encrypted-installation oracle
 (`qemu-install-encrypted`) reads one in the guest: the installer's

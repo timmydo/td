@@ -79,7 +79,62 @@ pub struct Header {
     /// Each orphaned td token, naming no keyslot, with its token number,
     /// ascending: never released, left for the transition to remove.
     pub orphans: Vec<(u8, Role)>,
+    /// Each token of another type with its token number and the keyslots
+    /// it names, ascending: the transition leaves them alone.
+    pub foreign: Vec<(u8, Vec<u8>)>,
 }
+
+impl Header {
+    /// The keyslots tokens of other types name, ascending.
+    pub fn foreign_keyslots(&self) -> Vec<u8> {
+        let mut slots: Vec<u8> = self
+            .foreign
+            .iter()
+            .flat_map(|(_, slots)| slots.iter().copied())
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    /// Every token number in use, of any type, ascending.
+    pub fn token_numbers(&self) -> Vec<u8> {
+        let mut numbers: Vec<u8> = self
+            .tokens
+            .iter()
+            .map(|(number, _)| *number)
+            .chain(self.orphans.iter().map(|(number, _)| *number))
+            .chain(self.foreign.iter().map(|(number, _)| *number))
+            .collect();
+        numbers.sort_unstable();
+        numbers
+    }
+
+    /// The keyslots and tokens of every type, to compare with cryptsetup's
+    /// own metadata (`metadata`).
+    pub fn metadata(&self) -> Metadata {
+        Metadata {
+            keyslots: self.keyslots.clone(),
+            tokens: self.tokens.clone(),
+            orphans: self.orphans.clone(),
+            foreign: self.foreign.clone(),
+        }
+    }
+}
+
+/// A header's keyslots and tokens of every type, as `Header` carries them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metadata {
+    pub keyslots: Vec<u8>,
+    pub tokens: Vec<(u8, Token)>,
+    pub orphans: Vec<(u8, Role)>,
+    pub foreign: Vec<(u8, Vec<u8>)>,
+}
+
+/// The most text `metadata` parses: cryptsetup's indented rendering of a
+/// JSON area of at most 12 KiB, whose shortest element grows by a line
+/// break and its indentation.
+pub const MAX_METADATA_JSON: usize = 128 * 1024;
 
 /// What td keeps of one checksum-valid copy once its area is verified:
 /// the binary header, the JSON area only at td's formatted size, and the
@@ -258,13 +313,39 @@ fn header_from(copy: &ValidCopy, which: HeaderCopy) -> Result<Header, String> {
         }
     };
     let json = json_area(json)?;
-    let keyslots: Vec<u8> = numbered(&json, "keyslots")?
+    let Metadata {
+        keyslots,
+        tokens,
+        orphans,
+        foreign,
+    } = contents(&json)?;
+    let text = |at, len| -> Result<String, String> {
+        Ok(String::from_utf8_lossy(text_at(&copy.binary, at, len)?).into_owned())
+    };
+    Ok(Header {
+        copy: which,
+        seqid: copy.seqid,
+        hdr_size: copy.hdr_size,
+        uuid: text(UUID_AT, UUID_LEN)?,
+        label: text(LABEL_AT, LABEL_LEN)?,
+        keyslots,
+        tokens,
+        orphans,
+        foreign,
+    })
+}
+
+/// The keyslots and tokens of a parsed JSON header, under td's token
+/// rules.
+fn contents(json: &Json) -> Result<Metadata, String> {
+    let keyslots: Vec<u8> = numbered(json, "keyslots")?
         .into_iter()
         .map(|(number, _)| number)
         .collect();
     let mut tokens = Vec::new();
     let mut orphans = Vec::new();
-    for (number, value) in numbered(&json, "tokens")? {
+    let mut foreign = Vec::new();
+    for (number, value) in numbered(json, "tokens")? {
         let kind = value
             .get("type")
             .and_then(Json::as_str)
@@ -273,18 +354,20 @@ fn header_from(copy: &ValidCopy, which: HeaderCopy) -> Result<Header, String> {
             .get("keyslots")
             .and_then(Json::as_arr)
             .ok_or_else(|| format!("LUKS2 token {number} has no keyslots array"))?;
+        let mut slots = Vec::with_capacity(named.len());
         for keyslot in named {
-            let exists = keyslot
+            let slot = keyslot
                 .as_str()
                 .and_then(slot_number)
-                .is_some_and(|slot| keyslots.contains(&slot));
-            if !exists {
-                return Err(format!(
-                    "LUKS2 token {number} names a keyslot the header does not have"
-                ));
-            }
+                .filter(|slot| keyslots.contains(slot))
+                .ok_or_else(|| {
+                    format!("LUKS2 token {number} names a keyslot the header does not have")
+                })?;
+            slots.push(slot);
         }
         if kind != TOKEN_TYPE {
+            slots.sort_unstable();
+            foreign.push((number, slots));
             continue;
         }
         if tokens.len() + orphans.len() == MAX_TD_TOKENS {
@@ -301,19 +384,29 @@ fn header_from(copy: &ValidCopy, which: HeaderCopy) -> Result<Header, String> {
         let token = Token::from_json(value).map_err(|e| format!("LUKS2 token {number}: {e}"))?;
         tokens.push((number, token));
     }
-    let text = |at, len| -> Result<String, String> {
-        Ok(String::from_utf8_lossy(text_at(&copy.binary, at, len)?).into_owned())
-    };
-    Ok(Header {
-        copy: which,
-        seqid: copy.seqid,
-        hdr_size: copy.hdr_size,
-        uuid: text(UUID_AT, UUID_LEN)?,
-        label: text(LABEL_AT, LABEL_LEN)?,
+    Ok(Metadata {
         keyslots,
         tokens,
         orphans,
+        foreign,
     })
+}
+
+/// The keyslots and tokens of the header cryptsetup itself uses, from
+/// `luksDump --dump-json-metadata`'s output: at most `MAX_METADATA_JSON`
+/// bytes of one JSON object, read under the same token rules as `read`.
+pub fn metadata(text: &[u8]) -> Result<Metadata, String> {
+    if text.len() > MAX_METADATA_JSON {
+        return Err(format!(
+            "cryptsetup's LUKS2 metadata is over {MAX_METADATA_JSON} bytes"
+        ));
+    }
+    let json =
+        td_json::parse_slice(text).map_err(|e| format!("cryptsetup's LUKS2 metadata: {e}"))?;
+    if json.as_obj().is_none() {
+        return Err("cryptsetup's LUKS2 metadata is not one object".into());
+    }
+    contents(&json)
 }
 
 /// Read the LUKS2 header at the start of `device` as cryptsetup would
@@ -447,8 +540,12 @@ mod tests {
         assert_eq!(header.uuid, "0f0e0d0c-0b0a-4908-8706-050403020100");
         assert_eq!(header.label, "td-system");
         assert_eq!(header.keyslots, [0, 1]);
-        // The systemd token is another type and is ignored.
+        // The systemd token is another type: only its number and keyslots
+        // are reported.
         assert_eq!(header.tokens.len(), 1);
+        assert_eq!(header.foreign, [(1, vec![0])]);
+        assert_eq!(header.foreign_keyslots(), [0]);
+        assert_eq!(header.token_numbers(), [0, 1]);
         let (number, token) = &header.tokens[0];
         assert_eq!(*number, 0);
         assert_eq!(token.keyslot(), 1);

@@ -92,7 +92,8 @@ releases in this order, and no step may move earlier:
    ([td-protector](../td-protector/DESIGN.md) "LUKS2 tokens"): from a copy
    failing only cryptsetup's validation, the released secret opens the
    volume only if its keyslot is in cryptsetup's copy, and otherwise the
-   boot reaches recovery.
+   boot reaches recovery. No header change follows unless cryptsetup's
+   own metadata agrees with td's copy (td-protector "Transitions").
 2. The selector tries every td token, up to a fixed bound, device-bound
    tokens first.
 3. Only when the first-boot protector alone releases, it seals the

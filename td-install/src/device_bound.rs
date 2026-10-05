@@ -1,22 +1,20 @@
 //! Device-bound formatting on a loop over the claimed volume (DESIGN.md
 //! "Device-bound formatting", ENCRYPTION.md "Device-bound formatting"):
-//! cryptsetup's exact arguments, key material by descriptor only, the
-//! first-boot protector and the checks verifying boot adds.
-//!
-//! Every cryptsetup child gets a cleared environment and an absolute program.
-//! The first secret goes on standard input; the second, the new key
-//! `luksAddKey` reads as its key file, through a std pipe this process keeps
-//! open and names as `/proc/<pid>/fd/N`. No argv element, environment
-//! variable or file carries key material, and nothing here is `unsafe`.
+//! the order of cryptsetup's commands, the first-boot protector and the
+//! checks verifying boot adds. td-protector's runner spells each command
+//! and passes key material by descriptor only (td-protector/DESIGN.md
+//! "Cryptsetup runner").
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 
+use td_protector::cryptsetup::{
+    add_key_args, close_args, format_args, open_args, test_args, token_import_args, Cryptsetup,
+    KeyFile, Mapping,
+};
 use td_protector::luks2;
 use td_protector::recovery::RecoveryKey;
 use td_protector::token::{Role, Token, MAX_TOKEN_JSON};
@@ -33,10 +31,8 @@ pub(crate) const HEADER_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const SECTOR_BYTES: u64 = 4096;
 const RECOVERY_SLOT: u8 = 0;
 const PROTECTOR_SLOT: u8 = 1;
-/// The most a child's input may be: one page, which any pipe holds, so
-/// filling it never blocks. A secret is at most 48 bytes, and a token's JSON
-/// is held to td-protector's `MAX_TOKEN_JSON`, no more than this.
-const MAX_PIPE_INPUT: usize = 4096;
+/// The first-boot protector's token number.
+const PROTECTOR_TOKEN: u8 = 0;
 /// How many times a mapping is asked to close, `CLOSE_RETRY` apart, before
 /// it is reported as surviving.
 const CLOSE_ATTEMPTS: usize = 3;
@@ -45,218 +41,19 @@ const CLOSE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(test)]
 const CLOSE_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// `luksFormat`'s fixed arguments, in ENCRYPTION.md's order, up to the UUID.
-const FORMAT: &[&str] = &[
-    "luksFormat",
-    "--batch-mode",
-    "--type",
-    "luks2",
-    "--cipher",
-    "aes-xts-plain64",
-    "--key-size",
-    "512",
-    "--sector-size",
-    "4096",
-    "--hash",
-    "sha256",
-    "--pbkdf",
-    "pbkdf2",
-    "--pbkdf-force-iterations",
-    "1000",
-    "--use-random",
-    "--luks2-metadata-size",
-    "16384",
-    "--luks2-keyslots-size",
-    "16744448",
-    "--offset",
-    "32768",
-];
-
-/// The PBKDF every keyslot takes: `luksFormat`'s, for `luksAddKey`.
-const PBKDF: &[&str] = &[
-    "--pbkdf",
-    "pbkdf2",
-    "--pbkdf-force-iterations",
-    "1000",
-    "--hash",
-    "sha256",
-];
-
-fn os(words: &[&str]) -> Vec<OsString> {
-    words.iter().map(OsString::from).collect()
+/// `luksFormat` with the plan's UUID and td's volume label.
+fn format_volume_args(uuid: &str, device: &Path) -> Vec<OsString> {
+    format_args(uuid, protocol::VOLUME_LABEL, device)
 }
 
-/// `luksFormat`, the recovery passphrase on standard input as keyslot 0.
-pub(crate) fn format_args(uuid: &str, device: &Path) -> Vec<OsString> {
-    let mut args = os(FORMAT);
-    args.extend(os(&[
-        "--uuid",
-        uuid,
-        "--label",
-        protocol::VOLUME_LABEL,
-        "--key-slot",
-        "0",
-        "--key-file=-",
-    ]));
-    args.push(device.into());
-    args
-}
-
-/// `luksAddKey` of keyslot 1, the recovery passphrase on standard input
-/// authorizing it through keyslot 0, the new key read from `new_key`.
-pub(crate) fn add_key_args(device: &Path, new_key: &Path) -> Vec<OsString> {
-    let mut args = os(&["luksAddKey", "--batch-mode"]);
-    args.extend(os(PBKDF));
-    args.extend(os(&[
-        "--key-slot",
-        "0",
-        "--new-key-slot",
-        "1",
-        "--key-file=-",
-    ]));
-    args.push(device.into());
-    args.push(new_key.into());
-    args
+/// `luksAddKey` of keyslot 1, keyslot 0's recovery passphrase authorizing it.
+fn add_protector_args(device: &Path, new_key: &Path) -> Vec<OsString> {
+    add_key_args(device, RECOVERY_SLOT, PROTECTOR_SLOT, new_key)
 }
 
 /// Token 0, its JSON on standard input.
-pub(crate) fn token_import_args(device: &Path) -> Vec<OsString> {
-    let mut args = os(&["token", "import", "--token-id", "0", "--json-file=-"]);
-    args.push(device.into());
-    args
-}
-
-/// The mapping `name`, opened with the passphrase on standard input.
-pub(crate) fn open_args(device: &Path, name: &str) -> Vec<OsString> {
-    let mut args = os(&["open", "--type", "luks2", "--key-file=-"]);
-    args.push(device.into());
-    args.push(name.into());
-    args
-}
-
-pub(crate) fn close_args(name: &str) -> Vec<OsString> {
-    os(&["close", name])
-}
-
-/// Whether the mapping `name` is active, asked of device-mapper by name:
-/// no node under `/dev/mapper` is consulted.
-pub(crate) fn status_args(name: &str) -> Vec<OsString> {
-    os(&["status", name])
-}
-
-/// cryptsetup 2.8.8's exit for an inactive `status`: `action_status` returns
-/// `-ENODEV` for `CRYPT_INACTIVE`, which `translate_errno` makes 4. An
-/// active mapping exits 0; anything else (`CRYPT_INVALID` exits 1) says
-/// neither.
-const STATUS_INACTIVE: i32 = 4;
-
-/// What `status` said of a mapping.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Mapping {
-    Active,
-    Inactive,
-}
-
-/// Whether `slot` opens with the key on standard input; nothing is mapped.
-pub(crate) fn test_args(device: &Path, slot: u8) -> Vec<OsString> {
-    let mut args = os(&["open", "--test-passphrase", "--type", "luks2", "--key-slot"]);
-    args.push(slot.to_string().into());
-    args.push("--key-file=-".into());
-    args.push(device.into());
-    args
-}
-
-/// The verified root's static cryptsetup.
-pub(crate) struct Cryptsetup {
-    pub(crate) program: PathBuf,
-}
-
-/// Input written whole into a pipe whose write end is closed: a reader gets
-/// exactly those bytes and end of file. Anything over `MAX_PIPE_INPUT` is
-/// refused rather than risk a write that blocks.
-fn filled_pipe(bytes: &[u8]) -> io::Result<io::PipeReader> {
-    if bytes.len() > MAX_PIPE_INPUT {
-        return Err(invalid(format!(
-            "a {}-byte input is over the {MAX_PIPE_INPUT} bytes a pipe is sure to hold",
-            bytes.len()
-        )));
-    }
-    let (reader, mut writer) = io::pipe()?;
-    writer.write_all(bytes)?;
-    drop(writer);
-    Ok(reader)
-}
-
-/// A key file only a descriptor holds: this process keeps the read end,
-/// close-on-exec, and the child opens it by its `/proc` name.
-pub(crate) struct KeyFile {
-    _held: io::PipeReader,
-    path: PathBuf,
-}
-
-impl KeyFile {
-    pub(crate) fn new(secret: &[u8]) -> io::Result<Self> {
-        let held = filled_pipe(secret)?;
-        let path = PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            held.as_raw_fd()
-        ));
-        Ok(Self { _held: held, path })
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Cryptsetup {
-    /// Runs one cryptsetup command with `input` on its standard input. Its
-    /// output is captured and copied to standard error, which it inherits.
-    pub(crate) fn run(&self, args: &[OsString], input: &[u8]) -> io::Result<()> {
-        let status = self.status_of(args, input)?;
-        if !status.success() {
-            return Err(self.failed(args, status));
-        }
-        Ok(())
-    }
-
-    /// Whether the mapping `name` is active, by `status`'s exit alone; an
-    /// exit meaning neither is an error.
-    pub(crate) fn mapping(&self, name: &str) -> io::Result<Mapping> {
-        let args = status_args(name);
-        let status = self.status_of(&args, &[])?;
-        match status.code() {
-            Some(0) => Ok(Mapping::Active),
-            Some(STATUS_INACTIVE) => Ok(Mapping::Inactive),
-            _ => Err(self.failed(&args, status)),
-        }
-    }
-
-    fn failed(&self, args: &[OsString], status: std::process::ExitStatus) -> io::Error {
-        let verb = args
-            .first()
-            .map(|verb| verb.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        invalid(format!(
-            "{} {verb} failed ({status})",
-            self.program.display()
-        ))
-    }
-
-    fn status_of(&self, args: &[OsString], input: &[u8]) -> io::Result<std::process::ExitStatus> {
-        let stdin = filled_pipe(input)?;
-        let output = Command::new(&self.program)
-            .args(args)
-            .env_clear()
-            .stdin(Stdio::from(stdin))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|error| invalid(format!("cannot run {}: {error}", self.program.display())))?;
-        let _ = io::stderr().write_all(&output.stdout);
-        Ok(output.status)
-    }
+fn import_protector_args(device: &Path) -> Vec<OsString> {
+    token_import_args(device, Some(PROTECTOR_TOKEN))
 }
 
 /// Seals and checks the first-boot protector. Production's is the live TPM,
@@ -367,7 +164,7 @@ pub(crate) fn check_header(
         ));
     }
     if header.tokens.len() != 1
-        || header.tokens.first() != Some(&(0, token.clone()))
+        || header.tokens.first() != Some(&(PROTECTOR_TOKEN, token.clone()))
         || !header.orphans.is_empty()
     {
         return Err("the LUKS2 header does not carry exactly the token imported".into());
@@ -456,12 +253,18 @@ pub(crate) fn format(
     let secret = Secret::generate().map_err(|error| write(invalid(error)))?;
     let passphrase = recovery.passphrase();
     cryptsetup
-        .run(&format_args(volume.uuid, device), passphrase.expose())
+        .run(
+            &format_volume_args(volume.uuid, device),
+            passphrase.expose(),
+        )
         .map_err(write)?;
     {
         let new_key = KeyFile::new(secret.expose()).map_err(write)?;
         cryptsetup
-            .run(&add_key_args(device, new_key.path()), passphrase.expose())
+            .run(
+                &add_protector_args(device, new_key.path()),
+                passphrase.expose(),
+            )
             .map_err(write)?;
     }
     let sealed = volume
@@ -471,7 +274,7 @@ pub(crate) fn format(
     let token = Token::new(PROTECTOR_SLOT, Role::FirstBoot, sealed)
         .map_err(|error| write(invalid(error)))?;
     let encoded = token.encode();
-    // What td-protector will read back, which also fits the pipe.
+    // What td-protector will read back, which also fits the runner's pipe.
     if encoded.len() > MAX_TOKEN_JSON {
         return Err(write(invalid(format!(
             "the first-boot token's {} bytes are over {MAX_TOKEN_JSON}",
@@ -479,7 +282,7 @@ pub(crate) fn format(
         ))));
     }
     cryptsetup
-        .run(&token_import_args(device), encoded.as_bytes())
+        .run(&import_protector_args(device), encoded.as_bytes())
         .map_err(write)?;
     let mapping = volume.mapper.join(volume.name);
     // An open that failed may still have loaded its table: `close` asks.
@@ -531,6 +334,8 @@ mod tests {
     use super::*;
     use crate::scratch;
     use std::cell::RefCell;
+    use std::path::PathBuf;
+    use td_protector::cryptsetup::status_args;
 
     const UUID: &str = "5a5a5a5a-5a5a-405a-805a-5a5a5a5a5a5a";
     const NAME: &str = "td-install-0707070707070707";
@@ -539,37 +344,17 @@ mod tests {
         args.iter().map(|arg| arg.to_str().unwrap()).collect()
     }
 
-    /// The arguments are ENCRYPTION.md's, word for word, and the layout
-    /// they spell is the 16 MiB the volume fit subtracts.
+    /// The arguments are ENCRYPTION.md's: the plan's UUID, td's label and
+    /// keyslot 0 for the format, keyslot 1 authorized by keyslot 0, token
+    /// 0. The runner pins the rest word for word, and the layout the format
+    /// spells is the 16 MiB the volume fit subtracts.
     #[test]
-    fn each_command_is_spelled_exactly() {
+    fn each_command_names_the_installation() {
         let device = Path::new("/dev/loop7");
+        let format = format_volume_args(UUID, device);
         assert_eq!(
-            words(&format_args(UUID, device)),
+            words(&format)[23..],
             [
-                "luksFormat",
-                "--batch-mode",
-                "--type",
-                "luks2",
-                "--cipher",
-                "aes-xts-plain64",
-                "--key-size",
-                "512",
-                "--sector-size",
-                "4096",
-                "--hash",
-                "sha256",
-                "--pbkdf",
-                "pbkdf2",
-                "--pbkdf-force-iterations",
-                "1000",
-                "--use-random",
-                "--luks2-metadata-size",
-                "16384",
-                "--luks2-keyslots-size",
-                "16744448",
-                "--offset",
-                "32768",
                 "--uuid",
                 UUID,
                 "--label",
@@ -581,16 +366,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            words(&add_key_args(device, Path::new("/proc/9/fd/4"))),
+            words(&add_protector_args(device, Path::new("/proc/9/fd/4")))[8..],
             [
-                "luksAddKey",
-                "--batch-mode",
-                "--pbkdf",
-                "pbkdf2",
-                "--pbkdf-force-iterations",
-                "1000",
-                "--hash",
-                "sha256",
                 "--key-slot",
                 "0",
                 "--new-key-slot",
@@ -601,7 +378,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            words(&token_import_args(device)),
+            words(&import_protector_args(device)),
             [
                 "token",
                 "import",
@@ -611,68 +388,19 @@ mod tests {
                 "/dev/loop7"
             ]
         );
-        assert_eq!(
-            words(&open_args(device, "td-install-07")),
-            [
-                "open",
-                "--type",
-                "luks2",
-                "--key-file=-",
-                "/dev/loop7",
-                "td-install-07"
-            ]
-        );
-        assert_eq!(
-            words(&close_args("td-install-07")),
-            ["close", "td-install-07"]
-        );
-        for slot in [0, 1] {
-            let slot_text = slot.to_string();
-            assert_eq!(
-                words(&test_args(device, slot)),
-                [
-                    "open",
-                    "--test-passphrase",
-                    "--type",
-                    "luks2",
-                    "--key-slot",
-                    slot_text.as_str(),
-                    "--key-file=-",
-                    "/dev/loop7",
-                ]
-            );
-        }
         // Two 16 KiB header copies and the keyslots area fill the 16 MiB
         // before the data segment, whose offset counts 512-byte sectors.
-        assert_eq!(2 * 16384 + 16_744_448, HEADER_BYTES);
-        assert_eq!(32768 * 512, HEADER_BYTES);
+        let at = |word: &str| {
+            let index = words(&format).iter().position(|w| *w == word).unwrap();
+            words(&format)[index + 1].parse::<u64>().unwrap()
+        };
+        assert_eq!(
+            2 * at("--luks2-metadata-size") + at("--luks2-keyslots-size"),
+            HEADER_BYTES
+        );
+        assert_eq!(at("--offset") * 512, HEADER_BYTES);
+        assert_eq!(at("--sector-size"), SECTOR_BYTES);
         assert_eq!(protocol::VOLUME_LABEL, "td-system");
-    }
-
-    /// The key file holds exactly the secret and then end of file, is open
-    /// in this process only, close-on-exec, and is named by this process's
-    /// own descriptor table.
-    #[test]
-    fn a_key_file_is_a_descriptor_holding_exactly_the_secret() {
-        let secret = [0x5c; 32];
-        let key = KeyFile::new(&secret).unwrap();
-        let prefix = format!("/proc/{}/fd/", std::process::id());
-        let fd = key.path().to_str().unwrap().strip_prefix(&prefix).unwrap();
-        assert!(fd.parse::<u32>().is_ok(), "{fd}");
-        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
-        let flags = info
-            .lines()
-            .find_map(|line| line.strip_prefix("flags:"))
-            .map(|flags| u32::from_str_radix(flags.trim(), 8).unwrap())
-            .unwrap();
-        assert_ne!(flags & 0o2_000_000, 0, "not close-on-exec");
-        let mut read = Vec::new();
-        File::open(key.path())
-            .unwrap()
-            .read_to_end(&mut read)
-            .unwrap();
-        assert_eq!(read, secret);
-        drop(key);
     }
 
     /// A program on `PATH`, for a stand-in that runs with no environment.
@@ -725,7 +453,7 @@ mod tests {
             .unwrap();
             Self {
                 dir,
-                cryptsetup: Cryptsetup { program },
+                cryptsetup: Cryptsetup::new(program),
             }
         }
 
@@ -760,26 +488,6 @@ mod tests {
         fn fail(&self, call: usize) {
             std::fs::write(self.dir.join(format!("fail.{call}")), b"").unwrap();
         }
-    }
-
-    #[test]
-    fn a_child_gets_its_input_and_no_environment() {
-        let recorder = Recorder::new();
-        recorder
-            .cryptsetup
-            .run(&close_args("td-install-07"), b"input")
-            .unwrap();
-        assert_eq!(recorder.argv(1), ["close", "td-install-07"]);
-        assert_eq!(recorder.read("stdin", 1), b"input");
-        let environment = String::from_utf8(recorder.read("env", 1)).unwrap();
-        assert!(!environment.contains("PATH"), "{environment}");
-        assert!(!environment.contains("HOME"), "{environment}");
-        recorder.fail(2);
-        let error = recorder
-            .cryptsetup
-            .run(&close_args("td-install-07"), b"")
-            .unwrap_err();
-        assert!(error.to_string().contains("close failed"), "{error}");
     }
 
     /// A fixed sealed object, and what each call was asked.
@@ -946,9 +654,12 @@ mod tests {
         assert!(key_path.starts_with(&format!("/proc/{}/fd/", std::process::id())));
         let token = formatted_token();
         let expected: [(Vec<OsString>, &[u8]); 9] = [
-            (format_args(UUID, device), &passphrase),
-            (add_key_args(device, Path::new(&key_path)), &passphrase),
-            (token_import_args(device), token.as_bytes()),
+            (format_volume_args(UUID, device), &passphrase),
+            (
+                add_protector_args(device, Path::new(&key_path)),
+                &passphrase,
+            ),
+            (import_protector_args(device), token.as_bytes()),
             (open_args(device, NAME), &passphrase),
             (status_args(NAME), b""),
             (close_args(NAME), b""),
@@ -993,27 +704,6 @@ mod tests {
         assert_eq!(recorder.calls(), 7);
         assert_eq!(recorder.argv(6), ["close", NAME]);
         assert_eq!(recorder.argv(7), ["status", NAME]);
-    }
-
-    /// `status` is read by its exit alone: 0 active, 4 inactive, and any
-    /// other exit, such as 1 for a device-mapper that cannot be asked, an
-    /// error rather than either. No node is consulted.
-    #[test]
-    fn a_mapping_is_classified_by_its_status_exit() {
-        let recorder = Recorder::new();
-        let cryptsetup = &recorder.cryptsetup;
-        assert_eq!(cryptsetup.mapping(NAME).unwrap(), Mapping::Inactive);
-        recorder.mapped();
-        assert!(!recorder.dir.join(NAME).exists());
-        assert_eq!(cryptsetup.mapping(NAME).unwrap(), Mapping::Active);
-        for (call, code) in [(3, 1), (4, 2), (5, 5)] {
-            recorder.exit_with(call, code);
-            let error = cryptsetup.mapping(NAME).unwrap_err();
-            assert!(error.to_string().contains("status failed"), "{error}");
-        }
-        recorder.exit_with(6, 4);
-        assert_eq!(cryptsetup.mapping(NAME).unwrap(), Mapping::Inactive);
-        assert_eq!(recorder.argv(6), ["status", NAME]);
     }
 
     /// The mapping is closed until status says inactive, whatever
@@ -1079,26 +769,6 @@ mod tests {
         assert!(error.contains("survives"), "{error}");
         assert_eq!(recorder.calls(), 5 + 2 * CLOSE_ATTEMPTS);
         assert_eq!(recorder.argv(5 + 2 * CLOSE_ATTEMPTS), ["status", NAME]);
-    }
-
-    /// Input over a page is refused before any pipe is filled, so a fill
-    /// can never block; the largest token td-protector admits is under it.
-    #[test]
-    fn pipe_input_is_bounded_by_a_page() {
-        assert!(filled_pipe(&[0; MAX_PIPE_INPUT]).is_ok());
-        let error = filled_pipe(&[0; MAX_PIPE_INPUT + 1]).unwrap_err();
-        assert!(error.to_string().contains("pipe"), "{error}");
-        assert!(MAX_TOKEN_JSON <= MAX_PIPE_INPUT);
-        let largest = Token::new(
-            1,
-            Role::FirstBoot,
-            SealedObject {
-                public: vec![0xff; td_protector::token::MAX_PUBLIC_BYTES],
-                private: vec![0xff; td_protector::token::MAX_PRIVATE_BYTES],
-            },
-        )
-        .unwrap();
-        assert!(largest.encode().len() <= MAX_TOKEN_JSON);
     }
 
     /// Each check verifying boot adds refuses as verification.

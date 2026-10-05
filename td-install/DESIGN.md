@@ -230,7 +230,8 @@ filesystem. The sibling crates the binary links for device-bound storage,
 td-protector, td-tpm and td-json, forbid `unsafe` and reach the TPM
 through td-tpm's safe file I/O on `/dev/tpmrm0` (D10 records that open
 and td-protector's `/dev/random` read). The pipes that carry key material
-to cryptsetup are std's, and the device-mapper requests cryptsetup's own.
+to cryptsetup are std's, created by td-protector's runner, and the
+device-mapper requests cryptsetup's own.
 The one exception is publication onto a disk this process holds, which
 binds a loop device over the volume with two value-pinned requests
 (`UNSAFE.md` §21, §5 "Publishing through a loop over the claim"). Any
@@ -293,7 +294,10 @@ check (D8) call td-tpm's `Device::open`, which opens the fixed path
 character device, and names the TPM resource manager in its error. The
 execution draws the recovery key and the protector secret through
 td-protector, which reads the fixed path `/dev/random` and names it in
-its error. Those two device opens are the documented exceptions; nothing
+its error. Those two device opens are the documented exceptions;
+td-protector's cryptsetup runner also execs the absolute cryptsetup path
+td-install gives it, naming that program in its errors, which is an exec
+of a path this crate chose rather than an open. Nothing else
 reaches another path through td-tpm, td-protector or td-json, and a
 further path a linked sibling opens for this binary is an amendment here,
 as a further syscall is to D8.
@@ -975,13 +979,14 @@ what one between the backup and primary writes leaves: the backup GPT
 alone, without a protective MBR, which firmware may or may not boot, with
 the key already confirmed.
 
-Every cryptsetup child runs `/bin/cryptsetup` from the verified root with a
-cleared environment, its output captured and copied to standard error, and
-its error inherited. Key
-material reaches it only by descriptor. The first secret travels on
+Every cryptsetup child runs through td-protector's runner, which
+the selector shares (td-protector/DESIGN.md "Cryptsetup runner"), and
+execs `/bin/cryptsetup` from the verified root with a cleared
+environment, its output captured, copied to standard error and zeroed,
+and its error inherited. Key material reaches it only by descriptor. The first secret travels on
 standard input as `--key-file=-`, written whole and then closed. The
 second, the new key `luksAddKey` takes as its key file, travels through a
-pipe created with std: td-install writes the secret, closes the write end,
+pipe created with std: the runner writes the secret, closes the write end,
 keeps the read end, close-on-exec, and names it to the child as
 `/proc/<td-install pid>/fd/N`, so cryptsetup opens the pipe anew and reads
 exactly the secret and end of file. Standard input carries the

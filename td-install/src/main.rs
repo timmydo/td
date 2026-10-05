@@ -1540,9 +1540,9 @@ impl LiveExecution {
                 None,
             ),
             installation_plan::Storage::DeviceBound => {
-                let cryptsetup = device_bound::Cryptsetup {
-                    program: self.root.join("bin").join(protocol::CRYPTSETUP),
-                };
+                let cryptsetup = td_protector::cryptsetup::Cryptsetup::new(
+                    self.root.join("bin").join(protocol::CRYPTSETUP),
+                );
                 let bound = DeviceBound {
                     cryptsetup: &cryptsetup,
                     protector: &device_bound::Tpm,
@@ -3913,7 +3913,7 @@ fn withdrawn(
 
 /// What a device-bound held format runs beyond the unencrypted one.
 struct DeviceBound<'a> {
-    cryptsetup: &'a device_bound::Cryptsetup,
+    cryptsetup: &'a td_protector::cryptsetup::Cryptsetup,
     protector: &'a dyn device_bound::Protector,
     /// The mapping's name, and where its node appears.
     name: &'a str,

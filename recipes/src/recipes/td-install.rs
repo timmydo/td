@@ -7,10 +7,10 @@ use crate::types::{Recipe, Step};
 // reaches its checksum as `crate::crc32`, so those two arrive as a pair or the
 // build does not link. `sha256.rs` is the live installation's check of the ESP
 // kernel against the authenticated manifest. The device-bound service's TPM
-// probe and formatting run over the sibling crates td-protector and td-tpm
-// (td-protector
-// reaches td-json), each compiled first as an rlib with the binary's profile
-// and passed by `--extern`, as td-boot passes td-tpm; td-tpm includes the same
+// probe and formatting run over the sibling crates td-protector, whose
+// cryptsetup runner formatting uses, and td-tpm (td-protector reaches
+// td-json), each compiled first as an rlib with the binary's profile and
+// passed by `--extern`, as td-boot passes td-tpm; td-tpm includes the same
 // engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-install/src/main.rs");
 const TIMEZONES_RS: &str = include_str!("../../../td-install/src/timezones.rs");
@@ -37,9 +37,11 @@ const JSON_RS: &str = include_str!("../../../td-json/src/lib.rs");
 const JSON_STRING_RS: &str = include_str!("../../../td-json/src/string.rs");
 const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_array.rs");
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
+const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
 const PROTECTOR_LUKS2_RS: &str = include_str!("../../../td-protector/src/luks2.rs");
 const PROTECTOR_RECOVERY_RS: &str = include_str!("../../../td-protector/src/recovery.rs");
 const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.rs");
+const PROTECTOR_TRANSITION_RS: &str = include_str!("../../../td-protector/src/transition.rs");
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
@@ -110,6 +112,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-protector/src/cryptsetup.rs".into(),
+            content: PROTECTOR_CRYPTSETUP_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-protector/src/luks2.rs".into(),
             content: PROTECTOR_LUKS2_RS.into(),
             exec: false,
@@ -122,6 +129,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-protector/src/token.rs".into(),
             content: PROTECTOR_TOKEN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/transition.rs".into(),
+            content: PROTECTOR_TRANSITION_RS.into(),
             exec: false,
         },
         Step::WriteFile {
