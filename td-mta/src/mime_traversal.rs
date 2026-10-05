@@ -41,6 +41,7 @@ pub struct Part {
     pub depth: u8,
     pub media: Media,
     pub encoding: Encoding,
+    /// Parse-problem flags plus DIGEST_CHILD_CONTEXT; use problems() for errors.
     pub diagnostics: u8,
 }
 pub const UNKNOWN_ENCODING: u8 = 1;
@@ -48,6 +49,24 @@ pub const ENCODING_PROBLEM: u8 = 2;
 pub const MISSING_CLOSE: u8 = 4;
 pub const IGNORED_SUFFIX: u8 = 8;
 pub const PARAMETER_PROBLEM: u8 = 16;
+/// Context evidence, not a parse problem; independent of the selected MIME type.
+pub const DIGEST_CHILD_CONTEXT: u8 = 32;
+pub const PROBLEM_FLAGS: u8 =
+    UNKNOWN_ENCODING | ENCODING_PROBLEM | MISSING_CLOSE | IGNORED_SUFFIX | PARAMETER_PROBLEM;
+impl Part {
+    /// Only parse-problem bits; context evidence does not imply a malformed part.
+    pub const fn problems(&self) -> u8 {
+        self.diagnostics & PROBLEM_FLAGS
+    }
+    /// Original header default context; passive evidence grants no source authority.
+    pub const fn context(&self) -> mime_metadata::Context {
+        if self.diagnostics & DIGEST_CHILD_CONTEXT != 0 {
+            mime_metadata::Context::DigestChild
+        } else {
+            mime_metadata::Context::Normal
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     InvalidRange,
@@ -497,6 +516,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
             entity_start: start,
             entity_end: end,
             parent,
+            diagnostics: if digest { DIGEST_CHILD_CONTEXT } else { 0 },
             depth: u8::try_from(depth).map_err(|_| Error::DepthLimit)?,
             ..Part::default()
         };
@@ -800,6 +820,16 @@ mod tests {
         let (parts, headers) = parse(source).unwrap();
         assert_eq!(parts.len(), 5);
         assert_eq!(
+            parts.iter().map(|part| part.context()).collect::<Vec<_>>(),
+            [
+                mime_metadata::Context::Normal,
+                mime_metadata::Context::Normal,
+                mime_metadata::Context::DigestChild,
+                mime_metadata::Context::Normal,
+                mime_metadata::Context::Normal,
+            ]
+        );
+        assert_eq!(
             parts
                 .iter()
                 .map(|p| (p.ordinal, p.parent, p.depth, p.media, p.size))
@@ -840,6 +870,167 @@ mod tests {
         assert_eq!(parts[2].size, parts[2].entity_end - parts[2].body_start);
         assert_eq!(headers, 43 + 44 + 35 + 45);
         assert_eq!(parts[4].diagnostics & ENCODING_PROBLEM, ENCODING_PROBLEM);
+    }
+    #[test]
+    fn retained_metadata_replays_original_digest_context_and_absolute_ranges() {
+        use crate::{mime_part_headers, nfc::Scratch};
+        use mime_part_headers::label_json;
+        let source = concat!(
+            "Content-Type: multipart/mixed; boundary=a\r\n\r\n--a\r\n",
+            "Content-Type: multipart/digest; boundary=b\r\n\r\n--b\r\n",
+            "Content-ID: <id@a>\r\nContent-Language: fr\r\nContent-Location: \r\n",
+            "\r\nFrom: inner\r\n\r\nbody\r\n--b\r\n",
+            "Content-Type: text/plain\r\nContent-Location: ../a\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\nYQ!\r\n--b\r\n",
+            "Content-Type: bad\r\nContent-Location: a%\r\n\r\nbody\r\n--b--\r\n--a\r\n",
+            "\r\nContent-Type: image/png\r\nContent-Location: ../body\r\n--a--\r\n"
+        )
+        .as_bytes();
+        let expected_types: [&[u8]; 6] = [
+            b"multipart/mixed",
+            b"multipart/digest",
+            b"message/rfc822",
+            b"text/plain",
+            b"message/rfc822",
+            b"text/plain",
+        ];
+        let expected_locations: [Option<&[u8]>; 6] =
+            [None, None, Some(b"\"\""), Some(b"\"../a\""), None, None];
+        for base in [0, 17, u64::MAX - source.len() as u64] {
+            let mut parts = [Part::default(); 64];
+            let mut work = meter();
+            let mut budget = HeaderBudget::new();
+            let work_ptr = std::ptr::from_mut(&mut work);
+            let budget_ptr = std::ptr::from_mut(&mut budget);
+            let mut cursor = Cursor::new(
+                source,
+                base,
+                SourceEnd::Eof,
+                &Limits::default(),
+                &mut parts,
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            drain(&mut cursor).unwrap();
+            let (parts, work, budget) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(parts.len(), expected_types.len());
+            for (index, part) in parts.iter().enumerate() {
+                let mut heads = [0; 256];
+                let mut charset = [0; 256];
+                let mut filename = [0; 256];
+                let mut id = [0; 256];
+                let mut language = [0; 256];
+                let mut location = [0; 256];
+                let mut scratch = Scratch::new();
+                let scratch_ptr = std::ptr::from_mut(&mut scratch);
+                let entity = mime_part_headers::Entity {
+                    source: td_header::resident::slice(
+                        source,
+                        base,
+                        part.entity_start..part.entity_end,
+                    )
+                    .unwrap(),
+                    base: part.entity_start,
+                    source_end: SourceEnd::Eof,
+                    header_limit: Limits::default().header_bytes as u64,
+                    context: part.context(),
+                };
+                let mut cursor = label_json::Cursor::new(
+                    entity,
+                    label_json::Backing {
+                        headers: mime_part_headers::Backing {
+                            heads: &mut heads,
+                            charset: &mut charset,
+                            filename: &mut filename,
+                        },
+                        labels: crate::mime_label_fields::json::Backing {
+                            content_id: &mut id,
+                            content_language: &mut language,
+                        },
+                        content_location: &mut location,
+                    },
+                    work,
+                    budget,
+                    &mut scratch,
+                )
+                .unwrap();
+                let mut complete = false;
+                for _ in 0..100_000 {
+                    if cursor.poll(Tick(1)).unwrap() == mime_part_headers::Status::Complete {
+                        complete = true;
+                        break;
+                    }
+                    assert!(cursor.value().is_none());
+                }
+                assert!(complete);
+                let (view, returned_work, returned_budget, returned_scratch) =
+                    cursor.finish(Tick(1)).unwrap();
+                assert_eq!(std::ptr::from_mut(returned_work), work_ptr);
+                assert_eq!(std::ptr::from_mut(returned_budget), budget_ptr);
+                assert_eq!(std::ptr::from_mut(returned_scratch), scratch_ptr);
+                assert_eq!(view.headers.content_type, expected_types[index]);
+                assert_eq!(view.headers.body_start, part.body_start);
+                assert_eq!(view.location.selection.end.body_start, part.body_start);
+                assert_eq!(view.location.value, expected_locations[index]);
+                assert_eq!(
+                    part.context(),
+                    if (2..=4).contains(&index) {
+                        mime_metadata::Context::DigestChild
+                    } else {
+                        mime_metadata::Context::Normal
+                    }
+                );
+                if index == 3 {
+                    assert_eq!(part.diagnostics, ENCODING_PROBLEM | DIGEST_CHILD_CONTEXT);
+                }
+                if index == 2 {
+                    assert_eq!(view.labels.content_id, Some(b"\"id@a\"".as_slice()));
+                    assert_eq!(view.labels.content_language, Some(b"[\"fr\"]".as_slice()));
+                }
+            }
+        }
+    }
+    #[test]
+    fn nested_digest_context_and_post_append_problems_remain_independent() {
+        let source = concat!(
+            "Content-Type: multipart/digest;boundary=a\n\n--a\n",
+            "Content-Type: multipart/mixed;boundary=b\n\n--b\n\ninside\n",
+            "--a\nContent-Type: multipart/digest;boundary=c\n\n",
+            "--c-tail\n\ninner\n--c--\n--a--"
+        )
+        .as_bytes();
+        let (parts, _) = parse(source).unwrap();
+        assert_eq!(parts.len(), 5);
+        let expected = [
+            (mime_metadata::Context::Normal, Media::Multipart, 0),
+            (
+                mime_metadata::Context::DigestChild,
+                Media::Multipart,
+                MISSING_CLOSE,
+            ),
+            (mime_metadata::Context::Normal, Media::TextPlain, 0),
+            (
+                mime_metadata::Context::DigestChild,
+                Media::Multipart,
+                IGNORED_SUFFIX,
+            ),
+            (mime_metadata::Context::DigestChild, Media::MessageRfc822, 0),
+        ];
+        for (part, (context, media, problems)) in parts.iter().zip(expected) {
+            assert_eq!(part.context(), context);
+            assert_eq!(part.media, media);
+            assert_eq!(part.problems(), problems);
+            assert_eq!(part.diagnostics & PROBLEM_FLAGS, problems);
+        }
+        assert_eq!(parts[1].diagnostics, DIGEST_CHILD_CONTEXT | MISSING_CLOSE);
+        assert_eq!(parts[3].diagnostics, DIGEST_CHILD_CONTEXT | IGNORED_SUFFIX);
+        let context_only = Part {
+            diagnostics: DIGEST_CHILD_CONTEXT | 64 | 128,
+            ..Part::default()
+        };
+        assert_eq!(context_only.problems(), 0);
+        assert_eq!(context_only.context(), mime_metadata::Context::DigestChild);
     }
     #[test]
     fn recovery_outer_precedence_empty_children_and_no_implicit_recursion() {

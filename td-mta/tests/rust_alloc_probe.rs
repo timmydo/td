@@ -4836,7 +4836,8 @@ fn resident_mime_traversal() {
     );
     let nested = concat!(
         "Content-Type: multipart/mixed;boundary=a\n\n--a\n",
-        "Content-Type: multipart/digest;boundary=b\n\n--b\n\nFrom: inside\n\nbody\n--b--\n",
+        "Content-Type: multipart/digest;boundary=b\n\n--b\n",
+        "Content-Transfer-Encoding: strange\n\nFrom: inside\n\nbody\n--b--\n",
         "--a\nContent-Transfer-Encoding: base64\n\nYWJj\n--a--"
     );
     let bad_nesting = format!(
@@ -4873,6 +4874,24 @@ fn resident_mime_traversal() {
         drain(&mut cursor).unwrap();
         assert!(!cursor.parts().unwrap().unwrap().is_empty());
         let (parts, work, budget) = cursor.finish(Tick(1)).unwrap();
+        if source == nested.as_bytes() {
+            assert_eq!(parts.len(), 4);
+            assert_eq!(
+                parts.get(2).unwrap().context(),
+                td_mta::mime_metadata::Context::DigestChild
+            );
+            assert_eq!(
+                parts.get(2).unwrap().diagnostics,
+                td_mta::mime_traversal::DIGEST_CHILD_CONTEXT
+                    | td_mta::mime_traversal::UNKNOWN_ENCODING
+            );
+            for index in [0, 1, 3] {
+                assert_eq!(
+                    parts.get(index).unwrap().context(),
+                    td_mta::mime_metadata::Context::Normal
+                );
+            }
+        }
         black_box(parts);
         assert_eq!(
             identity,

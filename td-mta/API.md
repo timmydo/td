@@ -4032,7 +4032,8 @@ identity body extents, including own delimiters and child headers, rather
 than summing child sizes. Base64/QP reuse their fixed decoders and original
 work/output admission. Charset, Unicode and display filters cannot affect
 sizes. message/rfc822 and message/global remain leaves; a digest child with
-no valid type defaults to message/rfc822.
+no valid type defaults to message/rfc822. M06di preserves the original
+per-part default context for retained metadata; see 1.114.
 
 The cursor exclusively borrows original Meter/HeaderBudget and owns
 prepaid credit throughout all entities and phases. Every active turn
@@ -4884,6 +4885,32 @@ publication. Finish returns original Meter/HeaderBudget/Scratch and a
 passive combined View. Caller-reserved bytes remain provisional on
 refusal; this layer supplies no null serialization, URI resolution or
 MIME traversal/response authority.
+
+### 1.114 Traversal context for retained part metadata
+
+M06di preserves the original MIME default context in each completed Part
+without changing descriptor storage or output charging. A previously unused
+flag bit now distinguishes immediate digest children independently of whether a
+valid explicit Content-Type was selected. Part::context() maps that bit
+to the existing metadata Context. Default cells/root context remain Normal.
+DIGEST_CHILD_CONTEXT is context evidence in the diagnostics byte;
+Part::problems() and PROBLEM_FLAGS expose only the five parse-problem bits.
+Bits 64 and 128 remain unused. All failure, completion, fresh admission and passive evidence rules are
+unchanged; copied cells confer no source binding or authorization.
+
+Qualification hands completed descriptor extents from one original
+immutable source to M06dh metadata with their recorded context, original
+Meter/HeaderBudget and a separate original Scratch. Nested digest children
+with missing or malformed types retain message/rfc822, an explicitly typed
+child keeps its chosen type, and ordinary siblings retain text/plain.
+Raw body starts correlate at zero, nonzero and maximum-fitting absolute
+bases; body header lookalikes cannot supply metadata. This is component
+handoff qualification. The per-entity header limit is a projection bound:
+traversal already validated the aggregate recognized raw-header count.
+Replay spends the same original per-email source/step and job allowances;
+it does not count recognized raw headers again. Automatic whole
+traversal/metadata response
+composition and source/publication authority remain external.
 
 ## 2. Read views and change history
 

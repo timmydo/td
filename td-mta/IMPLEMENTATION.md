@@ -2084,6 +2084,16 @@ Initial independently landable increments:
   reuse and measured zero Rust allocation within the existing 6 KiB cursor
   and 16 KiB parser region. Traversal response integration remains next.
 
+- **M06di — traversal default context:** retain immediate digest-child
+  context independently of selected type in the existing descriptor flags.
+  Preserve the combined 64-byte descriptor/body-list reservation and
+  original output costs. Qualify completed traversal-to-retained-metadata
+  handoff, nested missing/malformed/explicit types, absolute source bounds,
+  original owners, nested immediate-child context, after-append problem
+  preservation and measured allocation-free context retention. Expose
+  parse-problem flags separately from context evidence.
+  Automatic traversal/metadata response composition remains next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

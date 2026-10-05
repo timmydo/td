@@ -1274,6 +1274,21 @@ bytes and Part 56 bytes: 11952 parser bytes leave 4432 bytes of the existing
 16 KiB reservation. The committed const assertion keeps the target-independent
 ceiling; these host sizes are not native stack/RSS measurements.
 
+M06di stores digest-child context in a previously unused flag bit, so Part
+remains 56 host bytes and traversal layout/output charges are unchanged.
+The combined Part, body-list Node and membership byte still fit their
+existing 64-byte reservation. The existing combined compile-time assertion
+pins that ceiling.
+Context is passive evidence independent of selected type, never new source
+or response authority. Warm/measured traversal intervals also pin nested
+context retention without Rust allocations. A separate unit qualifies
+completed traversal-to-retained-metadata handoff under original owners at
+zero/nonzero/maximum-fitting absolute bases. Nested digest/mixed containers
+also pin immediate-child context and preservation beside after-append
+missing-close/ignored-suffix problems. A separate problems() accessor masks
+context from the five parse-problem flags. Native/worker/RSS and automatic
+whole-response composition remain separate.
+
 One poll advances one phase and funds one structural job record. Conservative
 ceilings are 352 I/O/header visits, 512 aggregate interpretation steps,
 32 job records and 96 output bytes per turn. Raw delimiter work retains its

@@ -602,6 +602,12 @@ metadata remains hidden until its boundary agrees with the earlier header
 view. Location refusal retires previous groups too; original scratch stays
 parked during that child. Traversal and response publication remain separate.
 
+M06di retains the traversal's per-part default context in an existing
+packed descriptor flag, independent of selected type. Later metadata must
+use that context with the same original source extents; passive descriptors
+cannot authorize or bind a source. Digest defaulting is not inferred from
+a child's final media classification.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or
