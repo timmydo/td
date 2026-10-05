@@ -745,7 +745,6 @@ xfail errexit-osh.test.sh::command sub with inherit_errexit and command_sub_erre
 xfail errexit-osh.test.sh::command sub with inherit_errexit only
 xfail errexit-osh.test.sh::command sub: errexit is NOT inherited and outer shell keeps going
 xfail errexit-osh.test.sh::global assignment with command sub: middle command fails
-xfail errexit-osh.test.sh::if pipeline doesn't fail fatally
 xfail errexit-osh.test.sh::local and inherit_errexit / command_sub_errexit
 xfail errexit-osh.test.sh::local: middle command fails and keeps going
 xfail errexit-osh.test.sh::strict_errexit prevents errexit from being disabled in function
@@ -995,7 +994,6 @@ xfail regex.test.sh::Quotes '' "" $'' $"" in pattern
 xfail regex.test.sh::make a lisp example
 xfail serialize.test.sh::set
 xfail serialize.test.sh::xtrace
-xfail sh-func.test.sh::Subshell function
 xfail sh-options-bash.test.sh::If shopt --set xtrace is allowed, it should update SHELLOPTS, not BASHOPTS
 xfail sh-options-bash.test.sh::OSH calling bash with SHELLOPTS does not change braceexpand
 xfail sh-options-bash.test.sh::SHELLOPTS and BASHOPTS are non-empty

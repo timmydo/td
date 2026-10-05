@@ -1696,9 +1696,9 @@ pub fn apply_option_letter(sh: &mut Shell, c: char, on: bool) -> bool {
     true
 }
 
-/// The `-o` names, split the same way as the letters. `pipefail` is the one
-/// refusal worth naming: ash has it under BASH_PIPEFAIL, but accepting it as a
-/// no-op would silently give every guarded pipeline the wrong status.
+/// The `-o` names, split the same way as the letters. A name this shell has no
+/// behaviour for is accepted as a no-op only where dash or ash also accept it;
+/// an unknown one is refused rather than silently given the wrong answer.
 pub fn apply_named_option(sh: &mut Shell, name: &str, on: bool) -> bool {
     match name {
         "errexit" => sh.opts.errexit = on,
@@ -1710,6 +1710,7 @@ pub fn apply_named_option(sh: &mut Shell, name: &str, on: bool) -> bool {
         "noexec" => sh.opts.noexec = on,
         "allexport" => sh.opts.allexport = on,
         "stdin" => sh.opts.stdin = on,
+        "pipefail" => sh.opts.pipefail = on,
         "ignoreeof" | "interactive" | "monitor" | "vi" | "emacs" | "notify" | "nolog" | "debug"
         | "errtrace" => {}
         _ => return false,
@@ -1732,6 +1733,7 @@ pub fn named_option_is_set(sh: &Shell, name: &str) -> bool {
         "noexec" => sh.opts.noexec,
         "allexport" => sh.opts.allexport,
         "stdin" => sh.opts.stdin,
+        "pipefail" => sh.opts.pipefail,
         // The names the setter takes and ignores: off, because this shell has
         // no such behaviour to report as on.
         _ => false,
@@ -5030,10 +5032,59 @@ mod tests {
     }
 
     #[test]
+    fn pipefail_reports_the_rightmost_failing_stage() {
+        // Off, the last stage decides; on, the rightmost non-zero one does, and
+        // an all-zero pipeline is still 0. `!` negates the pipefail status.
+        let (_, out, err) = run_capturing(
+            "(exit 9) | (exit 2) | true; echo $?; set -o pipefail; \
+             (exit 9) | (exit 2) | true; echo $?; (exit 9) | true; echo $?; \
+             true | true; echo $?; ! (exit 3) | true; echo $?; \
+             set +o pipefail; (exit 9) | true; echo $?",
+        );
+        assert_eq!(out, "0\n2\n9\n0\n0\n0\n", "stderr: {err:?}");
+    }
+
+    #[test]
+    fn pipefail_feeds_errexit_and_the_option_query() {
+        let (status, out, _) = run_capturing(
+            "set -eo pipefail; case $- in *e*) echo e;; esac; false | true; echo after",
+        );
+        assert_eq!((status, out.as_str()), (1, "e\n"));
+        // A subshell inherits it; `local -` restores it on return.
+        let (_, out, _) = run_capturing(
+            "set -o pipefail; ( false | true; echo sub=$? ); \
+             f() { local -; set +o pipefail; false | true; echo f=$?; }; f; \
+             false | true; echo after=$?",
+        );
+        assert_eq!(out, "sub=1\nf=0\nafter=1\n");
+        // A tested pipeline does not trip errexit, and a background job
+        // reports its pipefail status through `wait`.
+        let (status, out, _) = run_capturing(
+            "set -eo pipefail; false | true || echo r; false | true && :; \
+             if false | true; then :; fi; false | true & wait $! || echo bg=$?; echo after",
+        );
+        assert_eq!((status, out.as_str()), (0, "r\nbg=1\nafter\n"));
+        // Every stage's status is read as the shell stores it: an `exit 256`
+        // stage is a 0, and a `return` ends its stage with its own code.
+        let (_, out, _) = run_capturing(
+            "set -o pipefail; false | exit 256; echo $?; \
+             f() { return 7 | true; }; f; echo $?",
+        );
+        assert_eq!(out, "1\n7\n");
+        // Without pipefail too: a `return` ending the last stage, or a
+        // subshell, is that code, and an EXIT trap there sees it.
+        let (_, out, _) = run_capturing(
+            "f() { true | return 3; }; f; echo $?; \
+             g() { ( trap 'echo trap=$?' EXIT; return 5 ); }; g; echo $?",
+        );
+        assert_eq!(out, "3\ntrap=5\n5\n");
+    }
+
+    #[test]
     fn an_unknown_shell_option_is_refused_not_ignored() {
         // Silently accepting one is the dangerous answer: a script that asks for
-        // `pipefail` and is told nothing runs WITHOUT it.
-        for src in ["set -q", "set -o pipefail", "set +o pipefail"] {
+        // an option and is told nothing runs WITHOUT it.
+        for src in ["set -q", "set -o bogus", "set +o bogus"] {
             let (_, _, err) = run_capturing(src);
             assert!(err.contains("illegal option"), "{src}: {err:?}");
         }

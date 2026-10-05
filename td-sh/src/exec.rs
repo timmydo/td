@@ -131,6 +131,9 @@ pub struct Opts {
     /// `-s`: read the program from stdin. Only the invocation acts on it, as in
     /// dash, but it is an optlist entry there so it shows up in `$-`.
     pub stdin: bool,
+    /// `-o pipefail`, ash's BASH_PIPEFAIL: a pipeline's status is its
+    /// rightmost failing stage's. No letter, so it is not in `$-`.
+    pub pipefail: bool,
 }
 
 impl Opts {

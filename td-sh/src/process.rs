@@ -952,7 +952,9 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
                     // shell's own disposition is what decides.
                     let status = match exec::run_command(&mut stage, &staged.cmd) {
                         Ok(()) => stage.status,
-                        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+                        // A `return` ends the stage's subshell with its code,
+                        // which `pipefail` must see as any other status.
+                        Err(Sig::Exit(code) | Sig::Abort(code) | Sig::Return(code)) => code,
                         // A stage killed by a signal never reaches an EXIT trap,
                         // so this returns before `run_exit_trap` rather than
                         // through it.
@@ -997,18 +999,32 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
         return Err(Sig::Abort(126));
     }
 
-    // The pipeline's status is the LAST stage's (POSIX). An interrupt anywhere
-    // in it ends the pipeline, and is asked the same boundary question every
-    // other clone is -- once, out here, with every stage's clone already
-    // dropped and its dispositions back.
+    // The pipeline's status is the LAST stage's (POSIX), or under `pipefail`
+    // the rightmost stage that failed (pinned by builtin.rs's `pipefail_*`
+    // tests). An interrupt anywhere in it ends the
+    // pipeline, and is asked the same boundary question every other clone is
+    // -- once, out here, with every stage's clone already dropped and its
+    // dispositions back.
     let interrupted = outcomes.iter().find_map(|o| match o {
         Err(StageError::Interrupted(code)) => Some(*code),
         _ => None,
     });
-    let last_status = outcomes.last().map_or(0, |o| match o {
-        Ok(code) | Err(StageError::Interrupted(code)) => *code,
+    // Eight bits, as `set_status` stores it: an `exit 256` stage is a 0, so it
+    // must not be the failure `pipefail` picks over an earlier real one.
+    let status_of = |o: &Result<i32, StageError>| match o {
+        Ok(code) | Err(StageError::Interrupted(code)) => *code & 0xff,
         Err(StageError::Unstarted(_)) => 126,
-    });
+    };
+    let last_status = if sh.opts.pipefail {
+        outcomes
+            .iter()
+            .rev()
+            .map(status_of)
+            .find(|&code| code != 0)
+            .unwrap_or(0)
+    } else {
+        outcomes.last().map_or(0, status_of)
+    };
     if let Some(code) = interrupted {
         if dies_of_interrupt() {
             return Err(Sig::Interrupt(code));
@@ -1029,7 +1045,9 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
     let status = match apply_redirs(&mut child, redirs) {
         Ok(RedirOutcome::Applied(_saved)) => match exec::run_list(&mut child, body) {
             Ok(()) => child.status,
-            Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+            // A `return` ends the subshell with its code, as a pipeline
+            // stage's does (ash and bash both report it).
+            Err(Sig::Exit(code) | Sig::Abort(code) | Sig::Return(code)) => code,
             // An interrupt is NOT the subshell's to keep: the terminal signals
             // the whole foreground group, so a forked one would have died with
             // its parent rather than reporting a status to it.
