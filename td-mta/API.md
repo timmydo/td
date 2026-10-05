@@ -4098,8 +4098,9 @@ copied completed Views carry no completion, source, locator or
 publication authority on their own.
 
 This is a serialized projection after traversal releases its parser
-state, not a second simultaneous traversal frame set. Content-ID,
-language/location, body-list/JSON composition, authenticated locators,
+state, not a second simultaneous traversal frame set. M06cv adds passive
+CID/language field retention as described in 1.101. Integration of traversal,
+retained metadata and body lists into JSON, location, authenticated locators,
 streaming and worker/native stack/RSS qualification remain open.
 RESOURCES.md qualifies its fixed state and Rust allocation checks
 separately.
@@ -4453,6 +4454,38 @@ CID strings and ordered language tags under returned owners. These extents
 grant no raw source, blob, uniqueness, reference or publication authority.
 Cursor is neither Copy nor Clone. Location, JSON and traversal coordination
 remain separate; no growing label list or value copy is allocated.
+
+### 1.101 Retained CID and language fields in part headers
+
+M06cv extends mime_part_headers::View with content_id_field and
+content_language_field: optional passive absolute mime_headers::Field
+extents. After filename completion, the part-header cursor runs
+mime_label_fields::Cursor over the same complete authorized entity,
+original header limit and original Meter/HeaderBudget. Scratch remains
+borrowed without use by this child. The second scan spends original
+interpretation work; it grants no additional raw-header allowance. The
+label selector's body boundary and recognized raw-header count must match
+initial metadata selection before any View becomes visible.
+
+First-valid complete CID and language selection follows 1.100 and POLICY.md.
+Missing or wholly malformed fields retain None independently. Values remain
+raw extents: case, folding, comments and UTF-8 bytes are preserved. This adds
+no label backing window, CID string, retained tag list or MIME part-cell
+format. Consuming finish freshly admits and returns the passive View plus
+pointer-identical original Meter/HeaderBudget/Scratch. The caller may fund
+CID or language projection with those owners and its same authorized source.
+Extents grant no source, blob, uniqueness, reference or publication authority.
+
+A label child refusal retires the whole part-header result, including
+previously completed heads, charset and filename. Work/interpretation errors
+map to Admission; structural/nesting errors retain Error::Labels context.
+Mapping these helper refusals into final JMAP BodyPart/null/error responses
+remains downstream and unavailable in this increment. Caller backing is not
+wiped and remains provisional after failure. Cached
+Complete remains inert; check_deadline and finish require fresh admission.
+Location dispatch, automatic traversal integration and JSON projection remain
+separate increments.
+
 
 ## 2. Read views and change history
 

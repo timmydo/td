@@ -1,8 +1,9 @@
-//! Retained selected MIME heads, charset and filename from a complete entity.
+//! Retained selected MIME heads, charset, filename and passive label fields.
 use crate::{
     admission::work::{Charge, Meter},
     header_select::SourceEnd,
     mime_filename::{self, Fields},
+    mime_label_fields,
     mime_metadata::{self, ContentType, DefaultType, Selected},
     mime_parameter::protocol,
     nfc::{self, HeaderBudget, Scratch},
@@ -13,6 +14,7 @@ pub enum Error {
     Metadata(mime_metadata::Error),
     Charset(protocol::Error),
     Filename(mime_filename::Error),
+    Labels(mime_label_fields::Error),
     Admission(nfc::Error),
     OutputCapacity,
     InvalidState,
@@ -23,6 +25,7 @@ impl std::fmt::Display for Error {
             Self::Metadata(e) => write!(f, "MIME part headers: {e}"),
             Self::Charset(e) => write!(f, "MIME part charset: {e}"),
             Self::Filename(e) => write!(f, "MIME part filename: {e}"),
+            Self::Labels(e) => write!(f, "MIME part labels: {e}"),
             Self::Admission(e) => write!(f, "MIME part admission: {e}"),
             Self::OutputCapacity => f.write_str("MIME part head capacity"),
             Self::InvalidState => f.write_str("invalid MIME part header state"),
@@ -35,6 +38,7 @@ impl std::error::Error for Error {
             Self::Metadata(e) => Some(e),
             Self::Charset(e) => Some(e),
             Self::Filename(e) => Some(e),
+            Self::Labels(e) => Some(e),
             Self::Admission(e) => Some(e),
             _ => None,
         }
@@ -69,6 +73,8 @@ pub struct View<'w> {
     pub charset_end: Option<protocol::End>,
     pub filename: Option<&'w [u8]>,
     pub filename_end: mime_filename::End,
+    pub content_id_field: Option<crate::mime_headers::Field>,
+    pub content_language_field: Option<crate::mime_headers::Field>,
     pub body_start: u64,
     pub header_bytes: u64,
 }
@@ -83,6 +89,7 @@ enum Owner<'a, 'w> {
     Budgets(&'w mut Meter, &'w mut HeaderBudget, &'w mut Scratch),
     Charset(protocol::Cursor<'a, 'w>, &'w mut Scratch),
     Filename(mime_filename::Cursor<'a, 'w>),
+    Labels(mime_label_fields::Cursor<'a, 'w>, &'w mut Scratch),
     Retired,
 }
 #[derive(Clone, Copy)]
@@ -91,6 +98,7 @@ enum Phase {
     Heads,
     Charset,
     Filename,
+    Labels,
     Complete,
 }
 /// Replays selected entity headers under the same original job/header budgets.
@@ -104,6 +112,7 @@ enum Phase {
 pub struct Cursor<'a, 'w> {
     source: &'a [u8],
     base: u64,
+    header_limit: u64,
     selector: Option<mime_metadata::Cursor<'a>>,
     owner: Owner<'a, 'w>,
     phase: Phase,
@@ -120,6 +129,7 @@ pub struct Cursor<'a, 'w> {
     filename_output: Option<&'w mut [u8]>,
     charset: Option<protocol::Retained<'w>>,
     filename: Option<mime_filename::Retained<'w>>,
+    labels: Option<mime_label_fields::Selection>,
     end: Option<crate::mime_headers::End>,
     failure: Option<Error>,
 }
@@ -150,6 +160,15 @@ impl<'a, 'w> Cursor<'a, 'w> {
             other => Error::Filename(other),
         }
     }
+    fn label_error(error: mime_label_fields::Error) -> Error {
+        match error {
+            mime_label_fields::Error::Work(stop) => Error::Admission(nfc::Error::Work(stop)),
+            mime_label_fields::Error::InterpretationLimit => {
+                Error::Admission(nfc::Error::InterpretationLimit)
+            }
+            other => Error::Labels(other),
+        }
+    }
     pub fn new(
         entity: Entity<'a>,
         output: Backing<'w>,
@@ -170,6 +189,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
         Ok(Self {
             source,
             base,
+            header_limit,
             selector: Some(
                 mime_metadata::Cursor::new(source, base, header_limit, context, source_end)
                     .map_err(Self::metadata_error)?,
@@ -192,6 +212,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
             filename_output: Some(output.filename),
             charset: None,
             filename: None,
+            labels: None,
             end: None,
             failure: None,
         })
@@ -219,6 +240,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
             self.selector = None;
             self.charset = None;
             self.filename = None;
+            self.labels = None;
             self.end = None;
         }
         result
@@ -233,6 +255,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 .map_err(Error::Admission),
             Owner::Charset(cursor, _) => cursor.check_deadline(now).map_err(Self::charset_error),
             Owner::Filename(cursor) => cursor.check_deadline(now).map_err(Self::filename_error),
+            Owner::Labels(cursor, _) => cursor.check_deadline(now).map_err(Self::label_error),
             Owner::Retired => Err(Error::InvalidState),
         };
         self.outcome(result)
@@ -243,6 +266,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
         }
         let end = self.end?;
         let filename = self.filename.as_ref()?;
+        let labels = self.labels?;
         Some(View {
             content_type: self.heads.get(..self.type_len)?,
             disposition: if self.disposition {
@@ -254,6 +278,8 @@ impl<'a, 'w> Cursor<'a, 'w> {
             charset_end: self.charset.as_ref().map(|value| value.end),
             filename: filename.value(),
             filename_end: filename.end,
+            content_id_field: labels.content_id,
+            content_language_field: labels.content_language,
             body_start: end.body_start,
             header_bytes: end.header_bytes,
         })
@@ -276,6 +302,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
         }
         let end = self.end.ok_or(Error::InvalidState)?;
         let filename = self.filename.ok_or(Error::InvalidState)?;
+        let labels = self.labels.ok_or(Error::InvalidState)?;
         let Owner::Budgets(work, budget, scratch) = self.owner else {
             return Err(Error::InvalidState);
         };
@@ -295,6 +322,8 @@ impl<'a, 'w> Cursor<'a, 'w> {
             charset_end: self.charset.as_ref().map(|value| value.end),
             filename: filename.value(),
             filename_end: filename.end,
+            content_id_field: labels.content_id,
+            content_language_field: labels.content_language,
             body_start: end.body_start,
             header_bytes: end.header_bytes,
         };
@@ -492,6 +521,52 @@ impl<'a, 'w> Cursor<'a, 'w> {
                         let (value, work, budget, scratch) =
                             cursor.finish(now).map_err(Self::filename_error)?;
                         self.filename = Some(value);
+                        self.owner = Owner::Budgets(work, budget, scratch);
+                        self.phase = Phase::Labels;
+                    }
+                }
+                _ => return Err(Error::InvalidState),
+            },
+            Phase::Labels => match &mut self.owner {
+                Owner::Budgets(work, budget, _) => {
+                    budget
+                        .charge(work, now, 0, 1, &mut self.credit)
+                        .map_err(Error::Admission)?;
+                    let Owner::Budgets(work, budget, scratch) =
+                        std::mem::replace(&mut self.owner, Owner::Retired)
+                    else {
+                        return Err(Error::InvalidState);
+                    };
+                    self.owner = Owner::Labels(
+                        mime_label_fields::Cursor::new(
+                            mime_label_fields::Input {
+                                source: self.source,
+                                base: self.base,
+                                source_end: SourceEnd::Eof,
+                                header_limit: self.header_limit,
+                            },
+                            work,
+                            budget,
+                        )
+                        .map_err(Self::label_error)?,
+                        scratch,
+                    );
+                }
+                Owner::Labels(cursor, _) => {
+                    if cursor.poll(now).map_err(Self::label_error)?
+                        == mime_label_fields::Status::Complete
+                    {
+                        let Owner::Labels(cursor, scratch) =
+                            std::mem::replace(&mut self.owner, Owner::Retired)
+                        else {
+                            return Err(Error::InvalidState);
+                        };
+                        let (work, budget, labels) =
+                            cursor.finish(now).map_err(Self::label_error)?;
+                        if Some(labels.end) != self.end {
+                            return Err(Error::InvalidState);
+                        }
+                        self.labels = Some(labels);
                         self.owner = Owner::Budgets(work, budget, scratch);
                         self.phase = Phase::Complete;
                         return Ok(Status::Complete);
@@ -697,6 +772,8 @@ mod tests {
             drain(&mut cursor).unwrap();
             let value = cursor.value().unwrap();
             assert_eq!(value.content_type, typ);
+            assert_eq!(value.content_id_field, None);
+            assert_eq!(value.content_language_field, None);
             assert_eq!(value.filename, name);
             assert_eq!(value.charset, charset);
             assert_eq!(value.charset_end.map(|end| end.value), state);
@@ -739,7 +816,11 @@ mod tests {
 
     #[test]
     fn every_original_resource_cut_is_sticky_without_partial_result() {
-        let source = b"Content-Type:TEXT/PLAIN;charset=utf-8;name=x\n\n";
+        let source = concat!(
+            "Content-Type:TEXT/PLAIN;charset=utf-8;name=x\n",
+            "Content-ID: <A@B>\nContent-Language: en, FR\n\n"
+        )
+        .as_bytes();
         let mut work = meter();
         let before = work.remaining();
         let mut budget = HeaderBudget::new();
@@ -837,8 +918,11 @@ mod tests {
     }
     #[test]
     fn capacity_prefix_nesting_and_every_deadline_turn() {
-        let source =
-            b"Content-Type:TEXT/PLAIN;charset=utf-8\nContent-Disposition:inline;filename=x\n\n";
+        let source = concat!(
+            "Content-Type:TEXT/PLAIN;charset=utf-8\nContent-Disposition:inline;filename=x\n",
+            "Content-ID: <A@B>\nContent-Language: en, FR\n\n"
+        )
+        .as_bytes();
         let mut count = 0;
         for cut in 0..1000 {
             let mut work = meter();
@@ -879,6 +963,7 @@ mod tests {
             assert_eq!(resource(error), Some(nfc::Error::Work(Stop::Deadline)));
             assert_eq!(cursor.value(), None);
             assert_eq!(cursor.poll(Tick(1)), Err(error));
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
         }
         assert!(count > 0);
         for flavor in 0..3 {
@@ -1134,5 +1219,218 @@ mod tests {
         assert_eq!(value.charset, Some(b"UTf-8".as_slice()));
         assert_eq!(value.filename, Some(b"a b".as_slice()));
         assert_eq!(value.body_start, 900 + source.len() as u64 - 4);
+    }
+    #[test]
+    fn labels_keep_raw_extents_until_all_phases_succeed() {
+        let source = concat!(
+            "Content-Type: TEXT/PLAIN;name=x\r\n",
+            "Content-ID: <local>\r\n",
+            "Content-ID: (🐈) <A@B>\r\n",
+            "Content-ID: <late@id>\r\n",
+            "Content-Language: en,\r\n",
+            "Content-Language: en-GB,\r\n\tFR\r\n",
+            "Content-Language: de\r\n\r\nbody"
+        )
+        .as_bytes();
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let identity = (
+            std::ptr::from_ref(&work),
+            std::ptr::from_ref(&budget),
+            std::ptr::from_ref(&scratch),
+        );
+        let mut h = [0; 32];
+        let mut c = [0; 16];
+        let mut n = [0; 8];
+        let mut cursor = Cursor::new(
+            Entity {
+                source,
+                base: 100,
+                source_end: SourceEnd::Eof,
+                header_limit: 1024,
+                context: mime_metadata::Context::Normal,
+            },
+            backing(&mut h, &mut c, &mut n),
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut labels_reached = false;
+        for _ in 0..100_000 {
+            if matches!(cursor.phase, Phase::Labels) {
+                labels_reached = true;
+                assert!(cursor.filename.is_some());
+                assert!(cursor.value().is_none());
+            }
+            if cursor.poll(Tick(1)).unwrap() == Status::Complete {
+                break;
+            }
+            assert!(cursor.value().is_none());
+        }
+        assert!(labels_reached);
+        let (view, work, budget, scratch) = cursor.finish(Tick(1)).unwrap();
+        assert_eq!(
+            (
+                std::ptr::from_ref(&*work),
+                std::ptr::from_ref(&*budget),
+                std::ptr::from_ref(&*scratch)
+            ),
+            identity
+        );
+        assert_eq!(view.content_type, b"text/plain");
+        assert_eq!(view.filename, Some(b"x".as_slice()));
+        assert_eq!(view.body_start, 100 + source.len() as u64 - 4);
+        assert_eq!(view.header_bytes, source.len() as u64 - 6);
+        let cid = view.content_id_field.unwrap();
+        let language = view.content_language_field.unwrap();
+        let cid = td_header::resident::slice(source, 100, cid.value_start..cid.value_end).unwrap();
+        let language =
+            td_header::resident::slice(source, 100, language.value_start..language.value_end)
+                .unwrap();
+        assert_eq!(cid, " (🐈) <A@B>".as_bytes());
+        assert_eq!(language, b" en-GB,\r\n\tFR");
+        let mut next = crate::mime_content_id::Cursor::new(cid, work, budget);
+        let mut result = String::new();
+        loop {
+            match next.poll(Tick(1)).unwrap() {
+                crate::mime_content_id::Status::Scalar(c) => result.push(c),
+                crate::mime_content_id::Status::Complete => break,
+                _ => {}
+            }
+        }
+        assert_eq!(result, "A@B");
+        let (work, budget) = next.finish(Tick(1)).unwrap();
+        let mut next = crate::mime_language::Cursor::new(language, work, budget);
+        let mut tags = Vec::new();
+        loop {
+            match next.poll(Tick(1)).unwrap() {
+                crate::mime_language::Status::Tag(e) => {
+                    tags.push(language.get(e.start..e.end).unwrap())
+                }
+                crate::mime_language::Status::Complete => break,
+                _ => {}
+            }
+        }
+        assert_eq!(tags, [b"en-GB".as_slice(), b"FR".as_slice()]);
+        let (work, budget) = next.finish(Tick(1)).unwrap();
+        assert_eq!(
+            (
+                std::ptr::from_ref(&*work),
+                std::ptr::from_ref(&*budget),
+                std::ptr::from_ref(&*scratch)
+            ),
+            identity
+        );
+    }
+    #[test]
+    fn late_label_refusal_retires_completed_filename_and_heads() {
+        let source = format!(
+            "Content-Type: text/plain;charset=utf-8;name=x\nContent-Language: {}en{}\n\n",
+            "(".repeat(33),
+            ")".repeat(33)
+        );
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut h = [0; 32];
+        let mut c = [0; 16];
+        let mut n = [0; 8];
+        let mut cursor = Cursor::new(
+            Entity {
+                source: source.as_bytes(),
+                base: 0,
+                source_end: SourceEnd::Eof,
+                header_limit: 1024,
+                context: mime_metadata::Context::Normal,
+            },
+            backing(&mut h, &mut c, &mut n),
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut provisional_filename = false;
+        for _ in 0..100_000 {
+            if matches!(cursor.phase, Phase::Labels) {
+                provisional_filename = true;
+                assert_eq!(
+                    cursor.filename.as_ref().unwrap().value(),
+                    Some(b"x".as_slice())
+                );
+                assert_eq!(cursor.heads.get(..cursor.type_len).unwrap(), b"text/plain");
+            }
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(cursor.value().is_none()),
+                Ok(Status::Complete) => panic!("nested language accepted"),
+                Err(error) => {
+                    assert!(provisional_filename);
+                    assert_eq!(error, Error::Labels(mime_label_fields::Error::NestingLimit));
+                    assert!(cursor.value().is_none());
+                    assert!(cursor.filename.is_none());
+                    assert!(cursor.charset.is_none());
+                    assert!(cursor.end.is_none());
+                    assert!(cursor.labels.is_none());
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                    assert_eq!(h.get(..10).unwrap(), b"text/plain");
+                    assert_eq!(c.get(..5).unwrap(), b"utf-8");
+                    assert_eq!(n.get(..1).unwrap(), b"x");
+                    return;
+                }
+            }
+        }
+        panic!("late label refusal did not finish");
+    }
+    #[test]
+    fn disagreeing_section_end_retires_all_prior_results() {
+        for header_count in [false, true] {
+            let mut work = meter();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let mut h = [0; 32];
+            let mut c = [0; 16];
+            let mut n = [0; 8];
+            let mut cursor = Cursor::new(
+                Entity {
+                    source: b"Content-Type: text/plain;charset=utf-8;name=x\nContent-ID: <a@b>\n\n",
+                    base: 100,
+                    source_end: SourceEnd::Eof,
+                    header_limit: 1024,
+                    context: mime_metadata::Context::Normal,
+                },
+                backing(&mut h, &mut c, &mut n),
+                &mut work,
+                &mut budget,
+                &mut scratch,
+            )
+            .unwrap();
+            let mut reached = false;
+            for _ in 0..100_000 {
+                if matches!(cursor.phase, Phase::Labels) {
+                    reached = true;
+                    break;
+                }
+                assert_eq!(cursor.poll(Tick(1)).unwrap(), Status::Yield);
+            }
+            assert!(reached);
+            assert!(cursor.filename.is_some());
+            assert!(cursor.charset.is_some());
+            let end = cursor.end.as_mut().unwrap();
+            if header_count {
+                end.header_bytes += 1;
+            } else {
+                end.body_start += 1;
+            }
+            assert_eq!(drain(&mut cursor), Err(Error::InvalidState));
+            assert_eq!(cursor.value(), None);
+            assert!(cursor.filename.is_none());
+            assert!(cursor.charset.is_none());
+            assert!(cursor.end.is_none());
+            assert!(cursor.labels.is_none());
+            assert_eq!(cursor.poll(Tick(1)), Err(Error::InvalidState));
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(Error::InvalidState));
+        }
     }
 }

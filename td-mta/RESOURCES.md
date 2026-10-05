@@ -1316,6 +1316,17 @@ conversion partition. Complete selected fields and token ranges borrow
 resident source; no copied field string, input-sized state or additional
 descriptor is retained.
 
+M06cv adds two selected passive raw label extents and one exclusive
+mime_label_fields child to this same cursor reservation. The child replaces
+other live projection children, borrows the original Meter/HeaderBudget and
+leaves original Scratch untouched. A second raw scan uses original source
+and interpretation work without counting raw headers twice; matching End
+metadata pins this correspondence. Existing caller windows remain unchanged.
+Allocation intervals include malformed-then-valid CID/language fields and
+four-byte comments alongside retained heads/filename, plus late needed-label
+nesting refusal. No CID string or tag list, additional descriptor arena,
+whole-worker or native/RSS bound follows.
+
 Backing's heads, charset and filename are separate caller-reserved
 windows in existing admitted output/text backing. Head capacity needs
 the complete type and optional disposition token bytes (including the
@@ -1332,8 +1343,9 @@ Head copying funds one interpretation step for each bounded transition,
 including absent slots, plus one step per copied byte (at most 33 steps
 in a head-copy turn). It processes at most 32 bytes per turn and charges
 source visits, interpretation steps and output before each copy. Other
-turns use the existing metadata, protocol and filename child bounds;
-phase transitions do no input-sized work. Public child handoffs abandon
+turns use the existing metadata, protocol and filename child bounds; M06cv
+label turns also inherit M06cu's 256 source visits, 256 interpretation steps
+and 16 job records per turn; phase transitions do no input-sized work. Public child handoffs abandon
 unused prepaid credit without refunding any counters; they never
 recreate job/header budgets or scratch. Raw headers reported by replay
 are not counted again as new structural bytes. Literal slash/default

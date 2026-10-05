@@ -1965,6 +1965,15 @@ Initial independently landable increments:
   per-turn/full-allowance/deadline cuts. Retained label values, location,
   traversal coordination, JSON and worker/native/RSS remain open.
 
+- **M06cv — passive labels in retained part headers:** add first-valid raw
+  CID/language extents to completed Views after an exclusive selector phase
+  under original job/header owners. Require the same section/body boundary
+  and hide all prior projections until label success. Preserve original
+  Scratch and backing; labels introduce no string/list arena. Qualify late
+  label refusal, original handoff and allocation/resource/deadline checks.
+  Label-value/JSON projection, location dispatch, traversal integration and
+  worker/native/RSS qualification remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

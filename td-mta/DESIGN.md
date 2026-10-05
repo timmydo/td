@@ -471,6 +471,14 @@ success and provisional through fresh admission. Projection/retention and
 traversal coordination remain separate; selection grants no source or blob
 authority and allocates no label string or list.
 
+M06cv retains those two passive raw extents in completed part-header Views.
+The label selector runs after filename completion with the same authorized
+entity and original owners; both scans must agree on section/body bounds.
+No View is exposed until labels complete. Later label failure retires prior
+heads/charset/filename results. The original parser reservation and caller
+windows suffice; label strings/lists, location dispatch and automatic
+traversal/JSON integration remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

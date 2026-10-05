@@ -2438,11 +2438,23 @@ fn resident_part_headers() {
     };
     let source = concat!(
         "Content-Type: TEXT/PLAIN;charset=utf-8;name=type\n",
-        "Content-Disposition: INLINE;filename*=utf-8''e%CC%81\n\nbody"
+        "Content-Disposition: INLINE;filename*=utf-8''e%CC%81\n",
+        "Content-ID: <bad>\nContent-ID: (🐈) <A@B>\n",
+        "Content-Language: en,\nContent-Language: en-GB, FR\n\nbody"
     )
     .as_bytes();
+    let deep = format!(
+        "Content-Type: text/plain;name=x\nContent-Language: {}en{}\n\n",
+        "(".repeat(33),
+        ")".repeat(33)
+    );
     let before = COUNTERS.snapshot();
-    for (source, failed) in [(source, false), (b"\n".as_slice(), false), (source, true)] {
+    for (source, failed, late) in [
+        (source, false, false),
+        (b"\n".as_slice(), false, false),
+        (source, true, false),
+        (deep.as_bytes(), true, true),
+    ] {
         let mut work = Meter::new(
             Deadline::after(Tick(0), 100).unwrap(),
             Charge {
@@ -2466,7 +2478,7 @@ fn resident_part_headers() {
                 context: Context::Normal,
             },
             Backing {
-                heads: if failed { &mut [] } else { &mut h },
+                heads: if failed && !late { &mut [] } else { &mut h },
                 charset: &mut c,
                 filename: &mut n,
             },
@@ -2486,6 +2498,14 @@ fn resident_part_headers() {
                 }
                 Err(error) => {
                     assert!(failed);
+                    if late {
+                        assert_eq!(
+                            error,
+                            td_mta::mime_part_headers::Error::Labels(
+                                td_mta::mime_label_fields::Error::NestingLimit
+                            )
+                        );
+                    }
                     assert_eq!(cursor.poll(Tick(1)), Err(error));
                     assert!(cursor.value().is_none());
                     done = true;
@@ -2498,6 +2518,11 @@ fn resident_part_headers() {
             assert!(cursor.value().is_some());
             assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
             let (value, work, budget, _) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(value.content_id_field.is_some(), source != b"\n");
+            assert_eq!(
+                value.content_language_field.is_some(),
+                value.content_id_field.is_some()
+            );
             let class =
                 td_mta::mime_body_lists::Class::from_headers(value, Tick(1), work, budget).unwrap();
             black_box((value, class));
