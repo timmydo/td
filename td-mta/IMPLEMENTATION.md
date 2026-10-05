@@ -2000,6 +2000,14 @@ Initial independently landable increments:
   measured long-list/comment/refusal allocation paths. Selection/null mapping,
   retained metadata/response publication and worker/native/RSS remain open.
 
+- **M06cz — retained selected label JSON:** collect selected CID and language
+  JSON directly into separate caller-reserved backing. Keep original owners
+  exclusive across child handoff and expose only the healthy complete pair
+  through consuming finish. Qualify exact capacities, absence, diagnostics,
+  later-fragment retirement, original resource/deadline cuts and allocation.
+  Full retained part-header composition, source/selection authorization,
+  location dispatch and response publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

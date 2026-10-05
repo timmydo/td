@@ -1829,6 +1829,27 @@ refusal, fresh final
 retirement and original-owner reuse. Native, worker-stack and RSS
 qualification remain separate; no new parser reservation or grant follows.
 
+M06cz's retained label JSON collector plus HeaderBudget fits 1024 bytes in
+the existing parser region. CID/language child phases are exclusive; backing
+windows are separate caller-reserved retention storage, never grown here.
+Each turn performs original zero-count admission and one transition or one
+selected child poll. A completing child poll also freshly consumes its
+owners and restores them without another resource charge. At most two
+transition-only polls add no interpretation/output work. Per-turn selected
+child ceilings remain at most 160 visits, 255 interpretation steps, 16 job
+records and 10 combined conversion/serialized output bytes. Direct
+backing drains do not charge paid JSON twice. Missing values consume no output
+window. Capacity/resource/late syntax refusal retires the entire pair without
+wiping provisional backing. Exact-grant and original-owner reuse fixtures
+pin aggregate costs; a public-child prefix oracle pins every cumulative
+turn cost and completion point. Checked backing bounds are 6N+2 for CID JSON
+and 2N+3 for language JSON from the complete raw field-value length N; overflow
+returns None. No new parser reservation or output grant follows.
+Warm/measured Rust intervals cover long paired labels, absence, exact backing,
+capacity/syntax/job refusal including a late language output cut, fresh final
+retirement and original-owner reuse. Input/backing allocation precedes each
+measured interval; native, worker-stack and RSS qualification remain separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

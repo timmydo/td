@@ -2537,6 +2537,193 @@ fn content_language_json() {
     assert_eq!(before, after, "Content-Language JSON projection allocated");
 }
 
+fn retained_label_json() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_content_id,
+        mime_label_fields::json::{Backing, Cursor, Error, Status, Values},
+        mime_language,
+        nfc::{self, HeaderBudget},
+        ports::{Deadline, Tick},
+    };
+    let long_id = format!("<{}@B>", "a".repeat(8192));
+    let long_language = "x".to_owned() + &"-abcdefgh".repeat(1024);
+    let mut id_output = vec![0; 20_000];
+    let mut language_output = vec![0; 20_000];
+    let id_bad = Error::ContentId(mime_content_id::json::Error::Source(
+        mime_content_id::Error::Malformed,
+    ));
+    let language_bad = Error::ContentLanguage(mime_language::json::Error::Source(
+        mime_language::Error::Malformed,
+    ));
+    let records_bad = Error::ContentId(mime_content_id::json::Error::Source(
+        mime_content_id::Error::Work(Stop::Records),
+    ));
+    let late_output_bad = Error::ContentLanguage(mime_language::json::Error::Source(
+        mime_language::Error::Work(Stop::OutputBytes),
+    ));
+    let before = COUNTERS.snapshot();
+    for (id, language, id_cap, language_cap, records, output_bytes, fault) in [
+        (None, None, 0, 0, 100_000_000, 100_000_000, None),
+        (
+            Some(b"<A@B>".as_slice()),
+            Some(b"en, en".as_slice()),
+            5,
+            11,
+            100_000_000,
+            100_000_000,
+            None,
+        ),
+        (
+            Some(long_id.as_bytes()),
+            Some(long_language.as_bytes()),
+            20_000,
+            20_000,
+            100_000_000,
+            100_000_000,
+            None,
+        ),
+        (
+            Some(b"<a@b><c@d>"),
+            None,
+            64,
+            0,
+            100_000_000,
+            100_000_000,
+            Some(id_bad),
+        ),
+        (
+            Some(b"<A@B>"),
+            Some(b"en,"),
+            5,
+            64,
+            100_000_000,
+            100_000_000,
+            Some(language_bad),
+        ),
+        (
+            Some(b"<A@B>"),
+            Some(b"en"),
+            0,
+            64,
+            100_000_000,
+            100_000_000,
+            Some(Error::OutputCapacity),
+        ),
+        (
+            Some(b"<A@B>"),
+            Some(b"en"),
+            5,
+            0,
+            100_000_000,
+            100_000_000,
+            Some(Error::OutputCapacity),
+        ),
+        (
+            Some(b"<A@B>"),
+            Some(b"en"),
+            5,
+            64,
+            0,
+            100_000_000,
+            Some(records_bad),
+        ),
+        (
+            Some(b"<A@B>"),
+            Some(b"en"),
+            5,
+            64,
+            100_000_000,
+            14,
+            Some(late_output_bad),
+        ),
+    ] {
+        for trial in 0..if fault.is_some() { 1 } else { 2 } {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records,
+                    output_bytes,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let identity = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+            let mut cursor = Cursor::new(
+                Values {
+                    content_id: black_box(id),
+                    content_language: black_box(language),
+                },
+                Backing {
+                    content_id: id_output.get_mut(..id_cap).unwrap(),
+                    content_language: language_output.get_mut(..language_cap).unwrap(),
+                },
+                &mut work,
+                &mut budget,
+            );
+            let mut complete = false;
+            let mut failed = None;
+            for _ in 0..200_000 {
+                match cursor.poll(Tick(1)) {
+                    Ok(Status::Complete) => {
+                        complete = true;
+                        break;
+                    }
+                    Ok(Status::Yield) => {
+                        assert!(!cursor.is_complete());
+                    }
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(failed, fault);
+            if let Some(error) = fault {
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.poll(Tick(1)), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            assert!(complete);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            if trial == 1 {
+                let error = Error::Admission(nfc::Error::Work(Stop::Deadline));
+                assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            let (retained, work, budget) = cursor.finish(Tick(1)).unwrap();
+            black_box(retained.content_id);
+            black_box(retained.content_id_end);
+            black_box(retained.content_language);
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                identity
+            );
+            let mut next = mime_language::Cursor::new(b"fr", work, budget);
+            let mut complete = false;
+            for _ in 0..1000 {
+                if next.poll(Tick(1)).unwrap() == mime_language::Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            let (work, budget) = next.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                identity
+            );
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "retained label JSON allocated");
+}
+
 fn content_id_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -9451,6 +9638,7 @@ fn main() {
         content_id_values();
         content_id_json();
         content_language_json();
+        retained_label_json();
         content_language_values();
         body_value();
         mime_text();
@@ -9618,6 +9806,7 @@ fn main() {
     content_id_values();
     content_id_json();
     content_language_json();
+    retained_label_json();
     content_language_values();
     body_value();
     mime_text();

@@ -1,4 +1,5 @@
 //! First-valid resident Content-ID and Content-Language field extents.
+pub mod json;
 use crate::{
     admission::work::{Meter, Stop},
     decode_work::{self, Lexical, Parsing},

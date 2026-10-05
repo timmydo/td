@@ -4576,6 +4576,51 @@ The caller may reuse them for another projection without renewed grants.
 Cursor is neither Copy nor Clone. No source, locator, retained-part or
 whole-response publication authority follows.
 
+### 1.105 Retained selected MIME label JSON
+
+M06cz adds mime_label_fields::json::Cursor. Values supplies optional
+authorized complete selected CID and language values; Backing supplies
+separate mutable windows reserved by the caller. The constructor is
+inert. Field discovery, source extent authorization, optional-field/null
+policy and response publication stay with the enclosing owner. A copied
+field extent does not authorize its source.
+
+The cursor runs the existing selected CID and language JSON bindings in
+order, with the original Meter/HeaderBudget held exclusively by the
+collector or one active child. Drained paid JSON bytes go directly into
+backing without another output charge or an additional staging buffer.
+Child handoff may forfeit unused prepaid record credit; it never renews
+credit or grants. No retained tag list or growing buffer follows.
+Missing values remain absent and use no output window. Selected syntax,
+nesting, work, interpretation, admission or capacity refusal retires the
+whole pair, including an already completed earlier fragment. Partial
+backing is never a successful Retained result and is not wiped on
+failure.
+
+poll(now) yields Yield or Complete. Cached healthy Complete is inert.
+Fresh check_deadline and consuming finish(now) admit the original
+owners, even after Complete and before premature-state refusal. A
+complete healthy finish returns Retained plus the pointer-identical
+original owners. Retained contains optional complete JSON fragments and
+optional final CID diagnostics; it is passive borrowed data, without
+blob, source or publication authority. Absence is not serialized as null
+here. Capacity cannot expand and must cover the entire serialized
+fragment. Checked content_id_capacity_bound(raw_bytes) and
+content_language_capacity_bound(raw_bytes) return conservative bounds
+6N+2 and 2N+3, or None on usize overflow. N is the complete raw
+field-value length, including CFWS. They grant neither validity nor
+output work. Missing values need no window. Cursor is neither Copy nor
+Clone.
+
+Refusal shapes retain phase context: transitions/final admission use
+Admission(nfc::Error), while active children use
+ContentId/ContentLanguage with their typed source causes. Fresh
+admission precedes capacity checking; a full window may refuse capacity
+before selected syntax can be inspected. The inert constructor and at
+most two transition-only polls add no parsing or output charge. A
+completing child poll also performs fresh consuming handoff and owner
+restore with no additional resource charge.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

@@ -513,6 +513,15 @@ Fresh whole-list/framing completion precedes consuming original-owner
 handoff. Null/presence mapping and retained MIME/response composition remain
 separate; the binding grants no locale, source or publication authority.
 
+M06cz retains the selected CID/language JSON pair in separate caller-reserved
+windows. Exclusive child phases consume and return the original job/header
+owners without another output charge or source-sized temporary. No fragment
+escapes before complete healthy pair finish; a later language, capacity or
+admission refusal retires the earlier CID too. Missing values remain absent.
+Field selection, source authorization, optional/null policy and enclosing
+response publication remain separate. The child handoff may forfeit prepaid
+credit; it cannot renew any allowance.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or
