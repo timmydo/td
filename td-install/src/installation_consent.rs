@@ -8,7 +8,7 @@
 
 /// Sent and required by both ends before the first frame. A change to any
 /// message or its bytes changes the greeting; there is no negotiation.
-pub const GREETING: &[u8; 8] = b"TDINA01\n";
+pub const GREETING: &[u8; 8] = b"TDINA02\n";
 pub const MAX_MESSAGE_BYTES: usize = 1024;
 
 const NONCE_BYTES: usize = 32;
@@ -25,7 +25,8 @@ const REVIEW_BYTES: usize = 1
     + 2 * (1 + 2 + LABEL_BYTES)
     + (1 + HOSTNAME_BYTES)
     + (1 + USERNAME_BYTES)
-    + 32;
+    + 32
+    + 1;
 const _: () = assert!(REVIEW_BYTES <= MAX_MESSAGE_BYTES);
 
 const REVIEW: u8 = 0x01;
@@ -65,6 +66,34 @@ pub fn payload_len(header: [u8; 4]) -> Result<usize, String> {
     }
 }
 
+/// The held review's storage, as the plan's storage byte carries it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Storage {
+    Unencrypted,
+    DeviceBound,
+}
+
+impl Storage {
+    pub const ALL: &[Self] = &[Self::Unencrypted, Self::DeviceBound];
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Unencrypted => 0,
+            Self::DeviceBound => 1,
+        }
+    }
+
+    // A repeated code would silently shadow a variant.
+    #[deny(unreachable_patterns)]
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            0 => Ok(Self::Unencrypted),
+            1 => Ok(Self::DeviceBound),
+            _ => Err("unknown installation consent storage".into()),
+        }
+    }
+}
+
 /// What a consent prompt shows of one review. The service fills it from the
 /// review it holds; td-authd escapes, narrows and lays it out, and refuses
 /// what it cannot show.
@@ -78,6 +107,7 @@ pub struct Review {
     hostname: String,
     username: String,
     deployment: [u8; 32],
+    storage: Storage,
 }
 
 /// Unvalidated review fields. Construction copies admitted values.
@@ -91,6 +121,7 @@ pub struct ReviewFields<'a> {
     pub hostname: &'a str,
     pub username: &'a str,
     pub deployment: [u8; 32],
+    pub storage: Storage,
 }
 
 impl Review {
@@ -104,6 +135,7 @@ impl Review {
             hostname,
             username,
             deployment,
+            storage,
         } = fields;
         check_nonce(&nonce)?;
         if disk.is_empty()
@@ -139,6 +171,7 @@ impl Review {
             hostname: hostname.into(),
             username: username.into(),
             deployment,
+            storage,
         })
     }
     pub fn nonce(&self) -> &[u8; NONCE_BYTES] {
@@ -164,6 +197,9 @@ impl Review {
     }
     pub fn deployment(&self) -> &[u8; 32] {
         &self.deployment
+    }
+    pub fn storage(&self) -> Storage {
+        self.storage
     }
 }
 
@@ -309,6 +345,7 @@ impl Report {
                 put_text(&mut out, &review.hostname);
                 put_text(&mut out, &review.username);
                 out.extend_from_slice(&review.deployment);
+                out.push(review.storage.code());
             }
             Self::Ended(nonce, why) => {
                 out.push(ENDED);
@@ -340,6 +377,7 @@ impl Report {
                 let hostname = reader.text()?;
                 let username = reader.text()?;
                 let deployment = reader.array()?;
+                let storage = Storage::from_code(reader.byte()?)?;
                 Self::Review(Box::new(Review::new(ReviewFields {
                     nonce,
                     disk,
@@ -349,6 +387,7 @@ impl Report {
                     hostname,
                     username,
                     deployment,
+                    storage,
                 })?))
             }
             ENDED => {
@@ -504,6 +543,7 @@ mod tests {
             hostname: &"h".repeat(HOSTNAME_BYTES),
             username: &"u".repeat(USERNAME_BYTES),
             deployment: [9; 32],
+            storage: Storage::DeviceBound,
         })
         .unwrap()
     }
@@ -521,6 +561,7 @@ mod tests {
                     hostname: "td",
                     username: "alice",
                     deployment: [0; 32],
+                    storage: Storage::Unencrypted,
                 })
                 .unwrap(),
             )),
@@ -562,7 +603,7 @@ mod tests {
             );
         }
         assert_eq!(widest_bytes, REVIEW_BYTES);
-        assert_eq!(REVIEW_BYTES, 720);
+        assert_eq!(REVIEW_BYTES, 721);
         for answer in answers() {
             let bytes = answer.encode();
             assert_eq!(Answer::decode(&bytes).unwrap(), answer);
@@ -583,6 +624,8 @@ mod tests {
         );
         assert!(check_greeting(GREETING).is_ok());
         assert!(check_greeting(b"TDINS01\n").is_err());
+        // The version before the storage byte.
+        assert!(check_greeting(b"TDINA01\n").is_err());
     }
 
     #[test]
@@ -620,9 +663,40 @@ mod tests {
             hostname: "td",
             username: "alice",
             deployment: [0xab; 32],
+            storage: Storage::Unencrypted,
+        })
+        .unwrap();
+        let bound = Review::new(ReviewFields {
+            nonce: nonce(1),
+            disk: "vda",
+            capacity: 8 << 30,
+            model: None,
+            serial: None,
+            hostname: "td",
+            username: "alice",
+            deployment: [0xab; 32],
+            storage: Storage::DeviceBound,
         })
         .unwrap();
         for (message, bytes) in [
+            (
+                Report::Review(Box::new(bound)).encode(),
+                golden(&[
+                    &[0x01],
+                    &nonce(1),
+                    &[3],
+                    b"vda",
+                    &[0, 0, 0, 2, 0, 0, 0, 0],
+                    &[0],
+                    &[0],
+                    &[2],
+                    b"td",
+                    &[5],
+                    b"alice",
+                    &[0xab; 32],
+                    &[1],
+                ]),
+            ),
             (
                 Report::Review(Box::new(review)).encode(),
                 golden(&[
@@ -639,6 +713,7 @@ mod tests {
                     &[5],
                     b"alice",
                     &[0xab; 32],
+                    &[0],
                 ]),
             ),
             (
@@ -676,6 +751,9 @@ mod tests {
         assert_eq!(accepted(Ended::from_code), [1, 2, 3, 4]);
         assert_eq!(accepted(Outcome::from_code), [1, 2]);
         assert_eq!(accepted(NoConsent::from_code), [1, 2, 3]);
+        assert_eq!(accepted(Storage::from_code), [0, 1]);
+        let storage: Vec<u8> = Storage::ALL.iter().map(|each| each.code()).collect();
+        assert_eq!(storage, [0, 1]);
         let ended: Vec<u8> = Ended::ALL.iter().map(|why| why.code()).collect();
         let outcomes: Vec<u8> = Outcome::ALL.iter().map(|outcome| outcome.code()).collect();
         let refusals: Vec<u8> = NoConsent::ALL.iter().map(|why| why.code()).collect();
@@ -684,6 +762,9 @@ mod tests {
         assert_eq!(refusals, [1, 2, 3]);
         // Each code byte is the last byte of its message.
         for code in 0..=u8::MAX {
+            let mut bytes = Report::Review(Box::new(widest())).encode();
+            *bytes.last_mut().unwrap() = code;
+            assert_eq!(Report::decode(&bytes).is_ok(), code <= 1, "{code}");
             let mut bytes = Report::Ended([2; 32], Ended::Withdrawn).encode();
             *bytes.last_mut().unwrap() = code;
             assert_eq!(
@@ -745,6 +826,7 @@ mod tests {
             hostname: "td",
             username: "alice",
             deployment: [0; 32],
+            storage: Storage::Unencrypted,
         };
         assert!(Review::new(fields()).is_ok());
         let long_disk = "n".repeat(DISK_BYTES + 1);
@@ -817,6 +899,7 @@ mod tests {
             hostname: "td",
             username: "alice",
             deployment: [0; 32],
+            storage: Storage::Unencrypted,
         })
         .unwrap();
         let bytes = Report::Review(Box::new(review)).encode();

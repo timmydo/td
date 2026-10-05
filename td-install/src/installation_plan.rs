@@ -1,9 +1,9 @@
 //! Immutable review data, not a device claim, authenticated source or consent.
 
 /// Input admission ceiling, checked before parsing or allocating fields.
-/// The largest current valid encoding is 1191 bytes.
+/// The largest current valid encoding is 1192 bytes.
 pub const MAX_BYTES: usize = 2048;
-const MAGIC: &[u8; 8] = b"TDPLAN01";
+const MAGIC: &[u8; 8] = b"TDPLAN02";
 const CANDIDATES_MAGIC: &[u8; 8] = b"TDCAND01";
 const ZONES_MAGIC: &[u8; 8] = b"TDZONE01";
 pub const MAX_CANDIDATES: usize = 64;
@@ -21,6 +21,7 @@ const ENCODED_BYTES: usize = 8
     + 32
     + 16
     + DESTINATION_BYTES
+    + 1
     + 4 * 2
     + USERNAME_BYTES
     + HOSTNAME_BYTES
@@ -306,9 +307,41 @@ impl Settings {
     }
 }
 
-/// One proposed whole-disk, unencrypted, automatic-login installation.
-/// A fresh nonce distinguishes otherwise equal proposals. Equality binds all
-/// fields; cloning copies a proposal and never creates another authorization.
+/// How the installed volume is stored. The service sets it from its own
+/// storage operand; no request carries it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Storage {
+    Unencrypted,
+    /// LUKS2 released by this machine's TPM and boot chain
+    /// (ENCRYPTION.md "Device-bound default"); not lost-laptop protection.
+    DeviceBound,
+}
+
+impl Storage {
+    pub const ALL: &[Self] = &[Self::Unencrypted, Self::DeviceBound];
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Unencrypted => 0,
+            Self::DeviceBound => 1,
+        }
+    }
+
+    // A repeated code would silently shadow a variant.
+    #[deny(unreachable_patterns)]
+    fn from_code(code: u8) -> Result<Self, String> {
+        match code {
+            0 => Ok(Self::Unencrypted),
+            1 => Ok(Self::DeviceBound),
+            _ => Err("invalid plan storage".into()),
+        }
+    }
+}
+
+/// One proposed whole-disk, automatic-login installation, with the storage
+/// the service chose. A fresh nonce distinguishes otherwise equal proposals.
+/// Equality binds all fields; cloning copies a proposal and never creates
+/// another authorization.
 ///
 /// ```compile_fail,E0616
 /// fn change(plan: &mut td_install::installation_plan::Plan) {
@@ -321,6 +354,7 @@ pub struct Plan {
     destination: Destination,
     deployment: [u8; 32],
     volume_uuid: [u8; 16],
+    storage: Storage,
     settings: Settings,
 }
 
@@ -332,6 +366,7 @@ impl Plan {
         destination: Destination,
         deployment: [u8; 32],
         volume_uuid: [u8; 16],
+        storage: Storage,
         settings: Settings,
     ) -> Result<Self, String> {
         if nonce == [0; 32]
@@ -345,6 +380,7 @@ impl Plan {
             destination,
             deployment,
             volume_uuid,
+            storage,
             settings,
         })
     }
@@ -382,6 +418,9 @@ impl Plan {
     pub fn volume_uuid(&self) -> &[u8; 16] {
         &self.volume_uuid
     }
+    pub fn storage(&self) -> Storage {
+        self.storage
+    }
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
@@ -393,7 +432,8 @@ impl Plan {
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.deployment);
         out.extend_from_slice(&self.volume_uuid);
-        put_destination(&mut out, &self.destination);
+        // The storage byte follows the destination's removable flag.
+        put_destination_with(&mut out, &self.destination, &[self.storage.code()]);
         put_settings(&mut out, &self.settings);
         out
     }
@@ -409,10 +449,13 @@ impl Plan {
         let nonce = r.array()?;
         let deployment = r.array()?;
         let uuid = r.array()?;
-        let destination = read_destination(&mut r)?;
+        let (destination, storage) = read_destination_with(&mut r, |r| {
+            let [code] = r.array()?;
+            Storage::from_code(code)
+        })?;
         let settings = read_settings(&mut r)?;
         r.finish()?;
-        Self::new(nonce, destination, deployment, uuid, settings)
+        Self::new(nonce, destination, deployment, uuid, storage, settings)
     }
 }
 
@@ -436,12 +479,19 @@ pub(crate) fn read_settings(reader: &mut Reader<'_>) -> Result<Settings, String>
 }
 
 pub(crate) fn put_destination(out: &mut Vec<u8>, disk: &Destination) {
+    put_destination_with(out, disk, &[]);
+}
+
+/// The destination with `after_removable` between its fixed fields and its
+/// names, where the plan carries its storage byte.
+fn put_destination_with(out: &mut Vec<u8>, disk: &Destination, after_removable: &[u8]) {
     out.extend_from_slice(&disk.major.to_be_bytes());
     out.extend_from_slice(&disk.minor.to_be_bytes());
     out.extend_from_slice(&disk.sequence.to_be_bytes());
     out.extend_from_slice(&disk.capacity.to_be_bytes());
     out.extend_from_slice(&disk.sector.to_be_bytes());
     out.push(u8::from(disk.removable));
+    out.extend_from_slice(after_removable);
     put(out, &disk.name);
     for label in [&disk.model, &disk.serial, &disk.wwid] {
         out.push(u8::from(label.is_some()));
@@ -452,17 +502,27 @@ pub(crate) fn put_destination(out: &mut Vec<u8>, disk: &Destination) {
 }
 
 pub(crate) fn read_destination(reader: &mut Reader<'_>) -> Result<Destination, String> {
+    read_destination_with(reader, |_| Ok(())).map(|(destination, ())| destination)
+}
+
+/// The destination and what `after_removable` reads between its fixed fields
+/// and its names.
+fn read_destination_with<'a, T>(
+    reader: &mut Reader<'a>,
+    after_removable: impl FnOnce(&mut Reader<'a>) -> Result<T, String>,
+) -> Result<(Destination, T), String> {
     let major = u32::from_be_bytes(reader.array()?);
     let minor = u32::from_be_bytes(reader.array()?);
     let sequence = u64::from_be_bytes(reader.array()?);
     let capacity = u64::from_be_bytes(reader.array()?);
     let sector = u32::from_be_bytes(reader.array()?);
     let removable = reader.flag()?;
+    let between = after_removable(reader)?;
     let name = reader.string(NAME_BYTES)?;
     let model = reader.optional()?;
     let serial = reader.optional()?;
     let wwid = reader.optional()?;
-    Destination::new(DestinationObservation {
+    let destination = Destination::new(DestinationObservation {
         name,
         major,
         minor,
@@ -473,7 +533,8 @@ pub(crate) fn read_destination(reader: &mut Reader<'_>) -> Result<Destination, S
         model,
         serial,
         wwid,
-    })
+    })?;
+    Ok((destination, between))
 }
 
 fn text(value: &str, limit: usize) -> Result<(), String> {

@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::installation_consent::{self as consent, Answer, Ended, NoConsent, Outcome, Report};
-use crate::installation_plan::{Candidates, Destination, Plan, Settings, Zones};
+use crate::installation_plan::{Candidates, Destination, Plan, Settings, Storage, Zones};
 use crate::installation_protocol::{
-    check_greeting, frame, payload_len, Abandon, Ending, Failure, Phase, Refusal, Reply, Request,
-    ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
+    check_greeting, frame, payload_len, scrub, Abandon, Ending, Failure, Phase, Refusal, Reply,
+    Request, ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
 };
 
 /// What the service observes and holds. Production reads the machine;
@@ -159,7 +159,24 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
                 Err(refusal) => Reply::Refused(refusal),
             },
             Request::End(ending, nonce) => self.end(ending, nonce),
+            Request::RecoveryKey(_) | Request::ConfirmRecovery(..) => self.recovery(),
         })
+    }
+
+    /// The recovery-key phase belongs to a device-bound installation, whose
+    /// formatting holds the key (DESIGN.md "Device-bound formatting"). This
+    /// service formats none, so no state admits the key or its type-back:
+    /// a running installation is busy and every other state has no review.
+    fn recovery(&self) -> Reply {
+        match self.held {
+            Held::Running(..) => Reply::Refused(Refusal::Busy),
+            Held::Idle
+            | Held::Reviewed { .. }
+            | Held::AwaitingConsent { .. }
+            | Held::Complete(_)
+            | Held::Failed(..)
+            | Held::Abandoned(..) => Reply::Refused(Refusal::NoReview),
+        }
     }
 
     /// Only a complete installation, named by its nonce, restarts or
@@ -216,8 +233,15 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             Err(refusal) => return Ok(Err(refusal)),
         };
         let (nonce, uuid) = self.host.entropy()?;
-        let plan = Plan::new(nonce, destination, deployment, uuid, settings)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let plan = Plan::new(
+            nonce,
+            destination,
+            deployment,
+            uuid,
+            Storage::Unencrypted,
+            settings,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         // A review is only presented for a disk it fits, with the plan's own
         // volume identity sizing the selector.
         if let Err(refusal) = self.host.check_fit(&plan) {
@@ -419,6 +443,10 @@ fn consent_review(plan: &Plan) -> Result<consent::Review, String> {
         hostname: plan.settings().hostname(),
         username: plan.settings().username(),
         deployment: *plan.deployment(),
+        storage: match plan.storage() {
+            Storage::Unencrypted => consent::Storage::Unencrypted,
+            Storage::DeviceBound => consent::Storage::DeviceBound,
+        },
     })
 }
 
@@ -695,7 +723,9 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Option<Request>> {
     let length = payload_len(header, MAX_REQUEST_BYTES).map_err(invalid)?;
     let mut payload = vec![0; length];
     stream.read_exact(&mut payload)?;
-    Request::decode(&payload).map(Some).map_err(invalid)
+    let request = Request::decode(&payload).map(Some).map_err(invalid);
+    scrub(&mut payload);
+    request
 }
 
 fn read_consent(mut channel: UnixStream, events: &mpsc::Sender<Event>) {
@@ -1196,6 +1226,7 @@ mod tests {
             disk("vda", 1, Some("Disk")),
             [0xab; 32],
             uuid,
+            Storage::Unencrypted,
             settings(),
         )
         .unwrap()
@@ -1511,6 +1542,82 @@ mod tests {
             let calls = &service.host.log.lock().unwrap().calls;
             assert!(!calls.contains(&"restart") && !calls.contains(&"power off"));
         }
+    }
+
+    /// This service formats nothing device-bound, so no state admits the
+    /// recovery key or its type-back, and asking changes nothing.
+    #[test]
+    fn no_state_admits_the_recovery_key() {
+        let mut held = Service::new(Fake::new());
+        let plan = reviewed(&mut held);
+        assert_eq!(plan.storage(), Storage::Unencrypted);
+        let mut displayed = Service::new(Fake::new());
+        reviewed(&mut displayed);
+        if let Held::Reviewed { plan, claim } = std::mem::replace(&mut displayed.held, Held::Idle) {
+            displayed.held = Held::AwaitingConsent { plan, claim };
+        }
+        let mut services = vec![
+            (Refusal::NoReview, Service::new(Fake::new())),
+            (Refusal::NoReview, held),
+            (Refusal::NoReview, displayed),
+        ];
+        let mut later: Vec<_> = Phase::ALL
+            .iter()
+            .map(|p| (Refusal::Busy, Held::Running(nonce(), *p)))
+            .collect();
+        later.push((Refusal::NoReview, Held::Complete(nonce())));
+        later.extend(
+            Failure::ALL
+                .iter()
+                .map(|f| (Refusal::NoReview, Held::Failed(nonce(), *f))),
+        );
+        later.extend(
+            Abandon::ALL
+                .iter()
+                .map(|c| (Refusal::NoReview, Held::Abandoned(nonce(), *c))),
+        );
+        for (refusal, held) in later {
+            let mut service = Service::new(Fake::new());
+            service.held = held;
+            services.push((refusal, service));
+        }
+        let digits = crate::installation_protocol::RecoveryDigits::new(&[b'7'; 48]).unwrap();
+        for (refusal, mut service) in services {
+            let state = service.state();
+            for named in [nonce(), ReviewNonce::from(&plan)] {
+                for request in [
+                    Request::RecoveryKey(named),
+                    Request::ConfirmRecovery(named, digits.clone()),
+                ] {
+                    assert_eq!(
+                        service.answer(request).unwrap(),
+                        Reply::Refused(refusal),
+                        "{state:?}"
+                    );
+                }
+            }
+            assert_eq!(service.state(), state);
+            assert!(service.take_reports().is_empty());
+        }
+    }
+
+    /// The consent channel's review carries the plan's storage.
+    #[test]
+    fn the_consent_review_carries_the_storage() {
+        let plan = sample_plan();
+        let review = consent_review(&plan).unwrap();
+        assert_eq!(review.storage(), consent::Storage::Unencrypted);
+        let bound = Plan::new(
+            *plan.nonce(),
+            plan.destination().clone(),
+            *plan.deployment(),
+            *plan.volume_uuid(),
+            Storage::DeviceBound,
+            plan.settings().clone(),
+        )
+        .unwrap();
+        let review = consent_review(&bound).unwrap();
+        assert_eq!(review.storage(), consent::Storage::DeviceBound);
     }
 
     #[test]
@@ -2150,7 +2257,7 @@ mod tests {
             served_with_consent(FakeExecution::new(Ok(())), refused, |stream| {
                 let mut greeting = [0; 8];
                 stream.read_exact(&mut greeting).unwrap();
-                stream.write_all(b"TDINA02\n").unwrap();
+                stream.write_all(b"TDINA01\n").unwrap();
                 let mut rest = Vec::new();
                 stream.read_to_end(&mut rest).unwrap();
                 assert!(rest.is_empty());

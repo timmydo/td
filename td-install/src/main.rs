@@ -4180,6 +4180,7 @@ mod tests {
         for bytes in [
             Vec::new(),
             b"TDPLAN01".to_vec(),
+            b"TDPLAN02".to_vec(),
             vec![0; installation_plan::MAX_BYTES + 1],
         ] {
             let mut output = Vec::new();
@@ -4653,8 +4654,15 @@ mod tests {
         let mut uuid = [0; 16];
         uuid[6] = 0x40;
         uuid[8] = 0x80;
-        let plan =
-            installation_plan::Plan::new([1; 32], destination, [0xab; 32], uuid, settings).unwrap();
+        let plan = installation_plan::Plan::new(
+            [1; 32],
+            destination,
+            [0xab; 32],
+            uuid,
+            installation_plan::Storage::Unencrypted,
+            settings,
+        )
+        .unwrap();
         for (body, reason) in [
             (format!("printf '{}\\n'\n", "ab".repeat(32)), None),
             (
@@ -4707,8 +4715,15 @@ mod tests {
         let mut uuid = [0; 16];
         uuid[6] = 0x40;
         uuid[8] = 0x80;
-        let plan =
-            installation_plan::Plan::new([1; 32], destination, [0xab; 32], uuid, settings).unwrap();
+        let plan = installation_plan::Plan::new(
+            [1; 32],
+            destination,
+            [0xab; 32],
+            uuid,
+            installation_plan::Storage::Unencrypted,
+            settings,
+        )
+        .unwrap();
         std::fs::write(&observed_sequence, "1").unwrap();
         scratch::executable(
             &validator,
@@ -10402,9 +10417,15 @@ mod tests {
             let mut uuid = [0x5a; 16];
             uuid[6] = 0x40;
             uuid[8] = 0x80;
-            let plan =
-                installation_plan::Plan::new([7; 32], destination, deployment, uuid, settings)
-                    .unwrap();
+            let plan = installation_plan::Plan::new(
+                [7; 32],
+                destination,
+                deployment,
+                uuid,
+                installation_plan::Storage::Unencrypted,
+                settings,
+            )
+            .unwrap();
             Self {
                 _dir: dir,
                 disk: Scratch::disk(DISK),

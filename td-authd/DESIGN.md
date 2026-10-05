@@ -1531,8 +1531,10 @@ operation slot, it answers 99 00. Selection makes the review's consent
 summary, the disk installation description of "Immutable consent description
 prerequisite", with the review's nonce, the session owner as requester, the
 escaped model and serial and the deployment digest's first eight bytes. A
-review it cannot show (a name consent refuses), or whose operation cannot
-start, is declined as unavailable at once and answers 99 00. Otherwise it
+review it cannot show (a name consent refuses, or device-bound storage,
+which a service started without the storage operand never reviews and the
+summary has no row for until that tier is activated), or whose operation
+cannot start, is declined as unavailable at once and answers 99 00. Otherwise it
 answers 92 DESCRIPTION and holds the slot. Presentation (13), then one
 commit (14) after a fresh physical Enter, within 120 seconds, as for an
 update. Commit sends consent naming the review; Escape before commit sends

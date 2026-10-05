@@ -238,7 +238,15 @@ mod tests {
         let mut uuid = [0u8; 16];
         *uuid.get_mut(6).unwrap() = 0x40;
         *uuid.get_mut(8).unwrap() = 0x80;
-        Plan::new([1; 32], disk, [2; 32], uuid, settings).unwrap()
+        Plan::new(
+            [1; 32],
+            disk,
+            [2; 32],
+            uuid,
+            td_install::installation_plan::Storage::Unencrypted,
+            settings,
+        )
+        .unwrap()
     }
 
     fn surface(width: usize, height: usize) -> Surface {

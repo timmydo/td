@@ -791,7 +791,15 @@ mod tests {
         let mut uuid = [0; 16];
         uuid[6] = 0x40;
         uuid[8] = 0x80;
-        let plan = Plan::new([1; 32], destination, [2; 32], uuid, settings).unwrap();
+        let plan = Plan::new(
+            [1; 32],
+            destination,
+            [2; 32],
+            uuid,
+            crate::installation_plan::Storage::Unencrypted,
+            settings,
+        )
+        .unwrap();
         let current = || collect(&fixture.class).unwrap();
         plan_candidate(&current(), plan.destination()).unwrap();
         for (path, stale) in [
@@ -851,7 +859,15 @@ mod tests {
         let mut uuid = [0; 16];
         uuid[6] = 0x40;
         uuid[8] = 0x80;
-        let plan = Plan::new([1; 32], destination, [2; 32], uuid, settings).unwrap();
+        let plan = Plan::new(
+            [1; 32],
+            destination,
+            [2; 32],
+            uuid,
+            crate::installation_plan::Storage::Unencrypted,
+            settings,
+        )
+        .unwrap();
         recheck_inventory(plan.destination(), &fixture.class, || Ok(())).unwrap();
         fs::write(disk.join("diskseq"), "8").unwrap();
         let error = recheck_inventory(plan.destination(), &fixture.class, || Ok(())).unwrap_err();

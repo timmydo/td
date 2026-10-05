@@ -31,6 +31,7 @@ pub(crate) fn review(nonce: u8, disk: &str) -> wire::Review {
         hostname: "td-laptop",
         username: "alice",
         deployment: [0xab; 32],
+        storage: wire::Storage::Unencrypted,
     })
     .unwrap()
 }
@@ -190,6 +191,31 @@ fn a_review_is_shown_once_as_its_escaped_summary() {
 }
 
 #[test]
+fn a_device_bound_review_is_declined_as_unavailable() {
+    let (mut intake, mut service) = served();
+    greet(&mut intake, &mut service);
+    let bound = wire::Review::new(wire::ReviewFields {
+        nonce: [9; 32],
+        disk: "vda",
+        capacity: 8 << 30,
+        model: None,
+        serial: None,
+        hostname: "td-laptop",
+        username: "alice",
+        deployment: [0xab; 32],
+        storage: wire::Storage::DeviceBound,
+    })
+    .unwrap();
+    report(&mut service, Report::Review(Box::new(bound)));
+    reviewed(&mut intake);
+    assert!(intake.select().is_err());
+    assert_eq!(
+        answer(&mut service),
+        Answer::Declined([9; 32], NoConsent::Unavailable)
+    );
+}
+
+#[test]
 fn a_review_consent_cannot_show_is_declined_as_unavailable() {
     let (mut intake, mut service) = served();
     greet(&mut intake, &mut service);
@@ -203,6 +229,7 @@ fn a_review_consent_cannot_show_is_declined_as_unavailable() {
         hostname: "td laptop",
         username: "alice",
         deployment: [0; 32],
+        storage: wire::Storage::Unencrypted,
     })
     .unwrap();
     report(&mut service, Report::Review(Box::new(unshowable)));
@@ -295,7 +322,7 @@ fn reports_out_of_order_break_the_channel_and_kill_the_service() {
     }
     // A wrong greeting too.
     let (mut intake, mut service) = served();
-    service.write_all(b"TDINA02\n").unwrap();
+    service.write_all(b"TDINA01\n").unwrap();
     retired(&mut intake);
 }
 

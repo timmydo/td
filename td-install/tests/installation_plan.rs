@@ -6,7 +6,7 @@
 )]
 
 use td_install::installation_plan::{
-    Candidates, Destination, DestinationObservation, Plan, Settings, Zones, MAX_BYTES,
+    Candidates, Destination, DestinationObservation, Plan, Settings, Storage, Zones, MAX_BYTES,
     MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_ZONES, MAX_ZONE_BYTES,
 };
 
@@ -52,7 +52,15 @@ fn uuid() -> [u8; 16] {
     ]
 }
 fn plan() -> Plan {
-    Plan::new([1; 32], destination(), [2; 32], uuid(), settings()).unwrap()
+    Plan::new(
+        [1; 32],
+        destination(),
+        [2; 32],
+        uuid(),
+        Storage::Unencrypted,
+        settings(),
+    )
+    .unwrap()
 }
 
 fn distinct_candidates(count: usize, maximal: bool) -> Vec<Destination> {
@@ -226,7 +234,15 @@ fn time_zones_are_ascending_tokens_and_their_wire_is_canonical() {
 
 #[test]
 fn deployment_id_requires_exact_lowercase_manifest_digest() {
-    let p = Plan::new([1; 32], destination(), [0xab; 32], uuid(), settings()).unwrap();
+    let p = Plan::new(
+        [1; 32],
+        destination(),
+        [0xab; 32],
+        uuid(),
+        Storage::Unencrypted,
+        settings(),
+    )
+    .unwrap();
     let exact = "ab".repeat(32);
     assert!(p.matches_deployment_id(&exact));
     for changed in [
@@ -244,18 +260,21 @@ fn deployment_id_requires_exact_lowercase_manifest_digest() {
 #[test]
 fn wire_order_is_independently_specified_and_lossless() {
     let p = plan();
-    let mut bytes = b"TDPLAN01".to_vec();
+    let mut bytes = b"TDPLAN02".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
     bytes.extend([0, 0, 1, 3, 0, 0, 0, 3]);
     bytes.extend([0, 0, 0, 0, 0, 0, 0, 27]);
     bytes.extend([0, 0, 0, 1, 128, 0, 0, 0]);
+    // Sector size, removable, then the storage byte.
     bytes.extend([0, 0, 16, 0, 0]);
+    bytes.push(0);
     bytes.extend(b"\0\x07nvme0n1\x01\0\x07Model A\x01\0\x09serial-42\0");
     bytes.extend(b"\0\x05alice\0\x09td-laptop\0\x02us\0\x07Etc/UTC");
     assert_eq!(p.encode(), bytes);
     assert_eq!(Plan::decode(&bytes).unwrap(), p);
+    assert_eq!(p.storage(), Storage::Unencrypted);
     assert_eq!(p.destination().number(), (259, 3));
     assert_eq!(p.destination().sequence(), 27);
     assert_eq!(p.destination().capacity(), 6 << 30);
@@ -292,8 +311,58 @@ fn every_truncation_and_extension_refuses() {
         "installation plan exceeds wire bound"
     );
     let mut wrong_version = bytes;
-    wrong_version[7] = b'2';
+    wrong_version[7] = b'3';
     assert!(Plan::decode(&wrong_version).is_err());
+}
+
+#[test]
+fn storage_is_one_byte_after_the_removable_flag() {
+    let unencrypted = plan();
+    let bound = Plan::new(
+        [1; 32],
+        destination(),
+        [2; 32],
+        uuid(),
+        Storage::DeviceBound,
+        settings(),
+    )
+    .unwrap();
+    assert_eq!(bound.storage(), Storage::DeviceBound);
+    assert_ne!(bound, unencrypted);
+    // Magic, nonce, digest, UUID, then the fixed destination fields.
+    let at = 8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4 + 1;
+    let bytes = bound.encode();
+    assert_eq!(bytes[at], 1);
+    assert_eq!(unencrypted.encode()[at], 0);
+    let mut differs = unencrypted.encode();
+    differs[at] = 1;
+    assert_eq!(differs, bytes);
+    assert_eq!(Plan::decode(&bytes).unwrap(), bound);
+    assert_eq!(Storage::ALL, [Storage::Unencrypted, Storage::DeviceBound]);
+    for code in 2..=255 {
+        let mut other = bytes.clone();
+        other[at] = code;
+        assert_eq!(
+            Plan::decode(&other).unwrap_err(),
+            "invalid plan storage",
+            "{code}"
+        );
+    }
+}
+
+#[test]
+fn the_record_before_storage_is_refused() {
+    // A TDPLAN01 record: the same fields with no storage byte.
+    let mut old = plan().encode();
+    old.remove(8 + 32 + 32 + 16 + 4 + 4 + 8 + 8 + 4 + 1);
+    old[7] = b'1';
+    assert_eq!(
+        Plan::decode(&old).unwrap_err(),
+        "unsupported installation plan version"
+    );
+    // Under the current magic its missing byte misreads the name length.
+    old[7] = b'2';
+    assert!(Plan::decode(&old).is_err());
 }
 
 #[test]
@@ -325,7 +394,7 @@ fn retained_plan_owns_settings_and_labels() {
     )
     .unwrap();
     let s = Settings::new(&username, "host", "us", "Etc/UTC").unwrap();
-    let p = Plan::new([1; 32], d, [2; 32], uuid(), s).unwrap();
+    let p = Plan::new([1; 32], d, [2; 32], uuid(), Storage::Unencrypted, s).unwrap();
     let original = p.encode();
     label.clear();
     username.clear();
@@ -354,8 +423,8 @@ fn boundaries_and_missing_labels_remain_distinct() {
         &"z".repeat(64),
     )
     .unwrap();
-    let p = Plan::new([255; 32], d, [0; 32], uuid(), s).unwrap();
-    assert_eq!(p.encode().len(), 1191);
+    let p = Plan::new([255; 32], d, [0; 32], uuid(), Storage::Unencrypted, s).unwrap();
+    assert_eq!(p.encode().len(), 1192);
     assert!(p.encode().len() <= MAX_BYTES);
     assert_eq!(Plan::decode(&p.encode()).unwrap(), p);
     for model in [
@@ -369,7 +438,15 @@ fn boundaries_and_missing_labels_remain_distinct() {
     ] {
         let d = observed_destination("vda", (254, 0), 1, (512, 512), false, (model, None, None))
             .unwrap();
-        let p = Plan::new([1; 32], d, [2; 32], uuid(), settings()).unwrap();
+        let p = Plan::new(
+            [1; 32],
+            d,
+            [2; 32],
+            uuid(),
+            Storage::Unencrypted,
+            settings(),
+        )
+        .unwrap();
         assert_eq!(
             Plan::decode(&p.encode()).unwrap().destination().model(),
             model
@@ -411,11 +488,27 @@ fn malformed_observations_and_choices_refuse() {
         assert!(Settings::new("alice", "host", &value, "Etc/UTC").is_err());
         assert!(Settings::new("alice", "host", "us", &value).is_err());
     }
-    assert!(Plan::new([0; 32], destination(), [2; 32], uuid(), settings()).is_err());
+    assert!(Plan::new(
+        [0; 32],
+        destination(),
+        [2; 32],
+        uuid(),
+        Storage::Unencrypted,
+        settings()
+    )
+    .is_err());
     for (offset, byte) in [(6, 0x37), (8, 0x49)] {
         let mut bad = uuid();
         bad[offset] = byte;
-        assert!(Plan::new([1; 32], destination(), [2; 32], bad, settings()).is_err());
+        assert!(Plan::new(
+            [1; 32],
+            destination(),
+            [2; 32],
+            bad,
+            Storage::Unencrypted,
+            settings()
+        )
+        .is_err());
     }
 }
 
@@ -459,7 +552,15 @@ fn generated_uuid_text_maps_to_the_plan_network_byte_order() {
     for (slot, pair) in uuid.iter_mut().zip(compact.as_bytes().chunks_exact(2)) {
         *slot = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
     }
-    let p = Plan::new([1; 32], destination(), [2; 32], uuid, settings()).unwrap();
+    let p = Plan::new(
+        [1; 32],
+        destination(),
+        [2; 32],
+        uuid,
+        Storage::Unencrypted,
+        settings(),
+    )
+    .unwrap();
     assert_eq!(p.volume_uuid(), &uuid);
     assert_eq!(Plan::decode(&p.encode()).unwrap(), p);
 }

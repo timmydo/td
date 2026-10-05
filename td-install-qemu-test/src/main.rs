@@ -514,15 +514,21 @@ fn observed_destination(device: &str) -> Result<Vec<u8>, String> {
 /// shipped decoder against bytes that its own codec did not produce.
 fn observed_plan(device: &str, deployment: [u8; 32]) -> Result<Vec<u8>, String> {
     let destination = observed_destination(device)?;
+    // The plan's storage byte, unencrypted, follows the removable flag.
+    let (fixed, names) = destination
+        .split_at_checked(4 + 4 + 8 + 8 + 4 + 1)
+        .ok_or("observed destination is truncated")?;
     let mut bytes = Vec::with_capacity(256);
-    bytes.extend_from_slice(b"TDPLAN01");
+    bytes.extend_from_slice(b"TDPLAN02");
     bytes.extend_from_slice(&[1; 32]);
     bytes.extend_from_slice(&deployment);
     let mut uuid = [0; 16];
     *uuid.get_mut(6).ok_or("fixture UUID has no version byte")? = 0x40;
     *uuid.get_mut(8).ok_or("fixture UUID has no variant byte")? = 0x80;
     bytes.extend_from_slice(&uuid);
-    bytes.extend_from_slice(&destination);
+    bytes.extend_from_slice(fixed);
+    bytes.push(0);
+    bytes.extend_from_slice(names);
     for choice in ["alice", "td-qemu-installed", "us", "Europe/London"] {
         put_plan_text(&mut bytes, choice)?;
     }
@@ -1127,7 +1133,10 @@ fn drive_service(
         Reply::Reviewed(plan) => *plan,
         other => return Err(format!("the service did not review: {other:?}")),
     };
-    if *plan.deployment() != deployment || *plan.destination() != destination {
+    if *plan.deployment() != deployment
+        || *plan.destination() != destination
+        || plan.storage() != installation_plan::Storage::Unencrypted
+    {
         return Err("the review is not of the source and disk proposed".into());
     }
     let nonce = *plan.nonce();
@@ -1145,6 +1154,7 @@ fn drive_service(
         || review.hostname() != HOSTNAME
         || review.username() != USERNAME
         || *review.deployment() != deployment
+        || review.storage() != consent::Storage::Unencrypted
     {
         return Err("the consent review is not the review held".into());
     }
@@ -1218,7 +1228,9 @@ fn exchange(
     stream
         .read_exact(&mut payload)
         .map_err(|error| format!("service reply: {error}"))?;
-    let reply = wire::Reply::decode(&payload)?;
+    let reply = wire::Reply::decode(&payload);
+    wire::scrub(&mut payload);
+    let reply = reply?;
     if !reply.answers(request) {
         return Err(format!(
             "the service's reply answers another request: {reply:?}"

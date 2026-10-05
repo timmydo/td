@@ -23,7 +23,7 @@ pub mod settings;
 pub mod welcome;
 pub mod window;
 
-use td_install::installation_plan::{Destination, DestinationObservation, Plan, Settings};
+use td_install::installation_plan::{Destination, DestinationObservation, Plan, Settings, Storage};
 use td_ui::raster::{Composition, Primitive, Raster, Scale, Surface};
 use welcome::Welcome;
 
@@ -152,7 +152,7 @@ fn render_check_surface(font: &td_ui::font::Font, surface: Surface) -> Result<()
     )?;
     let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC")?;
     let uuid = [0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0];
-    let plan = Plan::new([1; 32], disk, [2; 32], uuid, settings)?;
+    let plan = Plan::new([1; 32], disk, [2; 32], uuid, Storage::Unencrypted, settings)?;
     let review = review::ReviewPage::new(surface, &plan, 0).ok_or("review page did not fit")?;
     paint(&review)?;
     let (_, review_pages) = review.position();

@@ -292,6 +292,11 @@ impl Drop for Service {
 
 /// The consent summary of a review, for `owner`.
 fn summary(review: &wire::Review, owner: u32) -> Result<Request, String> {
+    // The service runs without the storage operand, and the prompt shows
+    // no storage row until the device-bound tier is activated.
+    if review.storage() != wire::Storage::Unencrypted {
+        return Err("a device-bound review is not shown".into());
+    }
     let deployment = review
         .deployment()
         .first_chunk::<8>()

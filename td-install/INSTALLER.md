@@ -456,8 +456,8 @@ activate the service or provide the review/consent sequence.
 ## Immutable review data
 
 The `td-install` Rust library exports `installation_plan::{Plan,
-Destination, DestinationObservation, Settings, Candidates, Zones}` and the
-`installation_protocol` messages described below. Both are pure data
+Destination, DestinationObservation, Settings, Storage, Candidates, Zones}`
+and the `installation_protocol` messages described below. Both are pure data
 prerequisites for the service and UI, with no CLI, device access, filesystem
 access, entropy generation, transport or installation execution. The Cargo
 library is also a target path dependency of td-setup; it exports exactly
@@ -495,11 +495,10 @@ capacity, logical sector size, removable flag and optional model, serial
 and WWID. All retained fields are private and accessible only through
 shared references or copied scalar values. Equality compares every
 field, including optional labels and nonce. A clone is the same
-proposal, never a fresh consent or retry. The v1 record describes whole-
-disk erasure, unencrypted storage and automatic login; these policies
-are not caller-selectable flags. The device-bound records below name the
-storage the service's own operand chose; a request still cannot choose
-it.
+proposal, never a fresh consent or retry. The record describes whole-
+disk erasure and automatic login, which are not caller-selectable flags,
+and a storage byte naming the storage the service's own operand chose
+("Device-bound records"); a request cannot choose it.
 
 The public `DestinationObservation` names each unvalidated input field;
 `Destination::new` validates and copies it. Construction and decoding admit
@@ -526,21 +525,24 @@ representations and trailing bytes. The complete framing is checked
 before allocating field strings. No native-endian numbers, JSON numeric
 rounding or path resolution enters the codec. The field order is:
 
-- Eight bytes `TDPLAN01`, nonce (32), deployment digest (32), UUID (16).
+- Eight bytes `TDPLAN02`, nonce (32), deployment digest (32), UUID (16).
 - Big-endian major/minor (u32 each), sequence/capacity (u64 each), sector
-  size (u32), and removable (one byte, exactly zero or one).
+  size (u32), removable (one byte, exactly zero or one) and storage (one
+  byte, 0 unencrypted or 1 device-bound).
 - Kernel name, then model, serial and WWID. Each optional label starts with
   a zero/one presence byte; only a present label has a string payload.
 - Username, hostname, keyboard and timezone, in that order.
 
 Every string has a big-endian u16 byte count followed by exactly its
 bytes (UTF-8 for labels, ASCII for names and choices). The current
-maximal admitted record is 1191 bytes. UUID bytes are in textual/network
-order, with version 4 and the RFC variant bits checked; any 32-byte
-deployment digest is representable, including all zeroes. A digest is a
-full-width hash value, not a reserved nonce sentinel; only source
-authentication can establish that it names the intended manifest. The
-codec does not prove a nonce is fresh or a UUID globally unique. The
+maximal admitted record is 1192 bytes. The storage byte sits inside the
+destination's fixed fields, so a candidates record and a propose
+request, which carry the destination alone, have none. UUID bytes are in
+textual/network order, with version 4 and the RFC variant bits checked;
+any 32-byte deployment digest is representable, including all zeroes. A
+digest is a full-width hash value, not a reserved nonce sentinel; only
+source authentication can establish that it names the intended manifest.
+The codec does not prove a nonce is fresh or a UUID globally unique. The
 authority generates them.
 
 Before a service presents this value to an operator for consent, it must
@@ -573,7 +575,7 @@ proposed and that a withdraw answers abandoned (withdrawn), and an ending
 complete, for its nonce; any other answer ends its connection, and with it,
 until an installation starts, the review and claim.
 
-Both ends first send and require the eight bytes `TDINS04\n`. Any change to
+Both ends first send and require the eight bytes `TDINS05\n`. Any change to
 a message or its bytes changes this greeting; there is no negotiation. Each
 message then travels in one frame: a big-endian u32 length and that many
 payload bytes. `payload_len` admits a nonzero length within the direction's
@@ -594,7 +596,7 @@ Requests carry no path, executable, mount option, source or consent:
   plan carries the service's observation, never UI-supplied values. The
   service chooses the nonce and volume UUID, authenticates the source,
   claims the disk and checks that the disk holds the deployment.
-- `0x03` execute: the complete `TDPLAN01` record the installer reviewed. It
+- `0x03` execute: the complete `TDPLAN02` record the installer reviewed. It
   asks the service to seek consent for the review it retains, and is
   refused unless the record equals that review. Equality is a
   precondition, never consent: consent reaches root only from the
@@ -615,7 +617,7 @@ Requests carry no path, executable, mount option, source or consent:
 Replies set the high bit, so no request decodes as a reply or the reverse:
 
 - `0x81` destinations: a `TDCAND01` record.
-- `0x82` reviewed: the service's `TDPLAN01` record, made while it holds
+- `0x82` reviewed: the service's `TDPLAN02` record, made while it holds
   the destination claim. Its nonce names the review.
 - `0x83` status: a state byte, then for every state but idle the nonzero
   review nonce, then for running, failed and abandoned one detail code.
@@ -625,22 +627,26 @@ Replies set the high bit, so no request decodes as a reply or the reverse:
 - `0x85` time zones: a `TDZONE01` record.
 
 Running phases are 1 preparing the disk, 2 writing filesystems, 3 publishing
-the deployment, 4 applying settings and 5 verifying boot. Failures, after
-which the disk may be incomplete and a retry needs a new review, are 1
-destination changed, 2 insufficient space, 3 write failed, 4 verification
-failed and 5 settings failed. Abandonment, which means no destructive write
-started, is 1 withdrawn, 2 consent declined, 3 consent expired, 4 consent
-unavailable (the trusted path could not show the review, or lost it while
-displayed) or 5 destination changed (the held disk changed or vanished, or a
-recheck refused it, before the first write). Refusals are 1 busy, 2 source
+the deployment, 4 applying settings, 5 verifying boot and 6 recovery key.
+Failures, after which the disk may be incomplete and a retry needs a new
+review, are 1 destination changed, 2 insufficient space, 3 write failed, 4
+verification failed, 5 settings failed and 6 recovery unconfirmed.
+Abandonment, which means no destructive write started, is 1 withdrawn, 2
+consent declined, 3 consent expired, 4 consent unavailable (the trusted
+path could not show the review, or lost it while displayed) or 5
+destination changed (the held disk changed or vanished, or a recheck
+refused it, before the first write). Refusals are 1 busy, 2 source
 unavailable, 3 discovery failed, 4 destination changed, 5 destination busy,
 6 insufficient space, 7 invalid username, 8 invalid hostname, 9 unsupported
 keyboard, 10 unsupported timezone, 11 stale review, 12 no review, 13 consent
 unavailable (no seat, compositor or trusted consent path can present the
 review, or the consent channel cannot carry it), 14 time zones
-unavailable (the catalog could not be read) and 15 power unavailable (the
-supervisor did not accept the reboot or power-off). Unassigned codes
-refuse, and a duplicated code does not compile.
+unavailable (the catalog could not be read), 15 power unavailable (the
+supervisor did not accept the reboot or power-off), 16 recovery key sent
+and 17 recovery key mismatch. The recovery-key phase, its two requests
+(`0x09` and `0x0a`), its reply (`0x86`) and these last codes are
+"Device-bound records". Unassigned codes refuse, and a duplicated code
+does not compile.
 
 The service holds at most one review. A review is held while reviewed,
 awaiting consent or running, and not after complete, failed or abandoned.
@@ -691,9 +697,12 @@ retries a destructive operation after a reconnect or restart.
 
 ### Device-bound records
 
-The landing that adds them, in ENCRYPTION.md increment 5, changes these
-records at once: the greeting becomes `TDINS04\n`, the consent channel's
-`TDINA02\n` and the plan's magic `TDPLAN02`.
+These records carry device-bound storage. They landed at once, in
+ENCRYPTION.md increment 5, as the greeting `TDINS05\n`, the consent
+channel's `TDINA02\n` and the plan's magic `TDPLAN02`; the earlier
+versions are refused, not negotiated. `TDINS05` is `TDINS04` (power off,
+request `0x08`, included) with the additions below, so the recovery
+requests take the next free tags.
 
 - The plan gains one storage byte after the removable flag: 0 unencrypted
   or 1 device-bound, any other value refused. The service sets it from
@@ -703,11 +712,11 @@ records at once: the greeting becomes `TDINS04\n`, the consent channel's
 - Running phase 6, recovery key, follows verifying boot on a device-bound
   installation: everything is written and verified, and the service holds
   the recovery key.
-- Request `0x08` recovery key, a review nonce, is admitted only in that
+- Request `0x09` recovery key, a review nonce, is admitted only in that
   phase for that nonce. Its first admission is answered by reply `0x86`
   recovery key: the nonce and the key's 48 ASCII digits. Every later ask
   is refused as 16 recovery key sent, so the service sends it once.
-- Request `0x09` confirm recovery, a review nonce and the 48 digits typed
+- Request `0x0a` confirm recovery, a review nonce and the 48 digits typed
   back, is admitted only in that phase after the key was sent. The service
   compares the digits with the key it holds: equal, it zeroes the key and
   the installation is complete, answered with status; different, it is
@@ -718,6 +727,22 @@ records at once: the greeting becomes `TDINS04\n`, the consent channel's
 
 The phase has no deadline: a person may take as long as writing the key
 down needs. Withdraw stays refused as busy while it runs.
+
+The key travels as exactly 48 ASCII digits in both directions: the codec
+admits nothing else and leaves the check digits to td-protector's
+recovery-key entry. Its value is zeroed on drop and never printed, and
+equality reads all 48 bytes without an early exit. The encoded message
+holding it is its sender's to zero; each receiver (the service, td-setup
+and the QEMU oracle) zeroes every received payload with the codec's
+`scrub` after decoding it, successfully or not.
+
+Until formatting lands, the codecs exist and nothing reaches the phase:
+the service formats nothing device-bound, so it answers `0x09` and `0x0a`
+as busy while an installation runs and as no review otherwise, and its
+plans are unencrypted. td-setup ends a connection whose review is
+device-bound or whose status reports the phase or failure 6, and
+td-authd declines a device-bound review as unavailable, so no window or
+prompt shows storage until increment 7 activates the tier.
 
 ## Installation service core
 
@@ -827,7 +852,7 @@ live boot (td-authd/DESIGN.md "Whole-disk installation intake") as one end
 of a socketpair on the service's standard output, where the service opens
 it.
 
-Both ends first send and require `TDINA01\n`, which changes with any message
+Both ends first send and require `TDINA02\n`, which changes with any message
 or its bytes. Each message then travels in one frame: a big-endian u32
 length, nonzero and at most 1024, then that many payload bytes. A payload
 is a tag byte and its body, with trailing bytes refused. Every nonce is a
@@ -840,8 +865,9 @@ The service reports:
   nonzero capacity in bytes as a big-endian u64, its model then serial
   (each `0` for absent, or `1`, a big-endian u16 length and at most 256
   UTF-8 bytes, possibly none), the hostname (at most 63 bytes) and username
-  (at most 32), each nonempty UTF-8 behind a one-byte length, and the
-  32-byte deployment manifest digest. It is at most 720 bytes. These are
+  (at most 32), each nonempty UTF-8 behind a one-byte length, the
+  32-byte deployment manifest digest and the plan's storage byte (0
+  unencrypted, 1 device-bound). It is at most 721 bytes. These are
   the display facts of the held review, which asks for consent to it. The
   requester is not on the channel: td-authd knows whom it started the
   service for. td-authd escapes and narrows the facts for the prompt, and

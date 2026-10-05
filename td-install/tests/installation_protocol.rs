@@ -6,12 +6,13 @@
 )]
 
 use td_install::installation_plan::{
-    Candidates, Destination, DestinationObservation, Plan, Settings, Zones, MAX_CANDIDATES,
-    MAX_CANDIDATE_BYTES, MAX_ZONES,
+    Candidates, Destination, DestinationObservation, Plan, Settings, Storage, Zones,
+    MAX_CANDIDATES, MAX_CANDIDATE_BYTES, MAX_ZONES,
 };
 use td_install::installation_protocol::{
-    check_greeting, frame, payload_len, Abandon, Ending, Failure, Phase, Refusal, Reply, Request,
-    ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
+    check_greeting, frame, payload_len, scrub, Abandon, Ending, Failure, Phase, RecoveryDigits,
+    Refusal, Reply, Request, ReviewNonce, State, GREETING, MAX_REPLY_BYTES, MAX_REQUEST_BYTES,
+    RECOVERY_DIGITS,
 };
 
 // Independently specified: the destination and plan bytes of
@@ -45,16 +46,33 @@ fn uuid() -> [u8; 16] {
     ]
 }
 fn plan() -> Plan {
-    Plan::new([1; 32], destination(), [2; 32], uuid(), settings()).unwrap()
+    Plan::new(
+        [1; 32],
+        destination(),
+        [2; 32],
+        uuid(),
+        Storage::Unencrypted,
+        settings(),
+    )
+    .unwrap()
 }
 fn plan_bytes() -> Vec<u8> {
-    let mut bytes = b"TDPLAN01".to_vec();
+    let mut bytes = b"TDPLAN02".to_vec();
     bytes.extend([1; 32]);
     bytes.extend([2; 32]);
     bytes.extend(uuid());
-    bytes.extend(DESTINATION);
+    // The storage byte follows the destination's removable flag.
+    let (fixed, names) = DESTINATION.split_at(29);
+    bytes.extend(fixed);
+    bytes.push(0);
+    bytes.extend(names);
     bytes.extend(SETTINGS);
     bytes
+}
+/// Forty-eight digits: eight groups of five and a check digit.
+const KEY: &[u8; RECOVERY_DIGITS] = b"012345678901234567890123456789012345678901234567";
+fn digits() -> RecoveryDigits {
+    RecoveryDigits::new(KEY).unwrap()
 }
 fn nonce() -> ReviewNonce {
     ReviewNonce::new([7; 32]).unwrap()
@@ -76,6 +94,8 @@ fn requests() -> Vec<Request> {
         Request::Timezones,
         Request::End(Ending::Restart, nonce()),
         Request::End(Ending::PowerOff, nonce()),
+        Request::RecoveryKey(nonce()),
+        Request::ConfirmRecovery(nonce(), digits()),
     ]
 }
 
@@ -100,12 +120,13 @@ fn replies() -> Vec<Reply> {
     replies.extend(states().into_iter().map(Reply::Status));
     replies.extend(Refusal::ALL.iter().map(|&r| Reply::Refused(r)));
     replies.push(Reply::Timezones(zones()));
+    replies.push(Reply::RecoveryKey(nonce(), digits()));
     replies
 }
 
 #[test]
 fn wire_bytes_are_independently_specified() {
-    assert_eq!(GREETING, b"TDINS04\n");
+    assert_eq!(GREETING, b"TDINS05\n");
     let mut propose = vec![0x02];
     propose.extend(DESTINATION);
     propose.extend(SETTINGS);
@@ -117,7 +138,12 @@ fn wire_bytes_are_independently_specified() {
     restart.extend([7; 32]);
     let mut power_off = vec![0x08];
     power_off.extend([7; 32]);
-    let expected: [&[u8]; 8] = [
+    let mut recovery = vec![0x09];
+    recovery.extend([7; 32]);
+    let mut confirm = vec![0x0a];
+    confirm.extend([7; 32]);
+    confirm.extend(KEY);
+    let expected: [&[u8]; 10] = [
         &[0x01],
         &propose,
         &execute,
@@ -126,6 +152,8 @@ fn wire_bytes_are_independently_specified() {
         &[0x06],
         &restart,
         &power_off,
+        &recovery,
+        &confirm,
     ];
     for (request, bytes) in requests().iter().zip(expected) {
         assert_eq!(request.encode(), bytes, "{request:?}");
@@ -162,6 +190,10 @@ fn wire_bytes_are_independently_specified() {
             Reply::Status(State::Running(nonce(), Phase::VerifyingBoot)),
             status(3, Some(5)),
         ),
+        (
+            Reply::Status(State::Running(nonce(), Phase::RecoveryKey)),
+            status(3, Some(6)),
+        ),
         (Reply::Status(State::Complete(nonce())), status(4, None)),
         (
             Reply::Status(State::Failed(nonce(), Failure::DestinationChanged)),
@@ -170,6 +202,10 @@ fn wire_bytes_are_independently_specified() {
         (
             Reply::Status(State::Failed(nonce(), Failure::SettingsFailed)),
             status(5, Some(5)),
+        ),
+        (
+            Reply::Status(State::Failed(nonce(), Failure::RecoveryUnconfirmed)),
+            status(5, Some(6)),
         ),
         (
             Reply::Status(State::Abandoned(nonce(), Abandon::Withdrawn)),
@@ -191,6 +227,12 @@ fn wire_bytes_are_independently_specified() {
             vec![0x84, 14],
         ),
         (Reply::Refused(Refusal::PowerUnavailable), vec![0x84, 15]),
+        (Reply::Refused(Refusal::RecoveryKeySent), vec![0x84, 16]),
+        (Reply::Refused(Refusal::RecoveryKeyMismatch), vec![0x84, 17]),
+        (
+            Reply::RecoveryKey(nonce(), digits()),
+            [&[0x86], &[7; 32][..], KEY].concat(),
+        ),
         (
             Reply::Timezones(zones()),
             b"\x85TDZONE01\0\x02\0\x13America/Los_Angeles\0\x07Etc/UTC".to_vec(),
@@ -218,7 +260,7 @@ fn every_message_round_trips_and_codes_are_dense() {
     let expect = |count: u8| (1..=count).collect::<Vec<_>>();
     assert_eq!(
         codes(Refusal::ALL.iter().map(|&r| Reply::Refused(r)).collect()),
-        expect(15)
+        expect(17)
     );
     let status = |state| Reply::Status(state);
     assert_eq!(
@@ -228,7 +270,7 @@ fn every_message_round_trips_and_codes_are_dense() {
                 .map(|&p| status(State::Running(nonce(), p)))
                 .collect()
         ),
-        expect(5)
+        expect(6)
     );
     assert_eq!(
         codes(
@@ -237,7 +279,7 @@ fn every_message_round_trips_and_codes_are_dense() {
                 .map(|&f| status(State::Failed(nonce(), f)))
                 .collect()
         ),
-        expect(5)
+        expect(6)
     );
     assert_eq!(
         codes(
@@ -297,18 +339,75 @@ fn maximal_messages_fit_their_direction_bounds() {
         destination: maximal(0),
         settings: settings.clone(),
     };
+    // Propose carries no storage byte: the service chooses storage.
     assert_eq!(propose.encode().len(), 1104);
     assert_eq!(Request::decode(&propose.encode()).unwrap(), propose);
-    let plan = Plan::new([255; 32], maximal(0), [0; 32], uuid(), settings).unwrap();
+    let plan = Plan::new(
+        [255; 32],
+        maximal(0),
+        [0; 32],
+        uuid(),
+        Storage::Unencrypted,
+        settings,
+    )
+    .unwrap();
     let execute = Request::Execute(plan.clone());
-    assert_eq!(execute.encode().len(), 1192);
+    assert_eq!(execute.encode().len(), 1193);
     assert!(execute.encode().len() <= MAX_REQUEST_BYTES);
     assert_eq!(Request::decode(&execute.encode()).unwrap(), execute);
     let reviewed = Reply::Reviewed(Box::new(plan));
-    assert_eq!(reviewed.encode().len(), 1192);
+    assert_eq!(reviewed.encode().len(), 1193);
     assert_eq!(Reply::decode(&reviewed.encode()).unwrap(), reviewed);
     let status = Reply::Status(State::Running(nonce(), Phase::VerifyingBoot));
     assert_eq!(status.encode().len(), 35);
+    let key = Reply::RecoveryKey(nonce(), digits());
+    assert_eq!(key.encode().len(), 1 + 32 + 48);
+    let confirm = Request::ConfirmRecovery(nonce(), digits());
+    assert_eq!(confirm.encode().len(), 1 + 32 + 48);
+}
+
+#[test]
+fn recovery_digits_are_exactly_48_ascii_digits_and_never_printed() {
+    assert_eq!(digits().as_bytes(), KEY);
+    for bad in [
+        &KEY[..47],
+        &[KEY.as_slice(), b"0"].concat(),
+        b"01234567890123456789012345678901234567890123456a",
+        b"01234-678901234567890123456789012345678901234567",
+        b"0123 5678901234567890123456789012345678901234567",
+    ] {
+        assert_eq!(
+            RecoveryDigits::new(bad).unwrap_err(),
+            "installation recovery key is not 48 digits"
+        );
+    }
+    // A message carrying digits other than ASCII decimals refuses.
+    let mut reply = Reply::RecoveryKey(nonce(), digits()).encode();
+    *reply.last_mut().unwrap() = b'-';
+    assert!(Reply::decode(&reply).is_err());
+    let mut confirm = Request::ConfirmRecovery(nonce(), digits()).encode();
+    confirm[40] = b' ';
+    assert!(Request::decode(&confirm).is_err());
+    for printed in [
+        format!("{:?}", digits()),
+        format!("{:?}", Reply::RecoveryKey(nonce(), digits())),
+        format!("{:?}", Request::ConfirmRecovery(nonce(), digits())),
+    ] {
+        assert!(!printed.contains("0123"), "{printed}");
+    }
+}
+
+#[test]
+fn recovery_digits_compare_every_byte_and_payloads_scrub() {
+    assert_eq!(digits(), digits());
+    for index in [0, 23, 47] {
+        let mut other = *KEY;
+        other[index] = if other[index] == b'9' { b'0' } else { b'9' };
+        assert_ne!(RecoveryDigits::new(&other).unwrap(), digits());
+    }
+    let mut payload = Request::ConfirmRecovery(nonce(), digits()).encode();
+    scrub(&mut payload);
+    assert_eq!(payload, vec![0; 1 + 32 + 48]);
 }
 
 #[test]
@@ -356,8 +455,8 @@ fn every_truncation_and_extension_refuses() {
 #[test]
 fn unknown_tags_codes_and_zero_nonces_refuse() {
     for tag in 0..=255u8 {
-        let known_request = (0x01..=0x08).contains(&tag);
-        let known_reply = (0x81..=0x85).contains(&tag);
+        let known_request = (0x01..=0x0a).contains(&tag);
+        let known_reply = (0x81..=0x86).contains(&tag);
         if !known_request {
             assert_eq!(
                 Request::decode(&[tag]).unwrap_err(),
@@ -390,7 +489,7 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
             "unknown installation state"
         );
     }
-    for (state, limit, what) in [(3, 5, "phase"), (5, 5, "failure"), (6, 5, "abandonment")] {
+    for (state, limit, what) in [(3, 6, "phase"), (5, 6, "failure"), (6, 5, "abandonment")] {
         for detail in (0..=255).filter(|d| *d == 0 || *d > limit) {
             assert_eq!(
                 status(state, Some(detail)).unwrap_err(),
@@ -398,7 +497,7 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
             );
         }
     }
-    for code in (0..=255).filter(|c| *c == 0 || *c > 15) {
+    for code in (0..=255).filter(|c| *c == 0 || *c > 17) {
         assert_eq!(
             Reply::decode(&[0x84, code]).unwrap_err(),
             "unknown installation refusal"
@@ -412,11 +511,22 @@ fn unknown_tags_codes_and_zero_nonces_refuse() {
     zero_restart.extend([0; 32]);
     let mut zero_power_off = vec![0x08];
     zero_power_off.extend([0; 32]);
+    let mut zero_recovery = vec![0x09];
+    zero_recovery.extend([0; 32]);
+    let mut zero_confirm = vec![0x0a];
+    zero_confirm.extend([0; 32]);
+    zero_confirm.extend(KEY);
+    let mut zero_key = vec![0x86];
+    zero_key.extend([0; 32]);
+    zero_key.extend(KEY);
     for error in [
         Reply::decode(&zero_status).unwrap_err(),
         Request::decode(&zero_withdraw).unwrap_err(),
         Request::decode(&zero_restart).unwrap_err(),
         Request::decode(&zero_power_off).unwrap_err(),
+        Request::decode(&zero_recovery).unwrap_err(),
+        Request::decode(&zero_confirm).unwrap_err(),
+        Reply::decode(&zero_key).unwrap_err(),
     ] {
         assert_eq!(error, "installation review nonce cannot be zero");
     }
@@ -435,18 +545,25 @@ fn directions_are_disjoint() {
 
 #[test]
 fn only_this_version_is_admitted() {
-    assert!(check_greeting(b"TDINS04\n").is_ok());
-    for other in [b"TDINS03\n", b"TDAT001\n", b"TDUPD01\n", b"TDINS04\0"] {
+    assert!(check_greeting(b"TDINS05\n").is_ok());
+    for other in [
+        b"TDINS04\n",
+        b"TDINS03\n",
+        b"TDINS02\n",
+        b"TDAT001\n",
+        b"TDUPD01\n",
+        b"TDINS05\0",
+    ] {
         assert_eq!(
             check_greeting(other).unwrap_err(),
             "unsupported installation protocol greeting"
         );
     }
     let mut execute = Request::Execute(plan()).encode();
-    execute[8] = b'2';
+    execute[8] = b'1';
     assert!(Request::decode(&execute).is_err());
     let mut reviewed = Reply::Reviewed(Box::new(plan())).encode();
-    reviewed[8] = b'2';
+    reviewed[8] = b'1';
     assert!(Reply::decode(&reviewed).is_err());
     let mut destinations = Reply::Destinations(Candidates::new(vec![]).unwrap()).encode();
     destinations[8] = b'2';
@@ -463,6 +580,7 @@ fn messages_are_canonical_under_every_single_byte_change() {
         (requests()[1].encode(), true),
         (requests()[2].encode(), true),
         (requests()[4].encode(), true),
+        (requests()[9].encode(), true),
         (status.encode(), false),
     ];
     for (bytes, request) in cases {
@@ -553,8 +671,15 @@ fn replies_pair_only_with_their_requests() {
         (_, Reply::Refused(_)) => true,
         (Request::Destinations, Reply::Destinations(_)) => true,
         (Request::Propose { .. }, Reply::Reviewed(_)) => true,
-        (Request::Execute(_) | Request::Withdraw(_) | Request::End(..), Reply::Status(_)) => true,
+        (
+            Request::Execute(_)
+            | Request::Withdraw(_)
+            | Request::End(..)
+            | Request::ConfirmRecovery(..),
+            Reply::Status(_),
+        ) => true,
         (Request::Timezones, Reply::Timezones(_)) => true,
+        (Request::RecoveryKey(_), Reply::RecoveryKey(..)) => true,
         _ => false,
     };
     for request in requests() {

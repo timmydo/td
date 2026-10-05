@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use td_install::installation_plan::{Destination, Plan, Settings};
+use td_install::installation_plan::{Destination, Plan, Settings, Storage};
 use td_install::installation_protocol::{
     self as protocol, Abandon, Failure, Phase, Refusal, Reply, Request, ReviewNonce, State,
 };
@@ -318,7 +318,9 @@ fn exchange(stream: &mut UnixStream, request: &Request) -> Result<Answer, String
     stream
         .read_exact(&mut payload)
         .map_err(|error| format!("installer service reply: {error}"))?;
-    let reply = Reply::decode(&payload)?;
+    let reply = Reply::decode(&payload);
+    protocol::scrub(&mut payload);
+    let reply = reply?;
     if !reply.answers(request) {
         return Err("installer service reply does not answer its request".into());
     }
@@ -350,6 +352,11 @@ fn exchange(stream: &mut UnixStream, request: &Request) -> Result<Answer, String
             if plan.destination() != destination || plan.settings() != settings {
                 return Err("installer service review does not match the proposal".into());
             }
+            // This window discloses unencrypted storage only; td-authd
+            // starts no device-bound service, so another is not its review.
+            if plan.storage() != Storage::Unencrypted {
+                return Err("installer service review is not unencrypted".into());
+            }
             Ok(Answer::Reviewed(plan))
         }
         (_, Reply::Destinations(candidates)) => {
@@ -367,18 +374,22 @@ fn exchange(stream: &mut UnixStream, request: &Request) -> Result<Answer, String
         (Request::Execute(_), Reply::Refused(Refusal::StaleReview)) => {
             Ok(Answer::Stale(refusal_text(Refusal::StaleReview)))
         }
-        (_, Reply::Status(state)) => Ok(Answer::Standing(standing(state))),
+        (_, Reply::Status(state)) => standing(state).map(Answer::Standing),
         (_, Reply::Refused(refusal)) => Ok(Answer::Refused(refusal_text(refusal))),
-        // Only propose is answered with a review, and it is matched above.
-        (_, Reply::Reviewed(_)) => {
+        // Only propose is answered with a review, and it is matched above;
+        // this installer never asks for a recovery key.
+        (_, Reply::Reviewed(_) | Reply::RecoveryKey(..)) => {
             Err("installer service reply is not one this installer reads".into())
         }
     }
 }
 
-fn standing(state: State) -> Standing {
+/// The recovery-key phase and its failure are a device-bound
+/// installation's, which this installer never reviews, so either ends the
+/// connection.
+fn standing(state: State) -> Result<Standing, String> {
     let Some(nonce) = state.review() else {
-        return Standing::Idle;
+        return Ok(Standing::Idle);
     };
     let stage = match state {
         State::Idle | State::Reviewed(_) => Stage::Reviewed,
@@ -389,6 +400,7 @@ fn standing(state: State) -> Standing {
             Phase::PublishingDeployment => outcome::Phase::PublishingDeployment,
             Phase::ApplyingSettings => outcome::Phase::ApplyingSettings,
             Phase::VerifyingBoot => outcome::Phase::VerifyingBoot,
+            Phase::RecoveryKey => return Err(DEVICE_BOUND.into()),
         }),
         State::Complete(_) => Stage::Complete,
         State::Failed(_, failure) => Stage::Failed(match failure {
@@ -397,14 +409,17 @@ fn standing(state: State) -> Standing {
             Failure::WriteFailed => outcome::Failure::WriteFailed,
             Failure::VerificationFailed => outcome::Failure::VerificationFailed,
             Failure::SettingsFailed => outcome::Failure::SettingsFailed,
+            Failure::RecoveryUnconfirmed => return Err(DEVICE_BOUND.into()),
         }),
         State::Abandoned(_, abandon) => Stage::Abandoned(abandon_text(abandon)),
     };
-    Standing::Review {
+    Ok(Standing::Review {
         nonce: *nonce.as_bytes(),
         stage,
-    }
+    })
 }
+
+const DEVICE_BOUND: &str = "the installer service reports a device-bound installation";
 
 /// Plain text for each way a review ends before any write.
 fn abandon_text(abandon: Abandon) -> &'static str {
@@ -435,6 +450,8 @@ fn refusal_text(refusal: Refusal) -> &'static str {
         Refusal::ConsentUnavailable => "trusted consent is unavailable",
         Refusal::TimezonesUnavailable => "the time zones could not be read",
         Refusal::PowerUnavailable => "the computer could not be restarted or powered off",
+        Refusal::RecoveryKeySent => "the recovery key was already shown",
+        Refusal::RecoveryKeyMismatch => "the recovery key does not match",
     }
 }
 
@@ -480,6 +497,7 @@ pub(crate) mod tests {
             destination.clone(),
             [9; 32],
             uuid,
+            Storage::Unencrypted,
             settings.clone(),
         )
         .unwrap()
@@ -505,6 +523,9 @@ pub(crate) mod tests {
             ))),
             Request::Status => framed(&Reply::Status(State::Idle)),
             Request::End(_, nonce) => framed(&Reply::Status(State::Complete(*nonce))),
+            Request::RecoveryKey(_) | Request::ConfirmRecovery(..) => {
+                framed(&Reply::Refused(Refusal::NoReview))
+            }
         }
     }
 
@@ -812,6 +833,46 @@ pub(crate) mod tests {
         assert!(protocol::GREETING.starts_with(&received), "{received:?}");
     }
 
+    /// A device-bound review, its recovery-key phase or that phase's
+    /// failure is no review this installer shows: each ends the connection.
+    #[test]
+    fn device_bound_replies_end_the_connection() {
+        let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
+        let unencrypted = plan(&disk(), &settings);
+        let bound = Plan::new(
+            *unencrypted.nonce(),
+            disk(),
+            *unencrypted.deployment(),
+            *unencrypted.volume_uuid(),
+            Storage::DeviceBound,
+            settings.clone(),
+        )
+        .unwrap();
+        let socket = intake("bound-review", usize::MAX, move |request| match request {
+            Request::Propose { .. } => framed(&Reply::Reviewed(Box::new(bound.clone()))),
+            _ => listing(request),
+        });
+        let mut service = Service::connect(&socket).unwrap();
+        service.propose(disk(), settings.clone()).unwrap();
+        assert_eq!(
+            answer(&mut service).unwrap_err(),
+            "installer service review is not unencrypted"
+        );
+        let nonce = ReviewNonce::new(*unencrypted.nonce()).unwrap();
+        for state in [
+            State::Running(nonce, Phase::RecoveryKey),
+            State::Failed(nonce, Failure::RecoveryUnconfirmed),
+        ] {
+            let socket = intake("bound-status", usize::MAX, move |request| match request {
+                Request::Status => framed(&Reply::Status(state)),
+                _ => listing(request),
+            });
+            let mut service = Service::connect(&socket).unwrap();
+            service.status().unwrap();
+            assert_eq!(answer(&mut service).unwrap_err(), DEVICE_BOUND);
+        }
+    }
+
     #[test]
     fn execute_and_status_answer_the_service_state() {
         let settings = Settings::new("alice", "tdhost", "us", "Etc/UTC").unwrap();
@@ -871,10 +932,10 @@ pub(crate) mod tests {
         ] {
             assert_eq!(
                 standing(state),
-                Standing::Review {
+                Ok(Standing::Review {
                     nonce: [3; 32],
                     stage
-                }
+                })
             );
         }
         let texts: std::collections::BTreeSet<_> = Abandon::ALL
