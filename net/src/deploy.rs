@@ -111,15 +111,11 @@ fn refuse_signing_over_the_manifest(manifest: &Path, out: &Path) -> Result<(), S
     Ok(())
 }
 
-/// Write through a temporary and rename, so a crash leaves either the old
-/// signature or the new one and never a truncated file that reads as neither.
+/// Write whole and durably (`td_fs::replace`), so a crash leaves either the
+/// old signature or the new one and never a truncated file that reads as
+/// neither.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("sig.tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("rename {} -> {}: {e}", tmp.display(), path.display())
-    })
+    crate::td_fs_replace::replace(path, bytes, 0o666).map_err(|e| e.to_string())
 }
 
 // Matched as a SLICE rather than by `a.len()` plus `a[2]`: the crate-level

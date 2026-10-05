@@ -275,8 +275,8 @@ impl SpamModel {
         }
     }
 
-    /// Persist the model atomically (write to a temp file, then rename) so a
-    /// crash mid-write cannot corrupt the trained store.
+    /// Persist the model whole and durably (`td_fs::replace`), so a crash
+    /// mid-write cannot corrupt the trained store.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -284,10 +284,7 @@ impl SpamModel {
         }
         // Writing a value cannot fail, so there is no serialize error here.
         let bytes = self.to_json().to_vec();
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("write {:?}: {}", tmp, e))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename into {:?}: {}", path, e))?;
-        Ok(())
+        td_fs::replace(path, &bytes, 0o666).map_err(|e| format!("save spam model: {e}"))
     }
 }
 

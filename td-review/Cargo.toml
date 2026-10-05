@@ -24,10 +24,12 @@ gate-test-args = "--bins"
 name = "td-review"
 path = "src/main.rs"
 
-# The toolkit the window draws with, by the one sibling-dependency spelling
-# the lock guard admits (AGENTS.md 'Rust code'): the lock lists this crate
-# and td-ui and nothing else.
+# The toolkit the window draws with, and td-fs, whose atomic replace saves
+# the repository list, by the one sibling-dependency spelling the lock guard
+# admits (AGENTS.md 'Rust code'): the lock lists this crate, td-fs and td-ui
+# and nothing else.
 [dependencies]
+td-fs = { path = "../td-fs" }
 td-ui = { path = "../td-ui" }
 
 [lints.rust]

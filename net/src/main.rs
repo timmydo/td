@@ -57,6 +57,10 @@ mod protocol;
 #[allow(dead_code)]
 #[path = "../../td-fs/src/real_file.rs"]
 mod td_fs;
+// td-fs's durable atomic replace, which the feed, the substituter and the
+// signer write their files through.
+#[path = "../../td-fs/src/replace.rs"]
+mod td_fs_replace;
 
 // The TARGET-side verifier, compiled into the test build only. td signs here
 // with `ring` and verifies on the target with the engine's dependency-free

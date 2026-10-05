@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "td-fs"
+version = "0.1.0"
+
+[[package]]
 name = "td-review"
 version = "0.1.0"
 dependencies = [
+ "td-fs",
  "td-ui",
 ]
 

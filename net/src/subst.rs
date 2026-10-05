@@ -134,11 +134,7 @@ fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let mut t = dst.as_os_str().to_os_string();
-    t.push(format!(".{}.td-subst-tmp", std::process::id()));
-    let tmp = PathBuf::from(t);
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, dst).map_err(|e| format!("rename {}: {e}", dst.display()))
+    crate::td_fs_replace::replace(dst, bytes, 0o666).map_err(|e| format!("write {e}"))
 }
 
 // ---- HTTP (mirror of td-feed) ----

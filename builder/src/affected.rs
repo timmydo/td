@@ -1187,6 +1187,9 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
     // assertions below.
     if p == "td-boot/src/protocol.rs" || (p.starts_with("td-fs/") && !p.contains("..")) {
         sel.add_preflight("cargo-test");
+        // td-net's own suite: its feed, substituter and signer write through
+        // td-fs's replace, and the chain targets only compile it.
+        sel.add_preflight("net-test");
         // Both are `#[path]`-included by td-net, and `td-boot/` and `td-fs/`
         // are staged into td-net's seed, but that identity is re-derived LIVE
         // from the checkout (re #469 local-source-roster split) — no
@@ -3092,6 +3095,9 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "bootstrap-x86_64-self-gcc-store-native"
     );
     assert_preflight!("td-fs/src/real_file.rs", "cargo-test");
+    assert_preflight!("td-fs/src/real_file.rs", "net-test");
+    assert_preflight!("td-fs/src/replace.rs", "net-test");
+    assert_preflight!("td-boot/src/protocol.rs", "net-test");
     // The crate root is in td-net's staged tree too, so it routes the same.
     assert_target!("td-fs/src/lib.rs", "check");
     assert_target!(

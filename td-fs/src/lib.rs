@@ -4,8 +4,9 @@
 //! the crate. A crate a recipe compiles with a direct rustc includes by
 //! `#[path]` only the file of the helper it uses, so a helper it does not
 //! use, and that helper's file-system calls, never reach it: td-boot,
-//! td-install, td-net and the recipe library include `real_file.rs` alone,
-//! and td-update and td-vm-guest `private_dir.rs` alone.
+//! td-install and the recipe library include `real_file.rs` alone, td-net
+//! `real_file.rs` and `replace.rs`, and td-update and td-vm-guest
+//! `private_dir.rs` alone.
 
 mod private_dir;
 mod real_file;

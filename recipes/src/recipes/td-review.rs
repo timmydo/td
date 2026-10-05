@@ -7,7 +7,7 @@ use crate::types::Recipe;
 pub fn recipe() -> Recipe {
     Recipe::rust("td-review", "0.1.0")
         .local_source("td-review")
-        .local_source_trees(&["td-ui", "td-compositor"])
+        .local_source_trees(&["td-fs", "td-ui", "td-compositor"])
         .native_inputs(&[
             "rust-toolchain",
             "gcc-x86-64-self",
@@ -31,7 +31,7 @@ mod tests {
         assert_eq!(r.local_source.as_deref(), Some("td-review"));
         assert_eq!(
             r.local_source_trees,
-            Some(vec!["td-ui".into(), "td-compositor".into()])
+            Some(vec!["td-fs".into(), "td-ui".into(), "td-compositor".into()])
         );
         assert_eq!(r.cargo_subdir.as_deref(), Some("td-review"));
         assert_eq!(r.cargo_lock.as_deref(), Some("td-review/Cargo.lock"));

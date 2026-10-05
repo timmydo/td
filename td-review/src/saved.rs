@@ -9,7 +9,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 /// The most paths kept; recording one more drops the oldest.
@@ -99,9 +99,9 @@ fn folder(file: &Path) -> io::Result<&Path> {
     Ok(dir)
 }
 
-/// Writes `saved` to `file` whole, through a sibling synced and renamed
-/// over it, so a reader never sees half a list. A link is written through,
-/// to the file it names, so a list kept elsewhere stays linked.
+/// Writes `saved` to `file` whole and durably (`td_fs::replace`), so a
+/// reader never sees half a list. A link is written through, to the file
+/// it names, so a list kept elsewhere stays linked.
 pub fn store(file: &Path, saved: &[PathBuf]) -> io::Result<()> {
     let linked = fs::symlink_metadata(file).is_ok_and(|m| m.file_type().is_symlink());
     let target = if linked {
@@ -111,7 +111,6 @@ pub fn store(file: &Path, saved: &[PathBuf]) -> io::Result<()> {
         file.to_path_buf()
     };
     let file = target.as_path();
-    let dir = folder(file)?;
     let mut text = String::from(HEADER);
     for path in saved.iter().filter(|p| keepable(p)).take(MAX_SAVED) {
         if let Some(s) = path.to_str() {
@@ -119,17 +118,8 @@ pub fn store(file: &Path, saved: &[PathBuf]) -> io::Result<()> {
             text.push('\n');
         }
     }
-    let staged = dir.join(format!(".repositories.{}", std::process::id()));
-    let written = fs::File::create(&staged)
-        .and_then(|mut out| {
-            out.write_all(text.as_bytes())?;
-            out.sync_all()
-        })
-        .and_then(|()| fs::rename(&staged, file));
-    if written.is_err() {
-        let _ = fs::remove_file(&staged);
-    }
-    written
+    folder(file)?;
+    td_fs::replace(file, text.as_bytes(), 0o666)
 }
 
 /// `saved` with `repo` moved to the front.

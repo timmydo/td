@@ -376,14 +376,10 @@ fn read_digest_sidecar(path: &Path) -> io::Result<String> {
     })
 }
 
-/// Write `bytes` to `dst` atomically (pid-unique temp + rename), so a concurrent serve /
-/// another warming agent never sees a partial file.
+/// Write `bytes` to `dst` whole and durably (`td_fs::replace`), so a
+/// concurrent serve or another warming agent never sees a partial file.
 fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut t = dst.as_os_str().to_os_string();
-    t.push(format!(".{}.td-feed-tmp", std::process::id()));
-    let tmp = PathBuf::from(t);
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, dst).map_err(|e| format!("rename {}: {e}", dst.display()))
+    crate::td_fs_replace::replace(dst, bytes, 0o666).map_err(|e| format!("write {e}"))
 }
 
 /// GET `url` (http/https), returning the body or an error string. Carries the shared
