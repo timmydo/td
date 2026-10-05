@@ -533,7 +533,7 @@ pub fn configure(root: &Path, input: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     #[ignore = "subprocess fixture, invoked by bounded_capture"]
@@ -541,11 +541,15 @@ mod tests {
         let Ok(mode) = std::env::var("TD_VM_PROFILE_CHILD") else {
             return;
         };
-        fs::write(
-            std::env::var("TD_VM_PROFILE_PID").unwrap(),
-            std::process::id().to_string(),
-        )
-        .unwrap();
+        // The pid and start time from one /proc read, so the record names
+        // the process as the test's /proc lookup sees it; renamed into
+        // place, so a child killed mid-write leaves no partial record.
+        let stat = fs::read_to_string("/proc/self/stat").unwrap();
+        let pid = stat.split_whitespace().next().unwrap();
+        let record = std::env::var("TD_VM_PROFILE_PID").unwrap();
+        let staged = format!("{record}.tmp");
+        fs::write(&staged, format!("{pid} {}", start_time(&stat).unwrap())).unwrap();
+        fs::rename(&staged, &record).unwrap();
         match mode.as_str() {
             "ok" => {
                 std::io::stdout().write_all(b"profile-ok").unwrap();
@@ -565,6 +569,22 @@ mod tests {
             _ => thread::sleep(Duration::from_secs(60)),
         }
     }
+    /// The start time in a `/proc/PID/stat` line: field 22, counted after
+    /// the parenthesised command, which may itself hold spaces.
+    fn start_time(stat: &str) -> Option<&str> {
+        stat.rsplit_once(')')?.1.split_whitespace().nth(19)
+    }
+
+    /// Whether the process `profile_child` recorded (`PID STARTTIME`) is
+    /// still there, a zombie included. The start time is what names it:
+    /// the pid alone may have been reused.
+    pub(crate) fn still_running(record: &str) -> bool {
+        let (pid, started) = record.split_once(' ').unwrap();
+        fs::read_to_string(Path::new("/proc").join(pid).join("stat"))
+            .ok()
+            .is_some_and(|stat| start_time(&stat) == Some(started))
+    }
+
     #[test]
     #[ignore = "host process fixture"]
     fn bounded_capture_covers_connection_output_exit_and_reaps_the_client() {
@@ -572,31 +592,41 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
         for mode in ["ok", "large", "sleep", "backlog"] {
-            let mut command = Command::new(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "--exact",
-                    "vm_git_profile::tests::profile_child",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("TD_VM_PROFILE_CHILD", mode)
-                .env("TD_VM_PROFILE_PID", root.join("pid"))
-                .env("TD_VM_PROFILE_SOCKET", root.join("socket"));
-            let start = Instant::now();
-            let result = capture_until(command, Stdio::null(), Duration::from_millis(500));
-            assert_eq!(result.is_ok(), mode == "ok", "{mode}: {result:?}");
-            if mode == "ok" {
-                assert!(String::from_utf8(result.unwrap())
-                    .unwrap()
-                    .contains("profile-ok"));
-            }
-            assert!(start.elapsed() < Duration::from_secs(3));
-            let pid = fs::read_to_string(root.join("pid")).unwrap();
-            assert!(
-                !Path::new("/proc").join(pid).exists(),
-                "child must be reaped"
-            );
+            // A child a loaded host had not run far enough to write its
+            // record by the deadline was not in its mode, and the test has
+            // no name to check its reaping by: that attempt proves nothing,
+            // so the mode runs again.
+            let mut attempts = 0;
+            let record = loop {
+                attempts += 1;
+                assert!(attempts <= 20, "{mode}: the child never ran");
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "vm_git_profile::tests::profile_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("TD_VM_PROFILE_CHILD", mode)
+                    .env("TD_VM_PROFILE_PID", root.join("pid"))
+                    .env("TD_VM_PROFILE_SOCKET", root.join("socket"));
+                let _ = fs::remove_file(root.join("pid"));
+                let start = Instant::now();
+                let result = capture_until(command, Stdio::null(), Duration::from_millis(500));
+                let Ok(record) = fs::read_to_string(root.join("pid")) else {
+                    continue;
+                };
+                assert_eq!(result.is_ok(), mode == "ok", "{mode}: {result:?}");
+                if mode == "ok" {
+                    assert!(String::from_utf8(result.unwrap())
+                        .unwrap()
+                        .contains("profile-ok"));
+                }
+                assert!(start.elapsed() < Duration::from_secs(3));
+                break record;
+            };
+            assert!(!still_running(&record), "{mode}: child must be reaped");
         }
         drop(listener);
         fs::remove_dir_all(root).unwrap();

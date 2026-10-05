@@ -15994,7 +15994,15 @@ daemon build START (2/2 active)
     // the declared path it holds re-derives to the expected basename.
     #[test]
     fn verify_local_source_roster_basename_rejects_a_root_whose_roster_differs() {
-        let d = std::env::temp_dir().join(format!("td-roster-anchor-{}", std::process::id()));
+        // The pid alone is not unique: in a check's pid namespace it is a
+        // small number every concurrent run shares, over one /tmp.
+        let d = std::env::temp_dir().join(format!(
+            "td-roster-anchor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
         let _ = std::fs::remove_dir_all(&d);
         let real_root = seed_repo_root();
         let fake_root = d.join("root");

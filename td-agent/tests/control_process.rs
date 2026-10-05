@@ -25,7 +25,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+// Every wait polls and returns once its condition holds, so the bound costs
+// a passing run nothing; it is wide for a host loaded by parallel checks.
+const TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[path = "support/native_compositor.rs"]

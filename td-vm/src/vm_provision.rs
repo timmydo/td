@@ -289,12 +289,12 @@ mod tests {
         while !root.join("pid").exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let pid = fs::read_to_string(root.join("pid")).unwrap();
+        let record = fs::read_to_string(root.join("pid")).unwrap();
         assert!(File::open(root.join("lease")).unwrap().try_lock().is_err());
         drop(worker);
         assert!(finished.load(Ordering::Relaxed));
         assert!(Instant::now() < deadline);
-        assert!(!std::path::Path::new("/proc").join(pid).exists());
+        assert!(!crate::vm_git_profile::tests::still_running(&record));
         assert!(File::open(root.join("lease")).unwrap().try_lock().is_ok());
         drop(listener);
         fs::remove_dir_all(root).unwrap();
