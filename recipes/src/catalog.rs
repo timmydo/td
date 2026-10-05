@@ -506,6 +506,7 @@ mod tests {
                 "td-busd",
                 "td-civil",
                 "td-compositor",
+                "td-dua",
                 "td-editor",
                 "td-encoding",
                 "td-fetch-client",

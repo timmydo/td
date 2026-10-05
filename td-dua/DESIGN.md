@@ -14,9 +14,19 @@ Built: the crate, its scan, tree, list, treemap, delete list and window,
 with unit, filesystem, driven-state and confinement tests. It joins the
 gate by existing (`[package.metadata.td-gate]`, all-target Clippy).
 
-Not yet: a recipe, image integration and a launcher entry; a driven
-control socket; a native-compositor process case; a legend for the
-treemap's colours; cushion shading. Each is its own increment.
+Implemented artifact: `recipes/src/recipes/td-dua.rs` builds it with
+the source-built stage2 toolchain from the checkout's own trees, td-dua
+staged with td-civil, td-ui and td-compositor (td-ui's mounts and
+notices), as td-photo is; the binary is static, with its debug companion
+beside it. The image copies the whole output into the immutable root and
+links `/bin/td-dua` to it, run from the terminal. `td-dua-test` requires
+the binary, asserts its static shape and runs `--help` and
+`--font-license`. It does not run `--preview`, whose binary PPM would
+land in the build log that `build-run` reads back as UTF-8.
+
+Not yet: a launcher entry; a driven control socket; a native-compositor
+process case; a legend for the treemap's colours; cushion shading. Each
+is its own increment.
 
 ## Running
 

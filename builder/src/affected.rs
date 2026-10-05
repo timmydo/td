@@ -1600,6 +1600,15 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
+    // The disk usage analyzer the same way: td-dua-test runs the static
+    // binary's headless modes, a scanned preview frame among them.
+    if p.starts_with("td-dua/") && !p.contains("..") {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
+        return;
+    }
+
     // The notebook the same way: td-pass-test runs the static binary's
     // entry, and its window's cases run under the native harness.
     if p.starts_with("td-pass/") && !p.contains("..") {
@@ -3036,6 +3045,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-pass/src/app/mod.rs", "recipe-checks");
     assert_preflight!("td-pass/src/backend.rs", "cargo-test");
     assert_target!("td-pass/Cargo.lock", "recipe-checks");
+    // The disk usage analyzer as well: td-dua-test runs its headless modes.
+    assert_target!("td-dua/src/window.rs", "check");
+    assert_target!("td-dua/src/treemap.rs", "recipe-checks");
+    assert_preflight!("td-dua/src/scan.rs", "cargo-test");
+    assert_target!("td-dua/Cargo.lock", "recipe-checks");
     assert_target!("td-compositor/Cargo.lock", "recipe-checks");
     assert_no_target!("td-compositor/DESIGN.md", "check");
     assert_preflight!("start", "shell-syntax");

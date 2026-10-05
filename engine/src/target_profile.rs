@@ -99,6 +99,7 @@ pub const RUST_PROFILED_RECIPES: &[&str] = &[
     "td-busd",
     "td-cc",
     "td-compositor",
+    "td-dua",
     "td-editor",
     "td-firstboot",
     "td-init",

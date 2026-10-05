@@ -4447,6 +4447,16 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         target: "{in:td-pass}/bin/td-pass".into(),
         link: "{root}/real-root/bin/td-pass".into(),
     });
+    // td-dua, the disk usage analyzer, a static system-tree program run from
+    // the terminal (td-dua/DESIGN.md).
+    steps.push(Step::CopyTree {
+        from: "{in:td-dua}".into(),
+        dest: "{root}/real-root{in:td-dua}".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-dua}/bin/td-dua".into(),
+        link: "{root}/real-root/bin/td-dua".into(),
+    });
     // td-editor, the text editor, a static system-tree program run from the
     // terminal (td-editor/DESIGN.md).
     steps.push(Step::CopyTree {
@@ -5608,6 +5618,7 @@ pub fn recipe() -> Recipe {
             "td-photo",
             "td-editor",
             "td-pass",
+            "td-dua",
             "td-jail",
             "td-seatd",
             "td-vm-guest",
@@ -7429,6 +7440,7 @@ mod tests {
             ("td-photo", "td-photo"),
             ("td-editor", "td-editor"),
             ("td-pass", "td-pass"),
+            ("td-dua", "td-dua"),
         ] {
             assert!(steps.iter().any(|step| matches!(step,
                 Step::Symlink { link, target }
@@ -14443,10 +14455,10 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
     }
 
     #[test]
-    fn td_photo_td_editor_and_td_pass_are_packed_and_not_merely_symlinked() {
+    fn td_photo_td_editor_td_pass_and_td_dua_are_packed_and_not_merely_symlinked() {
         let steps = real_root_steps(&SYSTEM).unwrap();
         let native_inputs = recipe().native_inputs.expect("system native inputs");
-        for name in ["td-photo", "td-editor", "td-pass"] {
+        for name in ["td-photo", "td-editor", "td-pass", "td-dua"] {
             assert!(
                 steps.iter().any(|step| matches!(
                     step,
