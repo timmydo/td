@@ -592,14 +592,20 @@ pub(crate) mod tests {
         fs::create_dir(&root).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(root.join("socket")).unwrap();
         for mode in ["ok", "large", "sleep", "backlog"] {
-            // A child a loaded host had not run far enough to write its
-            // record by the deadline was not in its mode, and the test has
-            // no name to check its reaping by: that attempt proves nothing,
-            // so the mode runs again.
+            // An attempt a loaded host starved proves nothing, so the mode
+            // runs again: a child that wrote no record by the deadline was
+            // not in its mode, and the test has no name to check its reaping
+            // by; an "ok" or "large" child starved past the deadline after
+            // writing it reached neither mode's ending, though its reaping
+            // still counts.
             let mut attempts = 0;
+            let mut last = String::from("no attempt");
             let record = loop {
                 attempts += 1;
-                assert!(attempts <= 20, "{mode}: the child never ran");
+                assert!(
+                    attempts <= 20,
+                    "{mode}: no attempt reached its ending in time; the last: {last}"
+                );
                 let mut command = Command::new(std::env::current_exe().unwrap());
                 command
                     .args([
@@ -615,15 +621,26 @@ pub(crate) mod tests {
                 let start = Instant::now();
                 let result = capture_until(command, Stdio::null(), Duration::from_millis(500));
                 let Ok(record) = fs::read_to_string(root.join("pid")) else {
+                    last = format!("no record, {result:?}");
                     continue;
                 };
-                assert_eq!(result.is_ok(), mode == "ok", "{mode}: {result:?}");
-                if mode == "ok" {
-                    assert!(String::from_utf8(result.unwrap())
-                        .unwrap()
-                        .contains("profile-ok"));
-                }
                 assert!(start.elapsed() < Duration::from_secs(3));
+                let timed_out = matches!(&result, Err(e) if e.contains("timed out"));
+                if timed_out && matches!(mode, "ok" | "large") {
+                    assert!(!still_running(&record), "{mode}: child must be reaped");
+                    last = format!("{result:?}");
+                    continue;
+                }
+                match mode {
+                    "ok" => assert!(String::from_utf8(result.unwrap())
+                        .unwrap()
+                        .contains("profile-ok")),
+                    "large" => assert!(
+                        matches!(&result, Err(e) if e.contains("exceeds limit")),
+                        "{mode}: {result:?}"
+                    ),
+                    _ => assert!(timed_out, "{mode}: {result:?}"),
+                }
                 break record;
             };
             assert!(!still_running(&record), "{mode}: child must be reaped");

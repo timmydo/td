@@ -33,7 +33,9 @@ fn keyless() -> Down {
 }
 
 const PROGRAM: &str = env!("CARGO_BIN_EXE_td-agent");
-const TIMEOUT: Duration = Duration::from_secs(10);
+// Every wait polls and returns once its condition holds, so the bound costs
+// a passing run nothing; it is wide for a host loaded by parallel checks.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Scratch(PathBuf);
 impl Scratch {
