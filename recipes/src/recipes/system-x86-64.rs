@@ -979,7 +979,8 @@ const UUTILS_APPLETS: &[&str] = &[
     "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "id",
     "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head", "tail", "sort", "date",
     "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink", "basename",
-    "dirname", "true", "false", "printenv", "link", "unlink", "cut", "tr", "expr",
+    "dirname", "true", "false", "printenv", "link", "unlink", "cut", "tr", "expr", "tee", "uniq",
+    "install",
 ];
 
 enum UutilsProbe {
@@ -996,6 +997,9 @@ enum UutilsProbe {
     Printenv,
     Link,
     Unlink,
+    Tee,
+    Uniq,
+    Install,
 }
 
 const UUTILS_BEHAVIOR_PROBES: &[UutilsProbe] = &[
@@ -1017,6 +1021,9 @@ const UUTILS_BEHAVIOR_PROBES: &[UutilsProbe] = &[
     UutilsProbe::Printenv,
     UutilsProbe::Link,
     UutilsProbe::Unlink,
+    UutilsProbe::Tee,
+    UutilsProbe::Uniq,
+    UutilsProbe::Install,
 ];
 
 impl UutilsProbe {
@@ -1029,6 +1036,9 @@ impl UutilsProbe {
             Self::Printenv => "printenv",
             Self::Link => "link",
             Self::Unlink => "unlink",
+            Self::Tee => "tee",
+            Self::Uniq => "uniq",
+            Self::Install => "install",
         }
     }
 }
@@ -1103,6 +1113,32 @@ fn uutils_behavior_probe(probe: &UutilsProbe) -> String {
              {{ echo \"uutils: /bin/{applet} source contents mismatch: $o\"; u=0; }}; \
              else echo \"uutils: /bin/cat could not read source after unlink: $o\"; u=0; fi; \
              else echo \"uutils: /bin/{applet} failed\"; u=0; fi; fi; "
+        ),
+        UutilsProbe::Tee => format!(
+            "if /bin/printf \"%s\\n\" td | /bin/{applet} /tmp/td-uutils-probe/tee > /dev/null && \
+             /bin/printf \"%s\\n\" more | /bin/{applet} -a /tmp/td-uutils-probe/tee > /dev/null; then \
+             if o=$(/bin/tr -d \"\\n\" < /tmp/td-uutils-probe/tee 2>&1); then \
+             [ \"$o\" = tdmore ] || \
+             {{ echo \"uutils: /bin/{applet} wrote unexpected contents: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/tr could not read the tee output: $o\"; u=0; fi; \
+             else echo \"uutils: /bin/{applet} failed\"; u=0; fi; "
+        ),
+        UutilsProbe::Uniq => format!(
+            "if o=$(/bin/printf \"%s\\n\" a a b | /bin/{applet} | /bin/tr -d \"\\n\" 2>&1); then \
+             [ \"$o\" = ab ] || \
+             {{ echo \"uutils: /bin/{applet} returned unexpected output: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed: $o\"; u=0; fi; "
+        ),
+        UutilsProbe::Install => format!(
+            "if /bin/printf \"%s\\n\" td-install > /tmp/td-uutils-probe/install-src && \
+             /bin/{applet} -m 640 /tmp/td-uutils-probe/install-src /tmp/td-uutils-probe/install-dst; then \
+             o=$(/bin/cat /tmp/td-uutils-probe/install-dst 2>&1); \
+             [ \"$o\" = td-install ] || \
+             {{ echo \"uutils: /bin/{applet} installed unexpected contents: $o\"; u=0; }}; \
+             m=$(/bin/ls -l /tmp/td-uutils-probe/install-dst | /bin/cut -c1-10); \
+             [ \"$m\" = -rw-r----- ] || \
+             {{ echo \"uutils: /bin/{applet} -m 640 left mode $m\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed\"; u=0; fi; "
         ),
     }
 }
