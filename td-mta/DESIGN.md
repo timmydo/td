@@ -597,7 +597,10 @@ same authorized immutable entity. One live child owns the budgets at a time;
 no completed header metadata escapes before whole healthy label completion.
 Failure hides both Views without wiping provisional caller backing. Healthy
 fresh finish returns passive metadata and the original reusable owners.
-Traversal, location placement and response publication remain separate.
+M06dh adds source-bound location in a third exclusive phase. All retained
+metadata remains hidden until its boundary agrees with the earlier header
+view. Location refusal retires previous groups too; original scratch stays
+parked during that child. Traversal and response publication remain separate.
 
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident

@@ -1828,9 +1828,10 @@ words; retention buffers remain separate caller-reserved response storage.
 CID/language retention uses two such windows without increasing its existing
 1024-byte cursor ceiling or the composed part-header 6 KiB ceiling. The two
 windows add two inline refusal slots: the paired cursor grows from 352 to
-368 bytes on the 64-bit host. The composed cursor remains 5872 bytes
-(5896 including HeaderBudget), because its larger header owner dominates.
-Existing owner ceilings still compile. No growing storage, source-sized scratch or second parser/header arena is introduced.
+368 bytes on the 64-bit host. M06dh qualifies the current composed cursor,
+whose larger header owner still dominates. Existing owner ceilings still
+compile. No growing storage, source-sized scratch or second parser/header
+arena is introduced.
 
 A location turn performs fresh original admission and at most one JSON child
 poll; a completing poll freshly consumes/restores original owners in that
@@ -1999,29 +2000,54 @@ capacity/syntax/job refusal including a late language output cut, fresh final
 retirement and original-owner reuse. Input/backing allocation precedes each
 measured interval; native, worker-stack and RSS qualification remain separate.
 
-M06da's composed part-header label JSON cursor plus HeaderBudget
-measures 5896 bytes on the 64-bit host and has a compiled 6 KiB ceiling
-within the existing 16 KiB parser region. Header and label cursors are
-exclusive live owners; retention windows remain separate caller-owned
-backing. Each turn performs fresh original admission and at most one
-active child poll, then freshly consumes a completing child and hands
-back the same owners with no added parsing/output charge. The passive
-same-entity extent mapping reads no bytes. Delegated header/label turn
-ceilings remain unchanged; no new parser reservation, source grant or
-output grant follows. Whole metadata stays hidden until complete healthy
-composition, and later capacity, work or admission refusal hides earlier
-header results too. Exact resource-grant fixtures compare exact refusal
-contexts with standalone public children, require a retired owner and
-pin original grant exhaustion. Every prefix deadline cut checks
-original-owner retirement. A standalone header-plus-label prefix oracle
-compares all original job/header balances and completion after every
-composition turn; handoff adds no charge. Warm/measured Rust allocation
-intervals cover long selected labels, absent body-only labels,
-malformed-first selection, exact windows, label-capacity and job refusal
-including late language output exhaustion, fresh final retirement and
-consuming original-owner reuse. Source/backing allocation precedes each
-measured interval. Native allocator, worker-stack and RSS qualification
-remain separate.
+The composed part-header metadata cursor plus HeaderBudget retains its
+compiled 6 KiB ceiling within the existing 16 KiB parser region. Header,
+label and location cursors are exclusive live owners; retention windows
+remain separate caller-owned backing. Each turn performs fresh original
+admission and at most one active child poll, then freshly consumes a
+completing child and hands back the same owners with no added
+parsing/output charge. The passive same-entity extent mapping reads no
+bytes. Delegated header/label turn ceilings remain unchanged; no new
+parser reservation, source grant or output grant follows. Whole metadata
+stays hidden until complete healthy composition, and later capacity,
+work or admission refusal hides earlier header results too. Exact
+resource-grant fixtures compare exact refusal contexts with standalone
+public children, require a retired owner and pin original grant
+exhaustion. Every prefix deadline cut checks original-owner retirement.
+A standalone header-plus-label prefix oracle compares all original
+job/header balances and completion after every composition turn; handoff
+adds no charge. Warm/measured Rust allocation intervals cover long
+selected labels, absent body-only labels, malformed-first selection,
+exact windows, label-capacity and job refusal including late language
+output exhaustion, fresh final retirement and consuming original-owner
+reuse. Source/backing allocation precedes each measured interval. Native
+allocator, worker-stack and RSS qualification remain separate.
+
+M06dh extends that same composed cursor with retained location. The
+observed 64-bit host layout grows from 5872 to 6000 cursor bytes, plus
+the unchanged 24-byte HeaderBudget: 6024 bytes total, still within 6 KiB
+and the same 16 KiB parser region. These observed sizes are a host
+qualification snapshot; the compiled 6 KiB ceiling is the invariant.
+Location uses its separate reserved JSON window and the original
+immutable Entity; scratch is parked during that exclusive child. No
+positive charge, copying, renewed credit or second child poll is added
+by the handoff. Delegated child ceilings remain unchanged. Metadata and
+label discovery already scan the entity's headers separately; location
+discovery adds another whole header scan, followed by chosen-value
+replay. All repeated visits, steps, I/O and records spend the original
+per-email and job allowances. A previously fitting part can therefore
+now refuse; no aggregate budget is raised or renewed.
+
+Nine units qualify complete same-source metadata, exact three-child
+costs after every progress turn, all five resource cuts/exact grants,
+CID/language/location output capacities, first-empty/repair/absence,
+fresh prefix admission with phase error context, typed location nesting
+refusal without rescue and defensive boundary-correlation refusal.
+Warm/measured Rust intervals cover long literal and folded-word locations,
+1024 malformed needed occurrences, empty/repair/absence, late location
+capacity refusal, original triple-owner reuse and fresh complete-view
+retirement. Sources and all independent backings allocate before counting;
+native, RSS, worker and response reservations remain separate.
 
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future

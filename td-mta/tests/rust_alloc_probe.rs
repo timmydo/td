@@ -2168,6 +2168,210 @@ fn uri_word_runs() {
     assert_eq!(before, after, "URI encoded-word run allocated");
 }
 
+fn part_header_location_json() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        mime_label_fields::json as labels,
+        mime_location_field::retained,
+        mime_location_fields::json as location,
+        mime_metadata::Context,
+        mime_part_headers::{
+            self,
+            label_json::{Backing, Cursor, Error, Status},
+        },
+        nfc::{self, HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let prefix = "Content-Type: image/png\r\nContent-ID: <id@a>\r\nContent-Language: fr\r\n";
+    let literal = format!(
+        "{prefix}Content-Location: ../{}\r\n\r\nbody",
+        "a%2F/".repeat(8192)
+    );
+    let words = format!(
+        "{prefix}Content-Location: {}\r\n\r\nbody",
+        "=?utf-8?Q?e=CC=81?= \r\n ".repeat(1024)
+    );
+    let duplicates = format!(
+        "{prefix}{}Content-Location: ../ok\r\n\r\n",
+        "Content-Location: a%\r\n".repeat(1024)
+    );
+    let mut location_backing =
+        vec![0; retained::capacity_bound(literal.len().max(words.len())).unwrap()];
+    let mut heads = [0; 128];
+    let mut charset = [0; 32];
+    let mut filename = [0; 128];
+    let mut id = [0; 256];
+    let mut lang = [0; 256];
+    let mut next_heads = [0; 32];
+    let mut next_charset = [0; 32];
+    let mut next_filename = [0; 32];
+    let before = COUNTERS.snapshot();
+    let cases = [
+        (literal.as_bytes(), location_backing.len(), true, None),
+        (words.as_bytes(), location_backing.len(), true, None),
+        (duplicates.as_bytes(), location_backing.len(), true, None),
+        (
+            b"Content-ID: <id@a>\r\nContent-Language: fr\r\nContent-Location: \r\n\r\n".as_slice(),
+            location_backing.len(),
+            true,
+            None,
+        ),
+        (
+            concat!(
+                "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+                "Content-Location: =?utf-8?Q?=FF?=\r\n\r\n"
+            )
+            .as_bytes(),
+            location_backing.len(),
+            true,
+            None,
+        ),
+        (
+            b"Content-ID: <id@a>\r\nContent-Language: fr\r\nContent-Location: a%\r\n\r\n",
+            0,
+            false,
+            None,
+        ),
+        (
+            b"Content-ID: <id@a>\r\nContent-Language: fr\r\nContent-Location: ../ok\r\n\r\n",
+            3,
+            true,
+            Some(Error::Location(location::Error::Retention(
+                retained::Error::OutputCapacity,
+            ))),
+        ),
+    ];
+    for (source, capacity, wanted, fault) in cases {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100_000_000,
+                records: 2_000_000,
+                output_bytes: 1_000_000,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let original = (
+            std::ptr::from_ref(&work),
+            std::ptr::from_ref(&budget),
+            std::ptr::from_ref(&scratch),
+        );
+        let mut cursor = Cursor::new(
+            mime_part_headers::Entity {
+                source,
+                base: 37,
+                source_end: SourceEnd::Eof,
+                header_limit: 1_000_000,
+                context: Context::Normal,
+            },
+            Backing {
+                headers: mime_part_headers::Backing {
+                    heads: &mut heads,
+                    charset: &mut charset,
+                    filename: &mut filename,
+                },
+                labels: labels::Backing {
+                    content_id: &mut id,
+                    content_language: &mut lang,
+                },
+                content_location: location_backing.get_mut(..capacity).unwrap(),
+            },
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        let mut result = None;
+        for _ in 0..2_000_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Yield) => assert!(cursor.value().is_none()),
+                Ok(Status::Complete) => {
+                    result = Some(Ok(()));
+                    break;
+                }
+                Err(error) => {
+                    assert!(cursor.value().is_none());
+                    assert_eq!(cursor.poll(Tick(1)), Err(error));
+                    result = Some(Err(error));
+                    break;
+                }
+            }
+        }
+        assert_eq!(result, Some(fault.map_or(Ok(()), Err)));
+        if let Some(error) = fault {
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+        } else {
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            let (view, work, budget, scratch) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(view.labels.content_id, Some(b"\"id@a\"".as_slice()));
+            assert_eq!(view.labels.content_language, Some(b"[\"fr\"]".as_slice()));
+            assert_eq!(view.location.value.is_some(), wanted);
+            black_box(view.location.value);
+            assert_eq!(
+                view.location.selection.end.body_start,
+                view.headers.body_start
+            );
+            assert_eq!(
+                view.location.selection.end.header_bytes,
+                view.headers.header_bytes
+            );
+            assert_eq!(
+                (
+                    std::ptr::from_ref(&*work),
+                    std::ptr::from_ref(&*budget),
+                    std::ptr::from_ref(&*scratch)
+                ),
+                original
+            );
+            let mut next = Cursor::new(
+                mime_part_headers::Entity {
+                    source: b"\r\n",
+                    base: 0,
+                    source_end: SourceEnd::Eof,
+                    header_limit: 100,
+                    context: Context::Normal,
+                },
+                Backing {
+                    headers: mime_part_headers::Backing {
+                        heads: &mut next_heads,
+                        charset: &mut next_charset,
+                        filename: &mut next_filename,
+                    },
+                    labels: labels::Backing {
+                        content_id: &mut [],
+                        content_language: &mut [],
+                    },
+                    content_location: &mut [],
+                },
+                work,
+                budget,
+                scratch,
+            )
+            .unwrap();
+            let mut complete = false;
+            for _ in 0..10000 {
+                if next.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            let deadline = Error::Admission(nfc::Error::Work(Stop::Deadline));
+            assert_eq!(next.check_deadline(Tick(100)), Err(deadline));
+            assert!(next.value().is_none());
+            assert_eq!(next.finish(Tick(1)).err(), Some(deadline));
+        }
+    }
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "Rust allocation in part location JSON"
+    );
+}
+
 fn uri_location_source_bound() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -3932,6 +4136,7 @@ fn composed_part_label_json() {
                         content_id: id.get_mut(..id_cap).unwrap(),
                         content_language: lang.get_mut(..lang_cap).unwrap(),
                     },
+                    content_location: &mut [],
                 },
                 &mut work,
                 &mut budget,
@@ -11128,6 +11333,7 @@ fn main() {
         uri_location_json();
         uri_location_discovery();
         uri_location_source_bound();
+        part_header_location_json();
         uri_location_retention();
         uri_unfold_values();
         uri_reference_values();
@@ -11303,6 +11509,7 @@ fn main() {
     uri_location_json();
     uri_location_discovery();
     uri_location_source_bound();
+    part_header_location_json();
     uri_location_retention();
     uri_unfold_values();
     uri_reference_values();

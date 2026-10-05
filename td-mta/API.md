@@ -4627,6 +4627,7 @@ M06da adds mime_part_headers::label_json::Cursor. Its Entity is the same
 complete authorized immutable entity and absolute base as the existing
 part-header cursor. Backing supplies the existing independent heads,
 charset and filename windows plus separate CID/language JSON windows.
+M06dh also requires its distinct content_location JSON window.
 The existing header owner first selects metadata and first-valid label
 fields, then hands its original Meter, HeaderBudget and Scratch to the
 exclusive label phase. Selected extents are checked against the
@@ -4636,29 +4637,32 @@ authorization. Body bytes cannot supply a selected header; no blob or
 response authority follows.
 
 value() returns no metadata before whole healthy composition completes.
-Its passive View pairs the existing header View with the complete
-retained label pair, including final CID diagnostics. Missing labels
-remain absent; this layer does not serialize null. All original
+Its passive View combines the existing header View, complete retained
+label pair including final CID diagnostics, and M06dh's source-bound
+location fragment/selection. Missing labels remain absent; this layer
+does not serialize null. All original
 selection, normalization, syntax, capacity and resource rules remain
 delegated to the existing children. Any child or mapping refusal retires
-the entire composition and hides both Views, including already completed
-header metadata. Provisional caller backing is not wiped and must not be
+the entire composition and hides all three groups, including already
+completed metadata. Provisional caller backing is not wiped and must not be
 published after refusal.
 
 poll(now) invokes at most one active child poll; a completing child is
 freshly consumed in that turn and the same original owners are handed to
 the next phase or restored. Those handoffs add no parsing/output charge
-and never renew prepaid credit. Header and label cursors never coexist
-as live owners. Errors retain Headers or Labels context during either
-child and its consuming handoff. Fresh admission after healthy
-completion uses Admission; invalid extent/state uses InvalidState.
+and never renew prepaid credit. Header, label and location cursors never
+coexist as live owners. Errors retain Headers, Labels or Location context
+during the active child and its consuming handoff. Fresh admission after
+healthy completion uses Admission; invalid extent/state uses InvalidState.
 Cached healthy Complete is inert. Fresh check_deadline and consuming
 finish(now) admit the original owners even after Complete and before a
 premature-state refusal. Healthy complete finish returns View with the
 pointer-identical original Meter, HeaderBudget and Scratch, reusable for
 subsequent interpretation. Cursor is neither Copy nor Clone. Before
 parsing, reserve windows using the existing head/filename bounds and
-selected-label JSON bounds with an admitted upper bound on recognized
+selected-label JSON bounds plus the checked
+mime_location_field::retained::capacity_bound(N) for its independent
+Content-Location window, with an admitted upper bound on recognized
 header bytes as N. Each selected raw field value fits within that bound;
 its exact length is not needed to reserve backing. No window grows here.
 Traversal, location placement, source authorization and response
@@ -4857,6 +4861,29 @@ owners and a borrowed fragment in caller-reserved backing. The cursor is
 neither Copy nor Clone. The view remains provisional through enclosing
 publication; URI resolution, label matching and response/null policy stay
 external.
+
+### 1.113 Complete part metadata with retained location
+
+M06dh atomically extends mime_part_headers::label_json::Backing/View and
+all callers with content_location reserved backing and location retained
+metadata. Preserve the original complete Entity through the existing
+header and CID/language phases, then bind M06dg's location discovery and
+retention to that same entity, base, source-ending and header limit.
+Scratch stays parked exclusively during location processing. Correlate
+location's complete raw body_start/header_bytes with the earlier header
+view before making all three metadata groups visible together.
+
+First-valid location presence, first empty values, repair and whole-word
+versus literal form remain delegated to the existing location child.
+Location capacity, nesting, work or admission refusal hides completed
+headers and the CID/language pair too. No source can be replaced between
+phases, and no constructor/handoff charge or allowance renewal is added.
+Every live turn freshly admits and polls at most one exclusive child;
+whole completion is provisional through fresh consuming finish and
+publication. Finish returns original Meter/HeaderBudget/Scratch and a
+passive combined View. Caller-reserved bytes remain provisional on
+refusal; this layer supplies no null serialization, URI resolution or
+MIME traversal/response authority.
 
 ## 2. Read views and change history
 

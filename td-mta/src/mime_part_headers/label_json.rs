@@ -1,35 +1,40 @@
-//! Complete part headers and selected label JSON under the original owners.
+//! Complete part headers, labels and location under the original owners.
 use crate::{
     admission::work::Meter,
     mime_headers::Field,
     mime_label_fields::json as labels,
+    mime_location_fields::{self, json as location},
     nfc::{self, HeaderBudget, Scratch},
     ports::Tick,
 };
-/// Independent caller-reserved header and selected-label JSON windows.
+/// Independent caller-reserved header, label and location JSON windows.
 pub struct Backing<'w> {
     pub headers: super::Backing<'w>,
     pub labels: labels::Backing<'w>,
+    pub content_location: &'w mut [u8],
 }
 /// Passive complete metadata; source/blob/response authority remains external.
 pub struct View<'w> {
     pub headers: super::View<'w>,
     pub labels: labels::Retained<'w>,
+    pub location: location::Retained<'w>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Headers(super::Error),
     Labels(labels::Error),
+    Location(location::Error),
     Admission(nfc::Error),
     InvalidState,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Headers(error) => write!(f, "part label headers: {error}"),
-            Self::Labels(error) => write!(f, "part label JSON: {error}"),
-            Self::Admission(error) => write!(f, "part label admission: {error}"),
-            Self::InvalidState => f.write_str("invalid part label JSON state"),
+            Self::Headers(error) => write!(f, "part metadata headers: {error}"),
+            Self::Labels(error) => write!(f, "part metadata labels: {error}"),
+            Self::Location(error) => write!(f, "part location JSON: {error}"),
+            Self::Admission(error) => write!(f, "part metadata admission: {error}"),
+            Self::InvalidState => f.write_str("invalid part metadata JSON state"),
         }
     }
 }
@@ -38,17 +43,19 @@ impl std::error::Error for Error {
         match self {
             Self::Headers(error) => Some(error),
             Self::Labels(error) => Some(error),
+            Self::Location(error) => Some(error),
             Self::Admission(error) => Some(error),
             Self::InvalidState => None,
         }
     }
 }
 pub use super::Status;
-// Header and label cursors never coexist as live owners.
+// Header, label and location cursors never coexist as live owners.
 #[allow(clippy::large_enum_variant)]
 enum Owner<'a, 'w> {
-    Headers(super::Cursor<'a, 'w>, labels::Backing<'w>),
-    Labels(labels::Cursor<'a, 'w>, &'w mut Scratch),
+    Headers(super::Cursor<'a, 'w>, labels::Backing<'w>, &'w mut [u8]),
+    Labels(labels::Cursor<'a, 'w>, &'w mut Scratch, &'w mut [u8]),
+    Location(location::Cursor<'a, 'w>, &'w mut Scratch),
     Budgets(&'w mut Meter, &'w mut HeaderBudget, &'w mut Scratch),
     Retired,
 }
@@ -62,11 +69,11 @@ enum Owner<'a, 'w> {
 /// fn cloned<T: Clone>() {} cloned::<td_mta::mime_part_headers::label_json::Cursor<'_, '_>>();
 /// ```
 pub struct Cursor<'a, 'w> {
-    source: &'a [u8],
-    base: u64,
+    entity: super::Entity<'a>,
     owner: Owner<'a, 'w>,
     headers: Option<super::View<'w>>,
     labels: Option<labels::Retained<'w>>,
+    location: Option<location::Retained<'w>>,
     failure: Option<Error>,
 }
 impl<'a, 'w> Cursor<'a, 'w> {
@@ -77,16 +84,14 @@ impl<'a, 'w> Cursor<'a, 'w> {
         budget: &'w mut HeaderBudget,
         scratch: &'w mut Scratch,
     ) -> Result<Self, Error> {
-        let source = entity.source;
-        let base = entity.base;
         let headers = super::Cursor::new(entity, backing.headers, work, budget, scratch)
             .map_err(Error::Headers)?;
         Ok(Self {
-            source,
-            base,
-            owner: Owner::Headers(headers, backing.labels),
+            entity,
+            owner: Owner::Headers(headers, backing.labels, backing.content_location),
             headers: None,
             labels: None,
+            location: None,
             failure: None,
         })
     }
@@ -94,6 +99,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
         self.failure.is_none()
             && self.headers.is_some()
             && self.labels.is_some()
+            && self.location.is_some()
             && matches!(self.owner, Owner::Budgets(..))
     }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
@@ -101,6 +107,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
             self.failure = Some(error);
             self.headers = None;
             self.labels = None;
+            self.location = None;
             self.owner = Owner::Retired;
         }
         result
@@ -110,8 +117,9 @@ impl<'a, 'w> Cursor<'a, 'w> {
             return Err(error);
         }
         let result = match &mut self.owner {
-            Owner::Headers(cursor, _) => cursor.check_deadline(now).map_err(Error::Headers),
-            Owner::Labels(cursor, _) => cursor.check_deadline(now).map_err(Error::Labels),
+            Owner::Headers(cursor, _, _) => cursor.check_deadline(now).map_err(Error::Headers),
+            Owner::Labels(cursor, _, _) => cursor.check_deadline(now).map_err(Error::Labels),
+            Owner::Location(cursor, _) => cursor.check_deadline(now).map_err(Error::Location),
             Owner::Budgets(work, budget, _) => budget
                 .charge(work, now, 0, 0, &mut 0)
                 .map_err(Error::Admission),
@@ -121,10 +129,11 @@ impl<'a, 'w> Cursor<'a, 'w> {
     }
     fn field(&self, headers: &super::View<'_>, field: Field) -> Result<&'a [u8], Error> {
         let end = self
+            .entity
             .base
             .checked_add(headers.header_bytes)
             .ok_or(Error::InvalidState)?;
-        if field.name_start < self.base
+        if field.name_start < self.entity.base
             || field.name_start > field.name_end
             || field.name_end > field.value_start
             || field.value_start > field.value_end
@@ -133,20 +142,29 @@ impl<'a, 'w> Cursor<'a, 'w> {
         {
             return Err(Error::InvalidState);
         }
-        td_header::resident::slice(self.source, self.base, field.value_start..field.value_end)
-            .ok_or(Error::InvalidState)
+        td_header::resident::slice(
+            self.entity.source,
+            self.entity.base,
+            field.value_start..field.value_end,
+        )
+        .ok_or(Error::InvalidState)
     }
     pub fn value(&self) -> Option<View<'_>> {
         if !self.is_complete() {
             return None;
         }
         let labels = self.labels.as_ref()?;
+        let location = self.location.as_ref()?;
         Some(View {
             headers: self.headers?,
             labels: labels::Retained {
                 content_id: labels.content_id,
                 content_id_end: labels.content_id_end,
                 content_language: labels.content_language,
+            },
+            location: location::Retained {
+                selection: location.selection,
+                value: location.value,
             },
         })
     }
@@ -163,11 +181,11 @@ impl<'a, 'w> Cursor<'a, 'w> {
     }
     fn step(&mut self, now: Tick) -> Result<Status, Error> {
         match &mut self.owner {
-            Owner::Headers(cursor, _) => {
+            Owner::Headers(cursor, _, _) => {
                 if cursor.poll(now).map_err(Error::Headers)? != Status::Complete {
                     return Ok(Status::Yield);
                 }
-                let Owner::Headers(cursor, backing) =
+                let Owner::Headers(cursor, backing, location_backing) =
                     std::mem::replace(&mut self.owner, Owner::Retired)
                 else {
                     return Err(Error::InvalidState);
@@ -194,20 +212,55 @@ impl<'a, 'w> Cursor<'a, 'w> {
                         budget,
                     ),
                     scratch,
+                    location_backing,
                 );
                 Ok(Status::Yield)
             }
-            Owner::Labels(cursor, _) => {
+            Owner::Labels(cursor, _, _) => {
                 if cursor.poll(now).map_err(Error::Labels)? != labels::Status::Complete {
                     return Ok(Status::Yield);
                 }
-                let Owner::Labels(cursor, scratch) =
+                let Owner::Labels(cursor, scratch, backing) =
                     std::mem::replace(&mut self.owner, Owner::Retired)
                 else {
                     return Err(Error::InvalidState);
                 };
                 let (labels, work, budget) = cursor.finish(now).map_err(Error::Labels)?;
                 self.labels = Some(labels);
+                self.owner = Owner::Location(
+                    location::Cursor::new(
+                        mime_location_fields::Input {
+                            source: self.entity.source,
+                            base: self.entity.base,
+                            header_limit: self.entity.header_limit,
+                            source_end: self.entity.source_end,
+                        },
+                        backing,
+                        work,
+                        budget,
+                    )
+                    .map_err(Error::Location)?,
+                    scratch,
+                );
+                Ok(Status::Yield)
+            }
+            Owner::Location(cursor, _) => {
+                if cursor.poll(now).map_err(Error::Location)? != location::Status::Complete {
+                    return Ok(Status::Yield);
+                }
+                let Owner::Location(cursor, scratch) =
+                    std::mem::replace(&mut self.owner, Owner::Retired)
+                else {
+                    return Err(Error::InvalidState);
+                };
+                let (location, work, budget) = cursor.finish(now).map_err(Error::Location)?;
+                let headers = self.headers.ok_or(Error::InvalidState)?;
+                if location.selection.end.body_start != headers.body_start
+                    || location.selection.end.header_bytes != headers.header_bytes
+                {
+                    return Err(Error::InvalidState);
+                }
+                self.location = Some(location);
                 self.owner = Owner::Budgets(work, budget, scratch);
                 Ok(Status::Complete)
             }
@@ -237,6 +290,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
             View {
                 headers: self.headers.ok_or(Error::InvalidState)?,
                 labels: self.labels.ok_or(Error::InvalidState)?,
+                location: self.location.ok_or(Error::InvalidState)?,
             },
             work,
             budget,
@@ -263,7 +317,8 @@ mod tests {
         "Content-Disposition: INLINE;filename*=utf-8''e%CC%81\r\n",
         "Content-ID: bad\r\nContent-ID: (x)<A@B>\r\nContent-ID: <later@id>\r\n",
         "Content-Language: bad_\r\nContent-Language: EN-us, EN-us\r\nContent-Language: fr\r\n",
-        "\r\nContent-ID: <body@id>\r\n"
+        "Content-Location: a%\r\nContent-Location: ../img%2Fx\r\nContent-Location: ../later\r\n",
+        "\r\nContent-ID: <body@id>\r\nContent-Location: ../body\r\n"
     )
     .as_bytes();
     struct Storage {
@@ -272,6 +327,7 @@ mod tests {
         name: [u8; 128],
         id: [u8; 256],
         lang: [u8; 256],
+        location: [u8; 256],
     }
     impl Storage {
         fn new() -> Self {
@@ -281,6 +337,7 @@ mod tests {
                 name: [0xa5; 128],
                 id: [0xa5; 256],
                 lang: [0xa5; 256],
+                location: [0xa5; 256],
             }
         }
         fn backing(&mut self, id: usize, lang: usize) -> Backing<'_> {
@@ -294,6 +351,7 @@ mod tests {
                     content_id: &mut self.id[..id],
                     content_language: &mut self.lang[..lang],
                 },
+                content_location: &mut self.location,
             }
         }
     }
@@ -354,6 +412,7 @@ mod tests {
             assert_eq!(view.headers.charset, Some(b"UtF-8".as_slice()));
             assert_eq!(view.headers.filename, Some("é".as_bytes()));
             assert_eq!(view.labels.content_id, Some(b"\"A@B\"".as_slice()));
+            assert_eq!(view.location.value, Some(b"\"../img%2Fx\"".as_slice()));
             assert_eq!(
                 view.labels.content_language,
                 Some(b"[\"EN-us\",\"EN-us\"]".as_slice())
@@ -486,6 +545,7 @@ mod tests {
         assert_eq!(view.headers.body_start, 5);
         assert_eq!(view.labels.content_id, None);
         assert_eq!(view.labels.content_language, None);
+        assert_eq!(view.location.value, None);
         assert!(storage.id.iter().all(|b| *b == 0xa5));
         assert!(storage.lang.iter().all(|b| *b == 0xa5));
     }
@@ -514,6 +574,7 @@ mod tests {
                 assert!(!cursor.is_complete());
                 assert!(cursor.headers.is_none());
                 assert!(cursor.labels.is_none());
+                assert!(cursor.location.is_none());
                 assert!(matches!(cursor.owner, Owner::Retired));
                 assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
                 assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
@@ -570,20 +631,40 @@ mod tests {
                     }),
                 };
                 let mut cursor = labels::Cursor::new(values, backing.labels, work, budget);
+                let mut label_turns = 0;
                 for _ in header_turns..cut {
+                    label_turns += 1;
                     if cursor.poll(Tick(1)).unwrap() == labels::Status::Complete {
-                        complete = true;
                         break;
                     }
                 }
-                let result = cursor.finish(Tick(1));
-                assert_eq!(result.is_ok(), complete);
+                if let Ok((_, work, budget)) = cursor.finish(Tick(1)) {
+                    let mut cursor = location::Cursor::new(
+                        mime_location_fields::Input {
+                            source: SOURCE,
+                            base: 37,
+                            header_limit: 1_000_000,
+                            source_end: SourceEnd::Eof,
+                        },
+                        backing.content_location,
+                        work,
+                        budget,
+                    )
+                    .unwrap();
+                    for _ in header_turns + label_turns..cut {
+                        if cursor.poll(Tick(1)).unwrap() == location::Status::Complete {
+                            complete = true;
+                            break;
+                        }
+                    }
+                    assert_eq!(cursor.finish(Tick(1)).is_ok(), complete);
+                }
             }
         }
         (costs(&work, &budget), complete)
     }
     #[test]
-    fn every_turn_matches_standalone_header_and_label_costs() {
+    fn every_turn_matches_standalone_header_label_and_location_costs() {
         let mut work = meter();
         let mut budget = HeaderBudget::new();
         let mut scratch = Scratch::new();
@@ -703,7 +784,35 @@ mod tests {
             }
         }
         assert!(complete);
-        cursor.finish(Tick(1)).err().map(Error::Labels)
+        let (_, work, budget) = match cursor.finish(Tick(1)) {
+            Ok(value) => value,
+            Err(error) => return Some(Error::Labels(error)),
+        };
+        let mut cursor = location::Cursor::new(
+            mime_location_fields::Input {
+                source: SOURCE,
+                base: 0,
+                header_limit: 1_000_000,
+                source_end: SourceEnd::Eof,
+            },
+            backing.content_location,
+            work,
+            budget,
+        )
+        .unwrap();
+        let mut complete = false;
+        for _ in 0..200_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(location::Status::Complete) => {
+                    complete = true;
+                    break;
+                }
+                Ok(location::Status::Yield) => {}
+                Err(error) => return Some(Error::Location(error)),
+            }
+        }
+        assert!(complete);
+        cursor.finish(Tick(1)).err().map(Error::Location)
     }
 
     #[test]
@@ -751,6 +860,7 @@ mod tests {
                 assert!(!cursor.is_complete());
                 assert!(cursor.headers.is_none());
                 assert!(cursor.labels.is_none());
+                assert!(cursor.location.is_none());
                 assert_eq!(cursor.poll(Tick(100)), Err(error));
                 assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
                 if kind < 2 {
@@ -843,16 +953,35 @@ mod tests {
                 for _ in 0..cut {
                     cursor.poll(Tick(1)).unwrap();
                 }
+                let phase = match &cursor.owner {
+                    Owner::Headers(..) => 0,
+                    Owner::Labels(..) => 1,
+                    Owner::Location(..) => 2,
+                    Owner::Budgets(..) => 3,
+                    Owner::Retired => panic!("healthy prefix retired"),
+                };
+                let assert_context = |error| {
+                    assert!(matches!(
+                        (phase, error),
+                        (0, Error::Headers(_))
+                            | (1, Error::Labels(_))
+                            | (2, Error::Location(_))
+                            | (3, Error::Admission(_))
+                    ));
+                };
                 if trial == 0 {
-                    assert!(cursor.check_deadline(Tick(100)).is_err());
+                    let error = cursor.check_deadline(Tick(100)).unwrap_err();
+                    assert_context(error);
                     assert!(cursor.value().is_none());
                     assert!(!cursor.is_complete());
                     assert!(cursor.headers.is_none());
                     assert!(cursor.labels.is_none());
-                    assert!(cursor.finish(Tick(1)).is_err());
+                    assert!(cursor.location.is_none());
+                    assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
                     assert_eq!(work.stopped(), Some(Stop::Deadline));
                 } else if trial == 1 {
-                    assert!(cursor.finish(Tick(100)).is_err());
+                    let error = cursor.finish(Tick(100)).err().unwrap();
+                    assert_context(error);
                     assert_eq!(work.stopped(), Some(Stop::Deadline));
                 } else if cut == turns {
                     assert!(cursor.finish(Tick(1)).is_ok());
@@ -862,5 +991,219 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn first_empty_repair_and_absence_preserve_complete_part_metadata() {
+        type Case = (&'static [u8], Option<&'static [u8]>, bool, bool);
+        let cases: [Case; 4] = [
+            (
+                concat!(
+                    "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+                    "Content-Location: \r\nContent-Location: ../later\r\n\r\n"
+                )
+                .as_bytes(),
+                Some(b"\"\""),
+                false,
+                false,
+            ),
+            (
+                concat!(
+                    "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+                    "Content-Location: =?utf-8?Q?=FF?=\r\n\r\n"
+                )
+                .as_bytes(),
+                Some("\"�\"".as_bytes()),
+                true,
+                true,
+            ),
+            (
+                concat!(
+                    "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+                    "Content-Location: =?ascii?Q?=01?=\r\nContent-Location: ../later\r\n\r\n"
+                )
+                .as_bytes(),
+                Some(b"\"\""),
+                true,
+                false,
+            ),
+            (
+                concat!(
+                    "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+                    "Content-Location: a%\r\n\r\nContent-Location: ../body"
+                )
+                .as_bytes(),
+                None,
+                false,
+                false,
+            ),
+        ];
+        for (source, wanted, encoded, repair) in cases {
+            let mut work = meter();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let mut storage = Storage::new();
+            let mut cursor = Cursor::new(
+                entity(source, 37),
+                storage.backing(256, 256),
+                &mut work,
+                &mut budget,
+                &mut scratch,
+            )
+            .unwrap();
+            drain(&mut cursor).unwrap();
+            let (view, _, _, _) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(view.headers.content_type, b"text/plain");
+            assert_eq!(view.labels.content_id, Some(b"\"id@a\"".as_slice()));
+            assert_eq!(view.labels.content_language, Some(b"[\"fr\"]".as_slice()));
+            assert_eq!(view.location.value, wanted);
+            assert_eq!(
+                view.location.selection.content_location.is_some(),
+                wanted.is_some()
+            );
+            assert_eq!(
+                view.location.selection.location_end.is_some(),
+                wanted.is_some()
+            );
+            if let Some(end) = view.location.selection.location_end {
+                assert_eq!(end.encoded_words, encoded);
+                assert_eq!(end.encoding_problem, repair);
+            }
+            assert_eq!(
+                view.location.selection.end.body_start,
+                view.headers.body_start
+            );
+            assert_eq!(
+                view.location.selection.end.header_bytes,
+                view.headers.header_bytes
+            );
+        }
+    }
+    #[test]
+    fn every_location_capacity_cut_retires_completed_headers_and_label_pair() {
+        let wanted = b"\"../img%2Fx\"";
+        for cap in 0..=wanted.len() {
+            let mut work = meter();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let mut storage = Storage::new();
+            let Backing {
+                headers,
+                labels,
+                content_location,
+            } = storage.backing(5, 17);
+            let backing = Backing {
+                headers,
+                labels,
+                content_location: content_location.get_mut(..cap).unwrap(),
+            };
+            let mut cursor = Cursor::new(
+                entity(SOURCE, 37),
+                backing,
+                &mut work,
+                &mut budget,
+                &mut scratch,
+            )
+            .unwrap();
+            let result = drain(&mut cursor);
+            if cap < wanted.len() {
+                let error = Error::Location(location::Error::Retention(
+                    crate::mime_location_field::retained::Error::OutputCapacity,
+                ));
+                assert_eq!(result, Err(error));
+                assert!(cursor.value().is_none());
+                assert!(cursor.headers.is_none());
+                assert!(cursor.labels.is_none());
+                assert!(cursor.location.is_none());
+                assert!(matches!(cursor.owner, Owner::Retired));
+                assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                assert_eq!(work.stopped(), None);
+            } else {
+                let (view, _, _, _) = cursor.finish(Tick(1)).unwrap();
+                assert_eq!(view.location.value, Some(wanted.as_slice()));
+            }
+            assert!(storage
+                .location
+                .get(cap..)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0xa5));
+        }
+    }
+    #[test]
+    fn defensive_location_boundary_mismatch_retires_all_groups() {
+        for mismatch_body in [false, true] {
+            let mut work = meter();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let mut storage = Storage::new();
+            let mut cursor = Cursor::new(
+                entity(SOURCE, 37),
+                storage.backing(256, 256),
+                &mut work,
+                &mut budget,
+                &mut scratch,
+            )
+            .unwrap();
+            let mut location_phase = false;
+            for _ in 0..100_000 {
+                if matches!(cursor.owner, Owner::Location(..)) {
+                    location_phase = true;
+                    break;
+                }
+                assert_eq!(cursor.poll(Tick(1)).unwrap(), Status::Yield);
+            }
+            assert!(location_phase);
+            let headers = cursor.headers.as_mut().unwrap();
+            if mismatch_body {
+                headers.body_start += 1;
+            } else {
+                headers.header_bytes += 1;
+            }
+            assert_eq!(drain(&mut cursor), Err(Error::InvalidState));
+            assert!(cursor.value().is_none());
+            assert!(cursor.headers.is_none());
+            assert!(cursor.labels.is_none());
+            assert!(cursor.location.is_none());
+            assert!(matches!(cursor.owner, Owner::Retired));
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(Error::InvalidState));
+            assert_eq!(work.stopped(), None);
+        }
+    }
+    #[test]
+    fn location_nesting_refusal_cannot_publish_previous_metadata_or_choose_later() {
+        let source = format!(
+            concat!(
+                "Content-ID: <id@a>\r\nContent-Language: fr\r\n",
+                "Content-Location: {}x{}\r\nContent-Location: ../later\r\n\r\n"
+            ),
+            "(".repeat(33),
+            ")".repeat(33)
+        );
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut storage = Storage::new();
+        let mut cursor = Cursor::new(
+            entity(source.as_bytes(), 37),
+            storage.backing(256, 256),
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        let error = Error::Location(location::Error::Selection(
+            mime_location_fields::Error::Location(crate::mime_location_field::Error::Selection(
+                crate::mime_location_selection::Error::NestingLimit,
+            )),
+        ));
+        assert_eq!(drain(&mut cursor), Err(error));
+        assert!(cursor.value().is_none());
+        assert!(cursor.headers.is_none());
+        assert!(cursor.labels.is_none());
+        assert!(cursor.location.is_none());
+        assert!(matches!(cursor.owner, Owner::Retired));
+        assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+        assert_eq!(work.stopped(), None);
     }
 }

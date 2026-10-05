@@ -2071,7 +2071,18 @@ Initial independently landable increments:
   selection and borrowed JSON with correlated diagnostics. Qualify public
   child costs, every original resource/capacity cut, progress-prefix
   admission, original-owner reuse and measured zero Rust allocation.
-  Retained MIME part metadata and traversal response integration remain next.
+  M06dh supplies retained MIME part metadata; traversal response integration
+  remains next.
+
+- **M06dh — retained location in complete part metadata:** atomically extend
+  composed header/label backing and View with a separate location window
+  and completed source-bound fragment. Keep one immutable Entity and
+  exclusive header, label and location owners; correlate complete header
+  boundaries and hide all groups on any refusal. Scratch remains parked
+  during location. Qualify three-child prefix/cost/reference, all original
+  grants and location capacity/presence/repair/nesting cases, triple-owner
+  reuse and measured zero Rust allocation within the existing 6 KiB cursor
+  and 16 KiB parser region. Traversal response integration remains next.
 
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
