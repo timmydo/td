@@ -522,6 +522,15 @@ Field selection, source authorization, optional/null policy and enclosing
 response publication remain separate. The child handoff may forfeit prepaid
 credit; it cannot renew any allowance.
 
+M06da composes complete retained part headers with the selected label JSON
+pair under the original job/header/scratch owners. It checks selected field
+extents against the recognized header section and maps them only into the
+same authorized immutable entity. One live child owns the budgets at a time;
+no completed header metadata escapes before whole healthy label completion.
+Failure hides both Views without wiping provisional caller backing. Healthy
+fresh finish returns passive metadata and the original reusable owners.
+Traversal, location placement and response publication remain separate.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

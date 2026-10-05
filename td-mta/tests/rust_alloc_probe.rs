@@ -2537,6 +2537,193 @@ fn content_language_json() {
     assert_eq!(before, after, "Content-Language JSON projection allocated");
 }
 
+fn composed_part_label_json() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        mime_label_fields::json as labels,
+        mime_metadata::Context,
+        mime_part_headers::{
+            self,
+            label_json::{Backing, Cursor, Error, Status},
+        },
+        nfc::{self, HeaderBudget, Scratch},
+        ports::{Deadline, Tick},
+    };
+    let normal = concat!(
+        "Content-ID: bad\r\nContent-ID: <A@B>\r\n",
+        "Content-Language: bad_\r\nContent-Language: en, en\r\n",
+        "\r\nContent-ID: <body@id>"
+    )
+    .as_bytes();
+    let long = format!(
+        concat!(
+            "Content-Type: text/plain\r\n",
+            "Content-Disposition: inline;filename*=utf-8''e%CC%81\r\n",
+            "Content-ID: <{}@B>\r\nContent-Language: x{}\r\n\r\nBODY"
+        ),
+        "a".repeat(8192),
+        "-abcdefgh".repeat(1024)
+    );
+    let mut heads = [0; 128];
+    let mut charset = [0; 32];
+    let mut filename = [0; 128];
+    let mut id = vec![0; 20_000];
+    let mut lang = vec![0; 20_000];
+    let before = COUNTERS.snapshot();
+    for (source, id_cap, lang_cap, records, output, failed) in [
+        (
+            b"\r\nContent-ID: <body@id>".as_slice(),
+            0,
+            0,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (normal, 5, 11, 100_000_000, 100_000_000, false),
+        (
+            long.as_bytes(),
+            20_000,
+            20_000,
+            100_000_000,
+            100_000_000,
+            false,
+        ),
+        (normal, 0, 11, 100_000_000, 100_000_000, true),
+        (normal, 5, 0, 100_000_000, 100_000_000, true),
+        (normal, 5, 11, 0, 100_000_000, true),
+        (normal, 5, 11, 100_000_000, 25, true),
+    ] {
+        for trial in 0..if failed { 1 } else { 2 } {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records,
+                    output_bytes: output,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let identity = (
+                std::ptr::from_ref(&work),
+                std::ptr::from_ref(&budget),
+                std::ptr::from_ref(&scratch),
+            );
+            let mut cursor = Cursor::new(
+                mime_part_headers::Entity {
+                    source: black_box(source),
+                    base: 37,
+                    source_end: SourceEnd::Eof,
+                    header_limit: 1_000_000,
+                    context: Context::Normal,
+                },
+                Backing {
+                    headers: mime_part_headers::Backing {
+                        heads: &mut heads,
+                        charset: &mut charset,
+                        filename: &mut filename,
+                    },
+                    labels: labels::Backing {
+                        content_id: id.get_mut(..id_cap).unwrap(),
+                        content_language: lang.get_mut(..lang_cap).unwrap(),
+                    },
+                },
+                &mut work,
+                &mut budget,
+                &mut scratch,
+            )
+            .unwrap();
+            let mut completion = false;
+            let mut error = None;
+            for _ in 0..200_000 {
+                match cursor.poll(Tick(1)) {
+                    Ok(Status::Complete) => {
+                        completion = true;
+                        break;
+                    }
+                    Ok(Status::Yield) => {
+                        assert!(cursor.value().is_none());
+                        assert!(!cursor.is_complete());
+                    }
+                    Err(e) => {
+                        error = Some(e);
+                        break;
+                    }
+                }
+            }
+            if failed {
+                let error = error.unwrap();
+                let expected = if records == 0 {
+                    Error::Headers(mime_part_headers::Error::Admission(nfc::Error::Work(
+                        Stop::Records,
+                    )))
+                } else if output == 25 {
+                    Error::Labels(labels::Error::ContentLanguage(
+                        td_mta::mime_language::json::Error::Source(
+                            td_mta::mime_language::Error::Work(Stop::OutputBytes),
+                        ),
+                    ))
+                } else {
+                    Error::Labels(labels::Error::OutputCapacity)
+                };
+                assert_eq!(error, expected);
+                assert!(!completion);
+                assert!(cursor.value().is_none());
+                assert!(!cursor.is_complete());
+                assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            assert!(completion);
+            assert!(error.is_none());
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            if trial == 1 {
+                let error = Error::Admission(nfc::Error::Work(Stop::Deadline));
+                assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+                assert!(cursor.value().is_none());
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            let (view, work, budget, scratch) = cursor.finish(Tick(1)).unwrap();
+            black_box(view.headers);
+            black_box(view.labels.content_id);
+            black_box(view.labels.content_id_end);
+            black_box(view.labels.content_language);
+            assert_eq!(
+                (
+                    std::ptr::from_ref(&*work),
+                    std::ptr::from_ref(&*budget),
+                    std::ptr::from_ref(&*scratch)
+                ),
+                identity
+            );
+            let mut next = td_mta::mime_language::Cursor::new(b"fr", work, budget);
+            let mut complete = false;
+            for _ in 0..1000 {
+                if next.poll(Tick(1)).unwrap() == td_mta::mime_language::Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            let (work, budget) = next.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (
+                    std::ptr::from_ref(&*work),
+                    std::ptr::from_ref(&*budget),
+                    std::ptr::from_ref(&*scratch)
+                ),
+                identity
+            );
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "composed part label JSON allocated");
+}
+
 fn retained_label_json() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -9639,6 +9826,7 @@ fn main() {
         content_id_json();
         content_language_json();
         retained_label_json();
+        composed_part_label_json();
         content_language_values();
         body_value();
         mime_text();
@@ -9807,6 +9995,7 @@ fn main() {
     content_id_json();
     content_language_json();
     retained_label_json();
+    composed_part_label_json();
     content_language_values();
     body_value();
     mime_text();

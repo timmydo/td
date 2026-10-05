@@ -1850,6 +1850,30 @@ capacity/syntax/job refusal including a late language output cut, fresh final
 retirement and original-owner reuse. Input/backing allocation precedes each
 measured interval; native, worker-stack and RSS qualification remain separate.
 
+M06da's composed part-header label JSON cursor plus HeaderBudget
+measures 5896 bytes on the 64-bit host and has a compiled 6 KiB ceiling
+within the existing 16 KiB parser region. Header and label cursors are
+exclusive live owners; retention windows remain separate caller-owned
+backing. Each turn performs fresh original admission and at most one
+active child poll, then freshly consumes a completing child and hands
+back the same owners with no added parsing/output charge. The passive
+same-entity extent mapping reads no bytes. Delegated header/label turn
+ceilings remain unchanged; no new parser reservation, source grant or
+output grant follows. Whole metadata stays hidden until complete healthy
+composition, and later capacity, work or admission refusal hides earlier
+header results too. Exact resource-grant fixtures compare exact refusal
+contexts with standalone public children, require a retired owner and
+pin original grant exhaustion. Every prefix deadline cut checks
+original-owner retirement. A standalone header-plus-label prefix oracle
+compares all original job/header balances and completion after every
+composition turn; handoff adds no charge. Warm/measured Rust allocation
+intervals cover long selected labels, absent body-only labels,
+malformed-first selection, exact windows, label-capacity and job refusal
+including late language output exhaustion, fresh final retirement and
+consuming original-owner reuse. Source/backing allocation precedes each
+measured interval. Native allocator, worker-stack and RSS qualification
+remain separate.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

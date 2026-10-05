@@ -2008,6 +2008,16 @@ Initial independently landable increments:
   Full retained part-header composition, source/selection authorization,
   location dispatch and response publication remain subsequent work.
 
+- **M06da — composed part-header label JSON:** bind complete authorized
+  entity part-header selection to retained CID/language JSON in separate
+  caller windows. Map selected absolute fields only into the same entity
+  within its recognized header section. Retain original job/header/scratch
+  owners exclusively, hide all metadata until whole completion and retire
+  every View on any refusal. Qualify body isolation, first-valid selection,
+  exact windows, source bounds, every resource/deadline cut, original reuse
+  and warm/measured allocation. Location placement, traversal and response
+  publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

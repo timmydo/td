@@ -4621,6 +4621,49 @@ most two transition-only polls add no parsing or output charge. A
 completing child poll also performs fresh consuming handoff and owner
 restore with no additional resource charge.
 
+### 1.106 Composed part headers and selected label JSON
+
+M06da adds mime_part_headers::label_json::Cursor. Its Entity is the same
+complete authorized immutable entity and absolute base as the existing
+part-header cursor. Backing supplies the existing independent heads,
+charset and filename windows plus separate CID/language JSON windows.
+The existing header owner first selects metadata and first-valid label
+fields, then hands its original Meter, HeaderBudget and Scratch to the
+exclusive label phase. Selected extents are checked against the
+recognized header section and mapped only into that same Entity source.
+This passive mapping neither reads bytes nor grants source
+authorization. Body bytes cannot supply a selected header; no blob or
+response authority follows.
+
+value() returns no metadata before whole healthy composition completes.
+Its passive View pairs the existing header View with the complete
+retained label pair, including final CID diagnostics. Missing labels
+remain absent; this layer does not serialize null. All original
+selection, normalization, syntax, capacity and resource rules remain
+delegated to the existing children. Any child or mapping refusal retires
+the entire composition and hides both Views, including already completed
+header metadata. Provisional caller backing is not wiped and must not be
+published after refusal.
+
+poll(now) invokes at most one active child poll; a completing child is
+freshly consumed in that turn and the same original owners are handed to
+the next phase or restored. Those handoffs add no parsing/output charge
+and never renew prepaid credit. Header and label cursors never coexist
+as live owners. Errors retain Headers or Labels context during either
+child and its consuming handoff. Fresh admission after healthy
+completion uses Admission; invalid extent/state uses InvalidState.
+Cached healthy Complete is inert. Fresh check_deadline and consuming
+finish(now) admit the original owners even after Complete and before a
+premature-state refusal. Healthy complete finish returns View with the
+pointer-identical original Meter, HeaderBudget and Scratch, reusable for
+subsequent interpretation. Cursor is neither Copy nor Clone. Before
+parsing, reserve windows using the existing head/filename bounds and
+selected-label JSON bounds with an admitted upper bound on recognized
+header bytes as N. Each selected raw field value fits within that bound;
+its exact length is not needed to reserve backing. No window grows here.
+Traversal, location placement, source authorization and response
+publication remain separate.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

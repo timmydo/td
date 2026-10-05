@@ -1,4 +1,5 @@
 //! Retained selected MIME heads, charset, filename and passive label fields.
+pub mod label_json;
 use crate::{
     admission::work::{Charge, Meter},
     header_select::SourceEnd,
