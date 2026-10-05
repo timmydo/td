@@ -152,6 +152,15 @@ impl Supervisor {
         self
     }
 
+    /// The conversations with a process that has not failed.
+    pub fn ids(&self) -> Vec<Id> {
+        self.children
+            .iter()
+            .filter(|r| !r.failed)
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
     /// Whether conversation `id` has a process that has not failed.
     pub fn running(&self, id: &Id) -> bool {
         self.at(id)

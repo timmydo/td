@@ -66,6 +66,14 @@ pub enum Down {
         remote: String,
         result: Result<Fetched, String>,
     },
+    /// The commit each of `remote`'s `bases` was at when the window last
+    /// fetched its store, `ids` in their order (DESIGN.md §7, Keeping
+    /// current): asked for with `Heads`, and told after each fetch.
+    Heads {
+        remote: String,
+        bases: Vec<String>,
+        ids: Vec<String>,
+    },
 }
 
 /// A fetched store, for a repository workspace's preparation (DESIGN.md
@@ -162,6 +170,12 @@ pub enum Up {
     /// not: until then the window keeps its process (DESIGN.md §7).
     Prepared {
         remote: String,
+    },
+    /// Where the window last found each of `remote`'s `bases`, answered
+    /// with `Heads` of those it knows.
+    Heads {
+        remote: String,
+        bases: Vec<String>,
     },
 }
 
@@ -398,6 +412,20 @@ impl Down {
                 }
                 typed("fetched", pairs)
             }
+            Self::Heads { remote, bases, ids } => typed(
+                "heads",
+                vec![
+                    ("remote".into(), Json::Str(remote.clone())),
+                    (
+                        "bases".into(),
+                        Json::Arr(bases.iter().cloned().map(Json::Str).collect()),
+                    ),
+                    (
+                        "ids".into(),
+                        Json::Arr(ids.iter().cloned().map(Json::Str).collect()),
+                    ),
+                ],
+            ),
         }
     }
 
@@ -510,6 +538,18 @@ impl Down {
                     }),
                 },
             }),
+            Some("heads") => {
+                let bases = strings(&value, "bases")?;
+                let ids = strings(&value, "ids")?;
+                if bases.len() != ids.len() {
+                    return Err("heads holds a base without its commit".into());
+                }
+                Ok(Self::Heads {
+                    remote: string(&value, "remote")?,
+                    bases,
+                    ids,
+                })
+            }
             other => Err(format!("unknown message {other:?}")),
         }
     }
@@ -593,6 +633,16 @@ impl Up {
             Self::Prepared { remote } => typed(
                 "prepared",
                 vec![("remote".into(), Json::Str(remote.clone()))],
+            ),
+            Self::Heads { remote, bases } => typed(
+                "heads",
+                vec![
+                    ("remote".into(), Json::Str(remote.clone())),
+                    (
+                        "bases".into(),
+                        Json::Arr(bases.iter().cloned().map(Json::Str).collect()),
+                    ),
+                ],
             ),
             Self::Fetch { remote, bases } => typed(
                 "fetch",
@@ -704,6 +754,10 @@ impl Up {
             },
             Some("prepared") => Self::Prepared {
                 remote: string(&value, "remote")?,
+            },
+            Some("heads") => Self::Heads {
+                remote: string(&value, "remote")?,
+                bases: strings(&value, "bases")?,
             },
             other => return Err(format!("unknown message {other:?}")),
         })
@@ -819,6 +873,10 @@ mod tests {
             Up::Prepared {
                 remote: "https://github.com/timmydo/td".into(),
             },
+            Up::Heads {
+                remote: "https://github.com/timmydo/td".into(),
+                bases: vec!["main".into()],
+            },
             Up::Ask {
                 call: 9,
                 title: "Run a command?".into(),
@@ -915,10 +973,18 @@ mod tests {
                 model: None,
                 effort: None,
             },
+            Down::Heads {
+                remote: "https://github.com/timmydo/td".into(),
+                bases: vec!["main".into(), "next".into()],
+                ids: vec!["a".repeat(40), "b".repeat(40)],
+            },
         ] {
             assert!(down.encode().len() <= crate::frame::MAX_FRAME);
             assert_eq!(Down::decode(&down.encode()).unwrap(), down);
         }
+        // A base without its commit is no answer.
+        let lopsided = br#"{"type":"heads","remote":"https://github.com/timmydo/td","bases":["main","next"],"ids":["aaaa"]}"#;
+        assert!(Down::decode(lopsided).is_err());
         let client = Client::default();
         for down in [
             Down::Setup {

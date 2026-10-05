@@ -1530,6 +1530,7 @@ impl App {
                 | Up::Send { .. }
                 | Up::Query { .. }
                 | Up::Fetch { .. }
+                | Up::Heads { .. }
                 | Up::Prepared { .. },
             )
             | Update::Undeliverable { .. } => {}

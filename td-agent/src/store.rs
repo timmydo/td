@@ -765,6 +765,20 @@ pub struct Meta {
     /// the window writes it, and never clears it; absent and false in a
     /// meta written before.
     pub removed: bool,
+    /// Each base's remote-tracking ref as this conversation's process
+    /// last set it (DESIGN.md §7, Keeping current): what a base moving is
+    /// told against. Only that process writes it; absent and empty in a
+    /// meta written before.
+    pub tracked: Vec<Tracked>,
+}
+
+/// A base's remote-tracking ref, set to commit `id` in the repository
+/// of `remote`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Tracked {
+    pub remote: String,
+    pub base: String,
+    pub id: String,
 }
 
 impl Meta {
@@ -788,6 +802,21 @@ impl Meta {
             ("effort".into(), or_null(&self.effort)),
             ("archived".into(), Json::Bool(self.archived)),
             ("removed".into(), Json::Bool(self.removed)),
+            (
+                "tracked".into(),
+                Json::Arr(
+                    self.tracked
+                        .iter()
+                        .map(|tracked| {
+                            Json::Obj(vec![
+                                ("remote".into(), Json::Str(tracked.remote.clone())),
+                                ("base".into(), Json::Str(tracked.base.clone())),
+                                ("id".into(), Json::Str(tracked.id.clone())),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
             (
                 "prepared".into(),
                 Json::Arr(
@@ -837,6 +866,27 @@ impl Meta {
                 None => false,
                 Some(removed) => removed.as_bool().ok_or("meta's removed is not a boolean")?,
             },
+            tracked: match value.get("tracked") {
+                None => Vec::new(),
+                Some(tracked) => tracked
+                    .as_arr()
+                    .ok_or("meta's tracked is not a list")?
+                    .iter()
+                    .map(|item| {
+                        let text = |name: &str| item.get(name).and_then(Json::as_str);
+                        match (text("remote"), text("base"), text("id")) {
+                            (Some(remote), Some(base), Some(id)) if crate::git::object_id(id) => {
+                                Ok(Tracked {
+                                    remote: remote.to_string(),
+                                    base: base.to_string(),
+                                    id: id.to_string(),
+                                })
+                            }
+                            _ => Err("meta's tracked holds an entry that is not a remote, a base and a commit"),
+                        }
+                    })
+                    .collect::<Result<_, _>>()?,
+            },
             prepared: match value.get("prepared") {
                 None => Vec::new(),
                 Some(prepared) => prepared
@@ -868,6 +918,16 @@ fn optional_str(value: &Json, name: &str) -> Option<Option<String>> {
         Some(Json::Str(text)) => Some(Some(text.clone())),
         Some(_) => None,
     }
+}
+
+/// `meta`'s text, refused past what `read_meta` reads, so a record that
+/// grows never leaves a conversation that cannot be opened.
+fn bounded(meta: &Meta) -> Result<String, String> {
+    let text = meta.to_json().to_string();
+    if text.len() as u64 > MAX_META {
+        return Err(format!("meta would be past {MAX_META} bytes"));
+    }
+    Ok(text)
 }
 
 fn read_meta(dir: &Path) -> Result<Meta, String> {
@@ -1675,6 +1735,7 @@ impl Conversation {
                     archived: false,
                     prepared: Vec::new(),
                     removed: false,
+                    tracked: Vec::new(),
                 };
                 // The request prefix (§13) is written once and never
                 // rewritten; a later prefix is a log event.
@@ -1958,7 +2019,25 @@ impl Conversation {
         }
         let mut meta = self.meta.clone();
         meta.prepared.push(repository.to_path_buf());
-        replace(&self.dir, "meta", meta.to_json().to_string().as_bytes())?;
+        replace(&self.dir, "meta", bounded(&meta)?.as_bytes())?;
+        self.meta = meta;
+        Ok(())
+    }
+
+    /// Records `remote`'s `heads`, each a base and the commit its
+    /// remote-tracking ref was set to, in `meta`, in place of what was
+    /// recorded of those bases.
+    pub fn set_tracked(&mut self, remote: &str, heads: &[(String, String)]) -> Result<(), String> {
+        let mut meta = self.meta.clone();
+        meta.tracked.retain(|tracked| {
+            tracked.remote != remote || !heads.iter().any(|(base, _)| *base == tracked.base)
+        });
+        meta.tracked.extend(heads.iter().map(|(base, id)| Tracked {
+            remote: remote.to_string(),
+            base: base.clone(),
+            id: id.clone(),
+        }));
+        replace(&self.dir, "meta", bounded(&meta)?.as_bytes())?;
         self.meta = meta;
         Ok(())
     }
@@ -2848,6 +2927,55 @@ pub mod tests {
             pairs.push(("prepared".into(), Json::Arr(vec![Json::Str("rel".into())])));
         }
         assert!(Meta::from_json(&value).is_err());
+        // Nor has it `tracked`, each entry a remote, a base and a commit;
+        // a later record of a base replaces the earlier.
+        let mut value = conversation.meta().to_json();
+        if let Json::Obj(pairs) = &mut value {
+            pairs.retain(|(key, _)| key != "tracked");
+        }
+        assert!(Meta::from_json(&value).unwrap().tracked.is_empty());
+        if let Json::Obj(pairs) = &mut value {
+            pairs.push((
+                "tracked".into(),
+                Json::Arr(vec![Json::Obj(vec![
+                    ("remote".into(), Json::Str("r".into())),
+                    ("base".into(), Json::Str("main".into())),
+                    ("id".into(), Json::Str("main".into())),
+                ])]),
+            ));
+        }
+        assert!(Meta::from_json(&value).is_err(), "a commit that is no id");
+        drop(conversation);
+        let (mut conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        conversation
+            .set_tracked(
+                "r",
+                &[("main".into(), a.clone()), ("next".into(), a.clone())],
+            )
+            .unwrap();
+        conversation
+            .set_tracked("r", &[("main".into(), b.clone())])
+            .unwrap();
+        conversation
+            .set_tracked("s", &[("main".into(), a.clone())])
+            .unwrap();
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        let read: Vec<(&str, &str, &str)> = conversation
+            .meta()
+            .tracked
+            .iter()
+            .map(|t| (t.remote.as_str(), t.base.as_str(), t.id.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("r", "next", a.as_str()),
+                ("r", "main", b.as_str()),
+                ("s", "main", a.as_str())
+            ]
+        );
         // Nor has it `removed`, which must be a boolean.
         let mut value = conversation.meta().to_json();
         if let Json::Obj(pairs) = &mut value {

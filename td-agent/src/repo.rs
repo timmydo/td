@@ -39,6 +39,9 @@ pub(crate) const TASK_TIME: Duration =
 /// How long a survey's git may take in all, and its instance.
 const SURVEY_GIT_TIME: Duration = Duration::from_secs(240);
 pub(crate) const SURVEY_TIME: Duration = SURVEY_GIT_TIME.saturating_add(Duration::from_secs(60));
+/// How long setting the remote-tracking refs may take, and its instance.
+const TRACK_GIT_TIME: Duration = Duration::from_secs(60);
+pub(crate) const TRACK_TIME: Duration = TRACK_GIT_TIME.saturating_add(Duration::from_secs(60));
 /// The word a maintenance instance's entry is started with.
 pub const MAINTAIN: &str = "maintain";
 
@@ -435,6 +438,20 @@ pub enum Task {
         checkout: PathBuf,
         bases: Vec<String>,
     },
+    /// Sets each base's remote-tracking ref, `refs/remotes/origin/<base>`,
+    /// to the commit the trusted store resolved it to (DESIGN.md §7,
+    /// Keeping current), whatever the jail left there, all or none; the
+    /// commits are the store's, which the repository's alternates reach.
+    /// `preparing` runs it before the repository is recorded prepared,
+    /// when a ref's lock can only be one a killed run left.
+    Track {
+        git: PathBuf,
+        repository: PathBuf,
+        id: String,
+        checkout: PathBuf,
+        heads: Vec<(String, String)>,
+        preparing: bool,
+    },
 }
 
 /// A survey's answer, read back outside the instance: what the
@@ -514,6 +531,27 @@ impl Task {
             .into_iter()
             .chain(bases.iter().map(OsString::from))
             .collect(),
+            Self::Track {
+                git,
+                repository,
+                id,
+                checkout,
+                heads,
+                preparing,
+            } => [
+                if *preparing { "track-new" } else { "track" }.into(),
+                git.into(),
+                repository.into(),
+                id.into(),
+                checkout.into(),
+            ]
+            .into_iter()
+            .chain(
+                heads
+                    .iter()
+                    .flat_map(|(base, commit)| [OsString::from(base), OsString::from(commit)]),
+            )
+            .collect(),
         }
     }
 
@@ -551,8 +589,34 @@ impl Task {
                     bases: bases.to_vec(),
                 })
             }
+            [word, git, repository, id, checkout, heads @ ..]
+                if (word == "track" || word == "track-new")
+                    && !heads.is_empty()
+                    && heads.len() % 2 == 0
+                    && heads.len() / 2 <= MAX_WORKTREES =>
+            {
+                let heads = heads
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[base, commit]| {
+                        if !git::object_id(commit) {
+                            return Err(format!("{commit:?} is not a full commit id"));
+                        }
+                        Ok((git::branch_name(base)?.to_string(), commit.clone()))
+                    })
+                    .collect::<Result<_, String>>()?;
+                Ok(Self::Track {
+                    git: absolute(git)?,
+                    repository: absolute(repository)?,
+                    id: worktree_id(id)?.into(),
+                    checkout: absolute(checkout)?,
+                    heads,
+                    preparing: word == "track-new",
+                })
+            }
             _ => Err(
-                "usage: td-agent maintain checkout GIT REPOSITORY ID CHECKOUT BRANCH BASE, or survey GIT REPOSITORY ID CHECKOUT BASE...".into(),
+                "usage: td-agent maintain checkout GIT REPOSITORY ID CHECKOUT BRANCH BASE, survey GIT REPOSITORY ID CHECKOUT BASE..., or track (or track-new) GIT REPOSITORY ID CHECKOUT BASE COMMIT...".into(),
             ),
         }
     }
@@ -695,6 +759,47 @@ impl Task {
                     .and_then(|said| said.trim().parse::<u64>().ok())
                     .ok_or("counting its commits: git said no number")?;
                 Ok(Survey { changes, ahead }.say())
+            }
+            Self::Track {
+                git,
+                repository,
+                id,
+                checkout,
+                heads,
+                preparing,
+            } => {
+                if *preparing {
+                    let mut locks = vec![repository.join("packed-refs.lock")];
+                    locks.extend(heads.iter().map(|(base, _)| {
+                        repository.join(format!("refs/remotes/origin/{base}.lock"))
+                    }));
+                    for lock in locks {
+                        match fs::remove_file(&lock) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(format!("{}: {e}", lock.display()));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // One transaction: every ref is set, or none is, so the
+                // record of them is never half right.
+                let script: String = heads
+                    .iter()
+                    .map(|(base, commit)| format!("update refs/remotes/origin/{base} {commit}\n"))
+                    .collect();
+                git::run_fed(
+                    jailed(git, repository, id, checkout).args([
+                        "update-ref",
+                        "--no-deref",
+                        "--stdin",
+                    ]),
+                    Some(script.into_bytes()),
+                    MAX_SAID,
+                    TRACK_GIT_TIME,
+                )
+                .map_err(|e| said("setting the remote-tracking refs", &e))?;
+                Ok(format!("{} remote-tracking refs set", heads.len()))
             }
         }
     }
@@ -1291,7 +1396,9 @@ pub(crate) mod tests {
 
     fn task_git(task: &Task) -> PathBuf {
         match task {
-            Task::Checkout { git, .. } | Task::Survey { git, .. } => git.clone(),
+            Task::Checkout { git, .. } | Task::Survey { git, .. } | Task::Track { git, .. } => {
+                git.clone()
+            }
         }
     }
 
@@ -1443,6 +1550,73 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(Task::parse(&words_both).unwrap(), both);
         assert_eq!(Survey::parse(&both.run().unwrap()).unwrap().ahead, 0);
+        // A remote-tracking ref is set to the commit given, whatever was
+        // there, and is not the work's.
+        let origin = || {
+            String::from_utf8(git_in(&["rev-parse", "refs/remotes/origin/main"]))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let tracking = |heads: Vec<(String, String)>, preparing: bool| Task::Track {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            heads,
+            preparing,
+        };
+        let track = |commit: &str| tracking(vec![("main".into(), commit.to_string())], false);
+        // A lock a killed run left stops a later run, but not one made
+        // while preparing.
+        let lock = repository.join("refs/remotes/origin/main.lock");
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, "").unwrap();
+        assert!(track(&base).run().is_err());
+        let preparing = tracking(vec![("main".into(), base.clone())], true);
+        let words_new: Vec<String> = preparing
+            .args()
+            .iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(Task::parse(&words_new).unwrap(), preparing);
+        preparing.run().unwrap();
+        assert!(!lock.exists());
+        assert_eq!(origin(), base);
+        let tip = String::from_utf8(git_in(&["rev-parse", "agent/one"]))
+            .unwrap()
+            .trim()
+            .to_string();
+        track(&tip).run().unwrap();
+        assert_eq!(origin(), tip);
+        // All or none: a second base's missing commit leaves the first.
+        let both = tracking(
+            vec![
+                ("main".into(), base.clone()),
+                ("next".into(), "f".repeat(40)),
+            ],
+            false,
+        );
+        assert!(both.run().is_err());
+        assert_eq!(origin(), tip);
+        assert_eq!(Survey::parse(&survey.run().unwrap()).unwrap().ahead, 1);
+        let words_track: Vec<String> = track(&base)
+            .args()
+            .iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(Task::parse(&words_track).unwrap(), track(&base));
+        assert!(track(&"f".repeat(40)).run().is_err(), "no such commit");
+        for bad in [
+            vec!["main"],
+            vec!["main", "abc"],
+            vec!["-x", base.as_str()],
+            vec![base.as_str(), "main"],
+        ] {
+            let mut words: Vec<String> = words_track.iter().take(5).cloned().collect();
+            words.extend(bad.iter().map(|w| w.to_string()));
+            assert!(Task::parse(&words).is_err(), "{bad:?}");
+        }
         assert!(Survey::parse("changes many ahead 0")
             .unwrap()
             .changes

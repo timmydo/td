@@ -69,6 +69,11 @@ use crate::workspace::{Entry, Workspace};
 /// does not sees this.
 pub const NO_SETTINGS: &str = "no settings from the window";
 
+/// A commit as a notice names it.
+fn short(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
 /// What a workspace tool says once its repository workspace went with
 /// the conversation's archive (DESIGN.md §7).
 const WORKSPACE_GONE: &str = "the workspace went with this conversation's archive: its worktrees are removed, so the file, shell and search tools are refused";
@@ -268,6 +273,7 @@ pub fn serve_in(
         gone: false,
         bench: Bench::default(),
         awaiting: Vec::new(),
+        untracked: Vec::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -439,6 +445,19 @@ struct Session {
     /// The remotes this process asked the window for and has no answer
     /// for yet: a turn's first request waits for them (`await_stores`).
     awaiting: Vec<String>,
+    /// Each remote whose remote-tracking refs last failed to be set, with
+    /// the commits tried and what it said: the same commits are not
+    /// tried again until they change or the process starts again, and a
+    /// failure is logged once until it says something else.
+    untracked: Vec<Untracked>,
+}
+
+/// A remote whose remote-tracking refs could not be set to `tried`, and
+/// what that said.
+struct Untracked {
+    remote: String,
+    tried: Vec<(String, String)>,
+    said: String,
 }
 
 impl Session {
@@ -523,6 +542,7 @@ impl Session {
                 Down::ClearTodo => self.clear_todo()?,
                 Down::Choose { model, effort } => self.choose(model, effort)?,
                 Down::Fetched { remote, result } => self.stored(remote, result)?,
+                Down::Heads { remote, bases, ids } => self.heads(&remote, &bases, &ids)?,
                 // A reservation granted after its request gave up waiting:
                 // nothing was sent, so the window's hold is released.
                 Down::Reservation { id, refusal: None } => self.spent(id, 0),
@@ -1216,20 +1236,156 @@ impl Session {
         if meta.removed {
             return;
         }
-        let mut asks: Vec<(String, Vec<String>)> = Vec::new();
+        // A prepared one's bases are asked where the window last found
+        // them, so its remote-tracking refs follow (`heads`).
+        let mut asks: Vec<(String, Vec<String>, bool)> = Vec::new();
         for entry in &repositories.entries {
-            if meta.prepared.contains(&entry.repository) {
+            let prepared = meta.prepared.contains(&entry.repository);
+            match asks
+                .iter_mut()
+                .find(|(remote, _, _)| *remote == entry.remote)
+            {
+                Some((_, bases, _)) => bases.push(entry.base.clone()),
+                None => asks.push((entry.remote.clone(), vec![entry.base.clone()], prepared)),
+            }
+        }
+        for (remote, bases, prepared) in asks {
+            if prepared {
+                self.send(&Up::Heads { remote, bases });
+            } else {
+                self.awaiting.push(remote.clone());
+                self.send(&Up::Fetch { remote, bases });
+            }
+        }
+    }
+
+    /// The window's word of where `remote`'s `bases` were when it last
+    /// fetched the store, `ids` in their order (DESIGN.md §7, Keeping
+    /// current): each base this workspace names whose remote-tracking ref
+    /// was last set elsewhere is set there in a maintenance instance and
+    /// recorded, and one that moved from a commit recorded is said in the
+    /// log. A repository not yet prepared waits for its preparation,
+    /// which sets them.
+    fn heads(&mut self, remote: &str, bases: &[String], ids: &[String]) -> Result<(), String> {
+        let meta = self.conversation.meta().clone();
+        let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
+            return Ok(());
+        };
+        if meta.removed {
+            return Ok(());
+        }
+        let entries: Vec<&Entry> = repositories
+            .entries
+            .iter()
+            .filter(|entry| entry.remote == remote)
+            .collect();
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        if !meta.prepared.contains(&first.repository) {
+            return Ok(());
+        }
+        let mut moved: Vec<(String, String, Option<String>)> = Vec::new();
+        for (base, id) in bases.iter().zip(ids) {
+            let named = entries.iter().any(|entry| entry.base == *base);
+            if !named || !crate::git::object_id(id) || moved.iter().any(|(b, _, _)| b == base) {
                 continue;
             }
-            match asks.iter_mut().find(|(remote, _)| *remote == entry.remote) {
-                Some((_, bases)) => bases.push(entry.base.clone()),
-                None => asks.push((entry.remote.clone(), vec![entry.base.clone()])),
+            let was = meta
+                .tracked
+                .iter()
+                .find(|tracked| tracked.remote == remote && tracked.base == *base)
+                .map(|tracked| tracked.id.clone());
+            if was.as_deref() != Some(id.as_str()) {
+                moved.push((base.clone(), id.clone(), was));
             }
         }
-        for (remote, bases) in asks {
-            self.awaiting.push(remote.clone());
-            self.send(&Up::Fetch { remote, bases });
+        if moved.is_empty() {
+            return Ok(());
         }
+        let heads: Vec<(String, String)> = moved
+            .iter()
+            .map(|(base, id, _)| (base.clone(), id.clone()))
+            .collect();
+        if self
+            .untracked
+            .iter()
+            .any(|failed| failed.remote == remote && failed.tried == heads)
+        {
+            return Ok(());
+        }
+        let said = match self.track(&meta.id, &entries, &heads, false) {
+            Ok(()) => {
+                self.conversation.set_tracked(remote, &heads)?;
+                self.untracked.retain(|failed| failed.remote != remote);
+                let told: Vec<String> = moved
+                    .iter()
+                    .filter_map(|(base, id, was)| {
+                        let was = was.as_ref()?;
+                        Some(format!("{base} moved from {} to {}", short(was), short(id)))
+                    })
+                    .collect();
+                (!told.is_empty()).then(|| {
+                    format!(
+                        "upstream's {} in {remote}: each worktree's refs/remotes/origin/<base> names it now",
+                        told.join(", ")
+                    )
+                })
+            }
+            Err(why) => {
+                let text = format!("the remote-tracking refs of {remote} could not be set: {why}");
+                let new = !self
+                    .untracked
+                    .iter()
+                    .any(|failed| failed.remote == remote && failed.said == text);
+                self.untracked.retain(|failed| failed.remote != remote);
+                self.untracked.push(Untracked {
+                    remote: remote.to_string(),
+                    tried: heads.clone(),
+                    said: text.clone(),
+                });
+                new.then_some(text)
+            }
+        };
+        if let Some(text) = said {
+            self.log(Kind::Notice { text })?;
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Sets `heads`' remote-tracking refs in the repository of `entries`,
+    /// one remote's, in a maintenance instance, `preparing` it.
+    fn track(
+        &self,
+        id: &Id,
+        entries: &[&Entry],
+        heads: &[(String, String)],
+        preparing: bool,
+    ) -> Result<(), String> {
+        let first = entries.first().ok_or("no worktree to track in")?;
+        let programs = crate::jail::Programs::from_env()?;
+        let git = crate::repo::host_git()?;
+        let dir = crate::workspace::jail_dir(&StateDir::at(self.state.clone()), id);
+        let policy =
+            crate::workspace::maintenance(&dir, entries).ok_or("no worktree to track in")?;
+        let task = crate::repo::Task::Track {
+            git,
+            repository: first.repository.clone(),
+            id: first.id.clone(),
+            checkout: first.checkout.clone(),
+            heads: heads.to_vec(),
+            preparing,
+        };
+        crate::jail::maintain(
+            &programs,
+            &policy,
+            &dir.join("specs"),
+            &task,
+            crate::repo::TRACK_TIME,
+        )
+        .map(drop)
+        .map_err(|why| format!("setting its remote-tracking refs: {why}"))
     }
 
     /// The window's answer for `remote`'s store (`prepare`), then the
@@ -1271,11 +1427,26 @@ impl Session {
         // whether or not the checkout does.
         let checked = result.and_then(|fetched| {
             self.instructed(&entries, &fetched)?;
-            self.check_out(&meta.id, &entries, &fetched)
+            self.check_out(&meta.id, &entries, &fetched)?;
+            // Each base's remote-tracking ref at the commit its worktree
+            // starts from, so nothing has moved yet.
+            let heads: Vec<(String, String)> = entries
+                .iter()
+                .map(|entry| entry.base.clone())
+                .zip(fetched.ids.iter().cloned())
+                .fold(Vec::new(), |mut heads, (base, id)| {
+                    if !heads.iter().any(|(b, _)| *b == base) {
+                        heads.push((base, id));
+                    }
+                    heads
+                });
+            self.track(&meta.id, &entries, &heads, true)?;
+            Ok(heads)
         });
         let text = match checked {
-            Ok(()) => {
+            Ok(heads) => {
                 self.conversation.set_prepared(&repository)?;
+                self.conversation.set_tracked(remote, &heads)?;
                 let ready: Vec<String> = entries
                     .iter()
                     .map(|entry| entry.checkout.display().to_string())

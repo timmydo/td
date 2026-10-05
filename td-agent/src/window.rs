@@ -553,6 +553,19 @@ impl Session {
                         },
                     );
                 }
+                Update::Up(Up::Heads { remote, bases }) => {
+                    let (bases, ids) = self.known(remote, bases);
+                    if !bases.is_empty() {
+                        self.supervisor.answer(
+                            &id,
+                            &Down::Heads {
+                                remote: remote.clone(),
+                                bases,
+                                ids,
+                            },
+                        );
+                    }
+                }
                 Update::Up(Up::Fetch { remote, bases }) => {
                     if let Err(why) = self.fetch(&id, remote, bases) {
                         self.supervisor.answer(
@@ -686,6 +699,7 @@ impl Session {
             return;
         };
         let mut moved = Vec::new();
+        let mut learnt: Vec<String> = Vec::new();
         for done in stores.answers() {
             match done {
                 crate::git::Done::Prepared {
@@ -695,6 +709,9 @@ impl Session {
                     result,
                 } => {
                     if let Ok(fetched) = &result {
+                        if !learnt.contains(&remote) {
+                            learnt.push(remote.clone());
+                        }
                         let ids = fetched.ids.iter().map(|id| Some(id.as_str()));
                         moved.extend(
                             self.heads
@@ -722,6 +739,9 @@ impl Session {
                     let Ok(ids) = result else {
                         continue;
                     };
+                    if !learnt.contains(&remote) {
+                        learnt.push(remote.clone());
+                    }
                     for (base, id) in bases.iter().zip(&ids) {
                         self.trouble(
                             format!("{remote} {base}"),
@@ -755,6 +775,53 @@ impl Session {
             let note = format!("upstream moved: {}", said.join("; "));
             eprintln!("td-agent: {note}");
             self.app.note(note);
+        }
+        for remote in learnt {
+            self.tell_heads(&remote);
+        }
+    }
+
+    /// Of `bases` of `remote`, those the window knows where to find, and
+    /// the commits it last found them at.
+    fn known(&self, remote: &str, bases: &[String]) -> (Vec<String>, Vec<String>) {
+        bases
+            .iter()
+            .filter_map(|base| {
+                let id = self.heads.at(remote, base)?;
+                Some((base.clone(), id.to_string()))
+            })
+            .unzip()
+    }
+
+    /// Tells each running conversation whose workspace names `remote`
+    /// where the window last found its bases there (DESIGN.md §7,
+    /// Keeping current), so its remote-tracking refs follow; one not
+    /// running asks when its process starts, and one whose workspace
+    /// went with its archive lets it go.
+    fn tell_heads(&mut self, remote: &str) {
+        for id in self.supervisor.ids() {
+            let Ok(Some(crate::workspace::Workspace::Repositories(repositories))) =
+                self.state.workspace(&id)
+            else {
+                continue;
+            };
+            let bases: Vec<String> = repositories
+                .entries
+                .iter()
+                .filter(|entry| entry.remote == remote)
+                .map(|entry| entry.base.clone())
+                .collect();
+            let (bases, ids) = self.known(remote, &bases);
+            if !bases.is_empty() {
+                self.supervisor.answer(
+                    &id,
+                    &Down::Heads {
+                        remote: remote.to_string(),
+                        bases,
+                        ids,
+                    },
+                );
+            }
         }
     }
 

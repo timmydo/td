@@ -138,6 +138,7 @@ mod tests {
             archived,
             prepared: Vec::new(),
             removed,
+            tracked: Vec::new(),
         }
     }
 

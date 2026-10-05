@@ -1984,11 +1984,45 @@ base it has seen was at as each fetch, a preparation's or its own,
 last found it, and when a base it knew moves, forward or back, says so
 in a note, `upstream moved: <base> of <remote> is at <commit>`. That
 is a cache of what the store said, blind to what moved while td-agent
-was not running, so it decides nothing for a workspace: the next step
-sets each workspace's remote-tracking refs and tells its conversation
-of a base that moved by comparing the store's commit with the
-conversation's own record of what it was last told. Nothing in a
-workspace changes yet.
+was not running, so it decides nothing for a workspace: a workspace's
+remote-tracking refs follow by comparing the store's commit with its
+conversation's own record (As built (increment 11, remote-tracking
+refs)).
+
+**As built (increment 11, remote-tracking refs).** Once its worktrees
+are checked out, a conversation's process sets each base's
+remote-tracking ref, `refs/remotes/origin/<base>` in the workspace
+repository, to the commit the worktree started at, in a maintenance
+instance (`track`, below), clearing the ref locks a killed run of it
+left, as a checkout does, and records it in `meta`'s `tracked`, a
+remote, a base and a commit each, which only that process writes and
+never from what a jail could have written; a repository whose refs
+cannot be set is not prepared, and is tried again as any preparation
+is. A retried preparation keeps a worktree an earlier run made at the
+base resolved then, but sets the ref to the base now, so a move between
+the two is not said, as the project instructions it records are read
+at the base now. A process with a repository prepared asks the window, at its
+start, where the window last found its bases (`Heads`), and the window
+answers from what it keeps of each fetch and tells every running
+conversation whose workspace names a remote after each fetch of it, a
+preparation's or its own. A conversation not running is told when its
+process next starts, so a base that moved while td-agent was closed is
+caught by the first fetch after. Told a commit other than the one it
+recorded, between turns (one told during a turn waits for its end),
+the process sets the ref there, whatever the jail left in it, records
+it, and logs a notice, `upstream's <base> moved from <commit> to
+<commit> in <remote>: each worktree's refs/remotes/origin/<base> names
+it now`, which the window shows; a base it had no record of, from a
+meta written before, is set and recorded silently. Every ref is set in
+one transaction, or none is, so the record is never half right. A
+failure is logged once for each remote until it says something else or
+the refs are set, and the same commits are not tried again until they
+change or the process starts again, so a lasting failure does not
+start an instance every fetch. A write that would take `meta` past
+what is read back is refused.
+Nothing wakes the conversation, and nothing tells the model yet:
+notices are the log's and the human's, and §3's notifications to the
+model are a later step. Rebasing stays the conversation's own work.
 
 **As built (increment 11, preparation).** Choosing a template that
 names repositories makes its workspace's record at once, in the
@@ -2050,10 +2084,10 @@ the project instructions (§13, As built (increment 11, project
 instructions)); in this step the checkout then runs on the
 conversation process's main thread, so that turn, and any during a
 later preparation, waits behind it too, and the model is told nothing
-of it; rules from the base, the remote-tracking refs, base advances
-told to a conversation and the model's notification are later steps
-(the background fetch itself is As built (increment 11, background
-fetch)). Deleting the conversation removes its
+of it; rules from the base and the model's notification are later
+steps (the background fetch and the remote-tracking refs are As built
+(increment 11, background fetch) and (increment 11, remote-tracking
+refs)). Deleting the conversation removes its
 repository workspace (As built (increment 11, removal on deletion)),
 and archiving it does too (As built (increment 11, removal on
 archiving)).
@@ -2678,14 +2712,15 @@ untracked files, ignored ones aside (past its 64 KiB answer, "more
 than could be counted"), writing no index, and an index lock a killed
 tool left stops nothing; `rev-list --count --exclude=refs/remotes/*
 --all --not BASE...` the commits any ref but a remote-tracking one
-(upstream's, once a later step sets them) reaches that none of the
+(upstream's, which `track` sets) reaches that none of the
 bases do, which td-agent
 passes from its own record, every base of the repository's worktrees;
 it answers `changes N ahead M`, read back as the jail's word, nothing
 more. A workspace
-repository is never fetched into: its remote-tracking refs will be set
-with `update-ref` from the ids the git worker reads in the trusted
-store, whose objects the alternates already reach, so its empty
+repository is never fetched into: its third, `track`, sets each base's
+remote-tracking ref with `update-ref --no-deref` to the commit the git
+worker resolved in the trusted store, whose objects the alternates
+already reach, so its empty
 `shallow` (which makes git call it shallow) matters to no command
 td-agent runs; commit, log, counts and export do not depend on it. The
 live test in `tests/jail.rs` checks a sparse worktree out in a
@@ -4413,6 +4448,18 @@ thread answering a refresh for the window with its bases;
 remotes only, each once with its bases once, none whose fetch is
 pending, and a base moving only from a commit known before; the store
 thread's queue a preparation before queued background fetches.
+For the remote-tracking refs, `src/repo.rs` covers `track` setting a
+ref over what was there, a stale lock stopping a later run but cleared
+by one preparing, its words crossing in both forms and bad words
+refused, a commit the repository lacks refused, and a second base's
+missing commit leaving the first ref as it was; `src/store.rs` `tracked` read
+back, absent as empty, a bad commit refused, and a base's later record
+replacing its earlier; `src/protocol.rs` both `Heads` crossing and a
+base without its commit refused; `tests/processes.rs` a prepared
+repository asking `Heads` and not its store, a recorded commit doing
+nothing, and two remotes failing in turn each said once; and the live test in `tests/jail.rs`
+the ref set and recorded at preparation, and, started again and told
+upstream moved, set there, recorded and said.
 For removal on archiving, `src/store.rs` covers `removed` read back,
 absent as false, refused when not a boolean, kept by unarchiving and by
 a process's own write; `src/ui.rs` a conversation being archived named

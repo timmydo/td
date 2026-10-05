@@ -1086,13 +1086,32 @@ const GRACE: Duration = Duration::from_secs(1);
 /// gave within `GRACE` is its answer. Past `time`, or past `limit`, git
 /// is killed and the readers left to end with whatever it started.
 pub(crate) fn run(command: &mut Command, limit: u64, time: Duration) -> Result<Vec<u8>, Failure> {
+    run_fed(command, None, limit, time)
+}
+
+/// `run`, with `input` on git's standard input, written on a thread so a
+/// git that reads none cannot stall it.
+pub(crate) fn run_fed(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    limit: u64,
+    time: Duration,
+) -> Result<Vec<u8>, Failure> {
     let now = Instant::now();
     let deadline = now.checked_add(time).unwrap_or(now);
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(Failure::Start)?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, &input);
+        });
+    }
     let (tell, heard) = mpsc::channel();
     let mut open = 0;
     if let Some(stdout) = child.stdout.take() {

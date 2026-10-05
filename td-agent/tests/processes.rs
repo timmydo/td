@@ -460,6 +460,141 @@ fn a_conversation_whose_workspace_went_with_its_archive_prepares_nothing() {
     assert!(!scratch.0.join("data").join("ws").exists());
 }
 
+/// A prepared repository's process asks where its bases are rather than
+/// for its store (DESIGN.md §7, Keeping current): told a commit it
+/// recorded, it does nothing; told another, it sets the refs, which
+/// fails here with no jail and is said once however often it is told.
+#[test]
+fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
+    let scratch = Scratch::new("heads");
+    let state = scratch.state();
+    let id = Id::random().unwrap();
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    // Two remotes, so one's failures cannot hide the other's.
+    let (one, two) = (
+        "https://example.org/a/td".to_string(),
+        "https://example.org/a/docs".to_string(),
+    );
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: [&one, &two]
+            .iter()
+            .map(|remote| td_agent::config::Repo {
+                remote: remote.to_string(),
+                base: "main".into(),
+                branch: "agent".into(),
+                sparse: None,
+            })
+            .collect(),
+        shared: None,
+    };
+    let made = td_agent::workspace::repositories(
+        &template,
+        &id,
+        &scratch.0.join("data"),
+        &scratch.0.join("trees"),
+        &[td_agent::git::Admission::parse("example.org").unwrap()],
+        0,
+    )
+    .unwrap();
+    supervisor
+        .create(
+            id.clone(),
+            Role::Conversation,
+            Workspace::Repositories(made.clone()),
+        )
+        .unwrap();
+    let mut heard = Vec::new();
+    until(&mut supervisor, &mut heard, |heard| {
+        heard
+            .iter()
+            .any(|u| matches!(u, Update::Up(Up::Fetch { .. })))
+    });
+    drop(supervisor);
+    let (a, b) = ("a".repeat(40), "b".repeat(40));
+    let (mut conversation, _) =
+        Conversation::open(&state, &id, None, Duration::from_secs(5)).unwrap();
+    for entry in &made.entries {
+        conversation.set_prepared(&entry.repository).unwrap();
+    }
+    conversation
+        .set_tracked(&one, &[("main".into(), a.clone())])
+        .unwrap();
+    drop(conversation);
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless());
+    supervisor.open(id.clone(), None).unwrap();
+    heard.clear();
+    let asked = |heard: &[Update]| -> Vec<String> {
+        heard
+            .iter()
+            .filter_map(|u| match u {
+                Update::Up(Up::Heads { remote, bases }) if *bases == ["main"] => {
+                    Some(remote.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    until(&mut supervisor, &mut heard, |heard| asked(heard).len() == 2);
+    assert_eq!(asked(&heard), [one.clone(), two.clone()]);
+    assert!(!heard
+        .iter()
+        .any(|u| matches!(u, Update::Up(Up::Fetch { .. }))));
+    let told = |remote: &str, id: &str| Down::Heads {
+        remote: remote.to_string(),
+        bases: vec!["main".into()],
+        ids: vec![id.to_string()],
+    };
+    let notices = |heard: &[Update]| -> Vec<String> {
+        heard
+            .iter()
+            .filter_map(|u| match u {
+                Update::Up(Up::Event(e)) => match &e.kind {
+                    Kind::Notice { text } => Some(text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    // Something logged after what is told, so all of it has been heard.
+    let paused = |paused: bool| {
+        move |heard: &[Update]| {
+            heard
+                .iter()
+                .any(|u| matches!(u, Update::Up(Up::Event(e)) if e.kind == Kind::Pause { paused }))
+        }
+    };
+    supervisor.answer(&id, &told(&one, &a));
+    supervisor.answer(&id, &Down::Pause { paused: true });
+    until(&mut supervisor, &mut heard, paused(true));
+    assert!(notices(&heard).is_empty(), "{:?}", notices(&heard));
+    // Setting them fails here, with no jail: each remote's failure is
+    // said once, though they come in turn.
+    supervisor.answer(&id, &told(&one, &b));
+    supervisor.answer(&id, &told(&two, &b));
+    supervisor.answer(&id, &told(&one, &b));
+    supervisor.answer(&id, &told(&two, &b));
+    supervisor.answer(&id, &Down::Pause { paused: false });
+    until(&mut supervisor, &mut heard, paused(false));
+    let notices = notices(&heard);
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    for (notice, remote) in notices.iter().zip([&one, &two]) {
+        assert!(
+            notice.contains(&format!(
+                "remote-tracking refs of {remote} could not be set"
+            )),
+            "{notices:?}"
+        );
+    }
+    drop(supervisor);
+    let (conversation, _) = Conversation::open(&state, &id, None, Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        conversation.meta().tracked.first().map(|t| t.id.as_str()),
+        Some(a.as_str())
+    );
+}
+
 /// An interrupt ends a turn waiting for its stores, as one to be asked
 /// again, whether it came with the message or after.
 #[test]

@@ -517,6 +517,94 @@ fn a_repository_conversation_prepares_its_workspace() {
         recorded.first().map(|r| (&r.checkout, &r.base)),
         Some((&entry.checkout, &base))
     );
+    // The base's remote-tracking ref is set where the worktree started,
+    // and recorded.
+    let origin = || {
+        plain(
+            &entry.repository,
+            &["rev-parse", "refs/remotes/origin/main"],
+        )
+        .trim()
+        .to_string()
+    };
+    assert_eq!(origin(), base);
+    let tracked = |conversation: &Conversation| {
+        conversation
+            .meta()
+            .tracked
+            .iter()
+            .map(|t| (t.remote.clone(), t.base.clone(), t.id.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        tracked(&conversation),
+        [(entry.remote.clone(), "main".to_string(), base.clone())]
+    );
+    drop(conversation);
+    // Upstream moves; started again, the process asks where its base is,
+    // and told, sets the ref there and says so.
+    plain(&up, &["commit", "--quiet", "--allow-empty", "-m", "two"]);
+    plain(
+        &entry.store,
+        &["fetch", "--quiet", &from, "+refs/heads/*:refs/heads/*"],
+    );
+    let moved = plain(&entry.store, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let keyless = Down::Setup {
+        key: Err("no API key".into()),
+        client: td_agent::config::Client::default(),
+    };
+    let mut supervisor = Supervisor::new(PROGRAM.into(), state.root().to_path_buf(), keyless)
+        .env(jail::JAIL_VAR, named(jail::JAIL_VAR))
+        .env(jail::TXT_VAR, named(jail::TXT_VAR));
+    supervisor.open(id.clone(), None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut said = None;
+    while said.is_none() {
+        assert!(Instant::now() < deadline, "no notice came");
+        for (_, update) in supervisor.poll() {
+            match update {
+                Update::Up(Up::Fetch { .. }) => panic!("a prepared repository fetched again"),
+                Update::Up(Up::Heads { remote, bases }) => {
+                    assert_eq!(bases, ["main"]);
+                    supervisor.answer(
+                        &id,
+                        &Down::Heads {
+                            remote,
+                            bases,
+                            ids: vec![moved.clone()],
+                        },
+                    );
+                }
+                Update::Up(Up::Event(event)) => {
+                    // Its log's older notices come again as it opens.
+                    match event.kind {
+                        Kind::Notice { text } if text.contains("upstream") => said = Some(text),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let said = said.unwrap();
+    assert!(
+        said.contains(&format!(
+            "main moved from {} to {}",
+            &base[..12],
+            &moved[..12]
+        )),
+        "{said}"
+    );
+    assert_eq!(origin(), moved);
+    drop(supervisor);
+    let (conversation, _) = Conversation::open(&state, &id, None, Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        tracked(&conversation),
+        [(entry.remote.clone(), "main".to_string(), moved.clone())]
+    );
     drop(conversation);
     // Asked before a deletion, the worktree reports nothing to lose,
     // then a change and a commit; removed, the tree and the repository
