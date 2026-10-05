@@ -57,6 +57,7 @@ pub mod picker;
 pub mod post;
 pub mod prompt;
 pub mod protocol;
+pub mod removal;
 pub mod repo;
 pub mod review;
 #[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]

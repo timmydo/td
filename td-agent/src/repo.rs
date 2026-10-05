@@ -36,6 +36,9 @@ const CLEANUP_TIME: Duration = Duration::from_secs(30);
 /// before the task has cleaned up.
 pub(crate) const TASK_TIME: Duration =
     CHECKOUT_TIME.saturating_add(CLEANUP_TIME.saturating_add(Duration::from_secs(60)));
+/// How long a survey's git may take in all, and its instance.
+const SURVEY_GIT_TIME: Duration = Duration::from_secs(240);
+pub(crate) const SURVEY_TIME: Duration = SURVEY_GIT_TIME.saturating_add(Duration::from_secs(60));
 /// The word a maintenance instance's entry is started with.
 pub const MAINTAIN: &str = "maintain";
 
@@ -419,6 +422,60 @@ pub enum Task {
         branch: String,
         base: String,
     },
+    /// Says what removing the worktree would lose (DESIGN.md §7,
+    /// Archiving and deleting): how many of its files are changed or
+    /// untracked, and how many commits reachable from any ref of the
+    /// repository (every worktree's `HEAD`, branches, tags, the stash)
+    /// are in none of `bases`, the commits its worktrees started at. It
+    /// writes nothing.
+    Survey {
+        git: PathBuf,
+        repository: PathBuf,
+        id: String,
+        checkout: PathBuf,
+        bases: Vec<String>,
+    },
+}
+
+/// A survey's answer, read back outside the instance: what the
+/// workspace's own git reported, which the jail controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Survey {
+    /// Files changed or untracked; none when more than git's answer
+    /// could list.
+    pub changes: Option<u64>,
+    /// Commits not in the base.
+    pub ahead: u64,
+}
+
+impl Survey {
+    /// What the task says: `changes <n|many> ahead <n>`.
+    fn say(&self) -> String {
+        let changes = self
+            .changes
+            .map_or_else(|| "many".to_string(), |n| n.to_string());
+        format!("changes {changes} ahead {}", self.ahead)
+    }
+
+    pub fn parse(said: &str) -> Result<Self, String> {
+        let words: Vec<&str> = said.split(' ').collect();
+        let number = |word: &str| word.parse::<u64>().ok();
+        match words.as_slice() {
+            ["changes", changes, "ahead", ahead] => Ok(Self {
+                changes: match *changes {
+                    "many" => None,
+                    n => Some(number(n).ok_or_else(|| format!("a survey said {said:?}"))?),
+                },
+                ahead: number(ahead).ok_or_else(|| format!("a survey said {said:?}"))?,
+            }),
+            _ => Err(format!("a survey said {said:?}")),
+        }
+    }
+
+    /// Whether removing the worktree loses nothing it reported.
+    pub fn clean(&self) -> bool {
+        self.changes == Some(0) && self.ahead == 0
+    }
 }
 
 impl Task {
@@ -441,6 +498,22 @@ impl Task {
                 branch.into(),
                 base.into(),
             ],
+            Self::Survey {
+                git,
+                repository,
+                id,
+                checkout,
+                bases,
+            } => [
+                "survey".into(),
+                git.into(),
+                repository.into(),
+                id.into(),
+                checkout.into(),
+            ]
+            .into_iter()
+            .chain(bases.iter().map(OsString::from))
+            .collect(),
         }
     }
 
@@ -464,8 +537,22 @@ impl Task {
                     base: base.clone(),
                 })
             }
+            [word, git, repository, id, checkout, bases @ ..]
+                if word == "survey" && !bases.is_empty() && bases.len() <= MAX_WORKTREES =>
+            {
+                if let Some(base) = bases.iter().find(|base| !git::object_id(base)) {
+                    return Err(format!("{base:?} is not a full commit id"));
+                }
+                Ok(Self::Survey {
+                    git: absolute(git)?,
+                    repository: absolute(repository)?,
+                    id: worktree_id(id)?.into(),
+                    checkout: absolute(checkout)?,
+                    bases: bases.to_vec(),
+                })
+            }
             _ => Err(
-                "usage: td-agent maintain checkout GIT REPOSITORY ID CHECKOUT BRANCH BASE".into(),
+                "usage: td-agent maintain checkout GIT REPOSITORY ID CHECKOUT BRANCH BASE, or survey GIT REPOSITORY ID CHECKOUT BASE...".into(),
             ),
         }
     }
@@ -552,6 +639,62 @@ impl Task {
                     return Err(said("checking out", &e));
                 }
                 Ok(format!("{branch} checked out at {at}"))
+            }
+            Self::Survey {
+                git,
+                repository,
+                id,
+                checkout,
+                bases,
+            } => {
+                let now = Instant::now();
+                let deadline = now.checked_add(SURVEY_GIT_TIME).unwrap_or(now);
+                let run = |args: &[&str]| {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    git::run(
+                        jailed(git, repository, id, checkout).args(args),
+                        MAX_SAID,
+                        left,
+                    )
+                };
+                // `--no-optional-locks`: it only reads, so writes no
+                // index, as a refresh would.
+                let changes = match run(&[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--no-renames",
+                    "--ignore-submodules=none",
+                ]) {
+                    Ok(listed) => Some(
+                        listed
+                            .split(|byte| *byte == 0)
+                            .filter(|entry| !entry.is_empty())
+                            .count() as u64,
+                    ),
+                    Err(Failure::TooLong) => None,
+                    Err(e) => return Err(said("listing its changes", &e)),
+                };
+                // Remote-tracking refs are upstream's, not the work's.
+                let counted = run(&[
+                    "rev-list",
+                    "--count",
+                    "--exclude=refs/remotes/*",
+                    "--all",
+                    "--not",
+                ]
+                .into_iter()
+                .chain(bases.iter().map(String::as_str))
+                .chain(["--"])
+                .collect::<Vec<&str>>())
+                .map_err(|e| said("counting its commits", &e))?;
+                let ahead = String::from_utf8(counted)
+                    .ok()
+                    .and_then(|said| said.trim().parse::<u64>().ok())
+                    .ok_or("counting its commits: git said no number")?;
+                Ok(Survey { changes, ahead }.say())
             }
         }
     }
@@ -1148,7 +1291,169 @@ pub(crate) mod tests {
 
     fn task_git(task: &Task) -> PathBuf {
         match task {
-            Task::Checkout { git, .. } => git.clone(),
+            Task::Checkout { git, .. } | Task::Survey { git, .. } => git.clone(),
         }
+    }
+
+    /// A survey counts changed and untracked files, and commits from
+    /// `HEAD` or any branch not in the base, writing nothing; its words
+    /// cross and are read back.
+    #[test]
+    fn a_survey_counts_what_removing_the_worktree_would_lose() {
+        if !git::tests::have_git() {
+            return;
+        }
+        let scratch = Scratch::new("repo-survey");
+        let (store, base) = store_fixture(&scratch.0);
+        let repository = scratch.0.join("ws/w/r.git");
+        let checkout = scratch.0.join("tree/w/r");
+        let identity = Identity {
+            name: Some("Human".into()),
+            email: Some("h@example.org".into()),
+        };
+        create(&repository, &store, &identity).unwrap();
+        add_worktree(&repository, &worktree(&checkout, None)).unwrap();
+        let found = String::from_utf8(
+            Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let git = fs::canonicalize(found.trim()).unwrap();
+        Task::Checkout {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            branch: "agent/one".into(),
+            base: base.clone(),
+        }
+        .run()
+        .unwrap();
+        let survey = Task::Survey {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            bases: vec![base.clone()],
+        };
+        let words: Vec<String> = survey
+            .args()
+            .iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(Task::parse(&words).unwrap(), survey);
+        let read = || Survey::parse(&survey.run().unwrap()).unwrap();
+        assert!(read().clean(), "{:?}", read());
+        // A changed file and an untracked one; a lock a killed tool left
+        // stops nothing.
+        fs::write(checkout.join("top"), "changed\n").unwrap();
+        fs::write(checkout.join("new"), "new\n").unwrap();
+        let lock = repository.join("worktrees/r/index.lock");
+        fs::write(&lock, "").unwrap();
+        assert_eq!(
+            read(),
+            Survey {
+                changes: Some(2),
+                ahead: 0
+            }
+        );
+        fs::remove_file(&lock).unwrap();
+        // Committed, then a second branch past it: three commits.
+        let mut commit = jailed(&git, &repository, "r", &checkout);
+        git::run(
+            commit.args(["commit", "--quiet", "-a", "-m", "two"]),
+            MAX_SAID,
+            CHECKOUT_TIME,
+        )
+        .unwrap();
+        let mut branch = jailed(&git, &repository, "r", &checkout);
+        git::run(
+            branch.args(["checkout", "--quiet", "-b", "agent/side"]),
+            MAX_SAID,
+            CHECKOUT_TIME,
+        )
+        .unwrap();
+        fs::write(checkout.join("new"), "newer\n").unwrap();
+        let mut more = jailed(&git, &repository, "r", &checkout);
+        git::run(more.args(["add", "new"]), MAX_SAID, CHECKOUT_TIME).unwrap();
+        let mut side = jailed(&git, &repository, "r", &checkout);
+        git::run(
+            side.args(["commit", "--quiet", "-m", "three"]),
+            MAX_SAID,
+            CHECKOUT_TIME,
+        )
+        .unwrap();
+        // Back on the first branch: the side's commit is counted only as
+        // a branch's.
+        let mut back = jailed(&git, &repository, "r", &checkout);
+        git::run(
+            back.args(["checkout", "--quiet", "agent/one"]),
+            MAX_SAID,
+            CHECKOUT_TIME,
+        )
+        .unwrap();
+        assert_eq!(
+            read(),
+            Survey {
+                changes: Some(0),
+                ahead: 2
+            }
+        );
+        let git_in = |args: &[&str]| {
+            let mut command = jailed(&git, &repository, "r", &checkout);
+            git::run(command.args(args), MAX_SAID, CHECKOUT_TIME).unwrap()
+        };
+        // A stash is work: its two commits count, the tree clean.
+        fs::write(checkout.join("top"), "stashed\n").unwrap();
+        git_in(&["stash", "--quiet"]);
+        assert_eq!(
+            read(),
+            Survey {
+                changes: Some(0),
+                ahead: 4
+            }
+        );
+        git_in(&["stash", "drop", "--quiet"]);
+        // A tag keeps a branch's commit when the branch goes.
+        git_in(&["tag", "keep", "agent/side"]);
+        git_in(&["branch", "--quiet", "-D", "agent/side"]);
+        assert_eq!(read().ahead, 2);
+        git_in(&["tag", "-d", "keep"]);
+        assert_eq!(read().ahead, 1);
+        // Every base its repository's worktrees started at is upstream's:
+        // a commit in any is not counted.
+        let two = String::from_utf8(git_in(&["rev-parse", "agent/one"]))
+            .unwrap()
+            .trim()
+            .to_string();
+        let both = Task::Survey {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            bases: vec![base.clone(), two],
+        };
+        let words_both: Vec<String> = both
+            .args()
+            .iter()
+            .map(|w| w.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(Task::parse(&words_both).unwrap(), both);
+        assert_eq!(Survey::parse(&both.run().unwrap()).unwrap().ahead, 0);
+        assert!(Survey::parse("changes many ahead 0")
+            .unwrap()
+            .changes
+            .is_none());
+        for bad in ["", "changes 1", "changes x ahead 0", "changes 1 ahead -1"] {
+            assert!(Survey::parse(bad).is_err(), "{bad:?}");
+        }
+        let mut words = words;
+        if let Some(last) = words.last_mut() {
+            *last = "main".into();
+        }
+        assert!(Task::parse(&words).is_err());
     }
 }

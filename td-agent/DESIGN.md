@@ -2027,9 +2027,9 @@ instructions)); in this step the checkout then runs on the
 conversation process's main thread, so that turn, and any during a
 later preparation, waits behind it too, and the model is told nothing
 of it; rules from the base, background fetches and the model's
-notification are later steps, as is the cleanup:
-deleting the conversation leaves its repository workspace in place,
-which the deletion question says.
+notification are later steps. Deleting the conversation removes its
+repository workspace (As built (increment 11, removal on deletion));
+archiving it keeps it, for now.
 
 **Empty and directory workspaces.** The Empty template makes a scratch
 workspace under the jail directory, for a general-assistant conversation
@@ -2098,6 +2098,62 @@ remove`, which would run git over jail-written content. The store is
 left alone. An unarchived conversation whose repository workspace was
 removed keeps its log; its file, shell and git tools then refuse,
 saying the workspace went with the archive.
+
+**As built (increment 11, removal on deletion).** Deleting a repository
+workspace's conversation removes the workspace with it; archiving one
+keeps it, until a later step makes a conversation whose workspace went
+with its archive refuse its tools, as above. The deletion question says
+what goes, that each worktree is asked first, and that files git
+ignores, such as build output, are not asked about. Once it is
+confirmed, the window stops the conversation's processes, as a
+deletion does, and holds the conversation while its worktrees are
+asked: the list says `deleting`, it does not open, previous and next
+pass over it, and the post delivers nothing to it. On a thread, each
+worktree of a repository `meta` records prepared is surveyed in a
+maintenance instance the window starts, its conversation having none
+left (`survey`, below), within ten minutes for the whole survey, a
+worktree not reached by then said not asked: how many of its files are
+changed or untracked, and how many commits reachable from any ref of
+its repository (every worktree's `HEAD`, branches, tags, the stash) are
+in none of the commits its repository's worktrees started at, which the
+conversation recorded with its project instructions. Until a push
+exists (increment 14) those commits are all a worktree's work can be
+compared against. A worktree never prepared was bound by no instance
+but maintenance, so is not asked; one whose checkout finished but was
+never recorded prepared, and anything of the human's in the workspace
+tree beside the checkouts, go unasked. When every worktree reports
+nothing, the conversation is deleted and the workspace removed at once;
+when any reports something, or cannot be asked (no jail, no recorded
+commit, a failed instance, the time spent), a loss card lists each such
+worktree by checkout and branch, a line each cut to 1 KiB, with what it
+reported (its repository's commits said once) or why it could not be
+asked, says that the answers come from git inside the workspace, which
+the model could have changed, and asks; it is asked until answered, set
+aside and asked again as a tool's card is, and said once when it cannot
+be shown. `Delete anyway` deletes both; `Cancel` keeps both, the
+human's messages it had not taken held for it again (in memory, as an
+archive holds them, so lost if the window quits meanwhile). Before the
+conversation is deleted, the workspace tree and the data directory's
+`ws/<name>/`, which holds its repositories, are each renamed beside
+itself to `.deleting-<name>` (a random suffix when an earlier removal
+left that), so a crash past that point leaves nothing the next start's
+sweep does not take; renamed back if the deletion fails, they are
+otherwise removed on a thread by the walk that follows no link. A
+crash after the renames and before the deletion leaves the
+conversation with its workspace swept, its repositories still recorded
+prepared, so its tools fail on the missing paths until it is deleted
+again, which the human had chosen; one whose renaming back fails is
+swept too, which is said. A
+directory not named for the workspace is left and said. At its start
+the window sweeps the workspace root and `ws/` of directories with
+names a removal gives (`.deleting-`, a workspace's name, ending in
+eight hex digits, and perhaps a suffix), since the root is the human's
+to name; a root since
+renamed is not swept. A conversation whose record cannot be read is
+deleted as one with no workspace, any it had left and said. The
+conversation's jail directory, with the instances' home, goes with the
+conversation as before; the store stays. Archiving a conversation being
+deleted is refused.
 
 **As built (archiving).** `meta` holds `archived`, absent and false in
 one written before. Only the window writes it, under the conversation's
@@ -2541,7 +2597,7 @@ bind, run with a cleared environment, `GIT_DIR` the linked worktree's
 directory and `GIT_WORK_TREE` its checkout, no system or global
 configuration, `HOME` naming no directory, and hooks, fsmonitor,
 attributes and excludes files, submodules, every protocol and auto gc
-off on its command line. Its one task so far, `checkout`, trusts
+off on its command line. Its first task, `checkout`, trusts
 nothing in the id directory, which is the jail's to write once it is
 in place: it refuses one holding an `index`, makes the branch at the
 base with `update-ref` and an empty old value, sets `HEAD` to it, and
@@ -2556,7 +2612,18 @@ which it cannot itself check: so it clears the locks a killed git left
 `packed-refs.lock`) and keeps a branch already there, which only an
 earlier run of it, cut short, made, checking that out instead of the
 base; that one worktree's branch is no other's is the workspace
-record's to hold, which refuses a branch named twice for one remote. A workspace
+record's to hold, which refuses a branch named twice for one remote.
+Its second, `survey`, writes nothing: `git --no-optional-locks status
+--porcelain=v1 -z --untracked-files=all` counts the changed and
+untracked files, ignored ones aside (past its 64 KiB answer, "more
+than could be counted"), writing no index, and an index lock a killed
+tool left stops nothing; `rev-list --count --exclude=refs/remotes/*
+--all --not BASE...` the commits any ref but a remote-tracking one
+(upstream's, once a later step sets them) reaches that none of the
+bases do, which td-agent
+passes from its own record, every base of the repository's worktrees;
+it answers `changes N ahead M`, read back as the jail's word, nothing
+more. A workspace
 repository is never fetched into: its remote-tracking refs will be set
 with `update-ref` from the ids the git worker reads in the trusted
 store, whose objects the alternates already reach, so its empty
@@ -2623,7 +2690,8 @@ two places, and the line between them is the design. Outside a jail it
 is the window process's, which holds the shared repositories; a
 maintenance instance is started by the conversation process whose work
 needs it, or for workspace maintenance no turn asks for by the
-workspace's own conversation process (§2).
+workspace's own conversation process (§2); the survey before a
+deletion, whose conversation has no process left, by the window.
 
 - **Outside any jail**, only on repositories no jail can write: cloning
   and fetching the store, importing into and pushing from the publish
@@ -4260,6 +4328,26 @@ ending only after it, with its instructions recorded though the
 checkout then fails, and an interrupt end a waiting turn, sent with
 its message or after; the live test finds them recorded for the
 prepared worktree.
+
+For removal on deletion, `src/repo.rs` covers a survey's words
+crossing with one base and two, a clean worktree, a changed and an
+untracked file counted with an index lock left in place, commits on
+`HEAD`, on a branch `HEAD` is not on, in a stash and kept by a tag
+counted, a commit in a second base not, and an answer or a base that
+is not one refused; `src/removal.rs` what would be lost listed a
+worktree a line (changes, commits once a repository, too many to
+count, could not be asked, cut to its bound) and nothing for a clean
+one, the tree and repositories' directory renamed away then put back,
+or removed, a link not followed, a taken name passed over, a directory
+not named for the workspace left, removing again no matter, and a
+sweep taking a leftover but not the human's `.deleting-notes`, with
+the names a sweep knows; `src/ui.rs` a conversation being deleted
+closed, refusing to open, given nothing by the post and named
+`deleting`, and its loss card, Cancel focused, set aside with the
+keyboard and asked again, Cancel keeping and the action deleting. The
+live test in `tests/jail.rs` surveys the worktree it prepared in a
+real maintenance instance, clean, then with an untracked file, then
+with a commit, and removes the workspace, the store left.
 
 For the workspace card, `src/card.rs` covers the recommendation first,
 the worktrees of a remote at one commit grouped, each saying whether

@@ -132,6 +132,8 @@ pub struct Card {
 
 /// What the list says of a conversation that asks the human.
 pub const ASKS: &str = "asks you";
+/// And of one being deleted whose workspace is being asked.
+pub const CLOSING: &str = "deleting";
 /// How long a card that came unbidden ignores keys and presses, so that
 /// what the human was typing or clicking does not decide it.
 const CARD_SETTLE: Duration = Duration::from_millis(750);
@@ -263,6 +265,9 @@ pub enum Request {
     /// Read what this conversation's workspace card shows; the session
     /// answers through `show_workspace` (DESIGN.md §7).
     Workspace(Id),
+    /// The human answered the loss card of conversation `id`: delete it
+    /// and its workspace (`remove`), or keep both (DESIGN.md §7).
+    Remove { id: Id, remove: bool },
     /// The human admitted `remotes` on the admission card, so template
     /// `template`'s workspace can be made (DESIGN.md §7).
     Admit {
@@ -593,6 +598,15 @@ pub struct App {
     /// An admission card set aside when the window lost the keyboard:
     /// its template and remotes, asked again when it comes back.
     admission: Option<(String, Vec<String>)>,
+    /// Conversations being deleted whose workspaces are being asked what
+    /// removing them would lose: none opens or takes a message meanwhile.
+    closing: Vec<Id>,
+    /// Loss cards not yet answered, each conversation's with its title
+    /// and what its workspace reported: asked until answered, since the
+    /// conversation stays stopped until then.
+    removals: Vec<(Id, String, Vec<String>)>,
+    /// The loss card that could not be shown, said once.
+    removal_trouble: Option<Id>,
     /// The menu's revision: it is built again, from the state of the
     /// moment, each time it opens.
     menu_revision: u64,
@@ -699,6 +713,9 @@ impl App {
             settle: CARD_SETTLE,
             card_trouble: None,
             admission: None,
+            closing: Vec::new(),
+            removals: Vec::new(),
+            removal_trouble: None,
             menu_revision: 1,
             menu_row: None,
             credit: None,
@@ -773,7 +790,7 @@ impl App {
                     word => word,
                 }
                 .to_string(),
-                failed: row.state == RowState::Failed,
+                failed: row.state == RowState::Failed || self.closing.contains(&row.id),
                 archived: row.archived,
             })
             .collect()
@@ -953,7 +970,46 @@ impl App {
     /// The most recently active conversation's id, archived ones aside,
     /// when the list holds any.
     pub fn most_recent(&self) -> Option<Id> {
-        self.rows.iter().find(|r| !r.archived).map(|r| r.id.clone())
+        self.rows
+            .iter()
+            .find(|r| !r.archived && !self.closing.contains(&r.id))
+            .map(|r| r.id.clone())
+    }
+
+    /// Conversation `id` is being deleted, its workspace asked what
+    /// removing it would lose, or no longer: while it is, it does not
+    /// open, takes no message, and is closed when it was open.
+    pub fn set_closing(&mut self, id: &Id, closing: bool) {
+        self.closing.retain(|other| other != id);
+        if closing {
+            self.closing.push(id.clone());
+            self.background_turns.retain(|(of, _)| of != id);
+            if let Some(row) = self.rows.iter_mut().find(|r| &r.id == id) {
+                row.state = RowState::Closed;
+            }
+            if self.active.as_ref() == Some(id) {
+                self.active = None;
+                self.clear_transcript();
+            }
+        } else {
+            self.removals.retain(|(of, _, _)| of != id);
+        }
+        self.refresh_list();
+        self.touch();
+    }
+
+    /// Whether conversation `id` is being deleted, its workspace asked.
+    pub fn closing(&self, id: &Id) -> bool {
+        self.closing.contains(id)
+    }
+
+    /// Asks whether conversation `id`, titled `title`, is deleted though
+    /// its workspace reports `lost`: a card, asked when nothing else is
+    /// modal and until answered (`Request::Remove`).
+    pub fn ask_removal(&mut self, id: Id, title: String, lost: Vec<String>) {
+        self.removals.retain(|(of, _, _)| of != &id);
+        self.removals.push((id, title, lost));
+        self.offer();
     }
 
     /// The conversation the open menu is the row menu of.
@@ -1185,7 +1241,9 @@ impl App {
                     conversation: of,
                     call: n,
                 } => of == conversation && call.is_none_or(|call| call == *n),
-                confirm::Purpose::Delete(_) | confirm::Purpose::Admit { .. } => false,
+                confirm::Purpose::Delete(_)
+                | confirm::Purpose::Admit { .. }
+                | confirm::Purpose::Remove(_) => false,
             });
         if shown {
             self.close_confirm();
@@ -1204,6 +1262,36 @@ impl App {
         }
         if let Some((template, remotes)) = self.admission.take() {
             return self.ask_admission(template, remotes);
+        }
+        if let Some((id, title, lost)) = self.removals.first().cloned() {
+            self.cancel_pointer();
+            self.press = None;
+            self.confirm_revision = self.confirm_revision.wrapping_add(1);
+            match Confirm::remove(
+                self.surface,
+                body(self.surface),
+                id.clone(),
+                &title,
+                &lost,
+                self.confirm_revision,
+            ) {
+                Ok(confirm) => {
+                    self.confirm = Some(confirm);
+                    self.card_shown = Some(Instant::now());
+                    self.removal_trouble = None;
+                    self.apply_focus();
+                    self.touch();
+                }
+                Err(e) => {
+                    if self.removal_trouble.as_ref() != Some(&id) {
+                        self.removal_trouble = Some(id);
+                        self.note(format!(
+                            "the loss card for {title:?} cannot be shown ({e}): make the window larger to answer it; until then it is neither deleted nor opened"
+                        ));
+                    }
+                }
+            }
+            return;
         }
         let Some(card) = self
             .active
@@ -2182,6 +2270,12 @@ impl App {
                     // when there is room (`offer`).
                     confirm::Purpose::Approve { .. } => "the window is now too small for the card, which waits until there is room for it: nothing was decided".to_string(),
                     confirm::Purpose::Delete(_) => "the window is now too small for the question, which is closed: nothing was deleted".to_string(),
+                    // Asked again when there is room (`offer`), which says
+                    // nothing more meanwhile.
+                    confirm::Purpose::Remove(id) => {
+                        self.removal_trouble = Some(id.clone());
+                        "the window is now too small for the loss card, which waits until there is room for it: nothing was deleted".to_string()
+                    }
                 };
                 self.close_confirm();
                 self.note(said);
@@ -2290,7 +2384,7 @@ impl App {
         let live: Vec<&Id> = self
             .rows
             .iter()
-            .filter(|r| !r.archived)
+            .filter(|r| !r.archived && !self.closing.contains(&r.id))
             .map(|r| &r.id)
             .collect();
         let at = self
@@ -2315,6 +2409,19 @@ impl App {
                 row.title
             );
             // The list's selection goes back to the open one.
+            self.list.select(self.shown_active(), false);
+            self.touch();
+            return self.note(said);
+        }
+        if let Some(row) = self
+            .rows
+            .iter()
+            .find(|r| r.id == id && self.closing.contains(&id))
+        {
+            let said = format!(
+                "{:?} is being deleted: its workspace is being asked what removing it would lose",
+                row.title
+            );
             self.list.select(self.shown_active(), false);
             self.touch();
             return self.note(said);
@@ -3216,7 +3323,9 @@ impl App {
         // what was there before is not a decision.
         let settling = matches!(
             purpose,
-            confirm::Purpose::Approve { .. } | confirm::Purpose::Admit { .. }
+            confirm::Purpose::Approve { .. }
+                | confirm::Purpose::Admit { .. }
+                | confirm::Purpose::Remove(_)
         ) && self
             .card_shown
             .is_some_and(|shown| shown.elapsed() < self.settle);
@@ -3251,7 +3360,12 @@ impl App {
                         "no conversation from template {template:?}: its remotes were not admitted"
                     )),
                     confirm::Purpose::Delete(_) => {}
+                    confirm::Purpose::Remove(id) => self.answer_removal(id, false),
                 }
+                self.close_confirm();
+            }
+            confirm::Reply::Confirmed(confirm::Purpose::Remove(id)) => {
+                self.answer_removal(id, true);
                 self.close_confirm();
             }
             confirm::Reply::Confirmed(confirm::Purpose::Delete(id)) => {
@@ -3267,6 +3381,13 @@ impl App {
                 self.requests.push(Request::Admit { template, remotes });
             }
         }
+    }
+
+    /// The human's answer to conversation `id`'s loss card, sent and the
+    /// card forgotten.
+    fn answer_removal(&mut self, id: Id, remove: bool) {
+        self.removals.retain(|(of, _, _)| of != &id);
+        self.requests.push(Request::Remove { id, remove });
     }
 
     /// Asks whether `remotes`, which template `template` names and no
@@ -3767,6 +3888,8 @@ impl App {
         };
         let text = match column {
             0 => row.title.as_str(),
+            1 if self.removals.iter().any(|(of, _, _)| of == &row.id) => ASKS,
+            1 if self.closing.contains(&row.id) => CLOSING,
             1 if self.cards.iter().any(|c| c.conversation == row.id) => ASKS,
             1 => row.word(),
             _ => self.labels.get(index).map_or("", String::as_str),
@@ -6173,6 +6296,74 @@ pub mod tests {
         app.set_key_path(Some(PATH.into()));
         app.open_key_dialog();
         assert!(app.picker().is_none() && app.dialog().is_some());
+    }
+
+    /// A conversation being deleted while its workspace is asked neither
+    /// opens nor takes a message, and the list says so; what its workspace
+    /// reports is asked on a loss card, Cancel focused, until answered:
+    /// set aside when the window loses the keyboard and asked again when
+    /// it comes back, Cancel keeping both, the action deleting both.
+    #[test]
+    fn a_deletion_that_would_lose_work_is_asked_until_answered() {
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        app.set_closing(&id(1), true);
+        assert!(app.active().is_none(), "the open one is closed");
+        assert!(app.closing(&id(1)));
+        assert_eq!(app.most_recent(), Some(id(3)));
+        let entry = app.directory().into_iter().find(|e| e.id == id(1)).unwrap();
+        assert!(entry.failed, "nothing is delivered to it meanwhile");
+        let index = app.rows().iter().position(|r| r.id == id(1)).unwrap();
+        assert_eq!(app.cell(index, 1).text(), CLOSING);
+        // Previous and next pass over it: above the next, it is not.
+        app.set_active(id(3));
+        key(&mut app, "C-PageUp");
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().is_none_or(|n| !n.contains("is being deleted")));
+        app.open(id(1));
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().unwrap().contains("is being deleted"));
+        let lost =
+            vec!["/w/td-1/td (branch td-agent/td-1): 2 changed or untracked files".to_string()];
+        app.ask_removal(id(1), "title 1".into(), lost.clone());
+        let asked = |app: &App| matches!(app.confirm().map(Confirm::purpose), Some(confirm::Purpose::Remove(of)) if *of == id(1));
+        assert!(asked(&app));
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        let shown = text(&app);
+        assert!(shown.contains(confirm::REMOVE_TITLE), "{shown}");
+        assert!(shown.contains("2 changed or untracked files"), "{shown}");
+        assert_eq!(app.cell(index, 1).text(), ASKS);
+        // Set aside with the keyboard, and asked again when it is back.
+        app.input(Input::Focus(false), &mut NoClipboard);
+        assert!(app.confirm().is_none());
+        app.input(Input::Focus(true), &mut NoClipboard);
+        assert!(asked(&app));
+        // Cancel keeps both.
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Remove {
+                id: id(1),
+                remove: false
+            }]
+        );
+        assert!(app.confirm().is_none());
+        // Asked again, the action deletes both.
+        app.ask_removal(id(1), "title 1".into(), lost);
+        key(&mut app, "Tab");
+        assert_eq!(app.confirm().unwrap().focus(), "remove");
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Remove {
+                id: id(1),
+                remove: true
+            }]
+        );
+        app.set_closing(&id(1), false);
+        assert!(!app.closing(&id(1)));
+        app.open(id(1));
+        assert_eq!(app.take_requests(), [Request::Open(id(1))]);
     }
 
     /// A template's remotes no admission covers are asked about on a

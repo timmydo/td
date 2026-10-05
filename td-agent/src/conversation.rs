@@ -1391,13 +1391,8 @@ impl Session {
             )?;
         }
         let dir = crate::workspace::jail_dir(&StateDir::at(self.state.clone()), id);
-        let policy = crate::jail::Policy {
-            home: dir.join("maintenance"),
-            checkouts: entries.iter().map(|entry| entry.checkout.clone()).collect(),
-            repositories: vec![repository.clone()],
-            objects: vec![first.store.join("objects")],
-            ..crate::jail::Policy::default()
-        };
+        let policy =
+            crate::workspace::maintenance(&dir, entries).ok_or("no worktree to check out")?;
         for (entry, base) in entries.iter().zip(&fetched.ids) {
             let index = repository.join("worktrees").join(&entry.id).join("index");
             if std::fs::symlink_metadata(&index).is_ok() {

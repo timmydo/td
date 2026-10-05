@@ -32,6 +32,9 @@ pub enum Purpose {
         template: String,
         remotes: Vec<String>,
     },
+    /// Deleting this conversation though its repository workspace
+    /// reports work that would be lost (DESIGN.md §7).
+    Remove(Id),
 }
 
 /// What an input came to.
@@ -57,6 +60,9 @@ pub const ALLOW: &str = "Allow";
 /// The admission card's title and its action's label.
 pub const ADMIT_TITLE: &str = "Admit remotes";
 pub const ADMIT: &str = "Admit";
+/// The loss card's title and its action's label.
+pub const REMOVE_TITLE: &str = "Delete and lose work";
+pub const REMOVE: &str = "Delete anyway";
 
 /// The open question: what it is for and the dialog.
 pub struct Confirm {
@@ -79,9 +85,8 @@ fn worked(workspace: Option<&Workspace>) -> String {
             "The directory it works in, {}, is yours and stays.",
             directory.display()
         ),
-        // Its cleanup is a later step of increment 11 (DESIGN.md §7).
         Some(Workspace::Repositories(repositories)) => format!(
-            "Its repository workspace, made from template {}, stays for now: its worktrees in {} and its repositories are not yet removed with it.",
+            "Its repository workspace, made from template {}, is removed with it: its worktrees in {} and its repositories. td-agent first asks each worktree what removing it would lose; a changed or untracked file, or a commit on a branch, tag or stash that is not in a commit its worktrees started at, is listed and asked about again. Files git ignores, such as build output, are not asked about.",
             repositories.template,
             repositories
                 .tree()
@@ -97,7 +102,7 @@ fn worked(workspace: Option<&Workspace>) -> String {
 fn place(surface: Surface, body: Rect, purpose: &Purpose) -> Rect {
     let (columns, rows) = match purpose {
         Purpose::Delete(_) => (64, 10),
-        Purpose::Approve { .. } | Purpose::Admit { .. } => (100, 24),
+        Purpose::Approve { .. } | Purpose::Admit { .. } | Purpose::Remove(_) => (100, 24),
     };
     let scale = surface.scale.value();
     let pixels = |logical: usize| u32::try_from(logical.saturating_mul(scale)).unwrap_or(u32::MAX);
@@ -166,6 +171,39 @@ impl Confirm {
         })
     }
 
+    /// The card asking whether conversation `id`, titled `title`, is
+    /// deleted though its workspace reports `lost`, a line a worktree.
+    pub fn remove(
+        surface: Surface,
+        body: Rect,
+        id: Id,
+        title: &str,
+        lost: &[String],
+        revision: u64,
+    ) -> Result<Self, String> {
+        let asked = format!(
+            "Deleting \u{201c}{}\u{201d} ({}) removes its repository workspace, whose worktrees report work that would be lost with it:",
+            crate::tools::visible(title),
+            id.as_str()
+        );
+        let mut details: Vec<&str> = vec![&asked];
+        details.extend(lost.iter().map(String::as_str));
+        details.push(
+            "Each worktree's answer comes from git inside the workspace, which the model could have changed: td-agent can know no more than it says.",
+        );
+        details.push("Cancel keeps the conversation and its workspace as they are.");
+        let model = Model::new(REMOVE_TITLE, REMOVE, &details, Act, revision)
+            .map_err(|e| format!("the loss card: {e}"))?;
+        let purpose = Purpose::Remove(id);
+        let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
+            .map_err(|e| format!("the loss card: {e}"))?;
+        Ok(Self {
+            purpose,
+            dialog,
+            revision,
+        })
+    }
+
     /// The card asking whether `remotes`, which template `template` names
     /// and nothing admits, are admitted (DESIGN.md §7): what that lets
     /// td-agent do, and that it lasts.
@@ -206,7 +244,7 @@ impl Confirm {
     }
 
     /// Where its keyboard is: `details`, `cancel`, or its action, `delete`,
-    /// `allow` or `admit`.
+    /// `allow`, `admit` or `remove`.
     pub fn focus(&self) -> &'static str {
         match self.dialog.focus() {
             confirmations::Focus::Details => "details",
@@ -217,6 +255,7 @@ impl Confirm {
                 Purpose::Delete(_) => "delete",
                 Purpose::Approve { .. } => "allow",
                 Purpose::Admit { .. } => "admit",
+                Purpose::Remove(_) => "remove",
             },
         }
     }

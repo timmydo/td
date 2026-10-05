@@ -1002,6 +1002,21 @@ pub fn admit_shared(configured: &[Shared], places: &Places) -> (Vec<Shared>, Vec
     (admitted, notes)
 }
 
+/// The policy of a maintenance instance over one repository's worktrees
+/// `entries` (DESIGN.md §9): its home under the conversation's jail
+/// directory `dir`, the checkouts, the repository and its store's
+/// objects; none without an entry.
+pub fn maintenance(dir: &Path, entries: &[&Entry]) -> Option<crate::jail::Policy> {
+    let first = entries.first()?;
+    Some(crate::jail::Policy {
+        home: dir.join("maintenance"),
+        checkouts: entries.iter().map(|entry| entry.checkout.clone()).collect(),
+        repositories: vec![first.repository.clone()],
+        objects: vec![first.store.join("objects")],
+        ..crate::jail::Policy::default()
+    })
+}
+
 /// The state directory's directory of conversations' jail directories.
 pub const JAIL: &str = "jail";
 

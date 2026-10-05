@@ -517,6 +517,107 @@ fn a_repository_conversation_prepares_its_workspace() {
         recorded.first().map(|r| (&r.checkout, &r.base)),
         Some((&entry.checkout, &base))
     );
+    drop(conversation);
+    // Asked before a deletion, the worktree reports nothing to lose,
+    // then a change and a commit; removed, the tree and the repository
+    // go and the store stays (DESIGN.md §7).
+    let programs = || {
+        jail::Programs::new(
+            named(jail::JAIL_VAR).into(),
+            PROGRAM.into(),
+            named(jail::TXT_VAR).into(),
+        )
+    };
+    let made = match state.workspace(&id).unwrap() {
+        Some(td_agent::workspace::Workspace::Repositories(made)) => made,
+        other => panic!("{other:?}"),
+    };
+    let asked = || td_agent::removal::survey(&state, &id, &made, programs());
+    let found = asked();
+    assert_eq!(found.len(), 1);
+    assert!(td_agent::removal::lost(&found).is_empty(), "{found:?}");
+    std::fs::write(entry.checkout.join("a/new"), "new\n").unwrap();
+    let lost = td_agent::removal::lost(&asked());
+    assert_eq!(lost.len(), 1);
+    assert!(
+        lost.iter()
+            .all(|l| l.contains("1 changed or untracked file")),
+        "{lost:?}"
+    );
+    let git = bound_git().unwrap();
+    let committed = std::process::Command::new(&git)
+        .current_dir(&entry.checkout)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.org",
+            "commit",
+            "--quiet",
+            "-am",
+            "x",
+        ])
+        .status()
+        .unwrap();
+    assert!(
+        !committed.success(),
+        "nothing tracked changed: the new file is untracked"
+    );
+    let added = std::process::Command::new(&git)
+        .current_dir(&entry.checkout)
+        .args(["add", "a/new"])
+        .status()
+        .unwrap();
+    assert!(added.success());
+    let committed = std::process::Command::new(&git)
+        .current_dir(&entry.checkout)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args([
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.org",
+            "commit",
+            "--quiet",
+            "-m",
+            "x",
+        ])
+        .status()
+        .unwrap();
+    assert!(committed.success());
+    let lost = td_agent::removal::lost(&asked());
+    assert!(
+        lost.iter()
+            .all(|l| l.contains("1 commit, in its repository")),
+        "{lost:?}"
+    );
+    td_agent::removal::doom(&made).finish().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while entry
+        .repository
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_some()
+        || made
+            .tree()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    {
+        assert!(Instant::now() < deadline, "the workspace was not removed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(entry.store.join("objects").is_dir(), "the store stays");
 }
 
 /// The instance dies with the process that launched it, killed with
