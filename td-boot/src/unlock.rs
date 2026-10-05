@@ -27,9 +27,10 @@ const KEY_MODE: u32 = 0o400;
 /// could not unpack, the handoff archive and its key included.
 pub(crate) const INITRD_IMAGE: &str = "initrd.image";
 /// The TPM resource manager td-tpm opens.
-const TPM_DEVICE: &str = "/dev/tpmrm0";
+pub(crate) const TPM_DEVICE: &str = "/dev/tpmrm0";
 
-/// The handed-off volume key, in one heap allocation zeroed on drop. It is
+/// The handed-off volume key, in one heap allocation zeroed on drop: the
+/// selector's for the handoff, the deployment initramfs's as taken. It is
 /// neither `Debug`, `Display` nor `Clone`.
 pub(crate) struct VolumeKey(Box<[u8; protocol::VOLUME_KEY_BYTES]>);
 
@@ -40,7 +41,16 @@ impl Drop for VolumeKey {
 }
 
 impl VolumeKey {
-    fn expose(&self) -> &[u8] {
+    pub(crate) fn zeroed() -> Self {
+        Self(Box::new([0; protocol::VOLUME_KEY_BYTES]))
+    }
+
+    /// The buffer a reader fills.
+    pub(crate) fn fill(&mut self) -> &mut [u8] {
+        self.0.as_mut_slice()
+    }
+
+    pub(crate) fn expose(&self) -> &[u8] {
         self.0.as_slice()
     }
 }
@@ -94,7 +104,7 @@ fn read_key(path: &Path, owner: u32) -> io::Result<Option<VolumeKey>> {
             &format!("{} bytes, not {}", meta.len(), protocol::VOLUME_KEY_BYTES),
         ));
     }
-    let mut key = VolumeKey(Box::new([0; protocol::VOLUME_KEY_BYTES]));
+    let mut key = VolumeKey::zeroed();
     let mut reader = &file;
     reader
         .read_exact(key.0.as_mut_slice())
@@ -569,7 +579,7 @@ mod tests {
     }
 
     fn key() -> VolumeKey {
-        let mut key = VolumeKey(Box::new([0; protocol::VOLUME_KEY_BYTES]));
+        let mut key = VolumeKey::zeroed();
         key.0.copy_from_slice(&key_bytes());
         key
     }

@@ -4177,6 +4177,24 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     s.push_str("dir {in:td-util}/bin 0755 0 0\n");
     s.push_str("file {in:td-util}/bin/td-util {in:td-util}/bin/td-util 0755 0 0\n");
     s.push_str("slink /bin/td-util {in:td-util}/bin/td-util 0777 0 0\n");
+    // The static cryptsetup (D6), in BOTH phases, at td-boot's
+    // `/bin/{CRYPTSETUP}`: an installed selector opens a device-bound volume
+    // after its release and takes the handoff's volume key with it, and
+    // `td-boot on-volume mount-root` opens the volume with that key. Static,
+    // so it runs before any root is mounted; its debug companion ships in
+    // the real root with the package. The live selector carries it too,
+    // since both selectors are the stock one, and never runs it.
+    s.push_str("dir {in:cryptsetup-x86-64} 0755 0 0\n");
+    s.push_str("dir {in:cryptsetup-x86-64}/bin 0755 0 0\n");
+    s.push_str(&format!(
+        "file {{in:cryptsetup-x86-64}}/bin/{c}.static \
+         {{in:cryptsetup-x86-64}}/bin/{c}.static 0755 0 0\n",
+        c = td_boot_protocol::CRYPTSETUP
+    ));
+    s.push_str(&format!(
+        "slink /bin/{c} {{in:cryptsetup-x86-64}}/bin/{c}.static 0777 0 0\n",
+        c = td_boot_protocol::CRYPTSETUP
+    ));
     match phase {
         Phase::Selector => {
             s.push_str("dir {in:td-kexec} 0755 0 0\n");
@@ -4214,22 +4232,6 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             s.push_str(
                 "slink /bin/mkfs.btrfs {in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static 0777 0 0\n",
             );
-            // `td-boot on-volume mount-root` opens a device-bound volume with
-            // the selector's handed-off key through this static cryptsetup
-            // (D6's deployment half); its debug companion ships in the real
-            // root with the package. The selector carries none until it
-            // releases (ENCRYPTION.md increment 6).
-            s.push_str("dir {in:cryptsetup-x86-64} 0755 0 0\n");
-            s.push_str("dir {in:cryptsetup-x86-64}/bin 0755 0 0\n");
-            s.push_str(&format!(
-                "file {{in:cryptsetup-x86-64}}/bin/{c}.static \
-                 {{in:cryptsetup-x86-64}}/bin/{c}.static 0755 0 0\n",
-                c = td_boot_protocol::CRYPTSETUP
-            ));
-            s.push_str(&format!(
-                "slink /bin/{c} {{in:cryptsetup-x86-64}}/bin/{c}.static 0777 0 0\n",
-                c = td_boot_protocol::CRYPTSETUP
-            ));
         }
     }
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
@@ -4544,9 +4546,10 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
     });
     // A live installer formats a device-bound volume with the static
     // cryptsetup, bound at /bin in the hashed root as mkfs.btrfs is (D6). The
-    // image carries the binary and its debug companion; the deployment
-    // initramfs carries the binary for its unlock, and the selector's none
-    // until it releases (ENCRYPTION.md increment 6).
+    // image carries the binary and its debug companion; both initramfs
+    // carry the binary, the selector's for its release and the deployment
+    // initramfs's for its unlock (ENCRYPTION.md increment 6), the companion
+    // staying here.
     steps.push(Step::MkDir {
         path: "{root}/real-root{in:cryptsetup-x86-64}".into(),
     });
@@ -4952,10 +4955,11 @@ fn shape_check() -> String {
      [ \"$(readlink \"$root/bin/mkfs.btrfs\" 2>/dev/null)\" = \"{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -f \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -x \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] || { echo 'root tree: /bin/mkfs.btrfs must link the static mkfs.btrfs a live installer formats with' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/cryptsetup\" 2>/dev/null)\" = \"{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -f \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -x \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] || { echo 'root tree: /bin/cryptsetup must link the static cryptsetup a live installer formats device-bound volumes with' >&2; exit 1; }; \
      [ -s \"$root{in:cryptsetup-x86-64}/lib/debug/bin/cryptsetup.static.debug\" ] || { echo 'root tree: cryptsetup lacks its debug companion' >&2; exit 1; }; \
-     if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/cryptsetup; then echo 'selector initramfs: cryptsetup must stay out until the selector releases' >&2; exit 1; fi; \
-     if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$'; then echo 'selector initramfs: the cryptsetup payload must stay out until the selector releases' >&2; exit 1; fi; \
+     printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/cryptsetup || { echo 'selector initramfs: bin/cryptsetup missing - an installed selector could not open a device-bound volume after its release' >&2; exit 1; }; \
+     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'selector initramfs: cryptsetup store member missing - /bin/cryptsetup would dangle' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/cryptsetup || { echo 'deployment initramfs: bin/cryptsetup missing - td-boot could not open a device-bound volume with the handed-off key' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'deployment initramfs: cryptsetup store member missing - /bin/cryptsetup would dangle' >&2; exit 1; }; \
+     for a in \"$selector\" \"$init\"; do \"$bb\" cpio -tv < \"$a\" 2>/dev/null | grep -q -F ' bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup td-boot opens volumes with\" >&2; exit 1; }; done; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
@@ -7702,32 +7706,50 @@ mod tests {
         );
         assert!(copied < linked && companion < packed && linked < packed);
         assert_eq!(td_boot_protocol::CRYPTSETUP, "cryptsetup");
-        // The shape check names the binary, its companion, the deployment
-        // initramfs's copy and the selector's refusals.
+        // The shape check names the binary, its companion, and both
+        // initramfs's copies and links; nothing refuses cryptsetup in
+        // either any longer.
         let check = shape_check();
         for needle in [
             "\"$root/bin/cryptsetup\"",
             "{in:cryptsetup-x86-64}/bin/cryptsetup.static",
             "{in:cryptsetup-x86-64}/lib/debug/bin/cryptsetup.static.debug",
-            "selector initramfs: cryptsetup must stay out",
-            "selector initramfs: the cryptsetup payload must stay out",
-            "deployment initramfs: bin/cryptsetup missing",
-            "deployment initramfs: cryptsetup store member missing",
+            "printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/cryptsetup || { echo 'selector initramfs: bin/cryptsetup missing",
+            "printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'selector initramfs: cryptsetup store member missing",
+            "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/cryptsetup || { echo 'deployment initramfs: bin/cryptsetup missing",
+            "printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'deployment initramfs: cryptsetup store member missing",
+            // The link's target in both, as the root tree's readlink check
+            // pins its own.
+            "for a in \"$selector\" \"$init\"; do \"$bb\" cpio -tv < \"$a\" 2>/dev/null \
+             | grep -q -F ' bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' \
+             || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup",
+            "root tree: cryptsetup lacks its debug companion",
         ] {
             assert!(check.contains(needle), "{needle}");
         }
-        assert!(!check.contains("deployment initramfs: cryptsetup must stay out"));
-        // D6's deployment half: the deployment initramfs packs the static
-        // binary at /bin, as it packs mkfs.btrfs; the selector packs none.
-        let deployment = build_initramfs_spec("init", Phase::Deployment);
-        assert!(deployment.contains(
-            "file {in:cryptsetup-x86-64}/bin/cryptsetup.static \
-             {in:cryptsetup-x86-64}/bin/cryptsetup.static 0755 0 0\n"
-        ));
-        assert!(deployment.contains(
-            "slink /bin/cryptsetup {in:cryptsetup-x86-64}/bin/cryptsetup.static 0777 0 0\n"
-        ));
-        assert!(!build_initramfs_spec("init", Phase::Selector).contains("cryptsetup"));
+        assert!(!check.contains("must stay out"));
+        // D6: both initramfs pack the static binary at /bin, bound at build
+        // time as D7 binds mkfs.btrfs; only the binary, its debug companion
+        // staying in the real root.
+        for (name, phase) in [
+            ("selector-init", Phase::Selector),
+            ("init", Phase::Deployment),
+        ] {
+            let spec = build_initramfs_spec(name, phase);
+            for entry in [
+                "dir {in:cryptsetup-x86-64} 0755 0 0",
+                "dir {in:cryptsetup-x86-64}/bin 0755 0 0",
+                "file {in:cryptsetup-x86-64}/bin/cryptsetup.static \
+                 {in:cryptsetup-x86-64}/bin/cryptsetup.static 0755 0 0",
+                "slink /bin/cryptsetup {in:cryptsetup-x86-64}/bin/cryptsetup.static 0777 0 0",
+            ] {
+                assert!(spec.lines().any(|line| line == entry), "{name}: {entry}");
+            }
+            assert!(!spec.contains("cryptsetup-x86-64}/lib/debug"), "{name}");
+            assert!(initramfs_bin_names(phase)
+                .iter()
+                .any(|bin| bin == td_boot_protocol::CRYPTSETUP));
+        }
     }
 
     #[test]

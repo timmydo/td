@@ -220,8 +220,10 @@ pub fn valid_digest(bytes: &[u8]) -> bool {
 #[allow(dead_code)]
 pub const MKFS_BTRFS: &str = "mkfs.btrfs";
 // The other (D6): the static cryptsetup a live installer formats a
-// device-bound volume with, from the verified root's /bin. Bound the same way,
-// so an image without it reds the build.
+// device-bound volume with, from the verified root's /bin, and both
+// initramfs open one with, the selector after its release and the deployment
+// initramfs with the handed-off key, each from its own /bin. Bound the same way,
+// so an image without any of them reds the build.
 #[allow(dead_code)]
 pub const CRYPTSETUP: &str = "cryptsetup";
 // The device-bound volume-key handoff (td-install/ENCRYPTION.md "Boot and
@@ -237,7 +239,8 @@ pub const VOLUME_KEY_MEMBER: &str = "td-volume-key-v1";
 pub const VOLUME_KEY_BYTES: usize = 64;
 // The device-mapper name the deployment initramfs opens a td LUKS2 volume
 // under, so its dm uuid is `CRYPT-LUKS2-<hex UUID>-td-system`. The selector's
-// mapping does not survive kexec, so the two stages never hold it at once.
+// own, `td-selector` (selector_release.rs), does not survive kexec, so the
+// two stages never hold a mapping at once.
 #[allow(dead_code)]
 pub const VOLUME_MAPPING_NAME: &str = "td-system";
 // 1 MiB, the alignment every partition start is held to. A start that ignores

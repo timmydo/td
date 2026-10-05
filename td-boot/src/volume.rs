@@ -429,6 +429,20 @@ impl Mapping {
         }
     }
 
+    /// The held mapping, as `Pinned::path` names a partition.
+    pub(crate) fn path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.file.as_raw_fd()
+        ))
+    }
+
+    /// `dm-N (NAME)`, for the console.
+    pub(crate) fn describe(&self) -> String {
+        format!("{} ({})", self.entry.node, self.entry.name)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(node: &str, name: &str, file: File) -> Self {
         Self {
@@ -655,6 +669,38 @@ fn hold_mapping(entry: MappingEntry, partition: &str, uuid: &Uuid) -> io::Result
         )));
     }
     Ok(Mapping { entry, file })
+}
+
+/// The mapping the selector's cryptsetup opened over the pinned LUKS2
+/// `partition` under `expected`, admitted as discovery admits one and held
+/// for the mounts; one under another name is refused.
+pub(crate) fn admit_mapping(
+    partition: &Pinned,
+    uuid: &Uuid,
+    expected: &str,
+) -> io::Result<Mapping> {
+    let name = partition
+        .device
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("missing volume name"))?;
+    let mapping = open_mapping(name, uuid)?.ok_or_else(|| {
+        invalid(format!(
+            "td volume {uuid} has no active mapping after cryptsetup opened it"
+        ))
+    })?;
+    admitted_name(mapping, expected)
+}
+
+/// `mapping` when device-mapper names it `expected`.
+fn admitted_name(mapping: Mapping, expected: &str) -> io::Result<Mapping> {
+    if mapping.entry.name != expected {
+        return Err(invalid(format!(
+            "the active mapping {} is not the {expected:?} the selector opened",
+            mapping.describe()
+        )));
+    }
+    Ok(mapping)
 }
 
 /// The partition's active mapping, held; `None` when none is active.
@@ -2183,5 +2229,18 @@ mod tests {
             mode_device(&operation).unwrap(),
             Path::new("/volume-device")
         );
+    }
+
+    /// The selector admits only the mapping it opened, by its dm name.
+    #[test]
+    fn the_selector_admits_only_its_own_mapping_name() {
+        let mapping = Mapping::for_test("dm-0", "td-selector", File::open("/dev/null").unwrap());
+        assert_eq!(
+            admitted_name(mapping, "td-selector").unwrap().describe(),
+            "dm-0 (td-selector)"
+        );
+        let other = Mapping::for_test("dm-1", "td-root", File::open("/dev/null").unwrap());
+        let error = admitted_name(other, "td-selector").err().unwrap();
+        assert!(error.to_string().contains("dm-1 (td-root)"), "{error}");
     }
 }

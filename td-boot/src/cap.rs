@@ -67,7 +67,7 @@ pub fn live() -> Result<Proceed, String> {
     clippy::panic,
     clippy::indexing_slicing
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sha256;
     use std::cell::Cell;
@@ -78,13 +78,13 @@ mod tests {
         0, 0, 0, 1, 0, 0x0b, 3, 0, 0x10, 0, // SHA-256 PCR 12
     ];
     /// The empty password-session PCR_Extend reply.
-    const EXTEND_REPLY: &[u8] = &[
+    pub(crate) const EXTEND_REPLY: &[u8] = &[
         0x80, 2, 0, 0, 0, 19, 0, 0, 0, 0, // session response
         0, 0, 0, 0, 0, 0, 1, 0, 0, // no parameters; empty password response
     ];
 
     /// A PCR_Read reply carrying PCR 12 at `pcr`.
-    fn read_reply(pcr: [u8; 32]) -> Vec<u8> {
+    pub(crate) fn read_reply(pcr: [u8; 32]) -> Vec<u8> {
         let mut bytes = vec![
             0x80, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0x0b, 3, 0, 0x10, 0, 0, 0,
             0, 1, 0, 32,
@@ -95,7 +95,7 @@ mod tests {
         bytes
     }
 
-    fn capped() -> [u8; 32] {
+    pub(crate) fn capped() -> [u8; 32] {
         let mut hash = sha256::Sha256::new();
         hash.update(&[0; 32]);
         hash.update(&td_protector::cap_event());

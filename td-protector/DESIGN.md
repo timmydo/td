@@ -25,8 +25,7 @@ changes: the cryptsetup runner ("Cryptsetup runner"), moved from
 td-install with DESIGN.md "Device-bound formatting"'s descriptor rules
 unchanged, and the pure transition planner ("Transitions"); then the
 release orchestration that runs ENCRYPTION.md's release order ("Release
-orchestration"), a library the selector will call and nothing calls
-yet.
+orchestration"), which the installed selector, td-boot, calls.
 
 ## Policies
 
@@ -330,8 +329,13 @@ The runner keeps no copy of a secret: it writes from the caller's borrow
 into the pipe. A child's standard output is read up to `MAX_OUTPUT`, 128
 KiB, beyond which the run fails; `run` copies it to standard error,
 which the child inherits, and zeroes it, so no verb that prints key
-material to standard output (`luksDump --dump-volume-key`, say) may run
-through `run`. `metadata` runs `luksDump --dump-json-metadata` and
+material to standard output may run through `run`. `luksDump
+--dump-volume-key` prints the volume key in hex there unless it is given
+`--volume-key-file`, cryptsetup 2.8.8 also takes `--dump-master-key` and
+`--master-key-file` as aliases, and `--unbound` prints an unbound key, so
+the runner starts a `luksDump` only in exactly the two shapes below,
+with operands that cannot be read as options, and refuses any other
+before a child starts. `metadata` runs `luksDump --dump-json-metadata` and
 returns its output instead, the header's public JSON.
 
 `run` succeeds only on exit 0 and otherwise names the program, the verb
@@ -347,13 +351,17 @@ new keyslot, another keyslot's key on standard input authorizing it,
 with the format's PBKDF2 parameters; `token import`, at a given number
 or the lowest free one; `token remove`; `luksKillSlot --batch-mode
 --key-file=-`, whose standard input carries the key of a keyslot that
-remains; `luksDump --dump-json-metadata`; `open`, `close`, `status`;
-`open --test-passphrase` on one keyslot; and the deployment initramfs's
-`open --volume-key-file KEY-FILE`, the handed-off volume key a `KeyFile`
-with nothing on standard input, which cryptsetup 2.8.8 reads at the
-header's volume-key size and activates only when it matches the header's
-digest of the data segment (`_verify_key`), trying no token or keyslot.
-Given a key, cryptsetup
+remains; `luksDump --dump-json-metadata`; `luksDump --dump-volume-key
+--batch-mode --volume-key-file FILE --key-file=-`, for the selector's
+handoff, which cryptsetup 2.8.8 writes to a new FILE it creates
+`O_CREAT|O_EXCL` at mode 0400 and names on standard output without the
+key (ENCRYPTION.md "Selector release" says what was verified); `open`,
+`close`, `status`; `open --test-passphrase` on one keyslot; and the
+deployment initramfs's `open --volume-key-file KEY-FILE`, the handed-off
+volume key a `KeyFile` with nothing on standard input, which cryptsetup
+2.8.8 reads at the header's volume-key size and activates only when it
+matches the header's digest of the data segment (`_verify_key`), trying
+no token or keyslot. Given a key, cryptsetup
 2.8.8's `luksKillSlot` destroys a keyslot only once that key opens
 another; given an empty standard input, or one it fails to read, it
 ignores the failed read (`-EPIPE`) and destroys the keyslot unasked. So
@@ -446,8 +454,9 @@ it.
 ## Release orchestration
 
 `release::release` runs ENCRYPTION.md's release order, steps 2 to 5,
-for the installed selector, which calls it once td-boot links this
-crate. It takes the result of `luks2::read` on the volume (step 1,
+for the installed selector, td-boot, which then opens the volume with a
+`Released` secret and refuses boot and halts on any other outcome until
+the recovery flow lands (ENCRYPTION.md "Selector release"). It takes the result of `luks2::read` on the volume (step 1,
 which td-boot runs first, since a header carrying a td token decides
 its TPM wait), the name cryptsetup opens the partition by, the TPM as a
 `release::Tpm` (`DeviceTpm` opens `/dev/tpmrm0`; `None` when no device
@@ -586,7 +595,9 @@ valid copy or with disagreeing copies. Runner tests pin every command's
 arguments word for word, that a key file is a close-on-exec descriptor
 holding exactly the secret, the one-page input bound, a stand-in
 cryptsetup's cleared environment and inputs with no key in its argv, a
-relative program refused, and `status` exits 0, 4 and others. Planner
+relative program refused, every other luksDump shape (a key dump without
+a file, the master-key aliases, `--unbound`) refused
+before any child starts, and `status` exits 0, 4 and others. Planner
 tests model cryptsetup's header commits, a kill stripping its keyslot
 from the tokens naming it, and pin the plans of the first-boot
 transition, each of its interrupted states, a device-bound release with

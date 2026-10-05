@@ -199,13 +199,16 @@ never argv or the environment. The installer's device-bound formatting
 execs `/bin/cryptsetup` from the verified root (td-boot's `CRYPTSETUP`
 names it), bound at build time as D7 binds `mkfs.btrfs`: the image build
 refuses a root whose `/bin/cryptsetup` does not link the static binary or
-lacks its debug companion. The deployment initramfs's unlock execs the
-same static binary at its `/bin/cryptsetup` ("Full-system volume
-consumers"), so the image build refuses a deployment initramfs without
-`/bin/cryptsetup` and its store payload, as D7's live-boot exec is
-bound, the debug companion shipping in the root with the package; and,
-until selector release requires them there (ENCRYPTION.md increment 6),
-a selector initramfs carrying either.
+lacks its debug companion. Increment 6 binds both initramfs, each to the
+exec it runs, as D7's live-boot exec is bound. The installed selector
+execs `/bin/cryptsetup` to open the volume after its release and to read
+the handoff's key (ENCRYPTION.md "Selector release"), and the deployment
+initramfs's unlock execs it to open the volume with that key ("Full-system
+volume consumers"). So the image build refuses either initramfs without
+`/bin/cryptsetup` or its store payload, the static binary, or with a
+`/bin/cryptsetup` that does not link that payload; the debug companion
+ships in the root with the package. The live selector, the same stock
+initramfs, carries it and never runs it.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create
@@ -525,7 +528,7 @@ exactly one matching volume. The two kinds are counted together: multiple
 eligible volumes, including two devices carrying a cloned UUID and a
 LUKS2 partition beside a Btrfs one with its UUID, refuse rather than
 selecting by enumeration order. It refuses an encrypted volume, as every
-consumer does until td-boot unlocks one ("Full-system volume
+consumer but the installed selector's boot does ("Full-system volume
 consumers"). UUIDs and labels identify bytes; they do not authenticate a
 deployment or authorize a write.
 
@@ -570,9 +573,9 @@ over). A device whose claims name only other volumes is passed over
 without that check, malformed or not, so another disk's header, an old
 drive's or a newer td format's, cannot stop this volume's boot; a
 wanted claim that `identity` refuses, or a non-canonical UUID, refuses.
-Discovery reads no tokens: reading them with td-protector's full reader,
-on the selected volume alone, is the job of the later selector-release
-and deployment-initramfs unlock commits (ENCRYPTION.md increment 6). A
+Discovery reads no tokens: the installed selector reads them with
+td-protector's full reader, on the selected volume alone, through the
+held descriptor (ENCRYPTION.md "Selector release"). A
 header read that fails, a bad sector or a
 short read, before any wanted claim leaves the device no LUKS2
 candidate, so the Btrfs probe alone decides it as before. LUKS1, another
@@ -1279,7 +1282,16 @@ for up to five seconds. An admitted mapping is opened through
 carry the td Btrfs superblock with the volume's UUID; its `dm/uuid`,
 `dm/name`, `slaves/` and `dev` are then read again and must still
 describe the opened node, whose descriptor is held for the consumer.
-The deployment initramfs opens the mapping with the handed-off key
+The installed selector's `on-volume boot` of an encrypted volume runs
+the release order on the pinned partition, before any mount
+(ENCRYPTION.md "Selector release"); a mapping already active then
+refuses boot. The released secret opens the mapping `td-selector`,
+cryptsetup naming the partition by its held descriptor,
+`/proc/<pid>/fd/N`; the mapping is then admitted by this walk, under
+that name only, held with the partition, and the boot's mounts name it
+as `/proc/<pid>/fd/M`. It does not survive `kexec`.
+
+The deployment initramfs opens its own mapping with the handed-off key
 ([ENCRYPTION.md](ENCRYPTION.md) "Boot and authority boundaries" owns the
 key, the refusals and the post-cap check): `on-volume mount-root` runs
 cryptsetup on the partition by its held descriptor, `/proc/<pid>/fd/N`,
@@ -1292,13 +1304,12 @@ opens one. `on-volume mount-var` requires the active `td-system`
 mapping `mount-root` opened, admitted the same way, and mounts it;
 neither reads the key again. A failure after the open leaves the
 mapping until the reboot that refusal causes. Every other consumer, the
-selector's `on-volume boot`, the running system's `install`, `update`,
-`rollback` and `success`, and `td-boot volume`, still refuses an
-encrypted volume with `encrypted volume: not yet supported`, naming the
-partition and any active mapping: the selector until selector release
-opens the mapping after release, and the running system until a later
-commit binds its transactions to the mapping its deployment initramfs
-opened. An unencrypted volume's boot takes the same steps as before.
+running system's `install`, `update`, `rollback` and `success`, and
+`td-boot volume`, still refuses an encrypted volume with `encrypted
+volume: not yet supported`, naming the partition and any active
+mapping, until a later commit binds the running system's transactions
+to the mapping its deployment initramfs opened. An unencrypted volume's
+boot takes the same steps as before.
 
 The native installation oracle provisions its chosen UUID into both the
 formatter and the selector before writing the disk. Its tiny selector

@@ -282,7 +282,10 @@ the marker `etc/td/live-media` holding `td-live-media-v1`. It has no
 `etc/td/volume-uuid` and no `etc/td/boot-measurement` policy. `td-boot
 live-boot MOUNTPOINT CMDLINE` refuses without the exact marker or its trust
 root, and refuses a selector carrying either of those files, since it would
-apply neither; these read only the selector's own rootfs. Then it:
+apply neither; these read only the selector's own rootfs. The stock
+selector carries the static cryptsetup an installed selector opens its
+volume with (DESIGN.md D6); the live branch never releases, opens a
+volume or runs it. Then it:
 
 0. caps PCR 12 through td-protector before anything else, when
    `/dev/tpmrm0` exists, so that no live session can release a td disk's

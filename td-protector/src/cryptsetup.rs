@@ -151,6 +151,48 @@ pub fn dump_metadata_args(device: &Path) -> Vec<OsString> {
     args
 }
 
+/// `luksDump --dump-volume-key` of `device` into `file`, unlocked by the key
+/// of a keyslot on standard input, for the selector's handoff. cryptsetup
+/// 2.8.8 (`tools_write_mk`) creates `file` with `O_CREAT|O_EXCL` at mode
+/// 0400, so a name that exists, a symlink or a `/proc/self/fd` link
+/// included, is refused, and writes the raw key there; standard output then
+/// carries the header's summary and the file's name, never the key.
+/// `--batch-mode` answers its confirmation.
+pub fn dump_volume_key_args(device: &Path, file: &Path) -> Vec<OsString> {
+    let mut args = os(&[
+        "luksDump",
+        "--dump-volume-key",
+        "--batch-mode",
+        "--volume-key-file",
+    ]);
+    args.push(file.into());
+    args.push("--key-file=-".into());
+    args.push(device.into());
+    args
+}
+
+/// Whether `args` is exactly the shape `dump_metadata_args` or
+/// `dump_volume_key_args` builds, with operands that cannot be read as
+/// options: the only luksDump forms the runner starts.
+fn known_dump(args: &[OsString]) -> bool {
+    let operand = |arg: &OsString| !arg.is_empty() && !arg.as_encoded_bytes().starts_with(b"-");
+    match args {
+        [verb, flag, device] => {
+            verb == "luksDump" && flag == "--dump-json-metadata" && operand(device)
+        }
+        [verb, dump, batch, to, file, key, device] => {
+            verb == "luksDump"
+                && dump == "--dump-volume-key"
+                && batch == "--batch-mode"
+                && to == "--volume-key-file"
+                && operand(file)
+                && key == "--key-file=-"
+                && operand(device)
+        }
+        _ => false,
+    }
+}
+
 /// The mapping `name`, opened with the passphrase on standard input.
 pub fn open_args(device: &Path, name: &str) -> Vec<OsString> {
     let mut args = os(&["open", "--type", "luks2", "--key-file=-"]);
@@ -312,6 +354,18 @@ impl Cryptsetup {
                 "cannot run {}: not an absolute path",
                 self.program.display()
             )));
+        }
+        // Other luksDump forms can print key material to the standard output
+        // `run` copies to standard error: `--dump-volume-key` (or its alias
+        // `--dump-master-key`) without a file, and `--unbound`. cryptsetup
+        // takes options before its action too, so the verb is looked for
+        // anywhere.
+        if args.iter().any(|arg| arg == "luksDump") && !known_dump(args) {
+            return Err(invalid(
+                "luksDump runs only as --dump-json-metadata or as --dump-volume-key \
+                 into a --volume-key-file"
+                    .to_string(),
+            ));
         }
         if args.first().is_some_and(|verb| verb == "luksKillSlot") && input.len() < MIN_KILL_KEY {
             return Err(invalid(format!(
@@ -498,6 +552,21 @@ mod tests {
         assert_eq!(
             words(&dump_metadata_args(device)),
             ["luksDump", "--dump-json-metadata", "/dev/loop7"]
+        );
+        assert_eq!(
+            words(&dump_volume_key_args(
+                Path::new("/proc/1/fd/5"),
+                Path::new("/run/td-boot-volume-key/volume-key")
+            )),
+            [
+                "luksDump",
+                "--dump-volume-key",
+                "--batch-mode",
+                "--volume-key-file",
+                "/run/td-boot-volume-key/volume-key",
+                "--key-file=-",
+                "/proc/1/fd/5",
+            ]
         );
         for slot in [0, 1, 31] {
             let slot_text = slot.to_string();
@@ -720,6 +789,82 @@ mod tests {
             .unwrap();
         assert_eq!(recorder.read("stdin", 2), [b'1'; 48]);
         assert_eq!(MIN_KILL_KEY, 32);
+    }
+
+    /// A luksDump that could print key material to the output `run` copies
+    /// to standard error never starts: a volume-key dump without a file,
+    /// cryptsetup 2.8.8's `--dump-master-key` and `--master-key-file`
+    /// aliases, `--unbound`, an operand read as an option, or options before
+    /// the verb. Only the two shapes this module builds run.
+    #[test]
+    fn a_volume_key_dump_runs_only_into_a_file() {
+        let recorder = Recorder::new();
+        let device = Path::new("/dev/loop7");
+        let refused: &[&[&str]] = &[
+            &[
+                "luksDump",
+                "--dump-volume-key",
+                "--batch-mode",
+                "--key-file=-",
+                "/dev/loop7",
+            ],
+            &[
+                "luksDump",
+                "--dump-master-key",
+                "--batch-mode",
+                "--key-file=-",
+                "/dev/loop7",
+            ],
+            &[
+                "luksDump",
+                "--dump-master-key",
+                "--batch-mode",
+                "--master-key-file",
+                "/run/k",
+                "--key-file=-",
+                "/dev/loop7",
+            ],
+            &[
+                "luksDump",
+                "--dump-volume-key",
+                "--batch-mode",
+                "--volume-key-file",
+                "--unbound",
+                "--key-file=-",
+                "/dev/loop7",
+            ],
+            &[
+                "luksDump",
+                "--unbound",
+                "--key-slot",
+                "1",
+                "--batch-mode",
+                "--key-file=-",
+                "/dev/loop7",
+            ],
+            &["luksDump", "--dump-json-metadata", "--unbound"],
+            &["luksDump", "/dev/loop7"],
+            &["luksDump"],
+            &[
+                "--dump-volume-key",
+                "--batch-mode",
+                "--key-file=-",
+                "luksDump",
+                "/dev/loop7",
+            ],
+            &["--unbound", "luksDump", "/dev/loop7"],
+        ];
+        for args in refused {
+            let error = recorder.cryptsetup.run(&os(args), &[7; 32]).unwrap_err();
+            assert!(error.to_string().contains("--volume-key-file"), "{error}");
+        }
+        assert!(!recorder.dir.join("count").exists());
+        let file = recorder.dir.join("volume-key");
+        recorder
+            .cryptsetup
+            .run(&dump_volume_key_args(device, &file), &[7; 32])
+            .unwrap();
+        assert_eq!(recorder.read("stdin", 1), [7; 32]);
     }
 
     /// The metadata dump's output is returned, not echoed, and a failed

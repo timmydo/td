@@ -7,14 +7,17 @@ use crate::types::{Recipe, Step};
 // arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
 // and must not be: this binary verifies and never signs. Its PCR 11 measurement
 // runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), and its
-// volume discovery and the live selector's PCR 12 release cap over
-// td-protector, which reaches td-json; each is compiled first as an rlib
-// with the binary's profile and passed by `--extern`, as td-install passes
-// them. td-tpm includes the same engine SHA-256 by `#[path]`.
+// volume discovery, the live selector's PCR 12 release cap and the installed
+// selector's release and the deployment initramfs's unlock over
+// td-protector, which reaches td-json; each is
+// compiled first as an rlib with the binary's profile and passed by
+// `--extern`, as td-install passes them. td-tpm includes the same engine
+// SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
+const SELECTOR_RELEASE_RS: &str = include_str!("../../../td-boot/src/selector_release.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const TD_FS_RS: &str = include_str!("../../../td-fs/src/real_file.rs");
@@ -91,6 +94,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/measurement.rs".into(),
             content: MEASUREMENT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/selector_release.rs".into(),
+            content: SELECTOR_RELEASE_RS.into(),
             exec: false,
         },
         Step::WriteFile {

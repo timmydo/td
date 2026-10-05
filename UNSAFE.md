@@ -83,14 +83,17 @@ one.
 Standalone crates that carry NO `unsafe` are not on the roster and do not
 need to be, but one is worth naming because it looks like it would need one
 and does not: `td-boot` verifies a signature and kexecs through a helper.
-Its PCR 11 measurement and the live selector's PCR 12 cap run over td-tpm
-and td-protector (with td-json), each forbidding unsafe code, the TPM being
-td-tpm's safe file I/O on `/dev/tpmrm0`; a refused cap halts by parking
-the thread through std. The deployment initramfs's unlock adds none: its
-post-cap unseal is td-protector's over the same client, its key member is
-read with std file I/O, and its one cryptsetup child, with the key on a
-pipe, is td-protector's runner's std process and pipe. `td-install` was
-the second until it had to publish onto a disk it holds (§21). Its partition tables and filesystems are still bytes at offsets, a
+Its PCR 11 measurement, the live selector's PCR 12 cap and the installed
+selector's release run over td-tpm and td-protector (with td-json), each
+forbidding unsafe code, the TPM being td-tpm's safe file I/O on
+`/dev/tpmrm0`; a refused cap or release halts by parking the thread
+through std. The release's cryptsetup children, and the pipe that hands
+the volume key to td-kexec, are std's, through td-protector's runner and
+its `KeyFile`. The deployment initramfs's unlock adds none: its post-cap
+unseal is td-protector's over the same client, its key member is read
+with std file I/O, and its one cryptsetup child, with the key on a pipe,
+is td-protector's runner's std process and pipe. `td-install` was the
+second until it had to publish onto a disk it holds (§21). Its partition tables and filesystems are still bytes at offsets, a
 device's size is a `seek`, and its sector size is a file under `/sys`;
 `td-install/DESIGN.md`'s D8 keeps it that way except for that one recorded
 surface.
@@ -239,8 +242,8 @@ instruction, `syscall5`, copied from `sys.rs` and the crate's only scoped
   `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` (15), on the
   descriptor that `memfd_create` returned. These serve only `--fds-key`,
   the device-bound volume key handoff (`td-install/ENCRYPTION.md`
-  increment 6, "Boot and authority boundaries"), which nothing invokes
-  yet.
+  increment 6, "Boot and authority boundaries"), which the installed
+  selector, td-boot, invokes for an encrypted volume.
 
 No descriptor is adopted: the memfd stays a raw number, released at exit
 or by the kexec, and td-kexec writes it through a second open of

@@ -12,6 +12,8 @@ mod cap;
 #[path = "measurement.rs"]
 mod measurement;
 mod protocol;
+#[path = "selector_release.rs"]
+mod selector_release;
 #[path = "unlock.rs"]
 mod unlock;
 #[path = "volume.rs"]
@@ -66,6 +68,8 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use td_protector::cryptsetup::{Cryptsetup, KeyFile};
+use td_protector::release::DeviceTpm;
 
 // td-boot reaches no third-party program but D6's source-built cryptsetup,
 // which the deployment initramfs's unlock runs (unlock.rs). `losetup` was the
@@ -214,6 +218,9 @@ struct Deployment {
     id: String,
     kernel: File,
     initramfs: File,
+    // The manifest's digest `initramfs` verified against, which td-kexec's
+    // key handoff checks its copy against.
+    initramfs_digest: String,
 }
 
 struct Selection {
@@ -2015,6 +2022,7 @@ fn verify_deployment_payloads(
         id: id.to_string(),
         kernel,
         initramfs,
+        initramfs_digest: manifest.initramfs.clone(),
     })
 }
 
@@ -2333,6 +2341,27 @@ fn kexec_command(kernel: File, initramfs: File, cmdline: &OsStr) -> Command {
     let mut command = Command::new(TD_KEXEC);
     command
         .arg("--fds")
+        .arg(cmdline)
+        .stdin(Stdio::from(kernel))
+        .stdout(Stdio::from(initramfs));
+    command
+}
+
+/// `--fds-key`: as `--fds`, with the initramfs digest td-boot verified and
+/// the volume key on a pipe this process holds, named `/proc/PID/fd/N`
+/// (td-install/ENCRYPTION.md "Boot and authority boundaries").
+fn key_kexec_command(
+    kernel: File,
+    initramfs: File,
+    digest: &str,
+    key_pipe: &Path,
+    cmdline: &OsStr,
+) -> Command {
+    let mut command = Command::new(TD_KEXEC);
+    command
+        .arg("--fds-key")
+        .arg(digest)
+        .arg(key_pipe)
         .arg(cmdline)
         .stdin(Stdio::from(kernel))
         .stdout(Stdio::from(initramfs));
@@ -2923,6 +2952,7 @@ fn kexec_boot_decision(
     decision: &BootDecision,
     base_cmdline: &OsStr,
     measured: bool,
+    handoff: Option<&unlock::VolumeKey>,
 ) -> io::Result<()> {
     report_boot_decision(&mut io::stderr(), decision)?;
     let cmdline = kernel_cmdline(
@@ -2939,18 +2969,37 @@ fn kexec_boot_decision(
         )?;
     }
     let Deployment {
-        kernel, initramfs, ..
+        kernel,
+        initramfs,
+        initramfs_digest,
+        ..
     } = deployment;
-    run_command(
-        &mut kexec_command(kernel, initramfs, cmdline.as_os_str()),
-        "td-kexec",
-    )?;
+    // An encrypted volume's key, after the measurement: the whole key and
+    // then end of file on a pipe whose write end is closed, which td-kexec
+    // opens anew by name and appends to its sealed copy of the initramfs.
+    let key_pipe = handoff.map(|key| KeyFile::new(key.expose())).transpose()?;
+    let mut command = match &key_pipe {
+        None => kexec_command(kernel, initramfs, cmdline.as_os_str()),
+        Some(pipe) => key_kexec_command(
+            kernel,
+            initramfs,
+            &initramfs_digest,
+            pipe.path(),
+            cmdline.as_os_str(),
+        ),
+    };
+    run_command(&mut command, "td-kexec")?;
     Err(io::Error::other(
         "td-kexec returned without booting the verified deployment",
     ))
 }
 
-fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
+fn run_boot(
+    device: &Path,
+    mountpoint: &Path,
+    base_cmdline: &OsStr,
+    handoff: Option<&unlock::VolumeKey>,
+) -> io::Result<()> {
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
     // Read before the volume is touched: with no trust root nothing on it can
@@ -2965,7 +3014,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
         "read-only Btrfs mount",
     )?;
     if let Some((decision, deployment)) = read_only_current(mountpoint, &key) {
-        let result = kexec_boot_decision(deployment, &decision, base_cmdline, measured);
+        let result = kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff);
         best_effort_unmount(mountpoint);
         return result;
     }
@@ -2974,7 +3023,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
     {
         let result = (|| {
             let (decision, deployment) = read_only_recovery(mountpoint, &transaction_error, &key)?;
-            kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+            kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
         })();
         best_effort_unmount(mountpoint);
         return result;
@@ -2996,7 +3045,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
                 )?;
                 let deployment =
                     authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
-                kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+                kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
             })();
             best_effort_unmount(mountpoint);
             return result;
@@ -3005,7 +3054,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
             let result = (|| {
                 let (decision, deployment) =
                     read_only_recovery(mountpoint, &transaction_error, &key)?;
-                kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+                kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
             })();
             best_effort_unmount(mountpoint);
             return result;
@@ -3022,7 +3071,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
             let result = (|| {
                 let (decision, deployment) =
                     read_only_recovery(mountpoint, &transaction_error, &key)?;
-                kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+                kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
             })();
             best_effort_unmount(mountpoint);
             return result;
@@ -3039,7 +3088,7 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
         // The writable transaction closed its payload handles before unmounting.
         // Reverify under the mount whose handles are passed to kexec.
         let deployment = authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
-        kexec_boot_decision(deployment, &decision, base_cmdline, measured)
+        kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
     })();
     best_effort_unmount(mountpoint);
     result
@@ -3513,6 +3562,7 @@ fn authenticated_media_deployment(medium: &Path, key: &TrustRoot) -> io::Result<
         id: sha256::hex_digest(&manifest),
         kernel,
         initramfs,
+        initramfs_digest: parsed.initramfs,
     })
 }
 
@@ -3810,6 +3860,19 @@ fn on_volume(mut operation: Mode) -> io::Result<()> {
         )?)?
     };
     let opened = volume::Opened::open(&uuid)?;
+    // Only the installed selector's boot of a td LUKS2 volume releases; a
+    // Btrfs volume's boot and every other operation bind as before.
+    let (mut operation, opened) = match (operation, opened) {
+        (
+            Mode::Boot {
+                mountpoint,
+                cmdline,
+                ..
+            },
+            volume::Opened::Luks2 { partition, mapping },
+        ) => return boot_encrypted(&uuid, partition, mapping, &mountpoint, &cmdline),
+        other => other,
+    };
     let binding = bind_volume(&mut operation, opened, key, |partition, key| {
         unlock::unlock(
             &mut unlock::System::new(partition, &uuid)?,
@@ -3826,6 +3889,76 @@ fn on_volume(mut operation: Mode) -> io::Result<()> {
     dispatch(operation)
 }
 
+/// The installed selector on a td LUKS2 volume (td-install/ENCRYPTION.md
+/// "Selector release"). The release order runs on the pinned partition
+/// before any mount or deployment selection: td's bounded header read, the
+/// TPM wait, then td-protector's release with its cap. The released secret
+/// opens the mapping, which is admitted as discovery admits one and held,
+/// with the partition, until kexec. Selection, fallback, boot attempts and
+/// the PCR 11 measurement are `run_boot`'s, unchanged, over the mapping; the
+/// volume key reaches only the handoff. A refusal halts: the selector is
+/// init, and exiting would reboot into the same refusal.
+fn boot_encrypted(
+    uuid: &volume::Uuid,
+    partition: volume::Pinned,
+    mapping: Option<volume::Mapping>,
+    mountpoint: &Path,
+    cmdline: &OsStr,
+) -> io::Result<()> {
+    report_volume_binding(&mut io::stderr(), uuid, &partition.device)?;
+    if let Some(mapping) = mapping {
+        halt(&format!(
+            "td volume {uuid} already has an active mapping, {}, before the selector's \
+             release; boot refused",
+            mapping.describe()
+        ));
+    }
+    // Best effort: a failed console write must not exit init after a cap.
+    let mut console = |line: &str| {
+        let _ = writeln!(io::stderr(), "td-boot: {line}");
+    };
+    // Step 1, before any C parser.
+    let header = td_protector::luks2::read(&mut partition.file());
+    // Whatever the header holds: a corrupted or token-stripped header must
+    // not skip the wait and leave PCR 12 open to a late-probing TPM.
+    if !selector_release::tpm_present() {
+        console(&format!(
+            "waiting up to {} s for {}",
+            selector_release::TPM_WAIT.as_secs(),
+            unlock::TPM_DEVICE
+        ));
+    }
+    let present =
+        selector_release::wait_for_tpm(&mut selector_release::tpm_present, &mut std::thread::sleep);
+    if !present {
+        console(&format!(
+            "no TPM device ({}): nothing can release and PCR 12 stays open; a TPM the \
+             kernel exposes later on this boot finds it open",
+            unlock::TPM_DEVICE
+        ));
+    }
+    let mut tpm = present.then_some(DeviceTpm);
+    let mut cryptsetup = Cryptsetup::new(Path::new("/bin").join(protocol::CRYPTSETUP));
+    let (keyslot, key) = match selector_release::unlock(
+        &header,
+        &partition.path(),
+        tpm.as_mut(),
+        &mut cryptsetup,
+        Path::new(selector_release::KEY_DIRECTORY),
+        &mut console,
+    ) {
+        selector_release::Unlock::Boot { keyslot, key } => (keyslot, key),
+        selector_release::Unlock::Halt(reason) => halt(&reason),
+        selector_release::Unlock::Failed(error) => return Err(error),
+    };
+    let mapping = volume::admit_mapping(&partition, uuid, selector_release::MAPPING_NAME)?;
+    console(&format!(
+        "volume {uuid} opened with keyslot {keyslot} as {}",
+        mapping.describe()
+    ));
+    run_boot(&mapping.path(), mountpoint, cmdline, Some(&key))
+}
+
 /// What `bind_volume` decided.
 enum Binding {
     /// The operation's device, held.
@@ -3839,7 +3972,8 @@ enum Binding {
 /// volume binds only for the deployment initramfs: `mount-root` requires
 /// the key and no active mapping, and binds the mapping `unlock` opens;
 /// `mount-var` binds the mapping `mount-root` opened. Every other
-/// operation refuses it.
+/// operation refuses it; the installed selector's boot of one never
+/// reaches here (`boot_encrypted`).
 fn bind_volume(
     operation: &mut Mode,
     opened: volume::Opened,
@@ -3961,7 +4095,7 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             device,
             mountpoint,
             cmdline,
-        } => run_boot(&device, &mountpoint, &cmdline),
+        } => run_boot(&device, &mountpoint, &cmdline, None),
         Mode::Install {
             device,
             mountpoint,
@@ -6657,7 +6791,11 @@ mod tests {
             .0;
         assert!(boot.contains("measurement::enabled(Path::new(BOOT_ROOTFS))?"));
         for call in boot.split("kexec_boot_decision(").skip(1) {
-            assert!(call.split_once(')').unwrap().0.ends_with(", measured"));
+            assert!(call
+                .split_once(')')
+                .unwrap()
+                .0
+                .ends_with(", measured, handoff"));
         }
         let handoff = source
             .split_once("\nfn kexec_boot_decision(")
@@ -6666,15 +6804,22 @@ mod tests {
             .split_once("\n}\n")
             .unwrap()
             .0;
-        let arguments = handoff.find("let cmdline = kernel_cmdline(").unwrap();
-        let measure = handoff
-            .find("measurement::measure(&deployment.id, cmdline.as_bytes())?")
-            .unwrap();
-        let execute = handoff
-            .find("&mut kexec_command(kernel, initramfs, cmdline.as_os_str())")
-            .unwrap();
-        assert!(arguments < measure && measure < execute);
+        let position = |needle: &str| {
+            assert_eq!(handoff.matches(needle).count(), 1, "{needle}");
+            handoff.find(needle).unwrap()
+        };
+        let arguments = position("let cmdline = kernel_cmdline(");
+        let measure = position("measurement::measure(&deployment.id, cmdline.as_bytes())?");
+        // The key is written to its pipe only after the measurement, and
+        // the pipe lives until td-kexec returns.
+        let piped = position(".map(|key| KeyFile::new(key.expose()))");
+        let plain = position("None => kexec_command(kernel, initramfs, cmdline.as_os_str()),");
+        let keyed = position("Some(pipe) => key_kexec_command(");
+        let execute = position("run_command(&mut command, \"td-kexec\")?;");
+        assert!(arguments < measure && measure < piped);
+        assert!(piped < plain && plain < keyed && keyed < execute);
         assert!(handoff.contains("if measured {"));
+        assert!(!handoff.contains("drop(key_pipe)"));
     }
 
     /// Nothing `run_boot` hands to kexec was read by an unauthenticated
@@ -8228,15 +8373,27 @@ mod tests {
         ] {
             assert!(capped < position(later), "{later} precedes the cap");
         }
-        // Only run_live_boot caps; it and the deployment initramfs's unlock
-        // (`on_volume`) halt.
+        // Only run_live_boot caps through cap.rs, and it never releases.
         let (production, _) = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
         assert_eq!(production.matches("cap::live").count(), 1);
+        for release in ["selector_release::", "boot_encrypted(", "Cryptsetup::new("] {
+            assert!(!body.contains(release), "the live selector names {release}");
+        }
+        // Halts: the live selector's cap, the installed one's release
+        // (`boot_encrypted`, two calls) and the deployment initramfs's
+        // unlock (`on_volume`).
         assert_eq!(
             production.matches("halt(").count(),
-            3,
-            "its definition and the two calls"
+            5,
+            "its definition and the four calls"
         );
+        let encrypted = source
+            .split_once("\nfn boot_encrypted(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert_eq!(body.matches("halt(").count(), 1);
+        assert_eq!(encrypted.matches("halt(").count(), 2);
 
         let halt = source
             .split_once("\nfn halt(reason: &str) -> ! {\n")
@@ -8374,5 +8531,187 @@ mod tests {
         assert!(usage_error()
             .to_string()
             .contains("td-boot live-seed <mountpoint> <deployment-id> <seed-directory>"));
+    }
+
+    /// The body of production function `name`, up to its closing brace.
+    fn production_body(name: &str) -> &'static str {
+        include_str!("main.rs")
+            .split_once(&format!("\nfn {name}("))
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap()
+    }
+
+    /// The installed selector's boot of a td LUKS2 volume, and only that,
+    /// takes the release path; everything else binds as before.
+    #[test]
+    fn only_the_selectors_boot_of_a_luks2_volume_releases() {
+        let body = production_body("on_volume");
+        let opened = body
+            .find("let opened = volume::Opened::open(&uuid)?;")
+            .unwrap();
+        let arm = body
+            .find("volume::Opened::Luks2 { partition, mapping },\n        ) => return boot_encrypted(&uuid, partition, mapping, &mountpoint, &cmdline),")
+            .unwrap();
+        let bound = body
+            .find("bind_volume(&mut operation, opened, key, ")
+            .unwrap();
+        assert!(opened < arm && arm < bound, "{body}");
+        assert!(body[..arm].contains("Mode::Boot {"));
+        assert_eq!(body.matches("boot_encrypted(").count(), 1);
+        let source = include_str!("main.rs");
+        let (production, _) = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
+        assert_eq!(production.matches("boot_encrypted(").count(), 2);
+        assert_eq!(production.matches("selector_release::unlock(").count(), 1);
+        // Every operation but the two deployment mounts still refuses an
+        // encrypted volume in bind_volume.
+        assert!(production_body("bind_volume").contains(
+            "            None => {\n                return Err(volume::encrypted_unsupported("
+        ));
+    }
+
+    /// The release order and the cap, through `selector_release::unlock`, run before
+    /// any mount or deployment selection, which are `run_boot`'s alone; the
+    /// mapping is admitted only after the release opened it, and it and the
+    /// partition are held until `run_boot` returns, which is after
+    /// `kexec_file_load` returned. Nothing in td-boot closes a mapping.
+    #[test]
+    fn the_installed_selector_releases_before_it_mounts_or_selects() {
+        let body = production_body("boot_encrypted");
+        let position = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "{needle}");
+            body.find(needle).unwrap()
+        };
+        let pre_active = position("if let Some(mapping) = mapping {");
+        let header = position("let header = td_protector::luks2::read(&mut partition.file());");
+        let waited = position("selector_release::wait_for_tpm(&mut selector_release::tpm_present, &mut std::thread::sleep);");
+        // The wait never depends on what the header holds.
+        assert!(!body.contains("if wait") && !body.contains("tokens"));
+        let device = position("let mut tpm = present.then_some(DeviceTpm);");
+        let program = position(
+            "let mut cryptsetup = Cryptsetup::new(Path::new(\"/bin\").join(protocol::CRYPTSETUP));",
+        );
+        let released = position("let (keyslot, key) = match selector_release::unlock(");
+        let halted = position("selector_release::Unlock::Halt(reason) => halt(&reason),");
+        let failed = position("selector_release::Unlock::Failed(error) => return Err(error),");
+        let admitted = position(
+            "let mapping = volume::admit_mapping(&partition, uuid, selector_release::MAPPING_NAME)?;",
+        );
+        let booted = position("run_boot(&mapping.path(), mountpoint, cmdline, Some(&key))");
+        assert!(pre_active < header && header < waited);
+        assert!(waited < device && device < program && program < released);
+        assert!(released < halted && halted < failed && failed < admitted);
+        assert!(admitted < booted);
+        assert!(body
+            .trim_end()
+            .ends_with("run_boot(&mapping.path(), mountpoint, cmdline, Some(&key))"));
+        for later in [
+            "mount_command(",
+            "select_boot_deployment(",
+            "read_only_current(",
+            "authenticated_",
+            "measurement::",
+            "kexec",
+            "drop(",
+            "close",
+        ] {
+            assert!(!body.contains(later), "boot_encrypted names {later}");
+        }
+        let unlock = include_str!("selector_release.rs");
+        let (production, _) = unlock.split_once("\n#[cfg(test)]").unwrap();
+        for verb in ["close_args", "\"close\"", "remove_args", "kill_slot"] {
+            assert!(
+                !production.contains(verb),
+                "selector_release.rs names {verb}"
+            );
+            let main = include_str!("main.rs");
+            let (main, _) = main.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
+            assert!(!main.contains(verb), "main.rs names {verb}");
+        }
+        // The selection run_boot makes and its PCR 11 measurement are the
+        // unencrypted boot's, over the mapping.
+        assert!(production_body("run_boot").contains("select_boot_deployment(root, &key)"));
+    }
+
+    /// An unencrypted volume's boot is today's: `run_boot` contacts no TPM
+    /// but its configured PCR 11 measurement, caps nothing and runs no
+    /// cryptsetup, and dispatch hands it no key.
+    #[test]
+    fn an_unencrypted_boot_makes_no_tpm_contact_and_no_cap() {
+        let (signature, body) = production_body("run_boot")
+            .split_once(") -> io::Result<()> {")
+            .unwrap();
+        assert!(signature.ends_with("handoff: Option<&unlock::VolumeKey>,\n"));
+        for absent in [
+            "selector_release::",
+            "cap::",
+            "DeviceTpm",
+            "Cryptsetup",
+            "td_protector",
+            "td_tpm",
+            "luks2",
+        ] {
+            assert!(!body.contains(absent), "run_boot names {absent}");
+        }
+        assert!(production_body("dispatch")
+            .contains("} => run_boot(&device, &mountpoint, &cmdline, None),"));
+        let decision = production_body("kexec_boot_decision");
+        assert!(decision.contains("let key_pipe = handoff"));
+        assert!(decision.contains("None => kexec_command(kernel, initramfs, cmdline.as_os_str()),"));
+    }
+
+    /// The handoff's command is td-kexec's `--fds-key` with the manifest's
+    /// initramfs digest, and its pipe holds exactly the key then end of
+    /// file, read as td-kexec reads it: opened anew by name without
+    /// blocking.
+    #[test]
+    fn the_key_handoff_is_td_kexecs_fds_key_over_a_closed_pipe() {
+        let fixture = Fixture::new();
+        let id = fixture.valid_deployment();
+        fixture.selector("current", &id);
+        let deployment = select_deployment(&fixture.root).unwrap().deployment;
+        let (_, manifest) = verified_manifest(&fixture.root, &id).unwrap();
+        assert_eq!(deployment.initramfs_digest, manifest.initramfs);
+        assert!(valid_digest(deployment.initramfs_digest.as_bytes()));
+
+        let key = [0x3c; protocol::VOLUME_KEY_BYTES];
+        let pipe = KeyFile::new(&key).unwrap();
+        let Deployment {
+            kernel,
+            initramfs,
+            initramfs_digest,
+            ..
+        } = deployment;
+        let command = key_kexec_command(
+            kernel,
+            initramfs,
+            &initramfs_digest,
+            pipe.path(),
+            OsStr::new("quiet td.deployment=test"),
+        );
+        assert_eq!(command.get_program(), OsStr::new(TD_KEXEC));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("--fds-key"),
+                OsStr::new(&initramfs_digest),
+                pipe.path().as_os_str(),
+                OsStr::new("quiet td.deployment=test"),
+            ]
+        );
+        let name = pipe.path().to_str().unwrap();
+        let prefix = format!("/proc/{}/fd/", std::process::id());
+        assert!(name.strip_prefix(&prefix).unwrap().parse::<u32>().is_ok());
+
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(0o4000)
+            .open(pipe.path())
+            .unwrap();
+        assert!(reader.metadata().unwrap().file_type().is_fifo());
+        let mut read = [0u8; protocol::VOLUME_KEY_BYTES];
+        io::Read::read_exact(&mut reader, &mut read).unwrap();
+        assert_eq!(read, key);
+        assert_eq!(io::Read::read(&mut reader, &mut [0u8; 1]).unwrap(), 0);
     }
 }
