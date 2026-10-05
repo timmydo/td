@@ -1754,6 +1754,24 @@ cover combined healthy/refused fields, long values and fresh owner handoff.
 No extra arena is introduced. Encoded-word dispatch, retained metadata and
 worker/native/RSS qualification remain open.
 
+M06cu's resident CID/language selector plus HeaderBudget fits 768 bytes in
+the existing parser region. It borrows authorized source and stores at most
+two selected passive raw fields plus a candidate and section end, with one
+exclusive identifier/language syntax child,
+the raw scanner and fixed progress. Each poll invokes one bounded phase;
+fixtures measure at most 256 source visits, 256 interpretation steps and 16
+job records with no conversion output. One credit owner persists through
+malformed candidate fallback and both label kinds, so no phase discards or
+renews original allowances. Whole-section success precedes visible selected
+fields. Projection/retention, automatic traversal composition and
+worker/native/RSS qualification remain separate; no label-value allocation,
+second header arena or raw-header allowance is introduced. Warm/measured
+Rust allocation intervals cover missing/malformed/duplicate fields, long
+CID/list spellings, four-byte comments, source/header/nesting/job/aggregate
+refusal, fresh retirement and consuming handoff. Successful handoff projects
+selected CID/language with the exact returned owners, then reuses them for
+another header section; no retained value/list allocation is claimed.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

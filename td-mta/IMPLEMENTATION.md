@@ -1956,6 +1956,15 @@ Initial independently landable increments:
   explicitly caller-selected; encoded-word dispatch/placement, retained
   metadata and whole Content-Location activation remain open.
 
+- **M06cu — resident CID/language field selection:** select first-valid
+  complete fields through raw scanning and exclusive existing grammars under
+  original job/header owners. Skip malformed occurrences without renewed
+  credit or partial success; retire all fields after structural/source/work
+  refusal. Hide passive absolute extents until complete section success and
+  qualify duplicates, source boundaries, original consuming handoff and
+  per-turn/full-allowance/deadline cuts. Retained label values, location,
+  traversal coordination, JSON and worker/native/RSS remain open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

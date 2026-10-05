@@ -313,6 +313,17 @@ preference, quality weight or charset inference follows. Raw headers remain
 available. Field discovery, duplicate-field selection and retained JSON
 composition must separately establish their complete-source/output authority.
 
+For resident MIME CID/language metadata, select the first completely valid
+field of each kind; skip malformed needed occurrences independently. Later
+duplicates remain in raw headers and are scanned without interpreting their
+values. Missing or entirely malformed fields have no selected value. Never
+expose a valid prefix from a malformed single CID or language list. Nesting,
+raw-header bounds, incomplete resident prefixes, job and interpretation
+refusals retire the whole selection; later duplicates cannot rescue them.
+The scanner must establish the complete header boundary before any selected
+field is visible. Passive raw field extents grant no retained value or
+publication authority; subsequent projection uses original allowances.
+
 Content-Location surrounding-CFWS selection prefers greedy leading CFWS and a
 complete terminal CFWS suffix beginning with SP/HTAB or an admitted fold.
 After leading CFWS, parentheses adjoining URI bytes stay literal. Partial

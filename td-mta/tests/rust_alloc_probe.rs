@@ -1229,6 +1229,289 @@ fn mime_filename_retention() {
     assert_eq!(before, after, "filename retention allocated");
 }
 
+fn mime_label_fields() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        header_select::SourceEnd,
+        mime_label_fields::{Cursor, Error, Input, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!(
+        "Content-ID: <{}@b>\r\nContent-Language: en-GB, FR\r\n\r\n",
+        "a".repeat(8192)
+    );
+    let tags = format!("Content-Language: {}FR\r\n\r\n", "en,".repeat(4096));
+    let unicode = format!("Content-ID: ({}) <A@B>\r\n\r\n", "🐈".repeat(1024));
+    let deep = format!(
+        "Content-ID: <A@B>\r\nContent-Language: {}en{}\r\n\r\n",
+        "(".repeat(33),
+        ")".repeat(33)
+    );
+    let exhausting = format!("{}a", " ".repeat(8192));
+    let case_0 = b"".as_slice();
+    let case_1 = b"Content-ID: <bad>\r\nContent-Language: en,\r\n\r\n".as_slice();
+    let case_2 = concat!(
+        "Content-ID: <bad>\r\n",
+        "Content-ID: <A@B>\r\n",
+        "Content-ID: <late@id>\r\n",
+        "Content-Language: en,,FR\r\n",
+        "Content-Language: en-GB, FR\r\n",
+        "\r\n",
+        "body",
+    )
+    .as_bytes();
+    let case_3 = b"Content-ID: <A@B>\r\n\r\n".as_slice();
+    let case_4 = b"Content-ID: <A@B>\r\n".as_slice();
+    let case_5 = b"Content-ID: <A@B>\r\n\r\n".as_slice();
+    let case_6 = b"Content-ID: <A@B>\r\n\r\n".as_slice();
+    let case_7 = b"Content-ID: <A@B>\r\n\r\n".as_slice();
+    let before = COUNTERS.snapshot();
+    for (source, ending, limit, records, exhausted, fault) in [
+        (case_0, SourceEnd::Eof, 1_000_000, 100_000_000, false, None),
+        (case_1, SourceEnd::Eof, 1_000_000, 100_000_000, false, None),
+        (case_2, SourceEnd::Eof, 1_000_000, 100_000_000, false, None),
+        (
+            case_3,
+            SourceEnd::Prefix,
+            1_000_000,
+            100_000_000,
+            false,
+            None,
+        ),
+        (
+            long.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            100_000_000,
+            false,
+            None,
+        ),
+        (
+            tags.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            100_000_000,
+            false,
+            None,
+        ),
+        (
+            unicode.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            100_000_000,
+            false,
+            None,
+        ),
+        (
+            deep.as_bytes(),
+            SourceEnd::Eof,
+            1_000_000,
+            100_000_000,
+            false,
+            Some(Error::NestingLimit),
+        ),
+        (
+            case_4,
+            SourceEnd::Prefix,
+            1_000_000,
+            100_000_000,
+            false,
+            Some(Error::Truncated),
+        ),
+        (
+            case_5,
+            SourceEnd::Eof,
+            0,
+            100_000_000,
+            false,
+            Some(Error::Headers(td_mta::mime_headers::Error::HeaderLimit)),
+        ),
+        (
+            case_6,
+            SourceEnd::Eof,
+            1_000_000,
+            0,
+            false,
+            Some(Error::Work(Stop::Records)),
+        ),
+        (
+            case_7,
+            SourceEnd::Eof,
+            1_000_000,
+            100_000_000,
+            true,
+            Some(Error::InterpretationLimit),
+        ),
+    ] {
+        for trial in 0..if fault.is_some() { 1 } else { 2 } {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records,
+                    output_bytes: 100_000_000,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            if exhausted {
+                let mut refused = false;
+                for _ in 0..4000 {
+                    let mut probe = td_mta::mime_location_selection::Cursor::new(
+                        exhausting.as_bytes(),
+                        &mut work,
+                        &mut budget,
+                    );
+                    let mut complete = false;
+                    for _ in 0..20_000 {
+                        match probe.poll(Tick(1)) {
+                            Ok(td_mta::mime_location_selection::Status::Yield) => {}
+                            Ok(td_mta::mime_location_selection::Status::Complete(_)) => {
+                                complete = true;
+                                break;
+                            }
+                            Err(td_mta::mime_location_selection::Error::InterpretationLimit) => {
+                                refused = true;
+                                break;
+                            }
+                            Err(error) => panic!("unexpected aggregate refusal: {error}"),
+                        }
+                    }
+                    assert!(complete || refused);
+                    if refused {
+                        break;
+                    }
+                }
+                assert!(refused);
+                assert_eq!(work.stopped(), None);
+            }
+            let wp = &work as *const Meter;
+            let bp = &budget as *const HeaderBudget;
+            let mut cursor = Cursor::new(
+                Input {
+                    source: black_box(source),
+                    base: 0,
+                    header_limit: limit,
+                    source_end: ending,
+                },
+                &mut work,
+                &mut budget,
+            )
+            .unwrap();
+            let mut complete = false;
+            let mut failed = None;
+            for _ in 0..200_000 {
+                match cursor.poll(Tick(1)) {
+                    Ok(Status::Yield) => assert!(cursor.selection().is_none()),
+                    Ok(Status::Complete) => {
+                        complete = true;
+                        break;
+                    }
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(failed, fault);
+            if let Some(error) = fault {
+                assert!(cursor.selection().is_none());
+                assert_eq!(cursor.poll(Tick(1)), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            assert!(complete);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            if trial == 1 {
+                assert_eq!(
+                    cursor.check_deadline(Tick(100)),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                assert!(cursor.selection().is_none());
+                assert_eq!(
+                    cursor.finish(Tick(1)).err(),
+                    Some(Error::Work(Stop::Deadline))
+                );
+                continue;
+            }
+            let (mut work, mut budget, selected) = cursor.finish(Tick(1)).unwrap();
+            assert!(std::ptr::eq(work, wp));
+            assert!(std::ptr::eq(budget, bp));
+            if let Some(field) = selected.content_id {
+                let value =
+                    td_header::resident::slice(source, 0, field.value_start..field.value_end)
+                        .unwrap();
+                let mut next = td_mta::mime_content_id::Cursor::new(value, work, budget);
+                let mut complete = false;
+                for _ in 0..200_000 {
+                    match next.poll(Tick(1)).unwrap() {
+                        td_mta::mime_content_id::Status::Scalar(c) => {
+                            black_box(c);
+                        }
+                        td_mta::mime_content_id::Status::Complete => {
+                            complete = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(complete);
+                (work, budget) = next.finish(Tick(1)).unwrap();
+            }
+            if let Some(field) = selected.content_language {
+                let value =
+                    td_header::resident::slice(source, 0, field.value_start..field.value_end)
+                        .unwrap();
+                let mut next = td_mta::mime_language::Cursor::new(value, work, budget);
+                let mut complete = false;
+                for _ in 0..200_000 {
+                    match next.poll(Tick(1)).unwrap() {
+                        td_mta::mime_language::Status::Tag(e) => {
+                            black_box(value.get(e.start..e.end).unwrap());
+                        }
+                        td_mta::mime_language::Status::Complete => {
+                            complete = true;
+                            break;
+                        }
+                        td_mta::mime_language::Status::Yield => {}
+                    }
+                }
+                assert!(complete);
+                (work, budget) = next.finish(Tick(1)).unwrap();
+            }
+            let mut next = Cursor::new(
+                Input {
+                    source: b"Content-ID: <x@y>\r\n\r\n",
+                    base: 0,
+                    header_limit: 100,
+                    source_end: SourceEnd::Eof,
+                },
+                work,
+                budget,
+            )
+            .unwrap();
+            let mut complete = false;
+            for _ in 0..1000 {
+                if next.poll(Tick(1)).unwrap() == Status::Complete {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            let (work, budget, _) = next.finish(Tick(1)).unwrap();
+            assert!(std::ptr::eq(work, wp));
+            assert!(std::ptr::eq(budget, bp));
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(
+        before, after,
+        "resident CID/language selection/projection allocated"
+    );
+}
+
 fn uri_literal_field_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -8747,6 +9030,7 @@ fn main() {
         resident_mime_traversal();
         resident_part_headers();
         mime_body_list_selection();
+        mime_label_fields();
         uri_literal_field_values();
         uri_selection_values();
         uri_spelling_values();
@@ -8911,6 +9195,7 @@ fn main() {
     resident_mime_traversal();
     resident_part_headers();
     mime_body_list_selection();
+    mime_label_fields();
     uri_literal_field_values();
     uri_selection_values();
     uri_spelling_values();

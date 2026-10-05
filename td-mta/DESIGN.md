@@ -460,6 +460,17 @@ field discovery/presence and retained metadata/publication. Empty references
 remain permitted. Complete Content-Location word/literal dispatch remains
 open; this path grants no resolution or source authority.
 
+M06cu selects first-valid Content-ID and Content-Language raw fields from a
+complete resident entity header section. Existing strict single-identifier
+and shared complete-language-list syntax run as exclusive children of the
+same original job/header owners. Malformed needed occurrences are skipped;
+nesting, raw-header limits, incomplete source and admission refusal retire
+all selected fields. Later duplicates are scanned without interpreting
+values. Passive absolute extents remain hidden until complete section
+success and provisional through fresh admission. Projection/retention and
+traversal coordination remain separate; selection grants no source or blob
+authority and allocates no label string or list.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or

@@ -4424,6 +4424,36 @@ No retry grant, retained metadata or source/publication authority follows.
 Live state is neither Copy nor Clone. Caller separately maps these offsets
 into its authorized resident/message extents.
 
+### 1.100 Resident MIME label field selection
+
+M06cu adds mime_label_fields::Cursor over caller-authorized resident entity
+bytes and their absolute base, header limit and explicit Eof/Prefix ending.
+Reuse the raw header scanner and strict single Content-ID and complete
+Content-Language grammars. Select the first completely valid occurrence of
+each field, skipping malformed occurrences and scanning later duplicates
+without interpreting their values. Names match ASCII case insensitively,
+including scanner-supported obsolete whitespace before the colon. Missing
+or entirely malformed values select None independently for the two fields.
+
+One exclusive syntax child is live at a time. Every scan, name comparison,
+parse and EOF decision uses the same original Meter/HeaderBudget and shared
+prepaid credit. Syntax fallback discards only candidate progress; it does
+not reset work or aggregate admission. Nesting, raw-header bounds, truncated
+prefixes, work and interpretation refusals retire the entire selection.
+A Prefix can succeed only when the scanner establishes a complete header
+boundary inside the supplied bytes; Eof additionally permits true EOF.
+
+No selected fields are visible before complete header-section success.
+Cached selection is provisional through fresh original admission; cached
+Complete polls are inert. check_deadline retires cached results on refusal.
+Consuming finish(now) freshly admits before premature-state failure and
+returns the exact original owners and passive Selection, including absolute
+raw field extents and scanner End. The caller separately projects/retains
+CID strings and ordered language tags under returned owners. These extents
+grant no raw source, blob, uniqueness, reference or publication authority.
+Cursor is neither Copy nor Clone. Location, JSON and traversal coordination
+remain separate; no growing label list or value copy is allocated.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,
