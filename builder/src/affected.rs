@@ -3046,7 +3046,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-boot/src/main.rs", "recipe-checks");
     assert_no_preflight!("td-boot/src/main.rs", "local-source-roster");
     assert_no_preflight!("td-boot/src/protocol.rs", "local-source-roster");
-    assert_no_preflight!("td-fs/src/lib.rs", "local-source-roster");
+    assert_no_preflight!("td-fs/src/real_file.rs", "local-source-roster");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
     // protocol.rs is the deployment contract three OTHER trees compile: two
@@ -3075,18 +3075,27 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // `#[path]`-includes it so the signer refuses what the verifier refuses,
     // and without the chain targets an edit here that breaks only the signer
     // would compile td-boot and td-install and build no net at all.
+    assert_target!("td-fs/src/real_file.rs", "check");
+    assert_target!("td-fs/src/real_file.rs", "recipe-checks");
+    assert_target!(
+        "td-fs/src/real_file.rs",
+        "bootstrap-x86_64-toolchain-store-native"
+    );
+    assert_target!(
+        "td-fs/src/real_file.rs",
+        "bootstrap-x86_64-native-gcc-store-native"
+    );
+    assert_target!(
+        "td-fs/src/real_file.rs",
+        "bootstrap-x86_64-self-gcc-store-native"
+    );
+    assert_preflight!("td-fs/src/real_file.rs", "cargo-test");
+    // The crate root is in td-net's staged tree too, so it routes the same.
     assert_target!("td-fs/src/lib.rs", "check");
-    assert_target!("td-fs/src/lib.rs", "recipe-checks");
     assert_target!(
         "td-fs/src/lib.rs",
         "bootstrap-x86_64-toolchain-store-native"
     );
-    assert_target!(
-        "td-fs/src/lib.rs",
-        "bootstrap-x86_64-native-gcc-store-native"
-    );
-    assert_target!("td-fs/src/lib.rs", "bootstrap-x86_64-self-gcc-store-native");
-    assert_preflight!("td-fs/src/lib.rs", "cargo-test");
     assert_no_target!(
         "td-boot/src/main.rs",
         "bootstrap-x86_64-toolchain-store-native"
@@ -6309,7 +6318,7 @@ mod tests {
             "td-sh/tests/posix.rs",
             "td-bootx/src/main.rs",
             "recipes/src/recipes/td-bootx.rs",
-            "td-fs/src/lib.rs",
+            "td-fs/src/real_file.rs",
             "td-fs/Cargo.toml",
             "recipes/src/recipes/uutils.rs",
             "td-compositor/src/main.rs",

@@ -39,7 +39,7 @@ pub mod td_boot_protocol;
 pub mod td_civil_tzif;
 // Keep the ISO composer's shared file admission inside the catalog scan; the
 // installer's zone table, compiled below, reaches it as `super::td_fs`.
-#[path = "../../td-fs/src/lib.rs"]
+#[path = "../../td-fs/src/real_file.rs"]
 pub mod td_fs;
 #[path = "../../td-install/src/timezones.rs"]
 pub mod td_install_timezones;

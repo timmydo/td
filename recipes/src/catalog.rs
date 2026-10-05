@@ -703,7 +703,7 @@ mod named_dirs_tests {
             [
                 file("td-boot", "src/protocol.rs"),
                 file("td-civil", "src/tzif.rs"),
-                file("td-fs", "src/lib.rs"),
+                file("td-fs", "src/real_file.rs"),
                 file("td-install-qemu-test", "src/protocol.rs"),
                 file("td-install", "src/timezones.rs"),
                 file("td-profiler", "src/contract.rs"),

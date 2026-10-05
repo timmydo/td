@@ -19,7 +19,7 @@ mod protocol;
 // reimplemented here — DESIGN §10 item 10b. A rule spelled in both crates is
 // one they can come to disagree about, and this one did, three ways, on the
 // day the second copy was written.
-#[path = "../../td-fs/src/lib.rs"]
+#[path = "../../td-fs/src/real_file.rs"]
 #[allow(dead_code)]
 mod td_fs;
 // `gpt.rs` reaches its checksum as `crate::crc32`, the spelling that resolves
@@ -7258,8 +7258,8 @@ mod tests {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
-                "lib.rs",
-                include_str!("../../td-fs/src/lib.rs"),
+                "real_file.rs",
+                include_str!("../../td-fs/src/real_file.rs"),
                 TD_FS_CHOKE.as_slice(),
             ),
             (

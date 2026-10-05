@@ -265,8 +265,8 @@ path.** `io::Error` carries an errno and no filename, and one command line
 here names as many as five paths — so `No such file or directory` alone is
 a diagnostic an operator cannot act on. This crate's SHIPPED source reaches
 the filesystem only through `mod paths`, whose wrappers each pair the
-operation with the path they were given; td-fs's `src/lib.rs`, which the
-crate compiles in, is the second such point and already named its own, and
+operation with the path they were given; td-fs's `src/real_file.rs`, which
+the crate compiles in, is the second such point and already named its own, and
 `engine/src/sha256.rs`'s `sha256_file` is the third: the crate compiles
 that file for its digests, never calls the helper (a test pins that), and
 the helper names its path for every consumer. ONE
@@ -2581,8 +2581,8 @@ Ordered by dependency, not by size. Each is one landing with its own tests.
    open, an oversized read truncated rather than refused), all found by review
    rather than by anything that runs. So the pair moved to
    `td-boot/src/realfile.rs`, which all three `#[path]`-include as they already
-   do `protocol.rs`; it has since become `td-fs/src/lib.rs`, the crate td's
-   other programs take their file helpers from.
+   do `protocol.rs`; it has since become `td-fs/src/real_file.rs`, one file
+   of the crate td's other programs take their file helpers from.
 
    The signer matters most of the three and was the one nobody would have
    thought to check. Its own comment gives the reason to share rather than

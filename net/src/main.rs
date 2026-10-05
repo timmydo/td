@@ -55,7 +55,7 @@ mod protocol;
 // at boot instead of at signing; `deploy.rs` used to hold a copy written to
 // match, which is the arrangement that guarantees they eventually will not.
 #[allow(dead_code)]
-#[path = "../../td-fs/src/lib.rs"]
+#[path = "../../td-fs/src/real_file.rs"]
 mod td_fs;
 
 // The TARGET-side verifier, compiled into the test build only. td signs here

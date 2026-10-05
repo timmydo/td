@@ -14,9 +14,9 @@ mod protocol;
 mod volume;
 // The real-regular-bounded file rule, td-fs's, shared with `td-install` for
 // `protocol.rs`'s reason. It lives outside this crate, so the `#[path]` is
-// required, and the recipe stages it at `{src}/td-fs/src/lib.rs`: it is in
-// the target binary.
-#[path = "../../td-fs/src/lib.rs"]
+// required, and the recipe stages it at `{src}/td-fs/src/real_file.rs`: it
+// is in the target binary.
+#[path = "../../td-fs/src/real_file.rs"]
 mod td_fs;
 // The committed fixture deployment, in its own file because the `td-install`
 // recipe check stages the SAME one and the signatures are over the manifest
