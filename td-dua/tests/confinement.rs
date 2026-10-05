@@ -25,6 +25,7 @@ const FILES: &[&str] = &[
     "delete.rs",
     "lib.rs",
     "main.rs",
+    "report.rs",
     "scan.rs",
     "tree.rs",
     "treemap.rs",
@@ -33,9 +34,9 @@ const FILES: &[&str] = &[
     "worker.rs",
 ];
 
-/// Files that hold the tree, the list, the treemap and the window's state
-/// and reach nothing but memory.
-const PURE: &[&str] = &["app.rs", "tree.rs", "treemap.rs", "view.rs"];
+/// Files that hold the tree, the list, the treemap, the window's state and
+/// the cleanup report, and reach nothing but memory.
+const PURE: &[&str] = &["app.rs", "report.rs", "tree.rs", "treemap.rs", "view.rs"];
 
 #[test]
 fn the_source_inventory_is_closed() {
@@ -96,12 +97,38 @@ fn only_the_deletion_module_removes() {
             "rename(",
             "set_permissions",
             "OpenOptions",
+            "File::options",
             "File::create",
             "fs::write",
         ] {
-            let allowed = name == "delete.rs" && removal.starts_with("remove_");
+            // The report's tag reader opens one file read-only, below.
+            let allowed = (name == "delete.rs" && removal.starts_with("remove_"))
+                || (name == "scan.rs" && removal == "OpenOptions");
             assert!(allowed || !text.contains(removal), "{name} names {removal}");
         }
+    }
+    let scan = production("scan.rs");
+    assert_eq!(scan.matches("OpenOptions::new()").count(), 1);
+    assert!(scan.contains(".read(true)"));
+    // The flags are exactly these three, so none adds O_CREAT or O_TRUNC.
+    assert_eq!(scan.matches(".custom_flags(").count(), 1);
+    assert!(scan.contains(".custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)"));
+    for flag in [
+        "const O_NONBLOCK: i32 = 0o4000;",
+        "const O_NOCTTY: i32 = 0o400;",
+        "const O_NOFOLLOW: i32 = 0o400000;",
+    ] {
+        assert_eq!(scan.matches(flag).count(), 1, "{flag}");
+    }
+    assert_eq!(scan.matches("const O_").count(), 3);
+    for writes in [
+        ".write(",
+        ".append(",
+        ".create(",
+        ".truncate(",
+        "create_new",
+    ] {
+        assert!(!scan.contains(writes), "scan.rs names {writes}");
     }
     // A directory is removed by the bounded walk, never by std's own.
     assert!(!production("delete.rs").contains("remove_dir_all"));
@@ -131,7 +158,7 @@ fn pure_files_take_only_the_calendar_from_td_civil() {
 }
 
 #[test]
-fn the_manifest_names_the_calendar_and_the_toolkit() {
+fn the_manifest_names_the_calendar_the_json_writer_and_the_toolkit() {
     let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap();
     let deps: Vec<&str> = manifest
         .split("[dependencies]")
@@ -145,6 +172,7 @@ fn the_manifest_names_the_calendar_and_the_toolkit() {
         deps,
         [
             "td-civil = { path = \"../td-civil\" }",
+            "td-json = { path = \"../td-json\" }",
             "td-ui = { path = \"../td-ui\" }"
         ]
     );
@@ -154,6 +182,6 @@ fn the_manifest_names_the_calendar_and_the_toolkit() {
         .filter_map(|line| line.strip_prefix("name = \""))
         .filter_map(|rest| rest.strip_suffix('"'))
         .collect();
-    assert_eq!(names, ["td-civil", "td-dua", "td-ui"]);
+    assert_eq!(names, ["td-civil", "td-dua", "td-json", "td-ui"]);
     assert!(!lock.contains("source ="), "no registry or git source");
 }

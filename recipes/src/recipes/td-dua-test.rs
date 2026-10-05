@@ -6,13 +6,15 @@ const TD_DUA: &str = "{in:td-dua}/bin/td-dua";
 /// the static shape the system tree demands, then run it on the target in
 /// the modes that write text and need no display. `--help` proves the
 /// entry dispatches; `--font-license` writes the notices td-ui embeds from
-/// the staged compositor assets, proven by exit status alone since the
-/// sandbox holds no tool to read them back. `--preview` is not run: it
-/// writes a binary PPM to standard output, which the step would copy into
-/// the build log that `build-run` reads back as UTF-8, and a frame small
-/// enough to keep there paints no tree or treemap. The scan, the window and
-/// the delete list are the crate's own tests on the host preflight; this
-/// is target-artifact coverage of the static binary, not of the window.
+/// the staged compositor assets; `report --json` scans the binary's own
+/// output tree and writes the cleanup report through td-json, each proven
+/// by exit status alone since the sandbox holds no tool to read them
+/// back. `--preview` is not run: it writes a binary PPM to standard
+/// output, which the step would copy into the build log that `build-run`
+/// reads back as UTF-8, and a frame small enough to keep there paints no
+/// tree or treemap. The scan, the window and the delete list are the
+/// crate's own tests on the host preflight; this is target-artifact
+/// coverage of the static binary, not of the window.
 pub fn recipe() -> Recipe {
     Recipe::mesboot("td-dua-test", "1.0")
         .native_inputs(&["td-dua"])
@@ -24,12 +26,13 @@ pub fn recipe() -> Recipe {
             Step::assert_static(&[TD_DUA]),
             Step::run("{root}", &[TD_DUA, "--help"]),
             Step::run("{root}", &[TD_DUA, "--font-license"]),
+            Step::run("{root}", &[TD_DUA, "report", "--json", "{in:td-dua}"]),
             Step::MkDir {
                 path: "{out}".into(),
             },
             Step::WriteFile {
                 path: "{out}/result".into(),
-                content: "PASS: static target td-dua executed help and the embedded font licence notices\n"
+                content: "PASS: static target td-dua executed help, the embedded font licence notices and a JSON cleanup report\n"
                     .into(),
                 exec: false,
             },
@@ -84,7 +87,11 @@ mod tests {
                     if path == "{out}/result" && content.contains("td-dua"))
             }),
         );
-        for args in [vec![TD_DUA, "--help"], vec![TD_DUA, "--font-license"]] {
+        for args in [
+            vec![TD_DUA, "--help"],
+            vec![TD_DUA, "--font-license"],
+            vec![TD_DUA, "report", "--json", "{in:td-dua}"],
+        ] {
             let run = at(
                 "runs a text mode",
                 steps
@@ -104,7 +111,12 @@ mod tests {
     #[test]
     fn the_text_modes_are_the_entry_points_main_dispatches() {
         let main = include_str!("../../../td-dua/src/main.rs");
-        for arm in ["Some(\"--help\" | \"-h\")", "Some(\"--font-license\")"] {
+        for arm in [
+            "Some(\"--help\" | \"-h\")",
+            "Some(\"--font-license\")",
+            "Some(\"report\") => report(args)",
+            "Some(\"--json\") => json = true",
+        ] {
             assert!(main.contains(arm), "{arm}");
         }
     }

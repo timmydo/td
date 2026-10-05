@@ -11,8 +11,13 @@ name = "td-dua"
 version = "0.1.0"
 dependencies = [
  "td-civil",
+ "td-json",
  "td-ui",
 ]
+
+[[package]]
+name = "td-json"
+version = "0.1.0"
 
 [[package]]
 name = "td-ui"

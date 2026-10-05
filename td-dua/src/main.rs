@@ -14,6 +14,17 @@ const USAGE: &str = "td-dua [DIRECTORY]
 td-dua --preview WIDTHxHEIGHT [DIRECTORY [SELECT]]
   Scan, then write the window's first frame as a PPM to standard output,
   with SELECT (a path under DIRECTORY) revealed and selected.
+td-dua report [--json] [--apparent] [--top N] [--stale-days DAYS]
+              [--min-size SIZE] [DIRECTORY]
+  Scan, then print what is worth cleaning up, deleting nothing:
+  directories their owners usually recreate (CACHEDIR.TAG caches, node_modules,
+  __pycache__, .cache, the trash), the largest and the stale files outside
+  them, and the top level. --json writes one JSON document for a program;
+  --apparent measures lengths rather than allocated blocks. Each section
+  lists N entries (default 20); a file is stale after DAYS days unmodified
+  (default 365); the file sections list files of SIZE or more (bytes, or
+  with K, M, G or T; default 1M). A directory named report opens in the
+  window as ./report.
 td-dua --font-license
   Print the embedded font notices.
 
@@ -46,6 +57,69 @@ fn root(argument: Option<PathBuf>) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// `td-dua report`: scan on this thread, then print the report.
+fn report(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
+    use td_dua::report::{self, Options};
+    let mut options = Options::default();
+    let mut json = false;
+    let mut directory = None;
+    let number = |value: Option<std::ffi::OsString>, flag: &str| -> Result<u64, String> {
+        value
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| format!("{flag} expects a whole number"))
+    };
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--help" | "-h") => {
+                let _ = writeln!(std::io::stdout().lock(), "{USAGE}");
+                return Ok(());
+            }
+            Some("--json") => json = true,
+            Some("--apparent") => options.measure = td_dua::tree::Measure::Apparent,
+            Some("--top") => {
+                let top = number(args.next(), "--top")?;
+                options.top = usize::try_from(top)
+                    .ok()
+                    .filter(|top| *top <= report::MAX_TOP)
+                    .ok_or_else(|| format!("--top is at most {}", report::MAX_TOP))?;
+            }
+            Some("--stale-days") => options.stale_days = number(args.next(), "--stale-days")?,
+            Some("--min-size") => {
+                options.min_size = args
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .and_then(|value| report::parse_size(&value))
+                    .ok_or("--min-size expects bytes, or a number with K, M, G or T")?;
+            }
+            Some(flag) if flag.starts_with('-') => return Err(USAGE.to_owned()),
+            _ if directory.is_none() => directory = Some(PathBuf::from(arg)),
+            _ => return Err(USAGE.to_owned()),
+        }
+    }
+    let root = root(directory)?;
+    let tree = td_dua::scan::scan(&root, &td_dua::scan::Progress::default())
+        .map_err(|error| format!("cannot scan {}: {error}", root.display()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        });
+    let report = report::build(&tree, options, now, &mut td_dua::scan::cachedir_tagged);
+    let text = if json {
+        let mut text = report.to_json().to_string();
+        text.push('\n');
+        text
+    } else {
+        report.to_text()
+    };
+    std::io::stdout()
+        .lock()
+        .write_all(text.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
 fn run() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
@@ -69,6 +143,7 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        Some("report") => report(args),
         Some("--preview") => {
             let size = args
                 .next()

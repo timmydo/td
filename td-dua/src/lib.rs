@@ -1,10 +1,12 @@
 //! td-dua: a disk usage analyzer (`DESIGN.md`). The scan, the tree, the
-//! list's rows, the treemap and the window's state are library modules so
-//! the tests drive them; the binary adds the window and the worker.
+//! list's rows, the treemap, the window's state and the cleanup report are
+//! library modules so the tests drive them; the binary adds the window and
+//! the worker.
 #![forbid(unsafe_code)]
 
 pub mod app;
 pub mod delete;
+pub mod report;
 pub mod scan;
 pub mod tree;
 pub mod treemap;

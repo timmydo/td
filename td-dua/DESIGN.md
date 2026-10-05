@@ -3,29 +3,33 @@
 td-dua is td's disk usage analyzer, in the spirit of WinDirStat: one
 window over one directory, the hierarchy above sorted by size, a treemap
 below in which every file is a rectangle in proportion to the space it
-takes, and a delete list to reclaim it. It is dependency-free Rust over
-td-ui's widget window, tree table, split pane and confirmation dialog.
-This document is its component contract; the root `AGENTS.md` and
-`DEVELOPMENT.md` govern changes and submission.
+takes, and a delete list to reclaim it; `td-dua report` prints what is
+worth cleaning up, as text or JSON, for a person at a terminal or an
+agent. It is dependency-free Rust over td-ui's widget window, tree
+table, split pane and confirmation dialog, with td-json writing the
+report. This document is its component contract; the root `AGENTS.md`
+and `DEVELOPMENT.md` govern changes and submission.
 
 ## Status and scope
 
-Built: the crate, its scan, tree, list, treemap, delete list and window,
-with unit, filesystem, driven-state and confinement tests. It joins the
-gate by existing (`[package.metadata.td-gate]`, all-target Clippy).
+Built: the crate, its scan, tree, list, treemap, delete list, window and
+report, with unit, filesystem, driven-state and confinement tests. It
+joins the gate by existing (`[package.metadata.td-gate]`, all-target
+Clippy).
 
 Implemented artifact: `recipes/src/recipes/td-dua.rs` builds it with
 the source-built stage2 toolchain from the checkout's own trees, td-dua
-staged with td-civil, td-ui and td-compositor (td-ui's mounts and
-notices), as td-photo is; the binary is static, with its debug companion
-beside it. The image copies the whole output into the immutable root and
-links `/bin/td-dua` to it. The launcher's Disk Usage card, shown in
-authority mode, starts it through td-authd's fixed request 0b in the
-account home, which it scans (td-authd/DESIGN.md); it also runs from the
-terminal. `td-dua-test` requires the binary, asserts its static shape
-and runs `--help` and `--font-license`. It does not run `--preview`,
-whose binary PPM would land in the build log that `build-run` reads back
-as UTF-8.
+staged with td-civil, td-json, td-ui and td-compositor (td-ui's mounts
+and notices), as td-photo is, with td-json added; the binary is static,
+with its debug companion beside it. The image copies the whole output
+into the immutable root and links `/bin/td-dua` to it. The launcher's
+Disk Usage card, shown in authority mode, starts it through td-authd's
+fixed request 0b in the account home, which it scans
+(td-authd/DESIGN.md); it also runs from the terminal. `td-dua-test`
+requires the binary, asserts its static shape and runs `--help`,
+`--font-license` and `report --json` over its own output tree. It does
+not run `--preview`, whose binary PPM would land in the build log that
+`build-run` reads back as UTF-8.
 
 Not yet: a driven control socket; a native-compositor process case; a
 legend for the treemap's colours; cushion shading. Each is its own
@@ -38,8 +42,79 @@ resolving it to an absolute path with links resolved; anything that is
 not a directory is refused before a window opens. `--preview
 WIDTHxHEIGHT [DIRECTORY [SELECT]]` scans on the calling thread and writes
 the first frame as a PPM in the bitmap face, with SELECT (a path relative
-to DIRECTORY) revealed and selected. `--font-license` prints the face
-notices; `--help` the usage and keys.
+to DIRECTORY) revealed and selected. `report` prints the cleanup report
+below. `--font-license` prints the face notices; `--help` the usage and
+keys. A directory named `report` or starting with `-` is opened by a
+path that does not read as a mode, such as `./report`.
+
+## Report
+
+`td-dua report [--json] [--apparent] [--top N] [--stale-days DAYS]
+[--min-size SIZE] [DIRECTORY]` scans DIRECTORY (else the working
+directory) as the window does, on the calling thread, and prints what is
+worth cleaning up. It reads nothing beyond the scan and the cache tags
+below, and deletes nothing: an agent or person decides, and deletes by
+its own means. Sizes are allocated blocks, or lengths with
+`--apparent`. Each list holds at most N entries (default 20, at most
+`report::MAX_TOP`), the first by size and, of equal sizes, by path
+(the unreadable and mount lists by path alone), whatever the walk's
+order; the counts and totals are over everything.
+Numbers are digits alone; an unknown flag or a second directory prints
+the usage and fails, and `report --help` prints it.
+
+- Candidates: directories whose contents their owner usually recreates
+  or has already discarded, by reason: `cachedir-tag`, a directory
+  holding a regular `CACHEDIR.TAG` that begins with the standard
+  signature (bford.info/cachedir; Cargo's `target` and pytest's and
+  mypy's caches write one); `node-modules`; `pycache`, a
+  `__pycache__`; `cache-dir`, a directory named `.cache` at any depth;
+  and `trash`, a path ending `.local/share/Trash`, the XDG trash at its
+  default place (not a relocated data home or a volume's `.Trash`).
+  These are heuristics by name or tag: a vendored `node_modules` or a
+  project's own `.cache` matches too, so each carries a sentence (`why`)
+  for the reader to weigh. Only the outermost is listed: nothing
+  beneath a candidate is a candidate. The scanned directory itself never
+  is. Largest first, with their total and count, how many files beneath
+  have other hard links (`linked_files`) and how many other file
+  systems are mounted beneath (`mounts`), which a recursive delete
+  would enter.
+- Largest files and stale files: regular files of SIZE or more (default
+  1 MiB) outside every candidate, largest first; a file is stale when
+  modified before `stale_before`, DAYS days (default 365) before the
+  report's clock `now`. A candidate's contents are left out because they
+  are already accounted for, and because a package manager's files carry
+  old times.
+- Top level: the directory's own entries, largest first.
+- Unreadable directories and other file systems not entered, so a
+  partial or bounded total says why; `node_limit` says the scan stopped
+  at `tree::MAX_NODES` entries.
+
+An inode with several names owns its bytes at the name the scan met
+first, so a total moves with the walk's order: a file with other names
+says so (`linked`), and deleting one name, or a candidate whose
+`linked_files` is not zero, may free less or more than its size says.
+The text form shows paths as the list shows names, each control
+character a `?`, so each entry is one line. `--json` writes one JSON
+document on one line: `root` (and `root_lossy`), `measure`, `bytes`,
+`files`, `directories`, `partial`, `node_limit`, `now`, `top`,
+`stale_days`, `stale_before`, `min_size`, `candidate_bytes` and
+`candidate_count`; then `candidates`, `largest_files`, `stale_files`
+and `top_level` as objects with `path`, `kind`, `bytes`, `files`
+(entries beneath a directory or mount that are not directories, else
+1), `modified` (UTC `YYYY-MM-DD`) and, for a file with other names,
+`linked`, candidates adding `reason`, `why`, `linked_files` and
+`mounts`; then `unreadable_count`, `unreadable`, `mount_count` and
+`mounts` as objects with `path`. `now` and `stale_before` are seconds
+since the epoch. A path that is not UTF-8 is written lossily with
+`lossy` set, so a reader knows not to act on it.
+
+A tag is read only when `symlink_metadata` says it is a regular file,
+then opened read-only with `O_NOFOLLOW`, `O_NONBLOCK` and `O_NOCTTY`,
+and read for at most the signature's length only if the opened file is
+a regular file with the device and inode the path had: a link, FIFO or
+device swapped in between is no tag, and opening it neither follows a
+link, waits for a writer nor takes a terminal. The flags are x86-64's
+values, as td-agent spells them.
 
 ## The window
 
@@ -229,13 +304,16 @@ exit.
 
 ## Confinement
 
-`tests/confinement.rs` pins the source inventory, `forbid(unsafe_code)`
-in both crate roots, that `app.rs`, `tree.rs`, `treemap.rs` and `view.rs`
-reach no system interface (and use no grouped `std::{` import that would
-hide one from the scan), that only `delete.rs` removes and nothing
-writes, renames or changes permissions, that deletion reads the mount
-table and never calls `remove_dir_all`, and that the manifest's
-dependencies are td-civil (the modified date) and td-ui.
+`tests/confinement.rs` pins the source inventory and
+`forbid(unsafe_code)` in both crate roots. `app.rs`, `report.rs`,
+`tree.rs`, `treemap.rs` and `view.rs` reach no system interface, nor
+use a grouped `std::{` import that would hide one from the scan; the
+report's tag reader is `scan::cachedir_tagged`. Only `delete.rs`
+removes, and nothing writes, renames or changes permissions; `scan.rs`
+opens one file with `OpenOptions`, only to read it. Deletion reads the
+mount table and never calls `remove_dir_all`. The manifest's
+dependencies are td-civil (the modified date), td-json (the report) and
+td-ui.
 
 ## Tests
 
@@ -258,8 +336,21 @@ dependencies are td-civil (the modified date) and td-ui.
   selection made elsewhere during a refresh kept, a vanished selection
   leaving nothing selected, a root refresh replacing the tree and
   carrying state by path, and painting at scales one to four.
+- `tests/report.rs`: each candidate reason and only the outermost, a
+  decoy tag refused, the scanned root never a candidate, the trash
+  found from a scan of `.local` or `.local/share` and not elsewhere, the
+  file sections leaving candidates' contents out, the stale threshold,
+  whole-tree counts, the list bound, equal sizes kept by path, a linked
+  file and a candidate's linked files counted, the JSON document's
+  sections, clock and cutoff, plurals, one text line per entry, the tag
+  reader refusing a short, wrong, linked or non-file tag, size
+  arguments, and the binary's strict options, `report --help` and its
+  one-line JSON.
 
 Not covered by a test: a target on another device or a mount point
 (neither can be made without privilege; the device comparison and the
 mount-table reading are unit-tested apart), the per-directory re-check's
-refusal (it needs a racing swap), and dragging the divider.
+refusal (it needs a racing swap), dragging the divider, a report's
+mounts beneath a candidate (a mount needs privilege), a FIFO or device
+swapped for a tag (std makes no FIFO, and the swap is a race), and the
+node limit (sixteen million entries).

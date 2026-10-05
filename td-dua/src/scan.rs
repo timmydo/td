@@ -133,3 +133,46 @@ fn mark_unreadable(tree: &mut Tree, id: NodeId) {
     tree.partial = true;
     tree.mark_unreadable(id);
 }
+
+/// The signature a `CACHEDIR.TAG` begins with
+/// (<https://bford.info/cachedir/>).
+const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+// x86-64 open(2) flags std does not name, as td-agent spells them.
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("td-dua's open(2) flags are x86-64's");
+const O_NONBLOCK: i32 = 0o4000;
+const O_NOCTTY: i32 = 0o400;
+const O_NOFOLLOW: i32 = 0o400000;
+
+/// Whether the file at `path` is a regular file that begins with the
+/// cache-directory signature, reading at most the signature's length. It
+/// opens read-only without following a link, blocking on a FIFO or taking
+/// a terminal, then requires what it opened to be the regular file the
+/// path named before the open, so a node swapped in between is no tag.
+pub fn cachedir_tagged(path: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(before) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !before.is_file() {
+        return false;
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK | O_NOCTTY)
+        .open(path)
+    else {
+        return false;
+    };
+    let same = file.metadata().is_ok_and(|opened| {
+        opened.is_file() && opened.dev() == before.dev() && opened.ino() == before.ino()
+    });
+    if !same {
+        return false;
+    }
+    let mut head = Vec::with_capacity(CACHEDIR_SIGNATURE.len());
+    let limit = u64::try_from(CACHEDIR_SIGNATURE.len()).unwrap_or(u64::MAX);
+    file.take(limit).read_to_end(&mut head).is_ok() && head == CACHEDIR_SIGNATURE
+}

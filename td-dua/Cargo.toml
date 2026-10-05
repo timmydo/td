@@ -7,12 +7,13 @@ license = "MIT"
 
 # Own workspace root, so cargo behaves the same from the main checkout as from
 # a worktree nested under it (see the root Cargo.toml). Its dependencies are
-# td's civil calendar and the toolkit, sibling paths in the one spelling the
-# lock guard admits (AGENTS.md 'Rust code').
+# td's civil calendar, its JSON writer and the toolkit, sibling paths in the
+# one spelling the lock guard admits (AGENTS.md 'Rust code').
 [workspace]
 
 [dependencies]
 td-civil = { path = "../td-civil" }
+td-json = { path = "../td-json" }
 td-ui = { path = "../td-ui" }
 
 [package.metadata.td-gate]
