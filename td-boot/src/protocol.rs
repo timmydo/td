@@ -224,6 +224,17 @@ pub const MKFS_BTRFS: &str = "mkfs.btrfs";
 // so an image without it reds the build.
 #[allow(dead_code)]
 pub const CRYPTSETUP: &str = "cryptsetup";
+// The device-bound volume-key handoff (td-install/ENCRYPTION.md "Boot and
+// authority boundaries"): the selector's td-kexec appends to its sealed copy
+// of the deployment initramfs one newc archive whose only member is this
+// rootfs-relative file, holding exactly this many key bytes, and the
+// deployment initramfs reads it there. A permanent v1 contract: td has no
+// selector-update operation, so an installed selector hands every later
+// deployment this format, and a later format takes a new name beside it.
+#[allow(dead_code)]
+pub const VOLUME_KEY_MEMBER: &str = "td-volume-key-v1";
+#[allow(dead_code)]
+pub const VOLUME_KEY_BYTES: usize = 64;
 // 1 MiB, the alignment every partition start is held to. A start that ignores
 // it reads and writes across a physical block boundary forever, and nothing
 // reports it — `gpt.rs` refuses 0 for the same reason.

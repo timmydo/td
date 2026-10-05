@@ -6254,7 +6254,10 @@ mod tests {
                 "td-secret"
             ]
         );
-        assert_eq!(readers_of("td-boot"), ["td-install", "td-update"]);
+        assert_eq!(
+            readers_of("td-boot"),
+            ["td-install", "td-kexec", "td-update"]
+        );
         // Dev-dependency edges count: a td-source-scan change runs every
         // consumer's confinement tests.
         assert_eq!(
@@ -8990,6 +8993,7 @@ mod tests {
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
+                "td-kexec",
                 "td-login",
                 "td-mail",
                 "td-mta",

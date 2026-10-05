@@ -28,7 +28,15 @@ use crate::types::{Recipe, Step};
 //
 // The actual static link needs the full target toolchain (no target rustc in
 // the loop sandbox); the sibling td-kexec-test carries that build+assert check.
+//
+// The volume-key handoff (`--fds-key`) compiles three shared sources by
+// `#[path]`: td-boot's protocol (the archive member and key length), and the
+// engine's SHA-256 and newc writer. Each is staged where the relative include
+// resolves, beside `td-kexec/src/main.rs`.
 const MAIN_RS: &str = include_str!("../../../td-kexec/src/main.rs");
+const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
+const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
+const CPIO_RS: &str = include_str!("../../../engine/src/cpio.rs");
 
 pub fn recipe() -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>
@@ -59,11 +67,25 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
-    steps.push(Step::WriteFile {
-        path: "{src}/main.rs".into(),
-        content: MAIN_RS.into(),
-        exec: false,
-    });
+    for dir in [
+        "{src}/td-kexec/src",
+        "{src}/td-boot/src",
+        "{src}/engine/src",
+    ] {
+        steps.push(Step::MkDir { path: dir.into() });
+    }
+    for (path, content) in [
+        ("{src}/td-kexec/src/main.rs", MAIN_RS),
+        ("{src}/td-boot/src/protocol.rs", PROTOCOL_RS),
+        ("{src}/engine/src/sha256.rs", SHA256_RS),
+        ("{src}/engine/src/cpio.rs", CPIO_RS),
+    ] {
+        steps.push(Step::WriteFile {
+            path: path.into(),
+            content: content.into(),
+            exec: false,
+        });
+    }
     // Synthesize {root}/eh/libgcc_eh.a = libgcc.a (objcopy preserves the members;
     // ranlib writes the archive index ld needs) so `-lgcc_eh` resolves.
     steps.push(Step::MkDir {
@@ -104,7 +126,7 @@ pub fn recipe() -> Recipe {
                 "-Clink-arg=-static-libgcc",
                 "-o",
                 "{out}/bin/td-kexec",
-                "{src}/main.rs",
+                "{src}/td-kexec/src/main.rs",
             ],
         )
         .env("PATH", &path)

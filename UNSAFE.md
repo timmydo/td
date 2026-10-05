@@ -116,7 +116,7 @@ one.
 
 | # | crate | syscalls |
 |---|-------|----------|
-| 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)` |
+| 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)`, `memfd_create(2)` with pinned flags including `MFD_NOEXEC_SEAL`, `fcntl(2)` pinned to `F_ADD_SEALS` and one seal set (plus a test-only `F_SETLEASE` probe) — see [§1](#1-td-kexec--the-guest-kexec-helper) |
 | 2 | `td-netd` | `ioctl(2)` |
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has five pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
@@ -220,20 +220,41 @@ fields, one raw call site, and the payload restriction's caller path.
 
 ## 1. `td-kexec` — the guest kexec helper
 
-The `td-kexec` guest helper is confined to exactly two syscalls
-(`kexec_file_load(2)` + `reboot(2)` with `LINUX_REBOOT_CMD_KEXEC`) copied
-from `sys.rs`.
+The `td-kexec` guest helper is confined to four syscalls through one
+instruction, `syscall5`, copied from `sys.rs` and the crate's only scoped
+`#[allow(unsafe_code)]`:
 
-Planned, not present: the device-bound volume key handoff
-(`td-install/ENCRYPTION.md` increment 6, "Boot and authority
-boundaries") adds `memfd_create(2)` with flags pinned to
-`MFD_CLOEXEC | MFD_ALLOW_SEALING` and `fcntl(2)` pinned to `F_ADD_SEALS`
-with `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`, each
-value-pinned through the same single instruction. The commit that adds
-them amends this section and the roster; until then the surface is the
-two syscalls above. Adopting the returned descriptor into a `File`
-would be a second scoped `#[allow]` and amends this section too. Key
-material reaches td-kexec only by descriptor.
+- `kexec_file_load(2)` (320) and `reboot(2)` (169) with
+  `LINUX_REBOOT_CMD_KEXEC`, for every mode;
+- `memfd_create(2)` (319) with the fixed name `td-kexec-handoff` and flags
+  pinned to `MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL` (11), so
+  the copy is never executable, and `fcntl(2)` (72)
+  pinned to `F_ADD_SEALS` (1033) with
+  `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` (15), on the
+  descriptor that `memfd_create` returned. These serve only `--fds-key`,
+  the device-bound volume key handoff (`td-install/ENCRYPTION.md`
+  increment 6, "Boot and authority boundaries"), which nothing invokes
+  yet.
+
+No descriptor is adopted: the memfd stays a raw number, released at exit
+or by the kexec, and td-kexec writes it through a second open of
+`/proc/self/fd/N`, which std performs and which is closed before the
+seals, since `kexec_file_load` refuses an initramfs open for writing.
+Adopting the descriptor into a `File`, or closing it, would be a second
+scoped `#[allow]` or a further syscall and amends this section. Key
+material reaches td-kexec only by descriptor: a pipe named
+`/proc/<pid>/fd/<n>`, never argv or the environment. The crate's
+`confinement` tests pin the one unsafe block and allowance, the four call
+sites with their exact arguments, the pinned values, and the absence of
+descriptor adoption and environment reads; its unit tests run the real
+`memfd_create` and `F_ADD_SEALS` and check each seal's refusal, and no
+test calls `kexec_file_load` or `reboot`. One `#[cfg(test)]` helper
+passes `fcntl(2)` `F_SETLEASE` (1024) with `F_RDLCK` (0) through the same
+instruction on a fresh read-only open of a memfd: the kernel refuses that
+lease exactly when the inode is open for writing, the count
+`kexec_file_load` refuses, so the tests show no writer is left on the
+handoff memfd. It is absent from the shipped binary, and the confinement
+tests scan only production code for the four requests above.
 
 ## 2. `td-netd` — the network bring-up daemon
 

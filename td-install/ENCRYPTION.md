@@ -336,8 +336,8 @@ over the disk replaces.
 ## Selector release
 
 This section, the release order and the handoff ("Boot and authority
-boundaries") are increment 6's target; none of it is implemented yet.
-Today's selector neither releases nor caps, its discovery finds only a
+boundaries") are increment 6's target. Only td-kexec's half of the
+handoff exists, a mode nothing invokes yet. Today's selector neither releases nor caps, its discovery finds only a
 Btrfs volume, and the image refuses cryptsetup in either initramfs
 (DESIGN.md D6).
 
@@ -451,10 +451,51 @@ hands every later deployment the same format. A deployment from before
 increment 6 on an encrypted volume has no key reader; it fails closed,
 and the selector falls back through its boot attempts.
 
+The member is `td-volume-key-v1` at the root of the rootfs, a regular
+file of mode 0400 owned by root holding exactly the 64 key bytes; a later
+format takes a new name beside it. td-kexec builds the memfd as
+`td-kexec --fds-key DIGEST /proc/PID/fd/N CMDLINE`: the kernel and the
+verified initramfs on descriptors 0 and 1, as `--fds`, `DIGEST` the
+initramfs digest td-boot verified from the manifest, and the key on a
+pipe the caller holds, named as td-install names one to cryptsetup. The
+caller writes all 64 bytes and closes every write end of that pipe
+before it starts td-kexec, which opens the name anew without blocking,
+refuses anything but a pipe, and requires exactly 64 bytes and end of
+file: a read that would wait, because a write end is still open, refuses
+rather than hang the selector. td-kexec refuses a `CMDLINE` naming
+`retain_initrd` or `keepinitrd` (quotes removed, `-` and `_` alike, as
+the kernel parses them), which would keep the initramfs and so the key
+readable at `/sys/firmware/initrd`. It creates the memfd with
+`MFD_NOEXEC_SEAL`, so the copy can never be executed, and copies the
+initramfs into it with positioned reads, hashing what it writes; it
+reads the key only after the copy's digest equals `DIGEST`, so a
+mismatch refuses with no key read. It then writes NUL padding to a
+4-byte boundary and the archive, the key straight from its one buffer
+between the archive's header and trailer, zeroes that buffer, and adds
+the four seals before `kexec_file_load` takes the memfd and the
+unchanged command line. It writes the memfd through a second open of it,
+closed before the seals, because `kexec_file_load` refuses an initramfs
+open for writing (Linux 7.1.4 `kernel_read_file`'s `deny_write_access`),
+which memfd_create's own descriptor does not count as; a test-only read
+lease, which the kernel refuses on the same write count, shows no writer
+left. The initramfs, and the copy with the archive, are bounded by
+`kexec_file_load`'s 4 GiB.
+
+Once the key is in the memfd, any later failure (writing the archive's
+trailer, the length check, the seals, `kexec_file_load`, or `reboot`
+returning) leaves it there until td-kexec exits, and the memfd's pages
+are then freed without being zeroed. A loaded kexec image whose `reboot`
+fails keeps its copy of the key in the staged segments. Both are copies
+in memory of the kind described below, within the memory-extraction
+residue that Scope excludes.
+
 The deployment initramfs reads the key from its RAM-backed root, opens
 the volume by descriptor and removes the key file before starting the
-system; DESIGN.md "Full-system volume consumers" owns how it finds the
-partition and the active mapping. It refuses a key on an unencrypted
+system. When its kernel could not unpack an initramfs, the
+`CONFIG_BLK_DEV_RAM` fallback writes the whole initrd, archive and key
+included, to `/initrd.image` in that root, so the key reader must remove
+that file too before starting the system; DESIGN.md "Full-system volume
+consumers" owns how it finds the partition and the active mapping. It refuses a key on an unencrypted
 volume and an encrypted volume without a key. Then, as defence in depth,
 it attempts to unseal each td token, since the selector's cap must
 already be closed. Without a TPM device it attempts nothing, so a TPM
@@ -470,7 +511,7 @@ writes the key to any block device. Removing the file retires the key from
 the filesystem only: copies remain in the selector's memfd pages, the
 `kexec` segments and the second kernel's freed initrd region, which memory
 extraction, outside Scope, could read. td-kexec's memfd and sealing
-syscalls amend UNSAFE.md (§1) in the commit that adds them.
+syscalls are recorded in UNSAFE.md §1.
 
 The authenticated user gets an ordinary session. Later elevation uses the
 existing operation-to-principal policy and secure-attention path: one
