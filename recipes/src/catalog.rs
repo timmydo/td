@@ -520,6 +520,7 @@ mod tests {
                 "td-pass",
                 "td-photo",
                 "td-portal",
+                "td-protector",
                 "td-regex",
                 "td-review",
                 "td-secret",

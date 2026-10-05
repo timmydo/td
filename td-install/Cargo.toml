@@ -22,6 +22,11 @@ path = "src/main.rs"
 # td-install is a TARGET-built program outside the control-plane workspace, with
 # zero external dependencies. It compiles this source plus the shared engine GPT,
 # FAT32 and CRC-32 writers and td-boot's on-disk protocol directly with rustc.
+# The device-bound service's TPM probe runs over the sibling disk protector and
+# TPM client (td-protector reaches td-json), each an rlib in the recipe.
+[dependencies]
+td-protector = { path = "../td-protector" }
+td-tpm = { path = "../td-tpm" }
 
 [lints.rust]
 unsafe_code = "deny"

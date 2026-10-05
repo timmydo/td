@@ -39,6 +39,9 @@ pub(crate) trait Host {
     /// Asks the supervisor for its orderly reboot or power-off; `Ok` once
     /// it has accepted, before anything is stopped.
     fn end(&mut self, ending: Ending) -> Result<(), Refusal>;
+    /// The storage every plan of this service names: its caller's operand,
+    /// never a request's.
+    fn storage(&self) -> Storage;
 }
 
 /// Writes a consented installation under its claim, on its own thread.
@@ -238,7 +241,7 @@ impl<H: Host, E: Execute<H::Claim>> Service<H, E> {
             destination,
             deployment,
             uuid,
-            Storage::Unencrypted,
+            self.host.storage(),
             settings,
         )
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -826,6 +829,7 @@ mod tests {
         /// Proposals so far; each draws its own nonce.
         drawn: u8,
         end: Result<(), Refusal>,
+        storage: Storage,
     }
     impl Fake {
         fn new() -> Self {
@@ -841,6 +845,7 @@ mod tests {
                 zones: Ok(()),
                 drawn: 0,
                 end: Ok(()),
+                storage: Storage::Unencrypted,
             }
         }
         fn call(&self, name: &'static str) {
@@ -908,6 +913,9 @@ mod tests {
                 Ending::PowerOff => "power off",
             });
             self.end
+        }
+        fn storage(&self) -> Storage {
+            self.storage
         }
     }
 
@@ -1598,6 +1606,26 @@ mod tests {
             }
             assert_eq!(service.state(), state);
             assert!(service.take_reports().is_empty());
+        }
+    }
+
+    /// The host's storage, and only it, names every review's storage: a
+    /// proposal carries none.
+    #[test]
+    fn the_service_storage_names_the_review() {
+        for storage in Storage::ALL {
+            let mut fake = Fake::new();
+            fake.storage = *storage;
+            let mut service = Service::new(fake);
+            let plan = reviewed(&mut service);
+            assert_eq!(plan.storage(), *storage);
+            assert_eq!(
+                consent_review(&plan).unwrap().storage(),
+                match storage {
+                    Storage::Unencrypted => consent::Storage::Unencrypted,
+                    Storage::DeviceBound => consent::Storage::DeviceBound,
+                }
+            );
         }
     }
 

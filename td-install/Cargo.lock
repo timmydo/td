@@ -5,3 +5,23 @@ version = 4
 [[package]]
 name = "td-install"
 version = "0.1.0"
+dependencies = [
+ "td-protector",
+ "td-tpm",
+]
+
+[[package]]
+name = "td-json"
+version = "0.1.0"
+
+[[package]]
+name = "td-protector"
+version = "0.1.0"
+dependencies = [
+ "td-json",
+ "td-tpm",
+]
+
+[[package]]
+name = "td-tpm"
+version = "0.1.0"

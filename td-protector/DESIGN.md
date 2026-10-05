@@ -2,8 +2,10 @@
 
 td-protector is the disk-protector policy of
 [ENCRYPTION.md](../td-install/ENCRYPTION.md)'s device-bound tier, carried
-for both of its consumers: the installer, which seals and verifies the
-first-boot protector (increment 5), and the selector, which releases, seals
+for both of its consumers: the installer, which probes for a usable TPM
+with the observed-policy read before a device-bound service starts and
+seals and verifies the first-boot protector (increment 5), and the
+selector, which releases, seals
 the device-bound protector and caps PCR 12 (increment 6). It runs over the
 shared TPM 2.0 client [td-tpm](../td-tpm/DESIGN.md) and owns only what
 ENCRYPTION.md makes disk-specific: which PCRs a protector names, the

@@ -308,7 +308,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/sha256.rs",
-        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot and td-boot link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
+        "td-builder, td-recipe-eval, target-static td-boot, td-update and td-install (its live installation's ESP kernel check), td-authd, td-secret and the td-tpm client it, td-firstboot, td-boot and td-install link, the td-firstboot recipe, host td-vm, the td-compositor and td-ui terminal corpus verifiers/importers, and td-crypto's test-only ES256 oracle",
     ),
     (
         "engine/src/crc32.rs",
@@ -372,6 +372,8 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-firstboot/src", "recipes/src/recipes/td-firstboot.rs"),
     ("td-init/src", "recipes/src/recipes/td-init.rs"),
     ("td-install/src", "recipes/src/recipes/td-install.rs"),
+    ("td-json/src", "recipes/src/recipes/td-install.rs"),
+    ("td-protector/src", "recipes/src/recipes/td-install.rs"),
     (
         "td-install-qemu-test/src",
         "recipes/src/recipes/td-install-qemu-test.rs",
@@ -384,6 +386,7 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-tpm/src", "recipes/src/recipes/td-secret.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-firstboot.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-boot.rs"),
+    ("td-tpm/src", "recipes/src/recipes/td-install.rs"),
     (
         "recipes/src/fixtures",
         "recipes/src/recipes/td-secret-vm-test.rs",

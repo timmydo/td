@@ -87,7 +87,9 @@ operations are specified in "Installation service protocol".
 The `td-setup` front end has a source-built static target recipe and
 `td-setup-test` realized-output check. The recipe stages its own tree with
 `td-install`, `td-ui` and the compositor sources that the toolkit mounts,
-then builds with the target Rust toolchain. The check runs `--help`,
+and td-install's own Cargo dependencies (td-protector, td-tpm, td-json and
+the engine SHA-256 td-tpm includes), which the library td-setup uses does
+not name, then builds with the target Rust toolchain. The check runs `--help`,
 `--font-license` and a headless render of every page type at the reference
 800x600 size and the compositor's 752x508 tile, including all destination
 and review detail pages and every progress outcome, without emitting image
@@ -465,9 +467,10 @@ those two modules, as pinned by td-setup's confinement test, which lets only
 td-setup's `service` module name `installation_protocol`. The formatter
 binary stages the plan and protocol modules separately through `#[path]`,
 for `observe-plan` and `serve`, with its recipe and compiled-file guard
-declaring the sources. Each further target consumer must declare its source
-and public API reach in its own recipe and confinement roster. A decoded
-plan conveys no authority.
+declaring the sources; its recipe also compiles td-tpm, td-json and
+td-protector as rlibs for `serve`'s TPM probe. Each further target
+consumer must declare its source and public API reach in its own recipe
+and confinement roster. A decoded plan conveys no authority.
 
 `Candidates` carries at most 64 distinct destination observations, as the
 protocol's destinations reply. Its canonical `TDCAND01` record has an
@@ -738,11 +741,13 @@ and the QEMU oracle) zeroes every received payload with the codec's
 
 Until formatting lands, the codecs exist and nothing reaches the phase:
 the service formats nothing device-bound, so it answers `0x09` and `0x0a`
-as busy while an installation runs and as no review otherwise, and its
-plans are unencrypted. td-setup ends a connection whose review is
-device-bound or whose status reports the phase or failure 6, and
-td-authd declines a device-bound review as unavailable, so no window or
-prompt shows storage until increment 7 activates the tier.
+as busy while an installation runs and as no review otherwise. A service
+started without the storage operand reviews unencrypted plans; with it,
+its plans are device-bound and their execution stops before any write
+(DESIGN.md "Device-bound formatting"). td-setup ends a connection whose
+review is device-bound or whose status reports the phase or failure 6,
+and td-authd declines a device-bound review as unavailable, so no window
+or prompt shows storage until increment 7 activates the tier.
 
 ## Installation service core
 
@@ -773,9 +778,16 @@ The leading `--storage device-bound` operand, the only storage operand,
 makes every installation of this service device-bound
 ([ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting", which owns its
 activation boundary); without it, storage is unencrypted. td-authd never
-passes it. With it, serve opens the TPM before sending a byte and refuses
-to start, with a diagnostic, unless it is usable: PCR_Read of PCRs 4 and
-9 in the SHA-256 bank answers that bank, and neither value is zero.
+passes it. With it, serve opens the TPM once the admission checks above
+pass, so a misplaced start never reaches it, and before sending a byte,
+and refuses to start, with a diagnostic, unless it is usable: PCR_Read of
+PCRs 4 and 9 in the SHA-256 bank answers that bank, and neither value is
+zero. That read is td-protector's observed policy, made once on a fresh
+client and never retried; the probe seals nothing, and the TPM's state
+may change before execution, which seals under its own policy. Every plan
+the service reviews then names device-bound storage. Until formatting
+lands, an execution of such a plan stops before any write (DESIGN.md
+"Device-bound formatting").
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot

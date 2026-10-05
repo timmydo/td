@@ -98,7 +98,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve [--storage device-bound] <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]\n       \
                      td-install format ... --trusted-key <trusted-key> --publish <td-boot> <deployment> <mountpoint>";
@@ -593,6 +593,35 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
         (verb, None)
     };
     let rest: Vec<PathBuf> = args.map(PathBuf::from).collect();
+    // The service's control-plane storage operand (INSTALLER.md
+    // "Installation service core"): leading, once, and only device-bound.
+    let (storage, rest) = if rest
+        .first()
+        .is_some_and(|arg| arg.as_os_str() == "--storage")
+    {
+        if verb != "serve" {
+            return Err(invalid("--storage is only supported by serve".into()));
+        }
+        if !rest
+            .get(1)
+            .is_some_and(|arg| arg.as_os_str() == "device-bound")
+        {
+            return Err(invalid("--storage admits only device-bound".into()));
+        }
+        (
+            installation_plan::Storage::DeviceBound,
+            rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?,
+        )
+    } else {
+        (installation_plan::Storage::Unencrypted, rest.as_slice())
+    };
+    if rest.iter().any(|arg| arg.as_os_str() == "--storage") {
+        return Err(invalid(if verb == "serve" {
+            "--storage must appear once, before the serve operands".into()
+        } else {
+            "--storage is only supported by serve".into()
+        }));
+    }
     let (uuid, rest) = if rest.first().is_some_and(|arg| arg.as_os_str() == "--uuid") {
         if verb != "volume" {
             return Err(invalid("--uuid is only supported by volume".into()));
@@ -607,7 +636,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             rest.get(2..).ok_or_else(|| invalid(USAGE.into()))?,
         )
     } else {
-        (None, rest.as_slice())
+        (None, rest)
     };
     let (timezone, rest) = if rest
         .first()
@@ -780,6 +809,7 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 timezones: PathBuf::from(TIMEZONE_ROOT),
                 catalog: None,
                 booted: PathBuf::from(BOOTED_DEPLOYMENT),
+                storage,
             };
             if [
                 &host.td_boot,
@@ -1011,6 +1041,8 @@ struct LiveHost {
     catalog: Option<Result<installation_plan::Zones, installation_protocol::Refusal>>,
     /// Which deployment the running root was authenticated as.
     booted: PathBuf,
+    /// The caller's storage operand; every plan names it.
+    storage: installation_plan::Storage,
 }
 
 // Whatever the catalog reader admits, the protocol's record carries.
@@ -1191,6 +1223,27 @@ impl installation_service::Host for LiveHost {
         request_power(&supervisor, power_verb(ending), POWER_TIMEOUT)
             .map_err(|error| refuse(installation_protocol::Refusal::PowerUnavailable, error))
     }
+
+    fn storage(&self) -> installation_plan::Storage {
+        self.storage
+    }
+}
+
+/// Device-bound storage needs a usable TPM 2.0 (ENCRYPTION.md "Device-bound
+/// default"): `open` reaches the resource manager, and one PCR_Read answers
+/// the SHA-256 bank for PCRs 4 and 9, neither unmeasured. td-protector's
+/// observed policy is exactly that read and refusal; the policy itself is
+/// dropped, since nothing is sealed to it here. There is no fallback.
+fn probe_tpm<T: td_tpm::Transport>(open: impl FnOnce() -> Result<T, String>) -> io::Result<()> {
+    let unusable = |error: String| {
+        invalid(format!(
+            "no usable TPM 2.0 for device-bound storage: {error}"
+        ))
+    };
+    let transport = open().map_err(unusable)?;
+    td_protector::observed_policy(&mut td_tpm::Client::new(transport))
+        .map(drop)
+        .map_err(unusable)
 }
 
 /// td-svc's control verb for an ending.
@@ -1579,6 +1632,14 @@ impl installation_service::Execute<File> for LiveExecution {
             let _ = writeln!(io::stderr(), "td-install serve: {failure:?}: {error}");
             failure
         };
+        // Device-bound formatting is DESIGN.md's, and not this build's: such
+        // a plan stops before the first write, never formatted unencrypted.
+        if plan.storage() != installation_plan::Storage::Unencrypted {
+            return Err(report((
+                installation_protocol::Failure::VerificationFailed,
+                invalid("device-bound formatting is not available".into()),
+            )));
+        }
         // Nothing is written yet; a workspace that cannot be made is space,
         // or a name an earlier execution left.
         let workspace = Workspace::create(&self.run, plan.nonce())
@@ -1900,6 +1961,12 @@ fn run_serve(host: LiveHost) -> io::Result<()> {
     // Nothing serve runs writes to stdout: every child's is piped or null.
     let stdout = File::from(io::stdout().as_fd().try_clone_to_owned()?);
     let (stream, consent) = admit_serve(euid, stdin, stdout)?;
+    // After admission, so a misplaced start never opens the TPM, and before
+    // a byte: a device-bound service without a usable TPM refuses to start
+    // rather than serve unencrypted plans.
+    if host.storage == installation_plan::Storage::DeviceBound {
+        probe_tpm(td_tpm::Device::open)?;
+    }
     let execution = LiveExecution::for_host(&host);
     installation_service::serve(
         stream,
@@ -4210,6 +4277,7 @@ mod tests {
                 timezones: PathBuf::from(TIMEZONE_ROOT),
                 catalog: None,
                 booted: PathBuf::from(BOOTED_DEPLOYMENT),
+                storage: installation_plan::Storage::Unencrypted,
             })
         );
         for count in 1..full.len() {
@@ -4223,6 +4291,192 @@ mod tests {
                 parse_args(args(&relative)).unwrap_err().to_string(),
                 "serve operands must be absolute paths"
             );
+        }
+    }
+
+    /// Only a leading `--storage device-bound` makes the service
+    /// device-bound; without it storage is unencrypted, as above.
+    #[test]
+    fn serve_takes_one_leading_storage_operand() {
+        let operands = [
+            "/bin/td-boot",
+            "/source",
+            "/trusted.pub",
+            "/root",
+            "/bin/td-firstboot",
+        ];
+        let with = |leading: &[&str]| {
+            parse_args(args(&[&["serve"], leading, operands.as_slice()].concat()))
+        };
+        let Mode::Serve(host) = with(&["--storage", "device-bound"]).unwrap() else {
+            panic!("not serve");
+        };
+        assert_eq!(host.storage, installation_plan::Storage::DeviceBound);
+        assert_eq!(host.td_boot, PathBuf::from("/bin/td-boot"));
+        assert_eq!(host.firstboot, PathBuf::from("/bin/td-firstboot"));
+        let Mode::Serve(host) = with(&[]).unwrap() else {
+            panic!("not serve");
+        };
+        assert_eq!(host.storage, installation_plan::Storage::Unencrypted);
+        for (leading, refusal) in [
+            (
+                &["--storage", "unencrypted"][..],
+                "--storage admits only device-bound",
+            ),
+            (
+                &["--storage", "Device-Bound"],
+                "--storage admits only device-bound",
+            ),
+            (&["--storage", ""], "--storage admits only device-bound"),
+            (
+                &["--storage", "device-bound", "--storage", "device-bound"],
+                "--storage must appear once, before the serve operands",
+            ),
+        ] {
+            assert_eq!(
+                with(leading).unwrap_err().to_string(),
+                refusal,
+                "{leading:?}"
+            );
+        }
+        // A missing value takes the next operand as the value, which the
+        // operand refuses as not device-bound.
+        assert_eq!(
+            with(&["--storage"]).unwrap_err().to_string(),
+            "--storage admits only device-bound"
+        );
+        // Not after an operand, and not another verb's.
+        let mut trailing = vec!["serve"];
+        trailing.extend(operands);
+        trailing.extend(["--storage", "device-bound"]);
+        assert_eq!(
+            parse_args(args(&trailing)).unwrap_err().to_string(),
+            "--storage must appear once, before the serve operands"
+        );
+        for verb in [
+            &["timezones"][..],
+            &["observe-plan"],
+            &["volume", "/dev/vda", "/bin/mkfs.btrfs", "/scratch"],
+        ] {
+            let mut line = vec![verb[0], "--storage", "device-bound"];
+            line.extend(&verb[1..]);
+            assert_eq!(
+                parse_args(args(&line)).unwrap_err().to_string(),
+                "--storage is only supported by serve",
+                "{verb:?}"
+            );
+        }
+    }
+
+    /// A scripted TPM answering each command from its queue, and recording
+    /// what it was sent.
+    struct ScriptedTpm {
+        replies: Vec<Result<Vec<u8>, String>>,
+        sent: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl td_tpm::Transport for ScriptedTpm {
+        fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
+            self.sent.borrow_mut().push(command.to_vec());
+            if self.replies.is_empty() {
+                return Err("no scripted reply".into());
+            }
+            self.replies.remove(0)
+        }
+    }
+
+    fn tpm_reply(code: u32, parameters: &[u8]) -> Vec<u8> {
+        let mut reply = 0x8001u16.to_be_bytes().to_vec();
+        reply.extend(u32::try_from(10 + parameters.len()).unwrap().to_be_bytes());
+        reply.extend(code.to_be_bytes());
+        reply.extend(parameters);
+        reply
+    }
+
+    /// PCR_Read's answer for PCRs 4 and 9 in `bank`.
+    fn pcrs_reply(bank: u16, values: &[[u8; 32]]) -> Vec<u8> {
+        let mut parameters = 7u32.to_be_bytes().to_vec();
+        parameters.extend(1u32.to_be_bytes());
+        parameters.extend(bank.to_be_bytes());
+        parameters.extend([3, 0x10, 0x02, 0]);
+        parameters.extend(u32::try_from(values.len()).unwrap().to_be_bytes());
+        for value in values {
+            parameters.extend(32u16.to_be_bytes());
+            parameters.extend(value);
+        }
+        tpm_reply(0, &parameters)
+    }
+
+    /// The probe's outcome and every command it sent.
+    fn probe(
+        opened: bool,
+        replies: Vec<Result<Vec<u8>, String>>,
+    ) -> (io::Result<()>, Vec<Vec<u8>>) {
+        let sent = std::rc::Rc::default();
+        let tpm = ScriptedTpm {
+            replies,
+            sent: std::rc::Rc::clone(&sent),
+        };
+        let outcome = probe_tpm(|| {
+            if opened {
+                Ok(tpm)
+            } else {
+                Err("open TPM resource manager: No such file or directory".into())
+            }
+        });
+        let sent = sent.borrow().clone();
+        (outcome, sent)
+    }
+
+    #[test]
+    fn the_tpm_probe_requires_a_measured_sha256_bank() {
+        // One PCR_Read of the SHA-256 bank, selecting PCRs 4 and 9 alone.
+        let read = [
+            &0x8001u16.to_be_bytes()[..],
+            &20u32.to_be_bytes(),
+            &0x17eu32.to_be_bytes(),
+            &1u32.to_be_bytes(),
+            &0x000bu16.to_be_bytes(),
+            &[3, 0x10, 0x02, 0],
+        ]
+        .concat();
+        let measured = [[0x44; 32], [0x99; 32]];
+        let (outcome, sent) = probe(true, vec![Ok(pcrs_reply(0x000b, &measured))]);
+        outcome.unwrap();
+        assert_eq!(sent, [read.clone()]);
+        let refused = |outcome: io::Result<()>, cause: &str| {
+            let error = outcome.unwrap_err().to_string();
+            assert!(
+                error.starts_with("no usable TPM 2.0 for device-bound storage: "),
+                "{error}"
+            );
+            assert!(error.contains(cause), "{error}: {cause}");
+        };
+        // No device: nothing is sent.
+        let (outcome, sent) = probe(false, Vec::new());
+        refused(outcome, "No such file or directory");
+        assert!(sent.is_empty());
+        for (reply, cause) in [
+            // The TPM refuses the read, or the transport fails.
+            (Ok(tpm_reply(0x0000_0101, &[])), "refused"),
+            (Err("TPM write failed".to_string()), "TPM write failed"),
+            // Another bank answers.
+            (Ok(pcrs_reply(0x0004, &measured)), "another PCR bank"),
+            // PCR 4 or PCR 9 unmeasured.
+            (
+                Ok(pcrs_reply(0x000b, &[[0; 32], [0x99; 32]])),
+                "PCR 4 is unmeasured",
+            ),
+            (
+                Ok(pcrs_reply(0x000b, &[[0x44; 32], [0; 32]])),
+                "PCR 9 is unmeasured",
+            ),
+            (Ok(pcrs_reply(0x000b, &[[0; 32], [0; 32]])), "unmeasured"),
+        ] {
+            let (outcome, sent) = probe(true, vec![reply]);
+            refused(outcome, cause);
+            // One read, never a retry or another command.
+            assert_eq!(sent, [read.clone()], "{cause}");
         }
     }
 
@@ -4510,6 +4764,7 @@ mod tests {
             timezones: zones,
             catalog: None,
             booted: PathBuf::from(BOOTED_DEPLOYMENT),
+            storage: installation_plan::Storage::Unencrypted,
         };
         for (choice, expected) in [
             (["alice", "td-laptop", "us", "Europe/London"], Ok(())),
@@ -10483,6 +10738,24 @@ mod tests {
     /// is not the planned deployment, a manifest that is not the planned one,
     /// and a kernel the manifest does not name each fail verification with
     /// no phase begun and every byte of the disk still zero.
+    /// Until device-bound formatting lands, such a plan stops before the
+    /// first write and is never formatted unencrypted.
+    #[test]
+    fn a_device_bound_plan_is_not_formatted() {
+        let mut fixture = ExecutionFixture::new(b"kernel", b"kernel");
+        let plan = &fixture.plan;
+        fixture.plan = installation_plan::Plan::new(
+            *plan.nonce(),
+            plan.destination().clone(),
+            *plan.deployment(),
+            *plan.volume_uuid(),
+            installation_plan::Storage::DeviceBound,
+            plan.settings().clone(),
+        )
+        .unwrap();
+        fixture.assert_untouched(installation_protocol::Failure::VerificationFailed);
+    }
+
     #[test]
     fn execution_verifies_its_source_before_any_write() {
         use installation_protocol::Failure;
@@ -10646,6 +10919,7 @@ mod tests {
             timezones: execution.timezones.clone(),
             catalog: None,
             booted: execution.booted.clone(),
+            storage: installation_plan::Storage::Unencrypted,
         };
         let fit = |host: &mut LiveHost| host.check_fit(&fixture.plan);
         assert_eq!(fit(&mut host), Ok(()));
@@ -10764,6 +11038,7 @@ mod tests {
             timezones: execution.timezones.clone(),
             catalog: None,
             booted: execution.booted.clone(),
+            storage: installation_plan::Storage::Unencrypted,
         };
         assert_eq!(host.authenticate_source(), Ok(*fixture.plan.deployment()));
         std::fs::write(&execution.booted, format!("{}\n", "cd".repeat(32))).unwrap();
@@ -10792,6 +11067,7 @@ mod tests {
             timezones: execution.timezones.clone(),
             catalog: None,
             booted: execution.booted.clone(),
+            storage: installation_plan::Storage::Unencrypted,
         };
         assert_eq!(host.candidates(), Err(Refusal::DiscoveryFailed));
     }

@@ -220,11 +220,14 @@ with it.
 
 **D8. One recorded `unsafe` surface.** Everything here is ordinary file
 I/O: partition tables and filesystems are bytes at offsets, and efivarfs is a
-filesystem. The one exception is publication onto a disk this process holds,
-which binds a loop device over the volume with two value-pinned requests
-(`UNSAFE.md` §21, §5 "Publishing through a loop over the claim"). Any further
-syscall is an amendment to `UNSAFE.md` and is reviewed as one — not a thing
-to discover in a diff.
+filesystem. The sibling crates the binary links for the device-bound TPM
+probe, td-protector, td-tpm and td-json, forbid `unsafe` and reach the TPM
+through td-tpm's safe file I/O on `/dev/tpmrm0` (D10 records that open).
+The one exception is publication onto a disk this process holds, which
+binds a loop device over the volume with two value-pinned requests
+(`UNSAFE.md` §21, §5 "Publishing through a loop over the claim"). Any
+further syscall is an amendment to `UNSAFE.md` and is reviewed as one —
+not a thing to discover in a diff.
 
 **D9. The installer writes to a device OR to a regular file, and the file
 case is what the oracle exercises.** One code path, two destinations. This is
@@ -273,6 +276,16 @@ the helper names its path for every consumer. ONE
 wrapper is exempt from the naming and is named in the test that enforces
 it: `metadata_if_present` discards its error, because its caller asks only
 whether two files are the same and an unreadable path is not one of them.
+
+One open lies outside the three, the lint below and `compiled_files()`,
+because it is not this crate's source: the device-bound service's TPM
+probe (D8) calls td-tpm's `Device::open` from a sibling the binary links
+as an rlib. It opens the fixed path `/dev/tpmrm0` read-write with
+`O_NOFOLLOW`, refuses anything but a character device, and names the TPM
+resource manager in its error. That one device open is the documented
+exception; the probe reaches no other path through td-tpm, td-protector
+or td-json, and a further path a linked sibling opens for this binary is
+an amendment here, as a further syscall is to D8.
 
 The COMPILER holds the first half of that. `clippy.toml` disallows every
 path-taking entry point into the filesystem and `Cargo.toml` denies the
@@ -857,6 +870,11 @@ A service started with the device-bound storage operand (INSTALLER.md
 "Executing a consented installation" says, except as follows.
 [ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting" owns the volume
 format, its parameters and the operand's activation boundary.
+
+Until the landing that formats (ENCRYPTION.md increment 5's fifth commit),
+the operand and its TPM probe exist and the formatting below does not: an
+execution of a device-bound plan stops before its workspace or any write,
+as verification failed, and is never formatted unencrypted.
 
 No plaintext volume image exists. The settings, account and trusted key
 are staged as a directory tree in the workspace before the first write,
@@ -1703,7 +1721,7 @@ which ones is written down in `TARGET_INCLUDED_ENGINE_SOURCES`:
 | source | target consumer |
 |---|---|
 | `principals.rs` | td-firstboot identity parsing and reservations |
-| `sha256.rs` | td-boot, td-update, td-install live ESP kernel check, td-authd, td-secret, td-firstboot, td-compositor corpus verifier, td-ui terminal corpus |
+| `sha256.rs` | td-boot, td-update, td-install live ESP kernel check and its td-tpm rlib, td-authd, td-secret, td-firstboot, td-compositor corpus verifier, td-ui terminal corpus |
 | `crc32.rs` | td-install (via gpt) |
 | `gpt.rs` | td-install |
 | `cpio.rs` | td-install selector identity preparation |

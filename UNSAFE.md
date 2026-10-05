@@ -3064,6 +3064,9 @@ read-write open or `LOOP_CONFIGURE` fail with EBUSY, and binding is tried
 at most four times, each with a fresh index.
 
 The crate root denies unsafe code and the library root forbids it. The
+binary also links td-protector, td-tpm and td-json for the device-bound
+service's TPM probe; each forbids unsafe code and adds no syscall, the TPM
+being td-tpm's safe file I/O on `/dev/tpmrm0`. The
 `asm!` block leaves out `options(nomem)` because the kernel reads the
 configuration through the pointer. Confinement tests in `main.rs`, over
 every file the binary compiles, pin: the keyword only in the one block and

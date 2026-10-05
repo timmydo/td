@@ -133,3 +133,69 @@ fn a_misplaced_serve_exits_without_a_byte() -> Res<()> {
     }
     Ok(())
 }
+
+/// Admission runs before the TPM probe, so a misplaced device-bound start
+/// gets admission's diagnostic and never opens the TPM; an admitted one
+/// without a usable TPM refuses, and either sends nothing.
+#[test]
+fn a_device_bound_serve_is_admitted_then_probes_before_a_byte() -> Res<()> {
+    let exe = std::env::current_exe()?;
+    let file = exe.display().to_string();
+    let directory = exe.parent().ok_or("test binary has no parent")?;
+    let directory = directory.display().to_string();
+    let operands = vec![
+        "--storage".into(),
+        "device-bound".into(),
+        file.clone(),
+        directory.clone(),
+        file.clone(),
+        directory,
+        file,
+    ];
+    let root = std::fs::metadata("/proc/self")?.uid() == 0;
+    let authority = "serve requires the installation authority";
+
+    // No consent channel: refused by admission, whatever this host's TPM.
+    let (mut ours, theirs) = UnixStream::pair()?;
+    let (output, sent) = serve(
+        &operands,
+        Stdio::from(OwnedFd::from(theirs)),
+        Stdio::null(),
+        Some(&mut ours),
+    )?;
+    assert!(!output.status.success(), "{output:?}");
+    assert!(sent.is_empty(), "{sent:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = if root {
+        "serve requires its consent channel on stdout"
+    } else {
+        authority
+    };
+    assert!(stderr.contains(expected), "{output:?}");
+    assert!(!stderr.contains("TPM"), "{output:?}");
+
+    let (mut ours, theirs) = UnixStream::pair()?;
+    let (_authority, consent) = UnixStream::pair()?;
+    let (output, sent) = serve(
+        &operands,
+        Stdio::from(OwnedFd::from(theirs)),
+        Stdio::from(OwnedFd::from(consent)),
+        Some(&mut ours),
+    )?;
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !root {
+        assert!(stderr.contains(authority), "{output:?}");
+        assert!(!stderr.contains("TPM"), "{output:?}");
+        assert!(sent.is_empty(), "{sent:?}");
+    } else if std::fs::symlink_metadata("/dev/tpmrm0").is_err() {
+        assert!(
+            stderr.contains("no usable TPM 2.0 for device-bound storage"),
+            "{output:?}"
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+    // An admitted root start on a host with a usable TPM greets a closed
+    // installer and ends, as above.
+    Ok(())
+}
