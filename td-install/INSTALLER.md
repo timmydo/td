@@ -23,9 +23,22 @@ network setup, or source compilation on the destination machine.
 
 The first supported test platform is QEMU with UEFI firmware. ThinkPad
 T430s hardware validation is the next milestone, not a v1 hardware claim.
-Legacy BIOS, partition preservation, resizing, dual boot, RAID, and
-installation into an existing filesystem are outside v1. One selected
-whole disk is erased and receives GPT, a FAT32 ESP and the td Btrfs volume.
+Its drivers are built into the kernel ahead of it, each checked after
+config resolution by the linux-x86-64 recipe: i915 display, the 82579LM's
+e1000e, the Synaptics touchpad and TrackPoint, thinkpad_acpi with battery,
+AC, buttons, thermal, fan and backlight, CPU frequency and idle drivers,
+suspend, EHCI for its USB 2.0 port, the Ricoh SD card reader and the
+Conexant and Intel HDMI audio codecs. QEMU exercises their shared ACPI,
+input and power-management code but none of the laptop's devices; only the
+T430s itself can show those work. A card in the built-in reader is readable
+but never an installation target. The compositor treats the touchpad's
+absolute positions as a tablet's, so a touch places the pointer where it
+lands; the TrackPoint moves it relatively. Its Intel Wi-Fi needs vendor
+firmware, a class of foreign data AGENTS.md does not admit, so the wired
+port is its network until that is decided. Legacy BIOS, partition
+preservation, resizing, dual boot, RAID, and installation into an existing
+filesystem are outside v1. One selected whole disk is erased and receives
+GPT, a FAT32 ESP and the td Btrfs volume.
 
 The wizard collects one human username, hostname and timezone; the keyboard
 layout is `us`, the only one version 1 admits. Storage is unencrypted and

@@ -517,6 +517,22 @@ pub fn recipe() -> Recipe {
     //    while every td-audio ioctl kept using the native interface. FUSE_FS is
     //    still deliberately absent: it lands with the Documents portal.
     //
+    //    ThinkPad T430s drivers arrive ahead of its hardware validation
+    //    (td-install/INSTALLER.md): i915, e1000e, thinkpad_acpi with the ACPI
+    //    battery/AC/button/thermal/fan/video and backlight drivers, cpufreq and
+    //    idle, SUSPEND, EHCI, the Ricoh SDHCI reader and the Conexant and HDMI
+    //    codecs. MOUSE_PS2_SYNAPTICS, MOUSE_PS2_TRACKPOINT and
+    //    SND_HDA_CODEC_HDMI_INTEL prompt only under EXPERT and USB_EHCI_PCI has no
+    //    prompt, so like SND_HDA they are guarded, not written. Unasked: DRM_I915
+    //    selects ACPI_WMI, X86_PLATFORM_DEVICES, IOSF_MBI, INTEL_GTT and
+    //    SND_HDA_I915; THINKPAD_ACPI selects NVRAM (a root-only /dev/nvram), HWMON
+    //    and LEDS; SND_HDA_CODEC_HDMI selects SND_DYNAMIC_MINORS, harmless since
+    //    td-audio opens PCMs by name, and defaults in other vendors' HDMI codecs.
+    //    SUSPEND brings PM, PM_SLEEP and ACPI_SLEEP into every kernel, QEMU's
+    //    too: runtime PM is compiled into each driver and /sys/power/state offers
+    //    freeze and mem, which nothing in td writes. QEMU binds none of the
+    //    laptop's devices, so /dev/fb0 there stays virtio-gpu's.
+    //
     //    COMPAT_32BIT_TIME has a visible prompt, so allnoconfig turns it off.
     //    IA32_EMULATION alone leaves old glibc without futex/time syscalls.
     //
@@ -691,6 +707,32 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_SND_PCI[ =]/d; \
                   /^#? *CONFIG_SND_HDA_INTEL[ =]/d; \
                   /^#? *CONFIG_SND_HDA_GENERIC[ =]/d; \
+                  /^#? *CONFIG_DRM_I915[ =]/d; \
+                  /^#? *CONFIG_E1000E[ =]/d; \
+                  /^#? *CONFIG_X86_PLATFORM_DEVICES[ =]/d; \
+                  /^#? *CONFIG_ACPI_EC[ =]/d; \
+                  /^#? *CONFIG_I2C[ =]/d; \
+                  /^#? *CONFIG_THINKPAD_ACPI[ =]/d; \
+                  /^#? *CONFIG_ACPI_AC[ =]/d; \
+                  /^#? *CONFIG_ACPI_BATTERY[ =]/d; \
+                  /^#? *CONFIG_ACPI_BUTTON[ =]/d; \
+                  /^#? *CONFIG_ACPI_THERMAL[ =]/d; \
+                  /^#? *CONFIG_ACPI_FAN[ =]/d; \
+                  /^#? *CONFIG_ACPI_VIDEO[ =]/d; \
+                  /^#? *CONFIG_BACKLIGHT_CLASS_DEVICE[ =]/d; \
+                  /^#? *CONFIG_CPU_FREQ[ =]/d; \
+                  /^#? *CONFIG_X86_INTEL_PSTATE[ =]/d; \
+                  /^#? *CONFIG_CPU_IDLE[ =]/d; \
+                  /^#? *CONFIG_INTEL_IDLE[ =]/d; \
+                  /^#? *CONFIG_SUSPEND[ =]/d; \
+                  /^#? *CONFIG_USB_EHCI_HCD[ =]/d; \
+                  /^#? *CONFIG_MMC[ =]/d; \
+                  /^#? *CONFIG_MMC_BLOCK[ =]/d; \
+                  /^#? *CONFIG_MMC_SDHCI[ =]/d; \
+                  /^#? *CONFIG_MMC_SDHCI_PCI[ =]/d; \
+                  /^#? *CONFIG_MMC_RICOH_MMC[ =]/d; \
+                  /^#? *CONFIG_SND_HDA_CODEC_CONEXANT[ =]/d; \
+                  /^#? *CONFIG_SND_HDA_CODEC_HDMI[ =]/d; \
                   /^#? *CONFIG_SND_ALOOP[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -840,7 +882,33 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SND_PCI=y' \
                    'CONFIG_SND_HDA_INTEL=y' \
                    'CONFIG_SND_HDA_GENERIC=y' \
-                   'CONFIG_SND_ALOOP=y' >> .config"
+                   'CONFIG_SND_ALOOP=y' \
+                   'CONFIG_DRM_I915=y' \
+                   'CONFIG_E1000E=y' \
+                   'CONFIG_X86_PLATFORM_DEVICES=y' \
+                   'CONFIG_ACPI_EC=y' \
+                   'CONFIG_I2C=y' \
+                   'CONFIG_THINKPAD_ACPI=y' \
+                   'CONFIG_ACPI_AC=y' \
+                   'CONFIG_ACPI_BATTERY=y' \
+                   'CONFIG_ACPI_BUTTON=y' \
+                   'CONFIG_ACPI_THERMAL=y' \
+                   'CONFIG_ACPI_FAN=y' \
+                   'CONFIG_ACPI_VIDEO=y' \
+                   'CONFIG_BACKLIGHT_CLASS_DEVICE=y' \
+                   'CONFIG_CPU_FREQ=y' \
+                   'CONFIG_X86_INTEL_PSTATE=y' \
+                   'CONFIG_CPU_IDLE=y' \
+                   'CONFIG_INTEL_IDLE=y' \
+                   'CONFIG_SUSPEND=y' \
+                   'CONFIG_USB_EHCI_HCD=y' \
+                   'CONFIG_MMC=y' \
+                   'CONFIG_MMC_BLOCK=y' \
+                   'CONFIG_MMC_SDHCI=y' \
+                   'CONFIG_MMC_SDHCI_PCI=y' \
+                   'CONFIG_MMC_RICOH_MMC=y' \
+                   'CONFIG_SND_HDA_CODEC_CONEXANT=y' \
+                   'CONFIG_SND_HDA_CODEC_HDMI=y' >> .config"
                     .replace(
                         "@EFI_CMDLINE@",
                         &format!("{:?}", crate::ladder::efi_default_cmdline()),
@@ -989,6 +1057,38 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_SND_ALOOP=y' .config || { echo 'SND_ALOOP off — nothing can capture what was played, so the tone fixture has no in-image oracle' >&2; exit 1; }; \
                  grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off — td-audio discovers devices through /proc/asound/pcm' >&2; exit 1; }; \
                  if grep -q '^CONFIG_SND_PCM_OSS=y' .config; then echo 'SND_PCM_OSS on — APPLICATIONS.md K.4 refuses the deprecated OSS emulation layer on the merits, and olddefconfig must not bring it back as a default' >&2; exit 1; fi; \
+                 grep -q '^CONFIG_DRM_I915=y' .config || { echo 'DRM_I915 off — the T430s Ivy Bridge GPU has no KMS driver, so td-compositor has no /dev/fb0 there' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ETHERNET=y' .config || { echo 'ETHERNET off — NIC vendor menus stay hidden, so the e1000e driver cannot be chosen' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NET_VENDOR_INTEL=y' .config || { echo 'NET_VENDOR_INTEL off — the Intel NIC drivers stay hidden' >&2; exit 1; }; \
+                 grep -q '^CONFIG_E1000E=y' .config || { echo 'E1000E off — the T430s Intel 82579LM wired NIC has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MOUSE_PS2_SYNAPTICS=y' .config || { echo 'MOUSE_PS2_SYNAPTICS off — the T430s touchpad is driven as a bare PS/2 mouse' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MOUSE_PS2_TRACKPOINT=y' .config || { echo 'MOUSE_PS2_TRACKPOINT off — the TrackPoint loses its own protocol and settings' >&2; exit 1; }; \
+                 grep -q '^CONFIG_X86_PLATFORM_DEVICES=y' .config || { echo 'X86_PLATFORM_DEVICES off — laptop platform drivers stay hidden, thinkpad_acpi among them' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_EC=y' .config || { echo 'ACPI_EC off — the embedded controller behind battery, lid and hotkeys is unreachable' >&2; exit 1; }; \
+                 grep -q '^CONFIG_I2C=y' .config || { echo 'I2C off — thinkpad_acpi and i915 depend on the I2C core' >&2; exit 1; }; \
+                 grep -q '^CONFIG_THINKPAD_ACPI=y' .config || { echo 'THINKPAD_ACPI off — ThinkPad hotkeys, fan, LEDs and thermal readings have no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_AC=y' .config || { echo 'ACPI_AC off — the AC adapter state is unknown' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_BATTERY=y' .config || { echo 'ACPI_BATTERY off — the laptop battery is not reported' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_BUTTON=y' .config || { echo 'ACPI_BUTTON off — the power button and lid switch produce no events' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_THERMAL=y' .config || { echo 'ACPI_THERMAL off — ACPI thermal zones are not monitored' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_FAN=y' .config || { echo 'ACPI_FAN off — ACPI fan devices are not driven' >&2; exit 1; }; \
+                 grep -q '^CONFIG_ACPI_VIDEO=y' .config || { echo 'ACPI_VIDEO off — the panel backlight has no ACPI control' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BACKLIGHT_CLASS_DEVICE=y' .config || { echo 'BACKLIGHT_CLASS_DEVICE off — the panel backlight cannot be set' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CPU_FREQ=y' .config || { echo 'CPU_FREQ off — the CPU runs at one frequency, on battery as on AC' >&2; exit 1; }; \
+                 grep -q '^CONFIG_X86_INTEL_PSTATE=y' .config || { echo 'X86_INTEL_PSTATE off — Intel CPUs get no P-state scaling driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_CPU_IDLE=y' .config || { echo 'CPU_IDLE off — idle CPUs enter no deep C-states' >&2; exit 1; }; \
+                 grep -q '^CONFIG_INTEL_IDLE=y' .config || { echo 'INTEL_IDLE off — Intel CPUs get no native idle driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SUSPEND=y' .config || { echo 'SUSPEND off — the machine cannot suspend to RAM' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_EHCI_HCD=y' .config || { echo 'USB_EHCI_HCD off — a stick in a USB 2.0 port is invisible (the T430s has one EHCI-only port)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_USB_EHCI_PCI=y' .config || { echo 'USB_EHCI_PCI off — PCI EHCI controllers bind no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MMC=y' .config || { echo 'MMC off — the SD card reader has no MMC core' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MMC_BLOCK=y' .config || { echo 'MMC_BLOCK off — SD cards appear as no block device' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MMC_SDHCI=y' .config || { echo 'MMC_SDHCI off — the SDHCI card reader has no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MMC_SDHCI_PCI=y' .config || { echo 'MMC_SDHCI_PCI off — the PCI SDHCI card reader binds no driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MMC_RICOH_MMC=y' .config || { echo 'MMC_RICOH_MMC off — the Ricoh reader keeps its separate MMC function, so MMC cards are not seen through SDHCI' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_CODEC_CONEXANT=y' .config || { echo 'SND_HDA_CODEC_CONEXANT off — the T430s Conexant codec falls back to the generic parser' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_CODEC_HDMI=y' .config || { echo 'SND_HDA_CODEC_HDMI off — HDMI and DisplayPort audio codecs stay hidden' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SND_HDA_CODEC_HDMI_INTEL=y' .config || { echo 'SND_HDA_CODEC_HDMI_INTEL off — Intel HDMI and DisplayPort audio has no codec driver' >&2; exit 1; }; \
                  if grep -q '^CONFIG_IPC_NS=y' .config; then echo 'IPC_NS on — it is default y behind SYSVIPC||POSIX_MQUEUE, so pinning either brings it along unasked; td-jail omits CLONE_NEWIPC and APPLICATIONS.md §0 defers it deliberately' >&2; exit 1; fi".replace("@EFI_CMDLINE@", &format!("{:?}", crate::ladder::efi_default_cmdline())),
             ],
         )
@@ -1238,6 +1338,80 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ThinkPad T430s's hardware is built in and survives config
+    /// resolution: display, wired network, pointing devices, platform and
+    /// power, USB 2.0, the SD reader and audio codecs.
+    #[test]
+    fn t430s_drivers_are_builtin_after_config_resolution() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for symbol in [
+            "DRM_I915",
+            "ETHERNET",
+            "NET_VENDOR_INTEL",
+            "E1000E",
+            "X86_PLATFORM_DEVICES",
+            "ACPI_EC",
+            "I2C",
+            "THINKPAD_ACPI",
+            "ACPI_AC",
+            "ACPI_BATTERY",
+            "ACPI_BUTTON",
+            "ACPI_THERMAL",
+            "ACPI_FAN",
+            "ACPI_VIDEO",
+            "BACKLIGHT_CLASS_DEVICE",
+            "CPU_FREQ",
+            "X86_INTEL_PSTATE",
+            "CPU_IDLE",
+            "INTEL_IDLE",
+            "SUSPEND",
+            "USB_EHCI_HCD",
+            "MMC",
+            "MMC_BLOCK",
+            "MMC_SDHCI",
+            "MMC_SDHCI_PCI",
+            "MMC_RICOH_MMC",
+            "SND_HDA_CODEC_CONEXANT",
+            "SND_HDA_CODEC_HDMI",
+        ] {
+            let pin = format!("'CONFIG_{symbol}=y'");
+            let stale = format!("/^#? *CONFIG_{symbol}[ =]/d;");
+            assert_eq!(text.matches(&stale).count(), 1, "{symbol}");
+            assert_eq!(text.matches(&pin).count(), 1, "{symbol}");
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                "{symbol}"
+            );
+        }
+        // No prompt here, so a written line would read as a pin without
+        // being one: guarded only.
+        for symbol in [
+            "MOUSE_PS2_SYNAPTICS",
+            "MOUSE_PS2_TRACKPOINT",
+            "USB_EHCI_PCI",
+            "SND_HDA_CODEC_HDMI_INTEL",
+        ] {
+            assert!(
+                !text.contains(&format!("CONFIG_{symbol}[ =]/d")),
+                "{symbol}"
+            );
+            assert!(!text.contains(&format!("'CONFIG_{symbol}=y'")), "{symbol}");
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
+                "{symbol}"
+            );
+        }
+    }
 
     #[test]
     fn installation_media_drivers_are_builtin_after_config_resolution() {
