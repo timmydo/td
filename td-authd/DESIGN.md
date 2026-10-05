@@ -554,9 +554,9 @@ spawn and shorter than the channel frame deadline. Failure kills and reaps
 the trusted validator and closes the channel. There is no caller-provided
 executable, environment, directory path, account, uid or argument vector. A
 typed program kind selects a fixed executable and, for terminals, either
-the account home or td's fixed task worktree; the editor, photo tool and
-review window start in the account home, and the review window's one
-argument is fixed by the authority. All
+the account home or td's fixed task worktree; the editor, photo tool,
+review window and disk usage analyzer start in the account home, and the
+review window's one argument is fixed by the authority. All
 authority-spawned credential-helper children replace stdin, stdout and stderr
 with `/dev/null`, clear the environment, and start from `/`. The task variant's
 eventual td-term child enters only the fixed worktree described below. Replacing
@@ -583,6 +583,7 @@ Subsequent payloads are exact byte records:
 | `08` | `81` plus a process handle for the human text editor |
 | `09` | `81` plus a process handle for the human photo tool |
 | `0a` | `81` plus a process handle for the human code review window |
+| `0b` | `81` plus a process handle for the human disk usage analyzer |
 
 A full table returns `ff 01`; a spawn failure returns `ff 02`. Every other
 request, trailing byte, unknown handle, wait error, timeout or transport
@@ -606,8 +607,8 @@ request or heartbeat within each five-second receive deadline.
 
 The authority runs `/bin/td-login exec-as USER -- /bin/td-authd
 terminal-exec UID GENERATION HANDLE
-[task|claude|taskmgr|editor|photo|review]` in a new process group.
-The optional literal selects requests `04` and `06` through `0a`; it is not a
+[task|claude|taskmgr|editor|photo|review|dua]` in a new process group.
+The optional literal selects requests `04` and `06` through `0b`; it is not a
 pathname.
 td-login checks
 the human account policy and drops and verifies credentials. Its exact
@@ -662,7 +663,20 @@ environment, td-login's alone: no ssh agent, `LANG` or
 `XDG_CONFIG_HOME`, and standard streams on `/dev/null`, so a push that
 needs an agent fails from the card where a terminal's may not.
 
-An authority older than one of requests `07` through `0a` closes the
+Request `0b` is the same shape as `08` and `09` for td-dua, the disk
+usage analyzer: it execs `/bin/td-dua` with no arguments from the
+verified account home, which is therefore the directory it scans. It
+reads the home and deletes as the human, on the human's keys in its
+window, `D` without a question (td-dua/DESIGN.md, "Keys"). The home
+holds trees an application view can write, such as `~/src`, and
+td-dua's deletion checks are path-based: a directory an application
+swaps for a link between a check and its listing is listed through the
+link, so the entries deleted can lie outside the tree the human chose
+(td-dua/DESIGN.md, "Deletion"). A terminal start of td-dua has the same
+exposure; the card adds a way to start, not a new way to delete. What
+td-dua finds there is data it lists and measures, never runs.
+
+An authority older than one of requests `07` through `0b` closes the
 entire launch channel on it; its paired compositor then restarts. The image ships
 both peers atomically. The exact new record is additive within TDLA002, without
 negotiation or mixed-version compatibility.

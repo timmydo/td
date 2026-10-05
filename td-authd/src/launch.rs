@@ -260,7 +260,11 @@ fn terminal_command(
         }
         Program::Home | Program::Task => {}
         // Desktop programs returned above; listed so a new kind is a decision.
-        Program::TaskManager | Program::Editor | Program::Photo | Program::Review => {}
+        Program::TaskManager
+        | Program::Editor
+        | Program::Photo
+        | Program::Review
+        | Program::Dua => {}
     }
     Ok(command)
 }
@@ -268,7 +272,7 @@ fn terminal_command(
 /// Runs only after td-login dropped credentials, before any terminal code.
 pub(crate) fn terminal_exec(arguments: &[String]) -> Result<(), String> {
     const USAGE: &str = "terminal-exec requires UID GENERATION HANDLE \
-                         [task|claude|taskmgr|editor|photo|review]";
+                         [task|claude|taskmgr|editor|photo|review|dua]";
     let (uid, generation, handle, terminal) = match arguments {
         [uid, generation, handle] => (uid, generation, handle, Some(Program::Home)),
         [uid, generation, handle, literal] => {
@@ -386,6 +390,7 @@ enum Program {
     Editor,
     Photo,
     Review,
+    Dua,
 }
 
 impl Program {
@@ -398,6 +403,7 @@ impl Program {
             Self::Editor => Some("editor"),
             Self::Photo => Some("photo"),
             Self::Review => Some("review"),
+            Self::Dua => Some("dua"),
         }
     }
 
@@ -411,6 +417,7 @@ impl Program {
             "editor" => Self::Editor,
             "photo" => Self::Photo,
             "review" => Self::Review,
+            "dua" => Self::Dua,
             _ => return None,
         })
     }
@@ -423,6 +430,7 @@ impl Program {
             Self::Editor => Some("/bin/td-editor"),
             Self::Photo => Some("/bin/td-photo"),
             Self::Review => Some("/bin/td-review"),
+            Self::Dua => Some("/bin/td-dua"),
             Self::Home | Self::Task | Self::Claude => None,
         }
     }
@@ -437,15 +445,17 @@ impl Program {
             | Self::Claude
             | Self::TaskManager
             | Self::Editor
-            | Self::Photo => &[],
+            | Self::Photo
+            | Self::Dua => &[],
         }
     }
 
     /// Whether a desktop program starts in the account home, where its file
-    /// dialogs begin. The task manager has no files to open.
+    /// dialogs begin and the disk usage analyzer scans. The task manager has
+    /// no files to open.
     fn starts_in_account_home(self) -> bool {
         match self {
-            Self::Editor | Self::Photo | Self::Review => true,
+            Self::Editor | Self::Photo | Self::Review | Self::Dua => true,
             Self::Home | Self::Task | Self::Claude | Self::TaskManager => false,
         }
     }
@@ -461,6 +471,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
         [8] => Ok(Request::Start(Program::Editor)),
         [9] => Ok(Request::Start(Program::Photo)),
         [0x0a] => Ok(Request::Start(Program::Review)),
+        [0x0b] => Ok(Request::Start(Program::Dua)),
         [2, rest @ ..] if rest.len() == 8 => {
             let handle =
                 u64::from_be_bytes(rest.try_into().map_err(|_| "invalid terminal handle")?);

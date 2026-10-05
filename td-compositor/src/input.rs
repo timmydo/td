@@ -4699,6 +4699,7 @@ mod tests {
                 Bound::Launch(LaunchRequest::Editor) => "TEXT EDITOR",
                 Bound::Launch(LaunchRequest::Photo) => "PHOTOS",
                 Bound::Launch(LaunchRequest::Review) => "CODE REVIEW",
+                Bound::Launch(LaunchRequest::Dua) => "DISK USAGE",
                 Bound::Launcher(_) | Bound::Pointer(_, Pointing::Launcher) => "OPEN LAUNCHER",
                 Bound::Help(_) => "THIS HELP",
             }

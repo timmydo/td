@@ -19,14 +19,17 @@ the source-built stage2 toolchain from the checkout's own trees, td-dua
 staged with td-civil, td-ui and td-compositor (td-ui's mounts and
 notices), as td-photo is; the binary is static, with its debug companion
 beside it. The image copies the whole output into the immutable root and
-links `/bin/td-dua` to it, run from the terminal. `td-dua-test` requires
-the binary, asserts its static shape and runs `--help` and
-`--font-license`. It does not run `--preview`, whose binary PPM would
-land in the build log that `build-run` reads back as UTF-8.
+links `/bin/td-dua` to it. The launcher's Disk Usage card, shown in
+authority mode, starts it through td-authd's fixed request 0b in the
+account home, which it scans (td-authd/DESIGN.md); it also runs from the
+terminal. `td-dua-test` requires the binary, asserts its static shape
+and runs `--help` and `--font-license`. It does not run `--preview`,
+whose binary PPM would land in the build log that `build-run` reads back
+as UTF-8.
 
-Not yet: a launcher entry; a driven control socket; a native-compositor
-process case; a legend for the treemap's colours; cushion shading. Each
-is its own increment.
+Not yet: a driven control socket; a native-compositor process case; a
+legend for the treemap's colours; cushion shading. Each is its own
+increment.
 
 ## Running
 

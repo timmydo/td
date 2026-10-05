@@ -2633,14 +2633,14 @@ The launcher is a compositor-owned overlay, so opening it never depends on an
 already-running client. Its registry has a terminal entry that starts a
 `td-term`, one application entry for the admitted application the image names
 with `--launcher-application` (otherwise an input-monitor entry that starts
-`td-ui-demo`), four desktop-program entries in authority mode, and an
+`td-ui-demo`), five desktop-program entries in authority mode, and an
 explicit close entry. The desktop programs are system tools the image
-ships beside the terminal: Task Manager, Text Editor, Photos and Code
-Review issue fixed private requests 07, 08, 09 and 0a, and run with the
-human credentials described in td-authd/DESIGN.md (the task manager with
-its system PID view). No request carries a path; Code Review's fixed
-`--choose-repo`, added by the authority, has td-review ask which
-repository, for the reason td-authd/DESIGN.md gives. Direct
+ships beside the terminal: Task Manager, Text Editor, Photos, Code Review
+and Disk Usage issue fixed private requests 07, 08, 09, 0a and 0b, and
+run with the human credentials described in td-authd/DESIGN.md (the task
+manager with its system PID view). No request carries a path; Code
+Review's fixed `--choose-repo`, added by the authority, has td-review ask
+which repository, for the reason td-authd/DESIGN.md gives. Direct
 development mode hides those entries and refuses their requests; there the
 programs run directly on the user's Wayland session. Mail and news carry
 launcher declarations of their own, but the image names Firefox alone, so the
@@ -2649,7 +2649,7 @@ defers, and it grows the card. The application entry's uppercase label and
 lowercase search term are derived from the exact bounded application name; the
 compositor does not carry a fixture- or Firefox-specific card. The terminal is
 FIRST, so it is what an unfiltered Enter opens. The card reserves space
-for seven entries; direct mode shows three.
+for eight entries; direct mode shows three.
 `registry_entries_are_searchable_and_fit_the_card` refuses overflow. Each entry
 owns a label, lowercase search terms, and a typed launch request. The pure
 launcher model stores a bounded 64-byte ASCII filter, requires every

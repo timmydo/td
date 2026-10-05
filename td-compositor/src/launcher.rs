@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const CARD_WIDTH: usize = 480;
-const CARD_HEIGHT: usize = 378;
+const CARD_HEIGHT: usize = 420;
 const CARD: [u8; 4] = [0x20, 0x18, 0x28, 0];
 const HIGHLIGHT: [u8; 4] = [0x58, 0x30, 0x70, 0];
 const CARD_PADDING: usize = 24;
@@ -53,6 +53,7 @@ pub enum LaunchRequest {
     Editor,
     Photo,
     Review,
+    Dua,
 }
 
 impl LaunchRequest {
@@ -64,6 +65,7 @@ impl LaunchRequest {
             Self::Editor => Some(crate::authority::Program::Editor),
             Self::Photo => Some(crate::authority::Program::Photo),
             Self::Review => Some(crate::authority::Program::Review),
+            Self::Dua => Some(crate::authority::Program::Dua),
             Self::UiDemo | Self::Terminal => None,
         }
     }
@@ -112,6 +114,11 @@ const AUTHORITY_ENTRIES: &[Entry] = &[
         label: "CODE REVIEW",
         search: "code review git branch repository land merge",
         request: Some(LaunchRequest::Review),
+    },
+    Entry {
+        label: "DISK USAGE",
+        search: "disk usage space storage analyzer size clean up",
+        request: Some(LaunchRequest::Dua),
     },
 ];
 
@@ -736,7 +743,8 @@ pub(crate) fn launch_command(
             LaunchRequest::TaskManager
             | LaunchRequest::Editor
             | LaunchRequest::Photo
-            | LaunchRequest::Review,
+            | LaunchRequest::Review
+            | LaunchRequest::Dua,
             _,
         ) => {
             return Err("desktop programs are not configured for this development launcher".into());
@@ -1426,6 +1434,7 @@ mod authority_entry_tests {
                 "TEXT EDITOR",
                 "PHOTOS",
                 "CODE REVIEW",
+                "DISK USAGE",
                 "CLOSE LAUNCHER",
             ]
         );
@@ -1434,6 +1443,7 @@ mod authority_entry_tests {
             ("editor", "TEXT EDITOR", LaunchRequest::Editor),
             ("picture", "PHOTOS", LaunchRequest::Photo),
             ("git", "CODE REVIEW", LaunchRequest::Review),
+            ("storage", "DISK USAGE", LaunchRequest::Dua),
         ] {
             launcher.apply(LauncherAction::Open);
             for character in word.chars() {
@@ -1464,6 +1474,7 @@ mod authority_entry_tests {
             LaunchRequest::Editor,
             LaunchRequest::Photo,
             LaunchRequest::Review,
+            LaunchRequest::Dua,
         ] {
             assert!(launch_command(&options, request, 1).is_err(), "{request:?}");
         }

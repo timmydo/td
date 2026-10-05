@@ -135,6 +135,7 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
     assert_eq!(request(&[8]).unwrap(), Request::Start(Program::Editor));
     assert_eq!(request(&[9]).unwrap(), Request::Start(Program::Photo));
     assert_eq!(request(&[0x0a]).unwrap(), Request::Start(Program::Review));
+    assert_eq!(request(&[0x0b]).unwrap(), Request::Start(Program::Dua));
     assert_eq!(request(&[3]).unwrap(), Request::Heartbeat);
     let mut poll = vec![2];
     poll.extend_from_slice(&17u64.to_be_bytes());
@@ -152,7 +153,8 @@ fn the_caller_can_only_start_poll_or_keep_the_channel_alive() {
         vec![8, 0],
         vec![9, 0],
         vec![0x0a, 0],
-        vec![0x0b],
+        vec![0x0b, 0],
+        vec![0x0c],
         vec![2],
         vec![2, 0],
         vec![2; 10],
@@ -592,12 +594,21 @@ fn every_selection_literal_names_its_program_back() {
         Program::Editor,
         Program::Photo,
         Program::Review,
+        Program::Dua,
     ] {
         let literal = program.selection().unwrap();
         assert_eq!(Program::from_selection(literal), Some(program), "{literal}");
     }
     assert_eq!(Program::Home.selection(), None);
-    for literal in ["", "home", "codex", "Review", "/bin/td-review", "review "] {
+    for literal in [
+        "",
+        "home",
+        "codex",
+        "Review",
+        "/bin/td-review",
+        "review ",
+        "td-dua",
+    ] {
         assert_eq!(Program::from_selection(literal), None, "{literal:?}");
     }
 }
@@ -614,6 +625,7 @@ fn desktop_programs_exec_fixed_binaries_from_the_validated_home() {
             "/bin/td-review",
             &["--choose-repo"][..],
         ),
+        (Program::Dua, "dua", "/bin/td-dua", none),
     ] {
         let wrapper = config().terminal("000102030405060708090a0b0c0d0e0f", 17, program);
         assert_eq!(wrapper.get_program(), "/bin/td-login");
@@ -677,6 +689,7 @@ fn only_launches_placed_in_the_account_require_the_primary_account() {
         Program::Editor,
         Program::Photo,
         Program::Review,
+        Program::Dua,
     ] {
         let mut loaded = false;
         let result = terminal_command(1000, "000102030405060708090a0b0c0d0e0f", 1, program, || {

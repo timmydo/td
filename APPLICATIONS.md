@@ -8436,7 +8436,8 @@ td-editor and td-photo are launched by fixed requests 08 and 09 under the
 same checks, starting in the account home rather than at `/`, each with its
 own card in authority mode; td-review by request 0a, the same way, with
 its fixed `--choose-repo` so the human picks the repository (see
-td-authd/DESIGN.md).
+td-authd/DESIGN.md); td-dua by request 0b, the same way, scanning the
+account home.
 
 ### L.1 Elevation — consent without a secret
 

@@ -105,6 +105,7 @@ pub(crate) enum Program {
     Editor,
     Photo,
     Review,
+    Dua,
 }
 
 fn startup() -> Result<(), String> {
@@ -245,6 +246,7 @@ impl Processes {
             Program::Editor => [8],
             Program::Photo => [9],
             Program::Review => [0x0a],
+            Program::Dua => [0x0b],
         };
         match wire.exchange(&request)?.as_slice() {
             [0xff, 1] => Ok(Some("program authority process table is full")),
@@ -442,6 +444,7 @@ mod tests {
             (Program::Editor, 8),
             (Program::Photo, 9),
             (Program::Review, 0x0a),
+            (Program::Dua, 0x0b),
         ] {
             let mut processes = Processes::new();
             let mut wire = wire(vec![handle(1)]);
