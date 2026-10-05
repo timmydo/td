@@ -59,6 +59,57 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
     hash.finalize()
 }
 
+/// Why a PCR read returned no SHA-256 values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PcrReadError {
+    /// The TPM has no SHA-256 PCR bank allocated, so no SHA-256 PolicyPCR
+    /// can be satisfied until a platform-authorized reallocation and reset.
+    NoSha256Bank,
+    /// Transport, a refused command or any other malformed reply.
+    Other(String),
+}
+impl From<String> for PcrReadError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+impl From<&str> for PcrReadError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl From<PcrReadError> for String {
+    fn from(error: PcrReadError) -> Self {
+        match error {
+            PcrReadError::NoSha256Bank => "TPM has no SHA-256 PCR bank allocated".into(),
+            PcrReadError::Other(error) => error,
+        }
+    }
+}
+
+/// A PCR_Read reply's parameters as a TPM without a SHA-256 bank answers a
+/// SHA-256 selection: the update counter, then either the one SHA-256
+/// selection with every bit cleared, as the reference implementation
+/// filters an unallocated bank, or no selection, and no values.
+fn no_sha256_bank(out: &[u8]) -> bool {
+    let mut reader = Reader(out);
+    let empty = (|| -> Result<bool, String> {
+        reader.u32()?;
+        let selected = match reader.u32()? {
+            0 => true,
+            1 => {
+                let hash = reader.u16()?;
+                let width = reader.u8()?;
+                let mask = reader.take(usize::from(width))?;
+                hash == SHA256 && (3..=4).contains(&width) && mask.iter().all(|byte| *byte == 0)
+            }
+            _ => false,
+        };
+        Ok(selected && reader.u32()? == 0)
+    })();
+    empty.unwrap_or(false) && reader.end().is_ok()
+}
+
 pub trait Transport {
     fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String>;
 }
@@ -449,7 +500,20 @@ impl<T: Transport> Client<T> {
     /// The selected SHA-256 PCR values in ascending order. Whether a value
     /// is acceptable (for example, measured at all) is the caller's policy.
     pub fn read_pcrs(&mut self, selection: PcrSelection) -> Result<Vec<[u8; 32]>, String> {
+        self.read_pcrs_typed(selection).map_err(String::from)
+    }
+
+    /// As `read_pcrs`, typing the answer of a TPM with no SHA-256 PCR bank
+    /// allocated: the selection returned with no PCR selected, or no
+    /// selection, and no values.
+    pub fn read_pcrs_typed(
+        &mut self,
+        selection: PcrSelection,
+    ) -> Result<Vec<[u8; 32]>, PcrReadError> {
         let (_, out) = self.call(PCR_READ, &[], None, &selection.marshal(), false)?;
+        if no_sha256_bank(&out) {
+            return Err(PcrReadError::NoSha256Bank);
+        }
         let mut reader = Reader(&out);
         reader.u32()?; // update counter; PolicyPCR closes the read/use race
         if reader.u32()? != 1 || reader.u16()? != SHA256 {
@@ -482,7 +546,12 @@ impl<T: Transport> Client<T> {
 
     /// One of PCRs 0 through 15, the `PcrSelection` range.
     pub fn read_pcr(&mut self, index: u8) -> Result<[u8; 32], String> {
-        self.read_pcrs(PcrSelection::new(pcr_bit(index)?)?)?
+        self.read_pcr_typed(index).map_err(String::from)
+    }
+
+    /// As `read_pcr`, with `read_pcrs_typed`'s outcomes.
+    pub fn read_pcr_typed(&mut self, index: u8) -> Result<[u8; 32], PcrReadError> {
+        self.read_pcrs_typed(PcrSelection::new(pcr_bit(index)?)?)?
             .first()
             .copied()
             .ok_or_else(|| "missing PCR value".into())
@@ -907,6 +976,59 @@ mod tests {
                 [[0; 32]]
             );
         }
+    }
+
+    /// A TPM with only a SHA-1 bank allocated answers a SHA-256 selection
+    /// with that selection emptied, or with none, and no values. Anything
+    /// else that is not the selection asked for stays a malformed reply.
+    #[test]
+    fn an_absent_sha256_bank_is_typed() {
+        let selection = PcrSelection::new(1 << 12).unwrap();
+        let reply = |selections: &[(u16, &[u8])], values: u32| {
+            let mut parameters = Vec::new();
+            put32(&mut parameters, 0);
+            put32(&mut parameters, selections.len() as u32);
+            for (hash, mask) in selections {
+                put16(&mut parameters, *hash);
+                parameters.push(mask.len() as u8);
+                parameters.extend_from_slice(mask);
+            }
+            put32(&mut parameters, values);
+            response(NO_SESSIONS, 0, &parameters)
+        };
+        for absent in [
+            reply(&[(SHA256, &[0, 0, 0])], 0),
+            reply(&[(SHA256, &[0, 0, 0, 0])], 0),
+            reply(&[], 0),
+        ] {
+            let (mut client, sent) = Fixed::client(absent.clone());
+            assert_eq!(client.read_pcr_typed(12), Err(PcrReadError::NoSha256Bank));
+            assert_eq!(sent.borrow().len(), 1);
+            assert_eq!(
+                Fixed::client(absent).0.read_pcr(12).unwrap_err(),
+                "TPM has no SHA-256 PCR bank allocated"
+            );
+        }
+        let sha1 = 0x0004;
+        for other in [
+            reply(&[(sha1, &[0, 0x10, 0])], 0),
+            reply(&[(SHA256, &[0, 0, 0])], 1),
+            reply(&[(SHA256, &[0, 0, 0, 0, 0])], 0),
+            reply(&[(SHA256, &[0, 0, 1])], 0),
+            reply(&[(SHA256, &[0, 0, 0]), (sha1, &[0, 0x10, 0])], 0),
+        ] {
+            assert!(matches!(
+                Fixed::client(other).0.read_pcrs_typed(selection),
+                Err(PcrReadError::Other(_))
+            ));
+        }
+        let mut trailing = reply(&[], 0);
+        trailing.push(0);
+        trailing[5] += 1;
+        assert!(matches!(
+            Fixed::client(trailing).0.read_pcrs_typed(selection),
+            Err(PcrReadError::Other(_))
+        ));
     }
 
     /// td-boot's selector PCR 11 measurement sends these bytes; its own

@@ -83,8 +83,11 @@ one.
 Standalone crates that carry NO `unsafe` are not on the roster and do not
 need to be, but one is worth naming because it looks like it would need one
 and does not: `td-boot` verifies a signature and kexecs through a helper.
-`td-install` was the second until it had to publish onto a disk it holds
-(§21). Its partition tables and filesystems are still bytes at offsets, a
+Its PCR 11 measurement and the live selector's PCR 12 cap run over td-tpm
+and td-protector (with td-json), each forbidding unsafe code, the TPM being
+td-tpm's safe file I/O on `/dev/tpmrm0`; a refused cap halts by parking
+the thread through std. `td-install` was the second until it had to
+publish onto a disk it holds (§21). Its partition tables and filesystems are still bytes at offsets, a
 device's size is a `seek`, and its sector size is a file under `/sys`;
 `td-install/DESIGN.md`'s D8 keeps it that way except for that one recorded
 surface.

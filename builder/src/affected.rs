@@ -2054,8 +2054,9 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
 /// The crates the system image boots through or the oracles drive: init,
 /// the shell its scripts run in, the boot protocol and kexec, login, the
 /// service supervisor, first boot, and the installer with its test driver,
-/// and the libraries td-boot links for volume discovery and its PCR 11
-/// measurement: td-protector, td-tpm and td-json.
+/// and the libraries td-boot links for volume discovery, its PCR 11
+/// measurement and the live selector's PCR 12 cap: td-protector, td-tpm and
+/// td-json.
 /// td-fs, which td-boot and the installer compile in, is left out by
 /// decision: its changes run the gates on a branch and the oracles on main.
 /// A change to one's code, manifest, lock or build script, or to its recipe

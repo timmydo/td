@@ -85,6 +85,9 @@ pub enum Recovery {
     Header(String),
     /// PCR 12 was already non-zero, so nothing could release.
     AlreadyClosed,
+    /// The TPM has no SHA-256 PCR bank, so no protector's policy can be met
+    /// this boot and nothing released; PCR 12 was not extended.
+    NoSha256Bank,
     /// No td token released.
     NothingReleased,
     /// The first-boot protector alone released, and PCR 4 or PCR 9 is
@@ -109,6 +112,9 @@ impl fmt::Display for Recovery {
             Self::NoTpm => f.write_str("no TPM device: nothing released, PCR 12 not capped"),
             Self::Header(error) => write!(f, "the LUKS2 header is refused: {error}"),
             Self::AlreadyClosed => f.write_str("PCR 12 was already capped: nothing released"),
+            Self::NoSha256Bank => {
+                f.write_str("the TPM has no SHA-256 PCR bank: nothing released, PCR 12 not capped")
+            }
             Self::NothingReleased => f.write_str("no td protector released"),
             Self::Unmeasured { pcr } => write!(
                 f,
@@ -216,10 +222,26 @@ pub fn release<T: Tpm, C: Runner>(
         .and_then(|mut client| cap(&mut client));
     if let Err(error) = capped {
         console(&error.to_string());
+        let anything_released = !released.is_empty();
+        let sealed = matches!(new, Some(Ok(_)));
         drop(released);
         drop(new);
         return match error {
             CapError::AlreadyClosed => recovery(Recovery::AlreadyClosed, false),
+            // Without a SHA-256 bank no protector's policy can be met until a
+            // platform reset, but only if nothing released or sealed this
+            // boot: a SHA-256 PolicyPCR that did shows the bank was there,
+            // and recovery would leave PCR 12 open on a TPM that has it.
+            CapError::NoSha256Bank if !anything_released && !sealed => {
+                recovery(Recovery::NoSha256Bank, false)
+            }
+            CapError::NoSha256Bank => Outcome::Halt {
+                reason: CapError::Uncertain(
+                    "the TPM reports no SHA-256 PCR bank, yet a protector released \
+                     or was sealed this boot"
+                        .into(),
+                ),
+            },
             reason => Outcome::Halt { reason },
         };
     }
@@ -1028,6 +1050,51 @@ mod tests {
         let codes = tpm.codes();
         assert_eq!(count(&codes, PCR_EXTEND), 0);
         assert_eq!(count(&codes, UNSEAL), 0, "PolicyPCR refused both");
+    }
+
+    /// A TPM without a SHA-256 bank, when nothing released: its own
+    /// recovery, no reseal offered, no plan and nothing extended.
+    #[test]
+    fn a_tpm_without_a_sha256_bank_reaches_recovery_with_no_plan() {
+        let mut tpm = Scripted::new();
+        let (mut disk, _first) = installed(&mut tpm);
+        tpm.0.borrow_mut().no_sha256_bank = true;
+        // Nothing loads, so nothing releases and nothing is sealed.
+        tpm.0.borrow_mut().cleared = true;
+        tpm.codes();
+        let (outcome, lines) = boot(&mut disk, &mut tpm);
+        assert_eq!(recovered(outcome, &lines), (Recovery::NoSha256Bank, false));
+        assert!(disk.calls.is_empty());
+        assert_eq!(count(&tpm.codes(), PCR_EXTEND), 0);
+        assert!(lines
+            .iter()
+            .any(|l| l == &CapError::NoSha256Bank.to_string()));
+        assert!(!lines.iter().any(|l| l.ends_with(" released")), "{lines:?}");
+        assert_eq!(
+            Recovery::NoSha256Bank.to_string(),
+            "the TPM has no SHA-256 PCR bank: nothing released, PCR 12 not capped"
+        );
+    }
+
+    /// A release this boot shows a SHA-256 bank, so a cap that then reports
+    /// none contradicts it: halt, every secret zeroed, never recovery with
+    /// PCR 12 open.
+    #[test]
+    fn a_missing_sha256_bank_after_a_release_halts() {
+        let mut tpm = Scripted::new();
+        let (mut disk, _first) = installed(&mut tpm);
+        tpm.0.borrow_mut().no_sha256_bank = true;
+        tpm.codes();
+        // `boot` holds that no secret outlives it.
+        let (outcome, lines) = boot(&mut disk, &mut tpm);
+        let Outcome::Halt { reason } = outcome else {
+            panic!("no halt: {lines:?}")
+        };
+        assert!(matches!(reason, CapError::Uncertain(_)), "{reason}");
+        assert!(reason.to_string().contains("yet a protector released"));
+        assert!(disk.calls.is_empty());
+        assert_eq!(count(&tpm.codes(), PCR_EXTEND), 0);
+        assert!(lines.iter().any(|l| l.ends_with(" released")), "{lines:?}");
     }
 
     #[test]

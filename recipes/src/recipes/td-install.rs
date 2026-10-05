@@ -342,34 +342,11 @@ pub fn recipe() -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // The sibling crates are staged file by file, so a module added to one of
-    // them must be staged here too or the recipe build fails.
     #[test]
     fn every_sibling_crate_source_is_staged() {
-        let staged: Vec<String> = recipe()
-            .steps
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|step| match step {
-                Step::WriteFile { path, .. } => Some(path),
-                _ => None,
-            })
-            .collect();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        for krate in ["td-tpm", "td-json", "td-protector"] {
-            let dir = root.join(krate).join("src");
-            let mut names: Vec<String> = std::fs::read_dir(&dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                .collect();
-            names.sort();
-            for name in names {
-                assert!(name.ends_with(".rs"), "{krate}/src/{name} is not a file");
-                let path = format!("{{src}}/{krate}/src/{name}");
-                assert!(staged.contains(&path), "{path} is not staged");
-            }
-        }
+        crate::ladder::assert_sibling_sources_staged(
+            super::recipe(),
+            &["td-tpm", "td-json", "td-protector"],
+        );
     }
 }

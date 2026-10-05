@@ -7,11 +7,12 @@ use crate::types::{Recipe, Step};
 // arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
 // and must not be: this binary verifies and never signs. Its PCR 11 measurement
 // runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), and its
-// volume discovery over td-protector's bounded LUKS2 header reader, which
-// reaches td-json; each is compiled first as an rlib with the binary's
-// profile and passed by `--extern`, as td-install passes them. td-tpm
-// includes the same engine SHA-256 by `#[path]`.
+// volume discovery and the live selector's PCR 12 release cap over
+// td-protector, which reaches td-json; each is compiled first as an rlib
+// with the binary's profile and passed by `--extern`, as td-install passes
+// them. td-tpm includes the same engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
+const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
@@ -74,6 +75,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/main.rs".into(),
             content: MAIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/cap.rs".into(),
+            content: CAP_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -319,34 +325,12 @@ pub fn recipe() -> Recipe {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // The sibling crates are staged file by file, so a module added to one of
-    // them must be staged here too or the recipe build fails.
+    // td-boot's own files are `builder/src/affected.rs`'s staging guard's.
     #[test]
     fn every_sibling_crate_source_is_staged() {
-        let staged: Vec<String> = recipe()
-            .steps
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|step| match step {
-                Step::WriteFile { path, .. } => Some(path),
-                _ => None,
-            })
-            .collect();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        for krate in ["td-tpm", "td-json", "td-protector"] {
-            let dir = root.join(krate).join("src");
-            let mut names: Vec<String> = std::fs::read_dir(&dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-                .collect();
-            names.sort();
-            for name in names {
-                assert!(name.ends_with(".rs"), "{krate}/src/{name} is not a file");
-                let path = format!("{{src}}/{krate}/src/{name}");
-                assert!(staged.contains(&path), "{path} is not staged");
-            }
-        }
+        crate::ladder::assert_sibling_sources_staged(
+            super::recipe(),
+            &["td-tpm", "td-json", "td-protector"],
+        );
     }
 }

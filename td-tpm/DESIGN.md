@@ -72,7 +72,12 @@ The crate owns the protocol and nothing a consumer persists or decides:
   is the caller's to check.
 - **PCR read and extend.** `read_pcrs` returns the selected values in
   ascending order after checking the bank, bitmap and count; it does not
-  judge the values. `read_pcr` reads one. `extend_pcr` extends one with
+  judge the values. `read_pcr` reads one. `read_pcrs_typed` and
+  `read_pcr_typed` return a `PcrReadError` that separates
+  `NoSha256Bank`, the answer of a TPM with no SHA-256 bank allocated
+  (the selection returned with no PCR selected, as the reference
+  implementation filters an unallocated bank, or no selection, and no
+  values), from every other failure. `extend_pcr` extends one with
   a SHA-256 event digest and accepts only the exact empty
   password-session reply. Both take a `u8` index and refuse one outside
   the `PcrSelection` range.
@@ -103,6 +108,7 @@ capacity. Production code returns errors; it does not panic.
 
 Unit tests pin the policy digest literal, selection marshalling, the
 single-PCR read and extend command bytes, malformed and refused replies,
+an absent SHA-256 bank typed apart from another bank or a malformed reply,
 handle ownership across failed flushes, primary personalization,
 payload and public-area bounds before any TPM I/O, and, against a
 scripted TPM that evaluates the policy itself, seal then unseal through

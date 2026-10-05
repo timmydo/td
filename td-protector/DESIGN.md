@@ -35,8 +35,7 @@ PolicyCommandCode(Unseal), td-tpm's `PcrPolicy`, with no PolicyAuthorize.
 
 - **First boot.** `first_boot_policy` selects PCR 12 alone at its literal
   reset value of zero. It reads nothing from the TPM, so the installer can
-  seal it from the live medium, whose selector has, from increment 6,
-  already capped PCR 12.
+  seal it from the live medium, whose selector has already capped PCR 12.
 - **Device bound.** `observed_policy` reads PCR 4 (the selector EFI image)
   and PCR 9 (load options and the selector initramfs) in one PCR_Read and
   refuses either one at all zeros, as unmeasured. Its composite is those two
@@ -127,16 +126,24 @@ refuses an unmeasured PCR 4 or 9 as `ObserveError::Unmeasured`;
 
 `cap` reads PCR 12 and requires zero, extends it once with `cap_event()`,
 the SHA-256 of `td/disk-protector/release-cap/v1`, and requires the exact
-readback `SHA256(zero32 || cap_event())`. It never retries. Its error is a
-typed `CapError`, each displayed with PCR 12 context:
+readback `SHA256(zero32 || cap_event())`. Only a failed prior read is
+tried once more, since a read cannot move PCR 12; the extension and the
+readback are never retried. Its error is a typed `CapError`, each
+displayed with PCR 12 context:
 
 - `AlreadyClosed`: PCR 12 read non-zero, so nothing was extended. Every
   protector policy requires PCR 12 at zero, so no TPM release is possible
   this boot.
-- `Uncertain`: a PCR 12 read or the extension failed in transport or was
-  refused, so the cap's state is unknown: a failed prior read leaves PCR
-  12 unmoved but unverified, and a failed extension or readback may or
-  may not have moved it. Either way release cannot be shown closed.
+- `NoSha256Bank`: the prior read found no SHA-256 PCR bank allocated
+  (td-tpm's typed `PcrReadError::NoSha256Bank`), so nothing was
+  extended. Every protector policy is a SHA-256 PolicyPCR, which such a
+  TPM cannot satisfy, and a bank allocation takes platform authorization
+  and a reset to apply, so no TPM release is possible this boot.
+- `Uncertain`: a PCR 12 read (both tries of the prior one) or the
+  extension failed in transport or was refused, so the cap's state is
+  unknown: a failed prior read leaves PCR 12 unmoved but unverified, and
+  a failed extension or readback may or may not have moved it. Either
+  way release cannot be shown closed.
 - `Mismatch`: the readback differs from the expected value.
 
 The caller's contract follows ENCRYPTION.md's release order. The selector
@@ -145,8 +152,9 @@ protector alone released, it performs the first-boot transition's seal
 and verification unseal; then it caps exactly once, whether or not any
 unseal succeeded, before cryptsetup parses the header. ENCRYPTION.md's
 release order (step 4) says what each `CapError` leads to, and
-`release::release` is that caller ("Release orchestration"). No other td
-component extends PCR 12.
+`release::release` is that caller ("Release orchestration"). The live
+selector, which releases nothing, caps once before it reads its medium
+(MEDIA.md "Live boot"). No other td component extends PCR 12.
 
 ## Installer check
 
@@ -157,8 +165,7 @@ digest as its authPolicy with the fixed sealed attributes. It then loads
 the public and private pair under the storage primary with td-tpm's
 `load_and_flush`, so the TPM verifies the private area's integrity, and
 flushes both. Nothing is unsealed: the installer never unseals the
-first-boot protector, and from increment 6 the live selector has already
-capped PCR 12.
+first-boot protector, and the live selector has already capped PCR 12.
 
 ## Recovery key
 
@@ -448,7 +455,12 @@ nothing reaches cryptsetup before the cap.
    `observe`, seals a fresh `/dev/random` secret to them and a
    literal-zero PCR 12, and unseals it once, requiring the same secret.
 4. It caps PCR 12 on a fresh client whatever came before. `AlreadyClosed`
-   is `Recovery { AlreadyClosed }`; `Uncertain` and `Mismatch` are
+   is `Recovery { AlreadyClosed }`. `NoSha256Bank` is
+   `Recovery { NoSha256Bank }`, with no reseal offered, only when nothing
+   released and no protector was sealed this boot; otherwise a SHA-256
+   PolicyPCR that did shows the bank existed, and the contradiction is
+   `Halt` with an `Uncertain` reason, since recovery would leave PCR 12
+   open on a TPM that may have it. `Uncertain` and `Mismatch` are
    `Halt`, and a client that cannot be opened is `Uncertain`. Neither
    carries a secret: every released and new secret is dropped, which
    zeroes it, before the outcome returns.
@@ -520,8 +532,9 @@ then unseal under both policies; that the first-boot policy reads nothing
 and the observed policy reads exactly PCRs 4 and 9; refusal of an
 unmeasured PCR 4 or 9; that after the cap both policies are refused at
 PolicyPCR with no Unseal sent; each `CapError`, with no extension after a
-non-zero prior and no retry after a refused extension or a lost reply at
-any of the three exchanges; the installer check's command stream and its
+non-zero prior or a TPM answering without a SHA-256 bank, one retry of a
+lost prior read only, and no retry after a refused extension or a lost
+extension or readback reply; the installer check's command stream and its
 refusal of a private area the TPM will not load; refusal of unsealed
 payloads other than 32 bytes, including 31 and 33; and that secrets are
 one exact read from `/dev/random`, through an injectable source path.
@@ -590,7 +603,9 @@ outlives the release. They cover a device-bound release retiring a
 leftover first-boot protector and an orphan keyslot, the first-boot
 transition (seal, verification, then the cap last, each commit
 reported) and the next boot keeping its protector, nothing released,
-`AlreadyClosed` with no plan, `Uncertain` and `Mismatch` halting with
+`AlreadyClosed` and a TPM without a SHA-256 bank with no plan, that
+TPM halting when a protector released before its cap, `Uncertain` and
+`Mismatch` halting with
 or without a new protector, an unmeasured PCR 4 or 9, a cleared TPM,
 metadata that disagrees or fails, a dead released keyslot falling back
 to the next token and to recovery, a dead device-bound keyslot beside a

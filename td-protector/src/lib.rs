@@ -19,7 +19,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use td_tpm::{Client, PcrPolicy, PcrSelection, Refusal, SealedObject, Transport};
+use td_tpm::{Client, PcrPolicy, PcrReadError, PcrSelection, Refusal, SealedObject, Transport};
 
 pub mod cryptsetup;
 pub mod luks2;
@@ -328,6 +328,9 @@ pub enum CapError {
     Uncertain(String),
     /// The readback was not `SHA256(zero32 || cap_event())`.
     Mismatch,
+    /// The TPM has no SHA-256 PCR bank allocated, so nothing was extended:
+    /// no protector's SHA-256 PolicyPCR can be met this boot.
+    NoSha256Bank,
 }
 impl fmt::Display for CapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -342,6 +345,9 @@ impl fmt::Display for CapError {
             Self::Mismatch => {
                 f.write_str("PCR 12 release cap readback mismatch; platform reset required")
             }
+            Self::NoSha256Bank => f.write_str(
+                "PCR 12 release cap: the TPM has no SHA-256 PCR bank; no TPM release this boot",
+            ),
         }
     }
 }
@@ -349,10 +355,20 @@ impl std::error::Error for CapError {}
 
 /// Extend PCR 12 with the release-cap event once and require the exact
 /// readback `SHA256(zero32 || cap_event())`. PCR 12 must read zero first;
-/// a non-zero prior is `AlreadyClosed` and is not extended again. Never
-/// retried. The caller's handling of each outcome is DESIGN.md's.
+/// a non-zero prior is `AlreadyClosed` and is not extended again, and a
+/// TPM without a SHA-256 bank is `NoSha256Bank`. Only a failed first read
+/// is tried once more, since a read cannot move PCR 12; the extension and
+/// the readback are never retried. The caller's handling of each outcome
+/// is DESIGN.md's.
 pub fn cap<T: Transport>(client: &mut Client<T>) -> Result<(), CapError> {
-    let prior = client.read_pcr(CAP_PCR).map_err(CapError::Uncertain)?;
+    let prior = match client.read_pcr_typed(CAP_PCR) {
+        Err(PcrReadError::Other(_)) => client.read_pcr_typed(CAP_PCR),
+        first => first,
+    }
+    .map_err(|error| match error {
+        PcrReadError::NoSha256Bank => CapError::NoSha256Bank,
+        PcrReadError::Other(error) => CapError::Uncertain(error),
+    })?;
     if prior != [0; 32] {
         return Err(CapError::AlreadyClosed);
     }
@@ -455,13 +471,16 @@ mod tests {
         /// Extend with another event than the one sent.
         pub(crate) skew_extend: bool,
         pub(crate) refuse_extend: bool,
-        /// Run the command but lose its reply: the nth exchange, from one.
-        lose: Option<usize>,
+        /// Run the command but lose its reply: these exchanges, from one.
+        lose: Vec<usize>,
         /// A cleared TPM: its new storage primary seed loads no object
         /// sealed before.
         pub(crate) cleared: bool,
         /// Refuse this command with this response code.
         pub(crate) refuse: Option<(u32, u32)>,
+        /// Allocate no SHA-256 PCR bank: PCR_Read returns the SHA-256
+        /// selection emptied and no values.
+        pub(crate) no_sha256_bank: bool,
     }
 
     #[derive(Clone)]
@@ -481,9 +500,10 @@ mod tests {
                 objects: Vec::new(),
                 skew_extend: false,
                 refuse_extend: false,
-                lose: None,
+                lose: Vec::new(),
                 cleared: false,
                 refuse: None,
+                no_sha256_bank: false,
             })))
         }
 
@@ -512,7 +532,7 @@ mod tests {
         fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
             let mut tpm = self.0.borrow_mut();
             let reply = tpm.reply(command);
-            if tpm.lose == Some(tpm.codes.len()) {
+            if tpm.lose.contains(&tpm.codes.len()) {
                 return Err("lost reply".into());
             }
             Ok(reply)
@@ -613,6 +633,13 @@ mod tests {
                     input.end().unwrap();
                     self.reads.push(mask);
                     put32(&mut out, 0x55);
+                    if self.no_sha256_bank {
+                        put32(&mut out, 1);
+                        put16(&mut out, SHA256);
+                        out.extend_from_slice(&[3, 0, 0, 0]);
+                        put32(&mut out, 0);
+                        return response(NO_SESSIONS, 0, &out);
+                    }
                     out.extend_from_slice(&selection);
                     put32(&mut out, mask.count_ones());
                     for index in (0..16).filter(|index| mask & (1 << index) != 0) {
@@ -1000,7 +1027,7 @@ mod tests {
         tpm.0.borrow_mut().refuse = None;
         // The second command from here, the Load.
         let at = tpm.0.borrow().codes.len() + 2;
-        tpm.0.borrow_mut().lose = Some(at);
+        tpm.0.borrow_mut().lose = vec![at];
         assert_eq!(
             refusal(tpm.client(), &current, &sealed),
             UnsealError::Other("lost reply".into())
@@ -1063,21 +1090,41 @@ mod tests {
              TPM command 0x182 refused: 0x907"
         );
 
-        // A lost reply at each exchange: the prior read, the extension that
-        // reached the TPM, and the readback. None is retried.
+        // A lost reply at each exchange: both tries of the prior read, the
+        // extension that reached the TPM, and the readback. Only the prior
+        // read is tried twice.
         for (lose, codes) in [
-            (1, &[PCR_READ][..]),
-            (2, &[PCR_READ, PCR_EXTEND][..]),
-            (3, &[PCR_READ, PCR_EXTEND, PCR_READ][..]),
+            (&[1, 2][..], &[PCR_READ, PCR_READ][..]),
+            (&[2], &[PCR_READ, PCR_EXTEND][..]),
+            (&[3], &[PCR_READ, PCR_EXTEND, PCR_READ][..]),
         ] {
             let tpm = Scripted::new();
-            tpm.0.borrow_mut().lose = Some(lose);
+            tpm.0.borrow_mut().lose = lose.to_vec();
             assert_eq!(
                 cap(&mut tpm.client()),
                 Err(CapError::Uncertain("lost reply".into()))
             );
             assert_eq!(tpm.codes(), codes);
         }
+        // One lost prior read is tried again, and the cap then completes.
+        let tpm = Scripted::new();
+        tpm.0.borrow_mut().lose = vec![1];
+        cap(&mut tpm.client()).unwrap();
+        assert_eq!(tpm.codes(), [PCR_READ, PCR_READ, PCR_EXTEND, PCR_READ]);
+        assert_eq!(tpm.pcr(12), td_tpm::digest(&[[0; 32], event].concat()));
+
+        // A TPM with only a SHA-1 bank: typed at the first read, neither
+        // retried nor extended.
+        let tpm = Scripted::new();
+        tpm.0.borrow_mut().no_sha256_bank = true;
+        let absent = cap(&mut tpm.client()).unwrap_err();
+        assert_eq!(absent, CapError::NoSha256Bank);
+        assert_eq!(tpm.codes(), [PCR_READ]);
+        assert_eq!(tpm.pcr(12), [0; 32]);
+        assert_eq!(
+            absent.to_string(),
+            "PCR 12 release cap: the TPM has no SHA-256 PCR bank; no TPM release this boot"
+        );
 
         let tpm = Scripted::new();
         tpm.0.borrow_mut().skew_extend = true;

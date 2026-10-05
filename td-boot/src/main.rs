@@ -7,6 +7,8 @@
 //! `td-install/DESIGN.md` §6 is why.
 #![forbid(unsafe_code)]
 
+#[path = "cap.rs"]
+mod cap;
 #[path = "measurement.rs"]
 mod measurement;
 mod protocol;
@@ -3576,8 +3578,30 @@ fn live_trust_root(rootfs: &Path) -> io::Result<TrustRoot> {
     read_boot_trust_root(rootfs)
 }
 
+/// Stop on the console until a platform reset. The selector's `/init` execs
+/// td-boot, so returning would exit init and panic the kernel, and
+/// `panic=-1` would reboot into the same refusal without end.
+fn halt(reason: &str) -> ! {
+    let _ = writeln!(
+        io::stderr(),
+        "td-boot: {reason}\ntd-boot: halted; only a platform reset leaves this"
+    );
+    loop {
+        std::thread::park();
+    }
+}
+
 fn run_live_boot(mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
     let key = live_trust_root(Path::new(BOOT_ROOTFS))?;
+    // Before anything reads the medium, so that no live session can release
+    // a td disk's protector (MEDIA.md "Live boot" step 0). The console lines
+    // are best effort: a failed write must not exit init after a cap. A
+    // stuck TPM can hold each command for the kernel's timeout, so the
+    // first line says what the console is waiting on.
+    let _ = writeln!(io::stderr(), "td-boot: capping PCR 12");
+    let capped =
+        cap::live().unwrap_or_else(|refusal| halt(&format!("{refusal}; live boot refused")));
+    let _ = writeln!(io::stderr(), "td-boot: {}", capped.describe());
     let ram_disk_kib = live_ram_disk_kib(&read_bounded_real_file(
         Path::new("/proc/meminfo"),
         "memory summary",
@@ -8026,6 +8050,60 @@ mod tests {
             .unwrap();
         assert!(body.contains("live_trust_root(Path::new(BOOT_ROOTFS))?"));
         assert!(!body.contains("read_boot_trust_root("));
+    }
+
+    /// The cap runs once, after the selector's own provisioning check and
+    /// before anything else, the medium's discovery and mount included; a
+    /// refusal halts rather than returning, which would exit init.
+    #[test]
+    fn the_live_selector_caps_before_it_reads_the_medium() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("\nfn run_live_boot(")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        let position = |needle: &str| {
+            assert_eq!(body.matches(needle).count(), 1, "{needle}");
+            body.find(needle).unwrap()
+        };
+        let checked = position("live_trust_root(Path::new(BOOT_ROOTFS))?;");
+        let capped = position(
+            "cap::live().unwrap_or_else(|refusal| halt(&format!(\"{refusal}; live boot refused\")));",
+        );
+        let announced = position("let _ = writeln!(io::stderr(), \"td-boot: capping PCR 12\");");
+        assert!(checked < announced && announced < capped, "{body}");
+        assert!(
+            capped
+                < position("let _ = writeln!(io::stderr(), \"td-boot: {}\", capped.describe());")
+        );
+        for later in [
+            "live_ram_disk_kib(",
+            "volume::Uuid::random()",
+            "mount_medium(mountpoint)",
+            "authenticated_media_deployment(",
+            "kexec_command(",
+        ] {
+            assert!(capped < position(later), "{later} precedes the cap");
+        }
+        // Only run_live_boot caps or halts.
+        let (production, _) = source.split_once("\n#[cfg(test)]\nmod tests {").unwrap();
+        assert_eq!(production.matches("cap::live").count(), 1);
+        assert_eq!(
+            production.matches("halt(").count(),
+            2,
+            "its definition and the call"
+        );
+
+        let halt = source
+            .split_once("\nfn halt(reason: &str) -> ! {\n")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert!(halt.contains("loop {\n        std::thread::park();\n    }"));
+        for forbidden in ["exit", "return", "abort", "break", "?"] {
+            assert!(!halt.contains(forbidden), "halt contains {forbidden}");
+        }
     }
 
     /// What production passes, stated as a literal: the key is the handoff's,

@@ -105,7 +105,16 @@ releases in this order, and no step may move earlier:
    measurement does. A PCR 12 already non-zero (td-protector's
    `AlreadyClosed`) means nothing could release; the installed selector
    enters the recovery flow, which then offers no reseal and runs no
-   plan.
+   plan. A TPM with no SHA-256 PCR bank allocated (`NoSha256Bank`) can
+   meet no protector's SHA-256 PolicyPCR, and its banks change only by a
+   platform-authorized allocation effective at the next reset, so when
+   nothing released and no protector was sealed this boot the installed
+   selector enters recovery for it as it does for `AlreadyClosed`, with
+   no reseal and no plan. A release or seal this boot shows the bank
+   existed, so the cap reporting none then is a contradiction that halts
+   as an uncertain cap does. The first PCR 12 read, which cannot move
+   it, is tried once more when it fails; the extension and the readback
+   never are.
    An uncertain or mismatched extension zeroes every released secret,
    refuses boot and halts on the console, so that only a platform reset
    leaves it: exiting init would panic, and `panic=-1` would reboot into
@@ -128,7 +137,8 @@ component extends PCR 12. The installed selector caps PCR 12 when its
 volume is encrypted; on an unencrypted volume it makes no TPM contact
 until activation (increment 7). The live selector's cap is MEDIA.md's
 ("Live boot"): it caps whenever a TPM device is present, proceeds when
-PCR 12 is already closed, and skips the cap without a device.
+PCR 12 is already closed or the TPM has no SHA-256 bank, and skips the
+cap without a device.
 
 Without a TPM device (`/dev/tpmrm0` absent) nothing can release or be
 capped. An installed selector whose header carries a td token waits for
@@ -215,9 +225,11 @@ recovery cannot be declined in this tier.
 The installer seals the first-boot protector on the live medium under
 td-protector's first-boot policy. Sealing reads no PCR, and TPM2_Create
 does not evaluate the policy, so the seal does not depend on PCR 12's
-value at that moment. The installer never unseals that protector. Until
-increment 6 adds the live selector's cap, a live boot leaves PCR 12 at
-zero; only the test-only reach of increment 5 (below) runs there. After
+value at that moment. The installer never unseals that protector. On a
+machine with a TPM device that has a SHA-256 bank, the only one the
+installer seals on, the live selector has already capped PCR 12
+(MEDIA.md "Live boot"); increment 5's encrypted-installation oracle
+(below) boots its own test initramfs, not the live selector. After
 sealing and before declaring success, the installer verifies that the
 recovery keyslot and the first-boot keyslot each open the volume
 (`--test-passphrase`), the latter with the secret it still holds. It then
@@ -344,13 +356,14 @@ over the disk replaces.
 
 This section, the release order and the handoff ("Boot and authority
 boundaries") are increment 6's target. Only td-kexec's half of the
-handoff exists, a mode nothing invokes yet, and td-protector's release
+handoff exists, a mode nothing invokes yet, td-protector's release
 orchestration, which runs steps 2 to 5 of the release order as a
 library nothing calls yet ([td-protector](../td-protector/DESIGN.md)
-"Release orchestration"). Today's selector neither releases nor caps.
-td-boot's discovery identifies a td LUKS2 volume and admits its active
-mapping (DESIGN.md "Full-system volume consumers"), but every consumer
-refuses an encrypted volume as not yet supported, and the image refuses
+"Release orchestration"), and the live selector's cap (MEDIA.md "Live
+boot"). Today's installed selector neither releases nor caps. td-boot's
+discovery identifies a td LUKS2 volume and admits its active mapping
+(DESIGN.md "Full-system volume consumers"), but every consumer refuses
+an encrypted volume as not yet supported, and the image refuses
 cryptsetup in either initramfs (DESIGN.md D6). td-init's secret-line
 applet exists but no initramfs links it until the recovery flow does
 (UNSAFE.md §3).

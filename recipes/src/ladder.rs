@@ -225,6 +225,37 @@ pub fn split_target_debug(root: &str) -> Step {
     Step::split_debug_tree(root, "{in:binutils-x86-64-self}/bin/objcopy")
 }
 
+/// A direct-rustc recipe stages its sibling crates file by file, so a module
+/// added to one must be staged too or the recipe build fails: every file
+/// under each `crates/src` must be written at `{src}/CRATE/src/FILE`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn assert_sibling_sources_staged(recipe: Recipe, crates: &[&str]) {
+    let staged: Vec<String> = recipe
+        .steps
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|step| match step {
+            Step::WriteFile { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for krate in crates {
+        let dir = root.join(krate).join("src");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        for name in names {
+            assert!(name.ends_with(".rs"), "{krate}/src/{name} is not a file");
+            let path = format!("{{src}}/{krate}/src/{name}");
+            assert!(staged.contains(&path), "{path} is not staged");
+        }
+    }
+}
+
 /// A td-owned program built by direct rustc from a `local_source` tree of the
 /// checkout named `name` (td-install-qemu-test; the two applications it once
 /// built draw through td-ui and are Cargo builds now, APPLICATIONS.md §W.8)

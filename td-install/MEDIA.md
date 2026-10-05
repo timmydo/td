@@ -280,23 +280,32 @@ The live selector is the stock selector initramfs with two appended entries:
 the trust root at `etc/td/deployment.pub`, as for an installed selector, and
 the marker `etc/td/live-media` holding `td-live-media-v1`. It has no
 `etc/td/volume-uuid` and no `etc/td/boot-measurement` policy. `td-boot
-live-boot MOUNTPOINT CMDLINE` refuses without the exact marker, and refuses a
-selector carrying either of those files, since it would apply neither. Then
-it:
+live-boot MOUNTPOINT CMDLINE` refuses without the exact marker or its trust
+root, and refuses a selector carrying either of those files, since it would
+apply neither; these read only the selector's own rootfs. Then it:
 
-0. from ENCRYPTION.md increment 6 (a target, not implemented yet), caps
-   PCR 12 through td-protector before anything else when `/dev/tpmrm0`
-   exists, so that no live session can release a td disk's protector.
-   A PCR 12 already non-zero (`AlreadyClosed`, as after a chainloader or
-   `kexec` that extended it) means release is already closed, and the
-   live boot proceeds. An uncertain or mismatched cap refuses the live
-   boot and halts on the console, as an installed selector's does
-   (ENCRYPTION.md's release order, step 4). Without a TPM device it
+0. caps PCR 12 through td-protector before anything else, when
+   `/dev/tpmrm0` exists, so that no live session can release a td disk's
+   protector (ENCRYPTION.md increment 6's live selector cap). A PCR 12
+   already non-zero (`AlreadyClosed`, as after a chainloader or `kexec`
+   that extended it) means release is already closed, and the live boot
+   proceeds. A TPM with no SHA-256 PCR bank allocated (`NoSha256Bank`,
+   answered by the first PCR_Read) can satisfy no protector's policy, and
+   its banks change only by a platform-authorized allocation that takes
+   effect at the next reset, so the live boot proceeds without a cap.
+   An uncertain or mismatched cap, or a device that is present but will
+   not open, refuses the live boot and halts on the console until a
+   platform reset, as an installed selector's failed cap will
+   (ENCRYPTION.md's release order, step 4): td-boot is the selector's
+   init, and exiting would panic the kernel into a reboot that refuses
+   again. Without a TPM device, the open finding no `/dev/tpmrm0`, it
    skips the cap, so a machine without one still boots the live medium
-   and installs unencrypted; `qemu-boot-live` attaches no TPM and proves
-   that skip;
-1. reads the trust root and takes half of `MemTotal` as the RAM disk size,
-   refusing less than 512 MiB;
+   and installs unencrypted. The console says the cap is starting, since
+   a stuck TPM holds each command for the kernel's timeout, and then
+   names each outcome; `qemu-boot-live` attaches no TPM, so its boot is
+   the skip's evidence;
+1. takes half of `MemTotal` as the RAM disk size, refusing less than
+   512 MiB;
 2. draws a fresh version-4 volume UUID from `/dev/urandom`;
 3. finds and mounts the medium;
 4. authenticates the manifest under the trust root before parsing it, and
