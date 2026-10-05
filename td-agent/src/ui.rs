@@ -260,6 +260,9 @@ pub enum Request {
     Archive { id: Id, archived: bool },
     /// Make this the default model, from Conversation → Default model….
     SetDefault(String),
+    /// Read what this conversation's workspace card shows; the session
+    /// answers through `show_workspace` (DESIGN.md §7).
+    Workspace(Id),
     /// The human admitted `remotes` on the admission card, so template
     /// `template`'s workspace can be made (DESIGN.md §7).
     Admit {
@@ -805,7 +808,25 @@ impl App {
 
     /// The Messages window, while it is open.
     pub fn messages_window(&self) -> Option<&crate::notes::Panel> {
-        self.notes.as_ref()
+        self.notes
+            .as_ref()
+            .filter(|panel| panel.card_of().is_none())
+    }
+
+    /// The workspace card, while it is open.
+    pub fn workspace_card(&self) -> Option<&crate::notes::Panel> {
+        self.notes
+            .as_ref()
+            .filter(|panel| panel.card_of().is_some())
+    }
+
+    /// The open conversation's repository workspace, if it has one.
+    fn repositories(&self) -> Option<(&Id, &crate::workspace::Repositories)> {
+        let id = self.active.as_ref()?;
+        match &self.rows.iter().find(|r| &r.id == id)?.workspace {
+            Some(Workspace::Repositories(repositories)) => Some((id, repositories)),
+            _ => None,
+        }
     }
 
     /// The status row's line.
@@ -828,6 +849,11 @@ impl App {
             ""
         };
         let keyless = if self.keyed { "" } else { " | no key: F10" };
+        let card = if self.repositories().is_some() {
+            " | workspace: C-S-w"
+        } else {
+            ""
+        };
         let model = self.model();
         let effort = if self.reasoning(model) {
             self.effort()
@@ -860,7 +886,7 @@ impl App {
             .map(|c| format!(" | {c}"))
             .unwrap_or_default();
         format!(
-            "{state}{retry}{keyless}{unread} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
+            "{state}{retry}{keyless}{unread}{card} | {model} {effort} | {context} | cost {}{today}{credit} | mode {} | no limits | 0 background",
             of(self.meter.spent, self.limits.conversation),
             self.mode.word()
         )
@@ -1064,7 +1090,11 @@ impl App {
     pub fn note(&mut self, message: impl Into<String>) {
         let at = crate::store::now();
         let text = self.log.push(at, message.into()).to_string();
-        if let Some(panel) = self.notes.as_mut() {
+        if let Some(panel) = self
+            .notes
+            .as_mut()
+            .filter(|panel| panel.card_of().is_none())
+        {
             self.log.read();
             panel.push(at, &text, &self.log);
         }
@@ -2472,8 +2502,11 @@ impl App {
         if self.picker.is_some() {
             return self.note("a paste that came while the picker was open is dropped");
         }
-        if self.notes.is_some() {
-            return self.note("a paste that came while the Messages window was open is dropped");
+        if let Some(panel) = &self.notes {
+            let name = panel.name();
+            return self.note(format!(
+                "a paste that came while the {name} was open is dropped"
+            ));
         }
         if self.chooser.is_some() {
             return self.note("a paste that came while the directory chooser was open is dropped");
@@ -2604,6 +2637,7 @@ impl App {
         match action {
             menu::Action::New => self.new_conversation(),
             menu::Action::Messages => self.open_messages(),
+            menu::Action::Workspace => self.open_workspace(),
             menu::Action::SetKey => self.open_key_dialog(),
             menu::Action::Export => self.export_diagnostics(),
             menu::Action::Quit => self.requests.push(Request::Quit),
@@ -2708,6 +2742,7 @@ impl App {
         let model = self.model();
         let state = menu::State {
             open: self.active.is_some(),
+            workspace: self.repositories().is_some(),
             effort: self.effort(),
             reasoning: self.reasoning(model),
             show_archived: self.show_archived,
@@ -2828,6 +2863,52 @@ impl App {
             Ok(panel) => {
                 self.notes = Some(panel);
                 self.log.read();
+                self.apply_focus();
+                self.touch();
+            }
+            Err(why) => self.note(why),
+        }
+    }
+
+    /// Asks for the open conversation's workspace card, as `C-S-w` and
+    /// Conversation → Workspace card… do: the session reads what it
+    /// shows and answers through `show_workspace`.
+    pub fn open_workspace(&mut self) {
+        if self.modal() {
+            return;
+        }
+        let Some((id, _)) = self.repositories() else {
+            return self.note("the open conversation has no repository workspace, so no card");
+        };
+        let id = id.clone();
+        self.cancel_pointer();
+        self.menu.dismiss();
+        self.requests.push(Request::Workspace(id));
+    }
+
+    /// Shows conversation `id`'s workspace card from `record`, as the
+    /// session read it: only while it is the open conversation, and over
+    /// no modal. It is what was read then, opened again to read again.
+    pub fn show_workspace(&mut self, id: &Id, record: &crate::card::Record) {
+        let Some((open, repositories)) = self.repositories() else {
+            return;
+        };
+        if open != id || self.modal() {
+            return;
+        }
+        let (title, entries) = (
+            crate::card::title(repositories),
+            crate::card::entries(repositories, record),
+        );
+        match crate::notes::Panel::card(
+            self.surface,
+            body(self.surface),
+            id.clone(),
+            title,
+            &entries,
+        ) {
+            Ok(panel) => {
+                self.notes = Some(panel);
                 self.apply_focus();
                 self.touch();
             }
@@ -3422,6 +3503,7 @@ impl App {
 
             "C-n" if !repeat => return self.new_conversation(),
             "C-S-m" if !repeat => return self.open_messages(),
+            crate::card::CHORD if !repeat => return self.open_workspace(),
             "C-t" if !repeat => {
                 if self.todo.is_empty() {
                     self.note("the conversation has no todo list");
@@ -5390,6 +5472,120 @@ pub mod tests {
         assert!(app.keys_chosen, "the seam's pointer chose the item");
         assert!(!app.input_live(Input::Focus(true), &mut NoClipboard));
         assert!(app.take_requests().is_empty());
+    }
+
+    /// The open conversation's repository workspace has its card behind
+    /// the status row: `C-S-w` and the Conversation menu ask the session
+    /// for what it shows, the answer opens it modal over the body, notes
+    /// stay out of it, a prepared repository asks again, and `C-S-w`
+    /// closes it. A conversation without one says so, and an answer
+    /// for another conversation shows nothing.
+    #[test]
+    fn a_repository_workspace_has_its_card_behind_the_status_row() {
+        use crate::repo::Instructions;
+        use crate::workspace::{Entry, Repositories};
+        let mut app = app();
+        // None for a conversation with no repository workspace.
+        assert!(!app.status_line().contains("workspace"));
+        key(&mut app, "C-S-w");
+        assert!(app.take_requests().is_empty());
+        assert!(app.notice().unwrap().contains("no repository workspace"));
+        let repositories = Repositories {
+            template: "td".into(),
+            name: "td-1".into(),
+            entries: vec![Entry {
+                remote: "https://github.com/timmydo/td".into(),
+                base: "main".into(),
+                branch: "td-agent/td-1".into(),
+                sparse: None,
+                store: "/s/td".into(),
+                repository: "/r/td".into(),
+                id: "td".into(),
+                checkout: "/w/td-1/td".into(),
+            }],
+        };
+        let mut rows = app.rows().to_vec();
+        for row in &mut rows {
+            if row.id == id(1) {
+                row.workspace = Some(Workspace::Repositories(repositories.clone()));
+            }
+        }
+        app.set_rows(rows);
+        assert!(
+            app.status_line().contains(" | workspace: C-S-w |"),
+            "{}",
+            app.status_line()
+        );
+        key(&mut app, "C-S-w");
+        assert_eq!(app.take_requests(), [Request::Workspace(id(1))]);
+        let record = crate::card::Record {
+            instructions: Ok(vec![crate::store::Instructed {
+                checkout: "/w/td-1/td".into(),
+                base: "a".repeat(40),
+                read: Instructions::Found {
+                    name: "AGENTS.md".into(),
+                    text: "Read DESIGN.md first.".into(),
+                },
+            }]),
+            prepared: Ok(Vec::new()),
+        };
+        // Another conversation's answer shows nothing.
+        app.show_workspace(&id(2), &record);
+        assert!(app.workspace_card().is_none());
+        app.show_workspace(&id(1), &record);
+        let card = app.workspace_card().unwrap();
+        assert_eq!(card.len(), 2);
+        assert!(app.messages_window().is_none());
+        let shown = text(&app);
+        assert!(shown.contains("Workspace td-1:"), "{shown}");
+        assert!(shown.contains("Read DESIGN.md first."), "{shown}");
+        // A note is counted, not added to the card.
+        let unread = app.unread();
+        app.note("a note while the card is open");
+        assert_eq!(app.workspace_card().unwrap().len(), 2);
+        assert_eq!(app.unread(), unread + 1);
+        // It is what was read when it opened: a prepared repository asks
+        // nothing, and an answer over it shows nothing.
+        app.update(
+            Update::Up(Up::Prepared {
+                remote: "https://github.com/timmydo/td".into(),
+            }),
+            0,
+        );
+        assert!(app.take_requests().is_empty());
+        let prepared = crate::card::Record {
+            prepared: Ok(vec!["/r/td".into()]),
+            ..record
+        };
+        app.show_workspace(&id(1), &prepared);
+        assert!(text(&app).contains("not checked out yet"));
+        // A paste is dropped, naming it.
+        app.input(Input::Paste("pasted"), &mut NoClipboard);
+        assert!(app
+            .notice()
+            .unwrap()
+            .contains("while the workspace card was open"));
+        // Its chord closes it; C-S-m does not.
+        key(&mut app, "C-S-m");
+        assert!(app.workspace_card().is_some());
+        key(&mut app, "C-S-w");
+        assert!(app.workspace_card().is_none());
+        assert!(app.take_requests().is_empty());
+        // Opened again, it reads again.
+        key(&mut app, "C-S-w");
+        assert_eq!(app.take_requests(), [Request::Workspace(id(1))]);
+        app.show_workspace(&id(1), &prepared);
+        assert!(text(&app).contains("/w/td-1/td (main on branch td-agent/td-1): checked out"));
+        key(&mut app, "Escape");
+        assert!(app.workspace_card().is_none());
+        // The Conversation menu's item asks for it too.
+        app.menu_action(menu::Action::Workspace);
+        assert_eq!(app.take_requests(), [Request::Workspace(id(1))]);
+        // Over another modal, an answer shows nothing.
+        key(&mut app, "C-S-m");
+        app.show_workspace(&id(1), &prepared);
+        assert!(app.messages_window().is_some());
+        assert!(app.workspace_card().is_none());
     }
 
     #[test]

@@ -265,6 +265,13 @@ impl Session {
                 }
                 Request::SaveKey { secret, replace } => self.save_key(&secret, replace),
                 Request::Export => self.export(),
+                Request::Workspace(id) => {
+                    let record = crate::card::Record {
+                        instructions: self.state.instructions(&id),
+                        prepared: self.state.prepared(&id),
+                    };
+                    self.app.show_workspace(&id, &record);
+                }
                 Request::Delete(id) => self.delete(&id),
                 Request::Archive { id, archived } => self.archive(&id, archived),
                 Request::Admit { template, remotes } => self.admit(&template, &remotes),

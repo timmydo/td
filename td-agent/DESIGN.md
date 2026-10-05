@@ -855,8 +855,9 @@ conversation uses it from now on.
 **As built (the Messages window).** The status row keeps to items of a
 fixed width: the state, `C-r asks again` while a turn may be asked
 again, `no key: F10`, a count of the notes not yet read (`2 new
-messages: C-S-m`), the model and effort, the context, the cost, today
-and the credit, the mode, `no limits` and `0 background`. A note, which
+messages: C-S-m`), `workspace: C-S-w` for a repository workspace (§7,
+As built (increment 11, the workspace card)), the model and effort,
+the context, the cost, today and the credit, the mode, `no limits` and `0 background`. A note, which
 the row used to show cut to fit (a refusal said by name, a step done, a
 background conversation's notice under its title), goes to a log of the
 last 500, each with the time it came and kept whole up to 16 KiB, a
@@ -1825,6 +1826,39 @@ recommends against opening the tree in tools that execute on open
 (§8). It decides nothing about the creation, which the human's choice
 of template already made.
 
+**As built (increment 11, the workspace card).** While the open
+conversation has a repository workspace, the status row says
+`workspace: C-S-w` after its notes, and `C-S-w` or Conversation →
+`Workspace card…` (shown with `C-S-w`, off otherwise) opens its card,
+modal over the body in the Messages window's panel and with its keys,
+titled with the workspace's name, at its first entry rather than
+following the newest; `Escape` or `C-S-w` closes it. The window reads,
+as it opens, the conversation's recorded project instructions and
+which of its workspace repositories `meta` says are prepared, and
+shows: first the recommendation against opening the worktrees in a
+tool that runs code on opening a folder, then one entry for the
+worktrees of a remote read at one commit alike, as the prompt groups
+them (§13), and one for a remote's worktrees not read yet. An entry
+names the remote, each worktree with its base and branch and whether
+it is checked out, and what the model is given at the commit: the
+file's text as the prompt carries it, every control, whitespace other
+than a space, and invisible or bidirectional character (a
+right-to-left override, a zero-width space) named as `<U+XXXX>`, and a
+`<` that begins such a name in the text named too, so a name on the
+card is always one; or that there is none, or was not read and why, or
+is read once the commit is fetched. It does not catch look-alike
+letters from other scripts. A record that cannot be read is said, and
+what it would have told is then unknown, not guessed. An entry too
+large for the list says so in its place; no entry gives way to
+another, the recommendation least of all. It is what was read when it
+opened, and opening it again reads again; it opens only over no other
+modal, for the open conversation, and a note while it is open is
+counted, not added to it. The control seam's state ends with `card`,
+`open` or `closed`, and its `workspace` action is `C-S-w`. It shows
+neither the trust mark nor the repository's `.td-agent/rules`: neither
+changes anything until increment 13's classifier and rules, which add
+both to it, so the card does not offer what would do nothing yet.
+
 **Layout.**
 
 ```text
@@ -1992,8 +2026,8 @@ the project instructions (§13, As built (increment 11, project
 instructions)); in this step the checkout then runs on the
 conversation process's main thread, so that turn, and any during a
 later preparation, waits behind it too, and the model is told nothing
-of it; the workspace card, rules from the base, background fetches
-and the model's notification are later steps, as is the cleanup:
+of it; rules from the base, background fetches and the model's
+notification are later steps, as is the cleanup:
 deleting the conversation leaves its repository workspace in place,
 which the deletion question says.
 
@@ -4227,6 +4261,23 @@ checkout then fails, and an interrupt end a waiting turn, sent with
 its message or after; the live test finds them recorded for the
 prepared worktree.
 
+For the workspace card, `src/card.rs` covers the recommendation first,
+the worktrees of a remote at one commit grouped, each saying whether
+it is checked out, the text the model is given with a right-to-left
+override named, a control as the model gets it and the text's own
+`<U+202E>` told from a name, an absent, an unread and a not yet read
+entry, an unreadable record said with nothing claimed of what it held,
+and a header held to td-ui's label bound; `src/notes.rs` that a card
+longer than its panel opens at its first entry while the Messages
+window follows the newest; `src/menu.rs` that its item is on only for
+a repository workspace; `src/control.rs` that `workspace` with none
+says so and leaves `card` closed; and `src/ui.rs` the status row's
+item for a repository workspace and none otherwise, `C-S-w` and the
+menu item asking for it, an answer for another conversation or over
+another modal showing nothing, a note counted and kept out of it, a
+paste dropped naming it, a prepared repository asking nothing, opening
+it again reading again, and `C-S-w`, not `C-S-m`, closing it.
+
 For row menus and archiving, `src/menu.rs` covers the row menu's items
 for a live and an archived conversation, each activating its action,
 and Show archived checked while they show; `src/store.rs` holds that
@@ -4407,7 +4458,9 @@ in parallel with it.
 12. **Background processes.** `background` on `shell`, the process tools,
     the output store, exit notices, and the window's process list.
 13. **Rules and auto mode.** Rules, cards, repetition, both classifier
-    stages, the circuit breaker, the calibrated `jev_threshold`, and,
+    stages, the circuit breaker, the calibrated `jev_threshold`, the
+    workspace card's trust mark and its listing of each repository's
+    `.td-agent/rules`, and,
     for the crossings between conversations, "always" answers for a
     pair and direction and the classifier's deciding them in `auto`
     mode (§3).

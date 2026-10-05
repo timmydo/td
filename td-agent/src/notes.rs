@@ -7,7 +7,9 @@
 //! following the newest: a note's header is its time, and its text
 //! wraps, selects and copies as the transcript's does. `Escape` or
 //! `C-S-m` closes it. It always opens, so that what it holds is never
-//! out of reach: a window too small for its list says so in it.
+//! out of reach: a window too small for its list says so in it. A
+//! repository workspace's card (`card`) is shown in the same panel,
+//! closed by `Escape` or `C-S-w`.
 
 use std::collections::VecDeque;
 
@@ -28,6 +30,12 @@ pub const TITLE: &str =
     "Messages: td-agent's notes, oldest first; C-c copies, C-S-c copies one, Escape closes";
 /// What the window says where its list has no room.
 pub const NO_ROOM: &str = "The window is too small to show the notes: widen it, or Escape closes.";
+/// What a card's entry too large for its list says instead.
+const TOO_LARGE: &str =
+    "This entry is too large to show at this size: close the card and open it again in a larger window.";
+/// And a workspace card where its list has none.
+pub const CARD_NO_ROOM: &str =
+    "The window is too small to show the workspace card: widen it, or Escape closes.";
 /// What a cut note ends with.
 const CUT: &str = " \u{2026} (cut)";
 
@@ -94,9 +102,9 @@ fn cut(mut text: String) -> String {
     text
 }
 
-/// A note as the window shows it: its time, then its text.
-fn message(at: u64, text: &str) -> Result<Message, messages::Error> {
-    Message::new(&crate::history::utc(at))?.text(text)
+/// An entry as the panel shows it: a note's header is its time.
+fn message(header: &str, text: &str) -> Result<Message, messages::Error> {
+    Message::new(header)?.text(text)
 }
 
 /// What the window made of an input.
@@ -110,12 +118,16 @@ pub enum Reply {
     Refused(String),
 }
 
-/// The Messages window over the body.
+/// The Messages window over the body, or a workspace's card.
 #[derive(Debug)]
 pub struct Panel {
     surface: Surface,
     rect: Rect,
     list: Controller,
+    title: String,
+    /// The conversation whose workspace card it is; none for the
+    /// Messages window.
+    card: Option<crate::store::Id>,
 }
 
 /// The title row and the list below it within `rect`.
@@ -147,18 +159,82 @@ impl Panel {
             surface,
             rect: body,
             list,
+            title: TITLE.to_string(),
+            card: None,
         };
         for (at, text) in &log.notes {
-            panel.add(*at, text);
+            panel.add(&crate::history::utc(*at), text);
         }
         panel.focus(true);
         Ok(panel)
     }
 
-    /// Adds a note, the oldest shown going while the list refuses it;
+    /// Conversation `id`'s workspace card over `body`, titled `title`,
+    /// showing `entries` (`card::entries`) in order.
+    pub fn card(
+        surface: Surface,
+        body: Rect,
+        id: crate::store::Id,
+        title: String,
+        entries: &[(String, String)],
+    ) -> Result<Self, String> {
+        let (_, list_rect) = split(surface, body);
+        let list =
+            Controller::new(surface, list_rect).map_err(|e| format!("the workspace card: {e}"))?;
+        let mut panel = Self {
+            surface,
+            rect: body,
+            list,
+            title,
+            card: Some(id),
+        };
+        for (header, text) in entries {
+            panel.add(header, text);
+        }
+        panel.top();
+        panel.focus(true);
+        Ok(panel)
+    }
+
+    /// A card shows its first entry first: the list follows the newest.
+    fn top(&mut self) {
+        let home = messages::Event::Key {
+            key: messages::Key::Home,
+            repeat: false,
+        };
+        let _ = self.list.event(home, &mut NoClipboard);
+    }
+
+    /// The conversation whose workspace card it is; none while it is the
+    /// Messages window.
+    pub fn card_of(&self) -> Option<&crate::store::Id> {
+        self.card.as_ref()
+    }
+
+    /// What it is, as a note names it.
+    pub fn name(&self) -> &'static str {
+        if self.card.is_some() {
+            "workspace card"
+        } else {
+            "Messages window"
+        }
+    }
+
+    /// Adds an entry, the oldest shown going while the list refuses it;
     /// one it refuses alone is left out.
-    fn add(&mut self, at: u64, text: &str) {
-        let Ok(note) = message(at, text) else {
+    /// A card's entry is never evicted, its recommendation first of all:
+    /// one the list refuses is shown saying so instead.
+    fn add(&mut self, header: &str, text: &str) {
+        if self.card.is_some() {
+            let pushed = message(header, text).and_then(|note| self.list.push(note));
+            if pushed.is_err() {
+                if let Ok(said) = message(header, TOO_LARGE) {
+                    let _ = self.list.push(said);
+                }
+            }
+            return;
+        }
+        let Ok(note) = message(header, text) else {
             return;
         };
         while let Err(messages::Error::Limit) = self.list.push(note.clone()) {
@@ -172,7 +248,7 @@ impl Panel {
     /// A note that came while it is open, `log` having kept it: the list
     /// keeps no more notes than the log does.
     pub fn push(&mut self, at: u64, text: &str, log: &Log) {
-        self.add(at, text);
+        self.add(&crate::history::utc(at), text);
         let extra = self.list.len().saturating_sub(log.len());
         if extra > 0 {
             self.list.remove_first(extra);
@@ -183,11 +259,18 @@ impl Panel {
     /// out at its size waits, unlaid, for one that will.
     pub fn resize(&mut self, surface: Surface, body: Rect) {
         let (_, list_rect) = split(surface, body);
+        let laid = self.list.has_layout();
         while let Err(messages::Error::Limit) = self.list.resize(surface, list_rect) {
-            if self.list.is_empty() {
+            // A card waits, unlaid and saying so, for room.
+            if self.list.is_empty() || self.card.is_some() {
                 break;
             }
             self.list.remove_first(self.list.len().div_ceil(8));
+        }
+        // A card never follows its newest: laid out for the first time,
+        // or following because it fitted, it goes to its top.
+        if self.card.is_some() && (!laid || self.list.following()) && self.list.has_layout() {
+            self.top();
         }
         self.surface = surface;
         self.rect = body;
@@ -209,13 +292,15 @@ impl Panel {
     /// An input while it is open: its keys, the pointer and the wheel; a
     /// resize, a focus change and a paste are the window's. `at_ms` is
     /// the window's clock, for double clicks. A held key closes nothing:
-    /// only a press of `Escape` or `C-S-m` does.
+    /// only a press of `Escape`, or the chord that opened it, does.
     pub fn input(&mut self, input: &Input<'_>, clipboard: &mut dyn Clipboard, at_ms: u64) -> Reply {
+        let closing = if self.card.is_some() {
+            crate::card::CHORD
+        } else {
+            "C-S-m"
+        };
         let event = match *input {
-            Input::Key {
-                chord: "Escape" | "C-S-m",
-                repeat,
-            } => {
+            Input::Key { chord, repeat } if chord == "Escape" || chord == closing => {
                 return if repeat {
                     Reply::Stay(false)
                 } else {
@@ -304,9 +389,11 @@ impl Panel {
                 sink,
             );
         };
-        line(TITLE, title, CHROME, sink);
+        line(&self.title, title, CHROME, sink);
         if self.list.has_layout() {
             self.list.emit(damage, sink);
+        } else if self.card.is_some() {
+            line(CARD_NO_ROOM, below, PAPER, sink);
         } else {
             line(NO_ROOM, below, PAPER, sink);
         }
@@ -335,6 +422,58 @@ mod tests {
 
     fn surface() -> Surface {
         Surface::new(1024, 640, Scale::default()).unwrap()
+    }
+
+    /// A card longer than its panel opens on its first entry, not
+    /// following the newest as the Messages window does.
+    #[test]
+    fn a_card_opens_at_its_first_entry() {
+        let long = "a line of upstream's file\n".repeat(400);
+        let entries = vec![
+            (
+                crate::card::BEFORE.to_string(),
+                crate::card::OPENING.to_string(),
+            ),
+            ("td at aaaaaaaaaaaa".to_string(), long),
+        ];
+        let id = crate::store::Id::parse(&format!("{:032x}", 1)).unwrap();
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 640,
+        };
+        let card = Panel::card(surface(), body, id, "Workspace td-1".into(), &entries).unwrap();
+        assert_eq!(card.len(), 2);
+        assert!(card.shows());
+        assert!(!card.list.following());
+        // One that fits a page, then shrunk, still shows its first.
+        let short = vec![(
+            crate::card::BEFORE.to_string(),
+            crate::card::OPENING.to_string(),
+        )];
+        let mut fits = Panel::card(
+            surface(),
+            body,
+            crate::store::Id::parse(&format!("{:032x}", 2)).unwrap(),
+            "Workspace td-2".into(),
+            &short,
+        )
+        .unwrap();
+        let narrow = Surface::new(240, 140, Scale::default()).unwrap();
+        fits.resize(
+            narrow,
+            Rect {
+                width: 240,
+                height: 140,
+                ..body
+            },
+        );
+        assert!(fits.shows());
+        assert!(!fits.list.following());
+        let log = Log::default();
+        let notes = Panel::open(surface(), body, &log).unwrap();
+        assert!(notes.list.following());
     }
 
     #[test]

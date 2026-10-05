@@ -54,6 +54,12 @@ pub const BINDINGS: &[Binding] = &[
         help: "File > Messages...: open the Messages window, td-agent's notes whole and with their times; Escape closes it.",
     },
     Binding {
+        name: "workspace",
+        chord: Some("C-S-w"),
+        arguments: "",
+        help: "Conversation > Workspace card...: open the open conversation's repository workspace card, its project instructions and checkouts; Escape closes it.",
+    },
+    Binding {
         name: "previous",
         chord: Some("C-PageUp"),
         arguments: "",
@@ -294,7 +300,7 @@ impl Controller for Remote<'_> {
             |chooser| chooser.folder().display().to_string(),
         );
         Ok(format!(
-            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tarchived={}\tshown={}\trow-menu={}\tstatus={}",
+            "conversations={}\tactive={}\tstate={state}\tfocus={}\tmessages={}\tcomposer={}\tmenu={}\tdialog={dialog}\tentry={entry}\tpicker={picker}\tpicking={}\tquery={query}\tconfirm={}\tmodel={}\teffort={}\tdefault={}\tchooser={}\tnotes={}\tunread={}\tnote={}\tarchived={}\tshown={}\trow-menu={}\tstatus={}\tcard={}",
             app.rows().len(),
             active.map_or("none", |id| id.as_str()),
             app.focus().word(),
@@ -318,6 +324,11 @@ impl Controller for Remote<'_> {
             if app.shows_archived() { "all" } else { "unarchived" },
             app.menu_row().map_or("none", |id| id.as_str()),
             app.status_line().replace(['\t', '\n'], " "),
+            if app.workspace_card().is_some() {
+                "open"
+            } else {
+                "closed"
+            },
         ))
     }
 
@@ -439,6 +450,15 @@ mod tests {
         );
         assert!(remote.state().unwrap().contains("notes=closed"));
         assert!(remote.state().unwrap().contains("| no key: F10 |"));
+        // `workspace` is `C-S-w`: with no repository workspace open, it
+        // says so and opens nothing.
+        driven::request(&mut remote, b"1\t92\taction\tworkspace");
+        assert!(remote.state().unwrap().ends_with("\tcard=closed"));
+        assert!(remote
+            .app
+            .notice()
+            .unwrap()
+            .contains("no repository workspace"));
         assert!(driven::request(&mut remote, b"1\t1\taction\tmenu").ends_with("changed"));
         assert!(remote.state().unwrap().contains("menu=open"));
         // Down to Set OpenRouter key…, below New conversation…, and

@@ -138,7 +138,7 @@ fn project(place: &Place) -> Option<String> {
 /// `text` with its line ends made `\n` and every other control but a
 /// tab made U+FFFD: what a file's bytes mean to the model is kept, and
 /// none takes more than its quote or backslash would once escaped twice.
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     text.replace("\r\n", "\n")
         .chars()
         .map(|c| match c {

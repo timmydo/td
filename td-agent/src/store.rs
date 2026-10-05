@@ -410,6 +410,18 @@ impl StateDir {
         read_meta(&self.conversation(id)).map(|meta| meta.workspace)
     }
 
+    /// Conversation `id`'s recorded project instructions, as its process
+    /// wrote them (DESIGN.md §13).
+    pub fn instructions(&self, id: &Id) -> Result<Vec<Instructed>, String> {
+        read_instructions(&self.conversation(id))
+    }
+
+    /// The workspace repositories conversation `id`'s `meta` says are
+    /// prepared.
+    pub fn prepared(&self, id: &Id) -> Result<Vec<PathBuf>, String> {
+        read_meta(&self.conversation(id)).map(|meta| meta.prepared)
+    }
+
     /// Whether conversation `id`'s `meta` says it is archived, as stored.
     pub fn archived(&self, id: &Id) -> Result<bool, String> {
         read_meta(&self.conversation(id)).map(|meta| meta.archived)

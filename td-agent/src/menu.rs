@@ -35,6 +35,8 @@ pub enum Action {
     New,
     /// Open the Messages window, as `C-S-m` does.
     Messages,
+    /// Open the open conversation's workspace card, as `C-S-w` does.
+    Workspace,
     /// Open the dialog that stores the OpenRouter key.
     SetKey,
     /// Write the diagnostics archive (DESIGN.md §4).
@@ -79,6 +81,8 @@ pub const HELP: &[(&str, &str, Action)] = &[(keys::ITEM, keys::CHORD, Action::Ke
 
 /// The Conversation menu's item that opens the model picker.
 pub const MODEL: &str = "Model\u{2026}";
+/// The Conversation menu's item that opens the workspace card.
+pub const WORKSPACE: &str = "Workspace card\u{2026}";
 /// The Conversation menu's submenu of efforts.
 pub const EFFORT: &str = "Effort";
 /// The Conversation menu's item that chooses the default model.
@@ -99,6 +103,8 @@ pub const DELETE_ROW: &str = "Delete\u{2026}";
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct State<'a> {
     pub open: bool,
+    /// The open conversation has a repository workspace.
+    pub workspace: bool,
     pub effort: &'a str,
     pub reasoning: bool,
     pub show_archived: bool,
@@ -152,6 +158,11 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         row: row(level, "", true, level == state.effort),
         item: Item::Action(Action::Effort(level)),
     }));
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(WORKSPACE, crate::card::CHORD, state.workspace, false),
+        item: Item::Action(Action::Workspace),
+    });
     nodes.push(Node {
         parent: Some(conversation),
         row: row(DEFAULT_MODEL, "", true, false),
@@ -240,6 +251,7 @@ mod tests {
 
     const OPENED: State<'static> = State {
         open: true,
+        workspace: false,
         effort: "high",
         reasoning: true,
         show_archived: false,
@@ -268,6 +280,26 @@ mod tests {
             assert_eq!(key(&mut menu, "Return"), Outcome::Activated(action));
             assert!(!menu.is_open(), "an action closes the menu");
         }
+    }
+
+    /// Workspace card… is on only for a repository workspace, shows its
+    /// chord and activates its action.
+    #[test]
+    fn the_workspace_card_item_is_on_only_for_a_repository_workspace() {
+        let item = |state| {
+            nodes(&menu(surface(), state, 1).unwrap())
+                .into_iter()
+                .find(|node| node.row.label == WORKSPACE)
+                .unwrap()
+        };
+        assert!(!item(OPENED).row.enabled);
+        let on = item(State {
+            workspace: true,
+            ..OPENED
+        });
+        assert!(on.row.enabled);
+        assert_eq!(on.row.shortcut, crate::card::CHORD);
+        assert!(matches!(on.item, Item::Action(Action::Workspace)));
     }
 
     #[test]
