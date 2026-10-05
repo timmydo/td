@@ -347,8 +347,10 @@ boundaries") are increment 6's target. Only td-kexec's half of the
 handoff exists, a mode nothing invokes yet, and td-protector's release
 orchestration, which runs steps 2 to 5 of the release order as a
 library nothing calls yet ([td-protector](../td-protector/DESIGN.md)
-"Release orchestration"). Today's selector neither releases nor caps,
-its discovery finds only a Btrfs volume, and the image refuses
+"Release orchestration"). Today's selector neither releases nor caps.
+td-boot's discovery identifies a td LUKS2 volume and admits its active
+mapping (DESIGN.md "Full-system volume consumers"), but every consumer
+refuses an encrypted volume as not yet supported, and the image refuses
 cryptsetup in either initramfs (DESIGN.md D6). td-init's secret-line
 applet exists but no initramfs links it until the recovery flow does
 (UNSAFE.md §3).

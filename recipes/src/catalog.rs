@@ -333,11 +333,12 @@ mod tests {
                 );
             }
             if stem == "td-boot" {
-                // Its td-tpm rlib, then the binary, under each of two roots.
+                // Its td-tpm, td-json and td-protector rlibs, then the
+                // binary, under each of two roots.
                 assert_eq!(
                     remap_sources.len(),
-                    4,
-                    "td-boot must build its library and binary at two roots"
+                    8,
+                    "td-boot must build its libraries and binary at two roots"
                 );
                 let mut roots = remap_sources.clone();
                 roots.sort();
@@ -346,8 +347,8 @@ mod tests {
                 for root in &roots {
                     assert_eq!(
                         remap_sources.iter().filter(|seen| *seen == root).count(),
-                        2,
-                        "td-boot must build its library and binary under each root"
+                        4,
+                        "td-boot must build its libraries and binary under each root"
                     );
                 }
                 let (first, second) = (roots.first(), roots.get(1));

@@ -518,18 +518,24 @@ The Btrfs partition takes the remainder and carries `@var` plus
 
 `td-boot volume [UUID]` prints one canonical lowercase filesystem UUID and
 one `/dev` path, separated by a space and terminated by a newline. Without
-an argument it requires exactly one visible `td-system` Btrfs volume. With
-a UUID it requires exactly one matching volume. Multiple eligible volumes,
-including two devices carrying a cloned UUID, refuse rather than selecting
-by enumeration order. UUIDs and labels identify bytes; they do not
-authenticate a deployment or authorize a write.
+an argument it requires exactly one visible td volume, a `td-system` Btrfs
+filesystem or a `td-system` LUKS2 header (below). With a UUID it requires
+exactly one matching volume. The two kinds are counted together: multiple
+eligible volumes, including two devices carrying a cloned UUID and a
+LUKS2 partition beside a Btrfs one with its UUID, refuse rather than
+selecting by enumeration order. It refuses an encrypted volume, as every
+consumer does until td-boot unlocks one ("Full-system volume
+consumers"). UUIDs and labels identify bytes; they do not authenticate a
+deployment or authorize a write.
 
 The resolver refuses more than 4096 `/sys/class/block` entries and probes only
 direct virtio, SCSI/SATA and NVMe disk/partition names (`vd*`, `sd*`, and
 `nvme*n*`, with their numeric partition suffixes), and `ram<N>`, where a live
 boot keeps its volatile volume (MEDIA.md "Live boot"). An installed system's
 unused RAM disk carries no td volume and is ignored like any other disk.
-Loop, device-mapper, mdraid and optical devices are outside this primitive.
+Loop, device-mapper, mdraid and optical devices are not candidates; a
+device-mapper node is admitted only as the active mapping of a selected
+LUKS2 partition ("Full-system volume consumers").
 Install media are found by a separate descriptor probe, not this one. Each
 candidate's bounded sysfs device number must match its real block node
 before and after a read-only `O_NOFOLLOW|O_NONBLOCK` open, including inode
@@ -545,6 +551,34 @@ require CRC32C, the primary offset, a nonzero UUID, one device, and ordinary
 superblock flags. Unsupported checksums, seed/metadump/changing/error flags,
 and corrupt matching superblocks refuse. This is a narrow identity probe,
 not a complete filesystem validator; the kernel still validates mounts.
+
+The same held descriptor is probed for a td LUKS2 header
+([ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting"). Each 4096-byte
+binary header copy at offset zero and at cryptsetup's secondary offsets
+(16 KiB to 4 MiB, those the device holds) whose position's magic and
+version 2 carry the `td-system` label is a claim, read through
+td-protector's `luks2::binary_claim`, which verifies no checksum.
+Discovery checks identity only. A claim naming the volume sought, or any
+claim when no UUID is given, hands the device to td-protector's
+`luks2::identity` (td-protector/DESIGN.md "LUKS2 tokens"): the copy
+cryptsetup would use, chosen by magic, version, offsets, checksum and
+sequence number, with no JSON parsed. Its label must be `td-system`
+(another label is not a td volume) and its UUID canonical lowercase text
+and, when one is sought, that volume's (otherwise the device is passed
+over). A device whose claims name only other volumes is passed over
+without that check, malformed or not, so another disk's header, an old
+drive's or a newer td format's, cannot stop this volume's boot; a
+wanted claim that `identity` refuses, or a non-canonical UUID, refuses.
+Discovery reads no tokens: reading them with td-protector's full reader,
+on the selected volume alone, is the job of the later selector-release
+and deployment-initramfs unlock commits (ENCRYPTION.md increment 6). A
+header read that fails, a bad sector or a
+short read, before any wanted claim leaves the device no LUKS2
+candidate, so the Btrfs probe alone decides it as before. LUKS1, another
+version or another label is ignored like a foreign Btrfs. A device
+carrying both a td LUKS2 header and a td Btrfs superblock is ambiguous
+and refuses. Each device passed over by these rules is reported on
+standard error once per resolution, one whole line per note, at most 64.
 
 No match is polled against a thirty-second wall-clock deadline checked
 between scans. One scan can overrun it: block I/O may wait despite
@@ -1225,19 +1259,36 @@ pending candidate to `/dev/vdb` behind a blank disk, then requires its
 UUID evidence, persistent state, greeter and successful acknowledgement.
 
 Encrypted volumes are increment 6's target ([ENCRYPTION.md](ENCRYPTION.md)
-"Selector release") and are not implemented yet. Discovery will also
-identify a LUKS2 partition whose header, read by td-protector's bounded
-reader, carries the expected UUID and the `td-system` label. That
-partition and the dm-crypt mapping over it are one volume, not two
-devices with one UUID: a mapping is admitted only when its sysfs
-`dm/uuid` is `CRYPT-LUKS2-<the UUID's 32 hex digits>-<name>` and its
-`slaves/` names exactly the pinned partition, and it is found that way,
-never by a `/dev/mapper` name. Any other device carrying the UUID still
-refuses. cryptsetup opens the partition by its held descriptor,
-`/proc/<pid>/fd/N`; mounts then name the mapping, which `on-volume`
-pins and holds as it holds a partition. The selector opens the mapping
-after release, and the deployment initramfs opens it again with the
-handed-off key.
+"Selector release"). Discovery identifies a LUKS2 partition whose header,
+read by td-protector's bounded reader, carries the expected UUID and the
+`td-system` label ("Read-only volume discovery primitive"), and
+`on-volume` pins it as it pins a Btrfs partition. That partition and the
+dm-crypt mapping over it are one volume, not two devices with one UUID:
+a mapping is admitted only when its `/sys/block/dm-N/dm/uuid` is
+`CRYPT-LUKS2-<the UUID's 32 hex digits>-<name>`, `<name>` being its
+`dm/name`, and its `slaves/` names exactly the pinned partition, and it
+is found that way, never by a `/dev/mapper` name; the scan never counts
+a `dm-N` node as a candidate of its own. A mapping claiming the UUID
+whose name disagrees or whose `slaves/` names anything else, and a
+second such mapping, refuse. `dm/uuid` is read up to 129 bytes, the
+kernel's 128 characters and a newline. A `dm-N` or attribute that
+vanishes during the walk makes it incomplete, and the walk is repeated
+for up to five seconds. An admitted mapping is opened through
+`/dev/dm-N` under the same device-number and inode checks and must
+carry the td Btrfs superblock with the volume's UUID; its `dm/uuid`,
+`dm/name`, `slaves/` and `dev` are then read again and must still
+describe the opened node, whose descriptor is held for the consumer.
+Until td-boot unlocks a volume,
+every consumer, the selector's `on-volume boot`, the deployment
+initramfs's `mount-root` and `mount-var`, the running system's
+`install`, `update`, `rollback` and `success`, and `td-boot volume`,
+refuses an encrypted one with `encrypted volume: not yet supported`,
+naming the partition and any active mapping; an unencrypted volume's
+boot takes the same steps as before. In the later commits cryptsetup
+opens the partition by its held descriptor, `/proc/<pid>/fd/N`; mounts
+then name the mapping, which `on-volume` pins and holds as it holds a
+partition. The selector opens the mapping after release, and the
+deployment initramfs opens it again with the handed-off key.
 
 The native installation oracle provisions its chosen UUID into both the
 formatter and the selector before writing the disk. Its tiny selector

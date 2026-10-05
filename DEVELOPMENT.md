@@ -433,8 +433,9 @@ way. No branch's
 selection prints that the tier is deferred to main, and names in its
 notes a change to the boot path — the code, manifest, lock or build
 script of td-boot, td-firstboot, td-init, td-install,
-td-install-qemu-test, td-kexec, td-login, td-sh or td-svc, or the recipe
-of the same name; the linux-x86-64 or system-x86-64 recipe; the
+td-install-qemu-test, td-json, td-kexec, td-login, td-protector, td-sh,
+td-svc or td-tpm, or the recipe of the same name; the linux-x86-64 or
+system-x86-64 recipe; the
 oracles' code; or `builder/src/integration.rs`. The cost is that a
 boot-breaking change is found on main, after it lands. A branch that
 expects to touch the boot can run the tier by hand with `td-builder

@@ -6,8 +6,10 @@ use crate::types::{Recipe, Step};
 // ed25519 VERIFIER — which reaches its hash as `crate::sha512`, so the two
 // arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
 // and must not be: this binary verifies and never signs. Its PCR 11 measurement
-// runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), compiled
-// first as an rlib with the binary's profile and passed by `--extern`; td-tpm
+// runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), and its
+// volume discovery over td-protector's bounded LUKS2 header reader, which
+// reaches td-json; each is compiled first as an rlib with the binary's
+// profile and passed by `--extern`, as td-install passes them. td-tpm
 // includes the same engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
@@ -18,6 +20,16 @@ const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
 const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
 const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
+const JSON_RS: &str = include_str!("../../../td-json/src/lib.rs");
+const JSON_STRING_RS: &str = include_str!("../../../td-json/src/string.rs");
+const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_array.rs");
+const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
+const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
+const PROTECTOR_LUKS2_RS: &str = include_str!("../../../td-protector/src/luks2.rs");
+const PROTECTOR_RECOVERY_RS: &str = include_str!("../../../td-protector/src/recovery.rs");
+const PROTECTOR_RELEASE_RS: &str = include_str!("../../../td-protector/src/release.rs");
+const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.rs");
+const PROTECTOR_TRANSITION_RS: &str = include_str!("../../../td-protector/src/transition.rs");
 
 pub fn recipe() -> Recipe {
     let rustc = "{in:rust-toolchain}/bin/rustc";
@@ -52,6 +64,12 @@ pub fn recipe() -> Recipe {
         },
         Step::MkDir {
             path: "{src}/td-tpm/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-json/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-protector/src".into(),
         },
         Step::WriteFile {
             path: "{src}/td-boot/src/main.rs".into(),
@@ -98,6 +116,56 @@ pub fn recipe() -> Recipe {
             content: TPM_RS.into(),
             exec: false,
         },
+        Step::WriteFile {
+            path: "{src}/td-json/src/lib.rs".into(),
+            content: JSON_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-json/src/string.rs".into(),
+            content: JSON_STRING_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-json/src/string_array.rs".into(),
+            content: JSON_STRING_ARRAY_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/lib.rs".into(),
+            content: PROTECTOR_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/cryptsetup.rs".into(),
+            content: PROTECTOR_CRYPTSETUP_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/luks2.rs".into(),
+            content: PROTECTOR_LUKS2_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/recovery.rs".into(),
+            content: PROTECTOR_RECOVERY_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/release.rs".into(),
+            content: PROTECTOR_RELEASE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/token.rs".into(),
+            content: PROTECTOR_TOKEN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/transition.rs".into(),
+            content: PROTECTOR_TRANSITION_RS.into(),
+            exec: false,
+        },
         Step::MkDir {
             path: "{root}/eh".into(),
         },
@@ -117,41 +185,40 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
-    // Each root compiles its own td-tpm rlib under the same roots, so the
-    // two-root oracle below covers the library as well as the binary.
-    let library = |root: &str| {
+    // Each root compiles its own sibling rlibs, dependencies first, under the
+    // same roots, so the two-root oracle below covers the libraries as well
+    // as the binary.
+    let library = |root: &str, name: &str, krate: &str, externs: &[&str]| {
         let source = format!("{root}/source");
-        let output = format!("{root}/libtd_tpm.rlib");
-        let lib = format!("{source}/td-tpm/src/lib.rs");
-        target_rustc_at_roots(
-            &source,
-            rustc,
-            &[
-                "--edition",
-                "2021",
-                "--crate-type",
-                "rlib",
-                "--crate-name",
-                "td_tpm",
-                "-C",
-                "opt-level=2",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-C",
-                "target-feature=+crt-static",
-                "-C",
-                "relocation-model=static",
-                "-C",
-                "panic=abort",
-                "-o",
-                &output,
-                &lib,
-            ],
-            root,
-            &source,
-        )
-        .env("PATH", &path)
-        .env("SOURCE_DATE_EPOCH", "1")
+        let output = format!("{root}/lib{name}.rlib");
+        let lib = format!("{source}/{krate}/src/lib.rs");
+        let externs: Vec<String> = externs
+            .iter()
+            .flat_map(|dep| ["--extern".to_owned(), format!("{dep}={root}/lib{dep}.rlib")])
+            .collect();
+        let mut args = vec![
+            "--edition",
+            "2021",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            name,
+            "-C",
+            "opt-level=2",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "-C",
+            "target-feature=+crt-static",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "panic=abort",
+        ];
+        args.extend(externs.iter().map(String::as_str));
+        args.extend_from_slice(&["-o", &output, &lib]);
+        target_rustc_at_roots(&source, rustc, &args, root, &source)
+            .env("PATH", &path)
+            .env("SOURCE_DATE_EPOCH", "1")
     };
     let compile = |root: &str| {
         let source = format!("{root}/source");
@@ -159,6 +226,9 @@ pub fn recipe() -> Recipe {
         let output = format!("{root}/bin/td-boot");
         let main = format!("{source}/td-boot/src/main.rs");
         let tpm = format!("td_tpm={root}/libtd_tpm.rlib");
+        let protector = format!("td_protector={root}/libtd_protector.rlib");
+        // td-protector's own dependency, td-json, is found here.
+        let dependencies = format!("dependency={root}");
         target_rustc_at_roots(
             &directory,
             rustc,
@@ -177,6 +247,10 @@ pub fn recipe() -> Recipe {
                 "panic=abort",
                 "--extern",
                 &tpm,
+                "--extern",
+                &protector,
+                "-L",
+                &dependencies,
                 &linker,
                 "-L",
                 glib,
@@ -199,7 +273,14 @@ pub fn recipe() -> Recipe {
     // canonical remaps, deterministic build ID, runtime strip, and companion
     // transform must all converge byte for byte.
     for root in ["{root}/profile-repro-a", "{root}/profile-repro-b"] {
-        steps.push(library(root));
+        steps.push(library(root, "td_tpm", "td-tpm", &[]));
+        steps.push(library(root, "td_json", "td-json", &[]));
+        steps.push(library(
+            root,
+            "td_protector",
+            "td-protector",
+            &["td_json", "td_tpm"],
+        ));
         steps.push(compile(root));
     }
     steps.push(Step::compare_files(
@@ -234,4 +315,38 @@ pub fn recipe() -> Recipe {
             "glibc-x86-64",
         ])
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The sibling crates are staged file by file, so a module added to one of
+    // them must be staged here too or the recipe build fails.
+    #[test]
+    fn every_sibling_crate_source_is_staged() {
+        let staged: Vec<String> = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::WriteFile { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for krate in ["td-tpm", "td-json", "td-protector"] {
+            let dir = root.join(krate).join("src");
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            for name in names {
+                assert!(name.ends_with(".rs"), "{krate}/src/{name} is not a file");
+                let path = format!("{{src}}/{krate}/src/{name}");
+                assert!(staged.contains(&path), "{path} is not staged");
+            }
+        }
+    }
 }

@@ -1,10 +1,12 @@
 //! Read-only identity discovery; a match grants neither trust nor write authority.
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use td_protector::luks2;
 
 use crate::{invalid, protocol};
 
@@ -12,6 +14,26 @@ const SUPER_OFFSET: u64 = 65536;
 const SUPER_BYTES: usize = 4096;
 const MAX_DEVICES: usize = 4096;
 const OPEN_FLAGS: i32 = 0o400000 | 0o4000; // x86-64 Linux O_NOFOLLOW | O_NONBLOCK.
+const CLASS_BLOCK: &str = "/sys/class/block";
+// Whole disks, where device-mapper nodes appear.
+const SYS_BLOCK: &str = "/sys/block";
+// cryptsetup 2.8.8 lib/libdevmapper.c dm_prepare_uuid: the LUKS2 UUID
+// without its dashes, then the mapping's name.
+const MAPPING_UUID_PREFIX: &str = "CRYPT-LUKS2-";
+// A crypt mapping sits over one device; a few more entries are read only
+// to refuse them.
+const MAX_SLAVES: usize = 16;
+// An ordinary sysfs attribute here: a device number, a size, a dm name
+// (DM_NAME_LEN 128 with its NUL) and its newline.
+const MAX_SYSFS_BYTES: usize = 128;
+// DM_UUID_LEN is 129 with its NUL: 128 characters and a newline.
+const MAX_DM_UUID_BYTES: usize = 129;
+// A dm-N that vanishes mid-walk makes the walk incomplete; it is retried
+// this long.
+const MAPPING_WAIT: Duration = Duration::from_secs(5);
+// Distinct notes one resolve reports; the rest are dropped.
+const MAX_NOTES: usize = 64;
+pub(crate) const ENCRYPTED_UNSUPPORTED: &str = "encrypted volume: not yet supported";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Uuid([u8; 16]);
@@ -129,6 +151,118 @@ fn identify(bytes: &[u8]) -> io::Result<Option<Uuid>> {
     Ok(Some(Uuid::from_bytes(field(bytes, 32)?)?))
 }
 
+/// Which td volume a device carries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Kind {
+    /// A td Btrfs filesystem on the device itself.
+    Btrfs,
+    /// A td LUKS2 header, whose dm-crypt mapping carries the Btrfs volume.
+    Luks2,
+}
+
+fn read_block<R: Read + Seek>(device: &mut R, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    device.seek(SeekFrom::Start(offset))?;
+    device.read_exact(out)
+}
+
+fn wanted(claimed: &[u8], expected: Option<&Uuid>) -> bool {
+    expected.is_none_or(|uuid| claimed == uuid.to_string().as_bytes())
+}
+
+/// A td LUKS2 header's UUID, by identity alone. A binary header copy at
+/// the primary's offset or one of cryptsetup's secondary offsets that
+/// carries its magic, version 2 and the td label is a claim. Only a claim
+/// naming the volume sought (any, without `expected`) hands the device to
+/// `identity`, the copy cryptsetup would use with its checksum verified;
+/// another volume's claim is passed over with a note and never verified,
+/// so another disk's header cannot stop this volume's discovery. A header
+/// read that fails before any wanted claim passes the device over too.
+/// The tokens are read on the selected volume only, when it is opened.
+fn identify_luks2<R: Read + Seek>(
+    device: &mut R,
+    size: u64,
+    expected: Option<&Uuid>,
+    notes: &mut Vec<String>,
+    identity: impl FnOnce(&mut R) -> Result<luks2::Identity, String>,
+) -> io::Result<Option<Uuid>> {
+    let label = protocol::VOLUME_LABEL.as_bytes();
+    let mut binary = [0; luks2::BINARY_HEADER_LEN];
+    let copies =
+        std::iter::once((0, false)).chain(luks2::HEADER_SIZES.iter().map(|at| (*at, true)));
+    let mut claimed = false;
+    let mut other: Option<String> = None;
+    for (offset, secondary) in copies {
+        if offset.saturating_add(luks2::BINARY_HEADER_LEN as u64) > size {
+            continue;
+        }
+        if let Err(error) = read_block(device, offset, &mut binary) {
+            notes.push(format!(
+                "LUKS2 header probe at byte {offset} failed ({error}); not a td LUKS2 volume"
+            ));
+            return Ok(None);
+        }
+        let Some(claim) = luks2::binary_claim(&binary, secondary) else {
+            continue;
+        };
+        if claim.label != label {
+            continue;
+        }
+        if wanted(claim.uuid, expected) {
+            claimed = true;
+            break;
+        }
+        other.get_or_insert_with(|| String::from_utf8_lossy(claim.uuid).into_owned());
+    }
+    if !claimed {
+        if let Some(uuid) = other {
+            notes.push(format!(
+                "td LUKS2 header claiming volume {uuid:?} passed over, unverified: not the volume sought"
+            ));
+        }
+        return Ok(None);
+    }
+    let found = identity(device).map_err(|error| invalid(format!("td LUKS2 header: {error}")))?;
+    if found.label.as_bytes() != label {
+        notes.push("the td LUKS2 header copy in use has another label; not a td volume".into());
+        return Ok(None);
+    }
+    let uuid = Uuid::parse(&found.uuid)
+        .map_err(|error| invalid(format!("td LUKS2 header UUID: {error}")))?;
+    if expected.is_some_and(|expected| expected != &uuid) {
+        notes.push(format!(
+            "the td LUKS2 header copy in use names volume {uuid}, not the volume sought"
+        ));
+        return Ok(None);
+    }
+    Ok(Some(uuid))
+}
+
+/// The td volume `device`, of `size` bytes, carries. LUKS2 and Btrfs are
+/// counted together, so a device carrying both is ambiguous.
+fn identify_volume<R: Read + Seek>(
+    device: &mut R,
+    size: u64,
+    expected: Option<&Uuid>,
+    notes: &mut Vec<String>,
+    identity: impl FnOnce(&mut R) -> Result<luks2::Identity, String>,
+) -> io::Result<Option<(Uuid, Kind)>> {
+    let mut superblock = [0; SUPER_BYTES];
+    read_block(device, SUPER_OFFSET, &mut superblock)?;
+    let btrfs = identify(&superblock)?;
+    match (btrfs, identify_luks2(device, size, expected, notes, identity)?) {
+        (Some(_), Some(_)) => Err(invalid(
+            "ambiguous td volume identity: one device carries a td LUKS2 header and a td Btrfs superblock",
+        )),
+        (Some(uuid), None) => Ok(Some((uuid, Kind::Btrfs))),
+        (None, Some(uuid)) => Ok(Some((uuid, Kind::Luks2))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The scan's candidates. A device-mapper node is never one: it is
+/// admitted only as the active mapping of a pinned LUKS2 partition
+/// (`mapping_name`, `find_mapping`), so a mapping and its partition are
+/// one volume rather than two devices carrying the UUID.
 fn supported_name(name: &str) -> bool {
     // brd's device, where a live boot keeps its volatile volume.
     if let Some(number) = name.strip_prefix("ram") {
@@ -155,9 +289,15 @@ fn supported_name(name: &str) -> bool {
 }
 
 fn text(path: &Path) -> io::Result<String> {
+    text_bounded(path, MAX_SYSFS_BYTES)
+}
+
+fn text_bounded(path: &Path, max: usize) -> io::Result<String> {
     let mut bytes = Vec::new();
-    File::open(path)?.take(129).read_to_end(&mut bytes)?;
-    if bytes.len() > 128 {
+    File::open(path)?
+        .take(max.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max {
         return Err(invalid(format!("oversized sysfs value {}", path.display())));
     }
     String::from_utf8(bytes)
@@ -179,14 +319,23 @@ fn device_number(value: &str) -> io::Result<(u64, u64)> {
     Ok((parse(major)?, parse(minor)?))
 }
 
-fn matches_device(meta: &fs::Metadata, expected: (u64, u64)) -> bool {
+fn rdev_numbers(meta: &fs::Metadata) -> (u64, u64) {
     let dev = meta.rdev();
     let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000);
     let minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
-    meta.file_type().is_block_device() && (major, minor) == expected
+    (major, minor)
 }
 
-fn probe_open(sys: &Path, path: &Path) -> io::Result<Option<(Uuid, File)>> {
+fn matches_device(meta: &fs::Metadata, expected: (u64, u64)) -> bool {
+    meta.file_type().is_block_device() && rdev_numbers(meta) == expected
+}
+
+fn probe_open(
+    sys: &Path,
+    path: &Path,
+    expected_uuid: Option<&Uuid>,
+    notes: &mut Vec<String>,
+) -> io::Result<Option<(Uuid, Kind, File)>> {
     let expected = device_number(&text(&sys.join("dev"))?)?;
     let sectors = text(&sys.join("size"))?;
     let sectors: u64 = sectors
@@ -196,6 +345,7 @@ fn probe_open(sys: &Path, path: &Path) -> io::Result<Option<(Uuid, File)>> {
     if sectors < (SUPER_OFFSET + SUPER_BYTES as u64) / 512 {
         return Ok(None);
     }
+    let size = sectors.saturating_mul(512);
     let before = fs::symlink_metadata(path)?;
     if !matches_device(&before, expected) {
         return Err(invalid("volume path disagrees with sysfs block identity"));
@@ -211,9 +361,7 @@ fn probe_open(sys: &Path, path: &Path) -> io::Result<Option<(Uuid, File)>> {
     {
         return Err(invalid("volume device changed during open"));
     }
-    let mut bytes = [0; SUPER_BYTES];
-    file.read_exact_at(&mut bytes, SUPER_OFFSET)?;
-    let result = identify(&bytes)?;
+    let result = identify_volume(&mut &file, size, expected_uuid, notes, luks2::identity)?;
     let after = fs::symlink_metadata(path)?;
     if !matches_device(&after, expected)
         || after.dev() != opened.dev()
@@ -221,11 +369,7 @@ fn probe_open(sys: &Path, path: &Path) -> io::Result<Option<(Uuid, File)>> {
     {
         return Err(invalid("volume device changed during probe"));
     }
-    Ok(result.map(|uuid| (uuid, file)))
-}
-
-fn probe(sys: &Path, path: &Path) -> io::Result<Option<Uuid>> {
-    Ok(probe_open(sys, path)?.map(|(uuid, _)| uuid))
+    Ok(result.map(|(uuid, kind)| (uuid, kind, file)))
 }
 
 pub(crate) struct Pinned {
@@ -234,19 +378,6 @@ pub(crate) struct Pinned {
 }
 
 impl Pinned {
-    pub(crate) fn open(uuid: &Uuid) -> io::Result<Self> {
-        let (_, path) = resolve(Some(uuid))?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| invalid("missing volume name"))?;
-        let (found, file) = probe_open(&Path::new("/sys/class/block").join(name), &path)?
-            .ok_or_else(|| invalid("resolved volume disappeared"))?;
-        if &found != uuid {
-            return Err(invalid("resolved volume UUID changed"));
-        }
-        Ok(Self { file, device: path })
-    }
-
     // The parent retains this descriptor across every child mount and transaction.
     pub(crate) fn path(&self) -> PathBuf {
         PathBuf::from(format!(
@@ -254,6 +385,287 @@ impl Pinned {
             std::process::id(),
             self.file.as_raw_fd()
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(file: File, device: PathBuf) -> Self {
+        Self { file, device }
+    }
+}
+
+/// What sysfs says of a dm-N that claims the volume.
+#[derive(Debug, Eq, PartialEq)]
+struct MappingEntry {
+    /// The kernel's node name, `dm-N`.
+    node: String,
+    /// The device-mapper name cryptsetup opened it under.
+    name: String,
+}
+
+/// An active dm-crypt mapping admitted for a pinned LUKS2 partition, held
+/// open for the consumer that mounts through it.
+pub(crate) struct Mapping {
+    entry: MappingEntry,
+    file: File,
+}
+
+impl Mapping {
+    #[cfg(test)]
+    pub(crate) fn for_test(node: &str, name: &str, file: File) -> Self {
+        Self {
+            entry: MappingEntry {
+                node: node.into(),
+                name: name.into(),
+            },
+            file,
+        }
+    }
+}
+
+/// The volume discovery selected, reopened and pinned.
+pub(crate) enum Opened {
+    Btrfs(Pinned),
+    /// The LUKS2 partition, and its mapping when one is active.
+    Luks2 {
+        partition: Pinned,
+        mapping: Option<Mapping>,
+    },
+}
+
+impl Opened {
+    pub(crate) fn open(uuid: &Uuid) -> io::Result<Self> {
+        let found = resolve(Some(uuid))?;
+        let name = found
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("missing volume name"))?;
+        // The scan already reported what it passed over.
+        let mut notes = Vec::new();
+        let (id, kind, file) = probe_open(
+            &Path::new(CLASS_BLOCK).join(name),
+            &found.path,
+            Some(uuid),
+            &mut notes,
+        )?
+        .ok_or_else(|| invalid("resolved volume disappeared"))?;
+        if &id != uuid || kind != found.kind {
+            return Err(invalid("resolved volume identity changed"));
+        }
+        let mapping = match kind {
+            Kind::Btrfs => None,
+            Kind::Luks2 => open_mapping(name, uuid)?,
+        };
+        let partition = Pinned {
+            file,
+            device: found.path,
+        };
+        Ok(match kind {
+            Kind::Btrfs => Self::Btrfs(partition),
+            Kind::Luks2 => Self::Luks2 { partition, mapping },
+        })
+    }
+
+    /// The pinned Btrfs volume. Every consumer refuses an encrypted volume
+    /// until td-boot unlocks one (td-install/ENCRYPTION.md "Selector release").
+    pub(crate) fn unencrypted(self) -> io::Result<Pinned> {
+        match self {
+            Self::Btrfs(pinned) => Ok(pinned),
+            Self::Luks2 { partition, mapping } => {
+                Err(encrypted_unsupported(&partition.device, mapping.as_ref()))
+            }
+        }
+    }
+}
+
+fn encrypted_unsupported(device: &Path, mapping: Option<&Mapping>) -> io::Error {
+    let mapping = match mapping {
+        Some(mapping) => {
+            let number = match mapping.file.metadata() {
+                Ok(meta) => {
+                    let (major, minor) = rdev_numbers(&meta);
+                    format!("{major}:{minor}")
+                }
+                Err(error) => format!("device number unreadable: {error}"),
+            };
+            format!(
+                "its mapping {} ({}, {number}) is active",
+                mapping.entry.node, mapping.entry.name
+            )
+        }
+        None => "no mapping of it is active".to_owned(),
+    };
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{ENCRYPTED_UNSUPPORTED}: {} holds a td LUKS2 volume; {mapping}",
+            device.display()
+        ),
+    )
+}
+
+/// A device-mapper node name, `dm-N`.
+fn mapping_name(name: &str) -> bool {
+    name.strip_prefix("dm-")
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn mapping_uuid_prefix(uuid: &Uuid) -> String {
+    let mut prefix = String::from(MAPPING_UUID_PREFIX);
+    for byte in &uuid.0 {
+        prefix.push_str(&format!("{byte:02x}"));
+    }
+    prefix.push('-');
+    prefix
+}
+
+fn sysfs_line(path: &Path, max: usize) -> io::Result<String> {
+    let value = text_bounded(path, max)?;
+    Ok(value.strip_suffix('\n').unwrap_or(&value).to_owned())
+}
+
+fn slaves(directory: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        if names.len() == MAX_SLAVES {
+            return Err(invalid(format!(
+                "too many devices under {}",
+                directory.display()
+            )));
+        }
+        let name = entry?.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| invalid("non-ASCII device-mapper slave name"))?;
+        names.push(name.to_owned());
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+/// The dm-N at `directory` if its `dm/uuid` claims the volume; a claim
+/// whose name disagrees with `dm/name` or whose `slaves/` is not exactly
+/// `partition` refuses.
+fn mapping_entry(
+    directory: &Path,
+    node: &str,
+    uuid: &Uuid,
+    partition: &str,
+) -> io::Result<Option<MappingEntry>> {
+    let dm_uuid = sysfs_line(&directory.join("dm/uuid"), MAX_DM_UUID_BYTES)?;
+    let Some(named) = dm_uuid.strip_prefix(&mapping_uuid_prefix(uuid)) else {
+        return Ok(None);
+    };
+    let name = sysfs_line(&directory.join("dm/name"), MAX_SYSFS_BYTES)?;
+    if named != name {
+        return Err(invalid(format!(
+            "mapping {node} of td volume {uuid} is named {name:?} but its dm uuid names {named:?}"
+        )));
+    }
+    if slaves(&directory.join("slaves"))? != [partition] {
+        return Err(invalid(format!(
+            "mapping {node} of td volume {uuid} is not over exactly {partition}"
+        )));
+    }
+    Ok(Some(MappingEntry {
+        node: node.to_owned(),
+        name,
+    }))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MappingScan {
+    Complete(Option<MappingEntry>),
+    /// A node or attribute vanished during the walk: walk again.
+    Incomplete,
+}
+
+/// The one dm-N under `sys_block` that claims `partition`'s volume, found
+/// through sysfs alone and never by a `/dev/mapper` name: its `dm/uuid`
+/// is `CRYPT-LUKS2-<the UUID's 32 hex digits>-<its dm/name>` and its
+/// `slaves/` names exactly `partition`. A malformed claim and a second
+/// claim refuse.
+fn find_mapping(sys_block: &Path, partition: &str, uuid: &Uuid) -> io::Result<MappingScan> {
+    let mut found: Option<MappingEntry> = None;
+    for (index, entry) in fs::read_dir(sys_block)?.enumerate() {
+        if index >= MAX_DEVICES {
+            return Err(invalid("too many block devices for mapping discovery"));
+        }
+        let entry = match entry {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(MappingScan::Incomplete)
+            }
+            other => other?,
+        };
+        let node = entry.file_name();
+        let Some(node) = node.to_str().filter(|node| mapping_name(node)) else {
+            continue;
+        };
+        let claim = match mapping_entry(&entry.path(), node, uuid, partition) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(MappingScan::Incomplete)
+            }
+            other => other?,
+        };
+        let Some(claim) = claim else {
+            continue;
+        };
+        if let Some(first) = &found {
+            return Err(invalid(format!(
+                "td volume {uuid} has two active mappings, {} and {node}",
+                first.node
+            )));
+        }
+        found = Some(claim);
+    }
+    Ok(MappingScan::Complete(found))
+}
+
+/// The admitted mapping, opened through `/dev/dm-N` and held. The node is
+/// opened under probe_open's device-number and inode checks and must carry
+/// the volume's Btrfs; its sysfs claim and `dev` are then read again and
+/// must still describe the held node.
+fn hold_mapping(entry: MappingEntry, partition: &str, uuid: &Uuid) -> io::Result<Mapping> {
+    let directory = Path::new(SYS_BLOCK).join(&entry.node);
+    let path = Path::new("/dev").join(&entry.node);
+    let mut notes = Vec::new();
+    let file = match probe_open(&directory, &path, Some(uuid), &mut notes)? {
+        Some((found, Kind::Btrfs, file)) if &found == uuid => file,
+        _ => {
+            return Err(invalid(format!(
+                "mapping {} of td volume {uuid} does not carry its Btrfs volume",
+                entry.node
+            )))
+        }
+    };
+    let again = mapping_entry(&directory, &entry.node, uuid, partition)?;
+    let number = device_number(&text(&directory.join("dev"))?)?;
+    if again.as_ref() != Some(&entry) || !matches_device(&file.metadata()?, number) {
+        return Err(invalid(format!(
+            "mapping {} of td volume {uuid} changed while it was opened",
+            entry.node
+        )));
+    }
+    Ok(Mapping { entry, file })
+}
+
+/// The partition's active mapping, held; `None` when none is active.
+fn open_mapping(partition: &str, uuid: &Uuid) -> io::Result<Option<Mapping>> {
+    let started = Instant::now();
+    loop {
+        match find_mapping(Path::new(SYS_BLOCK), partition, uuid)? {
+            MappingScan::Complete(None) => return Ok(None),
+            MappingScan::Complete(Some(entry)) => {
+                return hold_mapping(entry, partition, uuid).map(Some)
+            }
+            MappingScan::Incomplete => {}
+        }
+        if started.elapsed() >= MAPPING_WAIT {
+            return Err(invalid(format!(
+                "mapping discovery for td volume {uuid} did not settle"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -292,26 +704,55 @@ pub(crate) fn command_line(bytes: &[u8], uuid: &Uuid) -> io::Result<std::ffi::Os
     Ok(std::ffi::OsString::from_vec(result))
 }
 
-fn choose(
-    found: &mut Option<(Uuid, PathBuf)>,
-    uuid: Uuid,
-    path: PathBuf,
-    expected: Option<&Uuid>,
-) -> io::Result<()> {
-    if expected.is_some_and(|expected| expected != &uuid) {
+/// One device a scan identified as a td volume.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Found {
+    pub(crate) uuid: Uuid,
+    pub(crate) kind: Kind,
+    pub(crate) path: PathBuf,
+}
+
+impl Found {
+    /// `td-boot volume`'s line. It refuses an encrypted volume as every
+    /// other consumer does, naming the mapping discovery finds.
+    pub(crate) fn describe(&self) -> io::Result<String> {
+        self.describe_with(open_mapping)
+    }
+
+    fn describe_with(
+        &self,
+        mapping: impl FnOnce(&str, &Uuid) -> io::Result<Option<Mapping>>,
+    ) -> io::Result<String> {
+        match self.kind {
+            Kind::Btrfs => Ok(format!("{} {}", self.uuid, self.path.display())),
+            Kind::Luks2 => {
+                let name = self
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| invalid("missing volume name"))?;
+                let mapping = mapping(name, &self.uuid)?;
+                Err(encrypted_unsupported(&self.path, mapping.as_ref()))
+            }
+        }
+    }
+}
+
+fn choose(found: &mut Option<Found>, candidate: Found, expected: Option<&Uuid>) -> io::Result<()> {
+    if expected.is_some_and(|expected| expected != &candidate.uuid) {
         return Ok(());
     }
     if found.is_some() {
         return Err(invalid("ambiguous td volume identity"));
     }
-    *found = Some((uuid, path));
+    *found = Some(candidate);
     Ok(())
 }
 
 fn select_scan(
-    entries: impl IntoIterator<Item = io::Result<Option<(Uuid, PathBuf)>>>,
+    entries: impl IntoIterator<Item = io::Result<Option<Found>>>,
     expected: Option<&Uuid>,
-) -> io::Result<Option<(Uuid, PathBuf)>> {
+) -> io::Result<Option<Found>> {
     let mut found = None;
     for entry in entries {
         let entry = match entry {
@@ -319,15 +760,15 @@ fn select_scan(
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             other => other?,
         };
-        if let Some((uuid, path)) = entry {
-            choose(&mut found, uuid, path, expected)?;
+        if let Some(candidate) = entry {
+            choose(&mut found, candidate, expected)?;
         }
     }
     Ok(found)
 }
 
-fn scan(expected: Option<&Uuid>) -> io::Result<Option<(Uuid, PathBuf)>> {
-    let entries = fs::read_dir("/sys/class/block")?
+fn scan(expected: Option<&Uuid>, notes: &mut Vec<String>) -> io::Result<Option<Found>> {
+    let entries = fs::read_dir(CLASS_BLOCK)?
         .enumerate()
         .map(|(index, entry)| {
             if index >= MAX_DEVICES {
@@ -342,21 +783,48 @@ fn scan(expected: Option<&Uuid>) -> io::Result<Option<(Uuid, PathBuf)>> {
                 return Ok(None);
             }
             let path = Path::new("/dev").join(name);
-            let uuid = probe(&entry.path(), &path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("probe volume {}: {error}", path.display()),
-                )
-            })?;
-            Ok(uuid.map(|uuid| (uuid, path)))
+            let mut device_notes = Vec::new();
+            let identity =
+                probe_open(&entry.path(), &path, expected, &mut device_notes).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("probe volume {}: {error}", path.display()),
+                    )
+                })?;
+            notes.extend(
+                device_notes
+                    .into_iter()
+                    .map(|note| format!("{}: {note}", path.display())),
+            );
+            Ok(identity.map(|(uuid, kind, _)| Found { uuid, kind, path }))
         });
     select_scan(entries, expected)
 }
 
-pub(crate) fn resolve(expected: Option<&Uuid>) -> io::Result<(Uuid, PathBuf)> {
+/// Writes each note not yet reported, whole, to standard error.
+fn report_notes(
+    out: &mut dyn Write,
+    reported: &mut Vec<String>,
+    notes: Vec<String>,
+) -> io::Result<()> {
+    for note in notes {
+        if reported.contains(&note) || reported.len() >= MAX_NOTES {
+            continue;
+        }
+        out.write_all(format!("td-boot: {note}\n").as_bytes())?;
+        reported.push(note);
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve(expected: Option<&Uuid>) -> io::Result<Found> {
     let started = Instant::now();
+    let mut reported = Vec::new();
     loop {
-        if let Some(volume) = scan(expected)? {
+        let mut notes = Vec::new();
+        let found = scan(expected, &mut notes);
+        report_notes(&mut io::stderr(), &mut reported, notes)?;
+        if let Some(volume) = found? {
             return Ok(volume);
         }
         if started.elapsed() >= Duration::from_secs(30) {
@@ -770,14 +1238,69 @@ mod tests {
                 inputs.reverse();
             }
             for (id, path) in inputs {
-                choose(&mut found, id, path.into(), Some(&uuid)).unwrap();
+                choose(&mut found, btrfs(id, path), Some(&uuid)).unwrap();
             }
-            assert_eq!(found, Some((uuid.clone(), PathBuf::from("/dev/vdb2"))));
-            assert!(choose(&mut found, uuid.clone(), "/dev/sda2".into(), Some(&uuid)).is_err());
+            assert_eq!(found, Some(btrfs(uuid.clone(), "/dev/vdb2")));
+            assert!(choose(&mut found, btrfs(uuid.clone(), "/dev/sda2"), Some(&uuid)).is_err());
         }
         let mut found = None;
-        choose(&mut found, uuid, "/dev/vda2".into(), None).unwrap();
-        assert!(choose(&mut found, other, "/dev/sda2".into(), None).is_err());
+        choose(&mut found, btrfs(uuid, "/dev/vda2"), None).unwrap();
+        assert!(choose(&mut found, btrfs(other, "/dev/sda2"), None).is_err());
+    }
+
+    fn btrfs(uuid: Uuid, path: &str) -> Found {
+        Found {
+            uuid,
+            kind: Kind::Btrfs,
+            path: path.into(),
+        }
+    }
+
+    fn encrypted(uuid: Uuid, path: &str) -> Found {
+        Found {
+            uuid,
+            kind: Kind::Luks2,
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn luks2_and_btrfs_candidates_are_counted_together() {
+        let uuid = Uuid([0x12; 16]);
+        let other = Uuid([0x34; 16]);
+        for order in [false, true] {
+            // A LUKS2 partition and a Btrfs one carrying its UUID are two.
+            let mut inputs = [
+                btrfs(uuid.clone(), "/dev/vda2"),
+                encrypted(uuid.clone(), "/dev/vdb2"),
+            ];
+            if order {
+                inputs.reverse();
+            }
+            let mut found = None;
+            let [first, second] = inputs;
+            choose(&mut found, first, Some(&uuid)).unwrap();
+            let error = choose(&mut found, second, Some(&uuid)).unwrap_err();
+            assert!(error.to_string().contains("ambiguous"), "{error}");
+            // Two LUKS2 headers carrying the UUID are two as well.
+            let mut found = None;
+            choose(&mut found, encrypted(uuid.clone(), "/dev/vda2"), None).unwrap();
+            assert!(choose(&mut found, encrypted(uuid.clone(), "/dev/sda2"), None).is_err());
+            // Without an expected UUID, any two td volumes are ambiguous.
+            let mut found = None;
+            choose(&mut found, encrypted(uuid.clone(), "/dev/vda2"), None).unwrap();
+            assert!(choose(&mut found, btrfs(other.clone(), "/dev/sda2"), None).is_err());
+        }
+        // Another UUID's volume is not counted against the expected one.
+        let mut found = None;
+        choose(&mut found, btrfs(other, "/dev/vda2"), Some(&uuid)).unwrap();
+        choose(
+            &mut found,
+            encrypted(uuid.clone(), "/dev/vdb2"),
+            Some(&uuid),
+        )
+        .unwrap();
+        assert_eq!(found, Some(encrypted(uuid, "/dev/vdb2")));
     }
 
     #[test]
@@ -917,7 +1440,7 @@ mod tests {
 
     #[test]
     fn an_incomplete_scan_cannot_select_a_partial_match() {
-        let good = || Ok(Some((Uuid([0x12; 16]), PathBuf::from("/dev/vda2"))));
+        let good = || Ok(Some(btrfs(Uuid([0x12; 16]), "/dev/vda2")));
         let missing = || Err(io::Error::from(io::ErrorKind::NotFound));
         assert_eq!(select_scan([good(), missing()], None).unwrap(), None);
         assert_eq!(select_scan([missing(), good()], None).unwrap(), None);
@@ -932,7 +1455,578 @@ mod tests {
         assert!(select_scan([good(), good()], None).is_err());
         assert_eq!(
             select_scan([good(), Ok(None)], None).unwrap(),
-            Some((Uuid([0x12; 16]), PathBuf::from("/dev/vda2")))
+            Some(btrfs(Uuid([0x12; 16]), "/dev/vda2"))
         );
+    }
+
+    const LUKS_UUID: &str = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    const OTHER_UUID: &str = "00112233-4455-4677-8899-aabbccddeeff";
+    const VOLUME_BYTES: usize = 128 * 1024;
+
+    fn seal_luks2(area: &mut [u8]) {
+        area[448..512].fill(0);
+        let digest = td_tpm::digest(area);
+        area[448..480].copy_from_slice(&digest);
+    }
+
+    /// One 16 KiB LUKS2 header copy as cryptsetup writes it, with `json`.
+    fn luks2_copy_with(
+        secondary: bool,
+        version: u16,
+        label: &[u8],
+        uuid: &str,
+        json: &[u8],
+    ) -> Vec<u8> {
+        let mut area = vec![0u8; 0x4000];
+        area[..6].copy_from_slice(if secondary {
+            b"SKUL\xba\xbe"
+        } else {
+            b"LUKS\xba\xbe"
+        });
+        area[6..8].copy_from_slice(&version.to_be_bytes());
+        area[8..16].copy_from_slice(&0x4000u64.to_be_bytes());
+        area[16..24].copy_from_slice(&3u64.to_be_bytes());
+        area[24..24 + label.len()].copy_from_slice(label);
+        area[72..78].copy_from_slice(b"sha256");
+        area[168..168 + uuid.len()].copy_from_slice(uuid.as_bytes());
+        let offset: u64 = if secondary { 0x4000 } else { 0 };
+        area[256..264].copy_from_slice(&offset.to_be_bytes());
+        area[4096..4096 + json.len()].copy_from_slice(json);
+        seal_luks2(&mut area);
+        area
+    }
+
+    const PLAIN_JSON: &[u8] = br#"{"keyslots":{"0":{"type":"luks2"}},"tokens":{},"segments":{"0":{"type":"crypt"}},"digests":{},"config":{}}"#;
+    // A td token naming a keyslot the header lacks: td-protector's full
+    // reader refuses it; identity never reads it.
+    const REFUSED_TOKEN_JSON: &[u8] = br#"{"keyslots":{"0":{"type":"luks2"}},"tokens":{"0":{"type":"td-protector","keyslots":["7"],"role":"first-boot","public":"00","private":"00"}},"segments":{},"digests":{},"config":{}}"#;
+
+    fn luks2_copy(secondary: bool, version: u16, label: &[u8], uuid: &str) -> Vec<u8> {
+        luks2_copy_with(secondary, version, label, uuid, PLAIN_JSON)
+    }
+
+    /// A volume with both LUKS2 copies of one version, label and UUID.
+    fn luks2_volume_with(version: u16, label: &[u8], uuid: &str, json: &[u8]) -> Vec<u8> {
+        let mut bytes = luks2_copy_with(false, version, label, uuid, json);
+        bytes.extend(luks2_copy_with(true, version, label, uuid, json));
+        bytes.resize(VOLUME_BYTES, 0xaa);
+        bytes
+    }
+
+    fn luks2_volume(version: u16, label: &[u8], uuid: &str) -> Vec<u8> {
+        luks2_volume_with(version, label, uuid, PLAIN_JSON)
+    }
+
+    fn btrfs_volume() -> Vec<u8> {
+        let mut bytes = vec![0; VOLUME_BYTES];
+        bytes[SUPER_OFFSET as usize..][..SUPER_BYTES].copy_from_slice(&superblock());
+        bytes
+    }
+
+    fn identify_expecting(
+        bytes: Vec<u8>,
+        expected: Option<&str>,
+    ) -> (io::Result<Option<(Uuid, Kind)>>, Vec<String>, usize) {
+        let size = bytes.len() as u64;
+        let expected = expected.map(|text| Uuid::parse(text).unwrap());
+        let mut notes = Vec::new();
+        let mut calls = 0;
+        let result = identify_volume(
+            &mut io::Cursor::new(bytes),
+            size,
+            expected.as_ref(),
+            &mut notes,
+            |device| {
+                calls += 1;
+                luks2::identity(device)
+            },
+        );
+        (result, notes, calls)
+    }
+
+    fn identify_bytes(bytes: Vec<u8>) -> io::Result<Option<(Uuid, Kind)>> {
+        identify_expecting(bytes, None).0
+    }
+
+    #[test]
+    fn a_td_luks2_header_identifies_its_volume() {
+        let uuid = Uuid::parse(LUKS_UUID).unwrap();
+        let volume = luks2_volume(2, b"td-system", LUKS_UUID);
+        assert_eq!(
+            identify_bytes(volume.clone()).unwrap(),
+            Some((uuid.clone(), Kind::Luks2))
+        );
+        let (found, notes, calls) = identify_expecting(volume.clone(), Some(LUKS_UUID));
+        assert_eq!(found.unwrap(), Some((uuid.clone(), Kind::Luks2)));
+        assert_eq!((notes.len(), calls), (0, 1));
+        // A primary that fails its checksum: identity uses the secondary,
+        // as cryptsetup does.
+        let mut damaged = volume.clone();
+        damaged[1000] ^= 1;
+        assert_eq!(
+            identify_bytes(damaged).unwrap(),
+            Some((uuid.clone(), Kind::Luks2))
+        );
+        // The primary's magic gone: the secondary still selects the device.
+        let mut wiped = volume.clone();
+        wiped[..4096].fill(0);
+        assert_eq!(
+            identify_bytes(wiped).unwrap(),
+            Some((uuid.clone(), Kind::Luks2))
+        );
+        // Tokens are the opened volume's concern, not discovery's.
+        let tokened = luks2_volume_with(2, b"td-system", LUKS_UUID, REFUSED_TOKEN_JSON);
+        assert!(luks2::read(&mut io::Cursor::new(tokened.clone())).is_err());
+        assert_eq!(
+            identify_expecting(tokened, Some(LUKS_UUID)).0.unwrap(),
+            Some((uuid, Kind::Luks2))
+        );
+        assert_eq!(
+            identify_bytes(btrfs_volume()).unwrap(),
+            Some((Uuid([0x12; 16]), Kind::Btrfs))
+        );
+        assert_eq!(identify_bytes(vec![0; VOLUME_BYTES]).unwrap(), None);
+    }
+
+    #[test]
+    fn other_luks_versions_and_labels_are_not_td_volumes() {
+        // LUKS1 and any other version carry the magic without being ours.
+        for version in [1, 3] {
+            let volume = luks2_volume(version, b"td-system", LUKS_UUID);
+            assert_eq!(identify_bytes(volume).unwrap(), None, "version {version}");
+        }
+        for label in [b"".as_slice(), b"td-system2", b"TD-SYSTEM", b"other"] {
+            let volume = luks2_volume(2, label, LUKS_UUID);
+            let (found, _, calls) = identify_expecting(volume, None);
+            assert_eq!((found.unwrap(), calls), (None, 0), "{label:?}");
+        }
+        // A secondary of a later sequence number in use with another label.
+        let mut relabelled = luks2_volume(2, b"td-system", LUKS_UUID);
+        let mut secondary = luks2_copy(true, 2, b"other", LUKS_UUID);
+        secondary[16..24].copy_from_slice(&4u64.to_be_bytes());
+        seal_luks2(&mut secondary);
+        relabelled[0x4000..0x8000].copy_from_slice(&secondary);
+        let (found, notes, _) = identify_expecting(relabelled, None);
+        assert_eq!(found.unwrap(), None);
+        assert!(notes[0].contains("another label"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_wanted_td_header_that_fails_identity_refuses_discovery() {
+        // Both copies corrupt: a td label with no valid copy.
+        let mut corrupt = luks2_volume(2, b"td-system", LUKS_UUID);
+        corrupt[1000] ^= 1;
+        corrupt[0x4000 + 1000] ^= 1;
+        for expected in [None, Some(LUKS_UUID)] {
+            let error = identify_expecting(corrupt.clone(), expected).0.unwrap_err();
+            assert!(error.to_string().contains("td LUKS2 header"), "{error}");
+        }
+        for uuid in [
+            "0F0E0D0C-0B0A-4908-8706-050403020100",
+            "00000000-0000-0000-0000-000000000000",
+            "0f0e0d0c0b0a49088706050403020100",
+        ] {
+            let error = identify_bytes(luks2_volume(2, b"td-system", uuid)).unwrap_err();
+            assert!(error.to_string().contains("UUID"), "{uuid}: {error}");
+        }
+    }
+
+    /// Another disk's td header, however malformed, is passed over by its
+    /// unverified UUID claim before identity runs: the counter is the
+    /// mutation check that the pre-filter is there.
+    #[test]
+    fn another_volume_td_header_is_passed_over_unverified() {
+        let mut corrupt = luks2_volume_with(2, b"td-system", OTHER_UUID, REFUSED_TOKEN_JSON);
+        corrupt[1000] ^= 1;
+        corrupt[0x4000 + 1000] ^= 1;
+        for foreign in [
+            corrupt,
+            luks2_volume_with(2, b"td-system", OTHER_UUID, REFUSED_TOKEN_JSON),
+        ] {
+            let (found, notes, calls) = identify_expecting(foreign, Some(LUKS_UUID));
+            assert_eq!(found.unwrap(), None);
+            assert_eq!(calls, 0, "identity ran on another volume's header");
+            assert!(notes[0].contains(OTHER_UUID), "{notes:?}");
+        }
+        // The same header, sought, refuses.
+        let mut corrupt = luks2_volume(2, b"td-system", OTHER_UUID);
+        corrupt[1000] ^= 1;
+        corrupt[0x4000 + 1000] ^= 1;
+        let (found, _, calls) = identify_expecting(corrupt, Some(OTHER_UUID));
+        assert!(found.is_err());
+        assert_eq!(calls, 1);
+        // A claim in a stale copy whose verified copy names another volume
+        // is passed over after identity.
+        let mut stale = luks2_volume(2, b"td-system", OTHER_UUID);
+        stale[..0x4000].copy_from_slice(&luks2_copy(false, 2, b"td-system", LUKS_UUID));
+        stale[1000] ^= 1;
+        let (found, notes, calls) = identify_expecting(stale, Some(LUKS_UUID));
+        assert_eq!((found.unwrap(), calls), (None, 1));
+        assert!(notes[0].contains("not the volume sought"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_foreign_header_beside_this_volume_lets_the_btrfs_volume_bind() {
+        let expected = Uuid([0x12; 16]);
+        let foreign = luks2_volume_with(2, b"td-system", OTHER_UUID, REFUSED_TOKEN_JSON);
+        let size = foreign.len() as u64;
+        let mut notes = Vec::new();
+        let devices = [(foreign, "/dev/vdb2"), (btrfs_volume(), "/dev/vda2")];
+        let entries = devices.into_iter().map(|(bytes, path)| {
+            let identity = identify_volume(
+                &mut io::Cursor::new(bytes),
+                size,
+                Some(&expected),
+                &mut notes,
+                luks2::identity,
+            )?;
+            Ok(identity.map(|(uuid, kind)| Found {
+                uuid,
+                kind,
+                path: path.into(),
+            }))
+        });
+        assert_eq!(
+            select_scan(entries, Some(&expected)).unwrap(),
+            Some(btrfs(expected, "/dev/vda2"))
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+    }
+
+    /// A device whose reads fail at chosen offsets.
+    struct Failing {
+        bytes: io::Cursor<Vec<u8>>,
+        bad: Vec<u64>,
+    }
+
+    impl Read for Failing {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.bad.contains(&self.bytes.position()) {
+                return Err(io::Error::other("medium error"));
+            }
+            self.bytes.read(out)
+        }
+    }
+
+    impl Seek for Failing {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            self.bytes.seek(to)
+        }
+    }
+
+    #[test]
+    fn a_failed_header_probe_is_not_a_luks2_candidate() {
+        let identify_failing = |bytes: Vec<u8>, bad: Vec<u64>| {
+            let size = bytes.len() as u64;
+            let mut notes = Vec::new();
+            let mut device = Failing {
+                bytes: io::Cursor::new(bytes),
+                bad,
+            };
+            let found = identify_volume(&mut device, size, None, &mut notes, luks2::identity);
+            (found, notes)
+        };
+        // Bad sectors before the superblock leave the Btrfs volume.
+        let (found, notes) = identify_failing(btrfs_volume(), vec![0, 0x4000]);
+        assert_eq!(found.unwrap(), Some((Uuid([0x12; 16]), Kind::Btrfs)));
+        assert!(notes[0].contains("byte 0"), "{notes:?}");
+        // A blank device with a bad first sector is no candidate at all.
+        let (found, notes) = identify_failing(vec![0; VOLUME_BYTES], vec![0]);
+        assert_eq!(found.unwrap(), None);
+        assert_eq!(notes.len(), 1);
+        // A short read past a claim is past the pre-check: identity decides.
+        let (found, _) = identify_failing(luks2_volume(2, b"td-system", LUKS_UUID), vec![0x8000]);
+        assert_eq!(
+            found.unwrap(),
+            Some((Uuid::parse(LUKS_UUID).unwrap(), Kind::Luks2))
+        );
+    }
+
+    #[test]
+    fn one_device_carrying_both_identities_is_ambiguous() {
+        let mut both = luks2_volume(2, b"td-system", LUKS_UUID);
+        both[SUPER_OFFSET as usize..][..SUPER_BYTES].copy_from_slice(&superblock());
+        let error = identify_bytes(both).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        // A foreign LUKS2 header beside a td Btrfs is the Btrfs volume.
+        let mut foreign = luks2_volume(2, b"other", LUKS_UUID);
+        foreign[SUPER_OFFSET as usize..][..SUPER_BYTES].copy_from_slice(&superblock());
+        assert_eq!(
+            identify_bytes(foreign).unwrap(),
+            Some((Uuid([0x12; 16]), Kind::Btrfs))
+        );
+    }
+
+    #[test]
+    fn notes_are_reported_whole_and_once() {
+        let mut out = Vec::new();
+        let mut reported = Vec::new();
+        let note = || vec!["/dev/vdb2: passed over".to_string()];
+        report_notes(&mut out, &mut reported, note()).unwrap();
+        report_notes(&mut out, &mut reported, note()).unwrap();
+        assert_eq!(out, b"td-boot: /dev/vdb2: passed over\n");
+        let many = (0..MAX_NOTES + 5).map(|n| n.to_string()).collect();
+        report_notes(&mut Vec::new(), &mut reported, many).unwrap();
+        assert_eq!(reported.len(), MAX_NOTES);
+    }
+
+    #[test]
+    fn mappings_are_dm_nodes_and_never_scan_candidates() {
+        for name in ["dm-0", "dm-12"] {
+            assert!(mapping_name(name), "{name}");
+            assert!(!supported_name(name), "{name}");
+        }
+        for name in ["dm-", "dm", "dm-0p1", "dm-x", "dm0", "vda2", "mapper"] {
+            assert!(!mapping_name(name), "{name}");
+        }
+    }
+
+    /// A private sysfs `block` directory.
+    struct FakeSysfs(PathBuf);
+
+    impl FakeSysfs {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("td-boot-sysfs-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            // A disk is not a mapping.
+            fs::create_dir_all(root.join("vda/vda2")).unwrap();
+            Self(root)
+        }
+
+        fn mapping(&self, node: &str, uuid: &str, name: &str, slaves: &[&str]) {
+            let dir = self.0.join(node);
+            fs::create_dir_all(dir.join("dm")).unwrap();
+            fs::create_dir_all(dir.join("slaves")).unwrap();
+            fs::write(dir.join("dm/uuid"), format!("{uuid}\n")).unwrap();
+            fs::write(dir.join("dm/name"), format!("{name}\n")).unwrap();
+            for slave in slaves {
+                fs::write(dir.join("slaves").join(slave), b"").unwrap();
+            }
+        }
+
+        fn find(&self) -> io::Result<MappingScan> {
+            find_mapping(&self.0, "vda2", &Uuid::parse(LUKS_UUID).unwrap())
+        }
+    }
+
+    impl Drop for FakeSysfs {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const DM_UUID: &str = "CRYPT-LUKS2-0f0e0d0c0b0a49088706050403020100";
+
+    fn entry(node: &str, name: &str) -> MappingScan {
+        MappingScan::Complete(Some(MappingEntry {
+            node: node.into(),
+            name: name.into(),
+        }))
+    }
+
+    #[test]
+    fn the_mapping_is_found_by_dm_uuid_and_its_one_slave() {
+        let sysfs = FakeSysfs::new("match");
+        assert_eq!(sysfs.find().unwrap(), MappingScan::Complete(None));
+        sysfs.mapping("dm-0", "LVM-abc", "vg-root", &["vda2"]);
+        sysfs.mapping(
+            "dm-1",
+            "CRYPT-LUKS2-00112233445566778899aabbccddeeff-other",
+            "other",
+            &["vdb2"],
+        );
+        sysfs.mapping("dm-2", "", "plain", &["vda2"]);
+        assert_eq!(sysfs.find().unwrap(), MappingScan::Complete(None));
+        sysfs.mapping("dm-3", &format!("{DM_UUID}-td-root"), "td-root", &["vda2"]);
+        assert_eq!(sysfs.find().unwrap(), entry("dm-3", "td-root"));
+        assert_eq!(
+            mapping_uuid_prefix(&Uuid::parse(LUKS_UUID).unwrap()),
+            format!("{DM_UUID}-")
+        );
+    }
+
+    #[test]
+    fn a_dm_uuid_of_the_kernel_maximum_is_read() {
+        // 128 characters and the newline: an unrelated one is skipped, and
+        // the volume's own with a long name is admitted.
+        let sysfs = FakeSysfs::new("long");
+        let unrelated = format!("LVM-{}", "a".repeat(124));
+        assert_eq!(unrelated.len(), 128);
+        sysfs.mapping("dm-0", &unrelated, "vg-long", &["vdb"]);
+        assert_eq!(sysfs.find().unwrap(), MappingScan::Complete(None));
+        let name = "n".repeat(128 - DM_UUID.len() - 1);
+        sysfs.mapping("dm-1", &format!("{DM_UUID}-{name}"), &name, &["vda2"]);
+        assert_eq!(sysfs.find().unwrap(), entry("dm-1", &name));
+        // One byte more is no dm uuid the kernel writes.
+        let sysfs = FakeSysfs::new("over");
+        sysfs.mapping("dm-0", &format!("{unrelated}b"), "vg-long", &["vdb"]);
+        assert!(sysfs.find().is_err());
+    }
+
+    #[test]
+    fn a_vanishing_mapping_makes_the_walk_incomplete() {
+        let sysfs = FakeSysfs::new("vanish");
+        // A dm-N whose attributes are gone, as one removed mid-walk.
+        fs::create_dir_all(sysfs.0.join("dm-4")).unwrap();
+        assert_eq!(sysfs.find().unwrap(), MappingScan::Incomplete);
+    }
+
+    #[test]
+    fn a_mapping_over_another_device_refuses() {
+        for slaves in [&["vdb2"][..], &[], &["vda2", "vdb2"], &["vda"]] {
+            let sysfs = FakeSysfs::new("slave");
+            sysfs.mapping("dm-0", &format!("{DM_UUID}-td-root"), "td-root", slaves);
+            let error = sysfs.find().unwrap_err();
+            assert!(
+                error.to_string().contains("not over exactly vda2"),
+                "{slaves:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_mappings_of_one_volume_refuse() {
+        let sysfs = FakeSysfs::new("two");
+        sysfs.mapping("dm-0", &format!("{DM_UUID}-td-root"), "td-root", &["vda2"]);
+        sysfs.mapping(
+            "dm-1",
+            &format!("{DM_UUID}-td-again"),
+            "td-again",
+            &["vda2"],
+        );
+        let error = sysfs.find().unwrap_err();
+        assert!(error.to_string().contains("two active mappings"), "{error}");
+    }
+
+    #[test]
+    fn a_mapping_whose_name_disagrees_with_its_dm_uuid_refuses() {
+        let sysfs = FakeSysfs::new("name");
+        sysfs.mapping("dm-0", &format!("{DM_UUID}-td-root"), "td-other", &["vda2"]);
+        let error = sysfs.find().unwrap_err();
+        assert!(error.to_string().contains("is named"), "{error}");
+    }
+
+    #[test]
+    fn every_consumer_refuses_an_encrypted_volume() {
+        let found = encrypted(Uuid::parse(LUKS_UUID).unwrap(), "/dev/vda2");
+        // `td-boot volume` asks mapping discovery for the partition.
+        let mut asked = None;
+        let error = found
+            .describe_with(|partition, uuid| {
+                asked = Some((partition.to_owned(), uuid.clone()));
+                Ok(None)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
+            "{error}"
+        );
+        assert!(error.to_string().contains("no mapping"), "{error}");
+        assert_eq!(
+            asked,
+            Some(("vda2".into(), Uuid::parse(LUKS_UUID).unwrap()))
+        );
+        let error = found
+            .describe_with(|_, _| {
+                Ok(Some(Mapping::for_test(
+                    "dm-0",
+                    "td-root",
+                    File::open("/dev/null").unwrap(),
+                )))
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("dm-0 (td-root, 1:3) is active"),
+            "{error}"
+        );
+        let error = found
+            .describe_with(|_, _| Err(invalid("two active mappings")))
+            .unwrap_err();
+        assert!(error.to_string().contains("two active mappings"), "{error}");
+        assert_eq!(
+            btrfs(Uuid::parse(LUKS_UUID).unwrap(), "/dev/vda2")
+                .describe_with(|_, _| panic!("a Btrfs volume has no mapping"))
+                .unwrap(),
+            format!("{LUKS_UUID} /dev/vda2")
+        );
+        for mapping in [
+            None,
+            Some(Mapping::for_test(
+                "dm-0",
+                "td-root",
+                File::open("/dev/null").unwrap(),
+            )),
+        ] {
+            let opened = Opened::Luks2 {
+                partition: Pinned::for_test(File::open("/dev/null").unwrap(), "/dev/vda2".into()),
+                mapping,
+            };
+            let error = opened.unencrypted().err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(
+                error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
+                "{error}"
+            );
+        }
+    }
+
+    /// The selector's `boot`, the deployment initramfs's mounts and the
+    /// running system's transactions all bind their device through
+    /// `bind_volume`: an encrypted volume refuses each, and a Btrfs one
+    /// binds each to its held descriptor as before.
+    #[test]
+    fn each_on_volume_operation_refuses_an_encrypted_volume() {
+        let id = "a".repeat(64);
+        let operations: &[&[&str]] = &[
+            &["boot", "/volume", "quiet"],
+            &["mount-root", "/volume"],
+            &["mount-var", "/sysroot/var"],
+            &["install", "/update", "/source", "/key"],
+            &["update", "/update", "/volume", "/volume/channel", "/key"],
+            &["rollback", "/update"],
+            &["success", "/update", &id],
+        ];
+        let device = |mode: &crate::Mode| -> Option<PathBuf> {
+            match mode {
+                crate::Mode::Boot { device, .. }
+                | crate::Mode::Install { device, .. }
+                | crate::Mode::Update { device, .. }
+                | crate::Mode::Rollback { device, .. }
+                | crate::Mode::Success { device, .. }
+                | crate::Mode::MountVolume { device, .. } => Some(device.clone()),
+                _ => None,
+            }
+        };
+        for words in operations {
+            let args = std::iter::once("on-volume")
+                .chain(words.iter().copied())
+                .map(std::ffi::OsString::from);
+            let crate::Mode::OnVolume { operation } = crate::parse_args(args).unwrap() else {
+                panic!("{words:?} is not an on-volume operation");
+            };
+            let mut operation = *operation;
+            let opened = Opened::Luks2 {
+                partition: Pinned::for_test(File::open("/dev/null").unwrap(), "/dev/vda2".into()),
+                mapping: None,
+            };
+            let error = crate::bind_volume(&mut operation, opened).err().unwrap();
+            assert!(
+                error.to_string().starts_with(ENCRYPTED_UNSUPPORTED),
+                "{words:?}: {error}"
+            );
+            assert_eq!(device(&operation).unwrap(), Path::new("/volume-device"));
+            let pinned = crate::bind_volume(
+                &mut operation,
+                Opened::Btrfs(Pinned::for_test(
+                    File::open("/dev/null").unwrap(),
+                    "/dev/vda2".into(),
+                )),
+            )
+            .unwrap();
+            assert_eq!(device(&operation).unwrap(), pinned.path(), "{words:?}");
+        }
     }
 }

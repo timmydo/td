@@ -3774,9 +3774,16 @@ fn on_volume(mut operation: Mode) -> io::Result<()> {
             MAX_CMDLINE_BYTES as u64,
         )?)?
     };
-    let pinned = volume::Pinned::open(&uuid)?;
+    let pinned = bind_volume(&mut operation, volume::Opened::open(&uuid)?)?;
     report_volume_binding(&mut io::stderr(), &uuid, &pinned.device)?;
-    let device = match &mut operation {
+    dispatch(operation)
+}
+
+/// Gives the operation the pinned volume as its device operand. Every
+/// operation refuses an encrypted volume until td-boot unlocks one.
+fn bind_volume(operation: &mut Mode, opened: volume::Opened) -> io::Result<volume::Pinned> {
+    let pinned = opened.unencrypted()?;
+    let device = match operation {
         Mode::Boot { device, .. }
         | Mode::Install { device, .. }
         | Mode::Update { device, .. }
@@ -3786,7 +3793,7 @@ fn on_volume(mut operation: Mode) -> io::Result<()> {
         _ => return Err(usage_error()),
     };
     *device = pinned.path();
-    dispatch(operation)
+    Ok(pinned)
 }
 
 fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
@@ -3818,8 +3825,8 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             var,
         } => mount_volume(&device, &mountpoint, var),
         Mode::Volume { uuid } => {
-            let (uuid, path) = volume::resolve(uuid.as_ref())?;
-            writeln!(io::stdout(), "{uuid} {}", path.display())
+            let line = volume::resolve(uuid.as_ref())?.describe()?;
+            writeln!(io::stdout(), "{line}")
         }
         Mode::Verify { root } => run_verify(&root),
         Mode::RootLoop {

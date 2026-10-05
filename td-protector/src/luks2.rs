@@ -392,6 +392,33 @@ fn contents(json: &Json) -> Result<Metadata, String> {
     })
 }
 
+/// What one binary header claims, unverified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryClaim<'a> {
+    /// The label and UUID, each up to its first NUL.
+    pub label: &'a [u8],
+    pub uuid: &'a [u8],
+}
+
+/// The label and UUID of a binary header that carries its position's
+/// magic and version 2; `None` for any other bytes. A cheap pre-check
+/// for volume discovery that verifies no checksum: only `identity` and
+/// `read` admit a header.
+pub fn binary_claim(binary: &[u8], secondary: bool) -> Option<BinaryClaim<'_>> {
+    let magic = if secondary {
+        SECONDARY_MAGIC
+    } else {
+        PRIMARY_MAGIC
+    };
+    if binary.get(..magic.len())? != magic || binary.get(VERSION_AT..HDR_SIZE_AT)? != [0, 2] {
+        return None;
+    }
+    Some(BinaryClaim {
+        label: text_at(binary, LABEL_AT, LABEL_LEN).ok()?,
+        uuid: text_at(binary, UUID_AT, UUID_LEN).ok()?,
+    })
+}
+
 /// The keyslots and tokens of the header cryptsetup itself uses, from
 /// `luksDump --dump-json-metadata`'s output: at most `MAX_METADATA_JSON`
 /// bytes of one JSON object, read under the same token rules as `read`.
@@ -413,6 +440,43 @@ pub fn metadata(text: &[u8]) -> Result<Metadata, String> {
 /// choose its copy, and return the used copy's td tokens. A used copy
 /// that fails td's own checks refuses the header rather than falling back.
 pub fn read<R: Read + Seek>(device: &mut R) -> Result<Header, String> {
+    let (copy, which) = used_copy(device)?;
+    header_from(&copy, which)
+}
+
+/// The identity of the copy cryptsetup would use, chosen as `read`
+/// chooses it, with no JSON parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub copy: HeaderCopy,
+    pub seqid: u64,
+    pub hdr_size: u64,
+    /// The binary header's UUID and label, up to their first NUL.
+    pub uuid: String,
+    pub label: String,
+}
+
+/// The used copy's identity: its magic, version, offsets and checksum
+/// verified as `read` verifies them, and nothing of its JSON area. It
+/// refuses what `read` refuses in choosing a copy (no valid copy, copies
+/// disagreeing at one sequence number, a checksum algorithm other than
+/// SHA-256) and admits a copy of any valid size and any tokens: volume
+/// discovery uses it, and `read` refuses the rest on the volume chosen.
+pub fn identity<R: Read + Seek>(device: &mut R) -> Result<Identity, String> {
+    let (copy, which) = used_copy(device)?;
+    let text = |at, len| -> Result<String, String> {
+        Ok(String::from_utf8_lossy(text_at(&copy.binary, at, len)?).into_owned())
+    };
+    Ok(Identity {
+        copy: which,
+        seqid: copy.seqid,
+        hdr_size: copy.hdr_size,
+        uuid: text(UUID_AT, UUID_LEN)?,
+        label: text(LABEL_AT, LABEL_LEN)?,
+    })
+}
+
+fn used_copy<R: Read + Seek>(device: &mut R) -> Result<(ValidCopy, HeaderCopy), String> {
     let primary = read_copy(device, 0, false)?;
     let secondary = match &primary {
         Some(primary) => read_copy(device, primary.hdr_size, true)?,
@@ -427,28 +491,27 @@ pub fn read<R: Read + Seek>(device: &mut R) -> Result<Header, String> {
             found
         }
     };
-    let (copy, which) = match (&primary, &secondary) {
+    match (primary, secondary) {
         (Some(primary), Some(secondary)) => {
             if primary.seqid > secondary.seqid {
-                (primary, HeaderCopy::Primary)
+                Ok((primary, HeaderCopy::Primary))
             } else if primary.seqid < secondary.seqid {
-                (secondary, HeaderCopy::Secondary)
+                Ok((secondary, HeaderCopy::Secondary))
             } else if primary.hdr_size != secondary.hdr_size
-                || shared(primary)? != shared(secondary)?
+                || shared(&primary)? != shared(&secondary)?
             {
-                return Err(format!(
+                Err(format!(
                     "LUKS2 header copies disagree at the same sequence number {}",
                     primary.seqid
-                ));
+                ))
             } else {
-                (primary, HeaderCopy::Primary)
+                Ok((primary, HeaderCopy::Primary))
             }
         }
-        (Some(primary), None) => (primary, HeaderCopy::Primary),
-        (None, Some(secondary)) => (secondary, HeaderCopy::Secondary),
-        (None, None) => return Err("no valid LUKS2 header copy".into()),
-    };
-    header_from(copy, which)
+        (Some(primary), None) => Ok((primary, HeaderCopy::Primary)),
+        (None, Some(secondary)) => Ok((secondary, HeaderCopy::Secondary)),
+        (None, None) => Err("no valid LUKS2 header copy".into()),
+    }
 }
 
 #[cfg(test)]
@@ -848,5 +911,92 @@ mod tests {
             read(&mut Failing).unwrap_err(),
             "read LUKS2 header copy at 0: medium error"
         );
+    }
+
+    #[test]
+    fn the_binary_claim_needs_its_position_magic_and_version_two() {
+        let json = standard();
+        let primary = copy(false, 0, 0x4000, 7, json.as_bytes());
+        let secondary = copy(true, 0x4000, 0x4000, 7, json.as_bytes());
+        let claim = Some(BinaryClaim {
+            label: b"td-system",
+            uuid: b"0f0e0d0c-0b0a-4908-8706-050403020100",
+        });
+        assert_eq!(binary_claim(&primary[..BINARY_HEADER_LEN], false), claim);
+        assert_eq!(binary_claim(&secondary[..BINARY_HEADER_LEN], true), claim);
+        // No checksum is verified: a corrupt area still reports its claim.
+        let mut corrupt = primary.clone();
+        corrupt[CHECKSUM_AT] ^= 1;
+        assert_eq!(binary_claim(&corrupt, false), claim);
+        // The other position's magic, another version, other bytes.
+        assert_eq!(binary_claim(&primary, true), None);
+        assert_eq!(binary_claim(&secondary, false), None);
+        for version in [0u16, 1, 3, 0x0200] {
+            let mut other = primary.clone();
+            other[6..8].copy_from_slice(&version.to_be_bytes());
+            assert_eq!(binary_claim(&other, false), None, "version {version}");
+        }
+        assert_eq!(binary_claim(&[0; BINARY_HEADER_LEN], false), None);
+        assert_eq!(binary_claim(&primary[..7], false), None);
+        // Fields are read up to their first NUL; a short header has none.
+        let mut relabelled = primary.clone();
+        relabelled[24..72].fill(0);
+        relabelled[24..29].copy_from_slice(b"other");
+        assert_eq!(
+            binary_claim(&relabelled, false).map(|claim| claim.label),
+            Some(b"other".as_slice())
+        );
+        assert_eq!(binary_claim(&primary[..30], false), None);
+        assert_eq!(binary_claim(&primary[..200], false), None);
+    }
+
+    #[test]
+    fn identity_chooses_the_copy_as_read_does_and_parses_no_json() {
+        let json = standard();
+        let identity_of = |bytes: Vec<u8>| identity(&mut Cursor::new(bytes));
+        let found = identity_of(device(7, &json, 8, &json)).unwrap();
+        assert_eq!(
+            found,
+            Identity {
+                copy: HeaderCopy::Secondary,
+                seqid: 8,
+                hdr_size: 0x4000,
+                uuid: "0f0e0d0c-0b0a-4908-8706-050403020100".into(),
+                label: "td-system".into(),
+            }
+        );
+        // JSON and tokens `read` refuses are not identity's concern.
+        for area in [
+            "{}".to_string(),
+            header_json(&format!(
+                r#""0":{},"1":{},"2":{},"3":{},"4":{}"#,
+                td_token(1, Role::FirstBoot),
+                td_token(1, Role::DeviceBound),
+                td_token(1, Role::DeviceBound),
+                td_token(1, Role::DeviceBound),
+                td_token(1, Role::DeviceBound)
+            )),
+        ] {
+            let bytes = device(7, &area, 7, &area);
+            assert!(read_bytes(bytes.clone()).is_err());
+            assert_eq!(identity_of(bytes).unwrap().copy, HeaderCopy::Primary);
+        }
+        // A size td does not format is a valid copy for identity alone.
+        let mut large = copy(false, 0, 0x8000, 7, json.as_bytes());
+        large.extend(copy(true, 0x8000, 0x8000, 7, json.as_bytes()));
+        assert!(read_bytes(large.clone()).is_err());
+        assert_eq!(identity_of(large).unwrap().hdr_size, 0x8000);
+        // What choosing a copy refuses, identity refuses.
+        let mut corrupt = device(7, &json, 7, &json);
+        corrupt[1000] ^= 1;
+        corrupt[0x4000 + 1000] ^= 1;
+        assert_eq!(
+            identity_of(corrupt).unwrap_err(),
+            "no valid LUKS2 header copy"
+        );
+        let other = header_json("");
+        assert!(identity_of(device(7, &json, 7, &other))
+            .unwrap_err()
+            .contains("disagree"));
     }
 }

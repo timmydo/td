@@ -6,7 +6,10 @@ for both of its consumers: the installer, which probes for a usable TPM
 with the observed-policy read before a device-bound service starts and
 seals and verifies the first-boot protector (increment 5), and the
 selector, which releases, seals
-the device-bound protector and caps PCR 12 (increment 6). It runs over the
+the device-bound protector and caps PCR 12 (increment 6), and whose
+volume discovery already identifies a td LUKS2 volume through the header
+identity below (td-install/DESIGN.md "Read-only volume discovery
+primitive"). It runs over the
 shared TPM 2.0 client [td-tpm](../td-tpm/DESIGN.md) and owns only what
 ENCRYPTION.md makes disk-specific: which PCRs a protector names, the
 release cap, and the protector secret. It is pure `std`, depends only on
@@ -267,11 +270,23 @@ metadata agrees with it ("Transitions").
 `cryptsetup token import` takes, keys in the order above, `decode` and
 `from_json` admit it, and `orphan_from_json` admits an orphan.
 `luks2::read` takes any `Read + Seek` whose offset zero is the volume's
-first byte, such as a window onto the installer's claim or the selector's
-opened partition, and returns the used copy's sequence number, size,
+first byte, such as a window onto the installer's claim or the
+selector's opened partition, and returns the used copy's sequence
+number, size,
 UUID, label, keyslot numbers, td tokens and orphans with their token
 numbers, and each token of another type with its number and the
 keyslots it names. It runs no cryptsetup and needs no privilege.
+Volume discovery checks identity only, so that another disk's header
+cannot stop a boot (td-install/DESIGN.md "Read-only volume discovery
+primitive"). `luks2::binary_claim` is its pre-check over one 4096-byte
+binary header: the label and UUID, each up to its first NUL, of a
+header carrying its position's magic and version 2, or nothing; it
+verifies no checksum. `luks2::identity` chooses and verifies the copy
+exactly as `read` does, refusing what that choice refuses (no valid
+copy, copies disagreeing at one sequence number, a checksum algorithm
+other than SHA-256), and returns its sequence number, size, UUID and
+label without parsing its JSON, so it admits any valid size and any
+tokens; `read` refuses the rest on the volume chosen.
 `luks2::metadata` reads the same keyslots and tokens, under the same
 token rules, from the JSON `luksDump --dump-json-metadata` prints for
 the copy cryptsetup uses: at most `MAX_METADATA_JSON`, 128 KiB, which
@@ -535,7 +550,12 @@ duplicate key, non-canonical slot numbers, tokens naming absent
 keyslots, a malformed td token, a td token naming two keyslots, other
 token types ignored, orphans reported beside a valid token and counted
 toward the four-token bound, a malformed orphan, the keyslots other
-token types name, and a read error. Runner tests pin every command's
+token types name, and a read error; `binary_claim` reports either
+position's label and UUID, also from a copy whose checksum fails, and
+nothing for the other position's magic, versions other than 2, zeros or
+a truncated header; `identity` chooses the copy as `read` does, admits
+JSON, tokens and a size `read` refuses, and refuses a header with no
+valid copy or with disagreeing copies. Runner tests pin every command's
 arguments word for word, that a key file is a close-on-exec descriptor
 holding exactly the secret, the one-page input bound, a stand-in
 cryptsetup's cleared environment and inputs with no key in its argv, a

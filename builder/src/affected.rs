@@ -373,7 +373,9 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-init/src", "recipes/src/recipes/td-init.rs"),
     ("td-install/src", "recipes/src/recipes/td-install.rs"),
     ("td-json/src", "recipes/src/recipes/td-install.rs"),
+    ("td-json/src", "recipes/src/recipes/td-boot.rs"),
     ("td-protector/src", "recipes/src/recipes/td-install.rs"),
+    ("td-protector/src", "recipes/src/recipes/td-boot.rs"),
     (
         "td-install-qemu-test/src",
         "recipes/src/recipes/td-install-qemu-test.rs",
@@ -2051,7 +2053,9 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
 
 /// The crates the system image boots through or the oracles drive: init,
 /// the shell its scripts run in, the boot protocol and kexec, login, the
-/// service supervisor, first boot, and the installer with its test driver.
+/// service supervisor, first boot, and the installer with its test driver,
+/// and the libraries td-boot links for volume discovery and its PCR 11
+/// measurement: td-protector, td-tpm and td-json.
 /// td-fs, which td-boot and the installer compile in, is left out by
 /// decision: its changes run the gates on a branch and the oracles on main.
 /// A change to one's code, manifest, lock or build script, or to its recipe
@@ -2065,10 +2069,13 @@ const BOOT_CRATES: &[&str] = &[
     "td-init",
     "td-install",
     "td-install-qemu-test",
+    "td-json",
     "td-kexec",
     "td-login",
+    "td-protector",
     "td-sh",
     "td-svc",
+    "td-tpm",
 ];
 
 /// Beyond the boot crates: the kernel and system recipes, the oracles'
@@ -6316,6 +6323,9 @@ mod tests {
             "td-install/Cargo.lock",
             "td-install-qemu-test/src/main.rs",
             "td-firstboot/src/main.rs",
+            "td-protector/src/luks2.rs",
+            "td-tpm/src/lib.rs",
+            "td-json/Cargo.toml",
             "recipes/src/recipes/td-init.rs",
             "recipes/src/recipes/td-install-qemu-test.rs",
             "recipes/src/recipes/linux-x86-64.rs",
