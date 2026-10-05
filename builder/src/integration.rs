@@ -248,7 +248,7 @@ pub(crate) fn run(root: &Path, eval: &str) -> i32 {
     println!("{line}");
     if code == td_engine::exit::EXIT_UNPROVISIONED {
         println!(
-            ">> {GOAL}: UNPROVISIONED — no oracle could run on this host (qemu, or \
+            ">> {GOAL}: UNPROVISIONED — no oracle could run on this host (qemu, /dev/kvm, or \
              OVMF for the UEFI boots); a skip is not a pass"
         );
         // A caller reads a host gap by the code and the sentinel together.

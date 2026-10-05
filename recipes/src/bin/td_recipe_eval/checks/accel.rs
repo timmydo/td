@@ -1,11 +1,15 @@
-//! The qemu accelerator the evaluator's boots choose: KVM when this host can
-//! hand it to qemu, TCG behind it as a fallback, and `TD_QEMU_ACCEL` to pin
-//! either. Shared by the interactive runner (`run`), the headless system
-//! oracles (`qemu_boot`) and the ISO launcher test (`qemu_boot::test_iso`),
-//! so the three cannot drift apart in what they probe or how they explain
-//! TCG. `qemu-update` is told its accelerator by `--accel` instead.
+//! The qemu accelerator the evaluator's boots choose, shared by the
+//! interactive runner (`run`), the headless system oracles (`qemu_boot`) and
+//! the ISO launcher test (`qemu_boot::test_iso`), so they cannot drift apart
+//! in what they probe or how they explain it. An operator's launch (`run`,
+//! `test-iso`) takes KVM when this host can hand it to qemu with TCG behind
+//! it; a check's boot takes KVM alone and is a host gap without it
+//! (`headless_from_env`). `TD_QEMU_ACCEL` pins either. `qemu-update` is told
+//! its accelerator by `--accel` instead.
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
+
+use crate::check_runner::HOST_GAP;
 
 /// Operator override for the accelerator choice: `kvm` or `tcg`. Anything else is an
 /// error rather than a silent fall-through, so a typo cannot quietly re-slow a boot.
@@ -60,6 +64,24 @@ impl KvmStatus {
             Self::Usable => None,
             Self::WrongArch => Some(TCG_WRONG_ARCH_HINT),
             Self::NodeUnavailable => Some(TCG_NO_NODE_HINT),
+        }
+    }
+
+    /// The same two reasons, worded for a check's boot, which emulates nothing
+    /// and so refuses. The process's groups are fixed at login, which is how a
+    /// user in `kvm` still has a run that cannot open the node.
+    fn refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Usable => None,
+            Self::WrongArch => Some(
+                "KVM accelerates only a guest of the host's own architecture, and this \
+                 guest is x86_64",
+            ),
+            Self::NodeUnavailable => Some(
+                "/dev/kvm does not open read/write for this process; it is absent, or its \
+                 `kvm` group is not among this process's groups (a login started before \
+                 joining the group keeps the old ones)",
+            ),
         }
     }
 }
@@ -168,15 +190,15 @@ pub(crate) fn from_env() -> Result<AccelPlan, String> {
     accel_plan(kvm_status, forced_accel(forced.as_deref())?)
 }
 
-/// `from_env` for a boot nobody watches: a forced `kvm` this host cannot hand
-/// over is refused before anything is created, with the probe's reason, since
-/// nothing falls back and qemu's own error does not name the override.
-pub(crate) fn headless_from_env() -> Result<AccelPlan, String> {
-    let plan = from_env()?;
-    headless_plan(plan, kvm_status)
+/// `from_env` for an operator's launch nobody else watches (`test-iso`): a
+/// forced `kvm` this host cannot hand over is refused before anything is
+/// created, with the probe's reason, since nothing falls back and qemu's own
+/// error does not name the override.
+pub(crate) fn launch_from_env() -> Result<AccelPlan, String> {
+    launch_plan(from_env()?, kvm_status)
 }
 
-fn headless_plan(plan: AccelPlan, probe: impl FnOnce() -> KvmStatus) -> Result<AccelPlan, String> {
+fn launch_plan(plan: AccelPlan, probe: impl FnOnce() -> KvmStatus) -> Result<AccelPlan, String> {
     if plan.forced && plan.names == ["kvm"] {
         if let Some(hint) = probe().hint() {
             return Err(format!(
@@ -185,6 +207,52 @@ fn headless_plan(plan: AccelPlan, probe: impl FnOnce() -> KvmStatus) -> Result<A
         }
     }
     Ok(plan)
+}
+
+/// The plan for a check's boot: KVM with nothing behind it. TCG runs these
+/// boots several times slower, hours for the system oracles, and a pass says
+/// nothing of it, so a host that cannot hand qemu KVM is a host gap, refused
+/// before anything is created. `TD_QEMU_ACCEL=tcg` is the explicit way to
+/// emulate one anyway.
+pub(crate) fn headless_from_env() -> Result<AccelPlan, String> {
+    let forced = std::env::var_os(ACCEL_ENV);
+    headless_plan(kvm_status, forced_accel(forced.as_deref())?)
+}
+
+/// What a check's boot asks qemu for under this environment, without asking
+/// the host: the accelerator a pass is keyed on. A boot gets exactly these or
+/// does not boot, so the probe would add nothing to the key.
+pub(crate) fn headless_names_from_env() -> Result<&'static [&'static str], String> {
+    let forced = std::env::var_os(ACCEL_ENV);
+    Ok(headless_plan(|| KvmStatus::Usable, forced_accel(forced.as_deref())?)?.names)
+}
+
+fn headless_plan(
+    probe: impl FnOnce() -> KvmStatus,
+    forced: Option<&str>,
+) -> Result<AccelPlan, String> {
+    match forced.map(str::trim) {
+        // A pinned tcg, or the error an unknown value earns; neither probes.
+        Some(pin) if pin != "kvm" => accel_plan(probe, forced),
+        _ => match probe().refusal() {
+            None => Ok(AccelPlan {
+                names: &["kvm"],
+                label: "KVM",
+                hint: None,
+                forced: forced.is_some(),
+            }),
+            Some(why) => Err(format!(
+                "{HOST_GAP}a check's boot runs on KVM alone{pinned}, and this host cannot \
+                 hand qemu KVM: {why}. {ACCEL_ENV}=tcg emulates it instead, several times \
+                 slower",
+                pinned = if forced.is_some() {
+                    format!(" ({ACCEL_ENV}=kvm pins it)")
+                } else {
+                    String::new()
+                }
+            )),
+        },
+    }
 }
 
 /// The accelerator line a boot log carries, with the reason a boot is
@@ -366,21 +434,67 @@ mod tests {
     }
 
     #[test]
-    fn a_headless_boot_refuses_a_forced_kvm_it_cannot_have() {
+    fn a_check_boot_runs_on_kvm_alone() {
+        // Probed or pinned, a usable KVM is the whole list: with tcg behind it
+        // a kernel that refused KVM would send the boot to hours of emulation
+        // that its pass never mentions.
+        for forced in [None, Some("kvm"), Some(" kvm ")] {
+            let plan = headless_plan(|| KvmStatus::Usable, forced).unwrap();
+            assert_eq!(plan.names, ["kvm"], "{forced:?}");
+            assert_eq!(plan.label, "KVM");
+            assert_eq!(plan.forced, forced.is_some());
+        }
+        let probed = headless_plan(|| KvmStatus::Usable, None).unwrap();
+        assert_eq!(describe(&probed), "accelerator: KVM");
+    }
+
+    #[test]
+    fn a_check_boot_without_kvm_is_a_host_gap_not_an_emulated_run() {
+        // Probed or pinned: a pinned kvm the host lacks is the same gap.
+        for forced in [None, Some("kvm")] {
+            for (status, cue) in [
+                (KvmStatus::NodeUnavailable, "/dev/kvm"),
+                (KvmStatus::WrongArch, "architecture"),
+            ] {
+                let err = headless_plan(|| status, forced).unwrap_err();
+                assert!(err.starts_with(HOST_GAP), "{forced:?} {status:?}: {err}");
+                assert!(err.contains(cue), "{status:?} names its reason: {err}");
+                assert!(err.contains("TD_QEMU_ACCEL=tcg"), "names the opt-in: {err}");
+                assert_eq!(err.contains("TD_QEMU_ACCEL=kvm"), forced.is_some(), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_tcg_still_emulates_a_check_boot_and_never_probes() {
+        let tcg = headless_plan(|| panic!("tcg is not probed"), Some("tcg")).unwrap();
+        assert_eq!(tcg.names, ["tcg"]);
+        assert_eq!(describe(&tcg), "accelerator: TCG (TD_QEMU_ACCEL)");
+        // An unknown value is the operator's error, not a host gap.
+        let err = headless_plan(|| panic!("not probed"), Some("kvm:tcg")).unwrap_err();
+        assert!(
+            !err.starts_with(HOST_GAP) && err.contains(ACCEL_ENV),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_operator_launch_keeps_its_fallback_and_refuses_a_forced_kvm_it_cannot_have() {
+        // `run` and `test-iso` have an operator watching, and a slow boot
+        // beats none there; they are no check.
         let forced = |name| accel_plan(|| KvmStatus::Usable, Some(name)).unwrap();
-        let refused = headless_plan(forced("kvm"), || KvmStatus::NodeUnavailable);
+        let refused = launch_plan(forced("kvm"), || KvmStatus::NodeUnavailable);
         assert!(refused.is_err_and(|e| e.contains("TD_QEMU_ACCEL=kvm") && e.contains("kvm")));
-        assert!(headless_plan(forced("kvm"), || KvmStatus::WrongArch).is_err());
-        let granted = headless_plan(forced("kvm"), || KvmStatus::Usable).unwrap();
+        assert!(launch_plan(forced("kvm"), || KvmStatus::WrongArch).is_err());
+        let granted = launch_plan(forced("kvm"), || KvmStatus::Usable).unwrap();
         assert_eq!(granted.names, ["kvm"]);
         // Only a forced kvm is probed: the probe already chose the others.
-        let tcg = headless_plan(forced("tcg"), || panic!("tcg is not probed")).unwrap();
+        let tcg = launch_plan(forced("tcg"), || panic!("tcg is not probed")).unwrap();
         assert_eq!(tcg.names, ["tcg"]);
         let probed = accel_plan(|| KvmStatus::Usable, None).unwrap();
-        let probed = headless_plan(probed, || panic!("a probed plan is not re-probed")).unwrap();
+        let probed = launch_plan(probed, || panic!("a probed plan is not re-probed")).unwrap();
         assert_eq!(probed.names, ["kvm", "tcg"]);
         assert_eq!(describe(&probed), "accelerator: KVM, TCG fallback");
-        assert_eq!(describe(&tcg), "accelerator: TCG (TD_QEMU_ACCEL)");
         let slow = accel_plan(|| KvmStatus::NodeUnavailable, None).unwrap();
         assert!(describe(&slow).starts_with("accelerator: TCG\n"));
     }

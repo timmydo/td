@@ -23,7 +23,7 @@ pub(crate) fn cli(args: &[String]) -> Result<(), String> {
             "test-iso requires a graphical host display (DISPLAY or WAYLAND_DISPLAY)".into(),
         );
     }
-    let plan = crate::checks::accel::headless_from_env()?;
+    let plan = crate::checks::accel::launch_from_env()?;
     eprintln!("test-iso: {}", crate::checks::accel::describe(&plan));
     let accelerator = plan.names;
     let scratch = private_scratch()?;

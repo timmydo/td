@@ -7370,7 +7370,7 @@ and image commits — showing:
     host QEMU oracle requires that exact line. A fake-clock wire transcript
     permanently checks all 31 alternating commands, their IDs, content
     validations, ten-second schedule, five-minute floor, and cleanup without
-    adding five minutes to the ordinary test suite. The real TCG system boot
+    adding five minutes to the ordinary test suite. The real system boot
     remains the end-to-end timing and connection authority;
 11. **blocked syscall probes still blocked in the outer app process, with no
     unrostered denial — LANDED.** A dedicated physical-input proof variant

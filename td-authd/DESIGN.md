@@ -1397,7 +1397,7 @@ Rust fixture init; it is not an input to the distribution image. Host QEMU
 is an execution oracle only, as for `qemu-boot-system`, and is required.
 This command runs outside the host-free recipe-check sandbox.
 
-Four fresh, diskless TCG guests exercise the existing root-only cases:
+Four fresh, diskless guests exercise the existing root-only cases:
 public `td-secret set` descriptor intake for both token roles, refusal of
 nonhuman callers, preparation and generation-exit relocking, read-only
 store inspection, and cleanup after the production worker refuses. Each

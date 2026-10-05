@@ -4813,9 +4813,9 @@ fn boot_source(
         .try_clone()
         .map_err(|e| format!("clone diag fd: {e}"))?;
 
-    // -accel: `accel::from_env`, KVM when this host can hand it over with TCG
-    //   behind it, which always works; `TD_QEMU_ACCEL=tcg` pins software
-    //   emulation, the accelerator these oracles' timings were first tuned under.
+    // -accel: `accel::headless_from_env`, KVM alone, a host gap without it;
+    //   `TD_QEMU_ACCEL=tcg` pins software emulation, the accelerator these
+    //   oracles' timings were first tuned under.
     // -cpu Nehalem: the default `qemu64` model has neither SSE4.2 nor POPCNT, and a
     //   modern userland binary that assumes the x86-64-v2 baseline dies on the first
     //   such instruction with SIGILL. Firefox's conservative distro build stays

@@ -1621,8 +1621,8 @@ exercise formatter refusal; this is not the wizard's sequencing.
 For one-boot session validation, run `td-recipe-eval qemu-boot-session`
 (optionally followed by `system-x86-64`). It builds a fresh disposable
 system volume and boots it under headless QEMU with networking disabled, on
-KVM when this user can open `/dev/kvm` and TCG otherwise; `TD_QEMU_ACCEL`
-pins either.
+KVM alone; without it the boot is a host gap, and `TD_QEMU_ACCEL=tcg`
+emulates on purpose.
 The full system validator requires firstboot identity, immutable deployment
 configuration, owned writable state, component health, the compositor and
 terminal, application workspace placement and browser support. The check

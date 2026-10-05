@@ -386,11 +386,13 @@ with a banner saying what it proves, its outcome and wall time, recorded
 in the check history as `integration:STEP` (`td-recipe-eval
 check-history integration`). On its own it runs only those steps; beside
 gate goals (`td-builder check check integration`), it runs after the
-gates pass and says so when they do not. Every boot uses KVM when this user can open `/dev/kvm`
-(membership in the `kvm` group, from a login started after joining it),
-with TCG behind it, and says which; `TD_QEMU_ACCEL=tcg` pins software
-emulation, several times slower. It needs the host's qemu, and OVMF for
-the last two (found beside qemu or in /usr/share/OVMF, or named by
+gates pass and says so when they do not. Every boot runs on KVM alone,
+which needs the run to open `/dev/kvm` (membership in the `kvm` group,
+from a login started after joining it): an oracle never falls back to
+TCG, several times slower, and without KVM it is a host gap.
+`TD_QEMU_ACCEL=tcg` emulates on purpose, keyed apart. It needs the
+host's qemu, and OVMF for the last two (found beside qemu or in
+/usr/share/OVMF, or named by
 `TD_QEMU_EFI_CODE` and `TD_QEMU_EFI_VARS`). An oracle the host cannot
 run is an unprovisioned skip; when none could run the tier exits 69,
 which is not a pass. An oracle that passed before
@@ -400,10 +402,11 @@ check's key over its recipes, beside its name, its accelerator list and
 as `td-recipe-eval oracle-memo ORACLE` reports; when all three do, the
 warm is skipped too. Each is asked again when its step is reached, its
 pass is forgotten before it boots, and `TD_CHECK_FULL=1` boots them all,
-so a doubted pass that fails is gone; an oracle whose question failed
-boots without forgetting or recording. The memo does not see the host's
-qemu or firmware, nor whether a `KVM, TCG fallback` boot fell back; the
-key is read when asked and again when a pass is recorded, not between.
+so a doubted pass that fails is gone, though a host without KVM, which
+boots nothing, keeps it; an oracle whose question failed boots without
+forgetting or recording. The memo does not see the host's qemu,
+firmware or KVM; the key is read when asked and again when a pass
+is recorded, not between.
 
 It belongs to main. On a provisioned host (qemu, OVMF, and `/dev/kvm`
 for the user), `td-builder main-integration run`, started from any

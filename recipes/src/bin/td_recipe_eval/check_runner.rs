@@ -704,6 +704,7 @@ fn reject_unsafe_clear_target(lw: &Path) -> Result<(), String> {
 pub fn qemu_secret_cli(args: &[String]) -> Result<(), String> {
     let tpm = crate::checks::qemu_boot::secret::options(args)?;
     let targets = crate::checks::qemu_boot::secret::TARGETS;
+    crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(targets)?;
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let name = scratch_name("qemu-secret", targets);
@@ -717,6 +718,7 @@ pub fn qemu_secret_cli(args: &[String]) -> Result<(), String> {
 pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
     let (tpm, powercuts) = crate::checks::qemu_boot::secret::system_options(args)?;
     let targets = crate::checks::qemu_boot::secret::SYSTEM_TARGETS;
+    crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(targets)?;
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let name = scratch_name("qemu-secret-system", targets);
@@ -736,11 +738,13 @@ pub fn qemu_secret_system_cli(args: &[String]) -> Result<(), String> {
 /// the sandbox: it builds linux-x86-64 (bzImage + initramfs) and boots it under
 /// host qemu, asserting the userland marker reaches ttyS0.
 pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
+    crate::checks::accel::headless_from_env()?;
     qemu_kernel_cli(args, "qemu-boot", &[], crate::checks::qemu_boot::run)
 }
 
 /// Cold host-firmware oracle; no direct kernel or initrd injection.
 pub fn qemu_boot_uefi_cli(args: &[String]) -> Result<(), String> {
+    crate::checks::accel::headless_from_env()?;
     qemu_kernel_cli(
         args,
         "qemu-boot-uefi",
@@ -751,6 +755,7 @@ pub fn qemu_boot_uefi_cli(args: &[String]) -> Result<(), String> {
 
 /// Boot one unchanged ISO through optical and USB firmware discovery.
 pub fn qemu_boot_media_cli(args: &[String]) -> Result<(), String> {
+    crate::checks::accel::headless_from_env()?;
     qemu_kernel_cli(
         args,
         "qemu-boot-media",
@@ -761,6 +766,7 @@ pub fn qemu_boot_media_cli(args: &[String]) -> Result<(), String> {
 
 /// Install a signed tiny fixture inside QEMU, then boot without its media.
 pub fn qemu_install_cli(args: &[String]) -> Result<(), String> {
+    crate::checks::accel::headless_from_env()?;
     qemu_kernel_cli(
         args,
         "qemu-install",
@@ -770,11 +776,13 @@ pub fn qemu_install_cli(args: &[String]) -> Result<(), String> {
 }
 
 /// A host oracle's needs, checked before it builds anything: no host qemu,
-/// or (for a UEFI boot) no firmware the host search finds, is a host gap
-/// the integration tier counts apart, not a failure. Firmware named by
-/// `TD_QEMU_EFI_CODE`/`TD_QEMU_EFI_VARS` that does not check out stays an
-/// error, as a misconfiguration is no host gap.
+/// no KVM (`accel::headless_from_env`), or (for a UEFI boot) no firmware
+/// the host search finds, is a host gap the integration tier counts apart,
+/// not a failure. Firmware named by `TD_QEMU_EFI_CODE`/`TD_QEMU_EFI_VARS`
+/// that does not check out stays an error, as a misconfiguration is no
+/// host gap.
 fn oracle_host(uefi: bool) -> Result<(), String> {
+    crate::checks::accel::headless_from_env()?;
     let qemu = crate::checks::qemu_boot::find_qemu().map_err(|e| format!("{HOST_GAP}{e}"))?;
     let named =
         env::var_os("TD_QEMU_EFI_CODE").is_some() || env::var_os("TD_QEMU_EFI_VARS").is_some();
@@ -869,6 +877,14 @@ pub fn oracle_memo_cli(args: &[String]) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let runner = RecipeCheckRunner::new(root, &scratch_name("oracle-memo", &[name]))?;
     if let Some(doubted) = forget {
+        // The forget makes way for a boot that may fail; a host without KVM
+        // boots nothing, so a pass earned elsewhere stands.
+        if let Err(gap) = crate::checks::accel::headless_from_env() {
+            if gap.starts_with(HOST_GAP) {
+                eprintln!("oracle-memo: {name}'s pass kept: this host will not boot it");
+                return Ok(());
+            }
+        }
         return runner.forget_check_verdict(&stem, 0, doubted);
     }
     let components = runner.oracle_verdict_components(name, targets)?;
@@ -990,6 +1006,7 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
     let targets = [stem];
+    crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -1046,6 +1063,7 @@ pub fn qemu_boot_session_cli(args: &[String]) -> Result<(), String> {
         return Err(format!("usage: qemu-boot-session [{STEM}]"));
     }
     let targets = [STEM, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
+    crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(&targets)?;
     let root = env::current_dir().map_err(|error| format!("current dir: {error}"))?;
     let name = scratch_name("qemu-boot", &[STEM]);
@@ -1074,6 +1092,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
     let targets = [stem, "btrfs-progs-x86-64", "td-jail-seccomp-probe"];
+    crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -1107,6 +1126,7 @@ pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
     let targets = [stem];
+    crate::checks::accel::headless_from_env()?;
     ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
@@ -5170,7 +5190,7 @@ impl RecipeCheckRunner {
         name: &str,
         targets: &[&str],
     ) -> Result<Vec<(String, String)>, String> {
-        let accel = crate::checks::accel::from_env()?;
+        let accel = crate::checks::accel::headless_names_from_env()?;
         let mut out = vec![
             (
                 "oracle".to_string(),
@@ -5182,8 +5202,8 @@ impl RecipeCheckRunner {
             (
                 "accelerator".to_string(),
                 digest_of(|h| {
-                    for accel in accel.names {
-                        hash_field(h, accel.as_bytes());
+                    for name in accel {
+                        hash_field(h, name.as_bytes());
                     }
                     Ok(())
                 })?,
@@ -12076,6 +12096,9 @@ chmod 755 '{}'
             "qemu_secret_cli",
             "qemu_secret_system_cli",
             "run_cli",
+            // The integration tier's memo, which keeps a pass a host without
+            // KVM will not boot.
+            "oracle_memo_cli",
             // Called from those commands alone.
             "oracle_host",
             // The oracle key, which holds the harnesses' fingerprint.
@@ -12233,6 +12256,38 @@ chmod 755 '{}'
             Some(verdict_key_of(&parts))
         );
         let _ = fs::remove_dir_all(&lw);
+    }
+
+    /// Every boot command but the interactive `run` asks for KVM before it
+    /// plans or builds anything, so a host without it is a host gap at once,
+    /// not after hours of building for a boot that cannot start.
+    #[test]
+    fn every_boot_command_refuses_without_kvm_before_building() {
+        let text = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/td_recipe_eval/check_runner.rs"),
+        )
+        .unwrap();
+        let mut seen = 0;
+        for chunk in text.split("\npub fn qemu_").skip(1) {
+            let body = chunk.split("\n}\n").next().unwrap();
+            let name = body.split('(').next().unwrap();
+            let asked = ["headless_from_env()?", "oracle_host("]
+                .iter()
+                .filter_map(|a| body.find(a))
+                .min()
+                .unwrap_or_else(|| panic!("qemu_{name} never asks for KVM"));
+            for builds in [
+                "ensure_targets_provenance(",
+                "RecipeCheckRunner::new(",
+                "qemu_kernel_cli(",
+            ] {
+                if let Some(at) = body.find(builds) {
+                    assert!(asked < at, "qemu_{name} reaches {builds} before KVM");
+                }
+            }
+            seen += 1;
+        }
+        assert!(seen >= 13, "{seen} boot commands");
     }
 
     /// A host oracle keys on its name, its accelerator and everything its

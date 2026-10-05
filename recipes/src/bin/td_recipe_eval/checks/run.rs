@@ -227,7 +227,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 /// at 10.0.2.2 and reachable LAN services, but no host-to-guest forwarding;
 /// `-no-user-config` prevents any ambient QEMU defaults. `-no-reboot` makes the guest
 /// reset exit qemu. `accel` is
-/// `accel::from_env`'s preference order, as the headless oracles use.
+/// `accel::from_env`'s preference order, TCG behind KVM, which the headless
+/// oracles do not fall back to.
 fn boot_interactive(
     qemu: &str,
     accel: &AccelPlan,
