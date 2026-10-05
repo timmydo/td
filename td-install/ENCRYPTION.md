@@ -101,18 +101,50 @@ releases in this order, and no step may move earlier:
    to verify it.
 4. Whether or not any unseal succeeded, it extends PCR 12 with a fixed td
    release-cap event and requires an exact readback, as the PCR 11
-   measurement does. A failed or uncertain extension zeroes the released
-   secret, refuses boot and requires a platform reset.
-5. Only after the cap does cryptsetup parse the header. After step 3 it
-   commits the new protector's keyslot and token, verifies that the keyslot
-   opens, and only then destroys the first-boot keyslot and token. When a
-   device-bound protector released, it only removes a leftover first-boot
-   or superseded keyslot and token. Then it opens the volume.
+   measurement does. A PCR 12 already non-zero (td-protector's
+   `AlreadyClosed`) means nothing could release; the installed selector
+   enters the recovery flow, which then offers no reseal and runs no
+   plan.
+   An uncertain or mismatched extension zeroes every released secret,
+   refuses boot and halts on the console, so that only a platform reset
+   leaves it: exiting init would panic, and `panic=-1` would reboot into
+   the same refusal without end. A TPM that fails every command
+   therefore stops the selector until it is disabled in firmware, when
+   the no-device rule below applies.
+5. Only after the cap does cryptsetup parse the header and the selector
+   run td-protector's transition plan, which owns the commit order and
+   what is superseded or orphaned ("Transitions"). No destroy precedes a
+   verified add or a verified released keyslot. After step 3 the new
+   protector's keyslot and token are committed and tested before the
+   first-boot keyslot and token are destroyed. When a device-bound
+   protector released, its keyslot is first tested with its secret, and
+   only then are a leftover first-boot or superseded keyslot and token
+   and any orphan removed. Then the selector opens the volume.
 
-The cap closes release until the next platform reset on every later path,
-including refusal, recovery and `kexec`. The installed selector and the live
-selector both cap PCR 12; the live selector does so unconditionally at boot.
-No other td component extends PCR 12.
+When the cap runs, it closes release until the next platform reset on
+every later path, including refusal, recovery and `kexec`. No other td
+component extends PCR 12. The installed selector caps PCR 12 when its
+volume is encrypted; on an unencrypted volume it makes no TPM contact
+until activation (increment 7). The live selector's cap is MEDIA.md's
+("Live boot"): it caps whenever a TPM device is present, proceeds when
+PCR 12 is already closed, and skips the cap without a device.
+
+Without a TPM device (`/dev/tpmrm0` absent) nothing can release or be
+capped. An installed selector whose header carries a td token waits for
+the device up to td-boot's TPM wait, a protocol constant of 10 seconds
+that the implementer may tune and a test pins; if it appears, the
+release order runs. Otherwise the selector skips the cap and enters the
+recovery flow, which offers no reseal. These are the paths the cap does
+not close, and their residuals are disclosed. A TPM that the kernel
+exposes only after that wait, by a late driver probe, sees PCR 12 still
+zero, so on that boot root can release the disk's first-boot and
+device-bound protectors; the deployment initramfs's check ("Boot and
+authority boundaries") catches it only when the TPM is visible by then.
+A not-yet-booted encrypted disk's first-boot protector likewise remains
+releasable to root on the same machine while it runs an unencrypted td
+install, or a live session whose selector found no TPM device that the
+kernel exposes later; its device-bound protectors are not, since neither
+boot measures that disk's selector initramfs into PCR 9.
 
 The first-boot protector's policy names PCR 12 alone. PCR 4 holds the
 firmware's measurement of the selector EFI image (`EFI/BOOT/BOOTX64.EFI`),
@@ -121,9 +153,9 @@ measurements of any firmware load options and of the prepared selector
 initramfs (`EFI/BOOT/INITRD`). The selector refuses to seal while either
 PCR is unmeasured and enters recovery instead. An interrupted first boot
 keeps the first-boot keyslot and repeats the transition, discarding any
-orphaned td keyslot or token; cryptsetup leaves a token whose keyslot was
-destroyed naming no keyslot, and td's reader reports it without releasing
-it. Until the installed selector's first boot,
+orphan (td-protector "Transitions"); cryptsetup leaves a token whose
+keyslot was destroyed naming no keyslot, and td's reader reports it
+without releasing it. Until the installed selector's first boot,
 release is not bound to the boot chain: any OS that leaves PCR 12 at zero,
 other than td's live medium, can unseal the first-boot protector. The first
 boot also adopts that boot's load options, so a one-time firmware boot-menu
@@ -137,16 +169,27 @@ so that most firmware updates are intended to keep releasing.
 
 When release fails, the selector enters a recovery flow on its console. It
 never falls back to plaintext, retries with weaker policy, or skips the
-volume. After the cap, a correct recovery key opens the volume; the
-selector then offers, with an explicit console confirmation, to seal a
-device-bound protector to the observed PCR 4 and PCR 9 values and a
-literal-zero PCR 12, commit its keyslot and token, and only then destroy
-the old device-bound keyslot and token. Its release is first proven on the
-next boot, and the recovery keyslot remains, so a failure returns to
-recovery. Recovery without that confirmation boots once and leaves the
-protectors unchanged. Nothing reseals automatically, because that would
-adopt a changed boot chain without its owner's decision. The live medium
-can open the volume with the recovery key for data access.
+volume. That console is the serial console the selector's built-in
+command line names (DESIGN.md "Full-system volume consumers"); a keyboard
+console is increment 7's activation gate. The selector reads the
+recovery key through td-init's secret-line applet with echo off, so its
+digits are never echoed; a console server or BMC recorder on the serial
+line may still log what is typed, which the review discloses. An entry
+is bounded at 256 bytes: a longer line is drained to its newline and
+refused. Each entry is tried on keyslot 0 alone, and a wrong one prompts
+again, without a limit: a 128-bit key needs no retry bound. After the
+cap, a correct recovery key opens the volume; when this boot's own cap
+closed PCR 12, the selector then offers, with an explicit console
+confirmation, to seal a device-bound protector to the observed PCR 4 and
+PCR 9 values and a literal-zero PCR 12, commit its keyslot and token, and
+only then destroy every other td keyslot and token, a surviving first-boot
+one included (td-protector "Transitions"). Its release is first proven on
+the next boot, and the recovery keyslot remains, so a failure returns to
+recovery. Recovery without that confirmation boots once and runs no plan,
+leaving the header, orphans included, unchanged. Nothing reseals
+automatically, because that would adopt a changed boot chain without its
+owner's decision. The live medium can open the volume with the recovery
+key for data access.
 
 The recovery key is 128 random bits read from `/dev/random`, encoded in
 grouped decimal digits with a check digit per group so that entry does not
@@ -290,6 +333,40 @@ key was already typed back, so a boot that reaches recovery is one its
 owner can open; nothing completes the installation, which a new one
 over the disk replaces.
 
+## Selector release
+
+This section, the release order and the handoff ("Boot and authority
+boundaries") are increment 6's target; none of it is implemented yet.
+Today's selector neither releases nor caps, its discovery finds only a
+Btrfs volume, and the image refuses cryptsetup in either initramfs
+(DESIGN.md D6).
+
+The installed selector acts on what discovery finds under its configured
+UUID (DESIGN.md "Full-system volume consumers"): a Btrfs volume boots as
+it does today, and a td LUKS2 volume runs the release order. Release and
+the cap, with any recovery prompt, run before any mount or deployment
+selection, so one volume key serves `current` and `previous` alike and
+selection, fallback and boot attempts are unchanged. The PCR 11
+measurement still follows selection, over a command line the handoff
+leaves unchanged; the handoff's archive lies outside its event. The
+mapping stays open until `kexec_file_load` returns, since the kernel reads
+the deployment's payloads through it.
+
+After release and the cap, the selector obtains the volume key from
+cryptsetup for the handoff without the key touching a block device or a
+persistent file. The selector-release commit fixes the mechanism after
+verifying how cryptsetup 2.8.8 writes a volume-key file: for example,
+`luksDump --dump-volume-key --volume-key-file` into a fresh mode-0700
+directory in the selector's RAM-backed root, read and unlinked at once.
+Unlinking retires the key from that filesystem only; its freed pages are
+a residual like the memfd's.
+
+Before activation the default unencrypted boot is behaviour-identical,
+not byte-identical: cryptsetup enters both initramfs and the boot
+binaries change, but an unencrypted volume's boot makes no TPM contact
+and takes the same steps. On a machine with a TPM, the live selector's
+cap is the one change a live boot shows.
+
 ## Authentication and recovery
 
 This section and the next govern the protected tier except where they name
@@ -367,15 +444,33 @@ deployment initramfs into an unlinked memfd, verifies that copy against the
 manifest, appends one 4-byte-aligned cpio archive holding only the volume
 key, seals the
 memfd and passes it to `kexec_file_load`. The appended archive is outside
-the signed manifest and the measured event. The deployment initramfs reads
-the key from its RAM-backed root, opens the volume through a descriptor,
-and removes the key file before starting the system. It refuses a key on an
-unencrypted volume and an encrypted volume without a key. Neither stage
+the signed manifest and the measured event. Its single member's name and
+the 64-byte key length are td-boot protocol constants and a permanent v1
+contract: td has no selector-update operation, so an installed selector
+hands every later deployment the same format. A deployment from before
+increment 6 on an encrypted volume has no key reader; it fails closed,
+and the selector falls back through its boot attempts.
+
+The deployment initramfs reads the key from its RAM-backed root, opens
+the volume by descriptor and removes the key file before starting the
+system; DESIGN.md "Full-system volume consumers" owns how it finds the
+partition and the active mapping. It refuses a key on an unencrypted
+volume and an encrypted volume without a key. Then, as defence in depth,
+it attempts to unseal each td token, since the selector's cap must
+already be closed. Without a TPM device it attempts nothing, so a TPM
+that appears later goes unchecked ("Device-bound default"). A policy
+refusal and a load refusal (td-protector "Unseal outcomes") release
+nothing: the closed cap causes the first, and a cleared or different
+TPM the second for tokens a recovery boot kept. Any release, or any
+other outcome, a transport error or a command the TPM did not answer
+included, zeroes what it released and halts on the console, as the
+selector's failed cap does; it never exits init. That attempt is the
+installed path's evidence of an unseal after the cap. Neither stage
 writes the key to any block device. Removing the file retires the key from
 the filesystem only: copies remain in the selector's memfd pages, the
 `kexec` segments and the second kernel's freed initrd region, which memory
-extraction, outside Scope, could read. The memfd and sealing syscalls amend
-UNSAFE.md in the increment that adds them.
+extraction, outside Scope, could read. td-kexec's memfd and sealing
+syscalls amend UNSAFE.md (§1) in the commit that adds them.
 
 The authenticated user gets an ordinary session. Later elevation uses the
 existing operation-to-principal policy and secure-attention path: one
@@ -429,8 +524,17 @@ same-uid process may impersonate the trusted UI or approve a request.
 6. Add selector release, the PCR 12 cap in the installed and live
    selectors (amending MEDIA.md), the first-boot transition, the
    recovery flow with its confirmed reseal, the volatile `kexec` handoff and
-   deployment-initramfs unlock, extending D6's binding to both initramfs.
-   Exercise them together before activation.
+   deployment-initramfs unlock, extending D6's binding to both initramfs
+   ("Selector release"). Exercise them together before activation. Its
+   commits, in order: this specification; td-protector's cryptsetup
+   runner, moved from td-install, and its pure transition planner;
+   td-protector's release orchestration; the live selector's cap;
+   td-kexec's sealed-memfd key handoff; td-init's console secret-line
+   applet; td-boot's LUKS2 volume and mapping discovery;
+   deployment-initramfs unlock with D6's deployment half; selector
+   release, the first-boot transition and the handoff with D6's selector
+   half; the recovery flow with its confirmed reseal; and the
+   `qemu-boot-encrypted` oracle.
 7. Activate the device-bound tier as the installer default on machines with
    a usable TPM 2.0 whose selector console accepts keyboard input, amending
    INSTALLER.md's disclosures in the same landing. A platform without such a
@@ -454,8 +558,9 @@ test touches an operator's disk or enrolls their hardware.
 For the device-bound tier, install under UEFI firmware that measures into
 the emulated TPM; the firmware oracle must attach that TPM. Require a real
 encrypted read/write roundtrip and reboot persistence with no interaction,
-and a first-boot transition interrupted between its token, keyslot and
-destroy commits that completes on the next boot. A changed selector image,
+and a first-boot transition interrupted between its keyslot, token, test
+and destroy steps (td-protector "Transitions") that completes on the
+next boot. A changed selector image,
 initramfs or load option and a cleared or different TPM must refuse release
 and reach the recovery flow, where the recovery key opens the volume and a
 confirmed reseal restores unattended boot. An unseal after the PCR 12 cap
@@ -501,7 +606,23 @@ destination's partition devices from the kernel's block inventory,
 never from `/dev/vda` literals. A no-TPM leg requires the operand's
 refusal with the disk unchanged, and a leg cut off in the recovery-key
 phase leaves both table ranges zero. The installed system is not booted:
-its release is increment 6.
+its release is increment 6's oracle.
+
+Increment 6's oracle, `td-recipe-eval qemu-boot-encrypted --tpm
+/absolute/path/to/swtpm`, is likewise outside the integration tier and an
+unprovisioned host gap without `--tpm`. Its legs are the device-bound
+requirements above, except the no-TPM disclosure, which changes only at
+activation; `qemu-boot-live`, which attaches no TPM, keeps proving the
+live selector's skip. A fresh swtpm state stands in for a cleared or
+different TPM: a cleared TPM's new storage primary seed has the same
+effect on these policies, since no protector sealed under the old
+primary loads. The interrupted transition's evidence comes from runs the
+host kills when the selector's console reports each transition commit,
+and from header states a guest constructs with cryptsetup (an orphaned
+keyslot or token, a superseded token) before the selector boots them.
+There is no test-only selector build: the oracle boots the selector td
+ships. The unseal after the cap is the deployment initramfs's
+defence-in-depth attempt ("Boot and authority boundaries").
 
 For the protected tier, require a real encrypted read/write roundtrip and
 reboot persistence; wrong PIN, missing token and changed boot measurements

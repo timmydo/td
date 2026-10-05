@@ -200,7 +200,11 @@ execs `/bin/cryptsetup` from the verified root (td-boot's `CRYPTSETUP`
 names it), bound at build time as D7 binds `mkfs.btrfs`: the image build
 refuses a root whose `/bin/cryptsetup` does not link the static binary or
 lacks its debug companion, and, until the selector opens volumes
-(ENCRYPTION.md increment 6), either initramfs that carries it.
+(ENCRYPTION.md increment 6), either initramfs that carries it. Increment
+6 replaces that refusal in two halves, each landing with the first exec
+it binds: the deployment-initramfs unlock requires `/bin/cryptsetup` and
+its store payload in the deployment initramfs, and selector release
+requires them in the selector initramfs, as D7's live-boot exec is bound.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create
@@ -1214,6 +1218,21 @@ The selector and deployment initramfs mount sysfs before discovery.
 state setup are unchanged. The full-system oracle moves an installed
 pending candidate to `/dev/vdb` behind a blank disk, then requires its
 UUID evidence, persistent state, greeter and successful acknowledgement.
+
+Encrypted volumes are increment 6's target ([ENCRYPTION.md](ENCRYPTION.md)
+"Selector release") and are not implemented yet. Discovery will also
+identify a LUKS2 partition whose header, read by td-protector's bounded
+reader, carries the expected UUID and the `td-system` label. That
+partition and the dm-crypt mapping over it are one volume, not two
+devices with one UUID: a mapping is admitted only when its sysfs
+`dm/uuid` is `CRYPT-LUKS2-<the UUID's 32 hex digits>-<name>` and its
+`slaves/` names exactly the pinned partition, and it is found that way,
+never by a `/dev/mapper` name. Any other device carrying the UUID still
+refuses. cryptsetup opens the partition by its held descriptor,
+`/proc/<pid>/fd/N`; mounts then name the mapping, which `on-volume`
+pins and holds as it holds a partition. The selector opens the mapping
+after release, and the deployment initramfs opens it again with the
+handed-off key.
 
 The native installation oracle provisions its chosen UUID into both the
 formatter and the selector before writing the disk. Its tiny selector

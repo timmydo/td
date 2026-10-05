@@ -16,8 +16,11 @@ surface to `UNSAFE.md`.
 Increment 5 adds the two persisted formats the installer writes and the
 selector reads: the recovery key's encoding and the td LUKS2 token, with
 the bounded reader that finds tokens in a LUKS2 header before the cap.
-Keyslot changes, the first-boot transition and the recovery flow belong
-to increment 6.
+Increment 6 (target, not yet implemented) adds what the installer and
+the selector share for keyslot changes: the cryptsetup runner, moved
+from td-install with DESIGN.md "Device-bound formatting"'s descriptor
+rules unchanged; the pure transition planner ("Transitions"); and the
+release orchestration that runs ENCRYPTION.md's release order.
 
 ## Policies
 
@@ -26,7 +29,8 @@ PolicyCommandCode(Unseal), td-tpm's `PcrPolicy`, with no PolicyAuthorize.
 
 - **First boot.** `first_boot_policy` selects PCR 12 alone at its literal
   reset value of zero. It reads nothing from the TPM, so the installer can
-  seal it from the live medium, whose selector has already capped PCR 12.
+  seal it from the live medium, whose selector has, from increment 6,
+  already capped PCR 12.
 - **Device bound.** `observed_policy` reads PCR 4 (the selector EFI image)
   and PCR 9 (load options and the selector initramfs) in one PCR_Read and
   refuses either one at all zeros, as unmeasured. Its composite is those two
@@ -68,6 +72,23 @@ protector opens only its own keyslot, so substituting another sealed
 protector of the same machine gains nothing that protector does not already
 grant, and ENCRYPTION.md asks for none.
 
+## Unseal outcomes
+
+This is increment 6's target; `unseal` does not yet type its errors.
+Its `UnsealError` separates the refusals that release nothing from
+everything else, so that the deployment initramfs's post-cap check
+(ENCRYPTION.md "Boot and authority boundaries") halts on no expected
+refusal:
+
+- `PolicyRefused`: only `TPM_RC_VALUE` on PolicyPCR's first parameter
+  (0x1c4), PCRs that differ from the policy's, and `TPM_RC_POLICY_FAIL`
+  on Unseal's first session (0x99d).
+- `LoadRefused`: TPM2_Load's integrity, seed and handle failures, the
+  answer of a cleared or different TPM whose storage primary did not
+  create the sealed object. The commit that adds it pins those codes.
+- `Other`: a transport error, a reply that does not answer the command,
+  and every other response code.
+
 ## Release cap
 
 `cap` reads PCR 12 and requires zero, extends it once with `cap_event()`,
@@ -77,7 +98,7 @@ typed `CapError`, each displayed with PCR 12 context:
 
 - `AlreadyClosed`: PCR 12 read non-zero, so nothing was extended. Every
   protector policy requires PCR 12 at zero, so no TPM release is possible
-  this boot. Increment 6 decides whether that routes to recovery.
+  this boot.
 - `Uncertain`: a PCR 12 read or the extension failed in transport or was
   refused, so the cap's state is unknown: a failed prior read leaves PCR
   12 unmoved but unverified, and a failed extension or readback may or
@@ -88,9 +109,9 @@ The caller's contract follows ENCRYPTION.md's release order. The selector
 tries every td token, up to the fixed bound; when the first-boot
 protector alone released, it performs the first-boot transition's seal
 and verification unseal; then it caps exactly once, whether or not any
-unseal succeeded, before cryptsetup parses the header. An `Uncertain` or
-`Mismatch` cap zeroes every released secret, refuses boot and requires a
-platform reset. No other td component extends PCR 12.
+unseal succeeded, before cryptsetup parses the header. ENCRYPTION.md's
+release order (step 4) says what each `CapError` leads to. No other td
+component extends PCR 12.
 
 ## Installer check
 
@@ -167,7 +188,7 @@ token, so a transition interrupted between destroying a keyslot and its
 token leaves one. An orphan must otherwise be the format; it is never
 released, it counts toward the four-token bound, and the reader reports
 its token number and role so that the transition removes it
-(ENCRYPTION.md). cryptsetup's own token validation also admits a token
+("Transitions"). cryptsetup's own token validation also admits a token
 naming several keyslots; td writes none, and a td token naming more than
 one refuses the header.
 
@@ -195,7 +216,8 @@ bytes, parsing without a duplicate key. Its `tokens` and `keyslots`
 objects are keyed by numbers 0 to 31, each token names keyslots that
 exist (cryptsetup's own token rule), and at most four td tokens, orphans
 included, are present: a first-boot and a device-bound protector, one
-superseded and one an interrupted transition left.
+superseded and one an interrupted transition left. "Transitions" says
+how a plan that adds stays within that bound.
 
 td's checks of the used copy refuse rather than fall back to the other
 copy. cryptsetup also discards a checksum-valid copy whose JSON fails its
@@ -214,6 +236,56 @@ first byte, such as a window onto the installer's claim or the selector's
 opened partition, and returns the used copy's sequence number, size,
 UUID, label, keyslot numbers, td tokens and orphans with their token
 numbers. It runs no cryptsetup and needs no privilege.
+
+## Transitions
+
+This is increment 6's target; none of it is implemented yet. The
+planner is pure: from the header the reader returned and the td tokens
+whose secrets released, it computes one transition's ordered cryptsetup
+steps, running no cryptsetup and reaching no TPM. The release
+orchestration executes the plan through the runner after the cap.
+
+- Keyslot 0 is always the recovery keyslot. No plan adds or kills it or
+  names it in a token. A td token naming it is never released and
+  suppresses every plan while it remains: no transition, reseal or
+  orphan removal runs, though other td tokens still release and the
+  volume opens. Its repair is removing that token from the live medium
+  (`cryptsetup token remove`), which the review discloses.
+- An orphan is any keyslot other than 0 that no token of any type
+  names, or any td token whose `keyslots` array is empty. Keyslots that
+  other token types name, such as systemd-cryptenroll's, are left
+  alone, so the reader also reports which keyslots those tokens name. A
+  passphrase keyslot added by hand without a token is therefore removed
+  at the next boot that runs a plan; the tier's only passphrase is the
+  recovery key in keyslot 0, and the review discloses this.
+- A superseded token is every device-bound token other than the
+  lowest-numbered one that released. When no device-bound token
+  released, nothing is superseded.
+- No destroy precedes a verified add or a verified released keyslot. A
+  plan first runs `open --test-passphrase` on the keyslot the released
+  secret's token names, with that secret, unless the recovery key in
+  keyslot 0 opened the volume. It then removes every orphan.
+- A new protector then commits in this order: add its keyslot, import
+  its token, `open --test-passphrase` on that keyslot with its secret,
+  `luksKillSlot` each old keyslot, then `token remove` each old token.
+  Should the add exceed the four-token bound, the plan first retires,
+  keyslot then token, every td token that did not release this boot:
+  keyslot 0 or the tested keyslot opens the volume. An
+  interruption at any step keeps keyslot 0 and whichever protector
+  opened the volume, or the new one once its token is committed; what it
+  leaves over is an orphan, a superseded token or a leftover first-boot
+  one, which the next boot's plan removes.
+
+What is old depends on the transition. The first-boot transition retires
+the first-boot keyslot and token. When a device-bound protector released
+there is no new protector, and the plan retires a leftover first-boot
+token and every superseded one, with their keyslots. The confirmed
+recovery reseal retires every td keyslot and token except the new one, a
+surviving first-boot one included. Recovery without that confirmation,
+recovery without a TPM device and the `AlreadyClosed` path run no plan:
+the header, orphans included, is unchanged. Tests drive each plan to
+every interruption point and require the next boot's plan to complete
+it.
 
 ## Bounds
 

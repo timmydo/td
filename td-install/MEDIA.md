@@ -284,6 +284,17 @@ live-boot MOUNTPOINT CMDLINE` refuses without the exact marker, and refuses a
 selector carrying either of those files, since it would apply neither. Then
 it:
 
+0. from ENCRYPTION.md increment 6 (a target, not implemented yet), caps
+   PCR 12 through td-protector before anything else when `/dev/tpmrm0`
+   exists, so that no live session can release a td disk's protector.
+   A PCR 12 already non-zero (`AlreadyClosed`, as after a chainloader or
+   `kexec` that extended it) means release is already closed, and the
+   live boot proceeds. An uncertain or mismatched cap refuses the live
+   boot and halts on the console, as an installed selector's does
+   (ENCRYPTION.md's release order, step 4). Without a TPM device it
+   skips the cap, so a machine without one still boots the live medium
+   and installs unencrypted; `qemu-boot-live` attaches no TPM and proves
+   that skip;
 1. reads the trust root and takes half of `MemTotal` as the RAM disk size,
    refusing less than 512 MiB;
 2. draws a fresh version-4 volume UUID from `/dev/urandom`;

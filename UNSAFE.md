@@ -224,6 +224,17 @@ The `td-kexec` guest helper is confined to exactly two syscalls
 (`kexec_file_load(2)` + `reboot(2)` with `LINUX_REBOOT_CMD_KEXEC`) copied
 from `sys.rs`.
 
+Planned, not present: the device-bound volume key handoff
+(`td-install/ENCRYPTION.md` increment 6, "Boot and authority
+boundaries") adds `memfd_create(2)` with flags pinned to
+`MFD_CLOEXEC | MFD_ALLOW_SEALING` and `fcntl(2)` pinned to `F_ADD_SEALS`
+with `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE`, each
+value-pinned through the same single instruction. The commit that adds
+them amends this section and the roster; until then the surface is the
+two syscalls above. Adopting the returned descriptor into a `File`
+would be a second scoped `#[allow]` and amends this section too. Key
+material reaches td-kexec only by descriptor.
+
 ## 2. `td-netd` — the network bring-up daemon
 
 The `td-netd` network bring-up daemon is confined to a single `ioctl(2)`
@@ -310,6 +321,12 @@ non-block kernel tests require ENOTTY. The td-install formatter continues
 to write through its whole-disk descriptor for both destination kinds;
 publication from inside the formatter goes through its own loop surface
 (§21), not this applet, which serves the separate mounted route.
+
+Planned, not present: the console `secret-line` applet
+(`td-install/ENCRYPTION.md` increment 6), which reads the selector's
+recovery-key entry, clears `ECHO` for one bounded line and restores the
+line's settings, through the same pinned `TCGETS`/`TCSETS` wrappers and
+`term.rs`'s read-back discipline. It adds no request and no syscall.
 
 `TCGETS`/`TCSETS` arrived with the `getty` applet, which is what took the
 LAST busybox name off the image — the tty setup half of the login chain,
