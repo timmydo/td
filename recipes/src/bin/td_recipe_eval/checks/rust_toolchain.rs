@@ -227,8 +227,7 @@ fn prove_td_shell_userland(
         "rust-toolchain {TD_STORE_DIR}/{rust_base} td-recipe-output\n\
          gcc-x86-64-self {TD_STORE_DIR}/{gcc_base} td-recipe-output\n\
          binutils-x86-64-self {TD_STORE_DIR}/{binutils_base} td-recipe-output\n\
-         glibc-x86-64 {TD_STORE_DIR}/{glibc_base} td-recipe-output\n\
-         busybox-x86-64 {TD_STORE_DIR}/{busybox_base} td-recipe-output\n"
+         glibc-x86-64 {TD_STORE_DIR}/{glibc_base} td-recipe-output\n"
     );
     fs::write(&native_lock, &lock).map_err(|e| format!("write {}: {e}", native_lock.display()))?;
 

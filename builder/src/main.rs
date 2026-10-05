@@ -8437,8 +8437,8 @@ struct NativeToolchain {
     cc: String,
     cxx: String,
     include: String,
-    /// Recipe-output lock lines for the source-built stage2, native
-    /// GCC/binutils/glibc, and build userland.
+    /// Recipe-output lock lines for the source-built stage2 and native
+    /// GCC/binutils/glibc: what a Rust package declares.
     lock_lines: String,
 }
 

@@ -20,7 +20,7 @@ pub fn recipe() -> Recipe {
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "busybox-x86-64",
+            "td-sh",
         ])
         .cargo_subdir("net")
         .cargo_lock("net/Cargo.lock")

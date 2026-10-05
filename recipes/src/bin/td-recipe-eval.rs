@@ -778,7 +778,6 @@ mod tests {
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "busybox-x86-64",
         ]
         .into_iter()
         .map(str::to_string)

@@ -13,8 +13,9 @@ use crate::types::Recipe;
 // system image also consumes it. `source_input`
 // wires TD_SRC from the pinned .crate; `native_inputs` name the build platform
 // (rust-toolchain for cargo/rustc, gcc/binutils/glibc-`self` for the native link
-// env the builder derives, busybox for cp/chmod/tar); `cargo_lock` is the
-// committed, checksum-pinned closure the `--auto` vendor gate verifies against.
+// env the builder derives; it copies and unpacks the source itself);
+// `cargo_lock` is the committed, checksum-pinned closure the `--auto` vendor gate
+// verifies against.
 pub fn recipe() -> Recipe {
     Recipe::rust("uutils", "0.9.0")
         .source_input("uutils-source")
@@ -23,7 +24,6 @@ pub fn recipe() -> Recipe {
             "gcc-x86-64-self",
             "binutils-x86-64-self",
             "glibc-x86-64",
-            "busybox-x86-64",
         ])
         .cargo_lock("recipes/locks/uutils/Cargo.lock")
         .bins(&["coreutils"])

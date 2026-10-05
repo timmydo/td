@@ -1829,8 +1829,6 @@ pub fn run_rust() -> Result<(), String> {
         "TD_RUST_OBJCOPY not set (exact declared target objcopy is required)".to_string()
     })?;
     require_executable_file(&objcopy, "target objcopy")?;
-    let cp = find_in_path(&path, "cp").ok_or("cp not found in TD_INPUTS")?;
-    let chmod = find_in_path(&path, "chmod").ok_or("chmod not found in TD_INPUTS")?;
     let gcc = env::var("TD_RUST_STORE_CC")
         .ok()
         .filter(|p| !p.is_empty())
@@ -1858,25 +1856,17 @@ pub fn run_rust() -> Result<(), String> {
     }
 
     // Materialize a WRITABLE source tree (cargo writes target/). A store directory
-    // (self-host) is copied; a tarball is unpacked, then its single subdir copied.
+    // (self-host) is copied; a tarball is unpacked with its single top directory
+    // stripped. Engine-native both ways, as `cp -aT` and `tar xf` then
+    // `chmod -R u+w` were: no recipe declares a userland to open its source.
     let path_env = vec![("PATH".to_string(), path.clone())];
     let build_dir = "td-rust-build";
     if Path::new(&src).is_dir() {
-        run_cmd(&cp, &["-aT", &src, build_dir], ".", &path_env, &WATCH_PHASE)?;
+        copy_tree_keeping_times(Path::new(&src), Path::new(build_dir))?;
     } else {
-        let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS")?;
-        run_cmd(&tar, &["xf", &src], ".", &path_env, &WATCH_PHASE)?;
-        let sub = single_subdir(".")?;
-        run_cmd(&cp, &["-aT", &sub, build_dir], ".", &path_env, &WATCH_PHASE)?;
+        crate::tar::unpack_archive(Path::new(&src), Path::new(build_dir), false)?;
+        make_tree_writable(Path::new(build_dir))?;
     }
-    // store copies are read-only; make the tree writable for cargo's target/.
-    run_cmd(
-        &chmod,
-        &["-R", "u+w", build_dir],
-        ".",
-        &path_env,
-        &WATCH_PHASE,
-    )?;
 
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
     // TD_RUST_STATIC=1 ⇒ the named binaries link as static position-independent
@@ -1922,8 +1912,8 @@ pub fn run_rust() -> Result<(), String> {
     // PATH for the conventional linker name `cc`, which native td GCC lacks.
     if static_link {
         if let Some(interp) = store_interp.as_deref() {
-            let shell = find_in_path(&path, "sh")
-                .ok_or("sh not found in TD_INPUTS (native Rust host-link wrapper)")?;
+            let shell = find_in_path(&path, "td-sh")
+                .ok_or("td-sh not found in TD_INPUTS (native Rust host-link wrapper)")?;
             path = install_native_rust_host_linker(
                 &cwd,
                 &shell,
@@ -2128,17 +2118,10 @@ pub fn run_rust() -> Result<(), String> {
         &vendor_input_dir,
     )?;
     if !crate_files.is_empty() {
-        let tar = find_in_path(&path, "tar").ok_or("tar not found in TD_INPUTS (vendor)")?;
         fs::create_dir_all(&vendor_dir).map_err(|e| format!("mkdir vendor: {e}"))?;
         for (c, nv) in &crate_files {
             // a cargo `.crate` tarball unpacks to exactly the single `<name>-<version>/` dir.
-            run_cmd(
-                &tar,
-                &["xf", c.as_str(), "-C", &vendor_abs],
-                ".",
-                &path_env,
-                &WATCH_PHASE,
-            )?;
+            crate::tar::unpack_archive(Path::new(c), &vendor_dir, true)?;
             let cdir = vendor_dir.join(nv);
             if !cdir.is_dir() {
                 return Err(format!("crate {c} did not unpack to {}/", cdir.display()));
@@ -2196,7 +2179,7 @@ pub fn run_rust() -> Result<(), String> {
         }
         let from = from.to_str().ok_or("non-utf8 Cargo binary path")?;
         let installed = format!("{bindir}/{b}");
-        run_cmd(&cp, &["-p", from, &installed], ".", &path_env, &WATCH_PHASE)?;
+        copy_file_keeping_time(Path::new(from), Path::new(&installed))?;
         if static_link {
             crate::elf::assert_static_pie(Path::new(&installed))?;
         }
@@ -2586,6 +2569,85 @@ pub fn run_cmake() -> Result<(), String> {
     let shell = format!("SHELL={bash}");
     run_cmd(&make, &[&shell], build_dir, &envs, &WATCH_PHASE)?;
     run_cmd(&make, &[&shell, "install"], build_dir, &envs, &WATCH_PHASE)?;
+    Ok(())
+}
+
+/// `cp -p`: the file's bytes, mode and modification time, the time set
+/// through the handle that wrote them, so the copy's own mode never matters.
+fn copy_file_keeping_time(from: &Path, to: &Path) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("copy {} -> {}: {e}", from.display(), to.display());
+    let meta = fs::metadata(from).map_err(err)?;
+    let mut input = fs::File::open(from).map_err(err)?;
+    let mut output = fs::File::create(to).map_err(err)?;
+    std::io::copy(&mut input, &mut output).map_err(err)?;
+    output
+        .set_modified(meta.modified().map_err(err)?)
+        .map_err(err)?;
+    output.set_permissions(meta.permissions()).map_err(err)
+}
+
+/// `cp -aT SRC DST` then `chmod -R u+w DST`: the tree with its modes and
+/// times, symlinks recreated, every file and directory owner-writable. Unlike
+/// `copy_tree_writable` the times are kept, as `cp -a` kept them, so a build
+/// that reads them sees the source's.
+fn copy_tree_keeping_times(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    let entries = fs::read_dir(src).map_err(|e| format!("read dir {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", src.display()))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("file type {}: {e}", entry.path().display()))?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        if ft.is_dir() {
+            copy_tree_keeping_times(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target =
+                fs::read_link(&from).map_err(|e| format!("readlink {}: {e}", from.display()))?;
+            std::os::unix::fs::symlink(&target, &to)
+                .map_err(|e| format!("symlink {}: {e}", to.display()))?;
+        } else {
+            copy_file_keeping_time(&from, &to)?;
+            let mode = fs::metadata(&to)
+                .map_err(|e| format!("stat {}: {e}", to.display()))?
+                .permissions()
+                .mode();
+            fs::set_permissions(&to, fs::Permissions::from_mode(mode | 0o200))
+                .map_err(|e| format!("chmod {}: {e}", to.display()))?;
+        }
+    }
+    let meta = fs::metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
+    fs::set_permissions(
+        dst,
+        fs::Permissions::from_mode(meta.permissions().mode() | 0o200),
+    )
+    .map_err(|e| format!("chmod {}: {e}", dst.display()))?;
+    let modified = meta
+        .modified()
+        .map_err(|e| format!("stat {}: {e}", src.display()))?;
+    fs::File::open(dst)
+        .and_then(|d| d.set_modified(modified))
+        .map_err(|e| format!("set mtime {}: {e}", dst.display()))
+}
+
+/// `chmod -R u+w`: every file and directory under `root` owner-writable,
+/// symlinks left alone.
+fn make_tree_writable(root: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(root).map_err(|e| format!("stat {}: {e}", root.display()))?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    fs::set_permissions(
+        root,
+        fs::Permissions::from_mode(meta.permissions().mode() | 0o200),
+    )
+    .map_err(|e| format!("chmod {}: {e}", root.display()))?;
+    if meta.is_dir() {
+        for entry in fs::read_dir(root).map_err(|e| format!("read dir {}: {e}", root.display()))? {
+            let entry = entry.map_err(|e| format!("read dir {}: {e}", root.display()))?;
+            make_tree_writable(&entry.path())?;
+        }
+    }
     Ok(())
 }
 
@@ -5437,18 +5499,18 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let path = install_native_rust_host_linker(
             &base,
-            "/td/store/busybox/bin/sh",
+            "/td/store/td-sh/bin/td-sh",
             "/td/store/gcc/bin/gcc",
             "/td/store/glibc/lib/ld-linux-x86-64.so.2",
             "/td/store/glibc/lib:/td/store/zlib/lib",
             "/td/store/binutils/bin:/td/store/glibc/lib",
-            "/td/store/rust/bin:/td/store/busybox/bin",
+            "/td/store/rust/bin:/td/store/td-sh/bin",
         )
         .unwrap();
         assert!(path.starts_with(base.join("td-native-bin").to_str().unwrap()));
         let wrapper = fs::read_to_string(base.join("td-native-bin/cc")).unwrap();
         for required in [
-            "#!/td/store/busybox/bin/sh",
+            "#!/td/store/td-sh/bin/td-sh",
             "exec \"/td/store/gcc/bin/gcc\" \"$@\"",
             "-static-libgcc",
             "-Wl,--dynamic-linker,\"/td/store/glibc/lib/ld-linux-x86-64.so.2\"",
@@ -6743,6 +6805,57 @@ mod tests {
         assert_eq!(tool & 0o200, 0o200, "owner write added: {tool:o}");
         assert_eq!(data & 0o111, 0, "plain file stays non-exec: {data:o}");
         assert_eq!(data & 0o200, 0o200, "owner write added: {data:o}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn run_rust_copies_its_source_as_cp_a_and_chmod_u_w_did() {
+        // `cp -aT` then `chmod -R u+w`: modes and times kept, links recreated,
+        // and every file and directory owner-writable for cargo's target/.
+        let d = std::env::temp_dir().join(format!("td-rust-copy-{}", std::process::id()));
+        let src = d.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub/data"), b"d").unwrap();
+        fs::write(src.join("tool"), b"#!x").unwrap();
+        std::os::unix::fs::symlink("sub/data", src.join("link")).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        for f in ["sub/data", "tool"] {
+            fs::File::options()
+                .write(true)
+                .open(src.join(f))
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        fs::set_permissions(src.join("sub/data"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(src.join("tool"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(src.join("sub"), fs::Permissions::from_mode(0o555)).unwrap();
+        let dst = d.join("dst");
+        copy_tree_keeping_times(&src, &dst).unwrap();
+        let meta = |p: &str| fs::metadata(dst.join(p)).unwrap();
+        assert_eq!(meta("tool").permissions().mode() & 0o777, 0o755);
+        assert_eq!(meta("sub/data").permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta("sub").permissions().mode() & 0o777, 0o755);
+        assert_eq!(meta("tool").modified().unwrap(), when);
+        assert_eq!(meta("sub/data").modified().unwrap(), when);
+        assert_eq!(
+            fs::read_link(dst.join("link")).unwrap(),
+            Path::new("sub/data")
+        );
+
+        // And the tarball path's half: a read-only tree made writable in place,
+        // its symlinks left alone.
+        let ro = d.join("ro");
+        fs::create_dir_all(ro.join("deep")).unwrap();
+        fs::write(ro.join("deep/f"), b"f").unwrap();
+        fs::set_permissions(ro.join("deep/f"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(ro.join("deep"), fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", ro.join("dangling")).unwrap();
+        make_tree_writable(&ro).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&ro.join("deep")), 0o755);
+        assert_eq!(mode(&ro.join("deep/f")), 0o644);
+        fs::set_permissions(src.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(&d).unwrap();
     }
 
