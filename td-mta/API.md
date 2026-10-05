@@ -4486,6 +4486,38 @@ Complete remains inert; check_deadline and finish require fresh admission.
 Location dispatch, automatic traversal integration and JSON projection remain
 separate increments.
 
+### 1.102 Selected Content-ID JSON string
+
+M06cw adds mime_content_id::json::Cursor for one caller-selected complete
+Content-ID field value. It binds the existing CID projector to shared
+std-only td_json::string::Frame for the whole cursor lifetime and borrows
+original Meter/HeaderBudget. Constructor admission is inert. Input and
+selected-field authorization remain caller responsibilities; absent or
+malformed-field null mapping belongs to the selecting coordinator.
+
+poll(now, output) emits provisional serialized bytes through Progress
+(written, Yield/NeedOutput/Complete). Short output windows preserve paid
+pending bytes; empty output performs fresh admission without visiting input.
+A cached Complete is inert. Existing whole-value syntax validation precedes
+CID scalar events, but the opening JSON quote may already be provisional.
+Every syntax or work refusal retires the whole JSON string, including that
+quote and any previous fragments. A source cannot be replaced or rewrapped
+inside this cursor. No source grant, renewed interpretation/output allowance,
+retained string, publication transaction or locator authority follows.
+
+CID case, quoted spelling, escapes and decomposed Unicode follow 1.90;
+encoded-word-looking identifiers stay literal and NFC is not applied. The
+existing conversion repairs disallowed noncharacters and reports its
+is_encoding_problem diagnostic. end() exposes passive End only after JSON
+completion; a failed fresh check clears it. Serialized quotes, escaping and
+UTF-8 use the shared framer's ordinary JSON policy and exact serialized output
+charges, in addition to the original CID conversion charges.
+
+check_deadline and consuming finish(now) freshly admit even after Complete.
+finish checks admission before premature-state failure and returns original
+Meter/HeaderBudget plus End. Partial output remains caller-reserved and is
+not wiped after refusal. The fixed source/framer pair is neither Copy nor
+Clone; this helper composes no part tree, null property or whole response.
 
 ## 2. Read views and change history
 

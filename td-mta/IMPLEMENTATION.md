@@ -1974,6 +1974,15 @@ Initial independently landable increments:
   Label-value/JSON projection, location dispatch, traversal integration and
   worker/native/RSS qualification remain open.
 
+- **M06cw — selected Content-ID JSON string:** bind the existing complete CID
+  projector to shared std-only string framing with original job/header
+  owners. Preserve literal identifier spelling and conversion diagnostics;
+  serialize into caller output without a retained string. Qualify short
+  drains, exact serialization charges, whole-value/refusal retirement and
+  original consuming handoff. Language arrays, missing-field property
+  mapping, location, part/response composition and worker/native/RSS remain
+  open.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

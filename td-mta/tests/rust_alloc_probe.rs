@@ -2152,6 +2152,148 @@ fn uri_reference_values() {
     assert_eq!(before, after, "URI-reference spelling allocated");
 }
 
+fn content_id_json() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_content_id::{
+            self,
+            json::{Cursor, Error, Status},
+        },
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = format!("<{}@b>", "a".repeat(8192));
+    let deep = format!("<a@b> {}x{}", "(".repeat(33), ")".repeat(33));
+    let before = COUNTERS.snapshot();
+    for (source, fault, records, output_bytes) in [
+        (b"(x) <A@b> (y)".as_slice(), None, 100_000_000, 100_000_000),
+        (
+            "(🐈) <e\u{301}@EXAMPLE>".as_bytes(),
+            None,
+            100_000_000,
+            100_000_000,
+        ),
+        ("<\u{fdd0}@b>".as_bytes(), None, 100_000_000, 100_000_000),
+        (b"<\"a\\b\"@c>", None, 100_000_000, 100_000_000),
+        (long.as_bytes(), None, 100_000_000, 100_000_000),
+        (
+            b"<local>",
+            Some(Error::Source(mime_content_id::Error::Malformed)),
+            100_000_000,
+            100_000_000,
+        ),
+        (
+            deep.as_bytes(),
+            Some(Error::Source(mime_content_id::Error::NestingLimit)),
+            100_000_000,
+            100_000_000,
+        ),
+        (
+            b"<a@b>",
+            Some(Error::Source(mime_content_id::Error::Work(Stop::Records))),
+            0,
+            100_000_000,
+        ),
+        (
+            b"<a@b>",
+            Some(Error::Source(mime_content_id::Error::Work(
+                Stop::OutputBytes,
+            ))),
+            100_000_000,
+            0,
+        ),
+    ] {
+        for trial in 0..if fault.is_some() { 1 } else { 2 } {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: 100_000_000,
+                    records,
+                    output_bytes,
+                    ..Charge::default()
+                },
+            );
+            let mut budget = HeaderBudget::new();
+            let identity = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+            let mut cursor = Cursor::new(black_box(source), &mut work, &mut budget);
+            assert_eq!(cursor.end(), None);
+            let mut complete = false;
+            let mut failed = None;
+            let mut byte = [0];
+            for turn in 0..200_000 {
+                if turn % 7 == 0 {
+                    if let Err(error) = cursor.poll(Tick(1), &mut []) {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+                match cursor.poll(Tick(1), &mut byte) {
+                    Ok(progress) => {
+                        black_box(byte.get(..progress.written).unwrap());
+                        if progress.status == Status::Complete {
+                            complete = true;
+                            break;
+                        }
+                        assert_eq!(cursor.end(), None);
+                    }
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(failed, fault);
+            if let Some(error) = fault {
+                assert_eq!(cursor.end(), None);
+                assert_eq!(cursor.poll(Tick(1), &mut byte), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            assert!(complete);
+            assert_eq!(
+                cursor.poll(Tick(100), &mut []).unwrap().status,
+                Status::Complete
+            );
+            if trial == 1 {
+                let error = Error::Source(mime_content_id::Error::Work(Stop::Deadline));
+                assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+                assert_eq!(cursor.end(), None);
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+                continue;
+            }
+            let (work, budget, end) = cursor.finish(Tick(1)).unwrap();
+            black_box(end);
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                identity
+            );
+            let mut next = mime_content_id::Cursor::new(b"<next@id>", work, budget);
+            let mut complete = false;
+            for _ in 0..1000 {
+                match next.poll(Tick(1)).unwrap() {
+                    mime_content_id::Status::Scalar(c) => {
+                        black_box(c);
+                    }
+                    mime_content_id::Status::Complete => {
+                        complete = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(complete);
+            let (work, budget) = next.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                identity
+            );
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "Content-ID JSON projection allocated");
+}
+
 fn content_id_values() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -9064,6 +9206,7 @@ fn main() {
         uri_unfold_values();
         uri_reference_values();
         content_id_values();
+        content_id_json();
         content_language_values();
         body_value();
         mime_text();
@@ -9229,6 +9372,7 @@ fn main() {
     uri_unfold_values();
     uri_reference_values();
     content_id_values();
+    content_id_json();
     content_language_values();
     body_value();
     mime_text();

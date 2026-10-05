@@ -1,4 +1,5 @@
 //! One Content-ID value using the existing identifier grammar and conversion.
+pub mod json;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Malformed,

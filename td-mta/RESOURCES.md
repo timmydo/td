@@ -1784,6 +1784,22 @@ refusal, fresh retirement and consuming handoff. Successful handoff projects
 selected CID/language with the exact returned owners, then reuses them for
 another header section; no retained value/list allocation is claimed.
 
+M06cw's bound CID JSON cursor plus HeaderBudget fits 640 bytes in the existing
+parser region. It owns one CID child and one six-byte shared JSON pending
+buffer, with no input-sized storage or retained string. A turn invokes at
+most one CID child poll or copies six already-paid bytes. Combined bounds
+are 160 source visits, 255 interpretation steps, 16 job records and ten
+conversion/serialized output bytes; fixtures measure those bounds. Exact
+serialized-length charges add to the existing CID conversion charges, and
+short drains never renew them. Complete JSON and fresh original admission
+precede consuming handoff and visible final diagnostics. Partial output
+remains provisional; no null mapping, whole-response transaction or additional
+source/output grant is introduced.
+Warm/measured Rust allocation intervals cover long CID spellings, four-byte
+comments, decomposed Unicode, escapes, noncharacter repair, syntax/nesting/job
+and output refusal, fresh retirement and original consuming handoff. They
+remain separate from native, worker-stack and RSS qualification.
+
 The resident unstructured header cursor fits 208 bytes, including its source,
 UTF-8 state, current word decoder and raw replay offsets, within a future
 256-byte decoding checkpoint. It uses the same decoder region with no

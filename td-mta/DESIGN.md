@@ -479,6 +479,24 @@ heads/charset/filename results. The original parser reservation and caller
 windows suffice; label strings/lists, location dispatch and automatic
 traversal/JSON integration remain separate.
 
+M06cw binds selected Content-ID projection to shared std-only JSON string
+framing under the same original job/header owners. Whole-value grammar
+success precedes identifier scalars; any opening quote and subsequent JSON
+fragments remain provisional through fresh completion admission. Ordinary
+JSON escaping adds serialized output charges to existing conversion work.
+The fixed framer/source pair allocates no retained string, applies no NFC or
+encoded-word decoding, and returns original owners with the existing
+encoding-problem diagnostic. Missing-field mapping, label arrays and whole
+part/response composition remain separate.
+
+The CID JSON binding uses the generic framer directly to preserve its typed
+CID error domain without widening the older header-property json_string
+error roster. CID Begin/End are non-scalar structural events from its fixed
+single-identifier projector; they yield while the child enforces its own
+sequence. Premature JSON finish and child source-state refusal retain their
+distinct outer/source error contexts. Future metadata composition must adapt
+those contexts explicitly rather than silently flattening them.
+
 The reusable CFWS, delimited-token and MIME parameter-name/value cursors
 live in td-header with generic caller-owned admission. Its passive resident
 extent helper shares checked absolute slice mapping without reading bytes or
