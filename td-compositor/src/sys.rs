@@ -480,10 +480,10 @@ impl AbsAxis {
     }
 }
 
-/// What an absolute axis reports: where it is NOW, and the span that says what
-/// that number means. Only the three fields answering those two questions are
-/// carried out; `fuzz`, `flat` and `resolution` describe filtering and physical
-/// size, and a pointer being mapped to a screen wants neither.
+/// What an absolute axis reports: where it is NOW, the span that says what
+/// that number means, and `resolution`, its units per millimetre (0 when the
+/// driver does not say), which scales a touchpad's finger travel. `fuzz` and
+/// `flat` describe filtering and are not carried out.
 ///
 /// `value` is the axis's position at the moment it was asked, which is the only
 /// way to know where a device is BEFORE it has reported anything: the kernel
@@ -494,6 +494,7 @@ pub struct AbsInfo {
     pub value: i32,
     pub minimum: i32,
     pub maximum: i32,
+    pub resolution: i32,
 }
 
 /// The kernel's `struct input_absinfo`: six native-endian `i32` fields — value,
@@ -558,11 +559,12 @@ pub fn absolute_info(device: &impl AsRawFd, axis: AbsAxis) -> Result<AbsInfo, St
 }
 
 fn absinfo(words: [i32; ABSINFO_WORDS]) -> AbsInfo {
-    let [value, minimum, maximum, _fuzz, _flat, _resolution] = words;
+    let [value, minimum, maximum, _fuzz, _flat, resolution] = words;
     AbsInfo {
         value,
         minimum,
         maximum,
+        resolution,
     }
 }
 
@@ -2554,17 +2556,18 @@ mod tests {
         assert_eq!(drm_count(0, MAX_DRM_OBJECTS, "connectors"), Ok(0));
     }
 
-    /// The three words this reads are adjacent and the same type, so nothing
-    /// about a wrong index is observable at runtime: it is a well-formed
-    /// position and range that puts every report somewhere else on the screen.
+    /// The words this reads are adjacent and the same type, so nothing about
+    /// a wrong index is observable at runtime: it is a well-formed position,
+    /// range or scale that puts every report somewhere else on the screen.
     #[test]
-    fn an_absinfo_reads_its_place_and_range_from_the_first_three_words() {
+    fn an_absinfo_reads_its_place_range_and_resolution_from_their_own_words() {
         assert_eq!(
             absinfo([11, 22, 33, 44, 55, 66]),
             AbsInfo {
                 value: 11,
                 minimum: 22,
-                maximum: 33
+                maximum: 33,
+                resolution: 66
             }
         );
         assert_eq!(std::mem::size_of::<[i32; ABSINFO_WORDS]>(), 24);

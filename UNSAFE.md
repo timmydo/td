@@ -511,46 +511,45 @@ surface when the terminal became its own program on td-ui; the compositor
 owns no terminal, and its allow-list refuses those numbers like any other.
 Two requests serve the ABSOLUTE pointer:
 `EVIOCGABS(ABS_X)`/`EVIOCGABS(ABS_Y)` (0x80184540/0x80184541), reached only
-from `input.rs`. A tablet reports a position in its
-own units, so mapping one to a screen needs the device's declared range, and
-nothing but this ioctl reports it — `/sys` carries which axes exist but not
-their bounds, and guessing would put the pointer somewhere other than where
-the operator is pointing. It is asked at open, and again only where an
-answer can have gone stale without a report saying so — a recovery, which a
+from `input.rs`. A tablet reports a position in its own units, so mapping
+one to a screen needs the device's declared range, and nothing but this
+ioctl reports it — `/sys` carries which axes exist but not their bounds, and
+guessing would put the pointer somewhere other than where the operator is
+pointing. It is asked at open, and again only where an answer can have gone
+stale without a report saying so — a tablet's recovery, which a
 `SYN_DROPPED` and a button overflow both reach, since each discards a report
-this crate never sees the axes of; the SPAN is a property of the device rather
-than of any report, so nothing asks per frame. A device that
-refuses it is relative, which is the ordinary case and not an error. It asks
-for three of the six words: the two bounds, and `value` — where the axis IS
-at the moment it is asked, which is the only account of a device's position
-before it has reported anything, and which the kernel needs because it omits
-an axis whose value has not changed. The argument is pinned. `EVIOCGABS`
+this crate never sees the axes of; the SPAN is a property of the device
+rather than of any report, so nothing asks per frame. A device that refuses
+it is relative, which is the ordinary case and not an error. It carries out
+four of the six words: the two bounds; `value` — where the axis IS at the
+moment it is asked, which is the only account of a device's position before
+it has reported anything, and which the kernel needs because it omits an
+axis whose value has not changed; and `resolution`, the units per millimetre
+that scale a touchpad's finger travel. The argument is pinned. `EVIOCGABS`
 copies `sizeof(struct input_absinfo)` — 24 bytes, six `__s32` — through the
 pointer, and it takes that length from the MINIMUM of the REQUEST NUMBER's
-own size field and its own `sizeof`. Half of that is
-protective, and the half that is not is the reason the two must be pinned
-TOGETHER: an oversized number cannot make the copy longer, but a buffer
-shortened without the number is 24 bytes written into less — an out-of-bounds
-kernel write from code the compiler reads as safe. Both numbers encode that
-same 24 and a test checks it against `ABSINFO_WORDS`, so the two cannot drift
-apart. The axis is named by an ENUM
-rather
-than by a number at the call site, td-sh's `Disposition` shape: the two
-requests differ in one nibble, and a caller free to compose one could
-compose a third. Its buffer is an `[i32; 6]`, a layout the language
-guarantees, so its field ORDER is a tested function — `value`, `minimum` and
-`maximum` are three ADJACENT words of the same type, so an index off by one
-is a well-formed position and range that maps every report to the wrong part
-of the screen, with nothing observable to say so.
+own size field and its own `sizeof`. Half of that is protective, and the
+half that is not is the reason the two must be pinned TOGETHER: an oversized
+number cannot make the copy longer, but a buffer shortened without the
+number is 24 bytes written into less — an out-of-bounds kernel write from
+code the compiler reads as safe. Both numbers encode that same 24 and a test
+checks it against `ABSINFO_WORDS`, so the two cannot drift apart. The axis
+is named by an ENUM rather than by a number at the call site, td-sh's
+`Disposition` shape: the two requests differ in one nibble, and a caller
+free to compose one could compose a third. Its buffer is an `[i32; 6]`, a
+layout the language guarantees, so its field ORDER is a tested function —
+`value`, `minimum` and `maximum` are three ADJACENT words of the same type,
+so an index off by one is a well-formed position and range that maps every
+report to the wrong part of the screen, with nothing observable to say so.
 Five more requests joined that roster for DRM/KMS DISCOVERY, reached only
 from `drm.rs` — a second disjoint module on this surface, and not a widening
-of the pointer's. `DRM_IOCTL_VERSION`
-(0xc0406400) asks which driver is behind a card node;
-`DRM_IOCTL_MODE_GETRESOURCES` (0xc04064a0) asks what it has;
-`DRM_IOCTL_MODE_GETCONNECTOR` (0xc05064a7) and `DRM_IOCTL_MODE_GETENCODER`
-(0xc01464a6) ask about one connector and one encoder. `APPLICATIONS.md` §M's
-first row is a DRM/KMS output backend, and these four are the half of it that
-only READS: none of them modesets or allocates.
+of the pointer's. `DRM_IOCTL_VERSION` (0xc0406400) asks which driver is
+behind a card node; `DRM_IOCTL_MODE_GETRESOURCES` (0xc04064a0) asks what it
+has; `DRM_IOCTL_MODE_GETCONNECTOR` (0xc05064a7) and
+`DRM_IOCTL_MODE_GETENCODER` (0xc01464a6) ask about one connector and one
+encoder. `APPLICATIONS.md` §M's first row is a DRM/KMS output backend, and
+these four are the half of it that only READS: none of them modesets or
+allocates.
 
 The fifth exists because "reads only" was not true of the OPEN.
 `DRM_IOCTL_DROP_MASTER` (0x641f) writes nothing to a display; it gives back
@@ -705,9 +704,10 @@ NOT in that surface:
 framebuffer and evdev
 READING (ordinary files — every input REPORT td acts on arrives as bytes off
 a `File`; the one thing that does not is the POSITION a resync reads, since
-`EVIOCGABS` answers `value` beside the bounds and the recovery frame
+`EVIOCGABS` answers `value` beside the bounds and a tablet's recovery frame
 publishes it, which is a cursor move that came through this surface rather
-than through a file), Unix socket setup and
+than through a file; a touchpad's recovery publishes nothing, and its
+`resolution` scales how far a finger moves the cursor), Unix socket setup and
 byte I/O (`std`), mmap (wl_shm
 pixels are copied with `FileExt`; the mapping hardware rendering will need is
 anticipated below rather than present), device ownership (safe `td-seatd`),
@@ -715,10 +715,11 @@ or any terminal control: the compositor starts processes only through
 `Command`. Nor, on the evdev side: `EVIOCGABS` for any axis but X and Y
 (a pressure or tilt axis is not a place on a screen, and the request number
 is composed from the axis, so serving one would mean composing them);
-`EVIOCGBIT`/`EVIOCGNAME` (which axes a device HAS is answered by whether
-`EVIOCGABS` reports a SPAN — the call itself succeeds for every axis on a
-device that has an absinfo table at all, zeroed where it has none — and its
-name by `/sys`); and `EVIOCGRAB`, which would
+`EVIOCGBIT`/`EVIOCGNAME`/`EVIOCGPROP` (which axes a device HAS is answered
+by whether `EVIOCGABS` reports a SPAN — the call itself succeeds for every
+axis on a device that has an absinfo table at all, zeroed where it has none
+— its name by `/sys`, and whether it is a touchpad by the `properties` and
+`capabilities/key` bitmaps `/sys` prints); and `EVIOCGRAB`, which would
 take a device away from everything else on the machine — td's compositor
 owns the console outright, so there is nothing to take it from, and a grab
 that outlived a crash would leave a keyboard nothing can type on.

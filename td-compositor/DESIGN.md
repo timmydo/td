@@ -594,7 +594,9 @@ else: `declared` refuses only a span of zero, so `0..1` is admitted and maps
 every report to one of two positions. Nothing parses the numbers — the
 oracle latches the substring — so they are there to be read by a person
 looking at a console, which is the only thing that can tell a plausible
-range from the device's real one.
+range from the device's real one. A touchpad (below) prints
+`TD-POINTER-TOUCHPAD` instead, adding its resolution. No QEMU device is one,
+so the oracle neither expects nor sees it.
 
 WHERE it is printed is the load-bearing part, and it is not beside the
 `EVIOCGABS`. The line comes off the argument the reader is about to build
@@ -718,29 +720,101 @@ true), does not map to one output among several (there is one), does not
 change the WIRE — clients still receive surface-local coordinates from the
 cursor's position, and `wl_pointer` has no absolute motion to receive — and
 does not move the cursor for a device that has produced no events at all.
-Anything that device DOES produce places it, though, and from a position no
+Anything a TABLET does produce places it, though, and from a position no
 report carried: the first frame, even one carrying nothing but a button, and
 the recovery frame after a dropped batch. Both are the seeded position above,
 and both are a jump by design rather than an exception to this.
 
-Nor does it ask what KIND of device declared those axes, and that is a stated
-limitation rather than an oversight. ANY node whose ABS_X and ABS_Y both
-declare a span is admitted, which is a wider class than a tablet and wider
-than the reading it is tempting to give it. A gamepad's left stick is
-ABS_X/ABS_Y, so moving it would take the cursor over. A laptop TOUCHPAD is
-the case that matters more, because it is the common one and it fails
-harder: it reports an absolute finger position and no `EV_REL` at all, so
-under this rule the cursor would teleport to wherever a finger lands rather
-than being dragged by it. An accelerometer node declares those axes too and
-would fly the cursor around with the tilt of the machine. The
-fix needs no new ioctl — `/sys/class/input/*/properties` carries the
-`INPUT_PROP_*` bitmap as an ordinary file, and `INPUT_PROP_POINTER` versus
-`INPUT_PROP_DIRECT` is the distinction wanted — but the property a QEMU
-tablet actually sets cannot be checked from here, and gating on the wrong
-bit would make the feature refuse the one device it exists for. The stock
-QEMU fixture has none of them: it is a PS/2 keyboard, a PS/2 mouse, and a
-virtio tablet. The USB-enabled kernel can expose additional HID devices;
-startup enumeration does not distinguish their intended use.
+A laptop TOUCHPAD declares ABS_X and ABS_Y too, and reports an absolute
+finger position with no `EV_REL` at all; read as a tablet, the cursor would
+teleport to wherever a finger lands rather than being dragged by it. So
+`input.rs` asks what kind of device declared the axes, and asks sysfs rather
+than a new ioctl: `/sys/class/input/eventN/device/properties` carries the
+`INPUT_PROP_*` bitmap and `.../capabilities/key` the key bitmap, both
+world-readable files found by the node's own basename, as `framebuffer.rs`
+finds `/sys/class/graphics`. The compositor runs in the root mount
+namespace under `td-login exec-service-as`, so sysfs is in reach, and only a
+device whose axes declared a span is asked. A node is a touchpad exactly
+when its properties include `INPUT_PROP_POINTER` and exclude
+`INPUT_PROP_DIRECT`, and its keys include `BTN_TOOL_FINGER` and exclude
+`BTN_TOOL_PEN`, udev's `finger_but_no_pen`.
+
+That is what Linux 7.1.4's touchpad drivers set and what neither QEMU tablet
+does. Synaptics, elantech, byd and synaptics_usb set POINTER and the finger
+tool outright. `input_mt_init_slots` with `INPUT_MT_POINTER` sets both, and
+alps (its multitouch protocols), focaltech, bcm5974, the Magic Trackpad
+(hid-magicmouse) and hid-multitouch on a `HID_DG_TOUCHPAD` application ask
+for it. cypress_ps2, appletouch and sentelic advertise the finger tool
+without POINTER, so they stay tablets. `virtio_input` copies a device's
+property bits from its config space; QEMU's virtio tablet config has no
+`VIRTIO_INPUT_CFG_PROP_BITS` entry and advertises `BTN_TOUCH` but no finger
+tool. `usb-tablet`'s HID descriptor is a Generic Desktop mouse with no
+Digitizer page, the only page hid-input derives a property from. A
+touchscreen is DIRECT and a pen tablet has a pen, so both stay tablets.
+Every failure — a missing or unreadable file, text that is not a bitmap, an
+attribute longer than a page — keeps the tablet reading, which is the
+behaviour before this existed, and none refuses the device.
+
+A touchpad's frame is always a DISTANCE. One finger is in contact when
+`BTN_TOUCH` and `BTN_TOOL_FINGER` are both held and no `BTN_TOOL_DOUBLETAP`
+through `BTN_TOOL_QUINTTAP` is, and only then does the travel between two
+consecutive reports of that contact move the pointer. The first report of a
+contact only anchors. A lift, a hover (the finger tool without `BTN_TOUCH`)
+or a second finger clears the anchor, so a new touch never jumps and the
+pointer does not leap when the emulated position changes finger.
+
+Each axis is anchored only on a value a report has NAMED since open or the
+last discard. The kernel omits an axis it believes unchanged, so an omitted
+axis is the last named value and adds no travel; one never named since then
+adds none and anchors nothing until a report names it. Neither the
+`EVIOCGABS` `value` at open nor a snapshot at recovery is used, since it can
+be newer than reports still queued, and anchoring on it would turn that
+difference into a jump.
+
+Travel is scaled by `input_absinfo.resolution`, units per millimetre from
+the same `EVIOCGABS` answer, at 16 px/mm: each axis's own where both state
+one, the one stated for both where only one does, assuming square units.
+A driver that states neither has its X span taken as 1024 px for both
+axes, on the same assumption. Integer arithmetic carries each axis's
+sub-pixel remainder, so slow motion is not rounded away. There is no
+acceleration curve, so the one constant serves both reach and precision: a
+60-70 mm pad crosses about 1000 px per stroke, and one pixel is a sixteenth
+of a millimetre.
+
+Buttons are unchanged. A clickpad's press arrives as `BTN_LEFT` and is
+forwarded with its frame. `BTN_TOUCH` and the `BTN_TOOL_*` keys lie outside
+both `BTN_MOUSE..=BTN_TASK` and the XKB key range, so no client sees them.
+A discard — `SYN_DROPPED`, a button overflow, or the attention cutoff's
+quarantine — forgets the contact keys and every named axis value, as it
+forgets held buttons. The kernel re-sends no unchanged key, so a belief
+kept across the gap could be wrong in either direction: a lost
+`BTN_TOOL_DOUBLETAP` release would leave the pad dead, and a lost
+`BTN_TOOL_FINGER` release would let two fingers or a hover move the
+pointer. Motion resumes after the next real contact transition; the cost
+is that a finger kept down across a drop, or already resting on the pad when
+the compositor opens it (the kernel sends a new reader no key state), moves
+nothing until it is lifted and set down again. The recovery then publishes
+NO place for a touchpad and asks the device nothing. A touchpad prints
+`TD-POINTER-TOUCHPAD` with its span and resolution in place of the absolute
+marker.
+
+Deferred: tap-to-click, two-finger and edge scrolling, palm rejection,
+pointer acceleration, and per-slot multitouch tracking — a finger swapped
+for another inside one report, with no contact key changing, is read as
+travel. QEMU can prove none of this. No device the stock fixture attaches,
+and no QEMU input device at all, is a touchpad, so the unit tests in
+`input.rs` and the ThinkPad T430s's Synaptics pad are its only coverage.
+
+The rest of the class is still a stated limitation. Any other node whose
+ABS_X and ABS_Y both declare a span is admitted as a tablet. A gamepad's
+left stick is ABS_X/ABS_Y, so moving it would take the cursor over, and it
+sets no property, so the classification above cannot tell it from QEMU's
+virtio tablet, which sets none either. An accelerometer node declares
+those axes too and would fly the cursor around with the tilt of the
+machine; most set `INPUT_PROP_ACCELEROMETER`, which nothing reads yet. The
+stock QEMU fixture has none of them: it is a PS/2 keyboard, a PS/2 mouse,
+and a virtio tablet. The USB-enabled kernel can expose additional HID
+devices; startup enumeration does not distinguish their intended use.
 
 Compositor commands act only on key presses. Evdev autorepeat records are
 ignored for both compositor and client delivery. A held `Super+v` therefore
@@ -4020,8 +4094,8 @@ The `syscall5` body carries:
 - fcntl(2), with only `F_GETFL` and `F_SETFL`, to add `O_NONBLOCK` while one
   clipboard source writes and restore the destination's prior status;
 - ioctl(2), for the two pinned `EVIOCGABS` requests that read an absolute
-  pointer's declared axis range, EVIOCSCLOCKID fixed to CLOCK_MONOTONIC, and
-  the fourteen DRM requests below;
+  pointer's declared axis range and resolution, EVIOCSCLOCKID fixed to
+  CLOCK_MONOTONIC, and the fourteen DRM requests below;
 - clock_gettime(2), fixed to CLOCK_MONOTONIC for the attention cutoff; and
 - munmap(2), for an owned dumb-buffer mapping. The six-argument body carries
   only mmap(2), pinned to that buffer's shared read/write mapping.
@@ -4239,10 +4313,14 @@ through that surface, and no input REPORT: every evdev record td acts on is
 read as bytes off an ordinary `File`. One POSITION does, and it is stated
 rather than glossed, because a resync is the one moment no record can answer
 for: `EVIOCGABS` returns `value` beside the bounds, and the frame published
-after a dropped batch carries it. That is a cursor move — and, through
-focus-follows-mouse, possibly a keyboard focus change — sourced from an
-ioctl rather than from a file. It is the only one, it happens only at a
-recovery, and §2 is where what it means is argued.
+after a tablet's dropped batch carries it. That is a cursor move — and,
+through focus-follows-mouse, possibly a keyboard focus change — sourced from
+an ioctl rather than from a file. It is the only one, it happens only at a
+recovery, and §2 is where what it means is argued. A touchpad's recovery
+publishes nothing. Its motion is scaled by the `resolution` word of the same
+answer, so the ioctl sets how FAR a finger moves the cursor, never where.
+Which kind a device is comes from sysfs, not from `EVIOCGPROP` or
+`EVIOCGBIT`.
 
 The second block consumes one `ReceivedFd` as a `File` with
 `File::from_raw_fd`. This serves received SHM pools, keymaps and the client-side
@@ -4600,8 +4678,16 @@ The landing must prove:
   through QEMU's own floor-scaling and required to come back as itself —
   which is the reachable-edge claim itself, and the one that would have gone
   unnoticed had either half been proved alone; the axis position and range
-  are proved to be read from the first three of `input_absinfo`'s six words,
-  three adjacent `__s32`s an index cannot distinguish at runtime;
+  are proved to be read from the first three of `input_absinfo`'s six words
+  and the resolution from the sixth, adjacent `__s32`s an index cannot
+  distinguish at runtime;
+- a touchpad is classified from sysfs only as POINTER, not DIRECT, with a
+  finger tool and no pen, and every missing or garbled bitmap leaves a
+  tablet; its single-finger travel is a distance scaled by resolution or
+  span with the remainder carried, a new contact, a second finger and a hover
+  move nothing, a clickpad press is delivered while contact keys are not, and
+  a discard forgets contact keys and named axes so neither a lost key nor a
+  newer snapshot moves the pointer;
 - a batch of 32 pointer reports delivers 32 frames and takes one paint, a lone
   report is painted without waiting for a second, a record split across two
   reads is carried rather than parsed short, an interrupted read resumes, and a
@@ -5645,16 +5731,18 @@ can buffer a value before close and timestamp its report only when it
 flushes afterward. This conservatively drops the first wholly fresh report
 from an idle device as well. Later stale records are discarded through
 their report boundary; they cannot restore modifiers or pointer buttons.
-At each discarded report boundary, an absolute device re-reads EVIOCGABS
-and refreshes its held position, including when quarantine swallowed a
-SYN_DROPPED marker. A buttonless position update reaches ordinary routing
+At each discarded report boundary, a tablet re-reads EVIOCGABS and
+refreshes its held position, including when quarantine swallowed a
+SYN_DROPPED marker; a touchpad instead forgets its contact keys and named
+axes, so a finger held across the quarantine moves nothing until it is
+lifted (section 2). A buttonless position update reaches ordinary routing
 only while attention is closed; a reopened screen suppresses it. Later
 button-only reports therefore use the current device position. No rejected
-key, button, wheel or relative-motion change is replayed by recovery.
-Evdev timestamps classify kernel reports, not electrical actuation time;
-deeper driver and hardware buffering remains a trusted-device limitation.
-The bindings lock covers this filter, pointer accumulation, and delivery.
-A failed transition restores input capture and attempts a full private
+key, button, wheel or relative-motion change is replayed by recovery. Evdev
+timestamps classify kernel reports, not electrical actuation time; deeper
+driver and hardware buffering remains a trusted-device limitation. The
+bindings lock covers this filter, pointer accumulation, and delivery. A
+failed transition restores input capture and attempts a full private
 repaint; every recovery failure is included in its returned diagnostic.
 
 Cancellation displays `RELEASE KEYS AND BUTTONS` until every admitted held

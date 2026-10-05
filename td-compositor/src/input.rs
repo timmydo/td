@@ -102,6 +102,36 @@ const BTN_MOUSE: u16 = 0x110;
 /// The first mouse button is the left one.
 const BTN_LEFT: u16 = BTN_MOUSE;
 const BTN_TASK: u16 = 0x117;
+/// A touchpad's contact keys. Outside `BTN_MOUSE..=BTN_TASK` and past
+/// `MAX_XKB_EVDEV_KEY`, so neither reaches a client as a button or a key.
+const BTN_TOOL_PEN: u16 = 0x140;
+const BTN_TOOL_FINGER: u16 = 0x145;
+const BTN_TOOL_QUINTTAP: u16 = 0x148;
+const BTN_TOUCH: u16 = 0x14a;
+const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
+const BTN_TOOL_TRIPLETAP: u16 = 0x14e;
+const BTN_TOOL_QUADTAP: u16 = 0x14f;
+/// Two or more fingers: the emulated position may change finger, so these
+/// frames move nothing.
+const MULTI_FINGER_TOOLS: &[u16] = &[
+    BTN_TOOL_DOUBLETAP,
+    BTN_TOOL_TRIPLETAP,
+    BTN_TOOL_QUADTAP,
+    BTN_TOOL_QUINTTAP,
+];
+const INPUT_PROP_POINTER: usize = 0;
+const INPUT_PROP_DIRECT: usize = 1;
+/// Where a node's `properties` and `capabilities/key` bitmaps live.
+const SYSFS_INPUT: &str = "/sys/class/input";
+/// A sysfs attribute is at most one page; anything longer is not one.
+const SYSFS_BITMAP_BYTES: u64 = 4096;
+/// Touchpad gain with no acceleration curve: one millimetre of finger travel
+/// is 16 pixels, so a 60-70 mm pad crosses about 1000 px per stroke while a
+/// pixel stays a sixteenth of a millimetre.
+const TOUCHPAD_PX_PER_MM: i64 = 16;
+/// The same gain for a pad whose driver states no resolution: its X span is
+/// taken as 64 mm, and Y is scaled by X's units, assuming square units.
+const TOUCHPAD_SPAN_PX: i64 = 1024;
 const MAX_XKB_EVDEV_KEY: u16 = 247;
 const KEY_RELEASE: i32 = 0;
 const KEY_PRESS: i32 = 1;
@@ -641,6 +671,206 @@ impl AbsoluteAxes {
     }
 }
 
+/// What an absolute device's ABS_X/ABS_Y mean. A tablet's are a place on the
+/// screen; a touchpad's are a finger on a pad, whose MOTION moves the pointer.
+/// Tablet is the default because it is today's reading of any declared span:
+/// a device that cannot be classified keeps it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AbsoluteKind {
+    #[default]
+    Tablet,
+    Touchpad,
+}
+
+/// One bit of a sysfs input bitmap: hex words separated by spaces, most
+/// significant first, leading zero words omitted, each as wide as the
+/// kernel's `unsigned long` as this process sees it (a compat reader is shown
+/// 32-bit words). `None` when the text is not such a bitmap.
+fn bitmap_bit(text: &str, bit: usize) -> Option<bool> {
+    let word_bits = usize::try_from(usize::BITS).ok()?;
+    let mut words = Vec::new();
+    for word in text.split_ascii_whitespace() {
+        if !word.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        words.push(usize::from_str_radix(word, 16).ok()?);
+    }
+    let last = words.len().checked_sub(1)?;
+    let Some(at) = last.checked_sub(bit.checked_div(word_bits)?) else {
+        return Some(false);
+    };
+    let word = words.get(at)?;
+    let shift = u32::try_from(bit.checked_rem(word_bits)?).ok()?;
+    Some(word.checked_shr(shift)? & 1 == 1)
+}
+
+/// A touchpad is a pointer (`INPUT_PROP_POINTER`), not a direct surface
+/// (`INPUT_PROP_DIRECT`), that reports a finger (`BTN_TOOL_FINGER`) and no pen
+/// (`BTN_TOOL_PEN`, udev's `finger_but_no_pen`). Anything missing or
+/// unreadable keeps the tablet reading.
+fn classify(properties: Option<&str>, keys: Option<&str>) -> AbsoluteKind {
+    let touchpad = (|| {
+        let (properties, keys) = (properties?, keys?);
+        Some(
+            bitmap_bit(properties, INPUT_PROP_POINTER)?
+                && !bitmap_bit(properties, INPUT_PROP_DIRECT)?
+                && bitmap_bit(keys, usize::from(BTN_TOOL_FINGER))?
+                && !bitmap_bit(keys, usize::from(BTN_TOOL_PEN))?,
+        )
+    })();
+    if touchpad == Some(true) {
+        AbsoluteKind::Touchpad
+    } else {
+        AbsoluteKind::Tablet
+    }
+}
+
+fn read_bitmap(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    File::open(path)
+        .ok()?
+        .take(SYSFS_BITMAP_BYTES.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (u64::try_from(text.len()).ok()? <= SYSFS_BITMAP_BYTES).then_some(text)
+}
+
+/// Classify an absolute node from sysfs rather than `EVIOCGPROP`/`EVIOCGBIT`,
+/// which would be new ioctls. The node's basename is its sysfs name, as
+/// `framebuffer.rs` reads `/sys/class/graphics`.
+fn absolute_kind(sysfs: &Path, node: &Path) -> AbsoluteKind {
+    let Some(name) = node.file_name() else {
+        return AbsoluteKind::Tablet;
+    };
+    let device = sysfs.join(name).join("device");
+    classify(
+        read_bitmap(&device.join("properties")).as_deref(),
+        read_bitmap(&device.join("capabilities").join("key")).as_deref(),
+    )
+}
+
+/// One touchpad axis: the value a report last NAMED since open or the last
+/// discard, the contact's anchor on it, and the sub-pixel carry. A value the
+/// stream has not named is never anchored on: neither absinfo's `value`, a
+/// snapshot that can be newer than reports still queued, nor anything held
+/// from before a gap.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TouchAxis {
+    reported: Option<i32>,
+    anchor: Option<i32>,
+    remainder: i64,
+}
+
+impl TouchAxis {
+    fn release(&mut self) {
+        self.anchor = None;
+        self.remainder = 0;
+    }
+
+    /// Pixels travelled since the anchor, which then moves here. The first
+    /// named value only anchors.
+    fn travel(&mut self, scale: (i64, i64)) -> i32 {
+        let Some(at) = self.reported else {
+            self.release();
+            return 0;
+        };
+        let Some(from) = self.anchor.replace(at) else {
+            return 0;
+        };
+        touch_pixels(
+            i64::from(at).saturating_sub(i64::from(from)),
+            scale,
+            &mut self.remainder,
+        )
+    }
+}
+
+/// A touchpad's contact keys and axes. A discard clears all of it: the
+/// kernel re-sends neither an unchanged key nor an unchanged axis, so after a
+/// gap none of it is known, and motion waits for a real contact transition
+/// and a report naming each axis.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TouchTrack {
+    touch: bool,
+    finger: bool,
+    /// One bit per `MULTI_FINGER_TOOLS` entry held.
+    multi: u8,
+    x: TouchAxis,
+    y: TouchAxis,
+}
+
+impl TouchTrack {
+    fn tracking(&self) -> bool {
+        self.touch && self.finger && self.multi == 0
+    }
+
+    fn key(&mut self, code: u16, pressed: bool) {
+        match code {
+            BTN_TOUCH => self.touch = pressed,
+            BTN_TOOL_FINGER => self.finger = pressed,
+            _ => {
+                if let Some(bit) = MULTI_FINGER_TOOLS
+                    .iter()
+                    .position(|tool| *tool == code)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .and_then(|index| 1u8.checked_shl(index))
+                {
+                    if pressed {
+                        self.multi |= bit;
+                    } else {
+                        self.multi &= !bit;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pixels one report moves the pointer: only a single finger in
+    /// contact moves it, from the second named value of each axis on.
+    fn motion(&mut self, axes: AbsoluteAxes, raw_x: Option<i32>, raw_y: Option<i32>) -> (i32, i32) {
+        self.x.reported = raw_x.or(self.x.reported);
+        self.y.reported = raw_y.or(self.y.reported);
+        if !self.tracking() {
+            self.x.release();
+            self.y.release();
+            return (0, 0);
+        }
+        let (scale_x, scale_y) = touch_scales(axes);
+        (self.x.travel(scale_x), self.y.travel(scale_y))
+    }
+}
+
+/// Pixels per device unit on each axis, as (numerator, denominator). Each
+/// axis's own resolution where both state one; one stated resolution serves
+/// both, assuming square units; with none, X's span at `TOUCHPAD_SPAN_PX`
+/// serves both.
+fn touch_scales(axes: AbsoluteAxes) -> ((i64, i64), (i64, i64)) {
+    let per_mm = |resolution: i32| (TOUCHPAD_PX_PER_MM, i64::from(resolution));
+    let (x, y) = (axes.x.resolution, axes.y.resolution);
+    match (x > 0, y > 0) {
+        (true, true) => (per_mm(x), per_mm(y)),
+        (true, false) => (per_mm(x), per_mm(x)),
+        (false, true) => (per_mm(y), per_mm(y)),
+        (false, false) => {
+            let span = i64::from(axes.x.maximum).saturating_sub(i64::from(axes.x.minimum));
+            ((TOUCHPAD_SPAN_PX, span), (TOUCHPAD_SPAN_PX, span))
+        }
+    }
+}
+
+/// Scale a travel in device units to whole pixels, carrying the rest so slow
+/// motion accumulates rather than rounding away.
+fn touch_pixels(units: i64, (numerator, denominator): (i64, i64), remainder: &mut i64) -> i32 {
+    if denominator <= 0 {
+        *remainder = 0;
+        return 0;
+    }
+    let total = units.saturating_mul(numerator).saturating_add(*remainder);
+    let pixels = total.checked_div(denominator).unwrap_or(0);
+    *remainder = total.checked_rem(denominator).unwrap_or(0);
+    i32::try_from(pixels).unwrap_or(if pixels < 0 { i32::MIN } else { i32::MAX })
+}
+
 #[derive(Clone, Copy, Default)]
 struct EventTimeline {
     cutoff: Option<u128>,
@@ -696,6 +926,8 @@ struct PointerMotion {
     pressed: BTreeSet<u16>,
     buttons: Vec<PointerButtonTransition>,
     overflowed: bool,
+    /// `Some` for a touchpad, whose declared axes are read as finger motion.
+    touchpad: Option<TouchTrack>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1205,6 +1437,13 @@ impl InputTarget for LiveInputTarget {
 }
 
 impl PointerMotion {
+    fn touchpad() -> Self {
+        PointerMotion {
+            touchpad: Some(TouchTrack::default()),
+            ..PointerMotion::default()
+        }
+    }
+
     fn feed(&mut self, event: Event, axes: Option<AbsoluteAxes>) -> Option<PointerFrame> {
         match (event.kind, event.code) {
             (EV_REL, REL_X) => self.dx = self.dx.saturating_add(event.value),
@@ -1241,6 +1480,13 @@ impl PointerMotion {
                     }
                 }
             }
+            (EV_KEY, BTN_TOOL_FINGER..=BTN_TOOL_QUADTAP)
+                if event.value == KEY_PRESS || event.value == KEY_RELEASE =>
+            {
+                if let Some(track) = self.touchpad.as_mut() {
+                    track.key(event.code, event.value == KEY_PRESS);
+                }
+            }
             (EV_SYN, SYN_REPORT) => return self.frame(event.time, axes),
             _ => {}
         }
@@ -1266,13 +1512,19 @@ impl PointerMotion {
     /// it from a byte slice, and a slice has no descriptor to ask. Keeping
     /// the last known position is the closest thing available, and it is what
     /// every ordinary report between two frames already relies on.
+    ///
+    /// A touchpad forgets its contact keys and every named axis value, as
+    /// buttons are forgotten: the kernel re-sends neither until it changes,
+    /// so either belief could be wrong in both directions.
     fn reset(&mut self) {
         let (held_x, held_y) = (self.held_x, self.held_y);
         let timeline = self.timeline;
+        let touchpad = self.touchpad.map(|_| TouchTrack::default());
         *self = PointerMotion::default();
         self.timeline = timeline;
         self.held_x = held_x;
         self.held_y = held_y;
+        self.touchpad = touchpad;
     }
 
     /// Adopt a position the DEVICE reported out of band, which only the
@@ -1286,8 +1538,9 @@ impl PointerMotion {
     /// Close the frame being accumulated, or answer `None` where it would say
     /// nothing. A position WINS over a delta in the same frame rather than
     /// composing with it: the two are different claims about the same pointer,
-    /// and a device that sends both — a touchpad in absolute mode — means the
-    /// place, with the deltas its own smoothing of the way there.
+    /// and a device that sends both means the place, with the deltas its own
+    /// smoothing of the way there. A touchpad's axes are no place, so its
+    /// frame is always a distance: finger motion plus any delta.
     ///
     /// An absolute device's frame is a PLACE unless the only thing in it is a
     /// distance. A BUTTON needs somewhere to land as much as a motion does,
@@ -1304,6 +1557,16 @@ impl PointerMotion {
         };
         let (raw_x, raw_y) = (self.abs_x.take(), self.abs_y.take());
         let place = match axes {
+            Some(axes) if self.touchpad.is_some() => {
+                let (x, y) = self
+                    .touchpad
+                    .as_mut()
+                    .map_or((0, 0), |track| track.motion(axes, raw_x, raw_y));
+                PointerPlace::By {
+                    dx: dx.saturating_add(x),
+                    dy: dy.saturating_add(y),
+                }
+            }
             Some(axes) if raw_x.is_some() || raw_y.is_some() || !buttons.is_empty() => {
                 let x = raw_x.or(self.held_x).unwrap_or(axes.x.value);
                 let y = raw_y.or(self.held_y).unwrap_or(axes.y.value);
@@ -1855,12 +2118,16 @@ struct DeviceState<'a> {
 impl DeviceState<'_> {
     fn new(
         axes: Option<AbsoluteAxes>,
+        kind: AbsoluteKind,
         resync: &mut dyn FnMut() -> Option<AbsoluteAxes>,
         attention_enabled: bool,
     ) -> DeviceState<'_> {
         DeviceState {
             attention_enabled,
-            pointer: PointerMotion::default(),
+            pointer: match kind {
+                AbsoluteKind::Tablet => PointerMotion::default(),
+                AbsoluteKind::Touchpad => PointerMotion::touchpad(),
+            },
             dropped: false,
             axes,
             resync,
@@ -1880,8 +2147,16 @@ impl DeviceState<'_> {
     /// moved during the gap and then stopped would leave the cursor wherever
     /// it was until it happened to move again. Buttonless — the drop already
     /// released everything this device held.
+    ///
+    /// A touchpad publishes nothing and asks nothing: its position is a
+    /// finger, not the pointer, and the snapshot can be newer than reports
+    /// still queued, so it is no anchor. The `reset` every discard performs
+    /// has already forgotten its contact and axes.
     fn recover(&mut self, time: u32) -> Option<PointerFrame> {
         self.axes?;
+        if self.pointer.touchpad.is_some() {
+            return None;
+        }
         let fresh = (self.resync)()?;
         self.axes = Some(fresh);
         self.pointer.hold(fresh.x.value, fresh.y.value);
@@ -1984,17 +2259,20 @@ fn read_device<T: InputTarget>(
     device: usize,
     target: &Mutex<T>,
     bindings: &Mutex<KeyBindings>,
-    axes: Option<AbsoluteAxes>,
+    absolute: Option<(AbsoluteAxes, AbsoluteKind)>,
     resync: &mut dyn FnMut() -> Option<AbsoluteAxes>,
 ) -> Result<(), String> {
     let mut buffer = [0u8; READ_BATCH_BYTES];
     let mut filled = 0usize;
+    let axes = absolute.map(|(axes, _)| axes);
+    let kind = absolute.map_or(AbsoluteKind::Tablet, |(_, kind)| kind);
     // The boot oracle's only evidence that a real device answered, since the
     // gate machine has none to ask. Printed off the argument `state` is built
     // from rather than beside the `EVIOCGABS` in `start`: being ASKED is not
     // the property, being USED is, and an answer dropped between the two would
-    // leave this line printed over a device read as relative.
-    if let Some(axes) = axes {
+    // leave this line printed over a device read as relative. A touchpad is
+    // named apart, since its axes are not a place.
+    if let (Some(axes), AbsoluteKind::Tablet) = (axes, kind) {
         eprintln!(
             "TD-POINTER-ABSOLUTE device={} x={}..{} y={}..{}",
             path.display(),
@@ -2004,11 +2282,23 @@ fn read_device<T: InputTarget>(
             axes.y.maximum
         );
     }
+    if let (Some(axes), AbsoluteKind::Touchpad) = (axes, kind) {
+        eprintln!(
+            "TD-POINTER-TOUCHPAD device={} x={}..{} y={}..{} resolution={}x{}",
+            path.display(),
+            axes.x.minimum,
+            axes.x.maximum,
+            axes.y.minimum,
+            axes.y.maximum,
+            axes.x.resolution,
+            axes.y.resolution
+        );
+    }
     let attention_enabled = bindings
         .lock()
         .map_err(|_| "input bindings lock poisoned".to_string())?
         .attention_enabled;
-    let mut state = DeviceState::new(axes, resync, attention_enabled);
+    let mut state = DeviceState::new(axes, kind, resync, attention_enabled);
     let mut last_time = 0;
     let result = loop {
         // An empty tail, not just an out-of-range one: `get_mut(len..)` yields
@@ -2128,6 +2418,9 @@ pub fn start(
             sys::input_monotonic_clock(&file)?;
         }
         let axes = absolute_axes(&file);
+        // Only a device with axes is classified; a mouse reads no sysfs.
+        // `path` is under `/dev/input`, whose node names are sysfs's.
+        let absolute = axes.map(|axes| (axes, absolute_kind(Path::new(SYSFS_INPUT), &path)));
         // A second handle purely so a dropped batch can ask the device where
         // it is now. The reader takes an `impl Read` so its tests can drive it
         // from a byte slice, and a slice has no descriptor to ask.
@@ -2138,7 +2431,9 @@ pub fn start(
         // and the kernel writes every event to every client — so the reader
         // would be racing a queue nothing drains, which is what produces the
         // dropped batches this exists to recover from.
-        let resync_handle = axes.and_then(|_| match file.try_clone() {
+        // A touchpad's recovery asks nothing, so only a tablet keeps one.
+        let tablet = absolute.filter(|(_, kind)| *kind == AbsoluteKind::Tablet);
+        let resync_handle = tablet.and_then(|_| match file.try_clone() {
             Ok(handle) => Some(handle),
             // Reported rather than swallowed: the device still works, but a
             // dropped batch can no longer be recovered from, and every other
@@ -2170,7 +2465,7 @@ pub fn start(
                     device,
                     target.as_ref(),
                     bindings.as_ref(),
-                    axes,
+                    absolute,
                     &mut resync,
                 ) {
                     eprintln!("td-compositor: {error}");
@@ -2575,6 +2870,7 @@ mod tests {
             value,
             minimum,
             maximum,
+            resolution: 0,
         }
     }
 
@@ -2979,6 +3275,498 @@ mod tests {
                 y: over(4000, 32767)
             }
         );
+    }
+
+    /// A Synaptics-like pad: 80 units/mm across, 40 down, so one pixel is
+    /// five units of X and two and a half of Y at 16 px/mm.
+    fn touchpad_axes() -> AbsoluteAxes {
+        AbsoluteAxes {
+            x: sys::AbsInfo {
+                resolution: 80,
+                ..axis(1472, 1472, 5472)
+            },
+            y: sys::AbsInfo {
+                resolution: 40,
+                ..axis(1408, 1408, 4448)
+            },
+        }
+    }
+
+    fn place_of(frame: Option<PointerFrame>) -> Option<PointerPlace> {
+        frame.map(|frame| frame.place)
+    }
+
+    /// Put one finger down at (x, y): the report that only anchors.
+    fn land(pad: &mut PointerMotion, axes: Option<AbsoluteAxes>, time: u32, x: i32, y: i32) {
+        pad.feed(key(BTN_TOUCH, KEY_PRESS), axes);
+        pad.feed(key(BTN_TOOL_FINGER, KEY_PRESS), axes);
+        pad.feed(abs(time, ABS_X, x), axes);
+        pad.feed(abs(time, ABS_Y, y), axes);
+        assert_eq!(
+            pad.feed(syn(time), axes),
+            None,
+            "a landing moved the pointer"
+        );
+    }
+
+    #[test]
+    fn a_touchpad_finger_drags_the_pointer_and_a_new_touch_never_jumps() {
+        let axes = Some(touchpad_axes());
+        let mut pad = PointerMotion::touchpad();
+        // Hovering: the finger tool without contact moves nothing.
+        pad.feed(key(BTN_TOOL_FINGER, KEY_PRESS), axes);
+        pad.feed(abs(1, ABS_X, 2000), axes);
+        assert_eq!(pad.feed(syn(1), axes), None);
+        pad.feed(key(BTN_TOOL_FINGER, KEY_RELEASE), axes);
+        pad.feed(syn(1), axes);
+
+        land(&mut pad, axes, 2, 3000, 2000);
+        pad.feed(abs(3, ABS_X, 3050), axes);
+        pad.feed(abs(3, ABS_Y, 2025), axes);
+        assert_eq!(
+            place_of(pad.feed(syn(3), axes)),
+            Some(PointerPlace::By { dx: 10, dy: 10 })
+        );
+        // An omitted axis did not move.
+        pad.feed(abs(4, ABS_X, 3000), axes);
+        assert_eq!(
+            place_of(pad.feed(syn(4), axes)),
+            Some(PointerPlace::By { dx: -10, dy: 0 })
+        );
+
+        // Lift, then land across the pad: the new contact only anchors.
+        pad.feed(key(BTN_TOUCH, KEY_RELEASE), axes);
+        pad.feed(key(BTN_TOOL_FINGER, KEY_RELEASE), axes);
+        assert_eq!(pad.feed(syn(5), axes), None);
+        land(&mut pad, axes, 6, 5000, 4000);
+        pad.feed(abs(7, ABS_X, 5005), axes);
+        assert_eq!(
+            place_of(pad.feed(syn(7), axes)),
+            Some(PointerPlace::By { dx: 1, dy: 0 })
+        );
+
+        // The same events on a tablet are places, as before.
+        let mut tablet = PointerMotion::default();
+        tablet.feed(abs(8, ABS_X, 3000), axes);
+        assert!(matches!(
+            place_of(tablet.feed(syn(8), axes)),
+            Some(PointerPlace::At { .. })
+        ));
+    }
+
+    #[test]
+    fn touchpad_travel_is_scaled_by_resolution_and_keeps_its_remainder() {
+        let axes = Some(touchpad_axes());
+        let mut pad = PointerMotion::touchpad();
+        land(&mut pad, axes, 1, 3000, 2000);
+        // Three units is three fifths of a pixel; five such steps are three
+        // whole pixels, none lost to rounding.
+        let mut moved = Vec::new();
+        for step in 1..=5 {
+            pad.feed(abs(1 + step, ABS_X, 3000 + 3 * step as i32), axes);
+            moved.push(place_of(pad.feed(syn(1 + step), axes)));
+        }
+        let one = Some(PointerPlace::By { dx: 1, dy: 0 });
+        assert_eq!(moved, [None, one, None, one, one]);
+        // Back the whole way in one report, and Y at its own resolution.
+        pad.feed(abs(7, ABS_X, 3000), axes);
+        pad.feed(abs(7, ABS_Y, 2005), axes);
+        assert_eq!(
+            place_of(pad.feed(syn(7), axes)),
+            Some(PointerPlace::By { dx: -3, dy: 2 })
+        );
+
+        // No stated resolution: the X span is TOUCHPAD_SPAN_PX, for Y too.
+        let bare = Some(AbsoluteAxes {
+            x: axis(0, 0, 2048),
+            y: axis(0, 0, 100),
+        });
+        let mut pad = PointerMotion::touchpad();
+        land(&mut pad, bare, 1, 1000, 50);
+        pad.feed(abs(2, ABS_X, 1010), bare);
+        pad.feed(abs(2, ABS_Y, 54), bare);
+        assert_eq!(
+            place_of(pad.feed(syn(2), bare)),
+            Some(PointerPlace::By { dx: 5, dy: 2 })
+        );
+        assert_eq!(touch_pixels(i64::MAX, (16, 1), &mut 0), i32::MAX);
+        assert_eq!(touch_pixels(5, (16, 0), &mut 7), 0);
+    }
+
+    #[test]
+    fn multi_finger_frames_move_nothing_and_the_finger_left_re_anchors() {
+        let axes = Some(touchpad_axes());
+        let mut pad = PointerMotion::touchpad();
+        land(&mut pad, axes, 1, 3000, 2000);
+        // A second finger: the emulated position may now be the other one.
+        pad.feed(key(BTN_TOOL_FINGER, KEY_RELEASE), axes);
+        pad.feed(key(BTN_TOOL_DOUBLETAP, KEY_PRESS), axes);
+        pad.feed(abs(2, ABS_X, 4000), axes);
+        assert_eq!(pad.feed(syn(2), axes), None);
+        for tool in [BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP, BTN_TOOL_QUINTTAP] {
+            pad.feed(key(tool, KEY_PRESS), axes);
+            pad.feed(abs(3, ABS_X, 4400), axes);
+            assert_eq!(pad.feed(syn(3), axes), None, "{tool:#x} moved");
+            pad.feed(key(tool, KEY_RELEASE), axes);
+        }
+        // Back to one finger, somewhere else: anchors, then moves from there.
+        pad.feed(key(BTN_TOOL_DOUBLETAP, KEY_RELEASE), axes);
+        pad.feed(key(BTN_TOOL_FINGER, KEY_PRESS), axes);
+        pad.feed(abs(4, ABS_X, 4500), axes);
+        assert_eq!(pad.feed(syn(4), axes), None);
+        pad.feed(abs(5, ABS_X, 4510), axes);
+        assert_eq!(
+            place_of(pad.feed(syn(5), axes)),
+            Some(PointerPlace::By { dx: 2, dy: 0 })
+        );
+        // A finger tool held beside any multi-finger one is still several,
+        // and the finger alone again only re-anchors.
+        for (tool, x) in [
+            (BTN_TOOL_DOUBLETAP, 4600),
+            (BTN_TOOL_TRIPLETAP, 4800),
+            (BTN_TOOL_QUADTAP, 5000),
+            (BTN_TOOL_QUINTTAP, 5200),
+        ] {
+            pad.feed(key(tool, KEY_PRESS), axes);
+            pad.feed(abs(6, ABS_X, x), axes);
+            assert_eq!(pad.feed(syn(6), axes), None, "{tool:#x} moved");
+            pad.feed(key(tool, KEY_RELEASE), axes);
+            pad.feed(abs(7, ABS_X, x + 100), axes);
+            assert_eq!(pad.feed(syn(7), axes), None, "{tool:#x} kept an anchor");
+        }
+    }
+
+    #[test]
+    fn a_clickpad_press_reaches_the_client_and_contact_keys_do_not() {
+        let mut data = Vec::new();
+        for event in [
+            key(BTN_TOUCH, KEY_PRESS),
+            key(BTN_TOOL_FINGER, KEY_PRESS),
+            abs(1, ABS_X, 3000),
+            abs(1, ABS_Y, 2000),
+            syn(1),
+            abs(2, ABS_X, 3050),
+            syn(2),
+            key(BTN_LEFT, KEY_PRESS),
+            syn(3),
+            key(BTN_LEFT, KEY_RELEASE),
+            key(BTN_TOUCH, KEY_RELEASE),
+            key(BTN_TOOL_FINGER, KEY_RELEASE),
+            syn(4),
+        ] {
+            data.extend_from_slice(&encode(event));
+        }
+        let (target, result, _) = drain_kind(
+            data,
+            Vec::new(),
+            Some(touchpad_axes()),
+            AbsoluteKind::Touchpad,
+            None,
+            None,
+        );
+        assert_eq!(result, Ok(()));
+        let left = |time, state| PointerButtonInput {
+            time,
+            button: u32::from(BTN_LEFT),
+            state,
+        };
+        assert_eq!(
+            target.pointer_frames,
+            [
+                (2, 10, 0, Vec::new()),
+                (3, 0, 0, vec![left(3, PointerButtonState::Pressed)]),
+                (4, 0, 0, vec![left(4, PointerButtonState::Released)]),
+            ]
+        );
+        assert!(target.pointer_places.is_empty(), "a touchpad was a place");
+        assert!(target.keys.is_empty(), "a contact key reached the keyboard");
+    }
+
+    fn dropped(time: u32) -> Event {
+        Event {
+            timestamp: u128::from(time) * 1_000_000,
+            time,
+            kind: EV_SYN,
+            code: SYN_DROPPED,
+            value: 0,
+        }
+    }
+
+    /// Drive a touchpad reader over `events`, answering a resync with `fresh`.
+    fn drain_touchpad(
+        events: &[Event],
+        fresh: Option<AbsoluteAxes>,
+    ) -> (RecordingTarget, Result<(), String>, usize) {
+        let data = events.iter().copied().flat_map(encode).collect();
+        drain_kind(
+            data,
+            Vec::new(),
+            Some(touchpad_axes()),
+            AbsoluteKind::Touchpad,
+            fresh,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_touchpad_recovery_publishes_no_place_and_trusts_no_snapshot() {
+        // The snapshot's Y is newer than what the queue still holds, and the
+        // pre-drop Y may have changed inside the gap: neither is an anchor.
+        let fresh = AbsoluteAxes {
+            y: sys::AbsInfo {
+                value: 2100,
+                ..touchpad_axes().y
+            },
+            ..touchpad_axes()
+        };
+        let (target, result, asked) = drain_touchpad(
+            &[
+                key(BTN_TOUCH, KEY_PRESS),
+                key(BTN_TOOL_FINGER, KEY_PRESS),
+                abs(1, ABS_X, 3000),
+                abs(1, ABS_Y, 2000),
+                syn(1),
+                abs(2, ABS_X, 3050),
+                syn(2),
+                dropped(3),
+                abs(3, ABS_X, 3400),
+                syn(4),
+                key(BTN_TOUCH, KEY_RELEASE),
+                key(BTN_TOOL_FINGER, KEY_RELEASE),
+                syn(5),
+                // A new contact whose Y the kernel omits as unchanged.
+                key(BTN_TOUCH, KEY_PRESS),
+                key(BTN_TOOL_FINGER, KEY_PRESS),
+                abs(6, ABS_X, 3500),
+                syn(6),
+                // Y named for the first time since the drop: it anchors.
+                abs(7, ABS_X, 3505),
+                abs(7, ABS_Y, 2104),
+                syn(7),
+                abs(8, ABS_Y, 2109),
+                syn(8),
+            ],
+            Some(fresh),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(asked, 0, "a touchpad recovery asked the device");
+        assert!(target.pointer_places.is_empty(), "a recovery placed a pad");
+        assert_eq!(
+            target.pointer_frames,
+            [
+                (2, 10, 0, Vec::new()),
+                (7, 1, 0, Vec::new()),
+                (8, 0, 2, Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_drop_forgets_contact_keys_so_a_lost_lift_cannot_leave_the_pad_dead() {
+        // Two fingers, then a gap that swallowed DOUBLETAP=0 and FINGER=1.
+        // Believing DOUBLETAP still held would refuse every later contact.
+        let (target, result, _) = drain_touchpad(
+            &[
+                key(BTN_TOUCH, KEY_PRESS),
+                key(BTN_TOOL_DOUBLETAP, KEY_PRESS),
+                abs(1, ABS_X, 3000),
+                abs(1, ABS_Y, 2000),
+                syn(1),
+                abs(2, ABS_X, 3100),
+                syn(2),
+                dropped(3),
+                key(BTN_TOOL_DOUBLETAP, KEY_RELEASE),
+                key(BTN_TOOL_FINGER, KEY_PRESS),
+                syn(4),
+                // Still one finger, unknown since the gap: no motion.
+                abs(5, ABS_X, 3200),
+                syn(5),
+                key(BTN_TOUCH, KEY_RELEASE),
+                key(BTN_TOOL_FINGER, KEY_RELEASE),
+                syn(6),
+                key(BTN_TOUCH, KEY_PRESS),
+                key(BTN_TOOL_FINGER, KEY_PRESS),
+                abs(7, ABS_X, 4000),
+                abs(7, ABS_Y, 3000),
+                syn(7),
+                abs(8, ABS_X, 4010),
+                syn(8),
+            ],
+            None,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(target.pointer_frames, [(8, 2, 0, Vec::new())]);
+    }
+
+    #[test]
+    fn a_drop_forgets_contact_keys_so_a_lost_second_finger_cannot_move() {
+        // One finger tracking, then a gap that swallowed FINGER=0 and
+        // DOUBLETAP=1: the reports after it are two fingers.
+        let (target, result, _) = drain_touchpad(
+            &[
+                key(BTN_TOUCH, KEY_PRESS),
+                key(BTN_TOOL_FINGER, KEY_PRESS),
+                abs(1, ABS_X, 3000),
+                abs(1, ABS_Y, 2000),
+                syn(1),
+                abs(2, ABS_X, 3050),
+                syn(2),
+                dropped(3),
+                key(BTN_TOOL_FINGER, KEY_RELEASE),
+                key(BTN_TOOL_DOUBLETAP, KEY_PRESS),
+                syn(4),
+                abs(5, ABS_X, 3150),
+                syn(5),
+                abs(6, ABS_X, 3250),
+                abs(6, ABS_Y, 2100),
+                syn(6),
+                // Down to one finger again, re-touched: it moves once anchored.
+                key(BTN_TOOL_DOUBLETAP, KEY_RELEASE),
+                key(BTN_TOUCH, KEY_RELEASE),
+                syn(7),
+                key(BTN_TOUCH, KEY_PRESS),
+                key(BTN_TOOL_FINGER, KEY_PRESS),
+                abs(8, ABS_X, 3300),
+                syn(8),
+                abs(9, ABS_X, 3305),
+                syn(9),
+            ],
+            None,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            target.pointer_frames,
+            [(2, 10, 0, Vec::new()), (9, 1, 0, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn one_stated_resolution_serves_both_axes() {
+        let only_x = Some(AbsoluteAxes {
+            x: sys::AbsInfo {
+                resolution: 80,
+                ..axis(0, 0, 4000)
+            },
+            y: axis(0, 0, 100),
+        });
+        let mut pad = PointerMotion::touchpad();
+        land(&mut pad, only_x, 1, 1000, 50);
+        pad.feed(abs(2, ABS_X, 1010), only_x);
+        // 20 units at X's 80/mm is 4 px; X's span fallback would say 5.
+        pad.feed(abs(2, ABS_Y, 70), only_x);
+        assert_eq!(
+            place_of(pad.feed(syn(2), only_x)),
+            Some(PointerPlace::By { dx: 2, dy: 4 })
+        );
+        let only_y = Some(AbsoluteAxes {
+            x: axis(0, 0, 4000),
+            y: sys::AbsInfo {
+                resolution: 40,
+                ..axis(0, 0, 100)
+            },
+        });
+        let mut pad = PointerMotion::touchpad();
+        land(&mut pad, only_y, 1, 1000, 50);
+        pad.feed(abs(2, ABS_X, 1005), only_y);
+        pad.feed(abs(2, ABS_Y, 55), only_y);
+        assert_eq!(
+            place_of(pad.feed(syn(2), only_y)),
+            Some(PointerPlace::By { dx: 2, dy: 2 })
+        );
+    }
+
+    /// `capabilities/key` of a Synaptics clickpad and of QEMU's virtio
+    /// tablet, as the kernel prints them for a 64-bit reader.
+    const SYNAPTICS_KEYS: &str = "6420 30000 0 0 0 0\n";
+    const VIRTIO_TABLET_KEYS: &str = "30400 1f0000 0 0 0 0\n";
+
+    #[test]
+    fn a_sysfs_bitmap_is_read_from_its_least_significant_word() {
+        let finger = usize::from(BTN_TOOL_FINGER);
+        assert_eq!(bitmap_bit(SYNAPTICS_KEYS, finger), Some(true));
+        assert_eq!(
+            bitmap_bit(SYNAPTICS_KEYS, usize::from(BTN_TOUCH)),
+            Some(true)
+        );
+        assert_eq!(
+            bitmap_bit(SYNAPTICS_KEYS, usize::from(BTN_LEFT)),
+            Some(true)
+        );
+        assert_eq!(bitmap_bit(SYNAPTICS_KEYS, 0x112), Some(false));
+        assert_eq!(
+            bitmap_bit(VIRTIO_TABLET_KEYS, usize::from(BTN_TOUCH)),
+            Some(true)
+        );
+        assert_eq!(bitmap_bit(VIRTIO_TABLET_KEYS, finger), Some(false));
+        // Leading zero words are omitted, so a high bit past the text is clear.
+        assert_eq!(bitmap_bit("1\n", 700), Some(false));
+        assert_eq!(bitmap_bit("1\n", 0), Some(true));
+        for garbled in ["", "\n", "+1", "1 zz", "-1", "10000000000000000000"] {
+            assert_eq!(bitmap_bit(garbled, 0), None, "{garbled:?}");
+        }
+    }
+
+    #[test]
+    fn a_touchpad_is_a_pointer_that_is_not_direct_and_reports_a_finger() {
+        let touchpad = AbsoluteKind::Touchpad;
+        let tablet = AbsoluteKind::Tablet;
+        // POINTER alone, and POINTER with BUTTONPAD (and TOPBUTTONPAD).
+        for properties in ["1\n", "5\n", "d\n"] {
+            assert_eq!(classify(Some(properties), Some(SYNAPTICS_KEYS)), touchpad);
+        }
+        // DIRECT is a touchscreen, with or without POINTER.
+        for properties in ["2\n", "3\n"] {
+            assert_eq!(classify(Some(properties), Some(SYNAPTICS_KEYS)), tablet);
+        }
+        // QEMU's virtio tablet sets no property and no finger tool; a pen
+        // tablet may set POINTER but has no finger either.
+        assert_eq!(classify(Some("0\n"), Some(VIRTIO_TABLET_KEYS)), tablet);
+        assert_eq!(classify(Some("1\n"), Some(VIRTIO_TABLET_KEYS)), tablet);
+        // A finger beside a pen (bit 0x140) is a pen tablet, as udev's
+        // `finger_but_no_pen` reads it.
+        assert_eq!(classify(Some("1\n"), Some("6421 30000 0 0 0 0\n")), tablet);
+        // Missing or unreadable keeps the tablet reading.
+        assert_eq!(classify(None, Some(SYNAPTICS_KEYS)), tablet);
+        assert_eq!(classify(Some("1\n"), None), tablet);
+        assert_eq!(classify(None, None), tablet);
+        assert_eq!(classify(Some("x\n"), Some(SYNAPTICS_KEYS)), tablet);
+        assert_eq!(classify(Some("1\n"), Some("6420 3000g\n")), tablet);
+    }
+
+    #[test]
+    fn a_node_is_classified_from_its_own_sysfs_entry_and_fails_to_tablet() {
+        struct Tree(PathBuf);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tree = Tree(std::env::temp_dir().join(format!(
+            "td-input-sysfs-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        )));
+        let entry = |name: &str, properties: Option<&str>, keys: &str| {
+            let device = tree.0.join(name).join("device");
+            std::fs::create_dir_all(device.join("capabilities")).unwrap();
+            std::fs::write(device.join("capabilities").join("key"), keys).unwrap();
+            match properties {
+                Some(text) => std::fs::write(device.join("properties"), text).unwrap(),
+                // A directory where the file should be: present, unreadable.
+                None => std::fs::create_dir(device.join("properties")).unwrap(),
+            }
+        };
+        entry("event3", Some("5\n"), SYNAPTICS_KEYS);
+        entry("event4", Some("0\n"), VIRTIO_TABLET_KEYS);
+        entry("event5", None, SYNAPTICS_KEYS);
+        entry("event6", Some(&"0 ".repeat(4096)), SYNAPTICS_KEYS);
+        let kind = |node: &str| absolute_kind(&tree.0, Path::new(node));
+        assert_eq!(kind("/dev/input/event3"), AbsoluteKind::Touchpad);
+        assert_eq!(kind("/dev/input/event4"), AbsoluteKind::Tablet);
+        assert_eq!(kind("/dev/input/event5"), AbsoluteKind::Tablet);
+        assert_eq!(kind("/dev/input/event6"), AbsoluteKind::Tablet);
+        assert_eq!(kind("/dev/input/event9"), AbsoluteKind::Tablet);
+        assert_eq!(kind("/"), AbsoluteKind::Tablet);
     }
 
     fn press(bindings: &mut KeyBindings, code: u16) -> Option<Command> {
@@ -3544,6 +4332,24 @@ mod tests {
         resync: Option<AbsoluteAxes>,
         pointer_error: Option<String>,
     ) -> (RecordingTarget, Result<(), String>, usize) {
+        drain_kind(
+            data,
+            chunks,
+            axes,
+            AbsoluteKind::Tablet,
+            resync,
+            pointer_error,
+        )
+    }
+
+    fn drain_kind(
+        data: Vec<u8>,
+        chunks: Vec<std::io::Result<usize>>,
+        axes: Option<AbsoluteAxes>,
+        kind: AbsoluteKind,
+        resync: Option<AbsoluteAxes>,
+        pointer_error: Option<String>,
+    ) -> (RecordingTarget, Result<(), String>, usize) {
         let target = Mutex::new(RecordingTarget::default());
         target
             .lock()
@@ -3562,7 +4368,7 @@ mod tests {
             0,
             &target,
             &bindings,
-            axes,
+            axes.map(|axes| (axes, kind)),
             &mut resync,
         );
         (
@@ -4748,7 +5554,7 @@ mod tests {
             asked.set(asked.get().saturating_add(1));
             Some(moved)
         };
-        let mut state = DeviceState::new(Some(tablet()), &mut resync, false);
+        let mut state = DeviceState::new(Some(tablet()), AbsoluteKind::Tablet, &mut resync, false);
         // A place first, so the recovery has a stale position to replace
         // rather than an absent one.
         for event in [abs(1, ABS_X, 100), abs(1, ABS_Y, 100), syn(1)] {
@@ -4789,7 +5595,7 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync, false);
+        let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, false);
         for index in 0..=MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
             apply_device_event(
                 &target,
@@ -5879,7 +6685,7 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync, false);
+        let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, false);
         for event in [
             key(KEY_LEFTMETA, KEY_PRESS),
             key(KEY_V, KEY_PRESS),
@@ -5960,7 +6766,7 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync, false);
+        let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, false);
         for event in [
             key(BTN_MOUSE, KEY_PRESS),
             Event {
@@ -6156,7 +6962,7 @@ mod tests {
                 ..KeyBindings::default()
             });
             let mut resync = || None;
-            let mut state = DeviceState::new(None, &mut resync, true);
+            let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
             for event in [key(code, KEY_PRESS), key(code, KEY_RELEASE)] {
                 apply_device_event(&target, event, 0, &bindings, &mut state).unwrap();
             }
@@ -6653,7 +7459,7 @@ mod tests {
             ..KeyBindings::default()
         });
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync, true);
+        let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
         let partial = Event {
             kind: 4,
             code: 0,
@@ -6737,7 +7543,7 @@ mod tests {
             ..KeyBindings::default()
         });
         let mut resync = || None;
-        let mut state = DeviceState::new(None, &mut resync, true);
+        let mut state = DeviceState::new(None, AbsoluteKind::Tablet, &mut resync, true);
         // Linux can collect a value before close and timestamp the whole
         // report at a later input_sync. Userspace has seen no partial record.
         for event in [
@@ -6790,7 +7596,8 @@ mod tests {
                     calls.set(calls.get() + 1);
                     Some(moved)
                 };
-                let mut state = DeviceState::new(Some(tablet()), &mut resync, true);
+                let mut state =
+                    DeviceState::new(Some(tablet()), AbsoluteKind::Tablet, &mut resync, true);
                 state.pointer.hold(100, 100);
                 if dropped {
                     apply_device_event(
