@@ -1728,6 +1728,24 @@ The selected-reader allocation intervals cover folded Q/Base64 success,
 repair, unknown/oversized fallback and late malformed/fresh deadline refusal.
 Whole-field placement, pipeline/worker/native/RSS qualification remain open.
 
+M06db's URI encoded-word run reader retains the existing 512-byte ceiling for
+Cursor plus HeaderBudget and one 75-octet scratch buffer. Shared passive
+framing fits four bytes and owns no work or source. Complete fold validation,
+whole-run classification and decoding replay use three separately funded wire
+passes; classification and replay each recognize every healthy bounded word.
+All passes use the same original allowances and prepaid credit. No word list,
+second header arena or source-sized scratch is introduced. Each poll retains
+the 225-visit, 452-step, 29-job-record and four-output-byte ceilings, with at
+most one scalar. Unknown or mixed runs emit no decoded prefix; later resource
+refusal retires provisional output.
+
+Warm/measured Rust allocation intervals cover a 2048-word folded run, exact
+75-octet words, combined diagnostics, absence, unknown/mixed/oversized fallback,
+late malformed folds, zero records and late scalar output exhaustion. They
+also qualify original owner reuse and fresh completed retirement. Input
+allocation precedes the measured interval; worker/native/RSS and complete
+Content-Location placement/retention remain separate qualifications.
+
 M06cq's selected literal URI reader plus HeaderBudget fits 320 bytes in the
 existing parser region. It retains shared fixed validator/unfolder state
 and source borrows, with no source-sized scratch or second header arena.

@@ -4664,6 +4664,37 @@ its exact length is not needed to reserve backing. No window grows here.
 Traversal, location placement, source authorization and response
 publication remain separate.
 
+### 1.107 Selected URI encoded-word runs
+
+M06db adds mime_location_word::Cursor::new_run for a complete
+caller-selected, placement-authorized encoded-word run, excluding
+surrounding CFWS and the final header ending. Constructor admission and
+single-word new behavior are unchanged. Complete wire unfolding precedes
+a whole-run recognition pass; only then does a second candidate pass
+decode scalars. Wire whitespace is removed before recognition. Adjacent
+words require a gap containing removed wire whitespace in the original
+source; touching words request whole fallback. Each logical word has the
+shared 75-octet ceiling; a run may be longer without growing scratch.
+
+Unknown charset, invalid word syntax, oversized words, empty spelling or
+mixed literal text complete with End.recognized false and no scalars.
+The enclosing owner replays that entire selected spelling. Malformed
+folds and original resource refusal are fatal, including after an
+invalid candidate. Classification deliberately funds the remaining
+source through admitted EOF after rejection; the prior fold pass does
+not prepay or bypass this complete classification attempt. Healthy runs
+preserve decoded spaces, non-ASCII, case and decomposed spelling. No URI
+validation, percent decoding, NFC, field placement or label resolution
+follows. End.encoding_problem combines every word's repair diagnostic.
+
+The original Meter, HeaderBudget and prepaid credit fund all three wire
+passes, both bounded recognitions per word, decoding and scalar output.
+One fixed buffer is immutable during each word's decoding; relative
+descriptors survive cursor relocation. Scalars remain provisional until
+whole healthy completion and fresh original admission. Cached Complete,
+sticky refusal, final admission and pointer-identical owner handoff
+retain the single-word contract.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

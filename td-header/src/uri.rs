@@ -1,6 +1,7 @@
-//! Generic RFC 3986 URI and reference syntax; no resolution or scheme policy.
+//! URI syntax, wire spelling and passive word framing; no resolution policy.
 pub mod spelling;
 pub mod unfold;
+pub mod word_token;
 use crate::{Charge, Work};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error<E> {

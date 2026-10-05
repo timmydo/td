@@ -2018,6 +2018,15 @@ Initial independently landable increments:
   and warm/measured allocation. Location placement, traversal and response
   publication remain subsequent work.
 
+- **M06db — selected URI encoded-word runs:** extract passive bounded word
+  framing into shared std-only td-header and use its common 75-octet ceiling.
+  Validate complete folds and classify every word before scalar replay under
+  original owners. Preserve decoded literal spelling and combined diagnostics;
+  unknown, oversized or mixed runs request whole-run fallback. Qualify every
+  resource/deadline cut, exact word ceilings, late malformed tails and measured
+  long-run/refusal allocation. Complete Content-Location placement, retained
+  labels and traversal/response publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

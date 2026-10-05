@@ -1,7 +1,7 @@
 //! Bounded encoded-word recognition/decoding; the caller owns lexical placement.
 pub mod decode;
 
-pub(crate) const MAX_TOKEN_OCTETS: usize = 75;
+pub(crate) const MAX_TOKEN_OCTETS: usize = td_header::uri::word_token::MAX_OCTETS;
 
 use crate::{
     admission::work::{Charge, Meter, Stop},

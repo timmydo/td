@@ -428,6 +428,19 @@ scratch transitions, recognition, decoding and output. Whole-field
 CFWS/placement and URI label validity remain
 open; the helper grants no Content-Location or publication authority.
 
+M06db extends the selected URI word reader with caller-authorized
+complete encoded-word runs. Shared passive framing locates bounded
+candidates while existing mail recognition supplies grammar and charset
+policy. Complete wire fold validation and whole-run classification
+precede every scalar. Unknown, oversized, touching or mixed literal runs
+request whole-spelling fallback without decoded prefix output. Healthy
+runs replay through one fixed 75-octet buffer, funding all three wire
+passes and both recognitions per word through the same original owners.
+Diagnostics accumulate across words. Decoded labels preserve spaces,
+non-ASCII and decomposed spelling without NFC or URI validation.
+Whole-field placement, label matching and publication remain enclosing
+responsibilities.
+
 M06cq composes shared URI unfolding and reference validation into a selected
 literal spelling reader. It validates the complete spelling before replaying
 literal ASCII octets and slice-relative provenance under original job/header

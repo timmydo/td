@@ -322,3 +322,17 @@ across replacement callbacks. Consuming finish requires healthy completion but
 performs no fresh admission; callers separately check original work before
 consuming/retaining offsets. Normative surrounding grammar:
 https://www.rfc-editor.org/rfc/rfc2557.html#section-4.1.
+
+uri::word_token::Token passively frames one logical encoded-word
+candidate beginning with =? through its first payload ?= after charset
+and encoding separators. It retains at most four bytes of state and
+enforces the shared 75-octet logical ceiling shared by every RFC 2047
+word context. URI runs are the first framing consumer; the state is
+reusable over any already-funded logical octets, independently of
+URI-reference validation. It does not validate charset, encoding or
+payload syntax, unfold wire bytes, recognize words or grant placement.
+The enclosing owner funds each octet before feeding it. Copies retain
+framing progress, not work or source authority. An extra feed after
+completion rejects; refusal is sticky. A payload beginning with = does
+not close at its preceding encoding separator. Normative word ceiling
+and separators: https://www.rfc-editor.org/rfc/rfc2047.html#section-2.

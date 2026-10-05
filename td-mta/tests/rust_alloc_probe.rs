@@ -2000,6 +2000,174 @@ fn uri_word_values() {
     assert_eq!(before, after, "URI selected word allocated");
 }
 
+fn uri_word_runs() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_location_word::{Cursor, Error, Status},
+        nfc::HeaderBudget,
+        ports::{Deadline, Tick},
+    };
+    let long = "=?utf-8?Q?e=CC=81?= \r\n ".repeat(2048);
+    let maximum = format!("=?ascii?Q?{}?= =?ascii?Q?b?=", "a".repeat(63));
+    let oversized = format!("=?ascii?Q?a?= =?ascii?Q?{}?=", "a".repeat(64));
+    let mut bad_tail = oversized.clone();
+    bad_tail.push_str("\r\n");
+    let before = COUNTERS.snapshot();
+    for (source, recognized, problem, bytes, fault, output_limit, records) in [
+        (long.as_bytes(), true, false, 6144, None, 100_000, 1_000_000),
+        (
+            maximum.as_bytes(),
+            true,
+            false,
+            64,
+            None,
+            100_000,
+            1_000_000,
+        ),
+        (
+            b"=?utf-8?Q?=FF?= =?ascii?Q?ok?=".as_slice(),
+            true,
+            true,
+            5,
+            None,
+            100_000,
+            1_000_000,
+        ),
+        (b"", false, false, 0, None, 100_000, 1_000_000),
+        (
+            b"=?ascii?Q?a?= =?unknown?Q?b?=",
+            false,
+            false,
+            0,
+            None,
+            100_000,
+            1_000_000,
+        ),
+        (
+            b"=?ascii?Q?a?= tail",
+            false,
+            false,
+            0,
+            None,
+            100_000,
+            1_000_000,
+        ),
+        (
+            oversized.as_bytes(),
+            false,
+            false,
+            0,
+            None,
+            100_000,
+            1_000_000,
+        ),
+        (
+            bad_tail.as_bytes(),
+            false,
+            false,
+            0,
+            Some(Error::MalformedFold),
+            100_000,
+            1_000_000,
+        ),
+        (
+            b"=?ascii?Q?a?= =?ascii?Q?b?=",
+            false,
+            false,
+            1,
+            Some(Error::Work(Stop::OutputBytes)),
+            1,
+            1_000_000,
+        ),
+        (
+            b"=?ascii?Q?a?=",
+            false,
+            false,
+            0,
+            Some(Error::Work(Stop::Records)),
+            100_000,
+            0,
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records,
+                output_bytes: output_limit,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let work_pointer = std::ptr::from_ref(&work);
+        let budget_pointer = std::ptr::from_ref(&budget);
+        let mut cursor = Cursor::new_run(source, &mut work, &mut budget);
+        let mut count = 0;
+        let mut result = None;
+        let mut complete = false;
+        for _ in 0..2_000_000 {
+            match cursor.poll(Tick(1)) {
+                Ok(Status::Scalar(value)) => {
+                    count += value.len_utf8();
+                    black_box(value);
+                }
+                Ok(Status::Yield) => assert_eq!(cursor.end(), None),
+                Ok(Status::Complete) => {
+                    complete = true;
+                    break;
+                }
+                Err(error) => {
+                    result = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(count, bytes);
+        assert_eq!(result, fault);
+        if let Some(error) = fault {
+            assert_eq!(cursor.end(), None);
+            assert_eq!(cursor.poll(Tick(100)), Err(error));
+            assert_eq!(cursor.check_deadline(Tick(100)), Err(error));
+        } else {
+            assert!(complete);
+            let end = cursor.end().unwrap();
+            assert_eq!(end.recognized, recognized);
+            assert_eq!(end.encoding_problem, problem);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            let (work, budget, end) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(std::ptr::from_ref(work), work_pointer);
+            assert_eq!(std::ptr::from_ref(budget), budget_pointer);
+            assert_eq!(end.recognized, recognized);
+            let mut cursor = Cursor::new_run(b"=?ascii?Q?x?=", work, budget);
+            let mut complete = false;
+            for _ in 0..1000 {
+                match cursor.poll(Tick(1)).unwrap() {
+                    Status::Scalar(value) => {
+                        assert_eq!(value, 'x');
+                        black_box(value);
+                    }
+                    Status::Yield => {}
+                    Status::Complete => {
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+            assert!(complete);
+            assert_eq!(cursor.poll(Tick(100)), Ok(Status::Complete));
+            assert_eq!(
+                cursor.check_deadline(Tick(100)),
+                Err(Error::Work(Stop::Deadline))
+            );
+            assert_eq!(cursor.end(), None);
+            assert!(cursor.finish(Tick(1)).is_err());
+        }
+    }
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "URI encoded-word run allocated");
+}
+
 fn uri_unfold_values() {
     use td_header::uri::unfold::{Cursor, Error, Status};
     struct UnfoldWork {
@@ -9820,6 +9988,7 @@ fn main() {
         uri_spelling_values();
         uri_literal_values();
         uri_word_values();
+        uri_word_runs();
         uri_unfold_values();
         uri_reference_values();
         content_id_values();
@@ -9989,6 +10158,7 @@ fn main() {
     uri_spelling_values();
     uri_literal_values();
     uri_word_values();
+    uri_word_runs();
     uri_unfold_values();
     uri_reference_values();
     content_id_values();
