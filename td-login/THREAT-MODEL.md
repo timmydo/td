@@ -44,6 +44,10 @@ Adversaries considered:
   `exec-as`, or `exec-service-as` chooses argv, the environment, the
   current directory, and the open file descriptors, including which file
   is on fd 0.
+- **A4 — a person at a locked machine** without an enrolled login key and
+  its PIN. This adversary exists only under the planned login-key tier in
+  [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), which owns that tier's scope; td-login's
+  part is the console refusal in §3.
 
 Explicitly **not** in the model: an attacker who already has uid 0
 (nothing here can constrain them), physical DMA, and the kernel itself.
@@ -65,7 +69,9 @@ from the shared source used by the realized OpenSSH recipe test. The daemon
 requires this configuration file explicitly; there is no optional include or
 fallback configuration. Generation failure stops boot before user processes,
 and the caller serializes publication against all account readers. This
-changes no credential transition or authentication method.
+changes no credential transition or authentication method. The planned
+login-key tier adds an enforced form of this policy that refuses root and
+every account but the primary (`TOKEN-LOGIN.md`, "SSH").
 The boot-health login uses a fresh volatile key for the unprivileged UI account,
 but its root-owned authorization line is constrained by OpenSSH `restrict` and
 `from="127.0.0.1"`; possession of that key cannot create a network-reachable
@@ -352,6 +358,29 @@ Consequences worth stating plainly:
   locked. These are properties of the shipped `SYSTEM` const, and the
   interactive behavior is unchanged from the busybox chain this replaces,
   which also accepted the empty shadow field without prompting.
+
+**Target, not implemented: login keys.** Under
+[`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), enrolling a FIDO2 login key publishes
+`/var/lib/td/login/1000`. td-login reads no CTAP and does not parse that
+record; it asks only whether one may exist. Unless the root-owned mode-0700
+`/var/lib/td/login` opens with valid metadata and the record name is absent,
+interactive `login` and `login-primary` refuse **every** account, root
+included, so no console path bypasses the key. Before refusing, they return
+a terminal that passes §6's checks to root:root with the pinned `TTY_MODE`,
+so no unprivileged process can open the line afresh. Neither `su` nor
+root's empty shadow field exists as an administrative path on an enrolled
+machine (TOKEN-LOGIN.md, "Enrollment requires §L.1 elevation"). The
+forced paths (`login -f`, `su`, `exec-as`, `exec-primary`,
+`exec-service-as`) keep this section's rules: they change credentials only
+for an all-root caller (§4) and are otherwise no-ops. A greeter must
+therefore use `login-primary`; the increment that adds this refusal
+deletes `build_autologin`'s `login -f` fallback for a non-primary
+autologin account, and `system_def_is_self_consistent` then requires the
+autologin account to be the primary one. The refused greeter prints one
+fixed line and holds the line instead of respawning. A console session
+started before enrollment does not survive it; TOKEN-LOGIN.md's "Cutover"
+owns how. The stock image never contains a record, so its console
+behaviour and the table above stand.
 
 The future hardware-backed disk and session unlock contract lives in
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary
@@ -645,6 +674,7 @@ assert equality against `/proc/self/status`.
   supplementary set. A switch that "worked" but left a residual group
   attached prints no marker and reds the boot oracle — which is the one
   failure mode every other check on the image would pass.
+- The login-key refusal's planned evidence is in `TOKEN-LOGIN.md`.
 - The jailed fixture is the cgroup-placement evidence. Its QEMU marker is
   withheld unless td-jail observes the active per-instance sibling leaf with
   the exact configured caps; that migration can succeed only when the

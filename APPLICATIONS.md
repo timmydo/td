@@ -8439,8 +8439,9 @@ update IS a deployment, and deployments are already in the table.
 Ordinary elevation requires **protected consent without an account
 password** (`AGENTS.md` principle 7). Changes to unlock credentials and
 recovery policy additionally require fresh hardware-backed PIN verification
-under [td-install/ENCRYPTION.md](td-install/ENCRYPTION.md). A password and a
-consent prompt answer different questions. A password asks *does this
+under [td-install/ENCRYPTION.md](td-install/ENCRYPTION.md), and for login
+keys under [td-login/TOKEN-LOGIN.md](td-login/TOKEN-LOGIN.md). A password
+and a consent prompt answer different questions. A password asks *does this
 person know the secret* — which malware holding the person's session can
 also answer, having watched them type it. A consent prompt on a path
 software cannot reach asks *is a human deliberately approving THIS
@@ -8703,12 +8704,24 @@ FIDO assertion.
 | **Walk-up attacker at an unlocked session** | **Out of scope by decision.** A password model would resist it and this one does not; that is the accepted trade. A screen lock is where to address it, and it belongs to the session rather than to elevation |
 | **Prompt spam from an unidentifiable requester** | **Partly unanswerable as specified.** Rate-limiting assumes a stable requester identity, and `Unconfined` code can fork a fresh process per request. Rate-limit the jailed case per app id; for `Unconfined` the limit can only be global, which degrades into denying elevation to everyone while an attacker spams |
 
+The session lock the walk-up row calls for is specified, as a target, in
+`td-login/TOKEN-LOGIN.md`.
+
 **Deliberately NOT in this design**: a `sudo`-equivalent running an
 arbitrary command; remembered or timed authority; per-application
 allow-lists that pre-approve anything; auto-elevation by signature or
 path; account-password recovery; and a policy language — the operation
 table is code, reviewed as code. Hardware PIN and recovery policy belong to
-`td-install/ENCRYPTION.md`; the application-secret policy remains in §W.4.
+`td-install/ENCRYPTION.md` and, for login keys, `td-login/TOKEN-LOGIN.md`;
+the application-secret policy remains in §W.4.
+
+**Retiring the escape hatch.** The increment that implements the
+ordinary-consent mechanism above (named operations behind Ctrl+Alt+Esc with
+a per-request random approval key, no password and no required security
+key) also removes `su` as an administrative path and root's empty shadow
+field, atomically, so no deployment is left without an administrative
+path. Until then both remain. `td-login/TOKEN-LOGIN.md` makes this
+increment a prerequisite of login-key enrollment.
 
 **Cost, honestly.** The credential operation adds a root authority, typed
 request intake and hardware transport to the trust surface. It grants only

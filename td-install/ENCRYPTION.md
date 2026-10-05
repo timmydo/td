@@ -13,6 +13,11 @@ tier by replacing protectors and its volume key, never by reinstalling.
 The current image remains unencrypted and auto-logs in. No increment may
 describe enrollment, disk confidentiality, or protected login as shipped
 until its complete boot and recovery path passes the acceptance tests below.
+The planned TPM-free login-key tier in
+[td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md) is an authentication
+tier over either storage state, not a third storage tier: it replaces
+automatic login with a FIDO2 key and PIN at boot and lock. Its scope,
+including what it leaves unprotected, is stated there.
 
 ## Scope
 
@@ -45,17 +50,21 @@ binds release to td's selector image, its initramfs and its load options;
 code that runs before the selector, including option ROMs and firmware
 drivers, is not covered. It does **not** protect a lost or stolen machine:
 whoever powers it on reaches the automatic-login desktop exactly as on an
-unencrypted install. No installer text, document or claim may describe it
-as lost-laptop protection.
+unencrypted install, or, once the planned login-key tier exists and keys
+are enrolled, its lock screen. No installer text, document or claim may
+describe it, alone or combined with login keys, as lost-laptop
+protection: with login keys the volume key is still released with no user
+action, so a locked machine holds it in RAM while exposing its devices and
+every surface reachable before unlock.
 
 TPM possession here releases storage and nothing else. It is device binding
 in the sense of AGENTS.md principle 7, not authentication: the session is
-still admitted by the existing, disclosed automatic login, which this tier
-neither changes nor strengthens. Root on the booted system holds the volume
-key and can change any protector, so this tier makes no authorization claim
-about protector changes. Its own protector changes happen only in the
-selector, as described below, and never through the administrative escape
-hatch.
+still admitted by the existing, disclosed automatic login (or, once it
+exists, by the planned login-key tier), and this tier neither changes nor
+strengthens either. Root on the booted system holds the volume key and can
+change any protector, so this tier makes no authorization claim about
+protector changes. Its own protector changes happen only in the selector,
+as described below, and never through the administrative escape hatch.
 
 The installer generates the volume key on the machine and formats the
 volume with a **first-boot protector** and a **recovery key**. Neither the
@@ -388,9 +397,11 @@ same-uid process may impersonate the trusted UI or approve a request.
    release and update policies, FIDO2 primary/recovery, the verified account
    handoff and the re-encrypting upgrade. Exercise them together before
    activation.
-9. Activate the protected tier only with trusted login/lock and operation
-   consent, retiring auto-login and the administrative escape hatch
-   atomically in that profile.
+9. Activate the protected tier only with trusted login/lock
+   (td-login/TOKEN-LOGIN.md) and operation consent, with no automatic login
+   in that profile, and only after `su` and root's empty shadow field have
+   retired as APPLICATIONS.md §L.1, "Retiring the escape hatch",
+   specifies.
 
 ## Acceptance evidence
 

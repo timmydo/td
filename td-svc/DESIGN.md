@@ -538,6 +538,25 @@ restart never reuses the old socket. This uses the cgroup v2 kernel contract
 documented in `Documentation/admin-guide/cgroup-v2.rst`, not numeric process
 group identity after its leader has been reaped.
 
+**Planned, not implemented: `stop=leaf`.** The login-key tier's activation
+(`td-login/TOKEN-LOGIN.md`, "Cutover") adds a unit key `stop`, with values
+`group` (the default, today's behaviour) and `leaf`. It is valid only with
+`cgroup=service` and without `tty=`; a `pair-exec` unit already stops this
+way and does not declare it. A requested stop or restart of a `stop=leaf`
+unit TERMs its group as usual, then writes its leaf's `cgroup.kill` at the
+KILL deadline and stays `stopping` until `cgroup.events` reports
+`populated 0`, so descendants that left the group, such as OpenSSH
+sessions that start their own sessions, end too. Shutdown stops it the
+same way. An unexpected exit of the leader is not a stop: the leaf keeps
+its other processes, and the restart policy starts a new leader in the
+same leaf without waiting for it to empty, so live sessions survive a
+listener crash exactly as they do today. Placement failure never fails a
+start, so a `stop=leaf` unit whose leaf membership was never verified, or
+whose `cgroup.events` cannot be read, counts as not empty: it stays
+`stopping`, and a revocation waiting on it fails closed. Shutdown stays
+bounded: at the shutdown deadline it proceeds past such a unit as it does
+for any other. The shipped `sshd` unit sets `stop=leaf`.
+
 Paired commands and their descendants must remain in their service leaf.
 They must not use the uid-1000 login/session handoff that moves work out of
 it. Unprivileged peers cannot move out of this root-owned cgroup; a root

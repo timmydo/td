@@ -5784,6 +5784,91 @@ installation; the root controller retains the transaction until completion.
 This confirmation does not authorize any secret-store operation or enroll or
 rotate a signing key. The installation protocol is in td-authd/DESIGN.md.
 
+### Session lock and login-key entry (target)
+
+Not implemented. [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
+owns the planned login-key tier, including when the session locks and what
+clients receive while locked ("Session lock"). The rules in this section
+change as follows; increment numbers are TOKEN-LOGIN.md's.
+
+1. **One operation per lifetime (3).** "Only one selection is allowed per
+   attention lifetime" becomes one operation per lifetime. `K` opens a
+   key-management screen whose own physical keys (`2`, `1`, `A`, `D`, the
+   digits naming keys, and a disclosure's fresh Enter) select and confirm
+   that one operation. On the lock surface the chord opens a login unlock
+   with no selection at all. Until activation the key-management
+   selections show `NOT AVAILABLE IN THIS BUILD`.
+2. **The PIN field (3).** "The screen accepts no credential bytes" gains
+   one exception. The field opens only after the current step has its
+   presentation receipt and root has asked for that step's PIN. It reads
+   only fresh physical evdev key presses from admitted devices, never
+   injected, automation, control or bridge input, held keys or repeats.
+   Keys map through the `us` keymap; Shift is honoured as the level
+   modifier inside the field, while Control, Alt, Super, Caps Lock and
+   chords are ignored. Echo is one mask dot per byte; Backspace edits,
+   Enter submits, Escape cancels, a 64th byte refuses, and nothing pastes.
+   The PIN reaches root through the paired client in a clearing owner and
+   is never painted, logged or retained after sending.
+3. **The token's own keyboard (3).** At startup the compositor records each
+   admitted keyboard's USB device from sysfs. A keyboard whose USB device
+   also exposes a HID interface whose report descriptor declares the FIDO
+   usage page 0xf1d0 is excluded from all secure-attention input: every
+   selection, every confirmation and the PIN field. A composite key's OTP
+   interface, touched by accident, types modhex letters (among them `d`,
+   `e`, `i`, `k`, `l`, `r`, `u`) and Enter, which could otherwise pick an
+   operation, confirm a disclosure or spend a PIN retry. This also covers
+   the existing selections above. It stays an ordinary keyboard elsewhere.
+   Report descriptors are world-readable in sysfs, so this needs no new
+   syscall. A keyboard whose USB ancestry cannot be read is still admitted,
+   a stated trusted-device residual. The fixed startup roster means a key
+   inserted later adds no keyboard at all.
+4. **Successors (3).** "Unlock has no successor" holds for the
+   application-store unlock only. Login operations present each next step
+   that td-authd admits, under its device-data rule; owner and nonce stay
+   fixed.
+5. **Lifetime (3).** A login operation's attention lifetime is td-authd's
+   ceiling for that operation instead of 120 seconds, never renewed, and
+   every prompt shows the remaining time.
+6. **Lock state (4).** The compositor learns the login state as
+   td-authd/DESIGN.md's login-state amendment specifies. What a locked
+   session shows and delivers is TOKEN-LOGIN.md's; here, the lock surface
+   is drawn by display rendering alone, like the attention screen, and a
+   lock is complete only when its own paint has a presentation receipt
+   under the rules below. `Super+l` joins the binding list and the
+   attention screen gains `L`. On an unenrolled account `Super+l` is
+   consumed with no effect and reaches no client, a lid close or resume
+   does nothing, and `L` shows `NO LOGIN KEYS ENROLLED` on the
+   attention screen.
+7. **Lid switch (4).** The startup roster admits the ACPI lid switch's
+   evdev node, a switch-only device reporting `SW_LID`. Its close event
+   locks; nothing else is read from it.
+8. **Resume (4).** The kernel does not repeat an unchanged switch state, so
+   a lid close cannot be relied on to precede every suspend. The compositor
+   detects resume itself: it compares how far the boot-time clock in
+   `/proc/uptime`, which counts suspended time, and `std::time::Instant`
+   have advanced since its last check. Each sample reads `/proc/uptime`
+   between two `Instant` reads and is discarded when those differ by more
+   than 100 ms. A gap of more than two seconds locks. The check runs before
+   each input batch is routed, before each repaint and at least once a
+   second, so no client receives input after resume before the lock; the
+   pre-suspend frame can stay on glass until the first check. A discarded
+   sample does not let the gated batch or repaint proceed: the sample is
+   retaken, and input stays held and the repaint deferred until a sample
+   is accepted. Both reads
+   are safe `std`, with no new syscall.
+
+   This depends on `Instant` being `CLOCK_MONOTONIC` on Linux, which
+   excludes suspended time; Rust documents whether `Instant` counts
+   suspend as unspecified. The QEMU S3 oracle in TOKEN-LOGIN.md's
+   increment 4 is therefore the regression guard and must pass on every
+   toolchain bump. On x86 without a TSC that runs in S3 the kernel measures
+   sleep with the RTC at one-second resolution, so only suspends longer
+   than about three seconds are certain to be detected; TOKEN-LOGIN.md
+   discloses that limit.
+
+The current profile has none of this: no lock, no PIN field, and one
+selection per lifetime.
+
 ### Immutable prompt presentation
 
 The shared `td-authd/src/consent.rs` value describes one session and one

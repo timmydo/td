@@ -1563,3 +1563,144 @@ and null standard descriptors. Real compositor keyboard input and
 correlated captures check live repaint, default Cancel, and confirmed
 suspend/resume of a child owned by the driver. Host fixture source is not
 staged into the target authority recipe.
+
+## Login keys and session lock (target)
+
+Not implemented. [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md)
+owns the planned login-key tier. "Session lock" there is the compositor's
+display and input lock; it is unrelated to this document's secret-session
+statuses (idle, a released key, relocking), and unlocking the session
+neither releases nor clears an application-store key. td-authd's part
+amends the contracts above as follows; increment numbers are
+TOKEN-LOGIN.md's.
+
+1. **Login state (4).** During Prepare, after its cleanup and before the
+   compositor admits any client or input, the authority reports the
+   human's login state in answer to request `1a`: unenrolled, enrolled,
+   or unavailable with its typed cause, as TOKEN-LOGIN.md defines them.
+   The answer also carries the revocation status of amendment 7. Only
+   td-authd decides that a session unlocks: on a login unlock's observed
+   success.
+
+   Root first applies the same predicate firstboot and td-login use:
+   `/var/lib/td/login` opens as a valid root:root mode-0700 directory and
+   the record name is absent. That alone, with no helper, is unenrolled;
+   an invalid directory is unavailable (damaged directory). Only when the
+   record name exists does root run a fixed read-only `td-secret
+   inspect-login --uid 1000` child to tell enrolled from a damaged record.
+   It shares store inspection's fixed helper launch (empty environment,
+   `/` cwd, null stdout and stderr, private stdin socketpair), its exact
+   bounded result and its two-second observed deadline, but not its
+   protocol: it is not request `17`, it runs synchronously inside Prepare
+   or the `1a` that needs it, it never occupies the operation slot, and a
+   missing helper, failed spawn, malformed result or expired deadline
+   answers unavailable (state could not be read) rather than ending the
+   generation. A name that exists is therefore always the enforced state,
+   whatever the helper does, and a helper failure on an unenrolled machine
+   cannot arise.
+
+   Root caches the last answer and serializes `1a`, so requests never
+   overlap: a `1a` returns the cache, and refreshes it first only after a
+   login operation or while the cache reads could-not-be-read. The
+   compositor sends `1a` again after every completed, failed or uncertain
+   login operation, and every 250 ms while a revocation is pending or the
+   state could not be read, so a first enrollment, the removal of the last
+   key or a transient helper failure resolves without a reboot.
+2. **Worker (2).** One fixed root `td-secret login-operation --uid 1000`
+   child per login operation, with the unlock worker's launch, framing,
+   presentation and commit rounds, cancellation, reaping and generation
+   teardown. It shares the single operation slot.
+3. **Consent operations (2).** `consent.rs` gains tags 7 to 10: login
+   unlock, first enrollment, key addition and key removal. Each carries its
+   step, the key count before and after and the fingerprints involved, and
+   every PIN step of every one of them carries the key's reported PIN
+   retries. Exact bytes are pinned with literal tests.
+4. **Step admission with device data (2).** `following_enrollment_step`
+   derives the whole successor and requires the worker's invitation to equal
+   it. A login step instead names data only the token supplies. Root still
+   derives nonce, owner, operation, policy, counts and the next step, and
+   accepts the worker's fingerprint only when it names a slot of the
+   baseline record (identify, authorize) or the credential the worker
+   reports creating (prove, repeat, probe), and a retry count only as one
+   byte displayed as a device claim. Any other difference cancels the
+   child.
+5. **Requests and version (2).** The paired protocol becomes `TDLA003`,
+   because TDLA002 states that no record contains a credential. Request
+   `1b` selects a login operation (unlock, one-key or two-key first
+   enrollment, addition, or removal with its key set), and `1c` carries the
+   exact current description followed by one PIN. Root forwards that PIN to
+   the worker as one bounded frame in a clearing owner and keeps no copy.
+   Both peers ship atomically, without negotiation, as earlier additions
+   did; the compositor first sends these requests in increment 3. Until
+   activation, `1b` refuses enrollment, addition and removal in a
+   production build, and an unlock refuses while no record exists. Host
+   child fixtures and the ignored root session fixture drive both requests
+   through the real paired Session, as they do for secret operations.
+   Request `1a` lands with login state in increment 4, and tests that treat
+   `1a` as unknown change with it.
+6. **Deadlines (2).** The fixed 120-second ceiling becomes 120 seconds per
+   key ceremony, fixed when the operation starts and never renewed: unlock,
+   removal and one-key enrollment 120 seconds, addition and two-key
+   enrollment 240. Each token transaction keeps the transport's own
+   two-minute bound. Physical timing is activation evidence.
+7. **Revocation (5).** Root performs TOKEN-LOGIN.md's "Cutover" whenever
+   the login state, reduced to unenrolled or enforced (enrolled or
+   unavailable), differs from the root-owned mode-0600 volatile record
+   `/run/td-login-cutover`, which names the boot ID and the state the
+   console and SSH were last brought to; firstboot writes it after its
+   boot-time render. An absent or unreadable record, or one naming another
+   boot ID, needs a cutover toward the enforced form unless the state is
+   verifiably unenrolled; an unavailable state never renders the ordinary
+   policy. The check runs after every login operation, including one whose
+   worker failed or whose outcome is uncertain, at every Prepare after
+   login state is reported, and when the authority starts. The cutover:
+   - renders the SSH policy for that state through a new fixed root
+     subcommand, `td-firstboot render-ssh-policy`, which applies
+     firstboot's account validation and serializes publication against all
+     account readers, as boot-time rendering does (`td-login/THREAT-MODEL.md`
+     §1);
+   - asks td-svc, over its existing control socket, to restart `sshd` and
+     `greeter`, issuing both requests before polling either, so their
+     TERM waits overlap; it names no other unit;
+   - polls `status` for each until it has left `stopping`, which for
+     `greeter` means its `tty=` containment is empty and for `sshd` its
+     whole service leaf (`td-svc/DESIGN.md`, `stop=leaf`), and runs a new
+     leader: a pid different from the leader recorded before the request,
+     whose `/proc` start time is later than the request. Each unit must
+     finish within 30 seconds of its request, longer than the default
+     10-second `stop-timeout` plus KILL observation even under emulation;
+   - only then writes the volatile record and reports completion.
+
+   One transient td-svc failure (a refused connection or a busy reply) is
+   retried once. A refusal after that, a failed render, or a teardown still
+   pending at its deadline is a failed revocation, never only a warning.
+   The `1a` revocation status then reads failed; the compositor shows `A
+   CONSOLE OR SSH SESSION COULD NOT BE CLOSED: RESTARTING` on its trusted
+   surface, and root asks td-svc for an orderly `reboot`, whose boot
+   ordering then enforces the boundary: firstboot renders the enforced
+   form before `sshd` and the greeter start. If that request fails too,
+   the authority ends its generation, and the next generation's check
+   repeats the cutover.
+
+   **Reboot guard.** Before requesting an automatic reboot, root writes the
+   current boot ID to the durable root-owned mode-0600
+   `/var/lib/td/login/cutover-reboot`; readers of the record ignore it, and
+   the first successful check of any later boot removes it. A failed
+   revocation while that file exists requests no further reboot: the
+   machine stays in its boot-time state, where firstboot's render and
+   td-login's refusal already enforce the boundary, and the `1a` status
+   reads held, which the compositor shows on its lock surface and
+   attention screen as `SESSION REVOCATION FAILED AFTER A RESTART`. If the
+   guard itself cannot be written, for example because the directory is
+   damaged, root likewise holds without rebooting and shows the same
+   notice; it never reboots unguarded. At most one automatic reboot
+   therefore separates two successful checks.
+8. **Update consent (4).** On an enrolled or unavailable machine, request
+   19 refuses, before any presentation, a queued deployment whose manifest
+   lacks the login-key tier marker or, when the record on disk is readable,
+   whose marker does not list that record's version. TOKEN-LOGIN.md cites
+   this as the update-consent rule. No key is required; consent is
+   otherwise unchanged.
+
+TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
+a login operation.

@@ -48,6 +48,11 @@ final review screens disclose those facts. There is no PIN field, password
 substitute or inert enrollment screen. [ENCRYPTION.md](ENCRYPTION.md) owns
 the later complete encrypted boot, hardware-backed PIN, recovery and
 session-authentication cutover. No account secret is needed to install.
+After installation the account may enroll FIDO2 login keys from its
+desktop, which turns automatic login off
+([td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md), not implemented);
+the installer collects no key and its disclosures describe the installed
+default.
 Networking can be configured after booting the installed system.
 
 ## User flow and authority

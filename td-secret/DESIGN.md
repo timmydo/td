@@ -4,6 +4,10 @@ The portable personal-vault workstream for td-pass is specified separately
 in [PORTABLE.md](PORTABLE.md). It targets TPM-independent primary/backup
 FIDO2 protection and supported foreign-Linux use. Its staged prerequisites
 do not change the application credential interfaces or protection below.
+The planned login-key root worker and record in
+[../td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md) reuse that
+PIN/hmac-secret flow and the root-only USB transport below; they do not
+change application-store protection either.
 
 ## File-backed stores before enrollment
 
@@ -332,10 +336,11 @@ hidraw, USB HID and UHID. UHID permits the guest fixture below to exercise
 kernel HID I/O; its root-only device is not delegated to applications.
 The prompted parents are explicitly enabled after
 allnoconfig; derived USB_XHCI_PCI is checked after olddefconfig without
-a fictitious direct pin. The profile does not add legacy USB host
-controller drivers. Raw token nodes stay root-only and never enter an
-application jail or the compositor's input-device delegation. Separate
-USB keyboard/pointer interfaces do enter the compositor's startup evdev
+a fictitious direct pin. Besides EHCI, built in for the ThinkPad T430s's
+USB 2.0 port, the profile adds no legacy USB host controller drivers.
+Raw token nodes stay root-only and never enter an application jail or the
+compositor's input-device delegation. Separate USB keyboard/pointer
+interfaces do enter the compositor's startup evdev
 roster; its trusted-device boundary is specified in
 `td-compositor/DESIGN.md` under Physical secure attention.
 

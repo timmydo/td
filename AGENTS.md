@@ -255,6 +255,11 @@ depend on the current escape hatch; see `APPLICATIONS.md` §L.1 and
 `td-login/THREAT-MODEL.md`. The planned device-bound encrypted default
 releases storage to TPM possession alone; it is device binding under this
 principle and advances no authentication or protector-authorization claim.
+The planned TPM-free login-key tier (`td-login/TOKEN-LOGIN.md`, not
+implemented) lets the installed account trade auto-login for a FIDO2 key
+plus PIN at boot and session lock; that document states what it does not
+protect, and `APPLICATIONS.md` §L.1 states when `su` and root's empty
+shadow field retire.
 
 # Tests
 
