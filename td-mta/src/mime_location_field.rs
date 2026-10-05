@@ -1,13 +1,14 @@
 //! Complete authorized field spelling with whole-word or literal projection.
 //! Field discovery, presence, label matching and publication remain external.
 use crate::{
-    admission::work::Meter,
+    admission::work::{Charge, Meter},
     mime_location_literal as literal, mime_location_selection as selection,
     mime_location_word as word,
     nfc::{self, HeaderBudget},
     ports::Tick,
 };
 pub use selection::Spelling;
+pub mod json;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Selection(selection::Error),
@@ -116,6 +117,45 @@ impl<'a, 'w> Cursor<'a, 'w> {
             Owner::Complete(work, budget) => budget
                 .charge(work, now, 0, 0, &mut 0)
                 .map_err(Error::Admission),
+            Owner::Retired => Err(Error::InvalidState),
+        };
+        self.outcome(result)
+    }
+    #[cfg(test)]
+    fn remaining(&self) -> Option<(Charge, u64, u64)> {
+        match &self.owner {
+            Owner::Selection(cursor) => Some(cursor.remaining()),
+            Owner::Words(cursor) => Some(cursor.remaining()),
+            Owner::Literal(cursor) => Some(cursor.remaining()),
+            Owner::Complete(work, budget) => Some((
+                work.remaining(),
+                budget.source_bytes_remaining(),
+                budget.steps_remaining(),
+            )),
+            Owner::Retired => None,
+        }
+    }
+    fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = match &mut self.owner {
+            Owner::Selection(cursor) => cursor.charge_output(now, bytes).map_err(Error::Selection),
+            Owner::Words(cursor) => cursor.charge_output(now, bytes).map_err(Error::Words),
+            Owner::Literal(cursor) => cursor.charge_output(now, bytes).map_err(Error::Literal),
+            Owner::Complete(work, budget) => budget
+                .charge(work, now, 0, 0, &mut 0)
+                .map_err(Error::Admission)
+                .and_then(|()| {
+                    work.charge(
+                        now,
+                        Charge {
+                            output_bytes: bytes,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(|error| Error::Admission(nfc::Error::Work(error)))
+                }),
             Owner::Retired => Err(Error::InvalidState),
         };
         self.outcome(result)

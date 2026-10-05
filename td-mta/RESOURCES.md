@@ -1766,6 +1766,32 @@ CFWS, diagnostics, empty/fallback, malformed folds/URI/CFWS, zero records and
 late output refusal in either projection form. All input allocation precedes
 counting; worker/native/RSS and retained response buffers remain separate.
 
+M06dd's location JSON cursor plus HeaderBudget fits a compiled 768-byte
+ceiling in the existing parser region. It adds the shared fixed six-byte
+framing buffer to the complete field reader, with no growing output or
+second header arena. Each turn invokes at most one field poll or copies at
+most six prepaid serialized bytes. Inherited child ceilings remain 225
+visits, 452 interpretation steps and 29 job records; a scalar turn may spend
+four decoded bytes plus six serialized bytes. Framing spends only exact
+job output bytes after live original header admission, never new credit.
+
+Two units compare shared-writer JSON and original costs with independently
+projected field scalars, including exact grants and all resource cuts. They
+pin identical visits, records and header steps plus exact serialized output;
+non-output cuts retain the independently observed scalar phase/context.
+Healthy per-turn deltas pin inherited visit/step/record and combined output
+ceilings; a supplementary scalar requires four decoded plus four serialized
+bytes, split across short drains. Failed-turn ceilings remain qualified by
+the child readers. The generic six-byte wire ceiling stays conservative under
+the URI source's inherited encoded-control dropping. Widths one through eight, empty interleaves,
+every original resource cut/exact grant, every-prefix deadlines/premature
+finish, malformed fields, typed framing refusals and owner reuse are covered.
+Warm/measured Rust allocation qualifies long literal and folded word fields,
+short escape drains, inherited control dropping, repair/absence/fallback,
+malformed tails, zero records/output and late scalar/closing refusal. Inputs
+are allocated before counting; worker/native/RSS and retained response
+buffers remain separate qualifications.
+
 M06cq's selected literal URI reader plus HeaderBudget fits 320 bytes in the
 existing parser region. It retains shared fixed validator/unfolder state
 and source borrows, with no source-sized scratch or second header arena.

@@ -4729,6 +4729,36 @@ are checked before child construction, and the cursor is neither Copy nor
 Clone. Retained strings/JSON, duplicate-field selection, MIME traversal and
 response publication remain separate composition.
 
+### 1.109 Complete location JSON string projection
+
+M06dd adds mime_location_field::json::Cursor, binding shared td-json string
+framing to the complete authorized field cursor and its original owners.
+The constructor carries the same CFWS, placement, source-ending and presence
+contracts. Decoded labels and literal fallback preserve the scalar cursor's
+spelling, repair diagnostics and character policy, including encoded-control
+dropping. No additional URI check, percent decoding or NFC occurs.
+
+poll(now, output) returns shared Progress/Status, copying at most six paid
+wire bytes or invoking at most one field poll per turn. Empty output performs
+fresh admission only and returns NeedOutput before healthy completion. JSON
+quotes, escapes and UTF-8 consume their exact serialized lengths in addition
+to the field's already-paid scalar output. These framing charges use the
+original Meter and fresh header admission without adding source visits,
+interpretation steps or prepaid credit. Errors wrap the active field phase;
+opening charges use Selection, scalar stages use Words/Literal, and closing
+or completed admission uses Admission. Framing InvalidState stays separate.
+
+End is the scalar cursor's passive spelling/form/repair metadata and remains
+hidden until the whole JSON string drains. Every refusal hides it and retires
+both source and frame; already-emitted bytes are provisional and not wiped.
+Cached Complete is inert. check_deadline and consuming finish(now) freshly
+admit even Complete; healthy finish returns the pointer-identical original
+Meter, HeaderBudget and End. Source and frame identity stay bound across
+short borrows and moves; the cursor is neither Copy nor Clone. Missing-field
+null selection, retained output windows, response ownership and publication
+remain enclosing obligations. A malformed field can follow a provisional
+opening quote; it never publishes a successful JSON string.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

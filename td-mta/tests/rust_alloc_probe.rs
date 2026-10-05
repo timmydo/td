@@ -2168,6 +2168,260 @@ fn uri_word_runs() {
     assert_eq!(before, after, "URI encoded-word run allocated");
 }
 
+fn uri_location_json() {
+    use td_mta::{
+        admission::work::{Charge, Meter, Stop},
+        mime_location_field::{
+            self as field,
+            json::{Cursor, Error, Status},
+        },
+        mime_location_literal as literal, mime_location_selection as selection,
+        mime_location_word as word,
+        nfc::{self, HeaderBudget},
+        ports::{Deadline, Tick},
+    };
+    let long_literal = format!("../{}", "a%2F/".repeat(8192));
+    let long_words = "=?utf-8?Q?e=CC=81?= \r\n ".repeat(1024);
+    let mut bad_literal = long_literal.clone();
+    bad_literal.push('%');
+    let before = COUNTERS.snapshot();
+    for (source, bytes, encoded, problem, fault, output, records) in [
+        (
+            long_literal.as_bytes(),
+            long_literal.len() + 2,
+            false,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            long_words.as_bytes(),
+            3074,
+            true,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            b"=?ascii?Q?=00=22=5C=0A?=".as_slice(),
+            6,
+            true,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            b"(x) =?utf-8?Q?=FF?= =?ascii?Q?ok?= (tail)",
+            7,
+            true,
+            true,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            b"=?utf-8?Q?=F0=9F=90=88?=",
+            6,
+            true,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (b"", 2, false, false, None, 100_000, 2_000_000),
+        (
+            b"=?unknown?Q?a?=",
+            b"=?unknown?Q?a?=".len() + 2,
+            false,
+            false,
+            None,
+            100_000,
+            2_000_000,
+        ),
+        (
+            bad_literal.as_bytes(),
+            1,
+            false,
+            false,
+            Some(Error::Source(field::Error::Literal(
+                literal::Error::MalformedUri,
+            ))),
+            100_000,
+            2_000_000,
+        ),
+        (
+            b"../a\r\nX",
+            1,
+            false,
+            false,
+            Some(Error::Source(field::Error::Words(
+                word::Error::MalformedFold,
+            ))),
+            100_000,
+            2_000_000,
+        ),
+        (
+            b"(broken",
+            1,
+            false,
+            false,
+            Some(Error::Source(field::Error::Selection(
+                selection::Error::Malformed,
+            ))),
+            100_000,
+            2_000_000,
+        ),
+        (
+            b"../a",
+            1,
+            false,
+            false,
+            Some(Error::Source(field::Error::Selection(
+                selection::Error::Work(Stop::Records),
+            ))),
+            100_000,
+            0,
+        ),
+        (
+            b"../a",
+            0,
+            false,
+            false,
+            Some(Error::Source(field::Error::Selection(
+                selection::Error::Work(Stop::OutputBytes),
+            ))),
+            0,
+            2_000_000,
+        ),
+        (
+            b"",
+            1,
+            false,
+            false,
+            Some(Error::Source(field::Error::Admission(nfc::Error::Work(
+                Stop::OutputBytes,
+            )))),
+            1,
+            2_000_000,
+        ),
+        (
+            b"=?ascii?Q?=22?=",
+            1,
+            true,
+            false,
+            Some(Error::Source(field::Error::Words(word::Error::Work(
+                Stop::OutputBytes,
+            )))),
+            2,
+            2_000_000,
+        ),
+        (
+            b"../a",
+            1,
+            false,
+            false,
+            Some(Error::Source(field::Error::Literal(literal::Error::Work(
+                Stop::OutputBytes,
+            )))),
+            2,
+            2_000_000,
+        ),
+    ] {
+        let mut work = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 10_000_000,
+                records,
+                output_bytes: output,
+                ..Charge::default()
+            },
+        );
+        let mut budget = HeaderBudget::new();
+        let pointers = (std::ptr::from_ref(&work), std::ptr::from_ref(&budget));
+        let mut cursor = Cursor::new(source, &mut work, &mut budget);
+        let mut count = 0;
+        let mut error = None;
+        let mut complete = false;
+        for _ in 0..2_000_000 {
+            let mut window = [0; 1];
+            match cursor.poll(Tick(1), &mut window) {
+                Ok(progress) => {
+                    count += progress.written;
+                    black_box(&window);
+                    if progress.status == Status::Complete {
+                        complete = true;
+                        break;
+                    }
+                    assert_eq!(cursor.end(), None);
+                    assert_eq!(
+                        cursor.poll(Tick(1), &mut []).unwrap().status,
+                        Status::NeedOutput
+                    );
+                }
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        assert_eq!(count, bytes);
+        assert_eq!(error, fault);
+        if let Some(error) = fault {
+            assert_eq!(cursor.end(), None);
+            assert_eq!(cursor.poll(Tick(100), &mut [0]), Err(error));
+            assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+            assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+        } else {
+            assert!(complete);
+            let end = cursor.end().unwrap();
+            assert_eq!(
+                (end.encoded_words, end.encoding_problem),
+                (encoded, problem)
+            );
+            assert!(source.get(end.spelling.start..end.spelling.end).is_some());
+            assert_eq!(
+                cursor.poll(Tick(100), &mut []).unwrap().status,
+                Status::Complete
+            );
+            let (work, budget, _) = cursor.finish(Tick(1)).unwrap();
+            assert_eq!(
+                (std::ptr::from_ref(&*work), std::ptr::from_ref(&*budget)),
+                pointers
+            );
+            let mut next = Cursor::new(b"=?ascii?Q?=22=5C?=", work, budget);
+            let mut complete = false;
+            let mut count = 0;
+            for _ in 0..1000 {
+                let progress = next.poll(Tick(1), &mut [0]).unwrap();
+                count += progress.written;
+                if progress.status == Status::Complete {
+                    complete = true;
+                    break;
+                }
+                assert_eq!(next.end(), None);
+            }
+            assert!(complete);
+            assert_eq!(count, 6);
+            assert_eq!(
+                next.poll(Tick(100), &mut []).unwrap().status,
+                Status::Complete
+            );
+            let deadline = Error::Source(field::Error::Admission(nfc::Error::Work(Stop::Deadline)));
+            assert_eq!(next.check_deadline(Tick(100)), Err(deadline));
+            assert_eq!(next.end(), None);
+            assert_eq!(next.finish(Tick(1)).err(), Some(deadline));
+        }
+    }
+    assert_eq!(
+        COUNTERS.snapshot(),
+        before,
+        "Rust allocation in URI location JSON"
+    );
+}
+
 fn uri_location_fields() {
     use td_mta::{
         admission::work::{Charge, Meter, Stop},
@@ -10180,6 +10434,7 @@ fn main() {
         uri_word_values();
         uri_word_runs();
         uri_location_fields();
+        uri_location_json();
         uri_unfold_values();
         uri_reference_values();
         content_id_values();
@@ -10351,6 +10606,7 @@ fn main() {
     uri_word_values();
     uri_word_runs();
     uri_location_fields();
+    uri_location_json();
     uri_unfold_values();
     uri_reference_values();
     content_id_values();

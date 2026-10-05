@@ -2037,6 +2037,14 @@ Initial independently landable increments:
   Field discovery/presence, retained location JSON and traversal/response
   metadata publication remain subsequent work.
 
+- **M06dd — complete authorized location JSON:** bind shared string framing
+  to the complete field cursor under original owner and character contracts.
+  Charge exact serialized bytes beside scalar output without renewed credit,
+  and hide metadata through whole drain and fresh final admission. Qualify
+  short/empty output, exact original costs and grants, prefix deadlines,
+  typed source/framing faults and long/escape/refusal allocation. First-valid
+  location discovery/retention and traversal/response integration remain next.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add

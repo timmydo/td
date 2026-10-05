@@ -1,6 +1,6 @@
 //! Caller-authorized URI spelling selection under original email admission.
 use crate::{
-    admission::work::{Meter, Stop},
+    admission::work::{Charge, Meter, Stop},
     decode_work::{self, Admission, Lexical, Parsing},
     nfc::HeaderBudget,
     ports::Tick,
@@ -78,6 +78,27 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 &mut self.credit,
             ))
             .map_err(Error::from)
+    }
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> (Charge, u64, u64) {
+        (
+            self.work.remaining(),
+            self.budget.source_bytes_remaining(),
+            self.budget.steps_remaining(),
+        )
+    }
+    /// Crate-internal framing charge; the enclosing caller retires on refusal.
+    pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        self.check_deadline(now)?;
+        self.work
+            .charge(
+                now,
+                Charge {
+                    output_bytes: bytes,
+                    ..Charge::default()
+                },
+            )
+            .map_err(Error::Work)
     }
     pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
         if !self.inner.is_complete() {

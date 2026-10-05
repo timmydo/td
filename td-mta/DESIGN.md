@@ -452,6 +452,15 @@ whole healthy completion, and every refusal hides the End and retires the
 owner. Empty-reference presence, discovery, label matching and retained
 response publication remain external.
 
+M06dd binds complete authorized location scalars to shared td-json framing.
+One bound source and original owner set funds both scalar output and exact
+serialized JSON bytes. Framing adds no source scans, interpretation credit,
+normalization or URI policy. Empty output and pending escape drains still
+freshly admit; whole JSON completion alone exposes passive field metadata.
+Any refusal retires source/frame and hides metadata, with bytes provisional
+through fresh consuming finish. Null selection, retained buffers and response
+publication remain separate obligations.
+
 M06cq composes shared URI unfolding and reference validation into a selected
 literal spelling reader. It validates the complete spelling before replaying
 literal ASCII octets and slice-relative provenance under original job/header

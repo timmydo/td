@@ -170,6 +170,29 @@ impl<'a, 'w> Cursor<'a, 'w> {
             .map_err(Error::from);
         self.outcome(result)
     }
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> (Charge, u64, u64) {
+        (
+            self.work.remaining(),
+            self.budget.source_bytes_remaining(),
+            self.budget.steps_remaining(),
+        )
+    }
+    /// Crate-internal framing charge; the enclosing caller retires on refusal.
+    pub(crate) fn charge_output(&mut self, now: Tick, bytes: u64) -> Result<(), Error> {
+        self.check_deadline(now)?;
+        let result = self
+            .work
+            .charge(
+                now,
+                Charge {
+                    output_bytes: bytes,
+                    ..Charge::default()
+                },
+            )
+            .map_err(Error::Work);
+        self.outcome(result)
+    }
     pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
         if let Some(error) = self.failure {
             return Err(error);
