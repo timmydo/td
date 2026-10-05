@@ -120,8 +120,10 @@ it, else after it, and past the `<#/part>` of a tag the caret is on or
 whose close it starts; of a selection, its lower end's line), and with
 the caret in the headers at the end of the draft, unsaved as any edit
 is. The CLI's `attach_file` appends it to a retained draft's end, saving
-the tag into it. The send reads the copy, so a file changed or removed
-after it was attached does not change the message, and the copy retires
+the tag into it; an answer carrying a `warning` took the tag but could
+not confirm the save durable, and keeps the copy. The send reads the
+copy, so a file changed or removed after it was attached does not
+change the message, and the copy retires
 with the draft to `sent`; a copy whose tag is deleted from the draft, or
 undone, stays in the sidecar while the draft is one and is removed when
 it is sent, so the retired sidecar holds what went. A copy is also named

@@ -1319,7 +1319,11 @@ fn cmd_reply_draft(state: &mut CliState, input: &Value) -> Value {
 /// "path" ("attachment_dir" when it has one, else made beside it) under
 /// what the connected server takes, and appends its tag to the draft; a
 /// draft that cannot take the tag has the copy removed again, and the
-/// sidecar when this made it.
+/// sidecar when this made it. A replace that failed may still have landed
+/// (its folder's sync failing past the rename), so the draft is read
+/// back: one holding the tag keeps the copy, the answer "ok" with the
+/// reason in "warning"; one that cannot be read back keeps it too, the
+/// error saying where it is; only one read back without the tag loses it.
 fn cmd_attach_file(state: &mut CliState, input: &Value) -> Value {
     let path = match input.get("path").and_then(|v| v.as_str()) {
         Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
@@ -1359,31 +1363,62 @@ fn cmd_attach_file(state: &mut CliState, input: &Value) -> Value {
     };
     // The tag on a line of its own at the draft's end, the draft replaced
     // whole; the copy removed again when the draft cannot take it.
-    let appended = std::fs::read_to_string(&path).and_then(|mut text| {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(attached.tag.trim_start_matches('\n'));
-        compose::replace_draft(&path, text.as_bytes())
-    });
-    if let Err(e) = appended {
+    let tag = attached.tag.trim_start_matches('\n');
+    let unwind = || {
         let _ = std::fs::remove_file(&attached.path);
         if attached.created {
             let _ = std::fs::remove_dir(&attached.sidecar);
         }
-        return err_response(&format!("the draft could not take the tag: {e}"));
+    };
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            unwind();
+            return err_response(&format!("the draft could not take the tag: {e}"));
+        }
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
     }
-    ok_response(
-        ObjectBuilder::new()
-            .set(
-                "attachment_dir",
-                attached.sidecar.to_string_lossy().as_ref(),
-            )
-            .set("copy", attached.path.to_string_lossy().as_ref())
-            .set("name", &attached.name)
-            .set("bytes", attached.bytes as u64)
-            .build(),
-    )
+    text.push_str(tag);
+    let mut warning = None;
+    if let Err(e) = compose::replace_draft(&path, text.as_bytes()) {
+        // The tag names a copy claimed just now, so no draft held it
+        // before: one that holds it now took it. The read-back is bounded
+        // and does not block, the draft having been a regular file; room
+        // is left for an edit made since.
+        let limit = (text.len() as u64).saturating_mul(2).saturating_add(4096);
+        match td_fs::read_bounded_real_file(&path, "draft", limit) {
+            Ok(now) if !String::from_utf8_lossy(&now).contains(tag) => {
+                unwind();
+                return err_response(&format!("the draft could not take the tag: {e}"));
+            }
+            Ok(_) => {
+                warning = Some(format!(
+                    "the draft took the tag, but may not keep it after a crash: {e}"
+                ));
+            }
+            Err(again) => {
+                return err_response(&format!(
+                    "the draft may not have taken the tag ({e}) and cannot be read back \
+                     ({again}); the copy is kept at {}",
+                    attached.path.display()
+                ));
+            }
+        }
+    }
+    let mut response = ObjectBuilder::new()
+        .set(
+            "attachment_dir",
+            attached.sidecar.to_string_lossy().as_ref(),
+        )
+        .set("copy", attached.path.to_string_lossy().as_ref())
+        .set("name", &attached.name)
+        .set("bytes", attached.bytes as u64);
+    if let Some(warning) = warning {
+        response = response.set("warning", warning);
+    }
+    ok_response(response.build())
 }
 
 /// Sends the retained draft at "path" through the account's server and,
@@ -1845,6 +1880,7 @@ forward_draft: Generate a forward draft.
 attach_file: Copy a file into a retained draft's attachment directory (made beside the draft when it has none) and append its MML tag to the draft, the file bounded by what the connected server takes, else by the fetch service's 32 MiB request bound.
    > {{"command": "attach_file", "path": "/home/me/.local/state/td-mail/drafts/td-mail-draft-1-2.eml", "file": "/home/me/Downloads/report.pdf"}}
    < {{"ok": true, "attachment_dir": "/home/me/.local/state/td-mail/drafts/td-mail-att-1-2", "copy": ".../td-mail-att-1-2/report.pdf", "name": "report.pdf", "bytes": 12345}}
+   A "warning" says the draft took the tag but its save was not confirmed durable.
 
 send_draft: Send a retained draft through the account's server (JMAP EmailSubmission), then move it to the sent directory beside its drafts directory.
    > {{"command": "send_draft", "path": "/home/me/.local/state/td-mail/drafts/td-mail-draft-1-2.eml", "attachment_dir": "/home/me/.local/state/td-mail/drafts/td-mail-att-1-2"}}

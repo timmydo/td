@@ -599,7 +599,8 @@ fn test_connect_without_fetch_service_names_the_socket() {
 
 /// `attach_file` copies a file into the draft's sidecar under the
 /// connected server's `maxSizeUpload` and appends its tag; a missing draft
-/// and a file past the limit are refused with nothing copied.
+/// and a file past the limit are refused with nothing copied, and a draft
+/// that cannot take the tag has the copy and its new sidecar removed.
 #[test]
 fn test_attach_file_copies_under_the_servers_limit() {
     let mut h = CliHarness::start();
@@ -653,6 +654,67 @@ fn test_attach_file_copies_under_the_servers_limit() {
     );
     assert_eq!(std::fs::read_to_string(&draft).expect("draft"), template);
     assert!(!drafts.join("td-mail-att-4-4").exists(), "no sidecar made");
+
+    // A draft that is not text cannot take the tag: the copy is made,
+    // then removed with the sidecar it made.
+    let binary = drafts.join("td-mail-draft-6-6.eml");
+    std::fs::write(&binary, b"\xff\xfe").expect("binary draft");
+    let resp = h.send(json!({
+        "command": "attach_file",
+        "path": binary.to_string_lossy(),
+        "file": small.to_string_lossy()
+    }));
+    assert!(!resp["ok"].is_true(), "a binary draft took a tag: {}", resp);
+    assert!(
+        text(&resp["error"]).contains("could not take the tag"),
+        "refused after the copy: {}",
+        resp
+    );
+    assert_eq!(std::fs::read(&binary).expect("draft"), b"\xff\xfe");
+    assert!(
+        !drafts.join("td-mail-att-6-6").exists(),
+        "the copy and its sidecar removed"
+    );
+
+    // A replace that fails before its rename (the drafts folder not
+    // writable) leaves the draft read back without the tag: the copy is
+    // removed, the sidecar this call did not make kept. Root writes
+    // regardless, so not as root.
+    let root =
+        std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/proc/self").expect("/proc/self"))
+            == 0;
+    if !root {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = state.path().join("td-mail/locked");
+        let held = locked.join("td-mail-att-7-7");
+        std::fs::create_dir_all(&held).expect("locked sidecar");
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700))
+            .expect("private sidecar");
+        let draft = locked.join("td-mail-draft-7-7.eml");
+        std::fs::write(&draft, template).expect("locked draft");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+            .expect("lock drafts");
+        let resp = h.send(json!({
+            "command": "attach_file",
+            "path": draft.to_string_lossy(),
+            "file": small.to_string_lossy(),
+            "attachment_dir": held.to_string_lossy()
+        }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("unlock drafts");
+        assert!(!resp["ok"].is_true(), "a locked draft took a tag: {}", resp);
+        assert!(
+            text(&resp["error"]).contains("could not take the tag"),
+            "refused after the copy: {}",
+            resp
+        );
+        assert_eq!(std::fs::read_to_string(&draft).expect("draft"), template);
+        assert_eq!(
+            std::fs::read_dir(&held).expect("sidecar kept").count(),
+            0,
+            "the copy removed"
+        );
+    }
 
     let resp = h.send(json!({
         "command": "attach_file",
