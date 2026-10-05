@@ -78,7 +78,6 @@ pub const HOST_ONLY_VERBS: &[&str] = &[
     "gate-body",
     "gate-crates",
     "gate-run",
-    "host-run",
     "install-apps",
     "install-fonts",
     "main-integration",

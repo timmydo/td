@@ -18,14 +18,14 @@ const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 td-agent is td's agent harness (td-agent/DESIGN.md). Its window lists the\n\
 conversations, the most recently active first, beside the open one.\n\
 Each message is a turn with the configured model through OpenRouter, by\n\
-way of td's fetch service: run it as ./agent from a td checkout, which\n\
-serves that.\n\
+way of td's fetch service: run it as ./install-apps installs it from a td\n\
+checkout, whose launch serves that.\n\
 \n\
 Keys: Return in the composer sends it (S-Return is a newline, and\n\
 C-Return sends from outside a dialog); C-r asks a failed turn again;\n\
 C-n starts a conversation from a workspace template\n\
 (Empty, Directory... or one configured; td-agent/DESIGN.md §7), or\n\
-with no workspace when ./agent's jail is absent; C-PageUp and C-PageDown\n\
+with no workspace when its jail is absent; C-PageUp and C-PageDown\n\
 open the one above or below; C-S-m opens the Messages window, which\n\
 keeps td-agent's notes whole and with their times (the status row\n\
 counts the unread); F6 and S-F6 move the focus between the\n\

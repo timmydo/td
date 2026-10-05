@@ -1,8 +1,8 @@
 //! The tool host in a real workspace jail (DESIGN.md §8): td-jail's
 //! `workspace` kind, launched as a conversation launches it. Ignored by
 //! default: it needs unprivileged user namespaces and a built td-jail and
-//! td-txt, named by `TD_AGENT_JAIL` and `TD_AGENT_TXT` as `./agent` names
-//! them. Run with `cargo test --test jail -- --ignored`.
+//! td-txt, named by `TD_AGENT_JAIL` and `TD_AGENT_TXT` as td-net's launch
+//! names them. Run with `cargo test --test jail -- --ignored`.
 #![forbid(unsafe_code)]
 #![allow(
     clippy::unwrap_used,

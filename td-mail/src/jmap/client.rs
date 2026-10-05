@@ -20,7 +20,7 @@ fn no_fetch_service() -> JmapError {
     };
     JmapError::NoFetchService(format!(
         "no td-fetch socket at {}: td-mail fetches through td's fetch service; \
-         on a host, ./mail from the checkout serves one, or \
+         on a host, ./install-apps installs a td-mail that serves one, or \
          td-net fetchd run --socket PATH",
         socket
     ))

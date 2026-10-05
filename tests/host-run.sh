@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# The ./news, ./mail and ./agent entry points bootstrap the Cargo runner and hand
-# everything else to `td-builder host-run NAME`, and ./install-fonts and
-# ./install-apps to `td-builder install-fonts` and `install-apps`: one
-# build of the runner
-# from the checkout into its own target directory, for this host, with the
-# linker the host has (cc, else gcc, or TD_CC_HOME's) named for rustc when
-# cc is not on PATH; then the verb with the application's name and the
-# arguments as given, exec'd so the runner is the script's process and its
-# exit the script's. All five scripts run through the same fake tools
-# under a PATH of those alone; a bootstrap that only one of them made would
-# be invisible from the others.
+# The ./install-fonts and ./install-apps entry points bootstrap the Cargo
+# runner and hand everything else to `td-builder install-fonts` and
+# `install-apps`: one build of the runner from the checkout into its own
+# target directory, for this host, with the linker the host has (cc, else
+# gcc, or TD_CC_HOME's) named for rustc when cc is not on PATH; then the
+# verb with the arguments as given, exec'd so the runner is the script's
+# process and its exit the script's. Both scripts run through the same
+# fake tools under a PATH of those alone; a bootstrap that only one of
+# them made would be invisible from the other.
 set -euo pipefail
 
 if [[ ${TD_HOST_RUN_TEST_FAKE:-} == 1 ]]; then
@@ -57,7 +55,7 @@ ln -s "$root/tests/host-run.sh" "$work/toolchain/bin/gcc"
 for tool in bash sed tr mkdir chmod; do
     ln -s "$(command -v "$tool")" "$work/bin/$tool"
 done
-cp "$root/news" "$root/mail" "$root/agent" "$root/install-fonts" "$root/install-apps" "$work/fixture/"
+cp "$root/install-fonts" "$root/install-apps" "$work/fixture/"
 
 # One run of `script` under the configuration `label`, with the extra
 # environment given, from the work directory by a relative path, under a
@@ -89,17 +87,13 @@ run() {
     # build's parent), its argument count and arguments; then the runner's
     # own pid, which is the script's process only if the script exec'd
     # it, its argument count and its arguments.
-    local script_pid expected verb
+    local script_pid expected
     script_pid=$(sed -n 2p "$log")
-    case $script in
-        install-fonts | install-apps) verb=(3 "$script") ;;
-        *) verb=(4 host-run "$script") ;;
-    esac
     expected=$(printf '%s\n' \
         "<unset>|$work/fixture/target|$linker|$work/fixture" \
         "$script_pid" \
         6 build --release --locked --quiet --manifest-path builder/Cargo.toml \
-        "$script_pid" "${verb[@]}" --one "two three")
+        "$script_pid" 3 "$script" --one "two three")
     test "$(cat "$log")" = "$expected" || {
         echo "FAIL: $script ($label): the tools were not called as expected; wanted:" >&2
         printf '%s\n' "$expected" >&2
@@ -110,22 +104,15 @@ run() {
 }
 
 # A host with gcc and no cc (Guix): gcc is named as the linker.
-run news guix-host gcc
-run mail guix-host gcc
-run agent guix-host gcc
 run install-fonts guix-host gcc
 run install-apps guix-host gcc
 # A host with cc: nothing is named.
 ln -s "$root/tests/host-run.sh" "$work/bin/cc"
-run news cc-host '<unset>'
-run agent cc-host '<unset>'
 run install-fonts cc-host '<unset>'
 run install-apps cc-host '<unset>'
 rm "$work/bin/cc"
 # A provided toolchain: its gcc is named, whatever PATH has.
-run mail provided-toolchain "$work/toolchain/bin/gcc" TD_CC_HOME="$work/toolchain"
-run agent provided-toolchain "$work/toolchain/bin/gcc" TD_CC_HOME="$work/toolchain"
 run install-fonts provided-toolchain "$work/toolchain/bin/gcc" TD_CC_HOME="$work/toolchain"
 run install-apps provided-toolchain "$work/toolchain/bin/gcc" TD_CC_HOME="$work/toolchain"
 
-echo "PASS: ./news, ./mail, ./agent, ./install-fonts and ./install-apps bootstrap the runner for this host and exec it"
+echo "PASS: ./install-fonts and ./install-apps bootstrap the runner for this host and exec it"

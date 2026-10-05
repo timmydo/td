@@ -95,19 +95,17 @@ program built before any is installed (`td-builder install-apps`). Each
 runs by name from `~/.local/bin`, and it tells you to add that to `PATH`
 when it is missing. td-news, td-mail and td-agent there are links to an
 installed td-net that serves their fetch service for each run, with the
-programs themselves in `~/.local/lib/td`. These are development builds
-run unjailed and as you, not the static artifacts the image carries. Run
+programs themselves in `~/.local/lib/td`. td-jail and td-txt go there
+too, linked nowhere: td-net names them to td-agent, whose tools run in
+td-jail's workspace jail, which needs unprivileged user namespaces.
+These are development builds run as you, not the static artifacts the
+image carries, and apart from td-agent's tools, unjailed. Run
 `./install-apps` again after a `git pull` to update them.
 
 `./install-fonts` installs the pinned JetBrains Mono Nerd Font that
 td-ui and td-term draw with in `~/.local/share/fonts/jetbrains-mono-nerd`
 (under `$XDG_DATA_HOME` when that is set), so td programs run on this
 host draw with it rather than Unifont (`td-builder install-fonts`).
-
-To try td-news, td-mail or td-agent without installing anything,
-`./news`, `./mail` and `./agent` build and run them from the checkout
-the same way, with td's fetch service started for each launch
-(`td-builder host-run`, APPLICATIONS.md §X.7).
 
 ### Hand it to somebody who has not built td
 

@@ -1423,7 +1423,7 @@ fn a_third_identical_call_in_a_row_goes_to_the_person() {
 
 /// A workspace conversation's request names its workspace and carries
 /// its tools; a read runs without asking, and a command waits for the
-/// person, whose refusal is the call's answer. Without `./agent`'s
+/// person, whose refusal is the call's answer. Without the launch's
 /// td-jail neither can run, which each says, so the gate needs no jail:
 /// the jail's own tests run the calls (tests/jail.rs).
 #[test]

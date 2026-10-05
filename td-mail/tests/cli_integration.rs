@@ -590,7 +590,7 @@ fn test_connect_without_fetch_service_names_the_socket() {
     let error = resp["error"].as_str().unwrap_or("");
     let expected = format!(
         "no td-fetch socket at {}/td-fetch/socket: td-mail fetches through \
-         td's fetch service; on a host, ./mail from the checkout serves one, or \
+         td's fetch service; on a host, ./install-apps installs a td-mail that serves one, or \
          td-net fetchd run --socket PATH",
         runtime_dir.path().display()
     );

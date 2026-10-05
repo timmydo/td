@@ -7,10 +7,11 @@
 //! itself refuses on top of that (its own state, credential locations,
 //! `workspace_root`) is the workspace's admission, before a spec exists.
 //!
-//! On a host the programs are the checkout's: `./agent` builds td-jail and
-//! td-txt and names them in `TD_AGENT_JAIL` and `TD_AGENT_TXT`. Without
-//! them there is no jail, and tools are refused by name; there is no
-//! unconfined fallback.
+//! On a host the programs are the copies `./install-apps` built from the
+//! checkout and installed: td-jail and td-txt beside td-agent, and td-net's
+//! launch names them in `TD_AGENT_JAIL` and `TD_AGENT_TXT`
+//! (net/src/launch.rs). Without them there is no jail, and tools are
+//! refused by name; there is no unconfined fallback.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 use crate::host::Client;
 use crate::repo::{self, Task};
 
-/// The variables `./agent` names its built td-jail and td-txt in.
+/// The variables td-net's launch names the installed td-jail and td-txt in.
 pub const JAIL_VAR: &str = "TD_AGENT_JAIL";
 pub const TXT_VAR: &str = "TD_AGENT_TXT";
 /// Where td-jail binds the spec's programs, each under its file name.
@@ -90,7 +91,7 @@ pub fn system_path(path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
 }
 
 impl Programs {
-    /// From `./agent`'s variables, with this program as the entry.
+    /// From the launch's variables, with this program as the entry.
     pub fn from_env() -> Result<Self, String> {
         let named = |var: &str| {
             std::env::var_os(var)
@@ -99,7 +100,7 @@ impl Programs {
                 .ok_or_else(|| {
                     format!(
                         "no workspace jail: {var} is not set, so tools cannot run confined \
-                         and are refused (./agent builds td-jail and td-txt and sets it)"
+                         and are refused (./install-apps installs td-jail and td-txt and the launch sets it)"
                     )
                 })
         };

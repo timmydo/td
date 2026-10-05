@@ -11723,11 +11723,6 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // td-builder host-run news|mail|agent [ARG...] — the checkout's application
-        // on this host, unjailed, with the fetch service it needs served for it;
-        // the repository-root ./news, ./mail and ./agent entry scripts exec this
-        // (host_run.rs).
-        Some("host-run") => host_run::run(args.get(2..).unwrap_or(&[])),
         // td-builder install-fonts — the pinned outline face, verified and
         // installed under the XDG data home for td programs run on this
         // host; ./install-fonts execs this (install_fonts.rs).

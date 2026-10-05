@@ -1138,17 +1138,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // The application, font and install entry points and the test that
-    // drives them through fake tools: they bootstrap the runner and exec
-    // `td-builder host-run`, `install-fonts` or `install-apps`, whose own
-    // logic the builder's cargo tests cover.
-    if p == "news"
-        || p == "mail"
-        || p == "agent"
-        || p == "install-fonts"
-        || p == "install-apps"
-        || p == "tests/host-run.sh"
-    {
+    // The font and install entry points and the test that drives them
+    // through fake tools: they bootstrap the runner and exec `td-builder
+    // install-fonts` or `install-apps`, whose own logic the builder's cargo
+    // tests cover.
+    if p == "install-fonts" || p == "install-apps" || p == "tests/host-run.sh" {
         sel.add_preflight("shell-syntax");
         sel.add_preflight("host-run-entry");
         return;
@@ -1827,7 +1821,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
 /// The shell scripts' syntax check, one `bash -n` per script: given several
 /// names at once, bash checks the first and hands the rest to it as its
 /// arguments.
-const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso test-iso host-preflight.sh news mail agent install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
+const SHELL_SYNTAX: &str = "for f in start build-qcow build-iso test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done";
 
 /// The repository-wide format check, as the preflights spell it: this binary's
 /// `gate-crates fmt --all` (`check_format`).
@@ -3064,12 +3058,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("test-iso", "start-bootstrap");
     assert_preflight!("host-preflight.sh", "shell-syntax");
     assert_preflight!("host-preflight.sh", "start-bootstrap");
-    assert_preflight!("news", "shell-syntax");
-    assert_preflight!("news", "host-run-entry");
-    assert_preflight!("mail", "shell-syntax");
-    assert_preflight!("mail", "host-run-entry");
-    assert_preflight!("agent", "shell-syntax");
-    assert_preflight!("agent", "host-run-entry");
     assert_preflight!("install-fonts", "shell-syntax");
     assert_preflight!("install-fonts", "host-run-entry");
     assert_preflight!("install-apps", "shell-syntax");
@@ -8194,7 +8182,7 @@ mod tests {
             .copied()
             .filter(|v| v.contains('-'))
             .collect();
-        assert!(verbs.len() >= 10, "{verbs:?}");
+        assert!(verbs.len() >= 9, "{verbs:?}");
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -11881,7 +11869,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  for f in start build-qcow build-iso test-iso host-preflight.sh news mail agent install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
+                "  for f in start build-qcow build-iso test-iso host-preflight.sh install-fonts install-apps tests/*.sh ci/*.sh tools/*.sh; do bash -n \"$f\" || exit 1; done",
                 &full_cargo,
                 "  td-builder check check",
                 &deferred,

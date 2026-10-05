@@ -49,10 +49,10 @@ none, minimal, low, medium, high or xhigh, is sent only when given; N\n\
 defaults to 32768, cut to the model's own limit. Its worst case must fit\n\
 max_cost_per_turn, priced from the API's models list: for a dear model,\n\
 ask a smaller N or raise that limit. It exits non-zero unless the review\n\
-finished whole. Run it as ./agent review from a td\n\
-checkout, which serves the fetch service it needs, for example:\n\
+finished whole. Run it as ./install-apps installs it from a td\n\
+checkout, whose launch serves the fetch service it needs, for example:\n\
 \n\
-  git show HEAD | ./agent review --model google/gemini-3.8-flash --effort high\n";
+  git show HEAD | td-agent review --model google/gemini-3.8-flash --effort high\n";
 
 /// The instruction the model is given. The commit follows it in the
 /// user message, between the markers `{OPEN}` and `{CLOSE}` name.
@@ -489,7 +489,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let commit = match options.input.as_deref() {
         Some(path) => read_input(open(path)?)?,
         None if std::io::stdin().is_terminal() => {
-            return Err("no commit: pipe one in, as `git show HEAD | ./agent review`".into())
+            return Err("no commit: pipe one in, as `git show HEAD | td-agent review`".into())
         }
         None => read_input(std::io::stdin().lock())?,
     };

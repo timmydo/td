@@ -1548,7 +1548,7 @@ pub fn run(
     app.set_rows(rows);
     let mut client = config.client.clone();
     // Workspaces, and the shared directories each gets, admitted once
-    // here; without ./agent's jail there are none, and asking says why.
+    // here; without the jail there are none, and asking says why.
     let places = places(&config, &state);
     match &places {
         Ok(places) => {

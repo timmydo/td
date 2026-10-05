@@ -17,7 +17,7 @@ starting point for successive agents; the root `AGENTS.md` and
 
 Increments 3 to 8 of §18 are built: td-ui's message list; the
 crate with its gate, the window and conversation processes, the store
-and `./agent`; the model client over `td-fetch 1`, with the key file,
+and the host launch; the model client over `td-fetch 1`, with the key file,
 the models list, cost limits, credit and titles; td-net's streamed
 fetch; streamed replies over it, drawn as they arrive and interrupted
 by `Escape`; and the conversation tools, the first a model is given:
@@ -37,8 +37,8 @@ were the user's to make were made on 2026-10-01, 2026-10-02 and
 2026-10-04:
 
 - **Use:** both coding and general assistance, coding first.
-- **Run target:** an unjailed checkout launch on a development host first
-  (`./agent`, the `./news` and `./mail` shape of APPLICATIONS.md §X.7), so
+- **Run target:** an unjailed installed launch on a development host first
+  (`./install-apps`, as td-news and td-mail, APPLICATIONS.md §X.7), so
   the harness can be exercised against OpenRouter at once; packaging as a
   jailed td application follows as its own increment.
 - **Coordination:** no orchestrator. Every conversation is a peer with
@@ -844,10 +844,10 @@ compositor's secure-attention path. It collects no secret that
 authenticates the human (principle 7's PINs and passphrases): the key
 is a bearer credential the human copies from their provider, the bytes
 the key file holds, which any process of theirs can read on the
-host-run path the dialog serves. Masking keeps it off the screen and
+host launch the dialog serves. Masking keeps it off the screen and
 out of what the window shows the driven seam; it does not stop another
-client drawing a look-alike, which is why the dialog is the host-run
-path's alone and the key on td is the portal credential (§6).
+client drawing a look-alike, which is why the dialog is the host
+launch's alone and the key on td is the portal credential (§6).
 
 Without a key the status row says `no key: F10` after the state, until
 one is stored, when a note says where it was stored and that every
@@ -1488,7 +1488,7 @@ any request, naming the setting that chose it.
 
 **The API key** is held only by the agent processes (§2).
 
-- **Host-run:** `$XDG_CONFIG_HOME/td-agent/openrouter.key`, holding one
+- **On a host:** `$XDG_CONFIG_HOME/td-agent/openrouter.key`, holding one
   line. It is opened without following a final symlink, and the opened
   descriptor, not the path, is checked: a regular file with one link,
   owned by the caller, mode 0600. Every ancestor directory up to `/` must
@@ -1735,11 +1735,11 @@ window process, from the key dialog of §4. Nothing else writes it.
   or any file but `openrouter.key` (and the temporary file a save cut
   short leaves).
 - **On td** the key is the portal credential (above), and the file is
-  not read. td-agent runs only as `./agent` on a host until the
-  packaging increment, so there is no jailed run for the window to tell
-  apart today and the item is always shown; the packaging increment
-  hides it in the jailed run, or has it say that the key is set with
-  `td-secret set agent/openrouter`.
+  not read. td-agent runs only as `./install-apps` installs it on a
+  host until the packaging increment, so there is no jailed run for the
+  window to tell apart today and the item is always shown; the packaging
+  increment hides it in the jailed run, or has it say that the key is
+  set with `td-secret set agent/openrouter`.
 
 ## 7. Workspaces
 
@@ -1815,7 +1815,7 @@ A template naming repositories was listed then, the finder's note
 saying it was refused until increment 11, and choosing it made nothing;
 increment 11 prepares it (As built (increment 11, preparation)). Choosing Directory… goes straight to the folder chooser: a card
 that waited behind the template chooser waits behind it too.
-Without `./agent`'s jail no workspace can be made and there is nothing
+Without the launch's jail no workspace can be made and there is nothing
 to choose: `C-n` starts a conversation with none at once, the reason on
 standard error, which is how the native compositor tests run.
 
@@ -2209,7 +2209,7 @@ directory are refused too; a work tree's subdirectory is admitted, since
 its `.git` is out of the jail's reach. The shared directories,
 `[[shared]]` in configuration and `~/Downloads` read-only by default,
 are admitted once at the window's start, each refused one named and left
-out. Without `./agent`'s td-jail and td-txt no workspace is made (As
+out. Without the launch's td-jail and td-txt no workspace is made (As
 built (templates)). A conversation's `meta` records its workspace,
 `{"kind": "scratch"}` or `{"kind": "directory", "path": …}`, fixed at
 creation; its jail directory is `$XDG_STATE_HOME/td-agent/jail/<id>/`,
@@ -2597,11 +2597,10 @@ td-agent then refuses, for every one of those sources, on top of §C:
   `PATH`, `~/bin`, `~/.local/bin` or `~/.cargo/bin` (one inside them
   puts nothing there): the model could replace its own jail, or the
   `cargo` that builds it. td-jail refuses the same by mount identity
-  for its own executable and the spec's programs. A checkout whose
-  build output holds them is therefore shared read-only or not at all;
-  one built elsewhere can be granted, and `./agent` then rebuilds
-  td-jail from sources the model wrote, a persistence channel like
-  those above.
+  for its own executable and the spec's programs. The programs run are
+  the ones `./install-apps` placed in `~/.local/lib/td`, which no
+  workspace may write; the checkout they were built from is never
+  needed by them and is granted, or not, like any other directory.
 
 **Limits.** The first increments set none, and say so in the status row.
 td-jail's application launch sets the package's `RLIMIT_DATA` on every
@@ -2672,16 +2671,23 @@ creates; the capability its stage 1 raises is the new namespace's. The
 
 - §X.1 launches a materialized package, and its applications need the
   caller's Wayland socket and a local td-busd socket. A `workspace`
-  instance runs the checkout's own tool host and td-txt, built by the same
-  `td-builder host-run` launch that builds td-agent and bound read-only
-  into the instance, with no package, no Wayland and no bus;
+  instance runs the installed tool host and td-txt, which the same
+  `./install-apps` that installs td-agent builds from the checkout, bound
+  read-only into the instance, with no package, no Wayland and no bus.
+  A td-agent window running when `./install-apps` replaces it starts
+  later conversations from the new file, which work. The conversations
+  it already runs, and its own archive and delete survey, find their
+  file gone: their workspace preparation and tracking are refused, and
+  so are their tools unless they had already found their programs,
+  which then run the newly installed td-jail and tool host;
 - §X refuses to borrow the host's own `/etc` or system trees, but a coding
   agent's tools on a host are the host's: its compiler, git and shell. The
   `workspace` kind binds them read-only, for that kind alone, as an
   availability divergence;
-- `./agent`'s launch builds td-jail from the checkout and writes the host
-  configuration td-agent passes to it, in the launch's own runtime
-  directory.
+- `./install-apps` builds td-jail and td-txt from the checkout and
+  installs them beside td-agent, td-net's launch names them to it, and
+  td-agent writes each instance's spec for td-jail under
+  `$XDG_STATE_HOME/td-agent/jail/` (As built, below).
 
 If that amendment is not made, tool execution is refused by name on a
 host. There is no silent unconfined fallback.
@@ -2691,7 +2697,7 @@ APPLICATIONS.md §C's `td-jail --workspace LAUNCHER-PID SPEC [ARG...]`,
 with §X.8
 naming its host divergences, and it settles four things this section
 left open. The spec is td-agent's to write, per instance, not
-`./agent`'s: an ordered keyfile of the entry and td-txt, the home, the
+the launch's: an ordered keyfile of the entry and td-txt, the home, the
 worktrees and the shared directories, read-only or read-write, kept
 outside every directory it grants, since the instance runs as the
 caller and could otherwise rewrite the next instance's spec. The
@@ -2834,13 +2840,14 @@ commits as the identity the configuration names, cannot write
 and cannot name the sparse mode, which leaves the patterns as they
 were.
 
-**As built (increment 10, the launch).** `./agent` builds td-jail and
-td-txt from the checkout beside td-agent and names them in
-`TD_AGENT_JAIL` and `TD_AGENT_TXT`; without them every tool is refused
-with that reason. `jail::launch` writes an instance's spec, mode 0600,
-under a 0700 directory of the caller's, creates the instance's 0700
-home, and starts `td-jail --workspace PID SPEC tool-host --txt
-/opt/workspace/bin/td-txt --root DIR...` with one end of a stream
+**As built (increment 10, the launch).** `./install-apps` installs
+td-jail and td-txt from the checkout beside td-agent, and td-net's
+launch names them in `TD_AGENT_JAIL` and `TD_AGENT_TXT`; without them
+every tool is refused with that reason. `jail::launch` writes an
+instance's spec, mode 0600, under a 0700 directory of the caller's,
+creates the instance's 0700 home, and starts `td-jail --workspace PID
+SPEC tool-host --txt /opt/workspace/bin/td-txt --root DIR...` with one
+end of a stream
 socketpair as its standard input and output and an empty environment;
 the tool host's roots are the worktrees and the shared directories,
 never the home. td-jail must be named `td-jail`, since its argv[0]
@@ -2859,7 +2866,7 @@ The caller names the spec directory; a conversation's are under
 `$XDG_STATE_HOME/td-agent/jail/`, outside `/tmp`, which td-jail
 reserves, and a specs directory and a home are named as they resolve.
 Ignored live tests, which name
-td-jail and td-txt as `./agent` does, run file, grep and shell calls in
+td-jail and td-txt as the launch does, run file, grep and shell calls in
 an instance and read its confinement back from inside, and kill a
 launching process with `SIGKILL` and find no process of its instance
 left, the command it was running included.
@@ -3089,7 +3096,7 @@ variables reaches nothing. Names are resolved by the relay, not in the
 jail.
 
 **The egress relay** is a new td-net applet beside fetchd, served by the
-host-run launch on a development host and as a unit on td. It takes a host
+installed launch on a development host and as a unit on td. It takes a host
 and port from td-agent over its socket, resolves, and refuses loopback,
 link-local, unspecified, broadcast, multicast, RFC 1918, unique-local and
 carrier-grade NAT addresses, and the machine's own addresses, read from
@@ -4401,7 +4408,7 @@ kind. td-agent's position on its features:
   background process, or a conversation or window process killed with
   `SIGKILL`. Admission refuses `$HOME`, the store, a credential
   location, and a shared directory containing a worktree.
-- **Live checks, by hand and never in the gate:** `./agent` against
+- **Live checks, by hand and never in the gate:** td-agent against
   OpenRouter, and a classifier fixture set of pending actions with expected
   verdicts. Each stage's false-allow and false-escalate counts, and Jev's
   calibration, are recorded in the commit that changes a classifier
@@ -5007,9 +5014,10 @@ covers what the deletion question says of each kind of workspace; and
 compositor tests run without the jail, so their `C-n` starts a
 conversation with no workspace as before.
 
-The live check is by hand. Run `./agent` from a checkout, with the key
-written as one line to `$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode
-0600, or stored from File → Set OpenRouter key…. A message to a new
+The live check is by hand. Run td-agent as `./install-apps` installs it
+from a checkout, with the key written as one line to
+`$XDG_CONFIG_HOME/td-agent/openrouter.key`, mode 0600, or stored from
+File → Set OpenRouter key…. A message to a new
 conversation gets a reply, with its usage and cost on it. Asked to plan
 three steps, a model writes a todo list, drawn above the composer;
 asked to tell another conversation something, it asks on a card to
@@ -5059,10 +5067,9 @@ in parallel with it.
    and conversation processes over their socketpairs, a conversation
    restarted from its log; the split window with the conversation tree,
    message list and composer; the store with local echo and no model;
-   driven window tests; and `./agent`. Its logic is `td-builder host-run`
-   learning the name (`builder/src/host_run.rs`, and td-net's launch roster
-   in `net/src/launch.rs`); the script is only the `./news` bootstrap shape,
-   adding no logic in shell.
+   driven window tests; and the host launch, td-net's launch roster
+   learning the name (`net/src/launch.rs`) and `./install-apps` installing
+   it (`builder/src/install_apps.rs`), adding no logic in shell.
 5. **Model client over `td-fetch 1`.** Non-streaming chat with no tools, in
    the conversation process; the key file; the models list; usage, cost
    limits and credit in the status row; titles; mock fetch tests. This is
@@ -5082,7 +5089,7 @@ in parallel with it.
     APPLICATIONS.md (§C, §X) and UNSAFE.md amendments: its seccomp
     variant, shared directories from configuration, and the host-mode
     divergences of §8, with no cgroup work, since instances stay in their
-    launcher's cgroup (§8); `./agent`'s launch building td-jail, td-txt and
+    launcher's cgroup (§8); the launch's td-jail, td-txt and
     the tool host; directory and scratch workspaces, with file and shell
     tools exposed for the first time, in `ask` mode.
 
@@ -5155,11 +5162,11 @@ Messages dialect.
 
 - **Host system trees.** The exact §X amendment that lets a `workspace`
   instance bind the host's system trees and `/etc` read-only.
-- **Resource limits.** For the later limits of §8: how `./agent` obtains
+- **Resource limits.** For the later limits of §8: how the launch obtains
   a delegated cgroup v2 subtree, from a systemd user manager's transient
   scope (whose delegated controllers depend on its version and must be
   checked) or, on hosts without one (elogind, Shepherd), from an
-  administrator; whether td-builder's host-run should create the scope
+  administrator; whether td-net's launch should create the scope
   itself; the defaults per conversation, per workspace and in total; and
   what the status row shows where nothing is delegated.
 - **Background servers.** Each jail instance has its own network

@@ -21,16 +21,19 @@ needs a Wayland compositor: `WAYLAND_SOCKET`, or `WAYLAND_DISPLAY` under
 
 ## Build / Run
 
-On a host, the one-word way is the repository root's entry script, which
-builds td-news, serves td's fetch service for this launch alone, runs
-td-news under your Wayland session and stops the service when td-news
-exits (`td-builder host-run`, APPLICATIONS.md §X.7). It is not the jail:
-td-news runs as you, with your whole privilege, and nothing confines it.
-It needs cargo and a C compiler (`cc`, `gcc`, or `TD_CC_HOME`), and
-crates.io the first time, for td-net's dependencies:
+On a host, install it with the repository root's `./install-apps`, which
+builds it with the other desktop programs and puts `td-news` in
+`~/.local/bin` as a link to td-net's launcher. Run that way, it serves
+td's fetch service for this launch alone, runs td-news under your
+Wayland session and stops the service when td-news exits
+(APPLICATIONS.md §X.7). It is not the jail: td-news runs as you, with
+your whole privilege, and nothing confines it. It needs cargo and a C
+compiler (`cc`, `gcc`, or `TD_CC_HOME`), and crates.io the first time,
+for td-net's dependencies:
 
 ```bash
-./news
+./install-apps
+td-news
 ```
 
 Directly, this project needs `CC=gcc` for the linker; `cc` is not on

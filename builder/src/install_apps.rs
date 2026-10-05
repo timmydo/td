@@ -8,11 +8,14 @@
 //! session does not run, so they are installed with td-net in
 //! `~/.local/lib/td`, and their names in `~/.local/bin` are links to
 //! td-net, whose `launch` applet serves a fetch service of their own and
-//! runs the program of the link's name beside it (net/src/launch.rs), as
-//! `./news`, `./mail` and `./agent` do from the checkout. td-net names
-//! those programs itself (`td-net launch --names`).
+//! runs the program of the link's name beside it (net/src/launch.rs).
+//! td-net names those programs itself (`td-net launch --names`), and the
+//! companions its launch gives them (`td-net launch --companions`): td-jail
+//! and td-txt, installed beside them and linked nowhere, which the launch
+//! names to td-agent as its workspace jail and the td-txt its tools run
+//! (APPLICATIONS.md §X.7). td-net is therefore built first and asked.
 //!
-//! A development fixture, as `host-run` is: every program is built before
+//! A development fixture, not host mode's jail: every program is built before
 //! any is installed, so a failed build leaves the installed set as it was;
 //! the launched programs and td-net are placed before the links to them;
 //! and each file and link is put in place by a rename, so a program running
@@ -88,10 +91,16 @@ struct Item {
 /// What `built` (each program's name and the file cargo built) becomes
 /// under `local`: td-net and each program it `launched` in `local/lib/td`
 /// with a link to td-net at the program's name in `local/bin`, placed
-/// after them; every other program in `local/bin`. The link's target is
+/// after them; td-net's `companions` in `local/lib/td` with no link; every
+/// other program in `local/bin`. The link's target is
 /// td-net's absolute path, since a relative one would resolve from
 /// wherever a linked `local/bin` really is.
-fn plan(built: &[(&str, PathBuf)], launched: &[String], local: &Path) -> Result<Vec<Item>, String> {
+fn plan(
+    built: &[(&str, PathBuf)],
+    launched: &[String],
+    companions: &[String],
+    local: &Path,
+) -> Result<Vec<Item>, String> {
     let (bin, lib) = (local.join("bin"), local.join(LIB));
     let td_net = lib.join(TD_NET);
     let launches = |name: &str| launched.iter().any(|l| l == name);
@@ -99,7 +108,7 @@ fn plan(built: &[(&str, PathBuf)], launched: &[String], local: &Path) -> Result<
     let mut bin_items = Vec::new();
     for (name, from) in built {
         let file = Source::File(from.clone());
-        if *name == TD_NET || launches(name) {
+        if *name == TD_NET || launches(name) || companions.iter().any(|c| c == name) {
             lib_items.push(Item {
                 dir: lib.clone(),
                 name: (*name).to_string(),
@@ -122,12 +131,11 @@ fn plan(built: &[(&str, PathBuf)], launched: &[String], local: &Path) -> Result<
     }
     let unbuilt: Vec<&String> = launched
         .iter()
+        .chain(companions)
         .filter(|l| !built.iter().any(|(name, _)| name == l))
         .collect();
     if !unbuilt.is_empty() {
-        return Err(format!(
-            "td-net launches programs not built here: {unbuilt:?}"
-        ));
+        return Err(format!("td-net names programs not built here: {unbuilt:?}"));
     }
     if !lib_items.is_empty() && !built.iter().any(|(name, _)| *name == TD_NET) {
         return Err("a launched program needs td-net beside it".into());
@@ -237,17 +245,18 @@ fn build_all<'a>(
         .collect()
 }
 
-/// The programs `td_net` launches by name, one per line of
-/// `td-net launch --names`.
-fn launched_by(td_net: &Path) -> Result<Vec<String>, String> {
+/// What `td-net launch FLAG` lists, one per line: the programs `td_net`
+/// launches by name (`--names`) or the companions it gives them
+/// (`--companions`).
+fn listed_by(td_net: &Path, flag: &str) -> Result<Vec<String>, String> {
     let output = Command::new(td_net)
-        .args(["launch", "--names"])
+        .args(["launch", flag])
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("cannot run {}: {e}", td_net.display()))?;
     if !output.status.success() {
-        return Err(format!("td-net launch --names failed ({})", output.status));
+        return Err(format!("td-net launch {flag} failed ({})", output.status));
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -261,35 +270,70 @@ fn on_path(dir: &Path, path: Option<&OsStr>) -> bool {
     path.is_some_and(|path| std::env::split_paths(path).any(|entry| entry == dir))
 }
 
+/// Whether `dir` is a crate of the checkout at `root`.
+fn checkout_crate(root: &Path, dir: &str) -> Result<(), String> {
+    if root.join(dir).join("Cargo.toml").is_file() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is not the td checkout ({dir}/Cargo.toml is not under it): run \
+         ./install-apps from the repository root",
+        root.display()
+    ))
+}
+
+/// A companion td-net names is built as the checkout's crate of that
+/// name, so it must be a bare `td-` name.
+fn companion_name(name: &str) -> Result<&str, String> {
+    let bare = name.starts_with("td-")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if bare {
+        Ok(name)
+    } else {
+        Err(format!(
+            "td-net names a companion that is not a td crate: {name:?}"
+        ))
+    }
+}
+
 fn install_apps(root: &Path) -> Result<PathBuf, String> {
     for dir in APPS.iter().chain(&["net"]) {
-        if !root.join(dir).join("Cargo.toml").is_file() {
-            return Err(format!(
-                "{} is not the td checkout ({dir}/Cargo.toml is not under it): run \
-                 ./install-apps from the repository root",
-                root.display()
-            ));
-        }
+        checkout_crate(root, dir)?;
     }
     let local = local_dir(std::env::var_os("HOME").as_deref())?;
     writable(&local.join("bin"))?;
     writable(&local.join(LIB))?;
     let tools = crate::host_run::tools(root)?;
+    let td_net = crate::host_run::build(root, &tools, "net", TD_NET)?;
+    let launched = listed_by(&td_net, "--names")?;
+    let companions = listed_by(&td_net, "--companions")?;
+    for (at, companion) in companions.iter().enumerate() {
+        let elsewhere = APPS.contains(&companion.as_str())
+            || companion == TD_NET
+            || launched.contains(companion)
+            || companions
+                .get(..at)
+                .is_some_and(|before| before.contains(companion));
+        if elsewhere {
+            return Err(format!(
+                "td-net names {companion} as a companion twice or as another program too"
+            ));
+        }
+        checkout_crate(root, companion_name(companion)?)?;
+    }
     let crates: Vec<(&str, &str)> = APPS
         .iter()
-        .map(|app| (*app, *app))
-        .chain([("net", TD_NET)])
+        .copied()
+        .chain(companions.iter().map(String::as_str))
+        .map(|app| (app, app))
         .collect();
-    let built = build_all(&crates, &mut |dir, bin| {
+    let mut built = build_all(&crates, &mut |dir, bin| {
         crate::host_run::build(root, &tools, dir, bin)
     })?;
-    let td_net = built
-        .iter()
-        .find(|(name, _)| *name == TD_NET)
-        .map(|(_, path)| path.clone())
-        .ok_or("td-net was not built")?;
-    let launched = launched_by(&td_net)?;
-    let items = plan(&built, &launched, &local)?;
+    built.push((TD_NET, td_net));
+    let items = plan(&built, &launched, &companions, &local)?;
     install(&items, &mut |item| {
         let to = item.dir.join(&item.name);
         match &item.source {
@@ -374,14 +418,32 @@ mod tests {
     }
 
     #[test]
+    fn a_companion_is_a_bare_td_crate_name() {
+        assert_eq!(companion_name("td-jail"), Ok("td-jail"));
+        assert_eq!(companion_name("td-txt2"), Ok("td-txt2"));
+        for bad in [
+            "",
+            "jail",
+            "td-../net",
+            "td-jail/x",
+            "../td-jail",
+            "td-Jail",
+            "td jail",
+        ] {
+            assert!(companion_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn the_launched_programs_live_with_td_net_and_their_names_link_to_it() {
         let local = Path::new("/h/.local");
-        let built: Vec<(&str, PathBuf)> = ["td-editor", "td-mail", "td-net", "td-news"]
+        let built: Vec<(&str, PathBuf)> = ["td-editor", "td-jail", "td-mail", "td-net", "td-news"]
             .iter()
             .map(|name| (*name, PathBuf::from(format!("/t/{name}"))))
             .collect();
         let launched = vec!["td-mail".to_string(), "td-news".to_string()];
-        let items = plan(&built, &launched, local).unwrap();
+        let companions = vec!["td-jail".to_string()];
+        let items = plan(&built, &launched, &companions, local).unwrap();
         let shown: Vec<(String, String, String)> = items
             .iter()
             .map(|item| {
@@ -398,6 +460,7 @@ mod tests {
         assert_eq!(
             shown,
             [
+                row("/h/.local/lib/td", "td-jail", "/t/td-jail"),
                 row("/h/.local/lib/td", "td-mail", "/t/td-mail"),
                 row("/h/.local/lib/td", "td-net", "/t/td-net"),
                 row("/h/.local/lib/td", "td-news", "/t/td-news"),
@@ -409,13 +472,16 @@ mod tests {
         // td-net launching a program not built here, or a launched program
         // without td-net, is refused.
         let more = vec!["td-chat".to_string()];
-        assert!(plan(&built, &more, local).is_err());
+        assert!(plan(&built, &more, &companions, local).is_err());
+        // Nor a companion td-net names that was not built.
+        let txt = vec!["td-jail".to_string(), "td-txt".to_string()];
+        assert!(plan(&built, &launched, &txt, local).is_err());
         let without: Vec<(&str, PathBuf)> = built
             .iter()
             .filter(|(name, _)| *name != TD_NET)
             .map(|(name, path)| (*name, path.clone()))
             .collect();
-        assert!(plan(&without, &launched, local).is_err());
+        assert!(plan(&without, &launched, &companions, local).is_err());
     }
 
     #[test]
@@ -532,7 +598,7 @@ mod tests {
             ("td-net", base.join("td-net")),
             ("td-news", base.join("td-news")),
         ];
-        let items = plan(&built, &["td-news".to_string()], &local).unwrap();
+        let items = plan(&built, &["td-news".to_string()], &[], &local).unwrap();
         install(&items, &mut |_| {}).unwrap();
         assert_eq!(fs::read(local.join("bin/td-news")).unwrap(), b"net");
         assert_eq!(fs::read(elsewhere.join("td-news")).unwrap(), b"net");

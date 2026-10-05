@@ -17,6 +17,8 @@ const TD_NET: &str = env!("CARGO_BIN_EXE_td-net");
 const MARK: &str = "TD_LAUNCH_TEST_MARK";
 const EXIT: &str = "TD_LAUNCH_TEST_EXIT";
 const HOLD: &str = "TD_LAUNCH_TEST_HOLD";
+/// Where the launched program writes the companion variables it was given.
+const COMPANIONS: &str = "TD_LAUNCH_TEST_COMPANIONS";
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("td-launch-it-{tag}-{}", std::process::id()));
@@ -55,6 +57,16 @@ fn launched_program() {
         session.parent().unwrap().join("wayland-9")
     );
     std::fs::write(&mark, socket.as_os_str().as_encoded_bytes()).unwrap();
+    if let Some(record) = std::env::var_os(COMPANIONS) {
+        let given = ["TD_AGENT_JAIL", "TD_AGENT_TXT"]
+            .iter()
+            .map(|var| match std::env::var_os(var) {
+                Some(value) => format!("{var}={}\n", value.to_string_lossy()),
+                None => format!("{var} unset\n"),
+            })
+            .collect::<String>();
+        std::fs::write(record, given).unwrap();
+    }
     if std::env::var_os(HOLD).is_some() {
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -76,6 +88,7 @@ fn as_child<'a>(command: &'a mut Command, runtime: &Path, mark: &Path) -> &'a mu
         .env_remove("WAYLAND_SOCKET")
         .env_remove(EXIT)
         .env_remove(HOLD)
+        .env_remove(COMPANIONS)
         .stdin(Stdio::null())
 }
 
@@ -208,6 +221,22 @@ fn a_program_is_a_path_and_one_that_cannot_run_leaves_nothing() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
+/// `command`'s status. A copy just written can be busy while another
+/// test's fork still holds its write descriptor (ETXTBSY) until that
+/// child execs, so that is retried.
+fn status_of_a_fresh_copy(command: &mut Command) -> std::process::ExitStatus {
+    let mut tries = 0;
+    loop {
+        match command.status() {
+            Err(e) if e.raw_os_error() == Some(26) && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            status => break status.unwrap(),
+        }
+    }
+}
+
 #[test]
 fn a_link_named_for_an_application_launches_it_from_beside_the_binary() {
     let base = scratch("link");
@@ -221,21 +250,56 @@ fn a_link_named_for_an_application_launches_it_from_beside_the_binary() {
     std::fs::create_dir_all(&runtime).unwrap();
     let mut command = Command::new(bin.join("td-news"));
     as_child(&mut command, &runtime, &mark);
-    // A copy just written can be busy while another test's fork still
-    // holds its write descriptor (ETXTBSY) until that child execs.
-    let mut tries = 0;
-    let status = loop {
-        match command.status() {
-            Err(e) if e.raw_os_error() == Some(26) && tries < 50 => {
-                tries += 1;
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            status => break status.unwrap(),
-        }
-    };
+    let status = status_of_a_fresh_copy(&mut command);
     assert!(status.success(), "{status}");
     nothing_served(&runtime, &mark);
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn the_agent_is_given_its_companions_and_never_an_inherited_one() {
+    let base = scratch("companions");
+    let (lib, bin) = (base.join("lib"), base.join("bin"));
+    std::fs::create_dir_all(&lib).unwrap();
+    // The launch names what it finds beside its own resolved path.
+    let lib = std::fs::canonicalize(&lib).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(TD_NET, lib.join("td-net")).unwrap();
+    std::fs::copy(std::env::current_exe().unwrap(), lib.join("td-agent")).unwrap();
+    std::fs::write(lib.join("td-jail"), b"").unwrap();
+    std::os::unix::fs::symlink(lib.join("td-net"), bin.join("td-agent")).unwrap();
+    let (runtime, mark, record) = (base.join("run"), base.join("mark"), base.join("record"));
+    std::fs::create_dir_all(&runtime).unwrap();
+    let mut command = Command::new(bin.join("td-agent"));
+    as_child(&mut command, &runtime, &mark)
+        .env(COMPANIONS, &record)
+        .env("TD_AGENT_JAIL", "/stale/td-jail")
+        .env("TD_AGENT_TXT", "/stale/td-txt");
+    let status = status_of_a_fresh_copy(&mut command);
+    assert!(status.success(), "{status}");
+    // The jail beside it replaces the inherited one; the absent td-txt
+    // takes the inherited one away.
+    assert_eq!(
+        std::fs::read_to_string(&record).unwrap(),
+        format!(
+            "TD_AGENT_JAIL={}\nTD_AGENT_TXT unset\n",
+            lib.join("td-jail").display()
+        )
+    );
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn the_companions_are_listed_for_the_installer() {
+    let output = Command::new(TD_NET)
+        .args(["launch", "--companions"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "td-jail\ntd-txt\n"
+    );
 }
 
 #[test]

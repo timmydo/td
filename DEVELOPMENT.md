@@ -65,9 +65,7 @@ still runs it. `ready` remains required for documentation updates.
 
 The repository-root entry scripts are `./start`, `./build-qcow` and
 `./build-iso`, which build the system through the Cargo runner, `./test-iso`,
-which boots a retained ISO with a private QEMU disk, `./news`, `./mail` and
-`./agent`, which run the checkout's fetching applications on this host
-unjailed (`td-builder host-run`, APPLICATIONS.md §X.7), `./install-fonts`,
+which boots a retained ISO with a private QEMU disk, `./install-fonts`,
 which installs the pinned outline face for td programs run on this host
 (`td-builder install-fonts`), and `./install-apps`, which builds the desktop
 programs in release mode and installs them for this host's user (`td-builder
@@ -111,7 +109,7 @@ the seed patches, committed cargo locks and local-source trees, the
 builder's engine sources — what a build can execute, with the seed digest
 table AND the local-source roster it compiles in, and not its routing,
 check loop, gates, isolated crypto-crate build or host commands
-(`host-run`, `install-apps`, `install-fonts`), which no check runs
+(`install-apps`, `install-fonts`), which no check runs
 (`engine_set::HOST_ONLY`) — and the evaluator's own
 sources, with the script that builds it for the gate and the crate files
 its shared modules compile in (`catalog::shared_embeds`), each as

@@ -24,6 +24,11 @@
 // Invoked by an application's name (`td-news`, `td-mail`, `td-agent`)
 // through a link to this binary, it launches the program of that name
 // beside the binary the link resolves to, refusing one that is this binary.
+// For td-agent it also names the td-jail and td-txt beside it, when
+// `./install-apps` put them there, in `TD_AGENT_JAIL` and `TD_AGENT_TXT`:
+// its workspace jail and the td-txt its tools run. One that is not there
+// is removed from the environment the program inherits, so a variable
+// left in the caller's shell never pairs it with another build's.
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -35,6 +40,47 @@ use std::time::{Duration, Instant};
 /// The applications a link to this binary may name: those that fetch
 /// through the service.
 pub(crate) const LAUNCHED: &[&str] = &["td-agent", "td-mail", "td-news"];
+
+/// The programs an application runs beside it, each found beside this
+/// binary and named to the application in an environment variable:
+/// td-agent's workspace jail and the td-txt its tools run
+/// (td-agent/src/jail.rs). Without them td-agent refuses its tools.
+fn companions(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "td-agent" => &[("td-jail", "TD_AGENT_JAIL"), ("td-txt", "TD_AGENT_TXT")],
+        _ => &[],
+    }
+}
+
+/// Every launched program's companions, each once, in order: what
+/// `./install-apps` builds and installs beside this binary.
+fn all_companions() -> Vec<&'static str> {
+    let mut all: Vec<&'static str> = Vec::new();
+    for name in LAUNCHED {
+        for (companion, _) in companions(name) {
+            if !all.contains(companion) {
+                all.push(companion);
+            }
+        }
+    }
+    all
+}
+
+/// Writes `names` one per line, for `./install-apps`.
+fn list(flag: &str, names: &[&str]) -> i32 {
+    let mut out = std::io::stdout().lock();
+    let written = names
+        .iter()
+        .try_for_each(|name| writeln!(out, "{name}"))
+        .and_then(|()| out.flush());
+    match written {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("td-launch: {flag}: {e}");
+            1
+        }
+    }
+}
 
 /// How long a freshly started service may take to answer its probe.
 const SERVICE_START: Duration = Duration::from_secs(5);
@@ -50,28 +96,19 @@ pub fn run(args: &[String]) {
     let code = match args.get(1).map(String::as_str) {
         // The names a link to this binary launches, one per line, for
         // `./install-apps` to link.
-        Some("--names") if args.len() == 2 => {
-            let mut out = std::io::stdout().lock();
-            let written = LAUNCHED
-                .iter()
-                .try_for_each(|name| writeln!(out, "{name}"))
-                .and_then(|()| out.flush());
-            match written {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("td-launch: --names: {e}");
-                    1
-                }
-            }
-        }
+        Some("--names") if args.len() == 2 => list("--names", LAUNCHED),
+        // The companions those programs are given, for `./install-apps`
+        // to build and install beside this binary.
+        Some("--companions") if args.len() == 2 => list("--companions", &all_companions()),
         Some(program) if program.contains('/') => {
             let rest = args.get(2..).unwrap_or(&[]);
-            say(launch_here(Path::new(program), rest, true))
+            say(launch_here(Path::new(program), rest, &[], true))
         }
         _ => {
             eprintln!(
                 "usage: td-net launch PROGRAM [ARG...]  (PROGRAM a path)
-       td-net launch --names"
+       td-net launch --names
+       td-net launch --companions"
             );
             2
         }
@@ -84,9 +121,69 @@ pub fn run(args: &[String]) {
 pub fn run_named(name: &str, args: &[String]) {
     let launched = std::env::current_exe()
         .map_err(|e| format!("cannot find this program: {e}"))
-        .and_then(|exe| beside(&exe, name))
-        .and_then(|program| launch_here(&program, args, false));
+        .and_then(|exe| {
+            let program = beside(&exe, name)?;
+            let named = companions_beside(&exe, name)?;
+            launch_here(&program, args, &named, false)
+        });
     std::process::exit(say(launched));
+}
+
+/// Each of `name`'s companions with the variable it is named in: its path
+/// when it is beside `exe`, or `None` when it is not, for the launch to
+/// remove the variable and the application to refuse what needs it. One
+/// that is `exe` itself by another name, is not a file, or is a link to
+/// nothing is refused, by the companion's name.
+fn companions_beside(
+    exe: &Path,
+    name: &str,
+) -> Result<Vec<(&'static str, Option<PathBuf>)>, String> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| format!("{} has no directory", exe.display()))?;
+    let launcher = identity(exe)?;
+    let mut named = Vec::new();
+    for (companion, var) in companions(name) {
+        let path = dir.join(companion);
+        let found = match std::fs::metadata(&path) {
+            Ok(meta) if (meta.dev(), meta.ino()) == launcher => {
+                return Err(format!(
+                    "{} is this launcher, not {name}'s {companion}",
+                    path.display()
+                ));
+            }
+            Ok(meta) if !meta.is_file() => {
+                return Err(format!(
+                    "{name}'s {companion} {} is not a file",
+                    path.display()
+                ));
+            }
+            Ok(_) => Some(path),
+            // A link to nothing is a fault to name, not an absence.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&path).is_err() =>
+            {
+                None
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!(
+                    "{name}'s {companion} {} is a link to nothing",
+                    path.display()
+                ));
+            }
+            Err(e) => return Err(format!("{name}'s {companion} {}: {e}", path.display())),
+        };
+        named.push((*var, found));
+    }
+    Ok(named)
+}
+
+/// A file's device and inode, following links.
+fn identity(path: &Path) -> Result<(u64, u64), String> {
+    std::fs::metadata(path)
+        .map(|meta| (meta.dev(), meta.ino()))
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A launch that returned did not become its program: say why.
@@ -107,11 +204,6 @@ fn beside(exe: &Path, name: &str) -> Result<PathBuf, String> {
         .parent()
         .ok_or_else(|| format!("{} has no directory", exe.display()))?;
     let program = dir.join(name);
-    let identity = |path: &Path| {
-        std::fs::metadata(path)
-            .map(|meta| (meta.dev(), meta.ino()))
-            .map_err(|e| format!("{}: {e}", path.display()))
-    };
     if identity(&program)? == identity(exe)? {
         return Err(format!(
             "{} is this launcher, not the application",
@@ -123,13 +215,18 @@ fn beside(exe: &Path, name: &str) -> Result<PathBuf, String> {
 
 /// The launch from this process's environment. `loud` says where the
 /// socket is served, for a launch asked for by path.
-fn launch_here(program: &Path, args: &[String], loud: bool) -> Result<(), String> {
+fn launch_here(
+    program: &Path,
+    args: &[String],
+    named: &[(&str, Option<PathBuf>)],
+    loud: bool,
+) -> Result<(), String> {
     let (runtime, display) = session(
         nonempty("XDG_RUNTIME_DIR").as_deref(),
         nonempty("WAYLAND_SOCKET").as_deref(),
         nonempty("WAYLAND_DISPLAY").as_deref(),
     )?;
-    launch(program, args, &runtime, display.as_deref(), loud)
+    launch(program, args, named, &runtime, display.as_deref(), loud)
 }
 
 /// A nonempty environment value, an empty one reading as unset.
@@ -267,6 +364,7 @@ fn start_service(socket: &Path) -> Result<Child, String> {
 fn launch(
     program: &Path,
     args: &[String],
+    named: &[(&str, Option<PathBuf>)],
     runtime: &Path,
     display: Option<&Path>,
     loud: bool,
@@ -288,6 +386,12 @@ fn launch(
     }
     let mut command = Command::new(program);
     command.args(args).env("XDG_RUNTIME_DIR", &private);
+    for (var, path) in named {
+        match path {
+            Some(path) => command.env(var, path),
+            None => command.env_remove(var),
+        };
+    }
     if let Some(display) = display {
         command.env("WAYLAND_DISPLAY", display);
     }
@@ -384,6 +488,71 @@ mod tests {
             "a dead one is swept"
         );
         assert!(runtime.join("td-launch/x").is_dir(), "not a pid: kept");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_installer_is_told_every_companion_once() {
+        assert_eq!(all_companions(), ["td-jail", "td-txt"]);
+    }
+
+    #[test]
+    fn the_agent_is_given_the_jail_and_td_txt_beside_it_when_they_are_there() {
+        assert_eq!(
+            companions("td-agent"),
+            [("td-jail", "TD_AGENT_JAIL"), ("td-txt", "TD_AGENT_TXT")]
+        );
+        assert!(companions("td-news").is_empty());
+        assert!(companions("td-mail").is_empty());
+        let base = scratch("companions");
+        let lib = base.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("td-net"), b"").unwrap();
+        let exe = lib.join("td-net");
+        // Absent ones are listed unnamed, for the launch to remove.
+        assert_eq!(
+            companions_beside(&exe, "td-agent").unwrap(),
+            [("TD_AGENT_JAIL", None), ("TD_AGENT_TXT", None)]
+        );
+        std::fs::write(lib.join("td-jail"), b"jail").unwrap();
+        assert_eq!(
+            companions_beside(&exe, "td-agent").unwrap(),
+            [
+                ("TD_AGENT_JAIL", Some(lib.join("td-jail"))),
+                ("TD_AGENT_TXT", None)
+            ]
+        );
+        std::fs::write(lib.join("td-txt"), b"txt").unwrap();
+        assert_eq!(
+            companions_beside(&exe, "td-agent").unwrap(),
+            [
+                ("TD_AGENT_JAIL", Some(lib.join("td-jail"))),
+                ("TD_AGENT_TXT", Some(lib.join("td-txt")))
+            ]
+        );
+        assert!(companions_beside(&exe, "td-news").unwrap().is_empty());
+        // A companion that is this binary by another name is refused, by
+        // its own name.
+        std::fs::remove_file(lib.join("td-txt")).unwrap();
+        std::fs::hard_link(&exe, lib.join("td-txt")).unwrap();
+        let refused = companions_beside(&exe, "td-agent").unwrap_err();
+        assert!(
+            refused.contains("is this launcher, not td-agent's td-txt"),
+            "{refused}"
+        );
+        // So are a directory and a link to nothing, by name.
+        std::fs::remove_file(lib.join("td-txt")).unwrap();
+        std::fs::create_dir(lib.join("td-txt")).unwrap();
+        let refused = companions_beside(&exe, "td-agent").unwrap_err();
+        assert!(refused.contains("td-agent's td-txt"), "{refused}");
+        assert!(refused.contains("is not a file"), "{refused}");
+        std::fs::remove_dir(lib.join("td-txt")).unwrap();
+        std::os::unix::fs::symlink(lib.join("gone"), lib.join("td-txt")).unwrap();
+        let refused = companions_beside(&exe, "td-agent").unwrap_err();
+        assert!(
+            refused.contains("td-agent's td-txt") && refused.contains("a link to nothing"),
+            "{refused}"
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 

@@ -3,7 +3,7 @@
 //! (td-ui/DESIGN.md, "Delivery and trust position"). The repository-root
 //! `./install-fonts` entry script execs this.
 //!
-//! A development fixture, as `host-run` is: a td program run on a host has
+//! A development fixture, as `install-apps` is: a td program run on a host has
 //! no `/etc/fonts/jetbrains-mono-nerd` and draws with Unifont until this
 //! has run. What it installs is the font recipe's output, from the plan
 //! `td-recipe-eval install-fonts-plan` prints from the recipe's own pins

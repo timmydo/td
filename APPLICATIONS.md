@@ -10770,28 +10770,41 @@ the safe stable `OsStrExt::from_bytes`; converting them would let the
 file drop its `#![allow(unsafe_code)]`, which is a reduction in td's
 unsafe surface available for free.
 
-### X.7 An unjailed checkout launch
+### X.7 An unjailed installed launch
 
-`./news`, `./mail` and `./agent` at the repository root run the
-checkout's td-news, td-mail and td-agent on the host in one word, and
-they are not §X.1's host mode: no jail, no materialized package, no
-td-busd, no confinement of any kind. The application runs as the caller,
-with the caller's whole privilege, under the caller's Wayland session.
-Each is an entry script in `./start`'s shape that builds the Cargo
-runner into the checkout's own target directory, the linker the host has
-named for rustc when `cc` is not on PATH (`TD_CC_HOME`'s, else `gcc`, as
-the seed provisioning resolves it), and execs `td-builder host-run
-NAME`, whose whole logic is dependency-free Rust in the builder. The
-verb resolves the host's own cargo and C compiler the same way, with no
-static or musl requirement, since nothing it builds enters a build;
-builds the checkout's td-net and the application, and for td-agent the
-checkout's td-jail and td-txt, named to it in `TD_AGENT_JAIL` and
-`TD_AGENT_TXT` so that its tools run in §X.8's `workspace` kind, the one
-confined part of the launch, taking each binary from cargo's own report
-of where it put it; and becomes `td-net launch
-APP`, the multicall's `launch` applet, which serves the application's
-fetch service itself, in a runtime directory of the launch's own under
-the session's (`$XDG_RUNTIME_DIR/td-launch/PID`, mode 0700), and then
+`./install-apps` at the repository root (`td-builder install-apps`)
+installs host builds of the checkout's desktop programs for the caller,
+and they are not §X.1's host mode: no jail, no materialized package, no
+td-busd, no confinement of any kind. A program runs as the caller, with
+the caller's whole privilege, under the caller's Wayland session. The
+entry script, in `./start`'s shape, builds the Cargo runner into the
+checkout's own target directory, the linker the host has named for rustc
+when `cc` is not on PATH (`TD_CC_HOME`'s, else `gcc`, as the seed
+provisioning resolves it), and execs the verb, whose whole logic is
+dependency-free Rust in the builder. The verb resolves the host's own
+cargo and C compiler the same way, with no static or musl requirement,
+since nothing it builds enters a build, and takes each binary from
+cargo's own report of where it put it. Those that need no service go in
+`~/.local/bin`. td-news, td-mail and td-agent, the names `td-net launch
+--names` prints, fetch only through td's fetch service, which a host
+session does not run: they go in `~/.local/lib/td` beside a host build
+of td-net, and their names in `~/.local/bin` are links to it. td-jail
+and td-txt, the companions `td-net launch --companions` prints, go
+there too, linked nowhere; td-net is built first so the verb can ask
+it both lists.
+
+Run by one of those names, td-net is `td-net launch` of the program of
+that name beside the binary the link resolves to, refusing one that is
+td-net itself by its device and inode; `launch` itself takes a path,
+never a name to look up on `PATH`. For td-agent the launch also names
+the td-jail and td-txt beside it in `TD_AGENT_JAIL` and `TD_AGENT_TXT`,
+so that its tools run in §X.8's `workspace` kind, the one confined part
+of the launch; one that is absent is removed from the environment the
+application inherits, so a variable left in the caller's shell never
+names another build's, and td-agent refuses its tools by name.
+`launch`, the multicall's applet, serves the application's fetch
+service itself, in a runtime directory of the launch's own under the
+session's (`$XDG_RUNTIME_DIR/td-launch/PID`, mode 0700), and then
 becomes the application, by exec, with that directory as its
 `XDG_RUNTIME_DIR` and the session's display made absolute. The
 application keeps the launch's pid, terminal and exit status, so a
@@ -10802,11 +10815,7 @@ own, so a terminal's signals pass it by: once its parent is no longer
 that pid, the application having ended however it ended, it removes the
 socket it bound, when that is still the one there, and the socket's
 directory when empty, and exits. td-net forbids `unsafe`, so that watch,
-not a parent-death signal, ties the service to the application. Invoked
-by the name `td-news`, `td-mail` or `td-agent` through a link, td-net is
-`td-net launch` of the program of that name beside the binary the link
-resolves to, refusing one that is td-net itself by its device and inode;
-`launch` itself takes a path, never a name to look up on `PATH`. Two
+not a parent-death signal, ties the service to the application. Two
 launches side by side are two services, neither the other's to take
 away; the session's own `td-fetch/socket` is never touched, so a direct
 `cargo run` still gets the application's named refusal, which now names
@@ -10828,18 +10837,8 @@ that is a property of the applications, not a boundary this launch
 enforces, and nothing of §W's confinement holds here. This section's
 two-configuration rule reads the launch as availability: the
 applications run here as they run on td, the jail is what is absent, and
-a feature owes this launcher nothing.
-
-`./install-apps` (`td-builder install-apps`) installs host builds of the
-desktop programs for the caller, as unconfined as a launch. Those that
-need no service go in `~/.local/bin`. td-news, td-mail and td-agent, the
-names `td-net launch --names` prints, go in `~/.local/lib/td` beside a host
-build of td-net, and their names in `~/.local/bin` are links to it:
-td-net invoked by one of those names is `td-net launch` of the program
-of that name beside the binary the link resolves to, so an installed
-td-news is served as `./news` serves the checkout's. The installed
-program finds no service of its own any other way, and the session's
-`td-fetch/socket` is still never touched.
+a feature owes this launcher nothing. The installed program finds no
+service of its own any other way.
 
 ### X.8 The `workspace` kind on a host
 
@@ -10847,7 +10846,7 @@ program finds no service of its own any other way, and the session's
 its divergences from §X.1 are availability ones, named here as the
 two-configuration rule requires:
 
-- **(a) A program, not a package.** It runs the checkout's own td-agent
+- **(a) A program, not a package.** It runs the installed td-agent
   tool host and td-txt, bound read-only, with no package root, registry,
   Wayland or bus. Its spec is written by its launcher, not by td-builder.
 - **(b) The host's tools.** §X.1 never borrows the host's own `/etc` or
@@ -10863,10 +10862,10 @@ two-configuration rule requires:
 
 User namespaces and the workspace seccomp program are fatal
 prerequisites, as for §X.1; the unenforced aggregate caps are one named
-diagnostic. A launch from §X.7's unjailed `./agent` is how td-agent
-reaches this kind on a host: `./agent` builds td-jail and td-txt and
-names them to td-agent, which writes each instance's spec and launches
-td-jail itself (its DESIGN.md §8).
+diagnostic. A launch from §X.7's installed td-agent is how td-agent
+reaches this kind on a host: `./install-apps` installs td-jail and td-txt
+beside it, the launch names them to td-agent, and td-agent writes each
+instance's spec and launches td-jail itself (its DESIGN.md §8).
 
 ## Z. No server infrastructure
 
