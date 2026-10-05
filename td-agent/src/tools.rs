@@ -122,6 +122,11 @@ impl Tool {
         )
     }
 
+    /// Whether the workspace tool named `name` acts (`acts`).
+    pub fn acting(name: &str) -> bool {
+        Self::find(true, name).is_some_and(Self::acts)
+    }
+
     fn find(workspace: bool, name: &str) -> Option<Self> {
         Self::all(workspace).into_iter().find(|t| t.name() == name)
     }
@@ -1113,6 +1118,13 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
         Call::Glob { pattern, .. } | Call::Grep { pattern, .. } => {
             card.line(visible(pattern));
             "Search the workspace"
+        }
+        // td-agent's own, which no card asks.
+        Call::Snapshot { checkouts, .. } => {
+            for checkout in checkouts {
+                card.line(visible(checkout));
+            }
+            "Snapshot the worktrees"
         }
     };
     (title.to_string(), card.done())

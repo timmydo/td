@@ -55,6 +55,7 @@ use crate::host;
 use crate::key::Secret;
 use crate::models::{Model, Models};
 use crate::protocol::{Down, Fetched as Stored, Up, MAX_TEXT};
+use crate::snapshot;
 use crate::sse::{self, Fault};
 use crate::store::{
     self, Basis, Call, Conversation, Effect, Event, Held, Id, Kind, Purpose, Role, StateDir,
@@ -68,6 +69,10 @@ use crate::workspace::{Entry, Workspace};
 /// request with: the window sends them first, so only a harness that
 /// does not sees this.
 pub const NO_SETTINGS: &str = "no settings from the window";
+
+/// The most a step snapshot may take, past which the turn tries none
+/// again (DESIGN.md §12).
+const SNAPSHOT_TIME: Duration = Duration::from_secs(60);
 
 /// The most of a failure's reason a notification quotes.
 const MAX_WHY: usize = 1000;
@@ -303,6 +308,8 @@ pub fn serve_in(
         awaiting: Vec::new(),
         untracked: Vec::new(),
         checking: Vec::new(),
+        unsnapped: false,
+        snapless: false,
         checked: VecDeque::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
@@ -483,6 +490,11 @@ struct Session {
     /// The remotes whose preparation began and whose end is not yet
     /// taken up (`prepare`, `done_with`): a second answer waits for it.
     checking: Vec<String>,
+    /// A step snapshot failed and was said; it is said once.
+    unsnapped: bool,
+    /// A step snapshot failed this turn: none is tried again in it, so a
+    /// slow or failing one costs each turn once.
+    snapless: bool,
     /// Checkouts done, with what each set or why not, kept until a turn's
     /// next step or the turn's end (`between`, `woken`).
     checked: VecDeque<(String, Set)>,
@@ -705,6 +717,7 @@ impl Session {
     /// Runs turn `turn` to its end in the log.
     fn turn(&mut self, turn: u64) -> Result<(), String> {
         self.interrupt = false;
+        self.snapless = false;
         let outcome = self.steps(turn)?;
         if outcome.replied && self.first_reply(turn) {
             self.title(turn)?;
@@ -1204,6 +1217,10 @@ impl Session {
             })
             .unwrap_or_default();
         let workspace = self.conversation.meta().workspace.is_some();
+        // A step that may change files is snapshotted before and after
+        // (DESIGN.md §12).
+        let writes = workspace && calls.iter().any(|call| tools::Tool::acting(&call.name));
+        let before = if writes { self.snapshot(&[]) } else { None };
         for (at, call) in calls.iter().enumerate() {
             self.hear();
             if self.interrupt {
@@ -1241,8 +1258,137 @@ impl Session {
             };
             self.result(reply, call, started, content, error, beside)?;
         }
+        if let Some(before) = before {
+            self.snapshotted(reply, before)?;
+        }
         self.sync()?;
         Ok(!self.interrupt)
+    }
+
+    /// Each ready worktree of a repository workspace snapshotted by the
+    /// tool host, against `before` when given (DESIGN.md §12); none for
+    /// another workspace, or when it could not be, which is said once.
+    fn snapshot(&mut self, before: &[snapshot::Taken]) -> Option<Vec<snapshot::Taken>> {
+        let meta = self.conversation.meta();
+        let Some(Workspace::Repositories(repositories)) = &meta.workspace else {
+            return None;
+        };
+        if meta.removed || self.snapless {
+            return None;
+        }
+        let checkouts: Vec<String> = if before.is_empty() {
+            repositories
+                .entries
+                .iter()
+                .filter(|entry| meta.prepared.contains(&entry.repository))
+                .map(|entry| entry.checkout.display().to_string())
+                .collect()
+        } else {
+            before.iter().map(|taken| taken.checkout.clone()).collect()
+        };
+        if checkouts.is_empty() {
+            return None;
+        }
+        let git = match crate::repo::host_git() {
+            Ok(git) => git.display().to_string(),
+            Err(why) => return self.unsnapped(why),
+        };
+        let call = host::Call::Snapshot {
+            git,
+            checkouts: checkouts.clone(),
+            before: before.iter().map(|taken| taken.tree.clone()).collect(),
+        };
+        match self
+            .internal(call, SNAPSHOT_TIME)
+            .and_then(|text| snapshot::decode(&text, &checkouts))
+        {
+            Ok(taken) => Some(taken),
+            Err(why) => self.unsnapped(why),
+        }
+    }
+
+    /// A snapshot not taken, said the first time; none is tried again in
+    /// this turn.
+    fn unsnapped(&mut self, why: String) -> Option<Vec<snapshot::Taken>> {
+        self.snapless = true;
+        if !self.unsnapped {
+            self.unsnapped = true;
+            let text = format!(
+                "a step's snapshot was not recorded, so its changes cannot be undone: {why}"
+            );
+            let _ = self.log(Kind::Notice { text });
+        }
+        None
+    }
+
+    /// The step of the reply at `reply` snapshotted again after its calls,
+    /// and each worktree it changed recorded with its trees and files.
+    fn snapshotted(&mut self, reply: u64, before: Vec<snapshot::Taken>) -> Result<(), String> {
+        let Some(after) = self.snapshot(&before) else {
+            return Ok(());
+        };
+        let worktrees: Vec<store::Snapped> = before
+            .into_iter()
+            .zip(after)
+            .filter(|(before, after)| before.tree != after.tree)
+            .map(|(before, after)| store::Snapped {
+                checkout: after.checkout,
+                before: before.tree,
+                after: after.tree,
+                changed: after.changed,
+                more: after.more,
+            })
+            .collect();
+        if worktrees.is_empty() {
+            return Ok(());
+        }
+        // Room for it, as its answer bounds it; a step it does not fit,
+        // or whose record cannot be written, is not recorded.
+        let size: usize = worktrees
+            .iter()
+            .map(|one| {
+                one.checkout.len().saturating_mul(6)
+                    + one
+                        .changed
+                        .iter()
+                        .map(|name| name.len().saturating_mul(6))
+                        .sum::<usize>()
+                    + 256
+            })
+            .sum();
+        if !self.conversation.has_room_for(size as u64) {
+            self.unsnapped("the conversation's log has no room for its record".into());
+            return Ok(());
+        }
+        if let Err(why) = self.log(Kind::Snapshot { reply, worktrees }) {
+            self.unsnapped(why);
+        }
+        Ok(())
+    }
+
+    /// Runs td-agent's own `call` in the jail, not a model's, for at most
+    /// `time`: no card, and short, so an interrupt waits for it; its
+    /// answer's text, or why not.
+    fn internal(&mut self, call: host::Call, time: Duration) -> Result<String, String> {
+        let mut client = self
+            .bench
+            .take(&call)
+            .map_err(|why| format!("the jail: {why}"))?;
+        client.call(call.clone())?;
+        let deadline = Instant::now() + time;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(CALL_UNANSWERED.into());
+            }
+            match client.next_reply(HOST_POLL) {
+                None | Some(Ok(host::Up::Output { .. })) => {}
+                Some(Err(why)) => return Err(why),
+                Some(Ok(host::Up::Done { outcome, .. })) => {
+                    self.bench.keep(&call, client);
+                    return outcome.map(|done| done.text);
+                }
+            }
+        }
     }
 
     /// Logs a call's result; one past what a log line holds is answered
@@ -2710,6 +2856,8 @@ fn unready(
         host::Call::Glob { path, .. } | host::Call::Grep { path, .. } => vec![path.as_deref()],
         host::Call::Shell { workdir, .. } => vec![workdir.as_deref()],
         host::Call::Sed { paths, .. } => paths.iter().map(|path| Some(path.as_str())).collect(),
+        // td-agent's own, over the ready worktrees alone.
+        host::Call::Snapshot { .. } => Vec::new(),
     };
     named.into_iter().find_map(|path| {
         let at = match path.map(Path::new) {

@@ -1832,6 +1832,13 @@ impl App {
                     self.note(format!("the transcript refused a tool result: {e}"));
                 }
             }
+            Kind::Snapshot { worktrees, .. } => {
+                let lines: Vec<String> = worktrees
+                    .iter()
+                    .map(crate::history::snapshot_line)
+                    .collect();
+                self.notice_message(&format!("this step changed {}", lines.join("; ")));
+            }
             Kind::Todo { items, cleared } => {
                 if cleared {
                     self.notice_message("you cleared the todo list");

@@ -75,6 +75,15 @@ pub enum Call {
         paths: Vec<String>,
         extended: bool,
     },
+    /// td-agent's own, never a model's: each of `checkouts` recorded as a
+    /// git tree onto its snapshot ref with `git`, the host's by the path
+    /// it resolves to, and, given `before`'s trees in their order, the
+    /// files changed since named (DESIGN.md §12).
+    Snapshot {
+        git: String,
+        checkouts: Vec<String>,
+        before: Vec<String>,
+    },
 }
 
 /// From a conversation to its tool host.
@@ -135,6 +144,7 @@ impl Call {
             Self::Shell { .. } => "shell",
             Self::Grep { .. } => "grep",
             Self::Sed { .. } => "sed",
+            Self::Snapshot { .. } => "snapshot",
         }
     }
 
@@ -216,6 +226,21 @@ impl Call {
                 ),
                 ("extended", Json::Bool(*extended)),
             ]),
+            Self::Snapshot {
+                git,
+                checkouts,
+                before,
+            } => member(vec![
+                ("git", Json::Str(git.clone())),
+                (
+                    "checkouts",
+                    Json::Arr(checkouts.iter().cloned().map(Json::Str).collect()),
+                ),
+                (
+                    "before",
+                    Json::Arr(before.iter().cloned().map(Json::Str).collect()),
+                ),
+            ]),
         }
     }
 
@@ -245,6 +270,18 @@ impl Call {
             }
         };
         let flag = |name: &str| args.get(name).is_some_and(Json::is_true);
+        let texts = |name: &str| -> Result<Vec<String>, String> {
+            args.get(name)
+                .and_then(Json::as_arr)
+                .ok_or_else(|| format!("{tool}: no `{name}`"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(String::from)
+                        .ok_or_else(|| format!("{tool}: `{name}` holds something not a string"))
+                })
+                .collect()
+        };
         Ok(match tool {
             "read_file" => Self::Read {
                 path: text("path")?,
@@ -295,6 +332,11 @@ impl Call {
                     })
                     .collect::<Result<_, _>>()?,
                 extended: flag("extended"),
+            },
+            "snapshot" => Self::Snapshot {
+                git: text("git")?,
+                checkouts: texts("checkouts")?,
+                before: texts("before")?,
             },
             other => return Err(format!("no tool {other:?}")),
         })
@@ -628,6 +670,11 @@ mod tests {
                 script: "s/a/b/".into(),
                 paths: vec!["/w/a".into()],
                 extended: false,
+            },
+            Call::Snapshot {
+                git: "/usr/bin/git".into(),
+                checkouts: vec!["/w/a".into(), "/w/b".into()],
+                before: vec!["a".repeat(40), "b".repeat(40)],
             },
         ];
         for (n, call) in calls.into_iter().enumerate() {

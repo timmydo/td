@@ -634,6 +634,61 @@ fn a_repository_conversation_prepares_its_workspace() {
         Some(td_agent::workspace::Workspace::Repositories(made)) => made,
         other => panic!("{other:?}"),
     };
+    // A step snapshot in the conversation's own kind of instance: the
+    // worktree kept as a tree on its snapshot ref, and a change named
+    // (DESIGN.md §12).
+    let snap = |before: &[String]| {
+        let workspace = td_agent::workspace::Workspace::Repositories(made.clone());
+        let (policy, specs) = td_agent::workspace::policy(
+            &workspace,
+            &state,
+            &id,
+            &[],
+            std::slice::from_ref(&entry.repository),
+        )
+        .unwrap();
+        let mut client = jail::launch(&programs().unwrap(), &policy, &specs).unwrap();
+        let checkouts = vec![entry.checkout.display().to_string()];
+        client
+            .call(td_agent::host::Call::Snapshot {
+                git: td_agent::repo::host_git().unwrap().display().to_string(),
+                checkouts: checkouts.clone(),
+                before: before.to_vec(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "no snapshot came");
+            if let Some(reply) = client.next_reply(Duration::from_millis(100)) {
+                if let td_agent::host::Up::Done { outcome, .. } = reply.unwrap() {
+                    let text = outcome.unwrap_or_else(|why| panic!("{why}")).text;
+                    break td_agent::snapshot::decode(&text, &checkouts).unwrap();
+                }
+            }
+        }
+    };
+    let first = snap(&[]);
+    let kept = format!("refs/td-agent/snapshots/{}", entry.id);
+    assert_eq!(
+        plain(
+            &entry.repository,
+            &["rev-parse", &format!("{kept}^{{tree}}")]
+        )
+        .trim(),
+        first[0].tree
+    );
+    std::fs::write(entry.checkout.join("a/new"), "made in a step\n").unwrap();
+    let second = snap(&[first[0].tree.clone()]);
+    assert_eq!(second[0].changed, ["a/new"]);
+    assert_eq!(
+        plain(
+            &entry.repository,
+            &["rev-parse", &format!("{kept}^{{tree}}")]
+        )
+        .trim(),
+        second[0].tree
+    );
+    std::fs::remove_file(entry.checkout.join("a/new")).unwrap();
     let asked = || td_agent::removal::survey(&state, &id, &made, programs());
     let found = asked();
     assert_eq!(found.len(), 1);

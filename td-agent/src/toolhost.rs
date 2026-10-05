@@ -473,6 +473,23 @@ fn act(
                 digest: None,
             })
         }
+        Call::Snapshot {
+            git,
+            checkouts,
+            before,
+        } => Ok(Done {
+            text: crate::snapshot::encode(&crate::snapshot::take(
+                &crate::snapshot::Git {
+                    path: PathBuf::from(git),
+                    env: shell::environment(),
+                },
+                checkouts,
+                before,
+                &config.roots,
+            )?),
+            kept: None,
+            digest: None,
+        }),
     }
 }
 

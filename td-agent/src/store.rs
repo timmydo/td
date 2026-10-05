@@ -1091,6 +1091,19 @@ impl Status {
     }
 }
 
+/// A worktree a step changed (DESIGN.md §12): its checkout, its trees
+/// before and after, and the files changed, as many as
+/// `snapshot::MAX_CHANGED`, and how many more. The trees and the names
+/// are a jail's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Snapped {
+    pub checkout: String,
+    pub before: String,
+    pub after: String,
+    pub changed: Vec<String>,
+    pub more: u64,
+}
+
 /// One item of a todo list.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TodoItem {
@@ -1238,6 +1251,9 @@ pub enum Kind {
     /// The todo list as written, whole (DESIGN.md §12); `cleared` when the
     /// human cleared it from the window.
     Todo { items: Vec<TodoItem>, cleared: bool },
+    /// The worktrees the step of the reply at `reply` changed, each as a
+    /// git tree before and after it (DESIGN.md §12).
+    Snapshot { reply: u64, worktrees: Vec<Snapped> },
     /// The human paused or resumed the conversation (DESIGN.md §3).
     Pause { paused: bool },
     /// The human chose the conversation's model and reasoning effort
@@ -1446,6 +1462,26 @@ impl Event {
                     put("cleared", Json::Bool(true));
                 }
             }
+            Kind::Snapshot { reply, worktrees } => {
+                put("kind", Json::Str("snapshot".into()));
+                put("reply", Json::from(*reply));
+                let worktrees = worktrees
+                    .iter()
+                    .map(|one| {
+                        Json::Obj(vec![
+                            ("checkout".into(), Json::Str(one.checkout.clone())),
+                            ("before".into(), Json::Str(one.before.clone())),
+                            ("after".into(), Json::Str(one.after.clone())),
+                            (
+                                "changed".into(),
+                                Json::Arr(one.changed.iter().cloned().map(Json::Str).collect()),
+                            ),
+                            ("more".into(), Json::from(one.more)),
+                        ])
+                    })
+                    .collect();
+                put("worktrees", Json::Arr(worktrees));
+            }
             Kind::Pause { paused } => {
                 put("kind", Json::Str("pause".into()));
                 put("paused", Json::Bool(*paused));
@@ -1636,6 +1672,50 @@ impl Event {
                     })
                     .collect::<Result<_, String>>()?,
                 cleared: flag("cleared")?,
+            },
+            Some("snapshot") => Kind::Snapshot {
+                reply: number("reply")?,
+                worktrees: value
+                    .get("worktrees")
+                    .and_then(Json::as_arr)
+                    .ok_or("no worktrees")?
+                    .iter()
+                    .map(|one| {
+                        let text = |name: &str| {
+                            one.get(name)
+                                .and_then(Json::as_str)
+                                .map(String::from)
+                                .ok_or_else(|| format!("a worktree with no {name}"))
+                        };
+                        let tree = |name: &str| {
+                            text(name).and_then(|id| {
+                                crate::git::object_id(&id)
+                                    .then_some(id)
+                                    .ok_or_else(|| format!("a {name} tree that is no id"))
+                            })
+                        };
+                        Ok(Snapped {
+                            checkout: text("checkout")?,
+                            before: tree("before")?,
+                            after: tree("after")?,
+                            changed: one
+                                .get("changed")
+                                .and_then(Json::as_arr)
+                                .ok_or("a worktree with no changed files")?
+                                .iter()
+                                .map(|name| {
+                                    name.as_str()
+                                        .map(String::from)
+                                        .ok_or("a changed file that is no name")
+                                })
+                                .collect::<Result<_, _>>()?,
+                            more: one
+                                .get("more")
+                                .and_then(Json::as_u64)
+                                .ok_or("a worktree with no count")?,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?,
             },
             Some("pause") => Kind::Pause {
                 paused: value
@@ -2592,6 +2672,39 @@ pub mod tests {
     }
 
     #[test]
+    fn a_snapshot_with_a_tree_that_is_no_id_is_refused() {
+        let event = Event {
+            seq: 1,
+            time: 0,
+            kind: Kind::Snapshot {
+                reply: 1,
+                worktrees: vec![Snapped {
+                    checkout: "/w".into(),
+                    before: "a".repeat(40),
+                    after: "HEAD".into(),
+                    changed: Vec::new(),
+                    more: 0,
+                }],
+            },
+        };
+        assert!(Event::from_json(&event.to_json()).is_err());
+        let fine = Event {
+            kind: Kind::Snapshot {
+                reply: 1,
+                worktrees: vec![Snapped {
+                    checkout: "/w".into(),
+                    before: "a".repeat(40),
+                    after: "b".repeat(64),
+                    changed: Vec::new(),
+                    more: 0,
+                }],
+            },
+            ..event
+        };
+        assert_eq!(Event::from_json(&fine.to_json()).unwrap(), fine);
+    }
+
+    #[test]
     fn the_tool_events_replay_exactly_and_pausing_is_kept_in_meta() {
         let scratch = Scratch::new("tools");
         let state = scratch.state();
@@ -2669,6 +2782,16 @@ pub mod tests {
                 by: "a rule".into(),
                 probabilities: None,
                 reason: Some("read-only".into()),
+            },
+            Kind::Snapshot {
+                reply: 3,
+                worktrees: vec![Snapped {
+                    checkout: "/w/td".into(),
+                    before: "a".repeat(40),
+                    after: "b".repeat(40),
+                    changed: vec!["src/\u{1}x.rs".into(), "new \"one\"".into()],
+                    more: 2,
+                }],
             },
         ];
         let written = {

@@ -126,10 +126,32 @@ fn kind(event: &Event) -> &'static str {
         Kind::ToolCall { .. } => "tool_call",
         Kind::ToolResult { .. } => "tool_result",
         Kind::Todo { .. } => "todo",
+        Kind::Snapshot { .. } => "snapshot",
         Kind::Pause { .. } => "pause",
         Kind::Choice { .. } => "choice",
         Kind::Approval { .. } => "approval",
     }
+}
+
+/// A worktree a step changed, on one line: its checkout, its trees, and
+/// the files changed, each made visible, since a jail named them.
+pub fn snapshot_line(one: &crate::store::Snapped) -> String {
+    let short = |id: &str| id.chars().take(12).collect::<String>();
+    let mut names: Vec<String> = one
+        .changed
+        .iter()
+        .map(|name| crate::tools::visible(name))
+        .collect();
+    if one.more > 0 {
+        names.push(format!("and {} more", one.more));
+    }
+    format!(
+        "{} ({}..{}): {}",
+        crate::tools::visible(&one.checkout),
+        short(&one.before),
+        short(&one.after),
+        names.join(", ")
+    )
 }
 
 /// An event rendered whole, as `history_read` pages it.
@@ -214,6 +236,13 @@ pub fn render(event: &Event) -> String {
             items,
         } if items.is_empty() => "the person cleared the todo list".into(),
         Kind::Todo { items, .. } => crate::tools::todo_text(items),
+        Kind::Snapshot { reply, worktrees } => {
+            let mut out = format!("the step of #{reply} changed files, snapshotted");
+            for one in worktrees {
+                out.push_str(&format!("\n{}", snapshot_line(one)));
+            }
+            out
+        }
         Kind::Pause { paused: true } => "the person paused this conversation".into(),
         Kind::Pause { paused: false } => "the person resumed this conversation".into(),
         Kind::Choice { model, effort } => format!(

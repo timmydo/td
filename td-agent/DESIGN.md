@@ -2808,9 +2808,9 @@ Its second, `survey`, writes nothing: `git --no-optional-locks status
 untracked files, ignored ones aside (past its 64 KiB answer, "more
 than could be counted"), writing no index, and an index lock a killed
 tool left stops nothing; `rev-list --count --exclude=refs/remotes/*
---all --not BASE...` the commits any ref but a remote-tracking one
-(upstream's, which `track` sets) reaches that none of the
-bases do, which td-agent
+--exclude=refs/td-agent/* --all --not BASE...` the commits any ref
+but a remote-tracking one (upstream's, which `track` sets) or a step
+snapshot's (td-agent's undo, §12) reaches that none of the bases do, which td-agent
 passes from its own record, every base of the repository's worktrees;
 it answers `changes N ahead M`, read back as the jail's word, nothing
 more. A workspace
@@ -2979,7 +2979,8 @@ rest.
 store's objects, and store gc cannot see their refs, so the store never
 prunes while any workspace exists: its gc repacks with unreachable
 objects kept. Snapshots (§12) are kept reachable by
-`refs/td-agent/snapshots/<conversation>` in the workspace repository, and
+`refs/td-agent/snapshots/<worktree>` in the workspace repository, which
+is the conversation's own, and
 workspace gc, in a maintenance instance, keeps what those refs reach.
 
 A repository workspace's history is therefore the agent's to make and the
@@ -3395,9 +3396,9 @@ relative path is an error naming the worktrees.
 
 **Step snapshots and undo.** Before and after each model step that
 changes files, the tool host records each worktree's state as a git tree,
-with `git add -A` into a private index in the workspace's jail home and
+with `git add -A` into a private index in the instance's `/tmp` and
 `git write-tree`, into the workspace repository's objects, and commits the
-tree onto `refs/td-agent/snapshots/<conversation>` so gc keeps it; the log
+tree onto `refs/td-agent/snapshots/<worktree>` so gc keeps it; the log
 records the tree ids and the files that changed. This is opencode's
 shadow-git design, without the shadow repository, since every worktree is
 already a repository. The human can undo a step, which restores its
@@ -3410,6 +3411,53 @@ and shared directories are not snapshotted, and undo cannot restore them.
 A directory or scratch workspace without git records pre-images of
 `write_file`, `edit_file` and `sed` targets instead, which `--sandbox`
 makes the whole of what `sed` can write.
+
+**As built (increment 11, step snapshots).** A repository workspace's
+step snapshots are recorded; undo and redo are the next step, and a
+directory or scratch workspace's pre-images later. A step whose reply
+calls a tool that acts (`write_file`, `edit_file`, `sed`, `shell`) is
+snapshotted before its first call and after its last, however its
+calls end, each time in a fresh tool instance by td-agent's own call,
+`snapshot` (`host::Call::Snapshot`, `src/snapshot.rs`), which no model
+can make and no card asks: it names each ready worktree's checkout and
+the host's git by the path it resolves to, as maintenance does, since
+an instance's `PATH` need not hold one. For each, the tool host copies
+the worktree's index, its time with it, to a private one in the
+instance's `/tmp`, so the worktree's own, and what is staged in it,
+are left alone while its stat cache spares rereading a tracked file
+unchanged since and its sparse checkout keeps what lies outside it;
+clears assume-unchanged marks in the copy, so a change under one is
+taken; and runs `git add -A --sparse`, taking a file made outside a
+sparse checkout too, and `git write-tree` with it. Git runs with no
+configuration, ignore rules or attributes from the home or the system
+(`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`,
+`GIT_ATTR_NOSYSTEM`, `core.excludesFile` and `core.attributesFile`
+`/dev/null`), attributes from an empty tree (`GIT_ATTR_SOURCE`) and
+`core.autocrlf=false`, so each blob is its file's bytes whatever a
+`.gitattributes` says and what the model plants in its home neither
+hides a file nor converts one, and with no hooks or fsmonitor; the
+host's git must be 2.40 or later, since an older one ignores
+`GIT_ATTR_SOURCE` without a word. It commits the tree onto
+`refs/td-agent/snapshots/<worktree>`, its worktree's id, over what it
+read there, unless that is a commit holding the tree already; a value
+there that is no commit, which the jail can write, is replaced, not
+taken as a parent. Against the trees before, it names the files
+changed (`diff-tree -r -z --name-only --no-renames`), at most 40 per
+worktree of at most 200 bytes each, within 16 KiB per worktree and
+256 KiB in all as JSON escapes them, the rest counted, so the answer,
+escaped again, fits a frame and the record a log line; the
+conversation refuses an answer past those bounds. Each worktree the
+step changed is
+logged in one `snapshot` event of its reply: its checkout, its trees
+before and after, and those names, which the window and
+`history_read` show made visible, since a jail wrote them; the model
+is not given it; the window shows one notice for the step. A snapshot
+that cannot be taken, a tool instance that cannot start, git that
+fails, or one past 60 seconds, is said in a notice once a process,
+that step is not recorded, and no other is tried in the turn, so a
+slow or failing one costs a turn once; a record with no room left in
+the log, or that cannot be written, is the same. The removal survey
+does not count a snapshot's commits as work.
 
 **Background processes.** A `shell` call with `background: true` keeps
 its instance running after the call returns, for a build, a watcher or a
@@ -4548,6 +4596,28 @@ thread answering a refresh for the window with its bases;
 remotes only, each once with its bases once, none whose fetch is
 pending, and a base moving only from a commit known before; the store
 thread's queue a preparation before queued background fetches.
+For step snapshots, `src/snapshot.rs` covers a worktree kept as a tree
+on its ref with its own index and what is staged in it left alone, an
+edit, a deletion and an addition named and an ignored file not, no
+new commit when nothing changed, the answer crossing whole and one for
+other worktrees refused, other worktrees, a tree that is no id, a
+mismatched count, git by a relative path and a repository's own
+checkout refused, many changes counted past the bound, a file made
+outside a sparse checkout named and none outside it taken as deleted,
+ignore rules and attributes in the home, `.gitattributes` in the tree
+and the repository's `core.autocrlf` changing nothing and a blob its
+file's bytes, a blob or a dangling id planted on the ref replaced, an edit under an assume-unchanged mark named with the
+worktree's mark left, naming cut at each bound with the rest counted,
+and the escaped bounds checked per worktree and in all, the most an
+answer may hold fitting a frame; `src/store.rs` the `snapshot` event replaying exactly
+and one with a tree that is no id refused; `src/repo.rs` a snapshot's
+commit not counted as work;
+`tests/model_client.rs` a step that writes only its todo list not
+snapshotted, one that runs a command snapshotted first and, with no
+jail, said once before its first call, and no `snapshot` event; and
+the live `tests/jail.rs` preparation test a snapshot in the
+conversation's own kind of instance, its ref holding its tree, and a
+file made between two named.
 For a call told a worktree's state, `src/conversation.rs` covers a
 read into a worktree still checking out, a command in a ready first
 worktree and a path outside every worktree passing, a path climbing

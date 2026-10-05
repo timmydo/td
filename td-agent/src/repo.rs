@@ -741,11 +741,13 @@ impl Task {
                     Err(Failure::TooLong) => None,
                     Err(e) => return Err(said("listing its changes", &e)),
                 };
-                // Remote-tracking refs are upstream's, not the work's.
+                // Remote-tracking refs are upstream's, and step snapshots
+                // td-agent's undo, not the work's.
                 let counted = run(&[
                     "rev-list",
                     "--count",
                     "--exclude=refs/remotes/*",
+                    "--exclude=refs/td-agent/*",
                     "--all",
                     "--not",
                 ]
@@ -1529,6 +1531,12 @@ pub(crate) mod tests {
         git_in(&["branch", "--quiet", "-D", "agent/side"]);
         assert_eq!(read().ahead, 2);
         git_in(&["tag", "-d", "keep"]);
+        assert_eq!(read().ahead, 1);
+        // A step snapshot is td-agent's undo, not the work.
+        let tree = String::from_utf8(git_in(&["write-tree"])).unwrap();
+        let kept =
+            String::from_utf8(git_in(&["commit-tree", tree.trim(), "-m", "snapshot"])).unwrap();
+        git_in(&["update-ref", "refs/td-agent/snapshots/r", kept.trim()]);
         assert_eq!(read().ahead, 1);
         // Every base its repository's worktrees started at is upstream's:
         // a commit in any is not counted.

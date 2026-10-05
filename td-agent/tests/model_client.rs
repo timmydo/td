@@ -466,6 +466,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::ToolCall { .. } => "tool_call",
             Kind::ToolResult { .. } => "tool_result",
             Kind::Todo { .. } => "todo",
+            Kind::Snapshot { .. } => "snapshot",
             Kind::Pause { .. } => "pause",
             Kind::Choice { .. } => "choice",
             Kind::Approval { .. } => "approval",
@@ -1925,6 +1926,110 @@ fn a_call_into_a_worktree_not_prepared_is_told_so_without_a_card() {
             .any(|e| matches!(e.kind, Kind::Approval { .. })),
         "{events:?}"
     );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A step of a repository workspace that may change files is
+/// snapshotted before and after it, one that cannot is not, and a
+/// snapshot that cannot be taken, here with no jail, is said once
+/// (DESIGN.md §12).
+#[test]
+fn a_step_that_may_change_files_is_snapshotted_or_says_why_not_once() {
+    let base = std::env::temp_dir().join(format!(
+        "td-agent-model-snap-{}-{}",
+        std::process::id(),
+        td_agent::store::random_hex(4).unwrap()
+    ));
+    let template = td_agent::config::Template {
+        name: "td".into(),
+        repos: vec![td_agent::config::Repo {
+            remote: "https://example.org/a/td".into(),
+            base: "main".into(),
+            branch: "agent".into(),
+            sparse: None,
+        }],
+        shared: None,
+    };
+    let admitted = [td_agent::git::Admission::parse("example.org").unwrap()];
+    let made = td_agent::workspace::repositories(
+        &template,
+        &Id::random().unwrap(),
+        &base.join("data"),
+        &base.join("trees"),
+        &admitted,
+        0,
+    )
+    .unwrap();
+    let repository = made.entries[0].repository.clone();
+    let argument = td_agent::workspace::Workspace::Repositories(made).argument();
+    let h = Harness::new_in(
+        "snap",
+        Role::Conversation,
+        Some(argument.to_str().unwrap()),
+        false,
+        vec![
+            Reply::sse("stream-tool-todo.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-tool-workspace.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-tool-workspace-stop.sse"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    // Prepared, as if checked out before.
+    let (mut conversation, mut h) = h.close();
+    conversation.set_prepared(&repository).unwrap();
+    drop(conversation);
+    h.reopen();
+    h.setup(Client::default());
+    let unsnapped = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, Kind::Notice { text } if text.starts_with("a step's snapshot was not recorded")))
+            .count()
+    };
+    // A step that writes only its todo list changes no worktree.
+    h.say("Plan the tidying.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(unsnapped(&events), 0, "{events:?}");
+    // One that runs a command is snapshotted first: with no jail, said.
+    let refuse = |h: &mut Harness| {
+        let (call, _, _) = h.until_ask();
+        h.down(&Down::Decision { call, allow: false });
+        h.turn()
+    };
+    h.say("Tidy the notes.");
+    let (events, outcome, _) = refuse(&mut h);
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let mut heard = std::mem::take(&mut h.heard);
+    heard.extend(events);
+    assert_eq!(unsnapped(&heard), 1, "{heard:?}");
+    // Said before the step's first call.
+    let said = heard
+        .iter()
+        .position(
+            |e| matches!(&e.kind, Kind::Notice { text } if text.starts_with("a step's snapshot")),
+        )
+        .unwrap();
+    let first = heard
+        .iter()
+        .position(|e| matches!(e.kind, Kind::ToolCall { .. }))
+        .unwrap();
+    assert!(said < first, "{heard:?}");
+    // Once only.
+    h.say("Tidy them again.");
+    let (events, outcome, _) = refuse(&mut h);
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let mut heard = std::mem::take(&mut h.heard);
+    heard.extend(events);
+    assert_eq!(unsnapped(&heard), 0, "{heard:?}");
+    let (conversation, _h) = h.close();
+    assert!(!conversation
+        .events()
+        .iter()
+        .any(|e| matches!(e.kind, Kind::Snapshot { .. })),);
     let _ = std::fs::remove_dir_all(&base);
 }
 

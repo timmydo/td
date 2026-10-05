@@ -64,6 +64,7 @@ pub mod review;
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;
 pub mod shell;
+pub mod snapshot;
 pub mod span;
 pub mod sse;
 pub mod store;
