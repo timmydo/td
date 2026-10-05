@@ -340,8 +340,15 @@ parenthesis run; percent-spell such URI characters to preserve them. Raw
 headers retain every original byte. Empty selection remains subject to
 complete-field presence policy; selection alone validates no URI, folds or
 encoded-word placement. The shared selector implements this boundary rule;
-complete Content-Location word/literal composition and retained metadata
-remain separate work.
+the complete authorized field composer tries encoded-word placement only
+across the entire selected spelling. Adjacent words require an original wire
+whitespace gap. Unknown, oversized, touching or mixed word spellings request
+whole literal URI-reference validation and replay, preserving all markers;
+no recognized prefix is decoded before fallback. A recognized run preserves
+decoded spaces, non-ASCII and decomposed spelling without URI validation or
+normalization. Job/interpretation refusal never permits fallback. Empty
+references remain a separate field-presence decision. Field discovery,
+retained location JSON, label matching and publication remain separate work.
 
 RFC 2231 MIME parameters support percent decoding, charset/language prefixes,
 and numbered continuations beginning at zero without gaps or leading zeros.

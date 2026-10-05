@@ -1746,6 +1746,26 @@ also qualify original owner reuse and fresh completed retirement. Input
 allocation precedes the measured interval; worker/native/RSS and complete
 Content-Location placement/retention remain separate qualifications.
 
+M06dc's complete authorized URI field cursor plus HeaderBudget fits 640
+bytes in the existing parser reservation. It retains one active fixed
+selector, word-run reader or literal reader, never simultaneous live work
+owners. Word mode keeps one 75-octet buffer; literal fallback allocates no
+source-sized storage. Each poll invokes at most one child within the existing
+225-visit, 452-step, 29-job-record and four-output-byte ceilings, emitting at
+most one scalar. Zero-charge fresh consuming handoffs forfeit unused credit
+without renewing it; all scans, replay and output use original allowances.
+
+Units compare output, diagnostics, poll counts and all original job/header
+balances with independent public selection/word/literal pipelines, including
+every resource cut and exact grants on both forms and unknown fallback. Equal
+turn counts pin one child poll per composer turn; the numeric ceilings are
+inherited from independently qualified child turns. Every-prefix fresh
+and premature admission, metadata retirement and original owner reuse are
+qualified. Warm/measured Rust allocation covers long literal and word runs,
+CFWS, diagnostics, empty/fallback, malformed folds/URI/CFWS, zero records and
+late output refusal in either projection form. All input allocation precedes
+counting; worker/native/RSS and retained response buffers remain separate.
+
 M06cq's selected literal URI reader plus HeaderBudget fits 320 bytes in the
 existing parser region. It retains shared fixed validator/unfolder state
 and source borrows, with no source-sized scratch or second header arena.

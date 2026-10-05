@@ -4695,6 +4695,40 @@ whole healthy completion and fresh original admission. Cached Complete,
 sticky refusal, final admission and pointer-identical owner handoff
 retain the single-word contract.
 
+### 1.108 Complete authorized URI field projection
+
+M06dc adds mime_location_field::Cursor over one complete caller-authorized
+field-value slice, excluding the final header ending. The caller authorizes
+surrounding CFWS and whole-spelling encoded-word placement. Selection uses
+the existing ambiguity policy and returns offsets into that same source.
+Only a complete recognized word run decodes; unknown, oversized, touching
+or mixed spellings replay the whole selected spelling through the existing
+literal URI-reference validator and projector. No known prefix is decoded
+before fallback. Decoded labels preserve spaces, non-ASCII and decomposed
+spelling without a later URI check, percent decoding or normalization.
+Empty references remain permitted; field discovery and presence policy are
+external. No label matching, URL access or publication authority follows.
+
+Status::Scalar contains a provisional Unicode scalar; literal ASCII uses
+the child's already-paid output, without a second conversion charge. End
+contains the selected Spelling, encoded_words and combined encoding_problem.
+No End escapes before whole healthy completion. Selection, Words and Literal
+errors retain child context; fresh admission after completion uses Admission.
+Context identifies the phase that failed, not the eventual field form: fold
+errors come from Words even for a plain literal spelling.
+Any refusal retires the active owner and hides every metadata extent/End.
+Provisional caller output is not wiped. Cached Complete is inert, while
+check_deadline and consuming finish(now) freshly admit even Complete before
+premature-state refusal.
+
+One poll invokes at most one active child poll. Fresh consuming handoffs
+move the original exclusive Meter and HeaderBudget to the next child or
+restore them at completion, adding no charge or renewed credit. Healthy
+finish returns the pointer-identical reusable owners and End. Source ranges
+are checked before child construction, and the cursor is neither Copy nor
+Clone. Retained strings/JSON, duplicate-field selection, MIME traversal and
+response publication remain separate composition.
+
 ## 2. Read views and change history
 
 ReadView pins account/epoch, checkpoint generation and sequence, active segment,

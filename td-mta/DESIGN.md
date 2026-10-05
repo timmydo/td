@@ -441,6 +441,17 @@ non-ASCII and decomposed spelling without NFC or URI validation.
 Whole-field placement, label matching and publication remain enclosing
 responsibilities.
 
+M06dc composes original-owner URI spelling selection, whole encoded-word
+runs and complete literal fallback for one authorized field-value slice.
+Word placement is limited to the entire selected spelling. Only completely
+recognized runs decode; other spellings retain all word-looking markers in
+literal replay after URI validation. Decoded labels receive no URI check or
+normalization. Child phases remain exclusive under the original owners;
+fresh handoff never adds charge or renews credit. No metadata escapes before
+whole healthy completion, and every refusal hides the End and retires the
+owner. Empty-reference presence, discovery, label matching and retained
+response publication remain external.
+
 M06cq composes shared URI unfolding and reference validation into a selected
 literal spelling reader. It validates the complete spelling before replaying
 literal ASCII octets and slice-relative provenance under original job/header

@@ -2027,6 +2027,16 @@ Initial independently landable increments:
   long-run/refusal allocation. Complete Content-Location placement, retained
   labels and traversal/response publication remain subsequent work.
 
+- **M06dc — complete authorized URI field projection:** compose existing
+  source-relative CFWS selection, whole encoded-word runs and literal URI
+  fallback under exclusive original owners. Decode only the complete selected
+  spelling; preserve decoded labels and whole literal fallback without extra
+  output charge. Retire metadata on any refusal and freshly restore original
+  owners at healthy completion. Qualify public-child costs, every resource and
+  deadline cut, exact grants, source bounds and long/fault allocation paths.
+  Field discovery/presence, retained location JSON and traversal/response
+  metadata publication remain subsequent work.
+
 Implement other header-form composition, encoded words, address/date
 parsing, multipart scanning, transfer decoding and part offsets. Implement
 documented charset coverage and error/opaque-body representation. Add
