@@ -4526,6 +4526,26 @@ fn real_root_steps(sys: &SystemDef) -> Result<Vec<Step>, String> {
         ),
         link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::MKFS_BTRFS),
     });
+    // A live installer formats a device-bound volume with the static
+    // cryptsetup, bound at /bin in the hashed root as mkfs.btrfs is (D6). The
+    // image carries the binary and its debug companion; neither initramfs
+    // does until the selector opens volumes (ENCRYPTION.md increment 6).
+    steps.push(Step::MkDir {
+        path: "{root}/real-root{in:cryptsetup-x86-64}".into(),
+    });
+    for child in ["bin", "lib/debug"] {
+        steps.push(Step::CopyTree {
+            from: format!("{{in:cryptsetup-x86-64}}/{child}"),
+            dest: format!("{{root}}/real-root{{in:cryptsetup-x86-64}}/{child}"),
+        });
+    }
+    steps.push(Step::Symlink {
+        target: format!(
+            "{{in:cryptsetup-x86-64}}/bin/{}.static",
+            td_boot_protocol::CRYPTSETUP
+        ),
+        link: format!("{{root}}/real-root/bin/{}", td_boot_protocol::CRYPTSETUP),
+    });
     // The QEMU HTTPS origin needs only LibreSSL's static command and its debug
     // companion. Keep the development archives and headers out of the image.
     steps.push(Step::MkDir {
@@ -4913,6 +4933,12 @@ fn shape_check() -> String {
      if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/mkfs[.]btrfs[.]static$'; then echo 'selector initramfs: the mkfs.btrfs payload must be deployment-only' >&2; exit 1; fi; \
      for p in mkfs.btrfs btrfs; do [ -f \"$root{in:btrfs-progs-x86-64}/lib/debug/bin/$p.static.debug\" ] || { echo \"root tree: $p lacks its debug companion\" >&2; exit 1; }; done; \
      [ \"$(readlink \"$root/bin/mkfs.btrfs\" 2>/dev/null)\" = \"{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -f \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] && [ -x \"$root{in:btrfs-progs-x86-64}/bin/mkfs.btrfs.static\" ] || { echo 'root tree: /bin/mkfs.btrfs must link the static mkfs.btrfs a live installer formats with' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/cryptsetup\" 2>/dev/null)\" = \"{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -f \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] && [ -x \"$root{in:cryptsetup-x86-64}/bin/cryptsetup.static\" ] || { echo 'root tree: /bin/cryptsetup must link the static cryptsetup a live installer formats device-bound volumes with' >&2; exit 1; }; \
+     [ -s \"$root{in:cryptsetup-x86-64}/lib/debug/bin/cryptsetup.static.debug\" ] || { echo 'root tree: cryptsetup lacks its debug companion' >&2; exit 1; }; \
+     if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/cryptsetup; then echo 'selector initramfs: cryptsetup must stay out of both initramfs until the selector opens volumes' >&2; exit 1; fi; \
+     if printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$'; then echo 'selector initramfs: the cryptsetup payload must stay out of both initramfs until the selector opens volumes' >&2; exit 1; fi; \
+     if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/cryptsetup; then echo 'deployment initramfs: cryptsetup must stay out of both initramfs until the selector opens volumes' >&2; exit 1; fi; \
+     if printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$'; then echo 'deployment initramfs: the cryptsetup payload must stay out of both initramfs until the selector opens volumes' >&2; exit 1; fi; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
@@ -5477,10 +5503,13 @@ pub fn recipe() -> Recipe {
         // td-portal: the static Settings service, activation supervisor, and
         //   unprivileged live client probe.
         // btrfs-progs-x86-64: static mkfs.btrfs for a live boot's volatile volume.
+        // cryptsetup-x86-64: static cryptsetup a live installer formats a
+        //   device-bound volume with.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
             "btrfs-progs-x86-64",
+            "cryptsetup-x86-64",
             "uutils",
             "ripgrep",
             "fd",
@@ -7623,6 +7652,53 @@ mod tests {
         assert!(copied < linked, "the link names a binary not yet copied");
         assert!(linked < packed, "the link must be in the packed root");
         assert_eq!(td_boot_protocol::MKFS_BTRFS, "mkfs.btrfs");
+    }
+
+    #[test]
+    fn the_live_installer_formats_device_bound_volumes_with_the_root_images_cryptsetup() {
+        let recipe = recipe();
+        assert!(recipe
+            .native_inputs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|input| input == "cryptsetup-x86-64"));
+        let steps = recipe.steps.unwrap();
+        let position = |wanted: &dyn Fn(&Step) -> bool| steps.iter().position(wanted).unwrap();
+        let copied = position(&|step| {
+            matches!(step, Step::CopyTree { from, dest }
+            if from == "{in:cryptsetup-x86-64}/bin"
+                && dest == "{root}/real-root{in:cryptsetup-x86-64}/bin")
+        });
+        let companion = position(&|step| {
+            matches!(step, Step::CopyTree { from, dest }
+            if from == "{in:cryptsetup-x86-64}/lib/debug"
+                && dest == "{root}/real-root{in:cryptsetup-x86-64}/lib/debug")
+        });
+        let linked = position(&|step| {
+            matches!(step, Step::Symlink { target, link }
+            if target == "{in:cryptsetup-x86-64}/bin/cryptsetup.static"
+                && link == "{root}/real-root/bin/cryptsetup")
+        });
+        let packed = position(
+            &|step| matches!(step, Step::PackErofs { root, .. } if root == "{root}/real-root"),
+        );
+        assert!(copied < linked && companion < packed && linked < packed);
+        assert_eq!(td_boot_protocol::CRYPTSETUP, "cryptsetup");
+        // The shape check names the binary, its companion and both
+        // initramfs refusals.
+        let check = shape_check();
+        for needle in [
+            "\"$root/bin/cryptsetup\"",
+            "{in:cryptsetup-x86-64}/bin/cryptsetup.static",
+            "{in:cryptsetup-x86-64}/lib/debug/bin/cryptsetup.static.debug",
+            "selector initramfs: cryptsetup must stay out",
+            "deployment initramfs: cryptsetup must stay out",
+            "selector initramfs: the cryptsetup payload must stay out",
+            "deployment initramfs: the cryptsetup payload must stay out",
+        ] {
+            assert!(check.contains(needle), "{needle}");
+        }
     }
 
     #[test]
@@ -12335,7 +12411,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         // Exact for the same reason: a floor stays green while shape_check quietly
         // stops asking one archive for a payload the other still gets checked for.
         assert_eq!(
-            greps, 12,
+            greps, 14,
             "{greps} store-member greps found - the scan has gone stale"
         );
     }

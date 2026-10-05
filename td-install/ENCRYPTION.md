@@ -45,7 +45,9 @@ in a store output.
 
 The device-bound tier has a narrower scope. It protects storage read away
 from its machine: a removed drive or a copied disk image. Erasing the LUKS2
-header and keyslots makes a disposed disk unreadable. On the same machine it
+header and keyslots makes what the installed system wrote unreadable on a
+disposed disk; it does not erase what the disk held before installation
+("Device-bound formatting"). On the same machine it
 binds release to td's selector image, its initramfs and its load options;
 code that runs before the selector, including option ROMs and firmware
 drivers, is not covered. It does **not** protect a lost or stolen machine:
@@ -154,9 +156,11 @@ without separators, so stock cryptsetup opens the volume with it from any
 medium when given the 48 digits alone; only td's own entry tolerates
 separators between groups. The installer displays it once on its completion
 screen, requires it to be typed back, and stores no copy. Completion waits
-for the type-back. If the installer is lost before it, the installation is
-withdrawn like any failure after layout (DESIGN.md "Device-bound
-formatting"), because recovery cannot be declined in this tier.
+for the type-back, and so does the disk's partition table: until the key
+is confirmed the disk carries none, so firmware boots nothing from it. If
+the installer is lost before it, the installation is withdrawn like any
+failure after layout (DESIGN.md "Device-bound formatting"), because
+recovery cannot be declined in this tier.
 
 The installer seals the first-boot protector on the live medium under
 td-protector's first-boot policy. Sealing reads no PCR, and TPM2_Create
@@ -246,6 +250,42 @@ first-boot protector, naming keyslot 1, in td-protector's token format
 ("LUKS2 tokens"). Key material reaches cryptsetup only through
 descriptors, never argv or the environment; DESIGN.md "Device-bound
 formatting" owns the mechanism.
+
+Formatting erases nothing beyond what it writes. `luksFormat` writes the
+16 MiB header area and leaves the data segment as it found it; mkfs.btrfs
+and td-boot then write, through the mapping, only the blocks the new
+filesystem uses. Every other block of the segment keeps what the disk held
+before, in plaintext. An attacker with the disk reads those earlier
+contents wherever the installed system has not yet overwritten them, which
+just after installation is nearly the whole volume, and can tell such
+blocks from ones written since, so learns roughly how much the system has
+written. The tier protects what is written after installation, not what
+the disk held before it. td performs no whole-disk overwrite, discard or
+drive sanitize; erasing a disk's earlier contents is its owner's separate
+step before installing. The ESP and the partition table are plaintext on
+every tier.
+
+The table is written last and only after the recovery key is typed back
+(DESIGN.md "Device-bound formatting"). A crash, power cut or lost
+installer before then leaves a disk with no partition table, which
+firmware does not boot. It still holds the ESP, with the kernel and the
+prepared selector, and the volume: its header with keyslot 0, opened by
+the unconfirmed recovery key, and keyslot 1 with token 0, whose protector
+only this TPM releases; inside, the published deployment and the staged
+settings, account and trusted key, none of them secret. A withdrawal also
+zeroes the volume's first 16 MiB, so neither keyslot opens; a crash leaves
+no withdrawal behind it, and a new installation over the disk replaces
+both.
+
+After the confirmation the table goes down backup first, then the primary
+with the protective MBR, each synced. A crash between the two leaves the
+backup GPT alone, with LBA 0 zeroed and so no protective MBR. Whether
+firmware then boots is its own: one that falls back to a valid backup
+header may boot the installation, one that wants the protective MBR or a
+valid primary treats the disk as unpartitioned. Either way the recovery
+key was already typed back, so a boot that reaches recovery is one its
+owner can open; nothing completes the installation, which a new one
+over the disk replaces.
 
 ## Authentication and recovery
 
@@ -428,7 +468,8 @@ with an explicit swtpm path; without one it is an unprovisioned skip. Its
 guest drives the service with the device-bound operand onto a disposable
 disk, as both of its peers, typing the displayed recovery key back. It
 then opens the volume with that recovery key and checks the ciphertext
-(no Btrfs superblock or staged plaintext in the data segment), the token
+(no Btrfs superblock or staged plaintext in the data segment, on a disk
+that starts zeroed, so it claims no erasure), the token
 read back through td's reader, and the published deployment. It checks
 that no recovery key or protector secret appears on the ESP, in the
 workspace or in any `/proc/*/cmdline` sampled while cryptsetup runs. It

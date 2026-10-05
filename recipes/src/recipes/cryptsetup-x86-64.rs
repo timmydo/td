@@ -13,9 +13,9 @@ use crate::types::{Recipe, Step};
 // The whole static closure (json-c, popt, libdevmapper, util-linux's libuuid
 // and libblkid) is compiled by the self-hosted toolchain under the shipped
 // target profile, and the binary is split into a runtime and a debug
-// companion (td-profiler/DESIGN.md §2). Nothing in the image execs it yet;
-// DESIGN.md D6 records the boot-path exception and the binding lands with
-// the first exec, as D7 requires of mkfs.btrfs.
+// companion (td-profiler/DESIGN.md §2). The system image binds it at
+// /bin/cryptsetup for the installer's device-bound formatting, with the
+// build-time binding D7 requires of mkfs.btrfs (DESIGN.md D6).
 /// Busybox applets configure, libtool and the Makefiles call by name.
 const TOOLS: &[&str] = &[
     "awk", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "diff", "dirname", "echo",

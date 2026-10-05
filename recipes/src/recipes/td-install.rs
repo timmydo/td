@@ -7,7 +7,8 @@ use crate::types::{Recipe, Step};
 // reaches its checksum as `crate::crc32`, so those two arrive as a pair or the
 // build does not link. `sha256.rs` is the live installation's check of the ESP
 // kernel against the authenticated manifest. The device-bound service's TPM
-// probe runs over the sibling crates td-protector and td-tpm (td-protector
+// probe and formatting run over the sibling crates td-protector and td-tpm
+// (td-protector
 // reaches td-json), each compiled first as an rlib with the binary's profile
 // and passed by `--extern`, as td-boot passes td-tpm; td-tpm includes the same
 // engine SHA-256 by `#[path]`.
@@ -23,6 +24,7 @@ const INSTALLATION_CONSENT_RS: &str =
     include_str!("../../../td-install/src/installation_consent.rs");
 const LOOP_SYS_RS: &str = include_str!("../../../td-install/src/loop_sys.rs");
 const LOOP_DEVICE_RS: &str = include_str!("../../../td-install/src/loop_device.rs");
+const DEVICE_BOUND_RS: &str = include_str!("../../../td-install/src/device_bound.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const TD_FS_RS: &str = include_str!("../../../td-fs/src/real_file.rs");
 const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
@@ -170,6 +172,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-install/src/loop_device.rs".into(),
             content: LOOP_DEVICE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-install/src/device_bound.rs".into(),
+            content: DEVICE_BOUND_RS.into(),
             exec: false,
         },
         Step::WriteFile {

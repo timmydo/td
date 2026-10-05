@@ -38,8 +38,9 @@ yet read. The TrackPoint moves it relatively. Its Intel Wi-Fi needs vendor
 firmware, a class of foreign data AGENTS.md does not admit, so the wired
 port is its network until that is decided. Legacy BIOS, partition
 preservation, resizing, dual boot, RAID, and installation into an existing
-filesystem are outside v1. One selected whole disk is erased and receives
-GPT, a FAT32 ESP and the td Btrfs volume.
+filesystem are outside v1. One selected whole disk is reformatted, not
+wiped (ENCRYPTION.md "Device-bound formatting"), and receives GPT, a FAT32
+ESP and the td Btrfs volume.
 
 The wizard collects one human username, hostname and timezone; the keyboard
 layout is `us`, the only one version 1 admits. Storage is unencrypted and
@@ -418,7 +419,9 @@ before anything is sent, and a key the service refuses as a mismatch is
 shown and asked again. The window holds the key, in memory only, until the
 service reports complete, and may show it again until then; the restart
 is offered only after completion. A connection lost during the phase
-shows that the installation was withdrawn, since the service withdraws it.
+before the key is confirmed shows that the installation was withdrawn,
+since the service withdraws it; one lost after shows the outcome as
+unknown, as any lost connection does.
 
 Disk enumeration is read-only and bounded. Show model, serial when supplied
 by the device, capacity and a distinguishing device identifier. These are
@@ -468,7 +471,8 @@ td-setup's `service` module name `installation_protocol`. The formatter
 binary stages the plan and protocol modules separately through `#[path]`,
 for `observe-plan` and `serve`, with its recipe and compiled-file guard
 declaring the sources; its recipe also compiles td-tpm, td-json and
-td-protector as rlibs for `serve`'s TPM probe. Each further target
+td-protector as rlibs for `serve`'s TPM probe and device-bound
+formatting. Each further target
 consumer must declare its source and public API reach in its own recipe
 and confinement roster. A decoded plan conveys no authority.
 
@@ -713,8 +717,8 @@ requests take the next free tags.
   and the consent channel's review report, which gains the same byte
   after the deployment digest, show it.
 - Running phase 6, recovery key, follows verifying boot on a device-bound
-  installation: everything is written and verified, and the service holds
-  the recovery key.
+  installation: everything but the partition table is written and
+  verified, and the service holds the recovery key.
 - Request `0x09` recovery key, a review nonce, is admitted only in that
   phase for that nonce. Its first admission is answered by reply `0x86`
   recovery key: the nonce and the key's 48 ASCII digits. Every later ask
@@ -722,11 +726,12 @@ requests take the next free tags.
 - Request `0x0a` confirm recovery, a review nonce and the 48 digits typed
   back, is admitted only in that phase after the key was sent. The service
   compares the digits with the key it holds: equal, it zeroes the key and
-  the installation is complete, answered with status; different, it is
-  refused as 17 recovery key mismatch and the phase continues.
-- Failure 6, recovery unconfirmed: the installer was lost during that
-  phase, and the installation was withdrawn (DESIGN.md "Device-bound
-  formatting").
+  answers status, still running in the phase, while the execution writes
+  the table; different, it is refused as 17 recovery key mismatch and the
+  phase continues.
+- Failure 6, recovery unconfirmed: the installer was lost before the key
+  was confirmed, during that phase or before it, and the installation was
+  withdrawn (DESIGN.md "Device-bound formatting").
 
 The phase has no deadline: a person may take as long as writing the key
 down needs. Withdraw stays refused as busy while it runs.
@@ -739,15 +744,33 @@ holding it is its sender's to zero; each receiver (the service, td-setup
 and the QEMU oracle) zeroes every received payload with the codec's
 `scrub` after decoding it, successfully or not.
 
-Until formatting lands, the codecs exist and nothing reaches the phase:
-the service formats nothing device-bound, so it answers `0x09` and `0x0a`
-as busy while an installation runs and as no review otherwise. A service
-started without the storage operand reviews unencrypted plans; with it,
-its plans are device-bound and their execution stops before any write
-(DESIGN.md "Device-bound formatting"). td-setup ends a connection whose
-review is device-bound or whose status reports the phase or failure 6,
-and td-authd declines a device-bound review as unavailable, so no window
-or prompt shows storage until increment 7 activates the tier.
+Only a device-bound execution reaches the phase, once its volume is
+written and verified (DESIGN.md "Device-bound formatting"): it hands the
+key to the service, which answers status as running in phase 6. Outside
+the phase both recovery requests are refused as busy while an
+installation runs and as no review otherwise; in it, a request naming
+another nonce is a stale review, and a type-back before the key was sent
+is busy. The service frames every reply it sends, the recovery key
+included, from buffers it zeroes once written or not, and a frame read
+short is zeroed too. A confirmed type-back releases the waiting
+execution, which only then writes the partition table, the write that
+makes the disk bootable, syncs it and reads it back. Its result completes
+the installation or fails it, as write failed or verification failed
+with the installation withdrawn, and only then reaches status and
+td-authd's finished report; until then status stays running in phase 6,
+and a request the phase admitted is refused as busy. An installer lost
+before the type-back, during the phase or before it, is answered on the
+execution's behalf: it withdraws the installation, which fails as
+recovery unconfirmed. One lost after it changes nothing: the execution
+finishes as it would have.
+
+A service started without the storage operand reviews unencrypted plans;
+with it, its plans are device-bound. td-setup ends a connection whose
+review is device-bound or whose status reports the phase or failure 6
+until the completion page's display and type-back land (ENCRYPTION.md
+increment 5's sixth commit), and td-authd declines a device-bound review
+as unavailable, so no window or prompt shows storage until increment 7
+activates the tier.
 
 ## Installation service core
 
@@ -785,9 +808,8 @@ PCRs 4 and 9 in the SHA-256 bank answers that bank, and neither value is
 zero. That read is td-protector's observed policy, made once on a fresh
 client and never retried; the probe seals nothing, and the TPM's state
 may change before execution, which seals under its own policy. Every plan
-the service reviews then names device-bound storage. Until formatting
-lands, an execution of such a plan stops before any write (DESIGN.md
-"Device-bound formatting").
+the service reviews then names device-bound storage, and its execution
+formats it encrypted (DESIGN.md "Device-bound formatting").
 
 It holds at most one review, under the admission rules above. Propose
 checks, in order: busy; the settings (the username through `td-firstboot

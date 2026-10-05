@@ -219,6 +219,11 @@ pub fn valid_digest(bytes: &[u8]) -> bool {
 // argument as `REQUIRED_TD_INIT_APPLETS` above, one program wide.
 #[allow(dead_code)]
 pub const MKFS_BTRFS: &str = "mkfs.btrfs";
+// The other (D6): the static cryptsetup a live installer formats a
+// device-bound volume with, from the verified root's /bin. Bound the same way,
+// so an image without it reds the build.
+#[allow(dead_code)]
+pub const CRYPTSETUP: &str = "cryptsetup";
 // 1 MiB, the alignment every partition start is held to. A start that ignores
 // it reads and writes across a physical block boundary forever, and nothing
 // reports it — `gpt.rs` refuses 0 for the same reason.

@@ -304,21 +304,25 @@ fn idle(stream: &mut UnixStream) -> Result<(), String> {
 }
 
 fn exchange(stream: &mut UnixStream, request: &Request) -> Result<Answer, String> {
-    stream
-        .write_all(&protocol::frame(
-            &request.encode(),
-            protocol::MAX_REQUEST_BYTES,
-        )?)
-        .map_err(|error| format!("installer service request: {error}"))?;
+    // A request may carry typed-back recovery digits: the encoded message
+    // and its frame are both zeroed, sent or not.
+    let mut encoded = request.encode();
+    let framed = protocol::frame(&encoded, protocol::MAX_REQUEST_BYTES);
+    protocol::scrub(&mut encoded);
+    let mut bytes = framed?;
+    let sent = stream.write_all(&bytes);
+    protocol::scrub(&mut bytes);
+    sent.map_err(|error| format!("installer service request: {error}"))?;
     let mut header = [0; 4];
     stream
         .read_exact(&mut header)
         .map_err(|error| format!("installer service reply: {error}"))?;
     let mut payload = vec![0; protocol::payload_len(header, protocol::MAX_REPLY_BYTES)?];
-    stream
+    // A reply cut short may still hold some of a recovery key's digits.
+    let reply = stream
         .read_exact(&mut payload)
-        .map_err(|error| format!("installer service reply: {error}"))?;
-    let reply = Reply::decode(&payload);
+        .map_err(|error| format!("installer service reply: {error}"))
+        .and_then(|()| Reply::decode(&payload));
     protocol::scrub(&mut payload);
     let reply = reply?;
     if !reply.answers(request) {

@@ -467,6 +467,8 @@ impl Request {
                 out.extend_from_slice(nonce.as_bytes());
             }
             Self::ConfirmRecovery(nonce, digits) => {
+                // One allocation, so no reallocation leaves a copy of the digits.
+                out.reserve_exact(1 + 32 + RECOVERY_DIGITS);
                 out.push(CONFIRM_RECOVERY);
                 out.extend_from_slice(nonce.as_bytes());
                 out.extend_from_slice(digits.as_bytes());
@@ -587,6 +589,8 @@ impl Reply {
                 out.extend_from_slice(&zones.encode());
             }
             Self::RecoveryKey(nonce, digits) => {
+                // One allocation, so no reallocation leaves a copy of the digits.
+                out.reserve_exact(1 + 32 + RECOVERY_DIGITS);
                 out.push(RECOVERY_KEY_REPLY);
                 out.extend_from_slice(nonce.as_bytes());
                 out.extend_from_slice(digits.as_bytes());

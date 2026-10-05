@@ -195,10 +195,12 @@ volume with it (MEDIA.md "Live boot"). The second is the source-built static
 `cryptsetup` that [ENCRYPTION.md](ENCRYPTION.md) approves for LUKS2: the
 installer formats with it, and the selector and deployment initramfs open
 the volume with it. Its key material reaches it only through a descriptor,
-never argv or the environment. Nothing execs it yet. The landing that first
-does, ENCRYPTION.md increment 5's formatting, execs `/bin/cryptsetup` from
-the verified root, carries the same build-time binding D7 requires of
-`mkfs.btrfs`, and ships its debug companion with it.
+never argv or the environment. The installer's device-bound formatting
+execs `/bin/cryptsetup` from the verified root (td-boot's `CRYPTSETUP`
+names it), bound at build time as D7 binds `mkfs.btrfs`: the image build
+refuses a root whose `/bin/cryptsetup` does not link the static binary or
+lacks its debug companion, and, until the selector opens volumes
+(ENCRYPTION.md increment 6), either initramfs that carries it.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create
@@ -220,9 +222,11 @@ with it.
 
 **D8. One recorded `unsafe` surface.** Everything here is ordinary file
 I/O: partition tables and filesystems are bytes at offsets, and efivarfs is a
-filesystem. The sibling crates the binary links for the device-bound TPM
-probe, td-protector, td-tpm and td-json, forbid `unsafe` and reach the TPM
-through td-tpm's safe file I/O on `/dev/tpmrm0` (D10 records that open).
+filesystem. The sibling crates the binary links for device-bound storage,
+td-protector, td-tpm and td-json, forbid `unsafe` and reach the TPM
+through td-tpm's safe file I/O on `/dev/tpmrm0` (D10 records that open
+and td-protector's `/dev/random` read). The pipes that carry key material
+to cryptsetup are std's, and the device-mapper requests cryptsetup's own.
 The one exception is publication onto a disk this process holds, which
 binds a loop device over the volume with two value-pinned requests
 (`UNSAFE.md` §21, §5 "Publishing through a loop over the claim"). Any
@@ -277,15 +281,18 @@ wrapper is exempt from the naming and is named in the test that enforces
 it: `metadata_if_present` discards its error, because its caller asks only
 whether two files are the same and an unreadable path is not one of them.
 
-One open lies outside the three, the lint below and `compiled_files()`,
-because it is not this crate's source: the device-bound service's TPM
-probe (D8) calls td-tpm's `Device::open` from a sibling the binary links
-as an rlib. It opens the fixed path `/dev/tpmrm0` read-write with
-`O_NOFOLLOW`, refuses anything but a character device, and names the TPM
-resource manager in its error. That one device open is the documented
-exception; the probe reaches no other path through td-tpm, td-protector
-or td-json, and a further path a linked sibling opens for this binary is
-an amendment here, as a further syscall is to D8.
+Two opens lie outside the three, the lint below and `compiled_files()`,
+because they are not this crate's source but siblings the binary links as
+rlibs. The device-bound service's TPM probe and its execution's seal and
+check (D8) call td-tpm's `Device::open`, which opens the fixed path
+`/dev/tpmrm0` read-write with `O_NOFOLLOW`, refuses anything but a
+character device, and names the TPM resource manager in its error. The
+execution draws the recovery key and the protector secret through
+td-protector, which reads the fixed path `/dev/random` and names it in
+its error. Those two device opens are the documented exceptions; nothing
+reaches another path through td-tpm, td-protector or td-json, and a
+further path a linked sibling opens for this binary is an amendment here,
+as a further syscall is to D8.
 
 The COMPILER holds the first half of that. `clippy.toml` disallows every
 path-taking entry point into the filesystem and `Cargo.toml` denies the
@@ -727,11 +734,13 @@ The system's root image carries the stock selector at
 `/lib/td-boot/selector-initramfs.cpio` (td-boot's root-relative
 `SELECTOR_TEMPLATE_PATH`), `td-install` at `/bin/td-install` and the
 static `mkfs.btrfs` the deployment initramfs already carries, linked at
-`/bin/mkfs.btrfs` (the name D7's `MKFS_BTRFS` gives), so a live installer
-finds all three in the root image `live-root` hashed against the
-authenticated manifest rather than on the medium's unauthenticated ESP.
-The image build refuses a root whose `/bin/mkfs.btrfs` does not link
-exactly that executable static binary.
+`/bin/mkfs.btrfs` (the name D7's `MKFS_BTRFS` gives), and the static
+`cryptsetup` with its debug companion, linked at `/bin/cryptsetup` (D6),
+so a live installer finds them in the root image `live-root` hashed
+against the authenticated manifest rather than on the medium's
+unauthenticated ESP. The image build refuses a root whose
+`/bin/mkfs.btrfs` or `/bin/cryptsetup` does not link exactly that
+executable static binary.
 That template carries neither a trust root nor a volume identity, and
 `prepare-selector` appends both, so it is that command's template as
 shipped. A selector built from it without a key refuses to boot. No live
@@ -871,66 +880,124 @@ A service started with the device-bound storage operand (INSTALLER.md
 [ENCRYPTION.md](ENCRYPTION.md) "Device-bound formatting" owns the volume
 format, its parameters and the operand's activation boundary.
 
-Until the landing that formats (ENCRYPTION.md increment 5's fifth commit),
-the operand and its TPM probe exist and the formatting below does not: an
-execution of a device-bound plan stops before its workspace or any write,
-as verification failed, and is never formatted unencrypted.
-
 No plaintext volume image exists. The settings, account and trusted key
 are staged as a directory tree in the workspace before the first write,
 as on the unencrypted path; they hold no secret. The scratch image and
 its admission ("Prepared volume image admission") remain only for the
-unencrypted path. After the layout's writes and their sync barriers, the
-formatter binds the loop over the volume's extent as "Publishing through a
-loop over the claim" does, and then, on that loop:
+unencrypted path. The layout's writes stop short of the table: the old
+table is invalidated and the ESP written, each synced, as on the
+unencrypted path, but neither copy of the new table is written until the
+recovery key is confirmed (below). A refusal by the layout's recheck
+before its first write leaves the disk untouched. The formatter then binds
+the loop over the layout's volume extent, which no table on the disk yet
+places, as "Publishing through a loop over the claim" does, its length
+rounded down to whole 4 KiB encryption sectors: cryptsetup refuses a
+device that is not, and the layout ends the volume at the last usable
+sector, which on a 512-byte disk need not be 4 KiB aligned. The at most
+3.5 KiB left past the loop stays unused. Then, on that loop:
 
 1. draws the recovery key and the first-boot protector secret from
    `/dev/random` through td-protector;
 2. runs `luksFormat` with ENCRYPTION.md's parameters;
-3. adds keyslot 1 with `luksAddKey --new-key-slot 1` and the same PBKDF
-   parameters, the recovery passphrase authorizing it;
-4. seals the protector under the first-boot policy and imports token 0
-   with `token import --token-id 0 --json-file=-`;
-5. opens the mapping `td-install-` followed by the workspace's name, with
-   the recovery passphrase;
-6. runs `mkfs.btrfs` on the mapping, with the volume's length less 16 MiB
+3. adds keyslot 1 with `luksAddKey --key-slot 0 --new-key-slot 1` and the
+   same PBKDF parameters (`--pbkdf pbkdf2 --pbkdf-force-iterations 1000
+   --hash sha256`), the recovery passphrase authorizing it;
+4. seals the protector under the first-boot policy on a fresh TPM client
+   and imports token 0, naming keyslot 1, with `token import --token-id 0
+   --json-file=-`, its JSON first held to td-protector's 4096-byte
+   `MAX_TOKEN_JSON`;
+5. opens the mapping `/dev/mapper/td-install-TAG`, the workspace
+   directory's own name, with the recovery passphrase;
+6. runs `mkfs.btrfs` on the mapping, with the loop's length less 16 MiB
    as `--byte-count`, the plan's UUID, the label, `--rootdir` over the
    staged tree and the `@var` subvolume, as on the unencrypted path;
-7. runs `td-boot install` on the mapping, then closes it.
+7. runs `td-boot install` on the mapping, then closes it whether or not
+   opening, mkfs or td-boot failed, since an open that failed may still
+   have loaded its table: so the loop can clear and no volume key stays
+   live. Only device-mapper's answer counts, never a node under
+   `/dev/mapper`: `status NAME` is asked before each close and after the
+   last, exit 0 meaning active and 4 inactive (cryptsetup 2.8.8's
+   `action_status` returns `-ENODEV` for an inactive name, which
+   `translate_errno` makes 4), and any other exit is taken as active. An
+   inactive mapping needs no close. A close is asked up to three times, a
+   second after each that fails. A mapping not inactive after the last is
+   a write failure whose error says so: its volume key stays in the
+   kernel until the live session ends.
 
 Verifying boot then also requires, while the loop is bound, that
-`open --test-passphrase` succeeds for keyslot 0 with the recovery
-passphrase and for keyslot 1 with the protector secret, and that the
-header, read back through the claim by td-protector's reader, carries
-exactly the token imported, which `verify_first_boot_object` accepts. The
-protector secret is then zeroed and the loop released as before. The
-service then holds the recovery key for its installer's type-back
-(INSTALLER.md "Installation service protocol") and reports complete only
-after it. Nothing names a partition of the destination: cryptsetup,
+`open --test-passphrase --key-slot N` succeeds for keyslot 0 with the
+recovery passphrase and for keyslot 1 with the protector secret, and that
+the header, read back through the claim by td-protector's reader from a
+valid primary copy no older than the secondary, carries the plan's UUID,
+the label, keyslots 0 and 1 alone and exactly the token imported as token
+0 with no orphan, which `verify_first_boot_object` on a fresh TPM client
+accepts. The reader reports neither whether both copies were valid nor
+the data segment's cipher, sector size or offset; the keyslot tests open
+the segment, and `luksFormat`'s exact arguments are the rest. These
+checks report the verifying boot phase, and their failure is
+verification failed. The protector secret is then zeroed and the loop
+released as before, and the boot artifacts are read back as on the
+unencrypted path, except that both of the table's ranges must still read
+zero. Nothing names a partition of the destination: cryptsetup,
 mkfs.btrfs and td-boot see only the loop and the mapping.
 
+The execution then removes its workspace and holds the claim while the
+service holds the recovery key for its installer's type-back
+(INSTALLER.md "Device-bound records"): it hands the key's 48 digits to
+the service, keeps no copy, and waits. Only a confirmed type-back makes
+the disk bootable: the execution then writes the table, backup then
+primary, each synced, and reads both back as verifying boot does, and
+only then is the installation complete. Deferring the table rather than
+token 0 keeps everything verifying boot checks in the volume and its
+header settled before the phase: a disk without a table is one firmware
+skips, while one without the token would still boot to recovery. A
+failure to write the table is write failed and one to read it back
+verification failed, each withdrawing the installation. An installer
+lost first, before or during the phase, answers the execution lost: it
+withdraws the installation and fails as recovery unconfirmed.
+ENCRYPTION.md "Device-bound formatting" says what a crash before the
+confirmation leaves on the disk, no table, so nothing firmware boots, and
+what one between the backup and primary writes leaves: the backup GPT
+alone, without a protective MBR, which firmware may or may not boot, with
+the key already confirmed.
+
 Every cryptsetup child runs `/bin/cryptsetup` from the verified root with a
-cleared environment, its output captured and its error inherited. Key
+cleared environment, its output captured and copied to standard error, and
+its error inherited. Key
 material reaches it only by descriptor. The first secret travels on
 standard input as `--key-file=-`, written whole and then closed. The
 second, the new key `luksAddKey` takes as its key file, travels through a
 pipe created with std: td-install writes the secret, closes the write end,
-keeps the read end and names it to the child as
-`/proc/<td-install pid>/fd/N`, so cryptsetup reads exactly the secret and
-end of file. A secret is at most 48 bytes, under any pipe's capacity, so
-the write never blocks. No argv element or environment variable carries key
-material; a descriptor path names no secret. This adds no `unsafe` and no
-syscall to UNSAFE.md: pipes and children are std's and the device-mapper
-requests are cryptsetup's own.
+keeps the read end, close-on-exec, and names it to the child as
+`/proc/<td-install pid>/fd/N`, so cryptsetup opens the pipe anew and reads
+exactly the secret and end of file. Standard input carries the
+passphrase, at most 48 bytes, or the token's JSON, and a pipe is filled
+whole before its child starts, so its input is held to one page, the
+least any pipe holds, and more is refused rather than risk a write that
+blocks. That `/proc` name opens only for a process the kernel lets trace
+td-install: td-install stays dumpable and runs cryptsetup under its own
+uid, and a `PR_SET_DUMPABLE(0)` would break `luksAddKey`. No argv element
+or environment variable carries key material; a descriptor path names no
+secret. This adds no `unsafe` and no syscall to UNSAFE.md: pipes and
+children are std's and the device-mapper requests are cryptsetup's own.
 
 The cost of formatting in place is the refusal order. A failing mkfs,
 which the unencrypted path meets before the first write, is here a write
 failure after layout. On this path every failure after the first write,
 and the loss of the installer before its type-back, withdraws the
-installation: the table is invalidated as at verifying boot, and the
-volume's first 16 MiB are zeroed through the claim, so no keyslot of an
-unfinished installation stays openable. The outcome keeps its stage's
-code; a withdrawal that itself fails is reported as at verifying boot.
+installation: both of the table's ranges and the volume's first 16 MiB
+are zeroed through the claim, so no keyslot of an unfinished installation
+stays openable, then synced, each attempted whatever became of the
+others. The outcome keeps its stage's code: write failed while writing or
+writing the table, verification failed in the checks or reading the table
+back, and recovery unconfirmed for a lost installer. A withdrawal that
+itself fails keeps that code too, as at verifying boot ("Executing a
+consented installation"): its error names each part that failed, and the
+disk may keep what that part did not zero.
+
+`luksFormat` does not erase the data segment, and nothing here does:
+ENCRYPTION.md "Device-bound formatting" says what of the disk's earlier
+plaintext an attacker with the disk still reads.
 
 ### Payload fit
 
@@ -964,9 +1031,11 @@ untouched. Past that point the payloads td-boot publishes are bound only
 by their digests; a source that changes size afterwards meets ENOSPC
 during publication.
 
-A device-bound plan first subtracts the 16 MiB LUKS2 header and keyslots
-area (ENCRYPTION.md "Device-bound formatting") from the volume, for this
-fit and for the layout's minimum volume size.
+A device-bound plan first rounds the volume down to whole 4 KiB
+encryption sectors and subtracts the 16 MiB LUKS2 header and keyslots
+area (ENCRYPTION.md "Device-bound formatting"), for this fit and for the
+layout's minimum volume size, which the volume inside the header must
+still hold.
 
 Scratch is not sized here. The execution's workspace under `/run` holds
 the kernel copy, the selector and a sparse volume image whose blocks are
@@ -1051,8 +1120,8 @@ so a client cannot tell the two write failures apart and treats either as a
 disk that may be incomplete. A verification failure at verifying boot leaves
 a disk fully written but with its table withdrawn, which firmware does not
 boot; if withdrawing it also fails, the error says so, and the disk may keep
-a valid copy of the table, the backup, which firmware may boot from: the
-primary is zeroed first, and no order avoids that. The workspace is removed
+a valid copy of the table, which firmware may boot from: each copy is zeroed
+whether or not the other could be, and no order avoids that. The workspace is removed
 whatever the outcome, each part attempted even where another fails, and also
 on drop, which covers a partial creation and an unwinding panic. The shipped
 binary aborts on panic, and a killed process drops nothing, so there the

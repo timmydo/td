@@ -1216,19 +1216,25 @@ fn exchange(
     request: &installation_protocol::Request,
 ) -> Result<installation_protocol::Reply, String> {
     use installation_protocol as wire;
-    let bytes = wire::frame(&request.encode(), wire::MAX_REQUEST_BYTES)?;
-    stream
-        .write_all(&bytes)
-        .map_err(|error| format!("installer request: {error}"))?;
+    // A request may carry typed-back recovery digits: the encoded message
+    // and its frame are both zeroed, sent or not.
+    let mut encoded = request.encode();
+    let framed = wire::frame(&encoded, wire::MAX_REQUEST_BYTES);
+    wire::scrub(&mut encoded);
+    let mut bytes = framed?;
+    let sent = stream.write_all(&bytes);
+    wire::scrub(&mut bytes);
+    sent.map_err(|error| format!("installer request: {error}"))?;
     let mut header = [0; 4];
     stream
         .read_exact(&mut header)
         .map_err(|error| format!("service reply: {error}"))?;
     let mut payload = vec![0; wire::payload_len(header, wire::MAX_REPLY_BYTES)?];
-    stream
+    // A reply cut short may still hold some of a recovery key's digits.
+    let reply = stream
         .read_exact(&mut payload)
-        .map_err(|error| format!("service reply: {error}"))?;
-    let reply = wire::Reply::decode(&payload);
+        .map_err(|error| format!("service reply: {error}"))
+        .and_then(|()| wire::Reply::decode(&payload));
     wire::scrub(&mut payload);
     let reply = reply?;
     if !reply.answers(request) {

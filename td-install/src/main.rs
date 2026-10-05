@@ -82,6 +82,9 @@ mod loop_sys;
 #[path = "loop_device.rs"]
 mod loop_device;
 
+#[path = "device_bound.rs"]
+mod device_bound;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -1185,7 +1188,7 @@ impl installation_service::Host for LiveHost {
         .ok_or_else(|| unavailable(invalid("the selector's length overflowed".into())))?;
         let sector = u64::from(plan.destination().sector());
         let capacity = plan.destination().capacity();
-        volume_fit(sector, capacity, payloads)
+        volume_fit(sector, capacity, payloads, plan.storage())
             .map_err(|error| refuse(Refusal::InsufficientSpace, error))?;
         // The ESP is the same size on every disk, its FAT capacity differing
         // only by a sector size's reserved sectors: what it cannot hold is
@@ -1428,7 +1431,7 @@ impl LiveExecution {
         claim: File,
         workspace: &Workspace,
         progress: &mut dyn FnMut(installation_protocol::Phase),
-    ) -> Result<(), Stopped> {
+    ) -> Result<Option<TypeBack>, Stopped> {
         use installation_protocol::{Failure, Phase};
         let verification = before_writing(Failure::VerificationFailed);
         let settings_failed = before_writing(Failure::SettingsFailed);
@@ -1445,6 +1448,7 @@ impl LiveExecution {
             u64::from(plan.destination().sector()),
             plan.destination().capacity(),
             payloads,
+            plan.storage(),
         )
         .map_err(|error| (Failure::InsufficientSpace, invalid(error)))?;
         let kernel_sha256 = self
@@ -1507,33 +1511,72 @@ impl LiveExecution {
         let selector_sha256 = td_fs::open_real_file(&workspace.selector, "prepared selector")
             .and_then(|(mut file, metadata)| digest_range(&mut file, 0, metadata.len()))
             .map_err(&verification)?;
-        let formatted = format_held(
-            prepared,
-            &mut destination,
-            &boot,
-            Some(&[kernel_sha256, selector_sha256]),
-            &mut io::sink(),
-            &mut |step| {
-                progress(match step {
-                    FormatStep::Writing => Phase::WritingFilesystems,
-                    FormatStep::Publishing => Phase::PublishingDeployment,
-                })
-            },
-        )
-        .map_err(|failure| match failure {
+        let digests = [kernel_sha256, selector_sha256];
+        let mut step = |step| {
+            progress(match step {
+                FormatStep::Writing => Phase::WritingFilesystems,
+                FormatStep::Publishing => Phase::PublishingDeployment,
+                FormatStep::Verifying => Phase::VerifyingBoot,
+            })
+        };
+        let held = |failure| match failure {
             HeldFailure::Layout(error) => verification(error),
-            // Writing the volume image in scratch: the disk is untouched.
+            // Staging in scratch: the disk is untouched.
             HeldFailure::Staging(error) => before_writing(Failure::WriteFailed)(error),
             HeldFailure::Written(error) => (Failure::WriteFailed, error),
-        })?;
+            HeldFailure::Verify(error) => (Failure::VerificationFailed, error),
+        };
+        let (formatted, recovery) = match plan.storage() {
+            installation_plan::Storage::Unencrypted => (
+                format_held(
+                    prepared,
+                    &mut destination,
+                    &boot,
+                    Some(&digests),
+                    &mut io::sink(),
+                    &mut step,
+                )
+                .map_err(held)?,
+                None,
+            ),
+            installation_plan::Storage::DeviceBound => {
+                let cryptsetup = device_bound::Cryptsetup {
+                    program: self.root.join("bin").join(protocol::CRYPTSETUP),
+                };
+                let bound = DeviceBound {
+                    cryptsetup: &cryptsetup,
+                    protector: &device_bound::Tpm,
+                    name: &workspace.name,
+                    mapper: Path::new(MAPPER_DIR),
+                };
+                let (formatted, recovery) = format_held_device_bound(
+                    prepared,
+                    &mut destination,
+                    &boot,
+                    Some(&digests),
+                    &bound,
+                    &mut step,
+                )
+                .map_err(held)?;
+                (formatted, Some(recovery))
+            }
+        };
         progress(Phase::VerifyingBoot);
+        let luks = recovery.as_ref().map(|_| formatted.volume.0);
         finish_installation(
             &mut destination.file,
             &formatted,
             &deployment,
-            &[kernel_sha256, selector_sha256],
+            &digests,
+            luks,
         )
-        .map_err(|error| (Failure::VerificationFailed, error))
+        .map_err(|error| (Failure::VerificationFailed, error))?;
+        Ok(recovery.map(|recovery| TypeBack {
+            file: destination.file,
+            table: formatted.table,
+            volume: formatted.volume,
+            recovery,
+        }))
     }
 
     /// The `bzImage` digest the authenticated manifest names, once the
@@ -1621,34 +1664,106 @@ fn canonical_uuid(bytes: &[u8; 16]) -> String {
     text
 }
 
+use installation_service::TypedBack;
+
 impl installation_service::Execute<File> for LiveExecution {
     fn execute(
         &self,
         plan: &installation_plan::Plan,
         claim: File,
         progress: &mut dyn FnMut(installation_protocol::Phase),
+        recovery: &mut dyn FnMut(installation_protocol::RecoveryDigits) -> TypedBack,
     ) -> Result<(), installation_protocol::Failure> {
         let report = |(failure, error): Stopped| {
             let _ = writeln!(io::stderr(), "td-install serve: {failure:?}: {error}");
             failure
         };
-        // Device-bound formatting is DESIGN.md's, and not this build's: such
-        // a plan stops before the first write, never formatted unencrypted.
-        if plan.storage() != installation_plan::Storage::Unencrypted {
-            return Err(report((
-                installation_protocol::Failure::VerificationFailed,
-                invalid("device-bound formatting is not available".into()),
-            )));
-        }
         // Nothing is written yet; a workspace that cannot be made is space,
         // or a name an earlier execution left.
         let workspace = Workspace::create(&self.run, plan.nonce())
             .map_err(|error| report((installation_protocol::Failure::InsufficientSpace, error)))?;
         let outcome = self.install(plan, claim, &workspace, progress);
+        // Before any type-back: nothing after verifying boot needs it.
         if let Err(error) = workspace.remove() {
             let _ = writeln!(io::stderr(), "td-install serve: workspace: {error}");
         }
-        outcome.map_err(report)
+        match outcome.map_err(report)? {
+            None => Ok(()),
+            Some(pending) => pending.wait(recovery).map_err(report),
+        }
+    }
+}
+
+/// Where a device-bound volume's mapping node appears.
+const MAPPER_DIR: &str = "/dev/mapper";
+
+/// A written and verified device-bound installation, still claimed and
+/// carrying no table, whose recovery key the installer must type back
+/// before its table makes it bootable.
+struct TypeBack {
+    file: File,
+    table: gpt::Image,
+    /// The volume's `(offset, len)`: the table must place it there, and a
+    /// withdrawal zeroes its first 16 MiB.
+    volume: (u64, u64),
+    recovery: td_protector::recovery::RecoveryKey,
+}
+
+impl TypeBack {
+    /// Hands the key to the service and waits. A confirmed key commits the
+    /// table, synced and read back, and only then is the installation
+    /// complete; a failure of either, or an installer lost first, withdraws
+    /// it.
+    fn wait(
+        self,
+        recovery: &mut dyn FnMut(installation_protocol::RecoveryDigits) -> TypedBack,
+    ) -> Result<(), Stopped> {
+        let Self {
+            mut file,
+            table,
+            volume,
+            recovery: key,
+        } = self;
+        let luks = volume.0;
+        let digits = installation_protocol::RecoveryDigits::new(key.passphrase().expose());
+        drop(key);
+        let outcome = match digits {
+            Ok(digits) => recovery(digits),
+            Err(error) => {
+                return Err((
+                    installation_protocol::Failure::VerificationFailed,
+                    withdrawn(&mut file, &table, Some(luks), invalid(error)),
+                ))
+            }
+        };
+        match outcome {
+            TypedBack::Confirmed => {
+                use installation_protocol::Failure;
+                // The write that makes the disk bootable.
+                commit_table(&mut file, &table)
+                    .map_err(|error| (Failure::WriteFailed, error))
+                    .and_then(|()| {
+                        verify_table(&mut file, &table, volume)
+                            .map_err(|error| (Failure::VerificationFailed, error))
+                    })
+                    .map_err(|(failure, error)| {
+                        (failure, withdrawn(&mut file, &table, Some(luks), error))
+                    })
+            }
+            TypedBack::Lost => Err((
+                installation_protocol::Failure::RecoveryUnconfirmed,
+                withdrawn(
+                    &mut file,
+                    &table,
+                    Some(luks),
+                    invalid(
+                        "the installer was lost before it typed the recovery key back; \
+                         the installation is withdrawn"
+                            .into(),
+                    ),
+                ),
+            )),
+        }
     }
 }
 
@@ -1719,6 +1834,9 @@ fn payload_len(source: &Path, name: &str) -> io::Result<u64> {
 /// Dropped without `remove`, as an unwinding panic drops it, it removes
 /// what it can.
 struct Workspace {
+    /// The directory's name, `td-install-` and the nonce's tag: also a
+    /// device-bound volume's mapping name.
+    name: String,
     dir: PathBuf,
     kernel: PathBuf,
     selector: PathBuf,
@@ -1736,10 +1854,12 @@ impl Workspace {
             .take(8)
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let dir = run.join(format!("td-install-{tag}"));
+        let name = format!("td-install-{tag}");
+        let dir = run.join(&name);
         paths::create_dir_with_mode(&dir, 0o700)?;
         // From here a failure drops it, which removes what was made.
         let workspace = Self {
+            name,
             kernel: dir.join("bzImage"),
             selector: dir.join("selector.cpio"),
             scratch: dir.join("scratch"),
@@ -2814,18 +2934,77 @@ impl PreparedLayout {
 
     fn write_to(self, destination: &mut FormatDestination, out: &mut dyn Write) -> io::Result<()> {
         self.check_unchanged(&mut destination.file)?;
+        let (esp_offset, volume) = self.offsets()?;
+        let table = self.write_contents(destination, esp_offset)?;
+        commit_table(&mut destination.file, &table)?;
+
+        // NUMBERS ONLY, whitespace-separated, and every one a BYTE OFFSET. The
+        // destination is deliberately not echoed back: a caller already knows what
+        // it passed, and a path is the one field here that can contain a space —
+        // which shifts every field a caller reads by position — or a newline, which
+        // would break the one-line promise outright. Nothing that can carry either
+        // goes on this channel.
+        //
+        // Bytes rather than the LBAs this function works in, because `volume`
+        // reports bytes and two verbs of one program reporting the same-shaped line
+        // in different units is a caller reading 2048 where the ESP is at 1048576 —
+        // with nothing on either line to say which it got.
+        writeln!(out, "{esp_offset} {volume}")
+    }
+
+    /// The ESP's and the volume's byte offsets.
+    fn offsets(&self) -> io::Result<(u64, u64)> {
+        let esp = self
+            .plan
+            .esp_offset()
+            .ok_or_else(|| invalid("the ESP offset overflowed".to_string()))?;
+        let volume = self
+            .plan
+            .volume_start
+            .checked_mul(self.plan.sector_size)
+            .ok_or_else(|| invalid("the volume offset overflowed".to_string()))?;
+        Ok((esp, volume))
+    }
+
+    /// `write_to` for a held format, its reportless writes classified: a
+    /// refusal before the first write leaves the disk untouched, a layout
+    /// failure. The table is committed only when `commit`; without it the
+    /// disk is left carrying none, and the table is returned for
+    /// `commit_table` once the caller may make the disk bootable.
+    fn write_held(
+        self,
+        destination: &mut FormatDestination,
+        commit: bool,
+    ) -> Result<gpt::Image, HeldFailure> {
+        self.check_unchanged(&mut destination.file)
+            .map_err(HeldFailure::Layout)?;
+        let (esp_offset, _) = self.offsets().map_err(HeldFailure::Layout)?;
+        let table = self
+            .write_contents(destination, esp_offset)
+            .map_err(HeldFailure::Written)?;
+        if commit {
+            commit_table(&mut destination.file, &table).map_err(HeldFailure::Written)?;
+        }
+        Ok(table)
+    }
+
+    /// Everything `write_to` writes but the table: the old table
+    /// invalidated, then the ESP, each synced. A disk left here carries no
+    /// table, so firmware finds nothing on it to boot.
+    fn write_contents(
+        self,
+        destination: &mut FormatDestination,
+        esp_offset: u64,
+    ) -> io::Result<gpt::Image> {
         let Self {
-            plan,
             table,
             esp,
             metadata,
             payloads,
+            ..
         } = self;
         let file = &mut destination.file;
         let label = destination.label.as_path();
-        let esp_offset = plan
-            .esp_offset()
-            .ok_or_else(|| invalid("the ESP offset overflowed".into()))?;
 
         // A REINSTALL is the case this order exists for. On a disk that already
         // carries a table, that table stays valid while the ESP beneath it is being
@@ -2836,10 +3015,8 @@ impl PreparedLayout {
         //
         // Each stage is flushed before the next. Nothing else orders one write
         // against another across a power cut: without the barriers the table can
-        // reach the platter before the filesystem it describes. The primary table
-        // is written LAST because it is the commit point — it is what firmware
-        // reads first, and it is only correct once everything it points at is
-        // durable.
+        // reach the platter before the filesystem it describes. The table is
+        // written LAST, by `commit_table`.
         invalidate_table(file, &table)?;
         file.sync_all()?;
 
@@ -2857,32 +3034,18 @@ impl PreparedLayout {
             zero_at(file, end, padding)?;
         }
         file.sync_all()?;
-
-        write_at(file, table.backup_offset, &table.backup)?;
-        file.sync_all()?;
-        write_at(file, table.primary_offset, &table.primary)?;
-        file.sync_all()?;
-
-        // NUMBERS ONLY, whitespace-separated, and every one a BYTE OFFSET. The
-        // destination is deliberately not echoed back: a caller already knows what
-        // it passed, and a path is the one field here that can contain a space —
-        // which shifts every field a caller reads by position — or a newline, which
-        // would break the one-line promise outright. Nothing that can carry either
-        // goes on this channel.
-        //
-        // Bytes rather than the LBAs this function works in, because `volume`
-        // reports bytes and two verbs of one program reporting the same-shaped line
-        // in different units is a caller reading 2048 where the ESP is at 1048576 —
-        // with nothing on either line to say which it got.
-        let esp = plan
-            .esp_offset()
-            .ok_or_else(|| invalid("the ESP offset overflowed".to_string()))?;
-        let volume = plan
-            .volume_start
-            .checked_mul(plan.sector_size)
-            .ok_or_else(|| invalid("the volume offset overflowed".to_string()))?;
-        writeln!(out, "{esp} {volume}")
+        Ok(table)
     }
+}
+
+/// Writes both copies of `table`, each synced. The primary goes LAST because
+/// it is the commit point: it is what firmware reads first, and it is only
+/// correct once everything it points at is durable.
+fn commit_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
+    write_at(file, table.backup_offset, &table.backup)?;
+    file.sync_all()?;
+    write_at(file, table.primary_offset, &table.primary)?;
+    file.sync_all()
 }
 
 /// The two byte ranges a table occupies, as `(offset, len)` pairs.
@@ -3374,21 +3537,29 @@ enum FormatStep {
     Writing,
     /// Publication through the loop.
     Publishing,
+    /// A device-bound volume's keyslot and header checks, the loop still
+    /// bound.
+    Verifying,
 }
 
 /// Where a held format stopped: laying out the disk or staging the volume,
-/// both before its first destination write, or after it.
+/// both before its first destination write, or after it, writing or in a
+/// device-bound volume's checks.
 #[derive(Debug)]
 enum HeldFailure {
     Layout(io::Error),
     Staging(io::Error),
     Written(io::Error),
+    Verify(io::Error),
 }
 
 impl HeldFailure {
     fn into_error(self) -> io::Error {
         match self {
-            Self::Layout(error) | Self::Staging(error) | Self::Written(error) => error,
+            Self::Layout(error)
+            | Self::Staging(error)
+            | Self::Written(error)
+            | Self::Verify(error) => error,
         }
     }
 }
@@ -3409,16 +3580,20 @@ struct Formatted {
     published: Option<Vec<u8>>,
 }
 
-/// Format the destination this process already holds, telling `step` as each
-/// step begins.
-fn format_held(
-    prepared: PreparedVolume<'_>,
+/// The layout a held format writes, with what a caller reads back.
+struct HeldLayout {
+    layout: PreparedLayout,
+    volume: (u64, u64),
+    boot: [(u64, u64, u64); 2],
+    metadata: (u64, Vec<u8>),
+    table: gpt::Image,
+}
+
+fn held_layout(
     destination: &mut FormatDestination,
     boot: &BootFiles,
     digests: Option<&[[u8; 32]; 2]>,
-    out: &mut dyn Write,
-    step: &mut dyn FnMut(FormatStep),
-) -> Result<Formatted, HeldFailure> {
+) -> Result<HeldLayout, HeldFailure> {
     let layout = prepare_layout(destination, Some(boot), digests).map_err(HeldFailure::Layout)?;
     let len = layout
         .plan
@@ -3430,9 +3605,36 @@ fn format_held(
         .checked_mul(layout.plan.sector_size)
         .map(|offset| (offset, len))
         .ok_or_else(|| HeldFailure::Layout(invalid("planned volume offset overflowed".into())))?;
-    let boot_extents = layout.boot_extents().map_err(HeldFailure::Layout)?;
+    let boot = layout.boot_extents().map_err(HeldFailure::Layout)?;
     let metadata = layout.metadata_image().map_err(HeldFailure::Layout)?;
     let table = layout.table.clone();
+    Ok(HeldLayout {
+        layout,
+        volume,
+        boot,
+        metadata,
+        table,
+    })
+}
+
+/// Format the destination this process already holds, telling `step` as each
+/// step begins.
+fn format_held(
+    prepared: PreparedVolume<'_>,
+    destination: &mut FormatDestination,
+    boot: &BootFiles,
+    digests: Option<&[[u8; 32]; 2]>,
+    out: &mut dyn Write,
+    step: &mut dyn FnMut(FormatStep),
+) -> Result<Formatted, HeldFailure> {
+    let HeldLayout {
+        layout,
+        volume,
+        boot: boot_extents,
+        metadata,
+        table,
+    } = held_layout(destination, boot, digests)?;
+    let len = volume.1;
     let seed = prepared.seed;
     let image = prepare_volume_image(prepared, destination, len).map_err(HeldFailure::Staging)?;
     // Guard layout too; write_to keeps its own check for standalone volume use.
@@ -3445,9 +3647,7 @@ fn format_held(
         .check_unchanged(&mut destination.file)
         .map_err(HeldFailure::Layout)?;
     step(FormatStep::Writing);
-    layout
-        .write_to(destination, &mut io::sink())
-        .map_err(HeldFailure::Written)?;
+    layout.write_held(destination, true)?;
     let Some((key, publish)) = seed.and_then(|seed| {
         seed.through_loop()
             .map(|publish| (seed.trusted_key(), publish))
@@ -3490,7 +3690,13 @@ fn format_held(
 /// the medium: the reads may be served from the kernel's cache, and
 /// durability rests on the syncs before them.
 fn verify_boot(file: &mut File, formatted: &Formatted, digests: &[[u8; 32]; 2]) -> io::Result<()> {
-    let table = &formatted.table;
+    verify_table(file, &formatted.table, formatted.volume)?;
+    verify_esp(file, formatted, digests)
+}
+
+/// Both copies of the table read back byte for byte, and place the volume
+/// where the layout did.
+fn verify_table(file: &mut File, table: &gpt::Image, volume: (u64, u64)) -> io::Result<()> {
     for (copy, offset, bytes) in [
         ("primary", table.primary_offset, &table.primary),
         ("backup", table.backup_offset, &table.backup),
@@ -3501,11 +3707,37 @@ fn verify_boot(file: &mut File, formatted: &Formatted, digests: &[[u8; 32]; 2]) 
             )));
         }
     }
-    if destination_volume(file)? != formatted.volume {
+    if destination_volume(file)? != volume {
         return Err(invalid(
             "the installed table does not place the volume where the layout did".into(),
         ));
     }
+    Ok(())
+}
+
+/// Neither copy of the table is on the disk, both ranges still zeroed: a
+/// device-bound installation before its type-back, which firmware finds
+/// nothing on to boot.
+fn verify_no_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
+    for (copy, offset, len) in [
+        ("primary", table.primary_offset, table.primary.len()),
+        ("backup", table.backup_offset, table.backup.len()),
+    ] {
+        if read_at(file, offset, len as u64)?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(invalid(format!(
+                "the {copy} table range is written before the recovery key is confirmed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The ESP's filesystem metadata byte for byte, and each boot file hashing
+/// to its digest with its cluster's rest zeroed.
+fn verify_esp(file: &mut File, formatted: &Formatted, digests: &[[u8; 32]; 2]) -> io::Result<()> {
     let (at, metadata) = &formatted.metadata;
     if read_at(file, *at, metadata.len() as u64)? != *metadata {
         return Err(invalid(
@@ -3545,12 +3777,15 @@ fn verify_boot(file: &mut File, formatted: &Formatted, digests: &[[u8; 32]; 2]) 
 /// published the plan's `deployment`, and the boot artifacts read back as
 /// written. An installation that fails either is withdrawn from firmware by
 /// invalidating its table again, as `write_to` does before it writes: a
-/// table over a disk that cannot be trusted is worse than none.
+/// table over a disk that cannot be trusted is worse than none. A
+/// device-bound one (`luks` its volume's offset) has no table yet, which is
+/// checked instead, and a withdrawal also loses its keyslots.
 fn finish_installation(
     file: &mut File,
     formatted: &Formatted,
     deployment: &str,
     digests: &[[u8; 32]; 2],
+    luks: Option<u64>,
 ) -> io::Result<()> {
     let verified = formatted
         .published
@@ -3566,17 +3801,231 @@ fn finish_installation(
                 )))
             }
         })
-        .and_then(|()| verify_boot(file, formatted, digests));
+        .and_then(|()| match luks {
+            None => verify_boot(file, formatted, digests),
+            Some(_) => verify_no_table(file, &formatted.table)
+                .and_then(|()| verify_esp(file, formatted, digests)),
+        });
     let Err(error) = verified else {
         return Ok(());
     };
-    match invalidate_table(file, &formatted.table).and_then(|()| file.sync_all()) {
-        Ok(()) => Err(error),
-        Err(withdrawal) => Err(io::Error::new(
-            error.kind(),
-            format!("{error}; and withdrawing its table failed: {withdrawal}"),
-        )),
+    Err(withdrawn(file, &formatted.table, luks, error))
+}
+
+/// Withdraws an installation from firmware: both copies of its table
+/// zeroed, and for a device-bound volume (`luks` its offset) the first
+/// 16 MiB, so no keyslot of it stays openable; then synced. Each is tried
+/// whatever became of the others. Returns `error`, naming every part of the
+/// withdrawal that failed too.
+fn withdrawn(
+    file: &mut File,
+    table: &gpt::Image,
+    luks: Option<u64>,
+    error: io::Error,
+) -> io::Error {
+    let mut ranges = vec![
+        (
+            "primary table",
+            table.primary_offset,
+            table.primary.len() as u64,
+        ),
+        (
+            "backup table",
+            table.backup_offset,
+            table.backup.len() as u64,
+        ),
+    ];
+    if let Some(offset) = luks {
+        ranges.push(("LUKS2 header", offset, device_bound::HEADER_BYTES));
     }
+    let mut failed = Vec::new();
+    for (what, offset, len) in ranges {
+        if let Err(error) = zero_at(file, offset, len) {
+            failed.push(format!("zero the {what}: {error}"));
+        }
+    }
+    if let Err(error) = file.sync_all() {
+        failed.push(format!("sync: {error}"));
+    }
+    if failed.is_empty() {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{error}; and withdrawing the installation failed: {}",
+            failed.join("; ")
+        ),
+    )
+}
+
+/// What a device-bound held format runs beyond the unencrypted one.
+struct DeviceBound<'a> {
+    cryptsetup: &'a device_bound::Cryptsetup,
+    protector: &'a dyn device_bound::Protector,
+    /// The mapping's name, and where its node appears.
+    name: &'a str,
+    mapper: &'a Path,
+}
+
+/// The device-bound held format (DESIGN.md "Device-bound formatting"): the
+/// settings tree is staged before the first write, then the ESP is written
+/// and on a loop over the volume cryptsetup formats it, mkfs.btrfs writes
+/// the filesystem inside and td-boot publishes into it, and the keyslots
+/// and header are checked. The table is left unwritten, for `TypeBack` to
+/// commit once the recovery key is confirmed. Every failure after the first
+/// write withdraws the installation; a refusal before it leaves the disk
+/// untouched.
+fn format_held_device_bound(
+    prepared: PreparedVolume<'_>,
+    destination: &mut FormatDestination,
+    boot: &BootFiles,
+    digests: Option<&[[u8; 32]; 2]>,
+    bound: &DeviceBound<'_>,
+    step: &mut dyn FnMut(FormatStep),
+) -> Result<(Formatted, td_protector::recovery::RecoveryKey), HeldFailure> {
+    let HeldLayout {
+        layout,
+        volume,
+        boot: boot_extents,
+        metadata,
+        table,
+    } = held_layout(destination, boot, digests)?;
+    let PreparedVolume {
+        settings,
+        uuid,
+        mkfs,
+        scratch,
+        seed,
+        key,
+    } = prepared;
+    let not_loop = || {
+        HeldFailure::Layout(invalid(
+            "device-bound formatting publishes through a loop".into(),
+        ))
+    };
+    let seed = seed.ok_or_else(not_loop)?;
+    let publish = seed.through_loop().ok_or_else(not_loop)?;
+    let uuid = uuid
+        .ok_or_else(|| {
+            HeldFailure::Layout(invalid(
+                "device-bound formatting needs the plan's UUID".into(),
+            ))
+        })?
+        .0
+        .clone();
+    let staging = stage_tree(settings, Some(seed), key, scratch).map_err(HeldFailure::Staging)?;
+    layout
+        .check_unchanged(&mut destination.file)
+        .map_err(HeldFailure::Layout)?;
+    step(FormatStep::Writing);
+    let mkfs =
+        |mapping: &Path, len: u64| run_mkfs(mkfs, len, &uuid, &staging, mapping, "the mapping");
+    let td_boot = |mapping: &Path| td_boot_install(publish, mapping, seed.trusted_key());
+    let volume_extent = volume;
+    let written = layout.write_held(destination, false).and_then(|_| {
+        let volume = device_bound::Volume {
+            cryptsetup: bound.cryptsetup,
+            protector: bound.protector,
+            uuid: &uuid,
+            name: bound.name,
+            mapper: bound.mapper,
+            mkfs: &mkfs,
+            publish: &td_boot,
+        };
+        publish_device_bound(destination, volume_extent, &volume, step)
+    });
+    match written {
+        Ok((stdout, recovery)) => Ok((
+            Formatted {
+                volume,
+                table,
+                metadata,
+                boot: boot_extents,
+                published: Some(stdout),
+            },
+            recovery,
+        )),
+        Err(failure) => {
+            let (offset, _) = volume;
+            let mut withdraw =
+                |error| withdrawn(&mut destination.file, &table, Some(offset), error);
+            Err(match failure {
+                // Refused before the first write: the disk is untouched.
+                HeldFailure::Layout(error) => HeldFailure::Layout(error),
+                HeldFailure::Staging(error) => HeldFailure::Staging(error),
+                HeldFailure::Written(error) => HeldFailure::Written(withdraw(error)),
+                HeldFailure::Verify(error) => HeldFailure::Verify(withdraw(error)),
+            })
+        }
+    }
+}
+
+/// Binds the loop over the layout's `(offset, len)` volume, which no table
+/// on the disk places yet, its length rounded down to whole encryption
+/// sectors, and formats and publishes on it. The loop is released and the
+/// destination synced before success.
+fn publish_device_bound(
+    destination: &mut FormatDestination,
+    (offset, len): (u64, u64),
+    volume: &device_bound::Volume<'_>,
+    step: &mut dyn FnMut(FormatStep),
+) -> Result<(Vec<u8>, td_protector::recovery::RecoveryKey), HeldFailure> {
+    let written = HeldFailure::Written;
+    let sector_size = logical_sector_size(&destination.file).map_err(written)?;
+    let extent = len - len % device_bound::SECTOR_BYTES;
+    let device =
+        loop_device::attach(&destination.file, offset, extent, sector_size).map_err(|error| {
+            written(io::Error::new(
+                error.kind(),
+                format!(
+                    "{}: loop over the volume: {error}",
+                    destination.label.display()
+                ),
+            ))
+        })?;
+    let formatted = device_bound::format(
+        volume,
+        device.path(),
+        extent,
+        &destination.file,
+        offset,
+        step,
+    )
+    .map_err(|stopped| match stopped {
+        device_bound::Stopped::Write(error) => HeldFailure::Written(error),
+        device_bound::Stopped::Verify(error) => HeldFailure::Verify(error),
+    })?;
+    device.release().map_err(written)?;
+    destination.file.sync_all().map_err(written)?;
+    Ok(formatted)
+}
+
+/// `td-boot install` on `device`; its standard output, the deployment id,
+/// copied to standard error and returned.
+fn td_boot_install(publish: &LoopPublish, device: &Path, key: &Path) -> io::Result<Vec<u8>> {
+    // td-boot's stdout is the deployment id; this program's is a report.
+    let output = std::process::Command::new(&publish.td_boot)
+        .arg("install")
+        .arg(device)
+        .arg(&publish.mountpoint)
+        .arg(&publish.deployment)
+        .arg(key)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|error| invalid(format!("cannot run {}: {error}", publish.td_boot.display())))?;
+    let _ = io::stderr().write_all(&output.stdout);
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "{} install on {} failed ({})",
+            publish.td_boot.display(),
+            device.display(),
+            output.status
+        )));
+    }
+    Ok(output.stdout)
 }
 
 /// Publish onto the volume just written, through a loop over the destination
@@ -3601,32 +4050,12 @@ fn publish_through_loop(
                 ),
             )
         })?;
-    // td-boot's stdout is the deployment id; this program's is a report.
-    let output = std::process::Command::new(&publish.td_boot)
-        .arg("install")
-        .arg(device.path())
-        .arg(&publish.mountpoint)
-        .arg(&publish.deployment)
-        .arg(key)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|error| invalid(format!("cannot run {}: {error}", publish.td_boot.display())))?;
-    let _ = io::stderr().write_all(&output.stdout);
-    if !output.status.success() {
-        return Err(invalid(format!(
-            "{} install on {} failed ({})",
-            publish.td_boot.display(),
-            device.path().display(),
-            output.status
-        )));
-    }
+    let stdout = td_boot_install(publish, device.path(), key)?;
     // td-boot has unmounted, so this is the last opener and the loop clears;
     // release confirms it did, so no loop outlives a reported success.
     device.release()?;
     destination.file.sync_all()?;
-    Ok(output.stdout)
+    Ok(stdout)
 }
 
 /// td-boot's install output: one deployment id and a newline.
@@ -3801,41 +4230,7 @@ fn prepare_volume_image(
     // volume that reports less space than the partition it is copied into, and
     // a larger one a volume whose tail is off the end of the partition.
     let image_path = scratch.join("td-volume.img");
-    let staging = scratch.join("td-volume-root");
-    let subvol = staging.join(protocol::VOLUME_SUBVOL);
-    // The staging tree is not a working directory but the volume's CONTENTS:
-    // `--rootdir` copies whatever is under it into the filesystem. So it is
-    // emptied rather than merely ensured — a scratch directory a previous run
-    // or another program left something in would otherwise put that something
-    // on a machine's /var, with nothing about the install saying so.
-    paths::remove_dir_all_if_present(&staging)?;
-    paths::create_dir_all(&subvol)?;
-    paths::set_mode(&subvol, 0o755)?;
-    if let Some(timezone) = settings.timezone {
-        seed_timezone(&subvol, timezone)?;
-    }
-    if let Some(hostname) = settings.hostname {
-        seed_setting(&subvol, HOSTNAME_STATE_RELATIVE, hostname.name())?;
-    }
-    if let Some(selection) = settings.username {
-        seed_setting(&subvol, USERNAME_STATE_RELATIVE, &selection.name)?;
-    }
-    // BEFORE the mkfs that bakes this tree into the image, which is the whole
-    // of why the publish can happen without a mount: `--rootdir` is what puts
-    // it in the filesystem.
-    //
-    // CANONICALIZED first, because `td-boot` requires an absolute volume root
-    // and a relative `<scratch-dir>` is otherwise accepted by every other part
-    // of this verb — a `volume ./scratch` that worked would start failing the
-    // moment a deployment was passed to it, which is a difference between the
-    // two forms that nothing about either says. Resolved once and used for
-    // `--rootdir` too, so the publish and the filesystem cannot be given two
-    // different names for one directory.
-    let staging = paths::canonicalize(&staging)?;
-    if let Some(seed) = seed {
-        let key = key.ok_or_else(|| invalid("the trusted key was not read".to_string()))?;
-        seed_into(&staging, seed, &key)?;
-    }
+    let staging = stage_tree(settings, seed, key, scratch)?;
     // `File::create` TRUNCATES, so a scratch directory that puts the image on
     // top of the DESTINATION destroys the disk whose table was just read — and
     // reports success, since everything after this writes a filesystem into
@@ -3877,42 +4272,7 @@ fn prepare_volume_image(
         Some(uuid) => uuid.0.clone(),
         None => random_guid()?.to_string(),
     };
-    // The child's stdout is CAPTURED and replayed on ours, because this
-    // program's stdout is a machine-readable line and mkfs.btrfs opens with a
-    // banner. Inherited, that banner is the first line of what a caller parses
-    // — which is exactly how this was found, the recipe check reading `v7.0`
-    // where it wanted an offset. stderr is inherited, so a failure still says
-    // what went wrong as it happens.
-    let output = std::process::Command::new(mkfs)
-        .arg("--byte-count")
-        .arg(len.to_string())
-        .arg("--uuid")
-        .arg(&uuid)
-        .arg("--label")
-        .arg(protocol::VOLUME_LABEL)
-        // The one directory in the staged root becomes the read-write subvolume
-        // the boot path mounts on /var. An empty volume without it is a disk
-        // that lays out, formats, and then cannot boot.
-        .arg("--rootdir")
-        .arg(&staging)
-        .arg("--subvol")
-        .arg(format!("rw:{}", protocol::VOLUME_SUBVOL))
-        .arg(&image_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|error| invalid(format!("cannot run {}: {error}", mkfs.display())))?;
-    // `let _`, as every other write to the diagnostic channel in this crate is:
-    // a closed or full stderr is not a reason to abandon an install half done,
-    // and reporting its ENOSPC would name the wrong disk entirely.
-    let _ = io::stderr().write_all(&output.stdout);
-    if !output.status.success() {
-        return Err(invalid(format!(
-            "{} failed on the scratch image ({})",
-            mkfs.display(),
-            output.status
-        )));
-    }
+    run_mkfs(mkfs, len, &uuid, &staging, &image_path, "the scratch image")?;
 
     let (image, prepared) = td_fs::open_real_file(&image_path, "prepared Btrfs image")?;
     {
@@ -3935,6 +4295,103 @@ fn prepare_volume_image(
     image.sync_all()?;
     drop(staged_image);
     Ok(PreparedVolumeImage { file: image, len })
+}
+
+/// Run `mkfs` over `target` for a volume of `len` bytes, baking in `staging`
+/// as its contents and its `@var` subvolume.
+fn run_mkfs(
+    mkfs: &Path,
+    len: u64,
+    uuid: &str,
+    staging: &Path,
+    target: &Path,
+    what: &str,
+) -> io::Result<()> {
+    // The child's stdout is CAPTURED and replayed on ours, because this
+    // program's stdout is a machine-readable line and mkfs.btrfs opens with a
+    // banner. Inherited, that banner is the first line of what a caller parses
+    // — which is exactly how this was found, the recipe check reading `v7.0`
+    // where it wanted an offset. stderr is inherited, so a failure still says
+    // what went wrong as it happens.
+    let output = std::process::Command::new(mkfs)
+        .arg("--byte-count")
+        .arg(len.to_string())
+        .arg("--uuid")
+        .arg(uuid)
+        .arg("--label")
+        .arg(protocol::VOLUME_LABEL)
+        // The one directory in the staged root becomes the read-write subvolume
+        // the boot path mounts on /var. An empty volume without it is a disk
+        // that lays out, formats, and then cannot boot.
+        .arg("--rootdir")
+        .arg(staging)
+        .arg("--subvol")
+        .arg(format!("rw:{}", protocol::VOLUME_SUBVOL))
+        .arg(target)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|error| invalid(format!("cannot run {}: {error}", mkfs.display())))?;
+    // `let _`, as every other write to the diagnostic channel in this crate is:
+    // a closed or full stderr is not a reason to abandon an install half done,
+    // and reporting its ENOSPC would name the wrong disk entirely.
+    let _ = io::stderr().write_all(&output.stdout);
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "{} failed on {} ({})",
+            mkfs.display(),
+            what,
+            output.status
+        )));
+    }
+    Ok(())
+}
+
+/// Empty the staging tree and stage the settings and seed into it: the
+/// volume's contents, which `--rootdir` copies in. Returns its canonical
+/// path.
+fn stage_tree(
+    settings: VolumeSettings<'_>,
+    seed: Option<&VolumeSeed>,
+    key: Option<Vec<u8>>,
+    scratch: &Path,
+) -> io::Result<PathBuf> {
+    let staging = scratch.join("td-volume-root");
+    let subvol = staging.join(protocol::VOLUME_SUBVOL);
+    // The staging tree is not a working directory but the volume's CONTENTS:
+    // `--rootdir` copies whatever is under it into the filesystem. So it is
+    // emptied rather than merely ensured — a scratch directory a previous run
+    // or another program left something in would otherwise put that something
+    // on a machine's /var, with nothing about the install saying so.
+    paths::remove_dir_all_if_present(&staging)?;
+    paths::create_dir_all(&subvol)?;
+    paths::set_mode(&subvol, 0o755)?;
+    if let Some(timezone) = settings.timezone {
+        seed_timezone(&subvol, timezone)?;
+    }
+    if let Some(hostname) = settings.hostname {
+        seed_setting(&subvol, HOSTNAME_STATE_RELATIVE, hostname.name())?;
+    }
+    if let Some(selection) = settings.username {
+        seed_setting(&subvol, USERNAME_STATE_RELATIVE, &selection.name)?;
+    }
+    // BEFORE the mkfs that bakes this tree into the image, which is the whole
+    // of why the publish can happen without a mount: `--rootdir` is what puts
+    // it in the filesystem.
+    //
+    // CANONICALIZED first, because `td-boot` requires an absolute volume root
+    // and a relative `<scratch-dir>` is otherwise accepted by every other part
+    // of this verb — a `volume ./scratch` that worked would start failing the
+    // moment a deployment was passed to it, which is a difference between the
+    // two forms that nothing about either says. Resolved once and used for
+    // `--rootdir` too, so the publish and the filesystem cannot be given two
+    // different names for one directory.
+    let staging = paths::canonicalize(&staging)?;
+    if let Some(seed) = seed {
+        let key = key.ok_or_else(|| invalid("the trusted key was not read".to_string()))?;
+        seed_into(&staging, seed, &key)?;
+    }
+    Ok(staging)
 }
 
 impl PreparedVolumeImage {
@@ -4057,12 +4514,35 @@ fn esp_volume(
 /// The system volume holds what installing writes (DESIGN.md "Payload
 /// fit"): one copy of the deployment's payloads, and the GiB td-boot's
 /// `MIN_VOLUME_BYTES` reserves for Btrfs metadata and `@var`. The layout's
-/// own refusal of a disk too small for it comes first.
-fn volume_fit(sector_size: u64, capacity: u64, payloads: u64) -> Result<(), String> {
+/// own refusal of a disk too small for it comes first. A device-bound
+/// volume first loses its LUKS2 header, for this fit and for the minimum
+/// volume size.
+fn volume_fit(
+    sector_size: u64,
+    capacity: u64,
+    payloads: u64,
+    storage: installation_plan::Storage,
+) -> Result<(), String> {
     const GIB: u64 = 1 << 30;
     let volume = plan(sector_size, capacity)?
         .volume_bytes()
         .ok_or("the system volume's length overflowed")?;
+    let volume = match storage {
+        installation_plan::Storage::Unencrypted => volume,
+        installation_plan::Storage::DeviceBound => {
+            let inside = volume
+                .saturating_sub(volume % device_bound::SECTOR_BYTES)
+                .saturating_sub(device_bound::HEADER_BYTES);
+            if inside < protocol::MIN_VOLUME_BYTES {
+                return Err(format!(
+                    "the encrypted volume would hold {inside} bytes after its \
+                     LUKS2 header and needs at least {}",
+                    protocol::MIN_VOLUME_BYTES
+                ));
+            }
+            inside
+        }
+    };
     let needed = payloads
         .checked_add(GIB)
         .ok_or("the deployment's size overflowed")?;
@@ -7524,7 +8004,7 @@ mod tests {
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 18] {
+    fn compiled_files() -> [Compiled; 19] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -7596,6 +8076,11 @@ mod tests {
                 include_str!("loop_device.rs"),
                 [].as_slice(),
             ),
+            (
+                "device_bound.rs",
+                include_str!("device_bound.rs"),
+                [].as_slice(),
+            ),
         ]
     }
 
@@ -7630,7 +8115,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 18] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 19] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
@@ -9577,7 +10062,7 @@ mod tests {
         };
         let (_disk, _dir, mut destination, formatted, digests) = formatted_fixture();
         let formatted = published(formatted, format!("{id}\n").as_bytes());
-        finish_installation(&mut destination.file, &formatted, &id, &digests).unwrap();
+        finish_installation(&mut destination.file, &formatted, &id, &digests, None).unwrap();
         destination_volume(&mut destination.file).unwrap();
         // Both copies, since firmware falls back to a valid backup.
         let withdrawn = |destination: &mut FormatDestination, table: &gpt::Image| {
@@ -9601,7 +10086,10 @@ mod tests {
                 published: stdout.map(String::into_bytes),
                 ..formatted
             };
-            assert!(finish_installation(&mut destination.file, &formatted, &id, &digests).is_err());
+            assert!(
+                finish_installation(&mut destination.file, &formatted, &id, &digests, None)
+                    .is_err()
+            );
             withdrawn(&mut destination, &formatted.table);
         }
         // The plan's id, but a boot artifact that does not read back, or the
@@ -9610,15 +10098,45 @@ mod tests {
         let formatted = published(formatted, format!("{id}\n").as_bytes());
         let (kernel_at, _, _) = formatted.boot[0];
         write_at(&mut destination.file, kernel_at, b"X").unwrap();
-        assert!(finish_installation(&mut destination.file, &formatted, &id, &digests).is_err());
+        assert!(
+            finish_installation(&mut destination.file, &formatted, &id, &digests, None).is_err()
+        );
         withdrawn(&mut destination, &formatted.table);
         let (_disk, _dir, mut destination, formatted, [kernel, initramfs]) = formatted_fixture();
         let formatted = published(formatted, format!("{id}\n").as_bytes());
-        assert!(
-            finish_installation(&mut destination.file, &formatted, &id, &[initramfs, kernel])
-                .is_err()
-        );
+        assert!(finish_installation(
+            &mut destination.file,
+            &formatted,
+            &id,
+            &[initramfs, kernel],
+            None
+        )
+        .is_err());
         withdrawn(&mut destination, &formatted.table);
+        // A device-bound installation also loses its keyslots: the first
+        // 16 MiB of its volume are zeroed, and nothing past them.
+        let (_disk, _dir, mut destination, formatted, digests) = formatted_fixture();
+        let (offset, _) = formatted.volume;
+        let header = device_bound::HEADER_BYTES;
+        write_at(
+            &mut destination.file,
+            offset,
+            &vec![0xff; header as usize + 512],
+        )
+        .unwrap();
+        assert!(finish_installation(
+            &mut destination.file,
+            &formatted,
+            &id,
+            &digests,
+            Some(offset)
+        )
+        .is_err());
+        withdrawn(&mut destination, &formatted.table);
+        let zeroed = read_at(&mut destination.file, offset, header).unwrap();
+        assert!(zeroed.iter().all(|byte| *byte == 0));
+        let beyond = read_at(&mut destination.file, offset + header, 512).unwrap();
+        assert!(beyond.iter().all(|byte| *byte == 0xff));
     }
 
     /// The selector, like the kernel, is checked through the descriptor the
@@ -9665,6 +10183,163 @@ mod tests {
         assert!(error.to_string().contains("geometry changed"), "{error}");
         assert!(before == volume_write_snapshot(&disk));
         assert_eq!(destination.file.metadata().unwrap().len(), DISK + MIB);
+    }
+
+    /// A held format's write refuses a changed disk as a layout failure,
+    /// before its first write, never as a write failure that withdraws: a
+    /// device-bound format so refused leaves the disk untouched.
+    #[test]
+    fn a_held_write_refuses_before_writing_as_a_layout_failure() {
+        for commit in [true, false] {
+            let (disk, _dir, boot) = combined_fixture(RECORDING_MKFS);
+            let mut destination = FormatDestination::open(&disk.path).unwrap();
+            let layout = prepare_layout(&mut destination, Some(&boot), None).unwrap();
+            destination.file.set_len(DISK + MIB).unwrap();
+            let before = volume_write_snapshot(&disk);
+            let failure = layout.write_held(&mut destination, commit).unwrap_err();
+            let HeldFailure::Layout(error) = failure else {
+                panic!("{failure:?}")
+            };
+            assert!(error.to_string().contains("geometry changed"), "{error}");
+            assert!(before == volume_write_snapshot(&disk));
+        }
+    }
+
+    /// A withdrawal tries every part whatever became of the others: a table
+    /// copy that cannot be zeroed leaves the other and the LUKS2 header
+    /// zeroed, synced, and is named in the error.
+    #[test]
+    fn a_withdrawal_zeroes_each_range_it_can() {
+        let (_disk, _dir, mut destination, formatted, _) = formatted_fixture();
+        let (offset, _) = formatted.volume;
+        let header = device_bound::HEADER_BYTES;
+        write_at(&mut destination.file, offset, &vec![0xff; header as usize]).unwrap();
+        let mut table = formatted.table.clone();
+        table.primary_offset = u64::MAX - 1;
+        let error = withdrawn(
+            &mut destination.file,
+            &table,
+            Some(offset),
+            invalid("the cause".into()),
+        );
+        let text = error.to_string();
+        assert!(text.starts_with("the cause; and withdrawing"), "{text}");
+        assert!(text.contains("zero the primary table"), "{text}");
+        assert!(
+            !text.contains("backup") && !text.contains("LUKS2"),
+            "{text}"
+        );
+        let backup = &formatted.table;
+        let read = |file: &mut File, at, len| read_at(file, at, len).unwrap();
+        assert!(read(
+            &mut destination.file,
+            backup.backup_offset,
+            backup.backup.len() as u64
+        )
+        .iter()
+        .all(|byte| *byte == 0));
+        assert!(read(&mut destination.file, offset, header)
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+
+    /// A device-bound installation stays unbootable until its recovery key
+    /// is typed back: verifying boot requires its table absent, the key is
+    /// handed over with no table on the disk, and only a confirmation
+    /// commits the table, read back before success. A lost installer, or a
+    /// table that cannot be written, withdraws it instead.
+    #[test]
+    fn a_device_bound_table_is_written_only_once_its_key_is_confirmed() {
+        use installation_protocol::Failure;
+        let id = "ab".repeat(32);
+        let header = device_bound::HEADER_BYTES;
+        let uncommitted = || {
+            let (disk, dir, mut destination, formatted, digests) = formatted_fixture();
+            let formatted = Formatted {
+                published: Some(format!("{id}\n").into_bytes()),
+                ..formatted
+            };
+            let (offset, _) = formatted.volume;
+            write_at(&mut destination.file, offset, &vec![0xff; header as usize]).unwrap();
+            // A committed table is refused before the key is handed over.
+            assert!(finish_installation(
+                &mut destination.file,
+                &formatted,
+                &id,
+                &digests,
+                Some(offset)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("before the recovery key is confirmed"));
+            write_at(&mut destination.file, offset, &vec![0xff; header as usize]).unwrap();
+            invalidate_table(&mut destination.file, &formatted.table).unwrap();
+            finish_installation(
+                &mut destination.file,
+                &formatted,
+                &id,
+                &digests,
+                Some(offset),
+            )
+            .unwrap();
+            let pending = TypeBack {
+                file: destination.file,
+                table: formatted.table.clone(),
+                volume: formatted.volume,
+                recovery: td_protector::recovery::RecoveryKey::generate().unwrap(),
+            };
+            (disk, dir, pending, formatted)
+        };
+        let unbootable = |disk: &Scratch| {
+            let mut file = File::open(&disk.path).unwrap();
+            assert!(destination_volume(&mut file).is_err());
+        };
+        let (disk, _dir, pending, formatted) = uncommitted();
+        let mut asked = 0;
+        pending
+            .wait(&mut |_| {
+                asked += 1;
+                unbootable(&disk);
+                TypedBack::Confirmed
+            })
+            .unwrap();
+        assert_eq!(asked, 1);
+        let mut file = File::open(&disk.path).unwrap();
+        verify_table(&mut file, &formatted.table, formatted.volume).unwrap();
+        let (offset, _) = formatted.volume;
+        assert!(read_at(&mut file, offset, header)
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0xff));
+        // Lost, or a confirmed table that cannot be written: withdrawn.
+        for lost in [true, false] {
+            let (disk, _dir, mut pending, formatted) = uncommitted();
+            if !lost {
+                pending.table.backup_offset = u64::MAX - 1;
+            }
+            let (failure, _) = pending
+                .wait(&mut |_| {
+                    unbootable(&disk);
+                    if lost {
+                        TypedBack::Lost
+                    } else {
+                        TypedBack::Confirmed
+                    }
+                })
+                .unwrap_err();
+            let expected = if lost {
+                Failure::RecoveryUnconfirmed
+            } else {
+                Failure::WriteFailed
+            };
+            assert_eq!(failure, expected);
+            unbootable(&disk);
+            let mut file = File::open(&disk.path).unwrap();
+            assert!(read_at(&mut file, formatted.volume.0, header)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0));
+        }
     }
 
     fn volume_write_snapshot(disk: &Scratch) -> Vec<Vec<u8>> {
@@ -10703,9 +11378,13 @@ mod tests {
                 .open(&self.disk.path)
                 .unwrap();
             let mut phases = Vec::new();
-            let outcome = self
-                .execution
-                .execute(&self.plan, claim, &mut |phase| phases.push(phase));
+            // No execution these tests reach gets as far as a type-back.
+            let outcome = self.execution.execute(
+                &self.plan,
+                claim,
+                &mut |phase| phases.push(phase),
+                &mut |_| panic!("a recovery key was handed over"),
+            );
             (outcome, phases)
         }
 
@@ -10734,26 +11413,50 @@ mod tests {
         }
     }
 
-    /// The source is checked before the destination is touched: a root that
-    /// is not the planned deployment, a manifest that is not the planned one,
-    /// and a kernel the manifest does not name each fail verification with
-    /// no phase begun and every byte of the disk still zero.
-    /// Until device-bound formatting lands, such a plan stops before the
-    /// first write and is never formatted unencrypted.
+    /// A device-bound plan is laid out, then its loop cannot be bound here
+    /// (unprivileged): a write failure that withdraws the installation, its
+    /// table invalidated and its volume's first 16 MiB zeroed, with no
+    /// recovery key handed over and the workspace gone.
     #[test]
-    fn a_device_bound_plan_is_not_formatted() {
+    fn a_device_bound_failure_after_layout_withdraws_the_installation() {
+        use installation_protocol::{Failure, Phase};
         let mut fixture = ExecutionFixture::new(b"kernel", b"kernel");
-        let plan = &fixture.plan;
+        let reviewed = &fixture.plan;
         fixture.plan = installation_plan::Plan::new(
-            *plan.nonce(),
-            plan.destination().clone(),
-            *plan.deployment(),
-            *plan.volume_uuid(),
+            *reviewed.nonce(),
+            reviewed.destination().clone(),
+            *reviewed.deployment(),
+            *reviewed.volume_uuid(),
             installation_plan::Storage::DeviceBound,
-            plan.settings().clone(),
+            reviewed.settings().clone(),
         )
         .unwrap();
-        fixture.assert_untouched(installation_protocol::Failure::VerificationFailed);
+        let layout = plan(512, DISK).unwrap();
+        let offset = layout.volume_start * 512;
+        let header = device_bound::HEADER_BYTES;
+        {
+            let mut disk = OpenOptions::new()
+                .write(true)
+                .open(&fixture.disk.path)
+                .unwrap();
+            write_at(&mut disk, offset, &vec![0xff; header as usize + 512]).unwrap();
+        }
+        let (outcome, phases) = fixture.run();
+        assert_eq!(outcome, Err(Failure::WriteFailed));
+        assert_eq!(phases, [Phase::WritingFilesystems]);
+        let mut disk = File::open(&fixture.disk.path).unwrap();
+        assert!(destination_volume(&mut disk).is_err(), "the table stayed");
+        assert!(fixture
+            .disk
+            .read_at(offset, header as usize)
+            .iter()
+            .all(|b| *b == 0));
+        assert!(fixture
+            .disk
+            .read_at(offset + header, 512)
+            .iter()
+            .all(|b| *b == 0xff));
+        fixture.assert_workspace_gone();
     }
 
     #[test]
@@ -10978,11 +11681,26 @@ mod tests {
     fn the_fit_is_one_copy_and_a_gib_and_the_prepared_selector() {
         let volume = plan(512, DISK).unwrap().volume_bytes().unwrap();
         let most = volume - GIB;
-        assert_eq!(volume_fit(512, DISK, most), Ok(()));
-        assert!(volume_fit(512, DISK, most + 1).is_err());
-        assert!(volume_fit(512, DISK, u64::MAX).is_err());
+        use installation_plan::Storage::{DeviceBound, Unencrypted};
+        assert_eq!(volume_fit(512, DISK, most, Unencrypted), Ok(()));
+        assert!(volume_fit(512, DISK, most + 1, Unencrypted).is_err());
+        assert!(volume_fit(512, DISK, u64::MAX, Unencrypted).is_err());
         // A disk the layout refuses is refused as such.
-        assert!(volume_fit(512, 1 << 20, 1).is_err());
+        assert!(volume_fit(512, 1 << 20, 1, Unencrypted).is_err());
+        // A device-bound volume holds less by its header, in whole
+        // encryption sectors.
+        let inside = volume - volume % 4096 - (16 << 20);
+        assert_eq!(volume_fit(512, DISK, inside - GIB, DeviceBound), Ok(()));
+        assert!(volume_fit(512, DISK, inside - GIB + 1, DeviceBound).is_err());
+        // The smallest volume the layout admits holds the minimum, which a
+        // header takes it below.
+        let smallest = (1..)
+            .map(|mib| mib << 20)
+            .find(|capacity| plan(512, *capacity).is_ok());
+        let smallest = smallest.unwrap();
+        assert_eq!(volume_fit(512, smallest, 0, Unencrypted), Ok(()));
+        let error = volume_fit(512, smallest, 0, DeviceBound).unwrap_err();
+        assert!(error.contains("after its LUKS2 header"), "{error}");
         assert_eq!(esp_fit(512, DISK, 1 << 20, 1 << 20), Ok(()));
         assert!(esp_fit(512, DISK, protocol::ESP_BYTES, 1).is_err());
         assert!(esp_fit(512, DISK, 1, protocol::ESP_BYTES).is_err());
