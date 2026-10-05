@@ -683,24 +683,13 @@ pub fn load(path: Option<&Path>) -> Result<Config, String> {
     let Some(path) = path else {
         return Ok(Config::default());
     };
-    let text = match std::fs::File::open(path) {
-        Ok(file) => {
-            use std::io::Read;
-            let mut text = String::new();
-            file.take(MAX_BYTES.saturating_add(1))
-                .read_to_string(&mut text)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            if text.len() as u64 > MAX_BYTES {
-                return Err(format!(
-                    "{} is longer than {MAX_BYTES} bytes",
-                    path.display()
-                ));
-            }
-            text
-        }
+    let bytes = match td_fs::read_bounded(path, MAX_BYTES) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(e) => return Err(e.to_string()),
     };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("{}: stream did not contain valid UTF-8", path.display()))?;
     parse(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 

@@ -9,7 +9,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// The most paths kept; recording one more drops the oldest.
@@ -67,20 +67,11 @@ pub fn parse(text: &str) -> Vec<PathBuf> {
 
 /// The list in `file`; empty when there is none yet.
 pub fn load(file: &Path) -> io::Result<Vec<PathBuf>> {
-    let opened = match fs::File::open(file) {
-        Ok(opened) => opened,
+    let bytes = match td_fs::read_bounded(file, MAX_FILE_BYTES) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", file.display()))),
+        Err(e) => return Err(e),
     };
-    let mut bytes = Vec::new();
-    opened.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(io::Error::other(format!(
-            "{} is larger than {} KiB",
-            file.display(),
-            MAX_FILE_BYTES / 1024
-        )));
-    }
     let text = String::from_utf8(bytes).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,

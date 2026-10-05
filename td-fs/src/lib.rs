@@ -8,10 +8,12 @@
 //! `real_file.rs` and `replace.rs`, and td-update and td-vm-guest
 //! `private_dir.rs` alone.
 
+mod bounded;
 mod private_dir;
 mod real_file;
 mod replace;
 
+pub use bounded::read_bounded;
 pub use private_dir::{check_private_dir, private_dir};
 pub use real_file::{open_real_file, read_bounded_real_file};
 pub use replace::replace;
