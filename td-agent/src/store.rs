@@ -1149,6 +1149,10 @@ pub enum Kind {
     Interrupted { started: u64 },
     /// Something the store reports about itself, a torn line dropped.
     Notice { text: String },
+    /// td-agent's own news of the conversation's workspace, a worktree
+    /// ready or failed or a base that moved upstream (DESIGN.md §3,
+    /// Notifications): shown as a notice is, and given to the model too.
+    Notification { text: String },
     /// A request prefix (DESIGN.md §6, §13) superseding the `prefix` file
     /// and any earlier one from here on, as exact text: a JSON object of
     /// the tools and the messages every request of the conversation begins
@@ -1301,6 +1305,10 @@ impl Event {
             }
             Kind::Notice { text } => {
                 put("kind", Json::Str("notice".into()));
+                put("text", Json::Str(text.clone()));
+            }
+            Kind::Notification { text } => {
+                put("kind", Json::Str("notification".into()));
                 put("text", Json::Str(text.clone()));
             }
             Kind::Prefix { text } => {
@@ -1523,6 +1531,9 @@ impl Event {
                 started: number("started")?,
             },
             Some("notice") => Kind::Notice {
+                text: string("text")?,
+            },
+            Some("notification") => Kind::Notification {
                 text: string("text")?,
             },
             Some("prefix") => Kind::Prefix {

@@ -492,7 +492,7 @@ fn a_repository_conversation_prepares_its_workspace() {
                     );
                 }
                 Update::Up(Up::Event(event)) => {
-                    if let Kind::Notice { text } = event.kind {
+                    if let Kind::Notification { text } = event.kind {
                         ready = Some(text);
                     }
                 }
@@ -580,7 +580,9 @@ fn a_repository_conversation_prepares_its_workspace() {
                 Update::Up(Up::Event(event)) => {
                     // Its log's older notices come again as it opens.
                     match event.kind {
-                        Kind::Notice { text } if text.contains("upstream") => said = Some(text),
+                        Kind::Notification { text } if text.contains("upstream") => {
+                            said = Some(text)
+                        }
                         _ => {}
                     }
                 }

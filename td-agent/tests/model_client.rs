@@ -456,6 +456,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Finished { .. } => "finished",
             Kind::Interrupted { .. } => "interrupted",
             Kind::Notice { .. } => "notice",
+            Kind::Notification { .. } => "notification",
             Kind::Prefix { .. } => "prefix",
             Kind::Request { .. } => "request",
             Kind::Assistant { .. } => "assistant",

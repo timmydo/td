@@ -66,7 +66,12 @@ impl Searchable {
         }
     }
 
+    /// A kind by its word; `notification`, which a page names td-agent's
+    /// news by, is a `notice` to search.
     pub fn parse(word: &str) -> Option<Self> {
+        if word == "notification" {
+            return Some(Self::Notice);
+        }
         Self::ALL.into_iter().find(|k| k.word() == word)
     }
 }
@@ -112,6 +117,7 @@ fn kind(event: &Event) -> &'static str {
         Kind::Finished { .. } => "finished",
         Kind::Interrupted { .. } => "interrupted",
         Kind::Notice { .. } => "notice",
+        Kind::Notification { .. } => "notification",
         Kind::Prefix { .. } => "prefix",
         Kind::Request { .. } => "request",
         Kind::Assistant { .. } => "assistant",
@@ -143,7 +149,7 @@ pub fn render(event: &Event) -> String {
             started, outcome, ..
         } => format!("#{started} ended: {outcome}"),
         Kind::Interrupted { started } => format!("#{started} was interrupted by a restart"),
-        Kind::Notice { text } => text.clone(),
+        Kind::Notice { text } | Kind::Notification { text } => text.clone(),
         Kind::Prefix { text } => format!("the request prefix changed ({} bytes)", text.len()),
         Kind::Request {
             turn,
@@ -246,7 +252,10 @@ fn searchable(event: &Event) -> Vec<(Searchable, String)> {
                 format!("{}\n{text}", message(from, *role, status.as_deref(), *held)),
             )]
         }
-        Kind::Notice { text } => vec![(Searchable::Notice, text.clone())],
+        // A notification is found as a notice is: `kinds` names both.
+        Kind::Notice { text } | Kind::Notification { text } => {
+            vec![(Searchable::Notice, text.clone())]
+        }
         Kind::Assistant {
             content,
             reasoning,

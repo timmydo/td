@@ -1444,7 +1444,7 @@ impl App {
             // What td-agent tells the human there, such as a wake budget
             // spent, is said here too.
             Update::Up(Up::Event(Event {
-                kind: Kind::Notice { text },
+                kind: Kind::Notice { text } | Kind::Notification { text },
                 ..
             })) => {
                 notice = Some(format!("{}: {text}", row.title));
@@ -1779,7 +1779,7 @@ impl App {
             }
             Kind::Prefix { text } => self.system(Ok(&text), self.system_shown),
             Kind::Title { .. } | Kind::ToolCall { .. } => {}
-            Kind::Notice { text } => self.notice_message(&text),
+            Kind::Notice { text } | Kind::Notification { text } => self.notice_message(&text),
             Kind::Message {
                 from,
                 role,

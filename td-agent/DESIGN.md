@@ -479,8 +479,9 @@ any conversation and talk to it directly.
 **Notifications.** td-agent's own news of a workspace goes to that
 workspace's conversation and to the window, which shows it, and to no
 other conversation. A worktree that became ready or failed and a base
-branch that advanced after a store fetch (§7) are notices logged in the
-workspace's conversation between turns; a turn that finished, failed or
+branch that advanced after a store fetch (§7) are notifications logged
+in the workspace's conversation between turns, which its model reads
+(§7, As built (increment 11, notifications)); a turn that finished, failed or
 is waiting for approval is the window's to show, on the conversation's
 row and as a notice when the conversation is not the one open. A
 worktree that became ready or failed wakes its idle conversation; a base
@@ -2012,17 +2013,43 @@ recorded, between turns (one told during a turn waits for its end),
 the process sets the ref there, whatever the jail left in it, records
 it, and logs a notice, `upstream's <base> moved from <commit> to
 <commit> in <remote>: each worktree's refs/remotes/origin/<base> names
-it now`, which the window shows; a base it had no record of, from a
+it now`, a notification (As built (increment 11, notifications)),
+which the window shows; a base it had no record of, from a
 meta written before, is set and recorded silently. Every ref is set in
 one transaction, or none is, so the record is never half right. A
 failure is logged once for each remote until it says something else or
 the refs are set, and the same commits are not tried again until they
 change or the process starts again, so a lasting failure does not
 start an instance every fetch. A write that would take `meta` past
-what is read back is refused.
-Nothing wakes the conversation, and nothing tells the model yet:
-notices are the log's and the human's, and §3's notifications to the
-model are a later step. Rebasing stays the conversation's own work.
+what is read back is refused. A failure is a notice, the human's to
+mend, not the model's news. Nothing wakes the conversation: the model
+reads the move at its next turn, as §3 has it. Rebasing stays the
+conversation's own work.
+
+**As built (increment 11, notifications).** td-agent's news of a
+repository workspace is a `notification` in its conversation's log,
+beside the `notice` the store and td-agent's own troubles use: a
+repository checked out and ready or not prepared, and a base that
+moved upstream. The window shows a notification as it shows a notice,
+on the row and in the transcript; `history_search` finds both under
+the kind `notice`, so the tool's schema, and the prefix, is unchanged.
+Unlike a notice, a notification is given to the model, as a user
+message beginning with the line every message has, then the label
+`[td-agent's news of this workspace, not from the person]`, then its
+text; the environment of a repository workspace's prefix names the
+label, says td-agent tells the model when a worktree is ready or fails
+and when a base moves, and that the line and the label are td-agent's
+but what the news quotes from git, the remote or the jail is not, and
+asks nothing by itself, a message from the person still the one to
+answer. A failure's reason is quoted on one line, every control named,
+and cut to 1,000 characters. The sentence every conversation's prefix
+has about the received line is left as it was, so no other
+conversation's cache is lost; `history_search` takes `notification`
+as a name for `notice`, its schema unchanged. One
+logged between turns is read at the next turn; nothing wakes the
+conversation for it yet, and a preparation's still runs on the
+process's main thread during the first turn, before its request, so
+the model reads that first turn's news with it.
 
 **As built (increment 11, preparation).** Choosing a template that
 names repositories makes its workspace's record at once, in the
@@ -2058,8 +2085,9 @@ base's commit, or why not. The process then lays the repository out
 and checks each worktree out in a maintenance instance (§8, As built
 (increment 11, the layout)), with the host's git by the path it
 resolves to, records the repository in `meta`'s `prepared`, and says
-in a notice in its log that it is ready, or why it is not, which the
-window shows; one that fails is asked for again when a process for the
+in a notification in its log that it is ready, or why it is not, which
+the window shows and the model reads (As built (increment 11,
+notifications)); one that fails is asked for again when a process for the
 conversation next starts, as on opening it again. From its ask until
 it says it is done (`Prepared`) the window keeps its process when the
 conversation is left, as it keeps one with a turn under way. Its
@@ -2083,11 +2111,12 @@ prepare. The first turn waits for each store's answer, which carries
 the project instructions (§13, As built (increment 11, project
 instructions)); in this step the checkout then runs on the
 conversation process's main thread, so that turn, and any during a
-later preparation, waits behind it too, and the model is told nothing
-of it; rules from the base and the model's notification are later
-steps (the background fetch and the remote-tracking refs are As built
-(increment 11, background fetch) and (increment 11, remote-tracking
-refs)). Deleting the conversation removes its
+later preparation, waits behind it too; rules from the base, and a
+checkout off the main thread whose news wakes an idle conversation,
+are later steps (the background fetch, the remote-tracking refs and
+the notifications are As built (increment 11, background fetch),
+(increment 11, remote-tracking refs) and (increment 11,
+notifications)). Deleting the conversation removes its
 repository workspace (As built (increment 11, removal on deletion)),
 and archiving it does too (As built (increment 11, removal on
 archiving)).
@@ -4448,6 +4477,14 @@ thread answering a refresh for the window with its bases;
 remotes only, each once with its bases once, none whose fetch is
 pending, and a base moving only from a commit known before; the store
 thread's queue a preparation before queued background fetches.
+For the notifications, `src/client.rs` covers one given to the model
+labelled, with and without the received line, and a notice not, its
+history rendering, and `notification` searching as `notice`;
+`src/conversation.rs` a failure's reason quoted on one bounded line;
+`src/prompt.rs` the repository environment naming the label and the
+news; and `tests/processes.rs` and the live `tests/jail.rs` a refused
+store, a ready repository and a moved base each logged as one, and a
+failure to set the refs logged as a notice.
 For the remote-tracking refs, `src/repo.rs` covers `track` setting a
 ref over what was there, a stale lock stopping a later run but cleared
 by one preparing, its words crossing in both forms and bad words

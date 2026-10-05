@@ -286,7 +286,7 @@ fn a_repository_conversation_asks_for_its_store_and_says_a_refusal() {
     until(&mut supervisor, &mut heard, |heard| {
         heard.iter().any(|u| {
             matches!(u, Update::Up(Up::Event(e)) if matches!(&e.kind,
-                Kind::Notice { text } if text.contains("could not be prepared: the remote is not admitted")))
+                Kind::Notification { text } if text.contains("could not be prepared: the remote is not admitted")))
         })
     });
     // Done preparing, it is retired as any left conversation is.
@@ -545,12 +545,14 @@ fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
         bases: vec!["main".into()],
         ids: vec![id.to_string()],
     };
+    // Either kind, marked, so news or a failure given to the model shows.
     let notices = |heard: &[Update]| -> Vec<String> {
         heard
             .iter()
             .filter_map(|u| match u {
                 Update::Up(Up::Event(e)) => match &e.kind {
                     Kind::Notice { text } => Some(text.clone()),
+                    Kind::Notification { text } => Some(format!("notification: {text}")),
                     _ => None,
                 },
                 _ => None,
@@ -580,9 +582,10 @@ fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
     let notices = notices(&heard);
     assert_eq!(notices.len(), 2, "{notices:?}");
     for (notice, remote) in notices.iter().zip([&one, &two]) {
+        // A notice, the human's to mend, not the model's news.
         assert!(
-            notice.contains(&format!(
-                "remote-tracking refs of {remote} could not be set"
+            notice.starts_with(&format!(
+                "the remote-tracking refs of {remote} could not be set"
             )),
             "{notices:?}"
         );

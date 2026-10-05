@@ -187,6 +187,9 @@ pub fn check_calls(calls: &[Call]) -> Result<(), String> {
     Ok(())
 }
 
+/// The label a notification is given to the model with (DESIGN.md §3).
+pub const NOTIFICATION: &str = "[td-agent's news of this workspace, not from the person]";
+
 /// The label a message from another conversation reaches the model under
 /// (DESIGN.md §3): its source, and that it is not the person's.
 pub fn label(from: &crate::store::Id, role: Role, status: Option<&str>) -> String {
@@ -216,7 +219,8 @@ pub fn timed(prefix: &str) -> bool {
 
 /// The messages of the log before a request, as the request carries
 /// them: each user message, and each message from another conversation
-/// under its label, each after the time it was received when `timed`;
+/// under its label, and each notification under `NOTIFICATION`, each
+/// after the time it was received when `timed`;
 /// each whole turn reply that has text, reasoning or tool calls to give
 /// back; and each tool result, as a `tool` message
 /// after the reply that asked for it. A reply a broken or interrupted
@@ -239,6 +243,10 @@ pub fn messages(events: &[Event], timed: bool) -> Vec<String> {
             Kind::User { text, .. } => out.push(crate::prompt::message(
                 "user",
                 &format!("{}{text}", at(event.time)),
+            )),
+            Kind::Notification { text } => out.push(crate::prompt::message(
+                "user",
+                &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
             )),
             Kind::Message {
                 from,
@@ -1419,6 +1427,48 @@ mod tests {
         assert_eq!(
             label(&from, Role::Orchestrator, None),
             "[a message from the orchestrator, not from the person]"
+        );
+    }
+
+    /// td-agent's news of the workspace goes to the model labelled as
+    /// its own; a notice, the human's, does not.
+    #[test]
+    fn a_notification_goes_to_the_model_labelled_as_td_agents() {
+        let events = vec![
+            event(
+                1,
+                Kind::Notification {
+                    text: "td is ready".into(),
+                },
+            ),
+            event(
+                2,
+                Kind::Notice {
+                    text: "a torn line dropped".into(),
+                },
+            ),
+        ];
+        assert_eq!(
+            messages(&events, true),
+            [format!(
+                "{{\"role\":\"user\",\"content\":\"[received 1970-01-01T00:00:00Z]\\n{NOTIFICATION}\\ntd is ready\"}}"
+            )]
+        );
+        assert_eq!(
+            crate::history::render(&events[0]),
+            "#1 notification 1970-01-01T00:00:00Z\ntd is ready\n"
+        );
+        // Under a prefix from before the received line, none is given.
+        assert_eq!(
+            messages(&events, false),
+            [format!(
+                "{{\"role\":\"user\",\"content\":\"{NOTIFICATION}\\ntd is ready\"}}"
+            )]
+        );
+        // A search for the word a page names it by finds it as a notice.
+        assert_eq!(
+            crate::history::Searchable::parse("notification"),
+            Some(crate::history::Searchable::Notice)
         );
     }
 
