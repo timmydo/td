@@ -20,9 +20,10 @@ the bounded reader that finds tokens in a LUKS2 header before the cap.
 Increment 6 adds what the installer and the selector share for keyslot
 changes: the cryptsetup runner ("Cryptsetup runner"), moved from
 td-install with DESIGN.md "Device-bound formatting"'s descriptor rules
-unchanged, and the pure transition planner ("Transitions"); the release
-orchestration that runs ENCRYPTION.md's release order is its target,
-not yet implemented.
+unchanged, and the pure transition planner ("Transitions"); then the
+release orchestration that runs ENCRYPTION.md's release order ("Release
+orchestration"), a library the selector will call and nothing calls
+yet.
 
 ## Policies
 
@@ -76,20 +77,48 @@ grant, and ENCRYPTION.md asks for none.
 
 ## Unseal outcomes
 
-This is increment 6's target; `unseal` does not yet type its errors.
-Its `UnsealError` separates the refusals that release nothing from
-everything else, so that the deployment initramfs's post-cap check
+`unseal`'s `UnsealError` separates the refusals that release nothing
+from everything else, so that the deployment initramfs's post-cap check
 (ENCRYPTION.md "Boot and authority boundaries") halts on no expected
-refusal:
+refusal. It types td-tpm's `UnsealError`, which carries the command and
+response code of the TPM refusal that ended the unseal, if one did:
 
 - `PolicyRefused`: only `TPM_RC_VALUE` on PolicyPCR's first parameter
-  (0x1c4), PCRs that differ from the policy's, and `TPM_RC_POLICY_FAIL`
-  on Unseal's first session (0x99d).
-- `LoadRefused`: TPM2_Load's integrity, seed and handle failures, the
-  answer of a cleared or different TPM whose storage primary did not
-  create the sealed object. The commit that adds it pins those codes.
+  (0x1c4, `POLICY_PCR_REFUSED`), PCRs that differ from the policy's,
+  and `TPM_RC_POLICY_FAIL` on Unseal's first session (0x99d,
+  `UNSEAL_POLICY_REFUSED`).
+- `LoadRefused` (`load_refused`): a refusal before the sealed object is
+  loaded. Without a parent there is no Load, and without a loaded object
+  no Unseal, so none of these can indicate a release:
+  - TPM2_Load's `TPM_RC_INTEGRITY` (`RC_FMT1` 0x080 + 0x01f = 0x09f) at
+    any handle or parameter position: 0x09f, on the parent handle
+    0x19f, on `inPrivate` 0x1df, on `inPublic` 0x2df (TPM 2.0 Part 2
+    6.6: `TPM_RC_P` 0x040, handle and parameter numbers in 0xf00). It
+    is the answer of a cleared or different TPM whose storage primary
+    did not create the sealed object: the private area's integrity
+    HMAC is keyed from the parent's seed, so a new seed fails there
+    before anything else is checked. swtpm 0.10.1 answers 0x1df, which
+    the emulator oracle pins. The code on a session position (0x89f
+    and up) is `Other`.
+  - CreatePrimary of the owner storage primary refused by the owner
+    hierarchy's state (`HIERARCHY_REFUSED`): `TPM_RC_BAD_AUTH`
+    (0x080 + 0x022) on session 1 (`TPM_RC_S` 0x800 + `TPM_RC_1`
+    0x100), 0x9a2, an owner password set since installation; and
+    `TPM_RC_HIERARCHY` (0x080 + 0x005) on handle 1, 0x185, the storage
+    hierarchy disabled. Either would otherwise make every recovery
+    boot's deployment check halt.
 - `Other`: a transport error, a reply that does not answer the command,
-  and every other response code.
+  every other response code, and a payload other than 32 bytes.
+
+So that a changed boot chain and a closed cap are the TPM's answers and
+not a local mismatch, td-tpm's `unseal_object` checks the sealed public
+area's format but leaves comparing its authPolicy to the TPM, and a
+device-bound token is unsealed under `release_policy`: PCRs 4 and 9 as
+they read now, unmeasured or not, and a literal-zero PCR 12. Before the
+cap a changed chain passes PolicyPCR and is refused at Unseal (0x99d);
+after it PolicyPCR refuses (0x1c4). `observe` is the seal's read, which
+refuses an unmeasured PCR 4 or 9 as `ObserveError::Unmeasured`;
+`observed_policy` is the same with its refusal as text.
 
 ## Release cap
 
@@ -112,7 +141,8 @@ tries every td token, up to the fixed bound; when the first-boot
 protector alone released, it performs the first-boot transition's seal
 and verification unseal; then it caps exactly once, whether or not any
 unseal succeeded, before cryptsetup parses the header. ENCRYPTION.md's
-release order (step 4) says what each `CapError` leads to. No other td
+release order (step 4) says what each `CapError` leads to, and
+`release::release` is that caller ("Release orchestration"). No other td
 component extends PCR 12.
 
 ## Installer check
@@ -301,8 +331,8 @@ starts.
 The planner is pure: from the header the reader returned and the td
 tokens whose secrets released, it computes one transition's ordered
 cryptsetup steps, running no cryptsetup and reaching no TPM. The release
-orchestration, increment 6's target, executes the plan through the
-runner after the cap. `transition::classify` names the transition the
+orchestration executes the plan through the runner after the cap
+("Release orchestration"). `transition::classify` names the transition the
 released tokens call for, and `transition::plan` its steps, each a
 runner command with the key of a named keyslot, the new token's JSON or
 nothing on standard input. A plan adds the new protector at the lowest
@@ -378,6 +408,71 @@ the header, orphans included, is unchanged. Tests drive each plan to
 every interruption point and require the next boot's plan to complete
 it.
 
+## Release orchestration
+
+`release::release` runs ENCRYPTION.md's release order, steps 2 to 5,
+for the installed selector, which calls it once td-boot links this
+crate. It takes the result of `luks2::read` on the volume (step 1,
+which td-boot runs first, since a header carrying a td token decides
+its TPM wait), the name cryptsetup opens the partition by, the TPM as a
+`release::Tpm` (`DeviceTpm` opens `/dev/tpmrm0`; `None` when no device
+appeared within td-boot's wait, whose constant is td-boot's), the
+cryptsetup commands as a `release::Runner` (the runner's
+`Cryptsetup`), and a console that receives one line per decision and
+per transition commit. Every TPM operation opens its own client;
+nothing reaches cryptsetup before the cap.
+
+1. Without a TPM nothing is tried or capped: `Recovery { NoTpm }`.
+2. It tries every td token up to `MAX_ATTEMPTS`, the reader's four,
+   device-bound tokens first and each role by number, through
+   `unseal_token`: the first-boot policy for a first-boot token,
+   `release_policy` for a device-bound one. A token naming keyslot 0 is
+   never tried. Every refusal releases nothing; the console names its
+   `UnsealError`.
+3. When only first-boot tokens released, it reads PCRs 4 and 9 with
+   `observe`, seals a fresh `/dev/random` secret to them and a
+   literal-zero PCR 12, and unseals it once, requiring the same secret.
+4. It caps PCR 12 on a fresh client whatever came before. `AlreadyClosed`
+   is `Recovery { AlreadyClosed }`; `Uncertain` and `Mismatch` are
+   `Halt`, and a client that cannot be opened is `Uncertain`. Neither
+   carries a secret: every released and new secret is dropped, which
+   zeroes it, before the outcome returns.
+5. After the cap a header td refused is `Recovery { Header }`, a step 3
+   that refused an unmeasured PCR or failed is `Recovery { Unmeasured }`
+   or `Recovery { Transition }`, and nothing released is `Recovery {
+   NothingReleased }`. Otherwise it classifies the released tokens and
+   plans `Keep`, or `FirstBoot` with the new protector, confirms the
+   plan against `luksDump --dump-json-metadata` and runs its steps: a
+   released or new keyslot's key on standard input, the new token's
+   JSON, or nothing, and the new secret as `luksAddKey`'s key file. A
+   plan the planner refuses, metadata that cannot be read or disagrees,
+   or an empty plan runs no step but a test of the released keyslot, so
+   the keyslot `Released` names was tested this boot.
+
+A failed test of the released keyslot, the plan's first step or that
+stand-in, falls back: classification runs again without that token, and
+when none is left the outcome is `Recovery { NoKeyslotOpens }`, never a
+halt. A fall-back that leaves only first-boot tokens is `Recovery {
+FirstBootFallback }`: a device-bound token released, so step 3 sealed
+nothing, and opening with the first-boot protector alone would leave
+release bound to PCR 12 alone on every later boot. The confirmed reseal
+then retires both. Any other failed step stops the plan; the volume opens with the
+released secret, or with the new protector's once its keyslot's test
+passed, and the next boot's plan removes what is left over. `Released {
+keyslot, secret }` is the only outcome holding a secret; the selector
+opens with it and drops it. `Recovery`'s `reseal_offerable` is
+ENCRYPTION.md's condition for offering the confirmed reseal: this
+boot's own cap closed PCR 12 and td read the header. It is false
+without a TPM, for `AlreadyClosed` and for a refused header.
+
+Two choices go beyond ENCRYPTION.md's text. A step 3 seal or
+verification that fails for a reason other than an unmeasured PCR also
+ends in recovery rather than opening with the first-boot secret, so the
+device never keeps releasing to the first-boot protector alone without
+its owner seeing it. And a header td refuses is still capped, with
+nothing tried: the cap closes release on an encrypted volume whatever
+its header holds.
+
 ## Bounds
 
 Every TPM exchange is td-tpm's: bounded commands and replies, no retry or
@@ -398,6 +493,9 @@ sealed areas are at most 256 and 512 bytes, and a header carries at most
 four td tokens, orphans included, among 32. A plan has at most 39
 steps: two tests, a kill per keyslot from 1 to 31, a removal per td
 token, an add and an import. The runner's inputs are at most one page.
+A release tries at most four tokens, seals at most one protector, caps
+once, and runs at most one plan per released token, each of whose
+fall-backs follows a failed first step.
 
 ## Evidence
 
@@ -458,15 +556,40 @@ every later boot no refusal but the header's own, no command
 cryptsetup would refuse (each test with the key that opens its keyslot),
 the four-token bound after every step, and an empty plan within three
 boots. The runner tests also refuse a `luksKillSlot` with an empty or
-31-byte key before any child starts. No test reads a header cryptsetup wrote: that needs the source-built
+31-byte key before any child starts. Unseal-outcome tests pin the
+refusal codes against Part 2's encodings, type each on its own command
+and positions only and a transport error as `Other`, and, through the
+scripted TPM, a changed chain refused at Unseal, a cleared TPM refused
+at Load, each load refusal answered with nothing unsealed, and an
+unmeasured PCR answered by the TPM. Release tests run the orchestration over the scripted TPM and
+a scripted cryptsetup that keeps keyslot keys and tokens, reads the new
+key from its descriptor, enforces the kill floor and authorization, and
+requires PCR 12 capped before every command, with no TPM command after
+the first; every test also requires that no secret but the returned one
+outlives the release. They cover a device-bound release retiring a
+leftover first-boot protector and an orphan keyslot, the first-boot
+transition (seal, verification, then the cap last, each commit
+reported) and the next boot keeping its protector, nothing released,
+`AlreadyClosed` with no plan, `Uncertain` and `Mismatch` halting with
+or without a new protector, an unmeasured PCR 4 or 9, a cleared TPM,
+metadata that disagrees or fails, a dead released keyslot falling back
+to the next token and to recovery, a dead device-bound keyslot beside a
+live first-boot one reaching recovery on every boot until a confirmed
+reseal converges, a td token naming keyslot 0 never
+tried and suppressing the plan, a failed import or kill and the boot
+that completes it, no TPM device, a refused header still capped, and
+the order tokens are tried in. No test reads a header cryptsetup wrote: that needs the source-built
 cryptsetup and its kernel crypto interfaces, which the host
 gate does not provide, so increment 5's encrypted-installation oracle
 (`qemu-install-encrypted`) reads one in the guest: the installer's
 verifying-boot check runs this reader and `verify_first_boot_object` on
 the header cryptsetup wrote, under the pinned swtpm, and the oracle
-requires the recovery-key phase that check gates. An ignored oracle runs the protector lifecycle against
-the pinned swtpm under td-secret's convention (`td-secret/DESIGN.md`, "TPM
-validation"):
+requires the recovery-key phase that check gates. Ignored oracles run the protector lifecycle and
+the release order against the pinned swtpm under td-secret's convention
+(`td-secret/DESIGN.md`, "TPM validation"): a first boot's transition
+over the scripted cryptsetup, the TPM's PolicyPCR refusal after the
+cap, the next boot's release after a restart, a changed selector image
+refused at Unseal, and a fresh TPM state's Load refusal (0x1df):
 
 ```
 TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-protector/Cargo.toml emulator_ -- --ignored

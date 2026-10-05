@@ -344,10 +344,14 @@ over the disk replaces.
 
 This section, the release order and the handoff ("Boot and authority
 boundaries") are increment 6's target. Only td-kexec's half of the
-handoff exists, a mode nothing invokes yet. Today's selector neither releases nor caps, its discovery finds only a
-Btrfs volume, and the image refuses cryptsetup in either initramfs
-(DESIGN.md D6). td-init's secret-line applet exists but no initramfs
-links it until the recovery flow does (UNSAFE.md §3).
+handoff exists, a mode nothing invokes yet, and td-protector's release
+orchestration, which runs steps 2 to 5 of the release order as a
+library nothing calls yet ([td-protector](../td-protector/DESIGN.md)
+"Release orchestration"). Today's selector neither releases nor caps,
+its discovery finds only a Btrfs volume, and the image refuses
+cryptsetup in either initramfs (DESIGN.md D6). td-init's secret-line
+applet exists but no initramfs links it until the recovery flow does
+(UNSAFE.md §3).
 
 The installed selector acts on what discovery finds under its configured
 UUID (DESIGN.md "Full-system volume consumers"): a Btrfs volume boots as
@@ -510,7 +514,9 @@ already be closed. Without a TPM device it attempts nothing, so a TPM
 that appears later goes unchecked ("Device-bound default"). A policy
 refusal and a load refusal (td-protector "Unseal outcomes") release
 nothing: the closed cap causes the first, and a cleared or different
-TPM the second for tokens a recovery boot kept. Any release, or any
+TPM, or an owner hierarchy given a password or disabled since
+installation, the second for tokens a recovery boot kept. Any release,
+or any
 other outcome, a transport error or a command the TPM did not answer
 included, zeroes what it released and halts on the console, as the
 selector's failed cap does; it never exits init. That attempt is the

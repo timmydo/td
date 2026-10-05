@@ -57,9 +57,15 @@ The crate owns the protocol and nothing a consumer persists or decides:
   `SEALED_ATTRIBUTES` (fixedTPM, fixedParent, adminWithPolicy, noDA;
   userWithAuth clear), the policy digest as its sole authorization, and
   a 1 to 128-byte payload. The caller's payload buffer is zeroed as soon
-  as it is marshaled. `unseal_object` validates the stored public area,
-  loads the object under the same primary, checks its Name, unseals in a
-  real policy session and returns the payload for the caller to zero.
+  as it is marshaled. `unseal_object` validates the stored public area's
+  format, loads the object under the same primary, checks its Name,
+  unseals in a real policy session and returns the payload for the
+  caller to zero. Whether the object's authPolicy is the session's
+  policy is the TPM's to answer (Unseal's `TPM_RC_POLICY_FAIL`), not a
+  local check, so that its `UnsealError` can carry, as a `Refusal`, the
+  command and response code of the TPM refusal that ended the unseal,
+  when one did; a consumer types its refusals from that
+  (td-protector/DESIGN.md "Unseal outcomes").
   `load_and_flush` loads a public and private pair under that primary,
   checks the Name and flushes the object and the primary, so the TPM
   verifies the private area without an unseal; the public area's format
@@ -102,8 +108,10 @@ payload and public-area bounds before any TPM I/O, and, against a
 scripted TPM that evaluates the policy itself, seal then unseal through
 the public API (including a policy over a PCR value supplied by the
 caller rather than read), an Unseal refused for a mismatched session
-policy, `load_and_flush` leaving no handle and refusing a private area
-the TPM will not load, and extend then read. td-secret's tests pin
+policy, `unseal_object`'s refusal carried for PolicyPCR, Unseal and
+Load, none for a public area outside the format (refused before any
+I/O) or a transport error, `load_and_flush` leaving no handle and
+refusing a private area the TPM will not load, and extend then read. td-secret's tests pin
 the complete seal and unseal command stream against a scripted TPM and
 its persisted envelope bytes, and its pinned-emulator and QEMU guest
 oracles exercise this client against a TPM.

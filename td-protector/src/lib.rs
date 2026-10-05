@@ -1,9 +1,9 @@
 //! td's device-bound disk protector policy over the shared td-tpm client:
 //! the first-boot and observed PCR policies, the protector secret, sealing
 //! and unsealing it, the PCR 12 release cap, the recovery key and the td
-//! LUKS2 tokens with their bounded header reader, the cryptsetup runner and
-//! the transition planner (DESIGN.md,
-//! td-install/ENCRYPTION.md "Device-bound default").
+//! LUKS2 tokens with their bounded header reader, the cryptsetup runner,
+//! the transition planner and the selector's release orchestration
+//! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default").
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -19,11 +19,12 @@ use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use td_tpm::{Client, PcrPolicy, PcrSelection, SealedObject, Transport};
+use td_tpm::{Client, PcrPolicy, PcrSelection, Refusal, SealedObject, Transport};
 
 pub mod cryptsetup;
 pub mod luks2;
 pub mod recovery;
+pub mod release;
 pub mod token;
 pub mod transition;
 
@@ -75,23 +76,74 @@ pub fn first_boot_policy() -> Result<PcrPolicy, String> {
     })
 }
 
-/// The observed PCR 4 and PCR 9 values and a literal-zero PCR 12. Only PCRs
-/// 4 and 9 are read; an unmeasured (all-zero) value is refused.
-pub fn observed_policy<T: Transport>(client: &mut Client<T>) -> Result<PcrPolicy, String> {
+/// Why `observe` gave no policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObserveError {
+    /// PCR 4 or PCR 9 reads all zeros: the firmware or the EFI stub did not
+    /// measure the selector.
+    Unmeasured { pcr: u8 },
+    /// The PCR read failed.
+    Tpm(String),
+}
+impl fmt::Display for ObserveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unmeasured { pcr } => {
+                let what = if *pcr == SELECTOR_IMAGE_PCR {
+                    "selector image"
+                } else {
+                    "selector initramfs"
+                };
+                write!(f, "PCR {pcr} is unmeasured: no {what} measurement")
+            }
+            Self::Tpm(error) => f.write_str(error),
+        }
+    }
+}
+
+/// PCRs 4 and 9 as they read now, in one PCR_Read.
+fn selector_pcrs<T: Transport>(client: &mut Client<T>) -> Result<([u8; 32], [u8; 32]), String> {
     let values = client.read_pcrs(selection(&[SELECTOR_IMAGE_PCR, SELECTOR_INITRD_PCR])?)?;
     let [image, initrd] = values.as_slice() else {
         return Err("TPM returned the wrong number of PCR values".into());
     };
-    if *image == [0; 32] {
-        return Err("PCR 4 is unmeasured: no selector image measurement".into());
-    }
-    if *initrd == [0; 32] {
-        return Err("PCR 9 is unmeasured: no selector initramfs measurement".into());
-    }
+    Ok((*image, *initrd))
+}
+
+/// The device-bound policy over these PCR 4 and PCR 9 values and a
+/// literal-zero PCR 12.
+fn device_bound_policy(image: [u8; 32], initrd: [u8; 32]) -> Result<PcrPolicy, String> {
     Ok(PcrPolicy {
         selection: selection(DEVICE_BOUND_PCRS)?,
-        pcr_digest: td_tpm::pcr_digest(&[*image, *initrd, [0; 32]]),
+        pcr_digest: td_tpm::pcr_digest(&[image, initrd, [0; 32]]),
     })
+}
+
+/// The observed PCR 4 and PCR 9 values and a literal-zero PCR 12, the policy
+/// a device-bound protector is sealed to. Only PCRs 4 and 9 are read; an
+/// unmeasured (all-zero) value is refused, typed.
+pub fn observe<T: Transport>(client: &mut Client<T>) -> Result<PcrPolicy, ObserveError> {
+    let (image, initrd) = selector_pcrs(client).map_err(ObserveError::Tpm)?;
+    for (pcr, value) in [(SELECTOR_IMAGE_PCR, image), (SELECTOR_INITRD_PCR, initrd)] {
+        if value == [0; 32] {
+            return Err(ObserveError::Unmeasured { pcr });
+        }
+    }
+    device_bound_policy(image, initrd).map_err(ObserveError::Tpm)
+}
+
+/// `observe`, its refusal as text.
+pub fn observed_policy<T: Transport>(client: &mut Client<T>) -> Result<PcrPolicy, String> {
+    observe(client).map_err(|error| error.to_string())
+}
+
+/// The policy a device-bound protector is unsealed under: PCRs 4 and 9 as
+/// they read now, unmeasured or not, and a literal-zero PCR 12. Whether the
+/// protector was sealed to it is the TPM's to answer, so a changed boot
+/// chain or a closed cap is a policy refusal rather than a local mismatch.
+pub fn release_policy<T: Transport>(client: &mut Client<T>) -> Result<PcrPolicy, String> {
+    let (image, initrd) = selector_pcrs(client)?;
+    device_bound_policy(image, initrd)
 }
 
 /// A protector secret. It lives in one heap allocation that is zeroed on
@@ -100,6 +152,8 @@ pub struct Secret(Box<[u8; SECRET_LEN]>);
 impl Drop for Secret {
     fn drop(&mut self) {
         td_tpm::zero(self.0.as_mut_slice());
+        #[cfg(test)]
+        tests::LIVE_SECRETS.with(|live| live.set(live.get() - 1));
     }
 }
 impl Secret {
@@ -111,15 +165,22 @@ impl Secret {
         Self::read_from(Path::new(SECRET_SOURCE))
     }
 
+    /// The one constructor: every secret starts zeroed in its allocation.
+    fn zeroed() -> Self {
+        #[cfg(test)]
+        tests::LIVE_SECRETS.with(|live| live.set(live.get() + 1));
+        Self(Box::new([0; SECRET_LEN]))
+    }
+
     fn read_from(source: &Path) -> Result<Self, String> {
-        let mut secret = Self(Box::new([0; SECRET_LEN]));
+        let mut secret = Self::zeroed();
         read_random(source, secret.0.as_mut_slice(), "protector secret")?;
         Ok(secret)
     }
 
     /// Takes an unsealed payload, zeroing it whether or not it is accepted.
     fn from_payload(mut payload: Vec<u8>) -> Result<Self, String> {
-        let mut secret = Self(Box::new([0; SECRET_LEN]));
+        let mut secret = Self::zeroed();
         let accepted = payload.len() == SECRET_LEN;
         if accepted {
             secret.0.copy_from_slice(&payload);
@@ -155,13 +216,105 @@ pub fn seal<T: Transport>(
     sealed
 }
 
+/// `TPM_RC_VALUE` on PolicyPCR's first parameter: the PCRs differ from the
+/// policy's, a closed cap among them.
+pub const POLICY_PCR_REFUSED: Refusal = Refusal {
+    command: td_tpm::POLICY_PCR,
+    rc: 0x1c4,
+};
+/// `TPM_RC_POLICY_FAIL` on Unseal's first session: the session's policy is
+/// not the object's authPolicy.
+pub const UNSEAL_POLICY_REFUSED: Refusal = Refusal {
+    command: td_tpm::UNSEAL,
+    rc: 0x99d,
+};
+/// `TPM_RC_INTEGRITY`, a format-1 code (`RC_FMT1` 0x080 + 0x01f) with no
+/// position. TPM2_Load answers it when the private area's integrity HMAC,
+/// keyed from the parent's seed, fails: a cleared or different TPM, whose
+/// new seed derives another storage primary. swtpm 0.10.1 answers 0x1df,
+/// on its first parameter `inPrivate` (the emulator oracle).
+pub const TPM_RC_INTEGRITY: u32 = 0x09f;
+/// A format-1 code's position bits: `TPM_RC_P` (0x040) and the number N
+/// (0xf00), a parameter's when P is set, else a handle's (N 1 to 7) or a
+/// session's (N 8 to 15).
+const RC_POSITION: u32 = 0xf40;
+const RC_P: u32 = 0x040;
+const RC_SESSION: u32 = 0x800;
+/// CreatePrimary's refusals of the owner storage primary from the owner
+/// hierarchy's state: `TPM_RC_BAD_AUTH` (0x0a2) on session 1 (0x9a2), an
+/// owner password set since installation, and `TPM_RC_HIERARCHY` (0x085)
+/// on handle 1 (0x185), the storage hierarchy disabled.
+pub const HIERARCHY_REFUSED: &[Refusal] = &[
+    Refusal {
+        command: td_tpm::CREATE_PRIMARY,
+        rc: 0x9a2,
+    },
+    Refusal {
+        command: td_tpm::CREATE_PRIMARY,
+        rc: 0x185,
+    },
+];
+
+/// Whether the TPM refused before the sealed object was loaded, so that it
+/// could not have unsealed it: `TPM_RC_INTEGRITY` on TPM2_Load at any
+/// handle or parameter position, or a `HIERARCHY_REFUSED` CreatePrimary.
+/// Without a parent there is no Load, and without a loaded object no
+/// Unseal, so neither can indicate a release.
+pub fn load_refused(refusal: Refusal) -> bool {
+    let integrity = refusal.command == td_tpm::LOAD
+        && refusal.rc & !RC_POSITION == TPM_RC_INTEGRITY
+        && (refusal.rc & RC_P != 0 || refusal.rc & RC_SESSION == 0);
+    integrity || HIERARCHY_REFUSED.contains(&refusal)
+}
+
+/// Why an unseal released nothing (DESIGN.md "Unseal outcomes").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsealError {
+    /// The TPM refused the policy: the PCRs differ from the policy's
+    /// (`POLICY_PCR_REFUSED`) or the object was sealed to another policy
+    /// (`UNSEAL_POLICY_REFUSED`).
+    PolicyRefused(String),
+    /// The TPM refused before loading the sealed object (`load_refused`):
+    /// a cleared or different TPM, or an owner hierarchy given a password
+    /// or disabled since installation.
+    LoadRefused(String),
+    /// A transport error, a reply that does not answer the command, any
+    /// other response code, or a payload that is not a protector secret.
+    Other(String),
+}
+impl fmt::Display for UnsealError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PolicyRefused(error) => write!(f, "policy refused: {error}"),
+            Self::LoadRefused(error) => write!(f, "load refused: {error}"),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+impl std::error::Error for UnsealError {}
+impl UnsealError {
+    fn from_tpm(error: td_tpm::UnsealError) -> Self {
+        match error.refusal {
+            Some(refusal) if refusal == POLICY_PCR_REFUSED || refusal == UNSEAL_POLICY_REFUSED => {
+                Self::PolicyRefused(error.message)
+            }
+            Some(refusal) if load_refused(refusal) => Self::LoadRefused(error.message),
+            _ => Self::Other(error.message),
+        }
+    }
+}
+
 /// Unseal a protector under `policy`, refusing any payload but 32 bytes.
+/// The TPM judges the policy: a refusal is typed as `UnsealError` says.
 pub fn unseal<T: Transport>(
     client: Client<T>,
     policy: &PcrPolicy,
     sealed: &SealedObject,
-) -> Result<Secret, String> {
-    Secret::from_payload(client.unseal_object(policy, None, &sealed.public, &sealed.private)?)
+) -> Result<Secret, UnsealError> {
+    let payload = client
+        .unseal_object(policy, None, &sealed.public, &sealed.private)
+        .map_err(UnsealError::from_tpm)?;
+    Secret::from_payload(payload).map_err(UnsealError::Other)
 }
 
 /// Why the release cap did not complete (DESIGN.md "Release cap").
@@ -241,6 +394,8 @@ mod tests {
         POLICY_GET_DIGEST, POLICY_PCR, SESSIONS, SHA256, START_AUTH_SESSION, UNSEAL,
     };
 
+    use std::cell::Cell;
+
     const POLICY_SESSION: u8 = 0x01;
     const TRIAL_SESSION: u8 = 0x03;
     /// TPM_RC_VALUE on parameter 1, TPM_RC_POLICY_FAIL on session 1, and
@@ -248,15 +403,26 @@ mod tests {
     const RC_VALUE: u32 = 0x1c4;
     const RC_POLICY_FAIL: u32 = 0x99d;
     const RC_LOCALITY: u32 = 0x907;
-    /// TPM_RC_INTEGRITY on parameter 1: a private area that fails Load.
-    const RC_INTEGRITY: u32 = 0x19f;
+    /// TPM_RC_INTEGRITY on parameter 1, as swtpm answers a private area
+    /// that fails Load.
+    const RC_INTEGRITY: u32 = 0x1df;
+
+    thread_local! {
+        /// Secrets alive on this test's thread: each test runs on its own,
+        /// so a delta across a call counts the secrets it left alive.
+        pub(crate) static LIVE_SECRETS: Cell<isize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn live_secrets() -> isize {
+        LIVE_SECRETS.with(Cell::get)
+    }
 
     /// An unseal's refusal; `Secret` is not `Debug`, so no `unwrap_err`.
-    fn refusal<T: Transport>(
+    pub(crate) fn refusal<T: Transport>(
         client: Client<T>,
         policy: &PcrPolicy,
         sealed: &SealedObject,
-    ) -> String {
+    ) -> UnsealError {
         match unseal(client, policy, sealed) {
             Ok(_) => panic!("the protector was released"),
             Err(error) => error,
@@ -279,25 +445,30 @@ mod tests {
     /// session's PolicyPCR refuses a composite other than its PCRs, a trial
     /// takes the caller's, and Unseal refuses a session whose digest is not
     /// the loaded object's authPolicy.
-    struct Tpm {
-        codes: Vec<u32>,
+    pub(crate) struct Tpm {
+        pub(crate) codes: Vec<u32>,
         reads: Vec<u16>,
-        pcrs: [[u8; 32]; 16],
+        pub(crate) pcrs: [[u8; 32]; 16],
         next: u32,
         sessions: Vec<(u32, bool, [u8; 32])>,
         objects: Vec<(u32, Vec<u8>, Vec<u8>)>,
         /// Extend with another event than the one sent.
-        skew_extend: bool,
-        refuse_extend: bool,
+        pub(crate) skew_extend: bool,
+        pub(crate) refuse_extend: bool,
         /// Run the command but lose its reply: the nth exchange, from one.
         lose: Option<usize>,
+        /// A cleared TPM: its new storage primary seed loads no object
+        /// sealed before.
+        pub(crate) cleared: bool,
+        /// Refuse this command with this response code.
+        pub(crate) refuse: Option<(u32, u32)>,
     }
 
     #[derive(Clone)]
-    struct Scripted(Rc<RefCell<Tpm>>);
+    pub(crate) struct Scripted(pub(crate) Rc<RefCell<Tpm>>);
     impl Scripted {
         /// PCRs 4 and 9 measured, every other PCR at reset.
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let mut pcrs = [[0; 32]; 16];
             pcrs[4] = [0x44; 32];
             pcrs[9] = [0x49; 32];
@@ -311,14 +482,16 @@ mod tests {
                 skew_extend: false,
                 refuse_extend: false,
                 lose: None,
+                cleared: false,
+                refuse: None,
             })))
         }
 
-        fn client(&self) -> Client<Self> {
+        pub(crate) fn client(&self) -> Client<Self> {
             Client::new(self.clone())
         }
 
-        fn codes(&self) -> Vec<u32> {
+        pub(crate) fn codes(&self) -> Vec<u32> {
             std::mem::take(&mut self.0.borrow_mut().codes)
         }
 
@@ -326,11 +499,11 @@ mod tests {
             std::mem::take(&mut self.0.borrow_mut().reads)
         }
 
-        fn pcr(&self, index: usize) -> [u8; 32] {
+        pub(crate) fn pcr(&self, index: usize) -> [u8; 32] {
             self.0.borrow().pcrs[index]
         }
 
-        fn idle(&self) -> bool {
+        pub(crate) fn idle(&self) -> bool {
             let tpm = self.0.borrow();
             tpm.sessions.is_empty() && tpm.objects.is_empty()
         }
@@ -402,6 +575,9 @@ mod tests {
             assert_eq!(size as usize, command.len());
             let code = u32::from_be_bytes(command[6..10].try_into().unwrap());
             self.codes.push(code);
+            if let Some((_, rc)) = self.refuse.filter(|(refused, _)| *refused == code) {
+                return response(NO_SESSIONS, rc, &[]);
+            }
             self.next += 1;
             let mut input = Reader(&command[10..]);
             let handle_count = match code {
@@ -534,7 +710,8 @@ mod tests {
                     let mut fields = Reader(public);
                     fields.take(8).unwrap();
                     let policy = fields.blob().unwrap().to_vec();
-                    let Some(data) = private.strip_prefix(b"scripted:") else {
+                    let Some(data) = private.strip_prefix(b"scripted:").filter(|_| !self.cleared)
+                    else {
                         return response(NO_SESSIONS, RC_INTEGRITY, &[]);
                     };
                     let data = data.to_vec();
@@ -649,7 +826,7 @@ mod tests {
         let mut forged = sealed.clone();
         forged.private[0] ^= 1;
         let refused = verify_first_boot_object(&mut tpm.client(), &forged).unwrap_err();
-        assert_eq!(refused, "TPM command 0x157 refused: 0x19f");
+        assert_eq!(refused, "TPM command 0x157 refused: 0x1df");
         assert!(tpm.idle());
         let unsealed = unseal(tpm.client(), &policy, &sealed).unwrap();
         assert_eq!(unsealed.expose(), secret.expose());
@@ -658,8 +835,10 @@ mod tests {
 
         cap(&mut tpm.client()).unwrap();
         assert_eq!(tpm.codes(), [PCR_READ, PCR_EXTEND, PCR_READ]);
-        let refused = refusal(tpm.client(), &policy, &sealed);
-        assert!(refused.contains("0x17f refused"), "{refused}");
+        assert_eq!(
+            refusal(tpm.client(), &policy, &sealed),
+            UnsealError::PolicyRefused("TPM command 0x17f refused: 0x1c4".into())
+        );
         assert!(!tpm.codes().contains(&UNSEAL));
         assert!(tpm.idle());
     }
@@ -681,15 +860,166 @@ mod tests {
         tpm.codes();
 
         cap(&mut tpm.client()).unwrap();
-        assert!(refusal(tpm.client(), &policy, &sealed).contains("0x17f refused"));
+        assert_eq!(
+            refusal(tpm.client(), &policy, &sealed),
+            UnsealError::PolicyRefused("TPM command 0x17f refused: 0x1c4".into())
+        );
         assert!(!tpm.codes().contains(&UNSEAL));
 
         // A changed selector image also refuses at PolicyPCR.
         let tpm = Scripted::new();
         let sealed = seal(tpm.client(), &policy, &secret).unwrap();
         tpm.0.borrow_mut().pcrs[4] = [0x45; 32];
-        assert!(refusal(tpm.client(), &policy, &sealed).contains("0x17f refused"));
+        assert_eq!(
+            refusal(tpm.client(), &policy, &sealed),
+            UnsealError::PolicyRefused("TPM command 0x17f refused: 0x1c4".into())
+        );
         assert!(!tpm.codes().contains(&UNSEAL));
+    }
+
+    /// The unseal outcomes are typed by the refusing command and response
+    /// code (DESIGN.md "Unseal outcomes"), and the codes are pinned.
+    #[test]
+    fn unseal_outcomes_are_typed_by_command_and_response_code() {
+        assert_eq!(
+            (POLICY_PCR_REFUSED.command, POLICY_PCR_REFUSED.rc),
+            (POLICY_PCR, 0x1c4)
+        );
+        assert_eq!(
+            (UNSEAL_POLICY_REFUSED.command, UNSEAL_POLICY_REFUSED.rc),
+            (UNSEAL, 0x99d)
+        );
+        // TPM 2.0 Part 2 6.6: RC_FMT1 0x080, TPM_RC_INTEGRITY RC_FMT1 + 0x01f,
+        // TPM_RC_HIERARCHY RC_FMT1 + 0x005, TPM_RC_BAD_AUTH RC_FMT1 + 0x022,
+        // TPM_RC_P 0x040, TPM_RC_H 0x000, TPM_RC_S 0x800, TPM_RC_1 0x100.
+        assert_eq!(TPM_RC_INTEGRITY, 0x080 + 0x01f);
+        assert_eq!(
+            HIERARCHY_REFUSED
+                .iter()
+                .map(|refusal| (refusal.command, refusal.rc))
+                .collect::<Vec<_>>(),
+            [
+                (CREATE_PRIMARY, 0x080 + 0x022 + 0x800 + 0x100),
+                (CREATE_PRIMARY, 0x080 + 0x005 + 0x100)
+            ]
+        );
+        let typed = |command, rc| {
+            UnsealError::from_tpm(td_tpm::UnsealError {
+                refusal: Some(Refusal { command, rc }),
+                message: "m".into(),
+            })
+        };
+        let policy = UnsealError::PolicyRefused("m".into());
+        let load = UnsealError::LoadRefused("m".into());
+        let other = UnsealError::Other("m".into());
+        for (command, rc, expected) in [
+            (POLICY_PCR, 0x1c4, &policy),
+            (UNSEAL, 0x99d, &policy),
+            // TPM_RC_INTEGRITY on Load with no position, on the parent
+            // handle, on inPrivate and on inPublic.
+            (LOAD, 0x09f, &load),
+            (LOAD, 0x19f, &load),
+            (LOAD, 0x1df, &load),
+            (LOAD, 0x2df, &load),
+            (CREATE_PRIMARY, 0x9a2, &load),
+            (CREATE_PRIMARY, 0x185, &load),
+            // The same codes on another command or position, or other codes
+            // on these.
+            (LOAD, 0x99f, &other),
+            (LOAD, 0x109f, &other),
+            (CREATE_PRIMARY, 0x0a2, &other),
+            (CREATE_PRIMARY, 0x1c5, &other),
+            (CREATE_PRIMARY, 0x98e, &other),
+            (LOAD, 0x9a2, &other),
+            (UNSEAL, 0x185, &other),
+            (UNSEAL, 0x1c4, &other),
+            (POLICY_PCR, 0x99d, &other),
+            (UNSEAL, 0x1df, &other),
+            (CREATE_PRIMARY, 0x1df, &other),
+            (POLICY_PCR, 0x184, &other),
+            (LOAD, 0x18b, &other),
+            (LOAD, 0x195, &other),
+            (UNSEAL, 0x98e, &other),
+            (PCR_READ, 0x1c4, &other),
+        ] {
+            assert_eq!(typed(command, rc), *expected, "{command:#x} {rc:#x}");
+        }
+        assert_eq!(
+            UnsealError::from_tpm(td_tpm::UnsealError {
+                refusal: None,
+                message: "lost reply".into()
+            }),
+            UnsealError::Other("lost reply".into())
+        );
+
+        // Through the scripted TPM: an object sealed to another boot chain
+        // reaches Unseal, a cleared TPM refuses Load, and a lost reply is
+        // neither.
+        let tpm = Scripted::new();
+        let secret = Secret::generate().unwrap();
+        let sealed = seal(
+            tpm.client(),
+            &observed_policy(&mut tpm.client()).unwrap(),
+            &secret,
+        )
+        .unwrap();
+        tpm.0.borrow_mut().pcrs[4] = [0x45; 32];
+        let current = release_policy(&mut tpm.client()).unwrap();
+        tpm.codes();
+        assert_eq!(
+            refusal(tpm.client(), &current, &sealed),
+            UnsealError::PolicyRefused("TPM command 0x15e refused: 0x99d".into())
+        );
+        assert!(tpm.codes().contains(&UNSEAL));
+        assert!(tpm.idle());
+        tpm.0.borrow_mut().cleared = true;
+        assert_eq!(
+            refusal(tpm.client(), &current, &sealed),
+            UnsealError::LoadRefused("TPM command 0x157 refused: 0x1df".into())
+        );
+        assert!(tpm.idle());
+        tpm.0.borrow_mut().cleared = false;
+        // Each load refusal, answered by the TPM: nothing is unsealed.
+        for (command, rc) in [
+            (LOAD, 0x09f),
+            (LOAD, 0x19f),
+            (LOAD, 0x1df),
+            (LOAD, 0x2df),
+            (CREATE_PRIMARY, 0x9a2),
+            (CREATE_PRIMARY, 0x185),
+        ] {
+            tpm.0.borrow_mut().refuse = Some((command, rc));
+            tpm.codes();
+            assert_eq!(
+                refusal(tpm.client(), &current, &sealed),
+                UnsealError::LoadRefused(format!("TPM command {command:#x} refused: {rc:#x}"))
+            );
+            assert!(!tpm.codes().contains(&UNSEAL));
+            assert!(tpm.idle());
+        }
+        tpm.0.borrow_mut().refuse = None;
+        // The second command from here, the Load.
+        let at = tpm.0.borrow().codes.len() + 2;
+        tpm.0.borrow_mut().lose = Some(at);
+        assert_eq!(
+            refusal(tpm.client(), &current, &sealed),
+            UnsealError::Other("lost reply".into())
+        );
+        // An unmeasured PCR is no local refusal for unsealing: the TPM
+        // answers.
+        let tpm = Scripted::new();
+        tpm.0.borrow_mut().pcrs[9] = [0; 32];
+        assert_eq!(
+            observe(&mut tpm.client()),
+            Err(ObserveError::Unmeasured { pcr: 9 })
+        );
+        let unmeasured = release_policy(&mut tpm.client()).unwrap();
+        tpm.codes();
+        assert!(matches!(
+            refusal(tpm.client(), &unmeasured, &sealed),
+            UnsealError::PolicyRefused(_)
+        ));
+        assert!(tpm.codes().contains(&UNSEAL));
     }
 
     #[test]
@@ -772,7 +1102,8 @@ mod tests {
                 .unwrap();
             let refused = refusal(tpm.client(), &policy, &sealed);
             assert!(
-                refused.contains(&format!("holds {size} bytes")),
+                matches!(&refused, UnsealError::Other(error)
+                    if error.contains(&format!("holds {size} bytes"))),
                 "{refused}"
             );
         }
@@ -829,7 +1160,7 @@ mod tests {
     /// td-secret's: `TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test
     /// --frozen --manifest-path td-protector/Cargo.toml emulator_ --
     /// --ignored`.
-    mod emulator {
+    pub(crate) mod emulator {
         use super::*;
         use std::io::Write;
         use std::os::unix::net::UnixStream;
@@ -837,7 +1168,7 @@ mod tests {
         use std::process::{Child, Command, Stdio};
         use std::time::{Duration, Instant};
 
-        struct Socket(UnixStream);
+        pub(crate) struct Socket(UnixStream);
         impl Transport for Socket {
             fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
                 self.0.write_all(command).map_err(|e| e.to_string())?;
@@ -856,58 +1187,92 @@ mod tests {
             }
         }
 
-        struct Emulator {
+        pub(crate) struct Emulator {
             child: Child,
             state: PathBuf,
             socket: PathBuf,
         }
+
+        /// A fresh state directory under the temporary directory.
+        pub(crate) fn fresh_state(name: &str) -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "td-protector-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+        }
+
+        /// swtpm on `state`, its socket inside it, once the socket exists.
+        fn spawn(state: &Path, socket: &Path) -> Child {
+            let executable = std::env::var_os("TD_TEST_SWTPM")
+                .expect("set TD_TEST_SWTPM to pinned swtpm 0.10.1");
+            let version = Command::new(&executable).arg("--version").output().unwrap();
+            assert!(version.status.success());
+            assert!(
+                String::from_utf8_lossy(&version.stdout)
+                    .starts_with("TPM emulator version 0.10.1,"),
+                "oracle requires swtpm 0.10.1"
+            );
+            let mut child = Command::new(executable)
+                .args(["socket", "--tpm2", "--tpmstate"])
+                .arg(format!("dir={},mode=0600", state.display()))
+                .arg("--server")
+                .arg(format!("type=unixio,path={}", socket.display()))
+                .args(["--flags", "not-need-init,startup-clear"])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !socket.exists() {
+                assert!(child.try_wait().unwrap().is_none(), "swtpm exited");
+                assert!(Instant::now() < deadline, "swtpm startup timeout");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child
+        }
+
         impl Emulator {
-            fn start(state: &Path) -> Self {
+            pub(crate) fn start(state: &Path) -> Self {
                 assert!(!state.exists());
                 std::fs::create_dir_all(state).unwrap();
                 let socket = state.join("socket");
-                let executable = std::env::var_os("TD_TEST_SWTPM")
-                    .expect("set TD_TEST_SWTPM to pinned swtpm 0.10.1");
-                let version = Command::new(&executable).arg("--version").output().unwrap();
-                assert!(version.status.success());
-                assert!(
-                    String::from_utf8_lossy(&version.stdout)
-                        .starts_with("TPM emulator version 0.10.1,"),
-                    "oracle requires swtpm 0.10.1"
-                );
-                let child = Command::new(executable)
-                    .args(["socket", "--tpm2", "--tpmstate"])
-                    .arg(format!("dir={},mode=0600", state.display()))
-                    .arg("--server")
-                    .arg(format!("type=unixio,path={}", socket.display()))
-                    .args(["--flags", "not-need-init,startup-clear"])
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .unwrap();
-                let mut result = Self {
-                    child,
+                Self {
+                    child: spawn(state, &socket),
                     state: state.to_path_buf(),
                     socket,
-                };
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !result.socket.exists() {
-                    assert!(result.child.try_wait().unwrap().is_none(), "swtpm exited");
-                    assert!(Instant::now() < deadline, "swtpm startup timeout");
-                    std::thread::sleep(Duration::from_millis(10));
                 }
-                result
             }
 
-            fn client(&self) -> Client<Socket> {
-                let socket = UnixStream::connect(&self.socket).unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                socket
-                    .set_write_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                Client::new(Socket(socket))
+            /// A platform reset: the same TPM state, its PCRs at reset.
+            pub(crate) fn restart(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_file(&self.socket);
+                self.child = spawn(&self.state, &self.socket);
             }
+
+            pub(crate) fn client(&self) -> Client<Socket> {
+                client_at(&self.socket)
+            }
+
+            pub(crate) fn socket(&self) -> PathBuf {
+                self.socket.clone()
+            }
+        }
+
+        /// A client on the emulator listening at `socket`.
+        pub(crate) fn client_at(socket: &Path) -> Client<Socket> {
+            let socket = UnixStream::connect(socket).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            Client::new(Socket(socket))
         }
         impl Drop for Emulator {
             fn drop(&mut self) {
@@ -920,15 +1285,7 @@ mod tests {
         #[test]
         #[ignore = "needs TD_TEST_SWTPM, the pinned swtpm 0.10.1"]
         fn emulator_protectors_release_until_the_cap() {
-            let state = std::env::temp_dir().join(format!(
-                "td-protector-oracle-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let tpm = Emulator::start(&state);
+            let tpm = Emulator::start(&fresh_state("oracle"));
             // The emulator has no firmware: the observed policy is refused
             // until fixture selector measurements reach PCRs 4 and 9.
             assert!(observed_policy(&mut tpm.client())
@@ -951,8 +1308,10 @@ mod tests {
             assert_eq!(unsealed.expose(), bound.expose());
 
             cap(&mut tpm.client()).unwrap();
-            assert!(unseal(tpm.client(), &first, &first_sealed).is_err());
-            assert!(unseal(tpm.client(), &observed, &bound_sealed).is_err());
+            // The closed cap is the TPM's PolicyPCR refusal.
+            let closed = UnsealError::PolicyRefused("TPM command 0x17f refused: 0x1c4".into());
+            assert_eq!(refusal(tpm.client(), &first, &first_sealed), closed);
+            assert_eq!(refusal(tpm.client(), &observed, &bound_sealed), closed);
             assert_eq!(cap(&mut tpm.client()), Err(CapError::AlreadyClosed));
         }
     }

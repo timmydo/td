@@ -20,6 +20,7 @@
 )]
 mod sha256;
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
@@ -183,25 +184,63 @@ pub struct SealedObject {
     pub private: Vec<u8>,
 }
 
+const NOT_SEALED: &str = "sealed TPM object does not have the fixed PCR-only policy";
+
+/// The authPolicy of a SHA-256 keyed-hash object with `SEALED_ATTRIBUTES`,
+/// refusing any other public area.
+fn sealed_auth_policy(public: &[u8]) -> Result<&[u8], String> {
+    let mut public = Reader(public);
+    if public.u16()? != 8 || public.u16()? != SHA256 || public.u32()? != SEALED_ATTRIBUTES {
+        return Err(NOT_SEALED.into());
+    }
+    let policy = public.blob()?;
+    if policy.len() != 32 || public.u16()? != ALG_NULL || public.blob()?.len() != 32 {
+        return Err(NOT_SEALED.into());
+    }
+    public.end()?;
+    Ok(policy)
+}
+
 /// Refuse any sealed public area other than a SHA-256 keyed-hash object
 /// with `SEALED_ATTRIBUTES` and exactly `policy` as its authPolicy.
 pub fn validate_sealed_public(public: &[u8], policy: &[u8; 32]) -> Result<(), String> {
-    let mut public = Reader(public);
-    if public.u16()? != 8
-        || public.u16()? != SHA256
-        || public.u32()? != SEALED_ATTRIBUTES
-        || public.blob()? != policy
-        || public.u16()? != ALG_NULL
-        || public.blob()?.len() != 32
-    {
-        return Err("sealed TPM object does not have the fixed PCR-only policy".into());
+    if sealed_auth_policy(public)? != policy {
+        return Err(NOT_SEALED.into());
     }
-    public.end()
+    Ok(())
+}
+
+/// A command the TPM answered with a non-zero response code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub command: u32,
+    pub rc: u32,
+}
+
+/// Why `unseal_object` failed: the TPM's refusal of the command that ended
+/// it, when a refusal is what ended it, and the message every client error
+/// carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsealError {
+    pub refusal: Option<Refusal>,
+    pub message: String,
+}
+impl fmt::Display for UnsealError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl From<UnsealError> for String {
+    fn from(error: UnsealError) -> Self {
+        error.message
+    }
 }
 
 pub struct Client<T: Transport> {
     transport: T,
     handles: Vec<u32>,
+    /// The refusal that ended the last command, if the TPM refused it.
+    refused: Option<Refusal>,
 }
 impl<T: Transport> Drop for Client<T> {
     fn drop(&mut self) {
@@ -215,6 +254,7 @@ impl<T: Transport> Client<T> {
         Self {
             transport,
             handles: Vec::new(),
+            refused: None,
         }
     }
 
@@ -233,6 +273,7 @@ impl<T: Transport> Client<T> {
         parameters: &[u8],
         returns_handle: bool,
     ) -> Result<(Option<u32>, Vec<u8>), String> {
+        self.refused = None;
         let mut area = Vec::new();
         if let Some(auth) = auth {
             put32(&mut area, auth);
@@ -288,6 +329,7 @@ impl<T: Transport> Client<T> {
                 if tag != NO_SESSIONS || !reader.0.is_empty() {
                     return Err("malformed TPM error response".into());
                 }
+                self.refused = Some(Refusal { command: code, rc });
                 return Err(format!("TPM command {code:#x} refused: {rc:#x}"));
             }
             if tag
@@ -559,15 +601,36 @@ impl<T: Transport> Client<T> {
     }
 
     /// Load and unseal an object sealed by `seal_object` under the same
-    /// policy and binding. The caller owns zeroing the returned payload.
+    /// policy and binding. The public area must have the sealed format;
+    /// whether its authPolicy is `policy` is the TPM's to answer (Unseal's
+    /// `TPM_RC_POLICY_FAIL`), so that the error's `refusal` tells a policy
+    /// the TPM refused from every other failure. The caller owns zeroing
+    /// the returned payload.
     pub fn unseal_object(
         mut self,
         policy: &PcrPolicy,
         binding: Option<&[u8; 32]>,
         public: &[u8],
         private: &[u8],
+    ) -> Result<Vec<u8>, UnsealError> {
+        let unsealed = self.unseal_in_session(policy, binding, public, private);
+        unsealed.map_err(|message| UnsealError {
+            refusal: self.refused,
+            message,
+        })
+    }
+
+    /// `unseal_object`'s commands; an error returns at once, so the client's
+    /// `refused` is the refusal of the command that ended it, if any.
+    fn unseal_in_session(
+        &mut self,
+        policy: &PcrPolicy,
+        binding: Option<&[u8; 32]>,
+        public: &[u8],
+        private: &[u8],
     ) -> Result<Vec<u8>, String> {
-        validate_sealed_public(public, &policy.digest())?;
+        self.refused = None;
+        sealed_auth_policy(public)?;
         let (parent, _) = self.storage_primary(binding)?;
         let handle = self.load(parent, public, private)?;
         let session = self.policy_session(policy, false)?;
@@ -1107,16 +1170,90 @@ mod tests {
         for size in 0..public.len() {
             assert!(validate_sealed_public(&public[..size], &policy.digest()).is_err());
         }
-        assert!(Client::new(NoIo)
-            .unseal_object(&other, None, &public, &[1])
-            .is_err());
+        // Unseal refuses a public area outside the sealed format before any
+        // TPM I/O, with no refusal: the TPM was not asked.
+        let mut short_policy = Vec::new();
+        put16(&mut short_policy, 8);
+        put16(&mut short_policy, SHA256);
+        put32(&mut short_policy, SEALED_ATTRIBUTES);
+        put_blob(&mut short_policy, &[6; 31]).unwrap();
+        put16(&mut short_policy, ALG_NULL);
+        put_blob(&mut short_policy, &[8; 32]).unwrap();
+        for bytes in [
+            &user_with_auth,
+            &trailing,
+            &short_policy,
+            &public[..9].to_vec(),
+        ] {
+            let refused = Client::new(NoIo)
+                .unseal_object(&policy, None, bytes, &[1])
+                .unwrap_err();
+            assert_eq!(refused.refusal, None);
+            assert!(!refused.message.is_empty());
+        }
+    }
+
+    /// Unseal leaves the authPolicy to the TPM: an object sealed under
+    /// another policy reaches it, and its error carries the refusal that
+    /// ended it.
+    #[test]
+    fn unseal_reports_the_refusal_that_ended_it() {
+        struct Refuses(u32, u32);
+        impl Transport for Refuses {
+            fn exchange(&mut self, command: &[u8]) -> Result<Vec<u8>, String> {
+                let code = u32::from_be_bytes(command[6..10].try_into().unwrap());
+                if code == self.0 {
+                    let mut out = NO_SESSIONS.to_be_bytes().to_vec();
+                    put32(&mut out, 10);
+                    put32(&mut out, self.1);
+                    return Ok(out);
+                }
+                Err(format!("unscripted {code:#x}"))
+            }
+        }
+        let policy = PcrPolicy {
+            selection: PcrSelection::new(1 << 7).unwrap(),
+            pcr_digest: [6; 32],
+        };
+        let other = PcrPolicy {
+            pcr_digest: [7; 32],
+            ..policy
+        };
+        let mut public = Vec::new();
+        put16(&mut public, 8);
+        put16(&mut public, SHA256);
+        put32(&mut public, SEALED_ATTRIBUTES);
+        put_blob(&mut public, &other.digest()).unwrap();
+        put16(&mut public, ALG_NULL);
+        put_blob(&mut public, &[8; 32]).unwrap();
+        let refused = Client::new(Refuses(CREATE_PRIMARY, 0x185))
+            .unseal_object(&policy, None, &public, &[1])
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            UnsealError {
+                refusal: Some(Refusal {
+                    command: CREATE_PRIMARY,
+                    rc: 0x185
+                }),
+                message: "TPM command 0x131 refused: 0x185".into()
+            }
+        );
+        assert_eq!(String::from(refused.clone()), refused.to_string());
+        // A transport error is no refusal.
+        let lost = Client::new(Refuses(LOAD, 0x1df))
+            .unseal_object(&policy, None, &public, &[1])
+            .unwrap_err();
+        assert_eq!(lost.refusal, None);
+        assert_eq!(lost.message, "unscripted 0x131");
     }
 
     /// TPM_RC_VALUE on parameter 1, TPM_RC_POLICY_FAIL on session 1, and
-    /// TPM_RC_INTEGRITY on parameter 1 for a private area that fails Load.
+    /// TPM_RC_INTEGRITY on parameter 1 (inPrivate), as swtpm answers a private
+    /// area that fails Load.
     const RC_VALUE: u32 = 0x1c4;
     const RC_POLICY_FAIL: u32 = 0x99d;
-    const RC_INTEGRITY: u32 = 0x19f;
+    const RC_INTEGRITY: u32 = 0x1df;
 
     /// A scripted TPM with PCR state. A real policy session's PolicyPCR
     /// refuses a composite that differs from its PCRs, a trial session
@@ -1472,15 +1609,51 @@ mod tests {
         assert!(tpm.0.borrow().objects.is_empty());
         tpm.codes();
 
+        // So does unseal_object, which leaves the authPolicy to the TPM: a
+        // session satisfying another policy reaches Unseal and is refused.
+        let refused = tpm
+            .client()
+            .unseal_object(&other, None, &sealed.public, &sealed.private)
+            .unwrap_err();
+        assert_eq!(
+            refused.refusal,
+            Some(Refusal {
+                command: UNSEAL,
+                rc: RC_POLICY_FAIL
+            })
+        );
+        assert_eq!(refused.message, "TPM command 0x15e refused: 0x99d");
+        assert!(tpm.0.borrow().sessions.is_empty());
+        assert!(tpm.0.borrow().objects.is_empty());
+        tpm.codes();
+
         // Once the PCR moves, the real session's PolicyPCR refuses and no
         // Unseal is sent.
         tpm.client().extend_pcr(7, &[1; 32]).unwrap();
-        assert!(tpm
-            .client()
-            .unseal_object(&policy, None, &sealed.public, &sealed.private)
-            .unwrap_err()
-            .contains("0x17f refused"));
+        assert_eq!(
+            tpm.client()
+                .unseal_object(&policy, None, &sealed.public, &sealed.private)
+                .unwrap_err()
+                .refusal,
+            Some(Refusal {
+                command: POLICY_PCR,
+                rc: RC_VALUE
+            })
+        );
         assert!(!tpm.codes().contains(&UNSEAL));
+        // A private area the TPM will not load is refused at Load.
+        let mut private = sealed.private.clone();
+        private[2] ^= 1;
+        assert_eq!(
+            tpm.client()
+                .unseal_object(&policy, None, &sealed.public, &private)
+                .unwrap_err()
+                .refusal,
+            Some(Refusal {
+                command: LOAD,
+                rc: RC_INTEGRITY
+            })
+        );
     }
 
     #[test]
@@ -1513,7 +1686,7 @@ mod tests {
             client
                 .load_and_flush(None, &sealed.public, &private)
                 .unwrap_err(),
-            "TPM command 0x157 refused: 0x19f"
+            "TPM command 0x157 refused: 0x1df"
         );
         assert_eq!(client.owned_handles(), 0);
         assert_eq!(tpm.codes(), [CREATE_PRIMARY, LOAD, FLUSH_CONTEXT]);
@@ -1557,7 +1730,7 @@ mod tests {
         };
         assert_eq!(unseal().unwrap(), [0x33; 64]);
         tpm.client().extend_pcr(12, &[0x5c; 32]).unwrap();
-        assert!(unseal().unwrap_err().contains("0x17f refused"));
+        assert!(unseal().unwrap_err().message.contains("0x17f refused"));
         assert!(tpm.0.borrow().reads.iter().all(|mask| *mask == 0x0210));
         let codes = tpm.codes();
         assert_eq!(codes.iter().filter(|code| **code == UNSEAL).count(), 1);
