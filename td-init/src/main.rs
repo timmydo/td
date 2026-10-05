@@ -8,6 +8,11 @@
 //! (`setsid(2)` + `TIOCSCTTY`), `init` (`wait4(2)`), and `hostname`
 //! (`sethostname(2)` — the `-F` flag uutils lacks).
 //!
+//! `secret-line` reads one line from `/dev/console` with echo off for the
+//! selector's recovery-key entry, through the `TCGETS`/`TCSETS` pair `getty`
+//! already uses and `TCSETSF`, which discards what was typed before its
+//! prompt; no initramfs links it yet.
+//!
 //! `devpts` is the one applet here that needs no syscall of its own: it mounts
 //! through the `mount` applet's own argv, and lives here rather than in td-util
 //! because that is where the mount it composes lives.
@@ -37,6 +42,7 @@ mod losetup;
 mod mknod;
 mod mount;
 mod partitions;
+mod secretline;
 mod switchroot;
 mod syncfs;
 mod sys;
@@ -63,6 +69,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("poweroff", halt::poweroff),
     ("reboot", halt::reboot),
     ("reread-partitions", partitions::run),
+    ("secret-line", secretline::run),
     ("switch_root", switchroot::run),
     ("sync", syncfs::run),
     ("umount", mount::umount),
@@ -400,7 +407,7 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_fifteen() {
+    fn the_roster_is_the_amended_sixteen() {
         assert_eq!(
             names(),
             vec![
@@ -416,6 +423,7 @@ mod tests {
                 "poweroff",
                 "reboot",
                 "reread-partitions",
+                "secret-line",
                 "switch_root",
                 "sync",
                 "umount"
@@ -544,8 +552,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            15,
-            "expected fifteen modules beside the crate root"
+            16,
+            "expected sixteen modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
@@ -573,7 +581,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_sixteen_scanned_modules() {
+    fn src_holds_exactly_the_seventeen_scanned_modules() {
         let scan::Tree { rs, other } = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -591,6 +599,7 @@ mod confinement {
                 "mknod.rs",
                 "mount.rs",
                 "partitions.rs",
+                "secretline.rs",
                 "switchroot.rs",
                 "syncfs.rs",
                 "sys.rs",
@@ -803,31 +812,43 @@ mod confinement {
     /// THREE mentions each since the roster moved into the code: the
     /// declaration, the `IOCTL_REQUESTS` entry the entry point checks against,
     /// and the one wrapper that issues it. A fourth is a second binding.
+    /// `TCSETS` is a prefix of `TCSETSF`, so its count excludes those.
     #[test]
     fn no_ioctl_request_can_be_shadowed() {
         let sys = code_only(&source("sys.rs"));
-        for request in ["TIOCSCTTY", "LOOP_SET_FD", "TCGETS", "TCSETS", "BLKRRPART"] {
+        for request in [
+            "TIOCSCTTY",
+            "LOOP_SET_FD",
+            "TCGETS",
+            "TCSETS",
+            "BLKRRPART",
+            "TCSETSF",
+        ] {
+            let mut mentions = sys.matches(request).count();
+            if request == "TCSETS" {
+                mentions -= sys.matches("TCSETSF").count();
+            }
             assert_eq!(
-                sys.matches(request).count(),
-                3,
+                mentions, 3,
                 "{request} is declared once, listed once and used once; \
                  a fourth mention shadows the pin"
             );
         }
     }
 
-    /// The ioctl roster is exactly the amended five, by VALUE, and the entry
+    /// The ioctl roster is exactly the amended six, by VALUE, and the entry
     /// point actually consults it.
     ///
     /// `ioctl(2)` is one syscall onto an unbounded space of operations, so the
     /// number in `rax` is not this surface — the request in `rsi` is. Pinning
-    /// the four numbers is half of it; the other half is that they are checked
-    /// BEFORE the syscall, which is what makes a sixth request an edit to this
-    /// array rather than a new call site somebody has to notice. `TCSETS`
-    /// mistyped as `0x5404` is `TCSETSF`, which DISCARDS pending terminal I/O
-    /// another process may own, and the array alone cannot tell them apart.
+    /// the numbers is half of it; the other half is that they are checked
+    /// BEFORE the syscall, which is what makes a seventh request an edit to
+    /// this array rather than a new call site somebody has to notice. `TCSETS`
+    /// mistyped as `0x5404` is `TCSETSF`, which DISCARDS pending input: on
+    /// the roster since secret-line, so the array alone cannot tell them apart
+    /// and only the value pins and the wrapper pins below can.
     #[test]
-    fn the_ioctl_requests_are_the_amended_five() {
+    fn the_ioctl_requests_are_the_amended_six() {
         let sys = squeeze(&code_only(&source("sys.rs")));
         for decl in [
             "constTIOCSCTTY:usize=0x540e;",
@@ -835,6 +856,7 @@ mod confinement {
             "constTCGETS:usize=0x5401;",
             "constTCSETS:usize=0x5402;",
             "constBLKRRPART:usize=0x125f;",
+            "constTCSETSF:usize=0x5404;",
         ] {
             assert_eq!(
                 sys.matches(decl).count(),
@@ -844,22 +866,22 @@ mod confinement {
         }
         assert_eq!(
             sys.matches(
-                "constIOCTL_REQUESTS:[usize;5]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS,BLKRRPART];"
+                "constIOCTL_REQUESTS:[usize;6]=[TIOCSCTTY,LOOP_SET_FD,TCGETS,TCSETS,BLKRRPART,TCSETSF];"
             )
             .count(),
             1,
-            "the ioctl roster changed; a sixth request is an UNSAFE.md amendment"
+            "the ioctl roster changed; a seventh request is an UNSAFE.md amendment"
         );
         assert_eq!(
             sys.matches("if!IOCTL_REQUESTS.contains(&request){").count(),
             1,
             "the ioctl entry point must refuse an off-roster request before issuing it"
         );
-        // The refused neighbours, absent from the file entirely: `TCSETSW` and
-        // `TCSETSF` drain or discard terminal I/O another process may own,
-        // `TIOCSWINSZ` resizes an operator's terminal, and `TIOCSTI` injects
-        // input into one — the classic escape from a restricted session.
-        for refused in ["TCSETSW", "TCSETSF", "TIOCSWINSZ", "TIOCSTI"] {
+        // The refused neighbours, absent from the file entirely: `TCSETSW`
+        // waits on terminal output another process may own, `TIOCSWINSZ`
+        // resizes an operator's terminal, and `TIOCSTI` injects input into one
+        // — the classic escape from a restricted session.
+        for refused in ["TCSETSW", "TIOCSWINSZ", "TIOCSTI"] {
             assert_eq!(
                 sys.matches(refused).count(),
                 0,
@@ -897,13 +919,13 @@ mod confinement {
             "(SYS_IOCTL,fdasusize,request,arg,0,0)",
             "(SYS_WAIT4,PID_ANY,ptr::addr_of_mut!(status)asusize,opts,0,0,)",
         ];
-        // One pin per SYSCALL now: the five ioctl requests share a single entry
+        // One pin per SYSCALL now: the six ioctl requests share a single entry
         // point, so what each one passes is pinned at its wrapper instead —
         // `the_ioctl_wrappers_pass_the_request_they_are_named_for`, below.
         assert_eq!(
             ARGUMENTS.len(),
             AMENDED.len(),
-            "one pin per call site; ioctl's five requests share one"
+            "one pin per call site; ioctl's six requests share one"
         );
         let sys = squeeze(&source("sys.rs"));
         for arguments in ARGUMENTS {
@@ -919,11 +941,11 @@ mod confinement {
     /// that request expects.
     ///
     /// With one entry point the pin above no longer sees a request number, so
-    /// this is where "restricted to these five" becomes a claim about what is
+    /// this is where "restricted to these six" becomes a claim about what is
     /// actually issued. The arguments matter as much as the requests:
     /// `TIOCSCTTY` reads its third register as the STEAL flag, `LOOP_SET_FD`
-    /// reads it as a descriptor, and the two termios calls read it as a pointer
-    /// the kernel writes 36 bytes through.
+    /// reads it as a descriptor, and the three termios calls read it as a
+    /// pointer the kernel copies 36 bytes through.
     #[test]
     fn the_ioctl_wrappers_pass_the_request_they_are_named_for() {
         const CALLS: &[&str] = &[
@@ -932,6 +954,7 @@ mod confinement {
             "ioctl(fd,TCGETS,out.as_mut_ptr()asusize)",
             "ioctl(fd,TCSETS,termios.as_ptr()asusize)",
             "ioctl(device.as_raw_fd(),BLKRRPART,0)",
+            "ioctl(fd,TCSETSF,termios.as_ptr()asusize)",
         ];
         let sys = squeeze(&source("sys.rs"));
         for call in CALLS {
@@ -952,7 +975,7 @@ mod confinement {
         assert_eq!(
             Some(CALLS.len()),
             declared,
-            "one wrapper per permitted request; a sixth is an UNSAFE.md amendment"
+            "one wrapper per permitted request; a seventh is an UNSAFE.md amendment"
         );
     }
 
@@ -1107,6 +1130,7 @@ mod confinement {
             // property of that one module, so it has to be the only one.
             (concat!("sys::", "termios_get"), &["term.rs"][..]),
             (concat!("sys::", "termios_set"), &["term.rs"][..]),
+            (concat!("sys::", "termios_set_flush"), &["term.rs"][..]),
             // Claiming a terminal decides which session can be signalled from a
             // keyboard. Two applets do it, for opposite reasons — cttyhack
             // degrades without one, getty refuses to continue.
@@ -1299,9 +1323,9 @@ mod confinement {
             );
             selected.push(selector);
         }
-        // Each of the ten exactly once, ioctl included: its five permitted
+        // Each of the ten exactly once, ioctl included: its six permitted
         // requests share ONE entry point, so the request register is pinned at
-        // the five wrappers rather than here. Membership alone would let every
+        // the six wrappers rather than here. Membership alone would let every
         // site name SYS_REBOOT while a wrapper quietly issued a different call
         // than the one it is named for; spelling the expected multiset out
         // keeps that closed while the roster widens.
@@ -1347,17 +1371,101 @@ mod confinement {
         assert!(applet.contains("letopened=file.metadata()?;if!opened.file_type().is_block_device()||(before.dev(),before.ino(),before.rdev())!=(opened.dev(),opened.ino(),opened.rdev())"));
     }
 
-    /// The ioctl entry point has EXACTLY the five call sites pinned above, and
+    /// `secret-line` reaches the terminal only through `term.rs`, whose
+    /// readback refuses to read under echo, and its secret has one sink: the
+    /// duplicated pipe. A `sys::` reach would skip the readback; std's stdout
+    /// (`emit`, the print macros) keeps an unzeroed buffer and writes to
+    /// whatever stdout is, pipe or not.
+    #[test]
+    fn the_secret_line_reaches_the_terminal_through_term_and_writes_one_pipe() {
+        let applet = squeeze(&code_only(&source("secretline.rs")));
+        assert_eq!(
+            applet.matches(concat!("sys", "::")).count(),
+            0,
+            "secret-line must reach the terminal through term.rs alone"
+        );
+        assert!(applet.contains("constCONSOLE:&str=\"/dev/console\";"));
+        assert!(applet.contains("constO_NOCTTY:i32=0o400;"));
+        assert!(applet.contains(
+            "OpenOptions::new().read(true).write(true).custom_flags(O_NOCTTY).open(CONSOLE)"
+        ));
+        assert!(applet.contains("constLINE_MAX:usize=256;"));
+        assert!(applet.contains("constRECORD_MAX:usize=4096;"));
+        assert_eq!(applet.matches(concat!("io::", "stdout()")).count(), 1);
+        assert!(applet.contains(concat!(
+            "io::stdout().as_fd().try_clone_to_owned()",
+            ".map_err(|e|format!(\"stdout:{e}\"))?;require_pipe(File::from(fd))"
+        )));
+        for sink in [
+            concat!("crate::", "emit("),
+            concat!("print", "!"),
+            concat!("println", "!"),
+            concat!("write", "!"),
+            concat!("std", "out().lock"),
+        ] {
+            assert_eq!(applet.matches(sink).count(), 0, "secret-line names {sink}");
+        }
+        // The line is written once, after the session restored the console.
+        assert_eq!(applet.matches("line.as_bytes()").count(), 1);
+        let session = applet
+            .split_once("fnsession(")
+            .and_then(|(_, rest)| rest.split_once("fnpiped_stdout"))
+            .map(|(body, _)| body)
+            .unwrap_or_default();
+        let at = |needle: &str| session.match_indices(needle).next().map(|(i, _)| i);
+        let (off, prompt, read, restore, newline) = (
+            at("term::echo_off(console)?;"),
+            at("console.write_out(prompt.as_bytes())"),
+            at("read_line(console,line)"),
+            at("term::restore(console,&saved)"),
+            at("console.write_out(b\"\\n\")"),
+        );
+        assert!(
+            [off, prompt, read, restore, newline]
+                .iter()
+                .all(Option::is_some),
+            "secret-line's session changed shape: {session}"
+        );
+        assert!(
+            off < prompt && prompt < read && read < restore && restore < newline,
+            "echo off, prompt, read, restore, newline"
+        );
+    }
+
+    /// `TCSETSF` discards pending input, which is right for exactly one step:
+    /// secret-line's echo-off, so a key typed before its prompt is neither
+    /// kept nor joined to the entry. Its wrapper is reached only through
+    /// `term::Kernel`, and the flushing set is issued once, by `echo_off`;
+    /// getty's settings and every restore stay plain `TCSETS`.
+    #[test]
+    fn the_flushing_set_is_secret_lines_echo_off_alone() {
+        let term = squeeze(&code_only(&source("term.rs")));
+        assert_eq!(
+            term.matches(concat!("sys::", "termios_set_flush(")).count(),
+            1
+        );
+        assert!(term.contains(concat!(
+            "fnset_flushing(&mutself,termios:&Bytes)->io::Result<()>{",
+            "sys::termios_set_flush(self.fd,termios)}"
+        )));
+        assert_eq!(term.matches(".set_flushing(").count(), 1);
+        let echo_off = term
+            .split_once("pubfnecho_off(")
+            .and_then(|(_, rest)| rest.split_once("pubfnrestore("))
+            .map(|(body, _)| body)
+            .unwrap_or_default();
+        assert!(echo_off.contains(".set_flushing(&want)"));
+    }
+
+    /// The ioctl entry point has EXACTLY the six call sites pinned above, and
     /// the roster it checks against has exactly one binding.
     ///
     /// This guards the value-pinned request claim. When the roster had four
     /// entries, a reviewer demonstrated the escape: redeclare `IOCTL_REQUESTS`
-    /// INSIDE `fn ioctl` with a fifth entry `0x5404`, add a fifth wrapper
-    /// passing that literal, and the whole crate stayed green — the outer
-    /// roster line is still present, each of the four names still appears three
-    /// times, and `TCSETSF` appears nowhere as a NAME. 0x5404 is `TCSETSF`,
-    /// which DISCARDS pending terminal I/O another process may own, and both
-    /// this file and UNSAFE.md §3 exclude it by that argument.
+    /// INSIDE `fn ioctl` with an extra literal entry, add a wrapper passing
+    /// that literal, and the whole crate stayed green — the outer roster line
+    /// is still present, each name still appears three times, and the new
+    /// request appears nowhere as a NAME.
     ///
     /// Two counts close it, mirroring what `syscall5` already gets: the call
     /// sites are bounded (definition plus one per permitted request, each of
@@ -1368,9 +1476,9 @@ mod confinement {
         let sys = squeeze(&code_only(&source("sys.rs")));
         assert_eq!(
             sys.matches("ioctl(").count(),
-            6,
-            "sys.rs must hold the ioctl definition and exactly five calls — one \
-             per permitted request, each pinned whole above; a sixth call site \
+            7,
+            "sys.rs must hold the ioctl definition and exactly six calls — one \
+             per permitted request, each pinned whole above; a seventh call site \
              can pass a literal the name-based pins cannot see"
         );
         assert_eq!(

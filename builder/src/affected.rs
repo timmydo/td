@@ -8906,6 +8906,7 @@ mod tests {
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
+                "td-init",
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
@@ -8936,9 +8937,10 @@ mod tests {
         // The test-only P-256 oracle connects td-secret to td-crypto and then
         // td-mta, adding two commands each, and td-open, which mounts
         // td-secret's descriptor module, adds two; the installation fixture,
-        // reading td-install's codecs, adds two.
+        // reading td-install's codecs, adds two, and td-init, whose
+        // secret-line PTY test opens its terminal through td-ui, adds two.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 68, "{comp:?}");
+        assert_eq!(comp.len(), 70, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -8953,6 +8955,7 @@ mod tests {
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
+                "td-init",
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",
@@ -8990,6 +8993,7 @@ mod tests {
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
+                "td-init",
                 "td-install",
                 "td-install-qemu-test",
                 "td-jail",

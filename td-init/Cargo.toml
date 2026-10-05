@@ -9,11 +9,14 @@ license = "MIT"
 name = "td-init"
 path = "src/main.rs"
 
-# The confinement tests read src/ through td-source-scan's shared scans.
+# The confinement tests read src/ through td-source-scan's shared scans;
+# secret-line's terminal test opens a PTY through td-ui's pinned surface
+# (UNSAFE.md §19), since td-init's own roster has no PTY request.
 # Dev-only: the recipe compiles src/main.rs with a direct rustc and no
 # `--test`, so the shipped binary never sees it.
 [dev-dependencies]
 td-source-scan = { path = "../td-source-scan" }
+td-ui = { path = "../td-ui" }
 
 # The engine root carries no `exclude` list and never needed one: an `exclude`
 # stops cargo only at THAT manifest.

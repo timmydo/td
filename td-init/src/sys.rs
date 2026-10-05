@@ -16,9 +16,10 @@
 //! The amended surface is exactly the ten syscalls below, one per boot-glue
 //! applet requirement that safe `std` does not expose. An ELEVENTH is a reviewed
 //! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
-//! `ioctl(2)` is the one with FIVE permitted requests — `TIOCSCTTY` for
-//! cttyhack and getty, `LOOP_SET_FD` for losetup, and `TCGETS`/`TCSETS` for the
-//! line settings getty applies, plus BLKRRPART for partition rereads. Each is
+//! `ioctl(2)` is the one with SIX permitted requests — `TIOCSCTTY` for
+//! cttyhack and getty, `LOOP_SET_FD` for losetup, `TCGETS`/`TCSETS` for the
+//! line settings getty applies, `TCSETSF` for secret-line's echo-off, plus
+//! BLKRRPART for partition rereads. Each is
 //! pinned by value and checked against the roster by the one `ioctl` entry
 //! point below, so widening it is as reviewable as adding a syscall.
 //! Notably absent: `pivot_root(2)` (it fails on the initramfs rootfs, so
@@ -247,12 +248,12 @@ pub fn setsid() -> io::Result<i32> {
 
 // ── the ioctl roster ────────────────────────────────────────────────────────
 
-/// The FIVE requests this crate's `ioctl` may issue, pinned by value.
+/// The SIX requests this crate's `ioctl` may issue, pinned by value.
 ///
 /// `ioctl(2)` is one syscall onto an unbounded space of operations, so the
 /// number in `rax` is not the surface — the request in `rsi` is. The roster is
 /// enforced HERE rather than per wrapper (td-sh's form, not td-util's): one
-/// entry point refuses anything outside the list before issuing, so a fifth
+/// entry point refuses anything outside the list before issuing, so a seventh
 /// request is an edit to this array rather than a new call site somebody has to
 /// notice.
 const TIOCSCTTY: usize = 0x540e;
@@ -260,7 +261,8 @@ const LOOP_SET_FD: usize = 0x4c00;
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const BLKRRPART: usize = 0x125f;
-const IOCTL_REQUESTS: [usize; 5] = [TIOCSCTTY, LOOP_SET_FD, TCGETS, TCSETS, BLKRRPART];
+const TCSETSF: usize = 0x5404;
+const IOCTL_REQUESTS: [usize; 6] = [TIOCSCTTY, LOOP_SET_FD, TCGETS, TCSETS, BLKRRPART, TCSETSF];
 
 /// The only path to `ioctl(2)` in this crate. `request` is checked against the
 /// roster before the syscall, so an unlisted number cannot reach the kernel even
@@ -321,7 +323,7 @@ pub fn reread_partitions(device: &File) -> io::Result<()> {
     ioctl(device.as_raw_fd(), BLKRRPART, 0)
 }
 
-// ── getty's two requests ────────────────────────────────────────────────────
+// ── the termios requests ───────────────────────────────────────────────────
 
 /// The KERNEL's `struct termios` — `asm-generic/termbits.h`, four 32-bit flag
 /// words, `c_line`, then `c_cc[NCCS]` with NCCS 19. Not glibc's, which carries
@@ -349,6 +351,15 @@ pub fn termios_get(fd: RawFd, out: &mut [u8; TERMIOS_LEN]) -> io::Result<()> {
 /// kernel or a previous session had already written to the operator's console.
 pub fn termios_set(fd: RawFd, termios: &[u8; TERMIOS_LEN]) -> io::Result<()> {
     ioctl(fd, TCSETS, termios.as_ptr() as usize)
+}
+
+/// `ioctl(fd, TCSETSF, &termios)` — apply line settings once pending output
+/// has drained, discarding pending INPUT. secret-line's echo-off alone uses it:
+/// whatever was typed before its prompt was echoed under the old settings, and
+/// discarding it is the point, so a key typed early is neither shown and then
+/// kept nor joined to the entry.
+pub fn termios_set_flush(fd: RawFd, termios: &[u8; TERMIOS_LEN]) -> io::Result<()> {
+    ioctl(fd, TCSETSF, termios.as_ptr() as usize)
 }
 
 // ── init's reaper ───────────────────────────────────────────────────────────
@@ -478,6 +489,12 @@ mod tests {
             Some(ENOTTY),
             "the write did not reach the kernel"
         );
+        let flush = termios_set_flush(fd, &buf).unwrap_err();
+        assert_eq!(
+            flush.raw_os_error(),
+            Some(ENOTTY),
+            "the flushing write did not reach the kernel"
+        );
     }
 
     /// The roster is enforced in CODE, so an off-roster request is refused
@@ -487,9 +504,9 @@ mod tests {
     /// worth proving cannot leave this module.
     ///
     /// Note what this is and is not. It proves ONE value of the roster's
-    /// complement is refused and that all five on it get through — not that the
-    /// roster is the right five, which is `main.rs`'s job. A sixth entry added
-    /// beside the five would satisfy every line here.
+    /// complement is refused and that all six on it get through — not that the
+    /// roster is the right six, which is `main.rs`'s job. A seventh entry added
+    /// beside the six would satisfy every line here.
     #[test]
     fn an_off_roster_request_never_reaches_the_kernel() {
         // 0x5412 is the terminal input-injection request, deliberately off the
@@ -501,7 +518,7 @@ mod tests {
         let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
         let refused = ioctl(fd, OFF_ROSTER, 0).unwrap_err();
         assert_eq!(refused.raw_os_error(), Some(EINVAL_ERRNO));
-        // ...and the five on the roster get past the check, reaching a kernel
+        // ...and the six on the roster get past the check, reaching a kernel
         // that answers for the device rather than the request.
         for request in IOCTL_REQUESTS {
             let err = ioctl(fd, request, 0).unwrap_err();

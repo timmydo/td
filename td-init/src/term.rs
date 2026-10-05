@@ -24,8 +24,14 @@
 //! set here is not only "turn the login bits on" but also "turn off what makes a
 //! line unusable" — CRTSCTS, EXTPROC, and the input/output mangling flags. Bits
 //! outside both sets are deliberately ACCEPTED as the line already had them.
+//!
+//! `secret-line` borrows the same discipline for the opposite job: it turns
+//! echo OFF for one line and puts back exactly what it found. `echo_off` and
+//! `restore` run over the `Termios` trait so the ordering can be tested without
+//! a terminal; `Kernel` is the one implementation that reaches the kernel.
 
 use crate::sys;
+use std::io;
 use std::os::fd::RawFd;
 
 /// The four leading `u32` flag words of the kernel `struct termios`, in order.
@@ -44,6 +50,10 @@ const VKILL: usize = 3;
 const VEOF: usize = 4;
 const VTIME: usize = 5;
 const VMIN: usize = 6;
+/// The two extra line terminators, which `secret-line` disables (0 is
+/// `_POSIX_VDISABLE` on Linux) so only a newline or `^D` ends a record.
+const VEOL: usize = 11;
+const VEOL2: usize = 16;
 
 /// `c_iflag`. `ICRNL` set and `IGNCR` clear are one requirement stated twice: a
 /// terminal sends CR for Enter, so with `IGNCR` set the byte is DISCARDED and
@@ -101,9 +111,15 @@ const ISIG: u32 = 0x0000_0001;
 const ICANON: u32 = 0x0000_0002;
 const ECHO: u32 = 0x0000_0008;
 const ECHOE: u32 = 0x0000_0010;
+/// Echo a newline even while `ECHO` is clear. Cleared with it for a secret
+/// line, so that nothing the operator types reaches the console's output.
+const ECHONL: u32 = 0x0000_0040;
 /// `EXTPROC` hands canonical processing to a pty master, so with it set ICANON
 /// reads back as on and does nothing. Cleared for CRTSCTS's reason.
 const EXTPROC: u32 = 0x0001_0000;
+/// Extended input processing: `^V` (literal next), `^O`, `^W`, `^R`. Cleared
+/// for a secret line, so `^V` cannot put a newline inside a record.
+const IEXTEN: u32 = 0x0000_8000;
 
 /// The control bytes a canonical line needs, at their `c_cc` slots. `VMIN`/
 /// `VTIME` are set because a leftover raw configuration can carry `VMIN = 0`,
@@ -280,6 +296,135 @@ fn disagreement(want: &[u8; sys::TERMIOS_LEN], after: &[u8; sys::TERMIOS_LEN]) -
     }
     // Unreachable: the caller compared the buffers and found them different.
     "the terminal did not take the line settings".to_string()
+}
+
+/// The kernel's `struct termios`, as opaque bytes outside this module.
+pub type Bytes = [u8; sys::TERMIOS_LEN];
+
+/// A terminal's settings. `secret-line`'s ordering is tested through this
+/// rather than through a real terminal.
+pub trait Termios {
+    /// `TCGETS`.
+    fn get(&mut self, out: &mut Bytes) -> io::Result<()>;
+    /// `TCSETS`: apply at once.
+    fn set(&mut self, termios: &Bytes) -> io::Result<()>;
+    /// `TCSETSF`: apply once output has drained, discarding pending input.
+    fn set_flushing(&mut self, termios: &Bytes) -> io::Result<()>;
+}
+
+/// The kernel's terminal behind a descriptor the caller keeps open.
+pub struct Kernel {
+    fd: RawFd,
+}
+
+impl Kernel {
+    pub fn new(fd: RawFd) -> Kernel {
+        Kernel { fd }
+    }
+}
+
+impl Termios for Kernel {
+    fn get(&mut self, out: &mut Bytes) -> io::Result<()> {
+        sys::termios_get(self.fd, out)
+    }
+
+    fn set(&mut self, termios: &Bytes) -> io::Result<()> {
+        sys::termios_set(self.fd, termios)
+    }
+
+    fn set_flushing(&mut self, termios: &Bytes) -> io::Result<()> {
+        sys::termios_set_flush(self.fd, termios)
+    }
+}
+
+/// The settings a line had before `echo_off`, which `restore` puts back.
+/// Opaque, so the only bytes a caller can restore are the kernel's own.
+pub struct Saved(Bytes);
+
+/// `before` with echo off for one secret line:
+///
+/// - `ECHO` and `ECHONL` clear, so neither the typed bytes nor the
+///   terminating newline reach the output;
+/// - `ISIG` clear, as glibc's `getpass` does, so `^C`, `^\` and `^Z` are input
+///   rather than signals that could kill or stop the reader while echo is off;
+/// - `IEXTEN` clear, so `^V` cannot quote a newline into the record;
+/// - `EXTPROC` clear, as getty's patch clears it, so n_tty itself assembles
+///   the record and a read returns at most one;
+/// - `ICANON` set, so the line discipline still assembles the record and its
+///   erase and kill keys still work;
+/// - `ICRNL` set with `IGNCR` and `INLCR` clear, so a serial console's CR
+///   ends the record and a newline stays one;
+/// - `VEOL` and `VEOL2` disabled, so only a newline or `^D` ends a record.
+///
+/// Every other byte is the kernel's own, and `restore` puts all of it back.
+fn secret_patched(before: &Bytes) -> Bytes {
+    let mut out = *before;
+    write_u32(
+        &mut out,
+        LFLAG_AT,
+        (read_u32(before, LFLAG_AT) | ICANON) & !(ECHO | ECHONL | ISIG | IEXTEN | EXTPROC),
+    );
+    write_u32(
+        &mut out,
+        IFLAG_AT,
+        (read_u32(before, IFLAG_AT) | ICRNL) & !(IGNCR | INLCR),
+    );
+    set_cc(&mut out, VEOL, 0);
+    set_cc(&mut out, VEOL2, 0);
+    out
+}
+
+/// Turn echo off and prove it took before anything is read.
+///
+/// The change is applied with `TCSETS` and read back, then applied again with
+/// `TCSETSF`, which discards pending input, and read back again. Input typed
+/// before the switch was echoed under the old settings, and input arriving
+/// during it may have been; both are discarded rather than read as the
+/// entry's start. Input arriving after the flush and before the caller's
+/// prompt is written is not echoed but is read. `TCSETSF` flushes input and
+/// then waits for pending output to drain, so that window lasts the drain:
+/// on a serial console with an output backlog, as long as the backlog takes
+/// to send. On any failure after the settings were read, the
+/// line is restored before returning: a request that applied part of the
+/// change, or a readback that disagrees, must not leave the console silent.
+pub fn echo_off(line: &mut impl Termios) -> Result<Saved, String> {
+    let mut before = [0u8; sys::TERMIOS_LEN];
+    line.get(&mut before).map_err(|e| format!("TCGETS: {e}"))?;
+    let saved = Saved(before);
+    let want = secret_patched(&before);
+    let applied = apply(line, &want).and_then(|()| {
+        line.set_flushing(&want)
+            .map_err(|e| format!("TCSETSF: {e}"))?;
+        read_back(line, &want)
+    });
+    match applied {
+        Ok(()) => Ok(saved),
+        Err(e) => match restore(line, &saved) {
+            Ok(()) => Err(e),
+            Err(r) => Err(format!("{e}; restoring the line also failed: {r}")),
+        },
+    }
+}
+
+/// Put back what `echo_off` found, and refuse unless the kernel agrees exactly.
+pub fn restore(line: &mut impl Termios, saved: &Saved) -> Result<(), String> {
+    apply(line, &saved.0)
+}
+
+fn apply(line: &mut impl Termios, want: &Bytes) -> Result<(), String> {
+    line.set(want).map_err(|e| format!("TCSETS: {e}"))?;
+    read_back(line, want)
+}
+
+fn read_back(line: &mut impl Termios, want: &Bytes) -> Result<(), String> {
+    let mut after = [0u8; sys::TERMIOS_LEN];
+    line.get(&mut after)
+        .map_err(|e| format!("TCGETS (readback): {e}"))?;
+    if &after == want {
+        Ok(())
+    } else {
+        Err(disagreement(want, &after))
+    }
 }
 
 /// A little-endian `u32` at `at`, or 0 if the buffer is too short to hold one.
@@ -562,6 +707,157 @@ mod tests {
         after[CC_AT + VMIN] = 0;
         let error = verify(&before, &want, &after).unwrap_err();
         assert!(error.contains("byte"), "{error}");
+    }
+
+    /// A secret line clears exactly ECHO, ECHONL, ISIG, IEXTEN and EXTPROC (with
+    /// which a pty master, not n_tty, would assemble the record), sets ICANON
+    /// and ICRNL, clears IGNCR and INLCR and disables VEOL and VEOL2. ECHONL
+    /// is the one echo bit that acts with ECHO clear, ISIG would let a
+    /// keyboard signal kill the reader with echo off, and IEXTEN's `^V` would
+    /// quote a newline into a record; every other byte is the kernel's own.
+    #[test]
+    fn a_secret_line_clears_echo_and_keeps_canonical_input() {
+        let mut before = [0u8; sys::TERMIOS_LEN];
+        for (i, slot) in before.iter_mut().enumerate() {
+            *slot = 0xa5 ^ i as u8;
+        }
+        write_u32(
+            &mut before,
+            LFLAG_AT,
+            ISIG | ECHO | ECHOE | ECHONL | EXTPROC | IEXTEN,
+        );
+        write_u32(&mut before, IFLAG_AT, IGNCR | INLCR | ISTRIP);
+        before[CC_AT + VEOL] = b'@';
+        before[CC_AT + VEOL2] = b'#';
+        let out = secret_patched(&before);
+        assert_eq!(
+            read_u32(&out, LFLAG_AT),
+            ICANON | ECHOE,
+            "only ECHO, ECHONL, ISIG, IEXTEN, EXTPROC and ICANON are the patch's"
+        );
+        assert_eq!(read_u32(&out, IFLAG_AT), ICRNL | ISTRIP);
+        assert_eq!((out[CC_AT + VEOL], out[CC_AT + VEOL2]), (0, 0));
+        let patched = |i: &usize| {
+            (LFLAG_AT..LFLAG_AT + 4).contains(i)
+                || (IFLAG_AT..IFLAG_AT + 4).contains(i)
+                || *i == CC_AT + VEOL
+                || *i == CC_AT + VEOL2
+        };
+        for i in (0..sys::TERMIOS_LEN).filter(|i| !patched(i)) {
+            assert_eq!(out[i], before[i], "byte {i} was not the patch's to change");
+        }
+        // Idempotent over a line already in that state, and never sets echo.
+        assert_eq!(secret_patched(&out), out);
+        assert_eq!((ECHONL, IEXTEN), (0x40, 0x8000));
+        assert_eq!((VEOL, VEOL2), (11, 16));
+        let mut all = [0u8; sys::TERMIOS_LEN];
+        write_u32(&mut all, LFLAG_AT, u32::MAX);
+        assert_eq!(
+            read_u32(&secret_patched(&all), LFLAG_AT),
+            !(ECHO | ECHONL | ISIG | IEXTEN | EXTPROC)
+        );
+    }
+
+    /// Scripted settings: records every exchange, can fail a numbered `set`, and
+    /// can lie on readback.
+    struct Script {
+        current: [u8; sys::TERMIOS_LEN],
+        log: Vec<&'static str>,
+        sets: usize,
+        fail_set: Option<usize>,
+        ignore_sets: bool,
+    }
+
+    impl Script {
+        fn new() -> Script {
+            let mut current = [0u8; sys::TERMIOS_LEN];
+            write_u32(&mut current, LFLAG_AT, ISIG | ICANON | ECHO | ECHOE);
+            Script {
+                current,
+                log: Vec::new(),
+                sets: 0,
+                fail_set: None,
+                ignore_sets: false,
+            }
+        }
+    }
+
+    impl Script {
+        fn store(&mut self, termios: &Bytes) -> io::Result<()> {
+            self.sets += 1;
+            if self.fail_set == Some(self.sets) {
+                return Err(io::Error::other("refused"));
+            }
+            if !self.ignore_sets {
+                self.current = *termios;
+            }
+            Ok(())
+        }
+    }
+
+    impl Termios for Script {
+        fn get(&mut self, out: &mut Bytes) -> io::Result<()> {
+            self.log.push("get");
+            *out = self.current;
+            Ok(())
+        }
+        fn set(&mut self, termios: &Bytes) -> io::Result<()> {
+            self.log.push("set");
+            self.store(termios)
+        }
+        fn set_flushing(&mut self, termios: &Bytes) -> io::Result<()> {
+            self.log.push("flush-set");
+            self.store(termios)
+        }
+    }
+
+    #[test]
+    fn echo_off_proves_the_change_and_restore_puts_back_the_kernels_bytes() {
+        let mut line = Script::new();
+        let original = line.current;
+        let saved = echo_off(&mut line).unwrap();
+        assert_eq!(
+            read_u32(&line.current, LFLAG_AT) & (ECHO | ECHONL | ISIG),
+            0
+        );
+        restore(&mut line, &saved).unwrap();
+        assert_eq!(line.current, original);
+        assert_eq!(
+            line.log,
+            ["get", "set", "get", "flush-set", "get", "set", "get"]
+        );
+    }
+
+    /// A driver that accepts TCSETS and changes nothing must not be read from:
+    /// the readback refuses, and the restore still runs.
+    #[test]
+    fn echo_that_did_not_turn_off_is_refused_and_the_line_restored() {
+        let mut line = Script::new();
+        line.ignore_sets = true;
+        let error = echo_off(&mut line).err().unwrap();
+        assert!(error.contains("c_iflag"), "{error}");
+        assert_eq!(line.log, ["get", "set", "get", "set", "get"]);
+    }
+
+    #[test]
+    fn a_refused_tcsets_still_restores_and_a_failed_restore_is_reported() {
+        let mut line = Script::new();
+        line.fail_set = Some(1);
+        let error = echo_off(&mut line).err().unwrap();
+        assert_eq!(error, "TCSETS: refused");
+        assert_eq!(line.log, ["get", "set", "set", "get"]);
+
+        let mut flush = Script::new();
+        flush.fail_set = Some(2);
+        let error = echo_off(&mut flush).err().unwrap();
+        assert_eq!(error, "TCSETSF: refused");
+        assert_eq!(flush.log, ["get", "set", "get", "flush-set", "set", "get"]);
+
+        let mut both = Script::new();
+        both.fail_set = Some(2);
+        both.ignore_sets = true;
+        let error = echo_off(&mut both).err().unwrap();
+        assert!(error.contains("restoring the line also failed"), "{error}");
     }
 
     /// The accessors read and write where the offsets say, round-trip, and

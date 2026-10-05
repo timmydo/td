@@ -30,6 +30,11 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //     asserted through its usage path and init through `--dry-run`, the inittab
 //     validator that parses a table and reports rejected lines through its exit
 //     code.
+//   * secret-line reads the console with echo off, so it is asserted through
+//     the refusals that come before any terminal is touched: a missing, extra
+//     or non-printable prompt, and a stdout that is not a pipe. Where the sandbox has no /dev/console, a
+//     piped run must fail with nothing on stdout; where it has one, the leg is
+//     skipped rather than left waiting for a line nobody types.
 //   * mount and umount are never asked to CHANGE the mount table: a build
 //     sandbox is a mount namespace whose filesystems the rest of the derivation
 //     is still standing on, and a `umount -a` here would take the store out from
@@ -102,11 +107,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack devpts getty halt hostname init losetup mknod mount poweroff reboot reread-partitions switch_root sync umount; do \
+                     for a in cttyhack devpts getty halt hostname init losetup mknod mount poweroff reboot reread-partitions secret-line switch_root sync umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 15 ] || {{ echo \"td-init serves $n applets, expected exactly 15 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 16 ] || {{ echo \"td-init serves $n applets, expected exactly 16 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -176,7 +181,26 @@ pub fn recipe() -> Recipe {
                      [ $? -eq 1 ] || {{ echo 'losetup must refuse a relative path with exit 1' >&2; exit 1; }}; \
                      e=$('{bin}' devpts /dev/pts 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'devpts must reject an argument with exit 1 — it takes none, and reaching the mount here would put a second instance over the one serving this build' >&2; exit 1; }}; \
-                     printf '%s\n' \"$e\" | grep -q 'takes no arguments' || {{ echo \"devpts rejected the argument without saying so: '$e'\" >&2; exit 1; }}"
+                     printf '%s\n' \"$e\" | grep -q 'takes no arguments' || {{ echo \"devpts rejected the argument without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' secret-line 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'secret-line must refuse a missing PROMPT with exit 1' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'usage: secret-line' || {{ echo \"secret-line refused a missing PROMPT without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' secret-line 'Key: ' /dev/ttyS0 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'secret-line must refuse a second operand with exit 1 — it reads /dev/console and nothing else' >&2; exit 1; }}; \
+                     e=$('{bin}' secret-line \"$(printf 'Key:\\033[2J')\" 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'secret-line must refuse a prompt with a control byte — it is written to the console as-is' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'printable ASCII' || {{ echo \"secret-line refused the control byte without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' secret-line 'Key: ' 2>&1 >/dev/null </dev/null); \
+                     [ $? -eq 1 ] || {{ echo 'secret-line must refuse a stdout that is not a pipe — the line would be shown or kept' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'not a pipe' || {{ echo \"secret-line refused a non-pipe stdout without saying so: '$e'\" >&2; exit 1; }}; \
+                     if [ ! -e /dev/console ]; then \
+                         o=$('{bin}' secret-line 'Key: ' 2>/dev/null </dev/null); \
+                         r=$?; \
+                         [ \"$r\" -eq 1 ] || {{ echo \"secret-line without a console exited $r, expected 1\" >&2; exit 1; }}; \
+                         [ -z \"$o\" ] || {{ echo 'secret-line wrote to stdout without reading a console' >&2; exit 1; }}; \
+                     else \
+                         echo 'note: this sandbox has a /dev/console; the console read is left to the boot oracle'; \
+                     fi"
                 ),
             ],
         )
@@ -349,7 +373,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the fifteen applets cttyhack/devpts/getty/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/reread-partitions/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
+        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the sixteen applets cttyhack/devpts/getty/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/reread-partitions/secret-line/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses a missing, extra or non-printable secret-line prompt or a stdout that is not a pipe before touching a terminal, refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

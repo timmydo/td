@@ -175,10 +175,16 @@ command line names (DESIGN.md "Full-system volume consumers"); a keyboard
 console is increment 7's activation gate. The selector reads the
 recovery key through td-init's secret-line applet with echo off, so its
 digits are never echoed; a console server or BMC recorder on the serial
-line may still log what is typed, which the review discloses. An entry
-is bounded at 256 bytes: a longer line is drained to its newline and
-refused. Each entry is tried on keyslot 0 alone, and a wrong one prompts
-again, without a limit: a 128-bit key needs no retry bound. After the
+line may still log what is typed, which the review discloses. The applet,
+not the selector, prints the prompt, and only after echo is off: it
+switches the console with a flushing settings change (`TCSETSF`,
+UNSAFE.md §3), so anything typed before the prompt is discarded rather
+than kept or joined to the entry. It reads one whole canonical record:
+an entry is bounded at 256 bytes, and a longer record, or one holding a
+newline before its end, is refused whole, consuming nothing after it; a
+record ended by `^D` rather than a newline ends input and is refused.
+Each entry is tried on keyslot 0 alone, and a wrong one prompts again,
+without a limit: a 128-bit key needs no retry bound. After the
 cap, a correct recovery key opens the volume; when this boot's own cap
 closed PCR 12, the selector then offers, with an explicit console
 confirmation, to seal a device-bound protector to the observed PCR 4 and
@@ -340,7 +346,8 @@ This section, the release order and the handoff ("Boot and authority
 boundaries") are increment 6's target. Only td-kexec's half of the
 handoff exists, a mode nothing invokes yet. Today's selector neither releases nor caps, its discovery finds only a
 Btrfs volume, and the image refuses cryptsetup in either initramfs
-(DESIGN.md D6).
+(DESIGN.md D6). td-init's secret-line applet exists but no initramfs
+links it until the recovery flow does (UNSAFE.md §3).
 
 The installed selector acts on what discovery finds under its configured
 UUID (DESIGN.md "Full-system volume consumers"): a Btrfs volume boots as

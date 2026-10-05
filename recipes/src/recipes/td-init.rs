@@ -76,6 +76,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-init/src/partitions.rs"),
     ),
     (
+        "secretline",
+        include_str!("../../../td-init/src/secretline.rs"),
+    ),
+    (
         "switchroot",
         include_str!("../../../td-init/src/switchroot.rs"),
     ),
