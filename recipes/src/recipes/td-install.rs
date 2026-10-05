@@ -36,6 +36,7 @@ const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
 const JSON_RS: &str = include_str!("../../../td-json/src/lib.rs");
 const JSON_RETAIN_RS: &str = include_str!("../../../td-json/src/retain.rs");
 const JSON_STRING_RS: &str = include_str!("../../../td-json/src/string.rs");
+const JSON_RETAIN_RS: &str = include_str!("../../../td-json/src/retain.rs");
 const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_array.rs");
 const JSON_RETAIN_RS: &str = include_str!("../../../td-json/src/retain.rs");
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
@@ -107,6 +108,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-json/src/string.rs".into(),
             content: JSON_STRING_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-json/src/retain.rs".into(),
+            content: JSON_RETAIN_RS.into(),
             exec: false,
         },
         Step::WriteFile {
