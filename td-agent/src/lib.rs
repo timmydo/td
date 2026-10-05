@@ -72,6 +72,7 @@ pub mod system;
 pub mod toolhost;
 pub mod tools;
 pub mod ui;
+pub mod upstream;
 pub mod wake;
 pub mod window;
 pub mod workspace;

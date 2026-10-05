@@ -848,18 +848,35 @@ pub struct Service {
     done: mpsc::Receiver<Done>,
 }
 
-/// A conversation's ask: fetch `remote`'s store and resolve `bases`.
-struct Job {
-    conversation: crate::store::Id,
-    remote: Remote,
-    bases: Vec<String>,
+/// What the store thread is asked.
+enum Job {
+    /// A conversation's: fetch `remote`'s store and resolve `bases`, with
+    /// what preparing its workspace needs.
+    Prepare {
+        conversation: crate::store::Id,
+        remote: Remote,
+        bases: Vec<String>,
+    },
+    /// The window's own, every `fetch_interval`: fetch `remote`'s store
+    /// and resolve `bases`, the ones workspaces name.
+    Refresh { remote: Remote, bases: Vec<String> },
 }
 
-/// A fetch's answer, for `conversation`.
-pub struct Done {
-    pub conversation: crate::store::Id,
-    pub remote: String,
-    pub result: Result<crate::protocol::Fetched, String>,
+/// An answer, for the conversation that asked or for the window, with
+/// the remote and the bases asked about.
+pub enum Done {
+    Prepared {
+        conversation: crate::store::Id,
+        remote: String,
+        bases: Vec<String>,
+        result: Result<crate::protocol::Fetched, String>,
+    },
+    /// Each base's commit, or why there is none, when the fetch was made.
+    Refreshed {
+        remote: String,
+        bases: Vec<String>,
+        result: Result<Vec<Result<String, String>>, String>,
+    },
 }
 
 impl Service {
@@ -873,15 +890,41 @@ impl Service {
             .name("td-agent-stores".into())
             .spawn(move || {
                 let made = Worker::new(&worker, &env);
-                for job in asked {
-                    let result = match &made {
-                        Ok(made) => made.prepare(&stores, &job.remote, &job.bases),
-                        Err(why) => Err(format!("the git worker: {why}")),
+                let unmade = |why: &String| format!("the git worker: {why}");
+                let mut queue = std::collections::VecDeque::new();
+                loop {
+                    queue.extend(asked.try_iter());
+                    if queue.is_empty() {
+                        match asked.recv() {
+                            Ok(job) => queue.push_back(job),
+                            Err(_) => break,
+                        }
+                    }
+                    let Some(job) = next(&mut queue) else {
+                        continue;
                     };
-                    let answer = Done {
-                        conversation: job.conversation,
-                        remote: job.remote.url(),
-                        result,
+                    let answer = match job {
+                        Job::Prepare {
+                            conversation,
+                            remote,
+                            bases,
+                        } => Done::Prepared {
+                            result: match &made {
+                                Ok(made) => made.prepare(&stores, &remote, &bases),
+                                Err(why) => Err(unmade(why)),
+                            },
+                            conversation,
+                            remote: remote.url(),
+                            bases,
+                        },
+                        Job::Refresh { remote, bases } => Done::Refreshed {
+                            result: match &made {
+                                Ok(made) => made.refresh(&stores, &remote, &bases),
+                                Err(why) => Err(unmade(why)),
+                            },
+                            remote: remote.url(),
+                            bases,
+                        },
                     };
                     if tell.send(answer).is_err() {
                         break;
@@ -903,7 +946,7 @@ impl Service {
         bases: Vec<String>,
     ) -> Result<(), String> {
         self.jobs
-            .send(Job {
+            .send(Job::Prepare {
                 conversation,
                 remote,
                 bases,
@@ -911,10 +954,29 @@ impl Service {
             .map_err(|_| "the store thread has ended".to_string())
     }
 
+    /// Asks for `remote`'s store fetched in the background and `bases`
+    /// resolved there, for the window; the answer comes from `answers`.
+    pub fn refresh(&self, remote: Remote, bases: Vec<String>) -> Result<(), String> {
+        self.jobs
+            .send(Job::Refresh { remote, bases })
+            .map_err(|_| "the store thread has ended".to_string())
+    }
+
     /// The answers that have come.
     pub fn answers(&self) -> Vec<Done> {
         self.done.try_iter().collect()
     }
+}
+
+/// The job the store thread runs next: the first conversation's ask
+/// waiting, so a preparation waits behind no queued background fetch,
+/// only one already running; else the oldest refresh.
+fn next(queue: &mut std::collections::VecDeque<Job>) -> Option<Job> {
+    let at = queue
+        .iter()
+        .position(|job| matches!(job, Job::Prepare { .. }))
+        .unwrap_or(0);
+    queue.remove(at)
 }
 
 impl Worker {
@@ -938,6 +1000,23 @@ impl Worker {
             ids,
             instructions,
         })
+    }
+
+    /// The store for `remote` under `stores`, made if need be and
+    /// fetched, then each of `bases` resolved there, or why not: a base
+    /// upstream deleted fails alone.
+    fn refresh(
+        &self,
+        stores: &Path,
+        remote: &Remote,
+        bases: &[String],
+    ) -> Result<Vec<Result<String, String>>, String> {
+        let store = self.store(stores, remote)?;
+        self.fetch(&store, remote)?;
+        Ok(bases
+            .iter()
+            .map(|base| self.resolve(&store, base))
+            .collect())
     }
 }
 
@@ -1328,6 +1407,20 @@ pub(crate) mod tests {
             None,
             "a tree"
         );
+        // A refresh fetches what upstream has since and resolves each
+        // base, one upstream no longer has failing alone.
+        upstream(&up, &["commit", "--quiet", "--allow-empty", "-m", "two"]);
+        let refreshed = worker
+            .refresh(&stores, &remote, &["main".into(), "gone".into()])
+            .unwrap();
+        let moved = refreshed.first().unwrap().clone().unwrap();
+        assert!(object_id(&moved) && moved != id, "{refreshed:?}");
+        assert!(refreshed
+            .get(1)
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .contains("no branch"));
         assert_eq!(worker.read(&store, &id, "link").unwrap(), None, "a link");
         assert!(worker.read(&store, "main", "AGENTS.md").is_err());
         assert!(worker
@@ -1441,11 +1534,84 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         for done in answers {
-            assert_eq!(done.conversation, id);
-            assert_eq!(done.remote, "https://example.org/a/td");
-            let why = done.result.unwrap_err();
+            let Done::Prepared {
+                conversation,
+                remote,
+                result,
+                ..
+            } = done
+            else {
+                panic!("not a preparation's answer");
+            };
+            assert_eq!(conversation, id);
+            assert_eq!(remote, "https://example.org/a/td");
+            let why = result.unwrap_err();
             assert!(why.starts_with("the git worker"), "{why}");
         }
+        // The window's refresh is answered for the window, with its bases.
+        service
+            .refresh(
+                Remote::parse("https://example.org/a/td").unwrap(),
+                vec!["main".into()],
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "no answer came");
+            if let Some(done) = service.answers().pop() {
+                let Done::Refreshed {
+                    remote,
+                    bases,
+                    result,
+                } = done
+                else {
+                    panic!("not a refresh's answer");
+                };
+                assert_eq!(
+                    (remote.as_str(), bases),
+                    ("https://example.org/a/td", vec!["main".to_string()])
+                );
+                assert!(result.unwrap_err().starts_with("the git worker"));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A conversation's ask goes before any background fetch queued
+    /// ahead of it; the refreshes keep their order.
+    #[test]
+    fn a_preparation_goes_before_queued_background_fetches() {
+        let remote = |path: &str| Remote::parse(&format!("https://example.org/{path}")).unwrap();
+        let refresh = |path: &str| Job::Refresh {
+            remote: remote(path),
+            bases: vec!["main".into()],
+        };
+        let id = crate::store::Id::random().unwrap();
+        let mut queue: std::collections::VecDeque<Job> = [
+            refresh("a"),
+            refresh("b"),
+            Job::Prepare {
+                conversation: id,
+                remote: remote("c"),
+                bases: vec!["main".into()],
+            },
+        ]
+        .into();
+        let order: Vec<String> = std::iter::from_fn(|| next(&mut queue))
+            .map(|job| match job {
+                Job::Prepare { remote, .. } => format!("prepare {}", remote.url()),
+                Job::Refresh { remote, .. } => format!("refresh {}", remote.url()),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "prepare https://example.org/c",
+                "refresh https://example.org/a",
+                "refresh https://example.org/b"
+            ]
+        );
     }
 
     #[test]

@@ -359,7 +359,7 @@ const KEYS: &[(&str, Use)] = &[
     ("network", Use::Later(15)),
     ("network_allowlist", Use::Later(15)),
     ("protected_branches", Use::Later(14)),
-    ("fetch_interval", Use::Later(11)),
+    ("fetch_interval", Use::Read),
     ("fetch_concurrency", Use::Later(11)),
     ("max_background", Use::Later(12)),
     ("background_output_bytes", Use::Later(12)),
@@ -404,6 +404,21 @@ pub struct Config {
     /// `remotes`: the git remotes the human admitted, each a remote or a
     /// host with a path prefix (DESIGN.md §7, Admitted remotes).
     pub remotes: Vec<crate::git::Admission>,
+    /// `fetch_interval` in seconds as the file gives it; none is
+    /// `DEFAULT_FETCH_INTERVAL`.
+    pub fetch_interval: Option<u64>,
+}
+
+/// How often, in seconds, the stores are fetched in the background
+/// (DESIGN.md §7, Keeping current), and the bounds a file may set.
+pub const DEFAULT_FETCH_INTERVAL: u64 = 600;
+const FETCH_INTERVAL: std::ops::RangeInclusive<u64> = 60..=86_400;
+
+impl Config {
+    /// How often the stores are fetched in the background.
+    pub fn fetch_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.fetch_interval.unwrap_or(DEFAULT_FETCH_INTERVAL))
+    }
 }
 
 /// A workspace template (DESIGN.md §7, §15).
@@ -765,6 +780,22 @@ pub fn parse(text: &str) -> Result<Config, String> {
             })
             .collect::<Result<_, String>>()?;
     }
+    if let Some(value) = table.get("fetch_interval") {
+        config.fetch_interval = Some(
+            match value {
+                Toml::Int(seconds) => u64::try_from(*seconds).ok(),
+                _ => None,
+            }
+            .filter(|seconds| FETCH_INTERVAL.contains(seconds))
+            .ok_or_else(|| {
+                format!(
+                    "`fetch_interval` is a whole number of seconds from {} to {}, not {value:?}",
+                    FETCH_INTERVAL.start(),
+                    FETCH_INTERVAL.end()
+                )
+            })?,
+        );
+    }
     let client = &mut config.client;
     for (key, slot) in [
         ("max_cost_per_turn", &mut client.limits.turn),
@@ -966,6 +997,26 @@ mod tests {
                     )]
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn the_fetch_interval_is_whole_seconds_within_its_bounds() {
+        assert_eq!(
+            Config::default().fetch_interval(),
+            std::time::Duration::from_secs(600)
+        );
+        for (text, seconds) in [("60", 60), ("3600", 3600), ("86400", 86_400)] {
+            let config = parse(&format!("fetch_interval = {text}")).unwrap();
+            assert_eq!(
+                config.fetch_interval(),
+                std::time::Duration::from_secs(seconds)
+            );
+            assert!(config.notes.is_empty(), "{:?}", config.notes);
+        }
+        for text in ["59", "86401", "-1", "600.5", "\"10m\""] {
+            let refused = parse(&format!("fetch_interval = {text}")).unwrap_err();
+            assert!(refused.contains("whole number of seconds"), "{refused}");
         }
     }
 

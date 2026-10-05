@@ -218,6 +218,16 @@ pub struct Session {
     stores: Option<crate::git::Service>,
     /// Deletions of repository workspaces' conversations under way.
     removals: Vec<Removal>,
+    /// The background store fetches (DESIGN.md §7, Keeping current):
+    /// how often, when the next is due, the remotes whose fetch has not
+    /// answered yet, and each base's commit as last fetched.
+    fetch_interval: Duration,
+    next_refresh: Instant,
+    refreshing: Vec<String>,
+    heads: crate::upstream::Heads,
+    /// What each failing background fetch, or base, last said, so it is
+    /// said once until it changes or mends.
+    troubles: std::collections::BTreeMap<String, String>,
 }
 
 /// A deletion of a repository workspace's conversation under way
@@ -667,20 +677,123 @@ impl Session {
         stores.ask(id.clone(), parsed, bases.to_vec())
     }
 
-    /// The store thread's answers, each to the conversation that asked;
-    /// one whose process has gone asks again when it starts.
+    /// The store thread's answers: a preparation's to the conversation
+    /// that asked, one whose process has gone asking again when it
+    /// starts; a background fetch's kept, and each base in use that
+    /// advanced said. Either teaches the window where each base is.
     fn stored(&mut self) {
         let Some(stores) = &self.stores else {
             return;
         };
+        let mut moved = Vec::new();
         for done in stores.answers() {
-            self.supervisor.answer(
-                &done.conversation,
-                &Down::Fetched {
-                    remote: done.remote,
-                    result: done.result,
-                },
-            );
+            match done {
+                crate::git::Done::Prepared {
+                    conversation,
+                    remote,
+                    bases,
+                    result,
+                } => {
+                    if let Ok(fetched) = &result {
+                        let ids = fetched.ids.iter().map(|id| Some(id.as_str()));
+                        moved.extend(
+                            self.heads
+                                .learn(&remote, &bases, ids)
+                                .into_iter()
+                                .map(|(base, id)| (remote.clone(), base, id)),
+                        );
+                    }
+                    self.supervisor
+                        .answer(&conversation, &Down::Fetched { remote, result });
+                }
+                crate::git::Done::Refreshed {
+                    remote,
+                    bases,
+                    result,
+                } => {
+                    self.refreshing.retain(|asked| *asked != remote);
+                    // Said where diagnostics go, not in the window, and
+                    // once until it changes or mends.
+                    let fetched = result.as_ref().err().cloned();
+                    self.trouble(
+                        remote.clone(),
+                        fetched.map(|e| format!("fetching {remote} in the background: {e}")),
+                    );
+                    let Ok(ids) = result else {
+                        continue;
+                    };
+                    for (base, id) in bases.iter().zip(&ids) {
+                        self.trouble(
+                            format!("{remote} {base}"),
+                            id.as_ref()
+                                .err()
+                                .map(|e| format!("{remote}'s {base:?} after fetching it: {e}")),
+                        );
+                    }
+                    let ids = ids.iter().map(|id| id.as_deref().ok());
+                    moved.extend(
+                        self.heads
+                            .learn(&remote, &bases, ids)
+                            .into_iter()
+                            .map(|(base, id)| (remote.clone(), base, id)),
+                    );
+                }
+            }
+        }
+        if !moved.is_empty() {
+            let said: Vec<String> = moved
+                .iter()
+                .map(|(remote, base, id)| {
+                    format!(
+                        "{} of {} is at {}",
+                        crate::tools::visible(base),
+                        crate::tools::visible(remote),
+                        id.chars().take(12).collect::<String>()
+                    )
+                })
+                .collect();
+            let note = format!("upstream moved: {}", said.join("; "));
+            eprintln!("td-agent: {note}");
+            self.app.note(note);
+        }
+    }
+
+    /// Says `said` of `what` where diagnostics go when it is new, and
+    /// forgets `what`'s trouble when there is none.
+    fn trouble(&mut self, what: String, said: Option<String>) {
+        match said {
+            None => {
+                self.troubles.remove(&what);
+            }
+            Some(said) => {
+                if self.troubles.get(&what) != Some(&said) {
+                    eprintln!("td-agent: {said}");
+                    self.troubles.insert(what, said);
+                }
+            }
+        }
+    }
+
+    /// Asks the store thread to fetch, in the background, each admitted
+    /// remote a live repository workspace uses, every `fetch_interval`
+    /// (DESIGN.md §7, Keeping current); one still fetching is not asked
+    /// again.
+    fn refresh(&mut self) {
+        let now = Instant::now();
+        if now < self.next_refresh {
+            return;
+        }
+        self.next_refresh = now.checked_add(self.fetch_interval).unwrap_or(now);
+        let Some(stores) = &self.stores else {
+            return;
+        };
+        let (metas, _) = self.state.list();
+        for (remote, bases) in crate::upstream::in_use(&metas, &self.remotes, &self.refreshing) {
+            let url = remote.url();
+            match stores.refresh(remote, bases) {
+                Ok(()) => self.refreshing.push(url),
+                Err(e) => eprintln!("td-agent: fetching {url} in the background: {e}"),
+            }
         }
     }
 
@@ -1203,6 +1316,7 @@ impl Handler for Session {
         self.app.tick(now);
         self.hear();
         self.stored();
+        self.refresh();
         self.control();
         self.serve();
         self.flow()
@@ -1499,6 +1613,11 @@ pub fn run(
         }),
         data,
         removals: Vec::new(),
+        fetch_interval: config.fetch_interval(),
+        next_refresh: Instant::now(),
+        refreshing: Vec::new(),
+        heads: crate::upstream::Heads::default(),
+        troubles: std::collections::BTreeMap::new(),
     };
     // What removals a crash cut short left (`removal::sweep`).
     if let Ok(data) = &session.data {

@@ -1967,6 +1967,29 @@ any network in its jail, and notifies each workspace conversation whose
 base advanced, which the window shows too. Rebasing is the
 conversation's own work.
 
+**As built (increment 11, background fetch).** At its start and every
+`fetch_interval` after, the window asks its store thread to fetch, in
+the background, each remote a repository workspace names whose
+conversation is neither archived nor gone with its archive, while the
+configuration or a card admits it, with every base those workspaces
+name on it; a remote whose last fetch has not answered is not asked
+again. The thread runs one job at a time, a conversation's ask before
+any background fetch queued ahead of it, so a preparation waits only
+for a fetch already running, which `FETCH_TIME` and the stall limits
+bound; a background fetch only fetches and resolves each base, a base
+upstream deleted failing alone. A fetch or base that fails is said
+where td-agent's diagnostics go, not in the window, once until what it
+says changes or it mends. The window keeps, in memory, the commit each
+base it has seen was at as each fetch, a preparation's or its own,
+last found it, and when a base it knew moves, forward or back, says so
+in a note, `upstream moved: <base> of <remote> is at <commit>`. That
+is a cache of what the store said, blind to what moved while td-agent
+was not running, so it decides nothing for a workspace: the next step
+sets each workspace's remote-tracking refs and tells its conversation
+of a base that moved by comparing the store's commit with the
+conversation's own record of what it was last told. Nothing in a
+workspace changes yet.
+
 **As built (increment 11, preparation).** Choosing a template that
 names repositories makes its workspace's record at once, in the
 window: every remote admitted (one that is not is asked about first,
@@ -1994,8 +2017,9 @@ repository it has not recorded prepared (`Fetch`, with its bases). The
 window checks the remote and bases against the conversation's own
 record and the remote against what is admitted again, and hands it to
 its store thread, which runs the git worker on the stores outside any
-jail, one fetch at a time (`fetch_concurrency` and `fetch_interval`
-are not read yet), and answers with the human's identity and each
+jail, one fetch at a time (`fetch_concurrency` is not read yet, and
+the background fetches of Keeping current wait their turn there too),
+and answers with the human's identity and each
 base's commit, or why not. The process then lays the repository out
 and checks each worktree out in a maintenance instance (§8, As built
 (increment 11, the layout)), with the host's git by the path it
@@ -2026,8 +2050,10 @@ the project instructions (§13, As built (increment 11, project
 instructions)); in this step the checkout then runs on the
 conversation process's main thread, so that turn, and any during a
 later preparation, waits behind it too, and the model is told nothing
-of it; rules from the base, background fetches and the model's
-notification are later steps. Deleting the conversation removes its
+of it; rules from the base, the remote-tracking refs, base advances
+told to a conversation and the model's notification are later steps
+(the background fetch itself is As built (increment 11, background
+fetch)). Deleting the conversation removes its
 repository workspace (As built (increment 11, removal on deletion)),
 and archiving it does too (As built (increment 11, removal on
 archiving)).
@@ -3784,7 +3810,8 @@ default, except `jev_threshold` until it is calibrated (§11):
 - `network`: the default policy, `off` or `allowlist`; default `allowlist`
 - `network_allowlist`: the default allowlist of §10, hosts with ports
 - `protected_branches`; default `["main", "master"]`
-- `fetch_interval` and `fetch_concurrency`; defaults ten minutes and 4
+- `fetch_interval`, a whole number of seconds from 60 to 86,400, and
+  `fetch_concurrency`; defaults 600 (ten minutes) and 4
 - `max_background` and `background_output_bytes`; defaults 4 and 16 MiB
   (§12)
 - `auto_compact`, `compact_at`, `compact_keep_tokens` and
@@ -4378,6 +4405,14 @@ the names a sweep knows; `src/ui.rs` a conversation being deleted
 closed, refusing to open, given nothing by the post and named
 `deleting`, and its loss card, Cancel focused, set aside with the
 keyboard and asked again, Cancel keeping and the action deleting.
+For the background fetch, `src/config.rs` covers `fetch_interval`'s
+default and bounds; `src/git.rs` a refresh against a local upstream
+finding the new commit and a deleted base failing alone, and the store
+thread answering a refresh for the window with its bases;
+`src/upstream.rs` the stores in use, from live workspaces' admitted
+remotes only, each once with its bases once, none whose fetch is
+pending, and a base moving only from a commit known before; the store
+thread's queue a preparation before queued background fetches.
 For removal on archiving, `src/store.rs` covers `removed` read back,
 absent as false, refused when not a boolean, kept by unarchiving and by
 a process's own write; `src/ui.rs` a conversation being archived named
