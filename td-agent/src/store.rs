@@ -405,6 +405,11 @@ impl StateDir {
         written
     }
 
+    /// The workspace conversation `id`'s `meta` records, as stored.
+    pub fn workspace(&self, id: &Id) -> Result<Option<crate::workspace::Workspace>, String> {
+        read_meta(&self.conversation(id)).map(|meta| meta.workspace)
+    }
+
     /// Whether conversation `id`'s `meta` says it is archived, as stored.
     pub fn archived(&self, id: &Id) -> Result<bool, String> {
         read_meta(&self.conversation(id)).map(|meta| meta.archived)
@@ -465,6 +470,64 @@ impl StateDir {
         }
     }
 
+    /// The remotes the human admitted on a card (DESIGN.md §7), one URL a
+    /// line as td-agent records a remote, oldest first; none when there
+    /// is no file. A line that is not such a URL refuses the file.
+    pub fn load_admitted(&self) -> Result<Vec<String>, String> {
+        let path = self.root.join(ADMITTED);
+        let bytes = match read_bounded(&path, MAX_ADMITTED_BYTES) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            read => read.map_err(|e| format!("{}: {e}", path.display()))?,
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+        if text.lines().count() > MAX_ADMITTED {
+            return Err(format!(
+                "{} holds more than {MAX_ADMITTED} remotes",
+                path.display()
+            ));
+        }
+        text.lines()
+            .map(|line| match crate::git::Remote::parse(line) {
+                Ok(remote) if remote.url() == line => Ok(line.to_string()),
+                _ => Err(format!(
+                    "{}: {line:?} is not a remote as td-agent records one",
+                    path.display()
+                )),
+            })
+            .collect()
+    }
+
+    /// Moves the remotes file aside, to `remotes.set-aside-<time>`, after
+    /// it could not be read: no remote in it is admitted, and a card can
+    /// admit again. Where it went.
+    pub fn set_admitted_aside(&self) -> Result<PathBuf, String> {
+        let from = self.root.join(ADMITTED);
+        let to = self.root.join(format!("{ADMITTED}.set-aside-{}", now()));
+        std::fs::rename(&from, &to).map_err(|e| format!("{}: {e}", from.display()))?;
+        Ok(to)
+    }
+
+    /// Adds `remotes` to those admitted on a card, each once, replacing
+    /// the file whole; what is admitted then.
+    pub fn admit(&self, remotes: &[String]) -> Result<Vec<String>, String> {
+        let mut admitted = self.load_admitted()?;
+        for remote in remotes {
+            let url = crate::git::Remote::parse(remote)?.url();
+            if !admitted.contains(&url) {
+                admitted.push(url);
+            }
+        }
+        if admitted.len() > MAX_ADMITTED {
+            return Err(format!(
+                "more than {MAX_ADMITTED} remotes admitted on cards: list a prefix in `remotes` in the configuration"
+            ));
+        }
+        let text: String = admitted.iter().map(|url| format!("{url}\n")).collect();
+        replace(&self.root, ADMITTED, text.as_bytes())?;
+        Ok(admitted)
+    }
+
     /// Saves the split's share, replacing the file whole.
     pub fn save_share(&self, first: u32, total: u32) -> Result<(), String> {
         replace(
@@ -474,6 +537,12 @@ impl StateDir {
         )
     }
 }
+
+/// The remotes admitted on cards: the file, and how many it holds, each
+/// at most a remote's longest text and its newline.
+const ADMITTED: &str = "remotes";
+const MAX_ADMITTED: usize = 256;
+const MAX_ADMITTED_BYTES: u64 = (MAX_ADMITTED * (crate::git::MAX_TEXT + 1)) as u64;
 
 /// A lock file, created when missing, never through a final link.
 fn open_lock(path: &Path) -> Result<File, String> {
@@ -2349,6 +2418,45 @@ pub mod tests {
         let other = Id::random().unwrap();
         assert!(state.set_archived(&other, true, LOCK_WAIT).is_err());
         assert!(!state.conversation(&other).exists());
+    }
+
+    #[test]
+    fn remotes_admitted_on_cards_are_kept_once_and_read_back() {
+        let scratch = Scratch::new("admitted");
+        let state = scratch.state();
+        assert!(state.load_admitted().unwrap().is_empty());
+        let url = |text| crate::git::Remote::parse(text).unwrap().url();
+        let both = [url("https://example.org/a/td"), url("git@example.org:a/b")];
+        let admitted = state
+            .admit(&[
+                "HTTPS://Example.org/a/td/".into(),
+                "git@example.org:a/b".into(),
+            ])
+            .unwrap();
+        assert_eq!(admitted, both);
+        // Admitted again, kept once; read back as written.
+        assert_eq!(state.admit(&[both[0].clone()]).unwrap(), both);
+        assert_eq!(state.load_admitted().unwrap(), both);
+        assert!(state.admit(&["http://example.org/a".into()]).is_err());
+        assert_eq!(state.load_admitted().unwrap(), both);
+        // A line td-agent would not have written refuses the file.
+        for line in ["HTTPS://Example.org/a/td/", "file:///srv/x", "not a remote"] {
+            std::fs::write(state.root().join(ADMITTED), format!("{line}\n")).unwrap();
+            assert!(state.load_admitted().is_err(), "{line}");
+            assert!(state.admit(&both).is_err(), "{line}");
+        }
+        // Set aside, no remote in it is admitted, and a card admits again.
+        let aside = state.set_admitted_aside().unwrap();
+        assert!(aside.is_file());
+        assert!(state.load_admitted().unwrap().is_empty());
+        assert_eq!(state.admit(&both).unwrap(), both);
+        // More lines than are admitted at most refuse the file.
+        let many: String = (0..=MAX_ADMITTED)
+            .map(|n| format!("https://example.org/r{n}\n"))
+            .collect();
+        std::fs::write(state.root().join(ADMITTED), many).unwrap();
+        let e = state.load_admitted().unwrap_err();
+        assert!(e.contains("more than 256"), "{e}");
     }
 
     #[test]

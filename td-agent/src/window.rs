@@ -40,6 +40,21 @@ use crate::workspace::{self, Places, Workspace};
 
 /// The longest a turn waits before polling the conversation again.
 const POLL_MS: u64 = 50;
+/// Whether `workspace` names `remote` and each of `bases` as one of its
+/// entries' base for that remote: all a conversation may ask fetched.
+fn names(workspace: Option<&Workspace>, remote: &str, bases: &[String]) -> bool {
+    let Some(Workspace::Repositories(repositories)) = workspace else {
+        return false;
+    };
+    let named: Vec<&String> = repositories
+        .entries
+        .iter()
+        .filter(|entry| entry.remote == remote)
+        .map(|entry| &entry.base)
+        .collect();
+    !named.is_empty() && bases.iter().all(|base| named.contains(&base))
+}
+
 /// The ids a repository workspace is named from before its making gives
 /// up: another holds a name rarely.
 const NAME_TRIES: usize = 8;
@@ -194,7 +209,8 @@ pub struct Session {
     places: Result<Places, String>,
     /// The configured workspace templates (DESIGN.md §7).
     templates: Vec<Template>,
-    /// The remotes the configuration admits (DESIGN.md §7).
+    /// The remotes admitted (DESIGN.md §7): the configuration's, then
+    /// those the human admitted on a card.
     remotes: Vec<crate::git::Admission>,
     /// td-agent's data directory, or why there is none, and the store
     /// fetches done there for repository workspaces.
@@ -251,6 +267,7 @@ impl Session {
                 Request::Export => self.export(),
                 Request::Delete(id) => self.delete(&id),
                 Request::Archive { id, archived } => self.archive(&id, archived),
+                Request::Admit { template, remotes } => self.admit(&template, &remotes),
                 // To whichever conversation asked, open or not; one whose
                 // process has gone asks again from nothing.
                 Request::Decide {
@@ -374,21 +391,50 @@ impl Session {
             .shared_for(&Workspace::Template(name.to_string()))
             .len();
         // A workspace's name is short: one another workspace holds is
-        // passed over for a new id.
+        // passed over for a new id. A remote nothing admits is the
+        // human's to admit, on a card, asked only of a template that is
+        // otherwise whole, so no admission outlasts a template refused.
         let made = self.data.clone().and_then(|data| {
             for _ in 0..NAME_TRIES {
                 let id = Id::random()?;
-                let repositories =
-                    workspace::repositories(&template, &id, &data, &root, &self.remotes, shared)?;
+                let repositories = workspace::plan(&template, &id, &data, &root, shared)?;
+                let unadmitted = workspace::unadmitted(&repositories, &self.remotes);
+                if !unadmitted.is_empty() {
+                    return Ok(Err(unadmitted));
+                }
                 if workspace::reserve(&repositories, &data)? {
-                    return Ok((id, repositories));
+                    return Ok(Ok((id, repositories)));
                 }
             }
             Err(format!("no free workspace name in {NAME_TRIES} tries"))
         });
         match made {
-            Ok((id, repositories)) => {
+            Ok(Ok((id, repositories))) => {
                 self.start_as(id, Some(Workspace::Repositories(repositories)))
+            }
+            Ok(Err(unadmitted)) => self.app.ask_admission(name.to_string(), unadmitted),
+            Err(why) => self
+                .app
+                .note(format!("no conversation from template {name:?}: {why}")),
+        }
+    }
+
+    /// The human admitted `remotes` on template `name`'s card: kept in the
+    /// state directory, then its workspace made.
+    fn admit(&mut self, name: &str, remotes: &[String]) {
+        let admitted = self.state.admit(remotes).and_then(|urls| {
+            urls.iter()
+                .map(|url| crate::git::Admission::parse(url))
+                .collect::<Result<Vec<_>, _>>()
+        });
+        match admitted {
+            Ok(admitted) => {
+                for admission in admitted {
+                    if !self.remotes.contains(&admission) {
+                        self.remotes.push(admission);
+                    }
+                }
+                self.start_from(name);
             }
             Err(why) => self
                 .app
@@ -575,10 +621,17 @@ impl Session {
     /// handed to the store thread when the configuration admits the
     /// remote; why not, otherwise, which it is answered with.
     fn fetch(&mut self, id: &Id, remote: &str, bases: &[String]) -> Result<(), String> {
+        // Only what the conversation's own record names, as the window
+        // made it: no process asks for another remote or base.
+        if !names(self.state.workspace(id)?.as_ref(), remote, bases) {
+            return Err(format!(
+                "the remote {remote} and its bases are not what this conversation's workspace names"
+            ));
+        }
         let parsed = crate::git::Remote::parse(remote)?;
         if !self.remotes.iter().any(|admitted| admitted.admits(&parsed)) {
             return Err(format!(
-                "the remote {remote} is not admitted: add it, or a prefix of it, to `remotes` in the configuration"
+                "the remote {remote} is not admitted: admit it on a template's card, or list it in `remotes` in the configuration"
             ));
         }
         let stores = self.stores.as_ref().ok_or_else(|| match &self.data {
@@ -1158,6 +1211,27 @@ pub fn run(
         }
     };
     let ledger = Ledger::load(Some(state.root()), client.limits.day, store::now());
+    let mut remotes = config.remotes.clone();
+    match state.load_admitted().and_then(|urls| {
+        urls.iter()
+            .map(|url| crate::git::Admission::parse(url))
+            .collect::<Result<Vec<_>, _>>()
+    }) {
+        Ok(admitted) => remotes.extend(admitted),
+        Err(e) => {
+            let said = match state.set_admitted_aside() {
+                Ok(to) => format!(
+                    "the remotes admitted on cards are set aside, as {}, and none of them is admitted: {e}",
+                    to.display()
+                ),
+                Err(moved) => format!(
+                    "the remotes admitted on cards are not admitted, and no card can admit until the file is mended: {e}; {moved}"
+                ),
+            };
+            eprintln!("td-agent: {said}");
+            app.note(said);
+        }
+    }
     let (outbox, problems) = Outbox::load(&state);
     for problem in &problems {
         eprintln!("td-agent: the outbox: {problem}");
@@ -1186,7 +1260,7 @@ pub fn run(
         show_keys: false,
         places,
         templates: config.templates.clone(),
-        remotes: config.remotes.clone(),
+        remotes,
         stores: data.as_ref().ok().map(|data| {
             crate::git::Service::start(git_dir, data.join("store"), crate::git::kept_env())
         }),
@@ -1217,7 +1291,40 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
-    use super::default_model;
+    use super::{default_model, names};
+    use crate::workspace::Workspace;
+
+    #[test]
+    fn a_conversation_asks_only_what_its_record_names() {
+        let template = crate::config::Template {
+            name: "td".into(),
+            repos: ["main", "next"]
+                .iter()
+                .map(|base| crate::config::Repo {
+                    remote: "https://example.org/a/td".into(),
+                    base: base.to_string(),
+                    branch: format!("agent-{base}"),
+                    sparse: None,
+                })
+                .collect(),
+            shared: None,
+        };
+        let id = crate::store::Id::random().unwrap();
+        let made = crate::workspace::plan(&template, &id, "/d".as_ref(), "/h".as_ref(), 0).unwrap();
+        let workspace = Workspace::Repositories(made);
+        let remote = "https://example.org/a/td";
+        let bases = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(names(Some(&workspace), remote, &bases(&["main", "next"])));
+        assert!(names(Some(&workspace), remote, &bases(&["next"])));
+        assert!(!names(Some(&workspace), remote, &bases(&["main", "other"])));
+        assert!(!names(
+            Some(&workspace),
+            "https://example.org/a/other",
+            &bases(&["main"])
+        ));
+        assert!(!names(Some(&Workspace::Scratch), remote, &bases(&["main"])));
+        assert!(!names(None, remote, &bases(&["main"])));
+    }
 
     #[test]
     fn the_saved_default_holds_until_the_configuration_changes_model() {

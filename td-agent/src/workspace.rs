@@ -324,6 +324,39 @@ pub fn repositories(
     admitted: &[crate::git::Admission],
     shared: usize,
 ) -> Result<Repositories, String> {
+    let made = plan(template, id, data, root, shared)?;
+    match unadmitted(&made, admitted).first() {
+        Some(url) => Err(format!(
+            "the remote {url} is not admitted: admit it on the template's card, or list it in `remotes` in the configuration"
+        )),
+        None => Ok(made),
+    }
+}
+
+/// The remotes `repositories` names that no admission in `admitted`
+/// covers, each once, as td-agent records them: what the human is asked
+/// to admit (DESIGN.md §7).
+pub fn unadmitted(repositories: &Repositories, admitted: &[crate::git::Admission]) -> Vec<String> {
+    let mut unadmitted: Vec<String> = Vec::new();
+    for entry in &repositories.entries {
+        let covered = crate::git::Remote::parse(&entry.remote)
+            .is_ok_and(|remote| admitted.iter().any(|admission| admission.admits(&remote)));
+        if !covered && !unadmitted.contains(&entry.remote) {
+            unadmitted.push(entry.remote.clone());
+        }
+    }
+    unadmitted
+}
+
+/// `repositories` but for admission: every other check, so a template a
+/// card's admission would not make is refused before the card asks.
+pub fn plan(
+    template: &crate::config::Template,
+    id: &Id,
+    data: &Path,
+    root: &Path,
+    shared: usize,
+) -> Result<Repositories, String> {
     if template.repos.is_empty() || template.repos.len() > MAX_ENTRIES {
         return Err(format!(
             "template {:?} names 1 to {MAX_ENTRIES} repositories",
@@ -340,11 +373,6 @@ pub fn repositories(
     for repo in &template.repos {
         let remote = crate::git::Remote::parse(&repo.remote)?;
         let url = remote.url();
-        if !admitted.iter().any(|admission| admission.admits(&remote)) {
-            return Err(format!(
-                "the remote {url} is not admitted: add it, or a prefix of it, to `remotes` in the configuration"
-            ));
-        }
         crate::git::branch_name(&repo.base)?;
         crate::git::branch_name(&repo.branch)?;
         crate::repo::cone(repo.sparse.as_deref())?;
@@ -1353,6 +1381,56 @@ mod tests {
         }
         let e = repositories(&long, &id, data, root, &admitted, 0).unwrap_err();
         assert!(e.contains("16384 bytes"), "{e}");
+    }
+
+    /// What the human is asked to admit: each remote once, as recorded,
+    /// none an admission covers; and only of a template that is otherwise
+    /// whole, so an admission never outlasts a template refused.
+    #[test]
+    fn a_templates_remotes_not_admitted_are_asked_about_only_when_it_is_whole() {
+        let id = Id::random().unwrap();
+        let (data, root) = (Path::new("/d"), Path::new("/h"));
+        let made = plan(
+            &template(&[
+                ("https://github.com/timmydo/td", "main", "a"),
+                ("https://example.org/a/td", "main", "a"),
+                ("HTTPS://Example.org/a/td/", "main", "b"),
+                ("git@example.org:a/b", "main", "a"),
+            ]),
+            &id,
+            data,
+            root,
+            0,
+        )
+        .unwrap();
+        let some = [crate::git::Admission::parse("github.com/timmydo").unwrap()];
+        assert_eq!(
+            unadmitted(&made, &some),
+            ["https://example.org/a/td", "git@example.org:a/b"]
+        );
+        let all = [
+            crate::git::Admission::parse("github.com").unwrap(),
+            crate::git::Admission::parse("example.org").unwrap(),
+        ];
+        assert!(unadmitted(&made, &all).is_empty());
+        // A template refused for anything else is refused before any
+        // card: a plain http remote, a branch named twice, a bad base.
+        for repos in [
+            vec![
+                ("https://example.org/a/td", "main", "a"),
+                ("http://example.org/plain", "main", "a"),
+            ],
+            vec![
+                ("https://example.org/a/td", "main", "a"),
+                ("https://example.org/a/td", "next", "a"),
+            ],
+            vec![("https://example.org/a/td", "-main", "a")],
+        ] {
+            assert!(
+                plan(&template(&repos), &id, data, root, 0).is_err(),
+                "{repos:?}"
+            );
+        }
     }
 
     #[test]

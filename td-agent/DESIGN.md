@@ -1084,7 +1084,8 @@ keeps that bears on what it did, and never the key file.
 
 - **What it holds.** Every regular file beneath the state directory
   (§6): each conversation's `meta`, `prefix` and `log`, the outbox, the
-  models cache, `spend` and `layout`, a crash's leftover temporaries,
+  models cache, `spend`, `layout` and the remotes admitted on cards, a
+  crash's leftover temporaries,
   under `td-agent-diagnostics/state/`; the configuration file as
   `td-agent-diagnostics/config`, copied as written, so the notice and
   the manifest say to read it before sharing; and a generated
@@ -1876,6 +1877,36 @@ refused, nothing is made. A remote of another transport is refused
 outright. Branch and base names are checked as git ref names before use
 and passed after `--end-of-options`.
 
+**As built (increment 11, admission).** Choosing a template asks, on
+one modal card titled `Admit remotes`, about every remote it names that
+neither `remotes` in configuration nor an earlier card admits, each
+once as td-agent records it, and only once every other check of the
+template has passed (As built (increment 11, preparation)), so no
+admission outlasts a template refused for something else; a remote of
+another transport is refused that way, never asked about. The card
+names the template, how many remotes it asks about when more than one
+(all admitted together) and the remotes, and says that, admitted,
+td-agent's git clones and fetches each for the human, outside any jail
+and with the human's git credentials, bypassing the egress relay, and
+that each stays admitted, with or without a final `.git` (an exact
+admission compares paths so), for every later workspace. `Cancel` is
+focused first and a key that comes as the card is shown decides
+nothing, as on a tool's card (§11); `Cancel` or `Escape` makes nothing
+and says so in a note. Losing the keyboard sets the card aside, and it
+is asked again when the keyboard comes back; a window grown too small
+for it closes it, saying nothing was made. `Admit` records each remote,
+exactly, in the window's `remotes` file in the state directory (one URL
+a line, oldest first, replaced whole, at most 256) and then makes the
+workspace. A file the window cannot read at start (a line td-agent
+would not have written, more than 256 lines) is moved aside, to
+`remotes.set-aside-<time>`, and said, so none of it is admitted and a
+card can admit again. An admission is the human's alone: nothing a
+conversation sends admits a remote, and a conversation's ask for a
+store is answered only for a remote and bases its own workspace record
+names, and only while an admission covers the remote (As built
+(increment 11, preparation)). Removing a line from the file, or from
+the configuration, ends that admission at the window's next start.
+
 **Asynchronous from the first increment.** Creating a conversation from
 a repository template returns at once. Each worktree then moves through
 `fetching` (clone or fetch of the store), `checking-out` (workspace
@@ -1904,8 +1935,8 @@ conversation's own work.
 
 **As built (increment 11, preparation).** Choosing a template that
 names repositories makes its workspace's record at once, in the
-window: every remote admitted by `remotes` (one that is not refuses
-the template, saying to list it; the admission card is a later step),
+window: every remote admitted (one that is not is asked about first,
+As built (increment 11, admission)),
 every base and branch a branch name td-agent passes to git, no branch
 named twice for one remote, at most 32 entries, no more directories
 bound than td-jail binds (32: its worktrees, repositories, stores and
@@ -1926,8 +1957,9 @@ td-agent's part of every data home is refused to directory workspaces
 and shared directories (§8). The conversation's process, at its start
 and after any restart, asks the window for each remote whose
 repository it has not recorded prepared (`Fetch`, with its bases). The
-window checks the remote against `remotes` again and hands it to its
-store thread, which runs the git worker on the stores outside any
+window checks the remote and bases against the conversation's own
+record and the remote against what is admitted again, and hands it to
+its store thread, which runs the git worker on the stores outside any
 jail, one fetch at a time (`fetch_concurrency` and `fetch_interval`
 are not read yet), and answers with the human's identity and each
 base's commit, or why not. The process then lays the repository out
@@ -1957,8 +1989,7 @@ another root. The prefix names every worktree with its remote, branch,
 base and paths whether or not it is ready, so it holds while they
 prepare. In this step the checkout runs on the conversation process's
 main thread, so a turn waits behind it, and the model is told nothing
-of it; the admission card, the workspace
-card, project instructions and rules from the base, background fetches
+of it; the workspace card, project instructions and rules from the base, background fetches
 and the model's notification are later steps, as is the cleanup:
 deleting the conversation leaves its repository workspace in place,
 which the deletion question says.
@@ -3569,8 +3600,8 @@ default, except `jev_threshold` until it is calibrated (§11):
     for this template's workspaces; absent, the top-level `network`
 - `remotes`: the admitted git remotes (§7), each a remote's URL or a
   host with a path prefix; default empty, so the first workspace on a
-  remote asks (until the admission card lands, a template whose remote
-  is not listed is refused, saying to list it)
+  remote asks; what a card admits is kept beside it, in the state
+  directory's `remotes` (§7)
 - `network`: the default policy, `off` or `allowlist`; default `allowlist`
 - `network_allowlist`: the default allowlist of §10, hosts with ports
 - `protected_branches`; default `["main", "master"]`
@@ -4116,6 +4147,20 @@ and say a refusal in its log, recording nothing; the ignored
 live test in `tests/jail.rs` answers a conversation's ask with a real
 store and finds its worktree checked out, its notice said and its
 repository recorded prepared.
+
+For the admission card, `src/workspace.rs` covers which of a
+template's remotes are asked about (each once, as recorded, none
+another admission covers) and that a template refused for anything
+else (a plain http remote, a branch named twice, a bad base) is
+refused before any card; `src/store.rs` that the remotes admitted are
+kept once, read back as written, refused whole when a line is not one
+td-agent writes or there are more than 256, and once set aside admit
+nothing and let a card admit again; `src/confirm.rs` that the card
+admits only on its action; and `src/ui.rs` that it is shown with
+`Cancel` focused, asks the window to admit only on `Admit`, says a
+refusal in a note, takes no key as it is shown, is set aside with the
+keyboard and asked again when it comes back, and is not asked over
+another question.
 
 For row menus and archiving, `src/menu.rs` covers the row menu's items
 for a live and an archived conversation, each activating its action,

@@ -260,6 +260,12 @@ pub enum Request {
     Archive { id: Id, archived: bool },
     /// Make this the default model, from Conversation → Default model….
     SetDefault(String),
+    /// The human admitted `remotes` on the admission card, so template
+    /// `template`'s workspace can be made (DESIGN.md §7).
+    Admit {
+        template: String,
+        remotes: Vec<String>,
+    },
     /// The human decided a card: whether call `call` of `conversation`
     /// may run (DESIGN.md §11).
     Decide {
@@ -581,6 +587,9 @@ pub struct App {
     settle: Duration,
     /// The card that could not be drawn, said once until one is.
     card_trouble: Option<(Id, u64)>,
+    /// An admission card set aside when the window lost the keyboard:
+    /// its template and remotes, asked again when it comes back.
+    admission: Option<(String, Vec<String>)>,
     /// The menu's revision: it is built again, from the state of the
     /// moment, each time it opens.
     menu_revision: u64,
@@ -686,6 +695,7 @@ impl App {
             card_shown: None,
             settle: CARD_SETTLE,
             card_trouble: None,
+            admission: None,
             menu_revision: 1,
             menu_row: None,
             credit: None,
@@ -1145,7 +1155,7 @@ impl App {
                     conversation: of,
                     call: n,
                 } => of == conversation && call.is_none_or(|call| call == *n),
-                confirm::Purpose::Delete(_) => false,
+                confirm::Purpose::Delete(_) | confirm::Purpose::Admit { .. } => false,
             });
         if shown {
             self.close_confirm();
@@ -1161,6 +1171,9 @@ impl App {
     fn offer(&mut self) {
         if self.modal() || !self.focused || self.menu.is_open() {
             return;
+        }
+        if let Some((template, remotes)) = self.admission.take() {
+            return self.ask_admission(template, remotes);
         }
         let Some(card) = self
             .active
@@ -2131,8 +2144,17 @@ impl App {
         }
         if let Some(confirm) = self.confirm.as_mut() {
             if !confirm.resize(self.surface, body(self.surface)) {
+                let said = match confirm.purpose() {
+                    confirm::Purpose::Admit { template, .. } => format!(
+                        "the window is now too small for the admission card, which is closed: no conversation from template {template:?} was made"
+                    ),
+                    // A tool's card stays the conversation's, shown again
+                    // when there is room (`offer`).
+                    confirm::Purpose::Approve { .. } => "the window is now too small for the card, which waits until there is room for it: nothing was decided".to_string(),
+                    confirm::Purpose::Delete(_) => "the window is now too small for the question, which is closed: nothing was deleted".to_string(),
+                };
                 self.close_confirm();
-                self.note("the window is now too small for the question, which is closed: nothing was deleted");
+                self.note(said);
             }
         }
         if let Some(dialog) = self.dialog.as_mut() {
@@ -2776,7 +2798,7 @@ impl App {
             (name.clone(), meta.to_string())
         }));
         let note = if self.templates.iter().any(|(_, repos)| *repos) {
-            "a repository template's worktrees are checked out in the background; its remotes must be in `remotes`"
+            "a repository template's worktrees are checked out in the background; a remote not yet admitted is asked about first"
         } else {
             "Empty is a private scratch directory; Directory\u{2026} is a folder of yours"
         };
@@ -3084,14 +3106,20 @@ impl App {
                     // td-ui's question is closed when the window loses
                     // the keyboard: nothing is deleted, and a card is
                     // set aside, to be shown again when it comes back.
-                    let closed = self.confirm.as_mut().is_some_and(|c| {
+                    let closed = self.confirm.as_mut().and_then(|c| {
                         matches!(
                             c.input(&input),
                             confirm::Reply::Closed | confirm::Reply::SetAside
                         )
+                        .then(|| c.purpose().clone())
                     });
-                    if closed {
+                    if let Some(purpose) = closed {
                         self.confirm = None;
+                        // An admission card is asked again when the
+                        // keyboard comes back, as a tool's card is.
+                        if let confirm::Purpose::Admit { template, remotes } = purpose {
+                            self.admission = Some((template, remotes));
+                        }
                         self.touch();
                     }
                 }
@@ -3105,10 +3133,12 @@ impl App {
         let purpose = confirm.purpose().clone();
         // A card just shown takes no key or press yet: one meant for
         // what was there before is not a decision.
-        let settling = matches!(purpose, confirm::Purpose::Approve { .. })
-            && self
-                .card_shown
-                .is_some_and(|shown| shown.elapsed() < self.settle);
+        let settling = matches!(
+            purpose,
+            confirm::Purpose::Approve { .. } | confirm::Purpose::Admit { .. }
+        ) && self
+            .card_shown
+            .is_some_and(|shown| shown.elapsed() < self.settle);
         if settling
             && matches!(
                 input,
@@ -3132,8 +3162,14 @@ impl App {
             confirm::Reply::SetAside => self.close_confirm(),
             // Cancel, or Escape, refuses a card's call.
             confirm::Reply::Closed => {
-                if let confirm::Purpose::Approve { conversation, call } = purpose {
-                    self.decide(conversation, call, false);
+                match purpose {
+                    confirm::Purpose::Approve { conversation, call } => {
+                        self.decide(conversation, call, false)
+                    }
+                    confirm::Purpose::Admit { template, .. } => self.note(format!(
+                        "no conversation from template {template:?}: its remotes were not admitted"
+                    )),
+                    confirm::Purpose::Delete(_) => {}
                 }
                 self.close_confirm();
             }
@@ -3145,6 +3181,44 @@ impl App {
                 self.decide(conversation, call, true);
                 self.close_confirm();
             }
+            confirm::Reply::Confirmed(confirm::Purpose::Admit { template, remotes }) => {
+                self.close_confirm();
+                self.requests.push(Request::Admit { template, remotes });
+            }
+        }
+    }
+
+    /// Asks whether `remotes`, which template `template` names and no
+    /// admission covers, are admitted (DESIGN.md §7): a card, modal, its
+    /// `Admit` making the workspace (`Request::Admit`). With something
+    /// else modal, or no room for it, nothing is made and that is said.
+    pub fn ask_admission(&mut self, template: String, remotes: Vec<String>) {
+        // The latest choice is the one asked; one set aside is dropped.
+        self.admission = None;
+        if self.modal() {
+            return self.note(format!(
+                "no conversation from template {template:?}: its remotes are not admitted, and another question is open"
+            ));
+        }
+        self.cancel_pointer();
+        self.menu.dismiss();
+        self.press = None;
+        self.confirm_revision = self.confirm_revision.wrapping_add(1);
+        let named = format!("no conversation from template {template:?}");
+        match Confirm::admit(
+            self.surface,
+            body(self.surface),
+            template,
+            remotes,
+            self.confirm_revision,
+        ) {
+            Ok(confirm) => {
+                self.confirm = Some(confirm);
+                self.card_shown = Some(Instant::now());
+                self.apply_focus();
+                self.touch();
+            }
+            Err(e) => self.note(format!("{named}: {e}")),
         }
     }
 
@@ -5903,6 +5977,79 @@ pub mod tests {
         app.set_key_path(Some(PATH.into()));
         app.open_key_dialog();
         assert!(app.picker().is_none() && app.dialog().is_some());
+    }
+
+    /// A template's remotes no admission covers are asked about on a
+    /// card, Cancel focused: Admit asks the window to admit them and make
+    /// the workspace, Cancel or Escape makes nothing and says so, a key
+    /// that comes as it is shown decides nothing, and nothing is asked
+    /// over another question.
+    #[test]
+    fn a_template_whose_remotes_are_not_admitted_asks_on_a_card() {
+        let mut app = app();
+        app.settle = Duration::ZERO;
+        let remotes = vec![
+            "https://example.org/a/td".to_string(),
+            "git@example.org:a/b".to_string(),
+        ];
+        let asked = |app: &App| match app.confirm().map(Confirm::purpose) {
+            Some(confirm::Purpose::Admit { template, remotes }) => {
+                Some((template.clone(), remotes.clone()))
+            }
+            _ => None,
+        };
+        app.ask_admission("td".into(), remotes.clone());
+        assert_eq!(asked(&app), Some(("td".to_string(), remotes.clone())));
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        let shown = text(&app);
+        assert!(shown.contains("Admit remotes"), "{shown}");
+        assert!(shown.contains("https://example.org/a/td"), "{shown}");
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert!(app.confirm().is_none());
+        // Said in a note: nothing was made.
+        assert_eq!(app.unread(), 1);
+        app.ask_admission("td".into(), remotes.clone());
+        key(&mut app, "Escape");
+        assert!(app.take_requests().is_empty() && app.confirm().is_none());
+        app.ask_admission("td".into(), remotes.clone());
+        key(&mut app, "Tab");
+        assert_eq!(app.confirm().unwrap().focus(), "admit");
+        key(&mut app, "Return");
+        assert_eq!(
+            app.take_requests(),
+            [Request::Admit {
+                template: "td".into(),
+                remotes: remotes.clone()
+            }]
+        );
+        assert!(app.confirm().is_none());
+        // Just shown, it takes no key: one meant for the chooser.
+        app.settle = Duration::from_secs(60);
+        app.ask_admission("td".into(), remotes.clone());
+        key(&mut app, "Tab");
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        // Set aside with the keyboard, decided nothing, and asked again
+        // when it comes back.
+        app.settle = Duration::ZERO;
+        key(&mut app, "Escape");
+        app.take_requests();
+        app.ask_admission("td".into(), remotes.clone());
+        key(&mut app, "Tab");
+        let unread = app.unread();
+        app.input(Input::Focus(false), &mut NoClipboard);
+        assert!(app.confirm().is_none() && app.take_requests().is_empty());
+        assert_eq!(app.unread(), unread);
+        app.input(Input::Focus(true), &mut NoClipboard);
+        assert_eq!(asked(&app), Some(("td".to_string(), remotes.clone())));
+        assert_eq!(app.confirm().unwrap().focus(), "cancel");
+        // Over another question, nothing is asked, and that is said.
+        let unread = app.unread();
+        app.ask_admission("other".into(), remotes);
+        assert_eq!(asked(&app).map(|(template, _)| template), Some("td".into()));
+        assert_eq!(app.unread(), unread + 1);
     }
 
     /// A card is shown for the open conversation whenever nothing else is

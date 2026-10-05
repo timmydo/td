@@ -1,8 +1,9 @@
 //! The window's questions, td-ui's confirmation dialog (td-ui/DESIGN.md)
 //! centred over its body, `Cancel` focused first, so `Return` alone does
-//! nothing: before a conversation is deleted (DESIGN.md §4), and the card
+//! nothing: before a conversation is deleted (DESIGN.md §4), the card
 //! that asks whether a workspace tool may act (§11), where `Cancel`
-//! refuses it and `Allow` lets it run.
+//! refuses it and `Allow` lets it run, and the card that asks whether a
+//! template's remotes are admitted (§7).
 
 use td_ui::chrome::ROW;
 use td_ui::confirmations::{self, Choice, Controller, Event, Key, Model, Outcome};
@@ -25,6 +26,12 @@ pub enum Purpose {
     /// Letting call `call` (its `ToolCall`'s sequence number) of this
     /// conversation run.
     Approve { conversation: Id, call: u64 },
+    /// Admitting `remotes`, the ones template `template` names that no
+    /// admission covers, then making its workspace.
+    Admit {
+        template: String,
+        remotes: Vec<String>,
+    },
 }
 
 /// What an input came to.
@@ -47,6 +54,9 @@ pub const TITLE: &str = "Delete conversation";
 pub const DELETE: &str = "Delete";
 /// A card's action's label.
 pub const ALLOW: &str = "Allow";
+/// The admission card's title and its action's label.
+pub const ADMIT_TITLE: &str = "Admit remotes";
+pub const ADMIT: &str = "Admit";
 
 /// The open question: what it is for and the dialog.
 pub struct Confirm {
@@ -87,7 +97,7 @@ fn worked(workspace: Option<&Workspace>) -> String {
 fn place(surface: Surface, body: Rect, purpose: &Purpose) -> Rect {
     let (columns, rows) = match purpose {
         Purpose::Delete(_) => (64, 10),
-        Purpose::Approve { .. } => (100, 24),
+        Purpose::Approve { .. } | Purpose::Admit { .. } => (100, 24),
     };
     let scale = surface.scale.value();
     let pixels = |logical: usize| u32::try_from(logical.saturating_mul(scale)).unwrap_or(u32::MAX);
@@ -156,13 +166,47 @@ impl Confirm {
         })
     }
 
+    /// The card asking whether `remotes`, which template `template` names
+    /// and nothing admits, are admitted (DESIGN.md §7): what that lets
+    /// td-agent do, and that it lasts.
+    pub fn admit(
+        surface: Surface,
+        body: Rect,
+        template: String,
+        remotes: Vec<String>,
+        revision: u64,
+    ) -> Result<Self, String> {
+        let asked = match remotes.len() {
+            1 => format!("Template \u{201c}{template}\u{201d} works on a remote no admission covers:"),
+            n => format!(
+                "Template \u{201c}{template}\u{201d} works on {n} remotes no admission covers, all admitted together:"
+            ),
+        };
+        let mut details: Vec<&str> = vec![&asked];
+        details.extend(remotes.iter().map(String::as_str));
+        details.push(
+            "Admitted, td-agent's git clones and fetches each for you, outside any jail and with your git credentials, bypassing the egress relay that holds the workspace's own network. Each stays admitted, with or without a final .git, for every later workspace: td-agent keeps them in the `remotes` file of its state directory, beside `remotes` in the configuration.",
+        );
+        details.push("Cancel makes nothing.");
+        let model = Model::new(ADMIT_TITLE, ADMIT, &details, Act, revision)
+            .map_err(|e| format!("the admission card: {e}"))?;
+        let purpose = Purpose::Admit { template, remotes };
+        let dialog = Controller::new(model, surface, place(surface, body, &purpose), None)
+            .map_err(|e| format!("the admission card: {e}"))?;
+        Ok(Self {
+            purpose,
+            dialog,
+            revision,
+        })
+    }
+
     /// What it asks about.
     pub fn purpose(&self) -> &Purpose {
         &self.purpose
     }
 
-    /// Where its keyboard is: `details`, `cancel`, or its action, `delete`
-    /// or `allow`.
+    /// Where its keyboard is: `details`, `cancel`, or its action, `delete`,
+    /// `allow` or `admit`.
     pub fn focus(&self) -> &'static str {
         match self.dialog.focus() {
             confirmations::Focus::Details => "details",
@@ -172,6 +216,7 @@ impl Confirm {
             | confirmations::Focus::Confirm => match self.purpose {
                 Purpose::Delete(_) => "delete",
                 Purpose::Approve { .. } => "allow",
+                Purpose::Admit { .. } => "admit",
             },
         }
     }
@@ -273,6 +318,34 @@ mod tests {
             chord,
             repeat: false,
         })
+    }
+
+    #[test]
+    fn the_admission_card_admits_only_on_its_action() {
+        let surface = Surface::new(1024, 640, Scale::default()).unwrap();
+        let admit = || {
+            Confirm::admit(
+                surface,
+                surface.bounds(),
+                "td".into(),
+                vec!["https://example.org/a/td".into()],
+                3,
+            )
+            .unwrap()
+        };
+        let mut confirm = admit();
+        assert_eq!(confirm.focus(), "cancel");
+        assert_eq!(key(&mut confirm, "Return"), Reply::Closed);
+        let mut confirm = admit();
+        assert_eq!(key(&mut confirm, "Tab"), Reply::Stay(true));
+        assert_eq!(confirm.focus(), "admit");
+        assert_eq!(
+            key(&mut confirm, "Return"),
+            Reply::Confirmed(Purpose::Admit {
+                template: "td".into(),
+                remotes: vec!["https://example.org/a/td".into()],
+            })
+        );
     }
 
     #[test]
